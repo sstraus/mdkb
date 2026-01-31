@@ -3,6 +3,10 @@
 //! This layer contains pure business logic independent of storage or UI.
 //! All domain types are storage-agnostic and can be tested with mocks.
 
+pub mod frontmatter;
+pub mod links;
+pub mod traits;
+
 use serde::{Deserialize, Serialize};
 
 /// A collection of documents from a directory.
