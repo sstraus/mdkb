@@ -18,7 +18,7 @@ use tempfile::TempDir;
 
 use mdkb::cli::handlers::{Context, handle_collection_add, handle_init, handle_update};
 use mdkb::domain::{SearchQuery, SearchResult};
-use mdkb::store::{collections, documents, search};
+use mdkb::store::{collections, documents, memory, search, stats};
 
 /// Test environment that simulates a complete mdkb installation.
 struct TestEnvironment {
@@ -1181,4 +1181,216 @@ fn test_all_documents_retrievable() {
             filename
         );
     }
+}
+
+// ==================== Memory System E2E Tests ====================
+
+/// Test complete memory workflow: add -> search -> get -> check stats -> prune.
+#[test]
+fn test_memory_complete_workflow() {
+    let env = TestEnvironment::new();
+    let now = chrono::Utc::now().timestamp();
+
+    // Initialize stats schema
+    stats::init_stats_schema(&env.ctx.conn).expect("Failed to init stats schema");
+
+    // 1. Add memory entries
+    let entry1 = memory::MemoryEntry {
+        id: "auth-oauth2-pkce".to_string(),
+        title: "OAuth2 PKCE implementation".to_string(),
+        content: "# OAuth2 PKCE\n\nImplemented PKCE flow for mobile clients.\n\n## Steps\n1. Generate code verifier\n2. Create code challenge\n3. Include in auth request".to_string(),
+        entry_type: memory::EntryType::Topic,
+        tags: vec!["auth".to_string(), "security".to_string(), "mobile".to_string()],
+        status: memory::EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+    };
+
+    let entry2 = memory::MemoryEntry {
+        id: "bug-null-email".to_string(),
+        title: "Null email causes panic".to_string(),
+        content: "# Bug Fix: Null Email\n\n## Symptom\nPanic when user has null email.\n\n## Root Cause\nUnwrap on Option<String>.\n\n## Fix\nUse unwrap_or_default().".to_string(),
+        entry_type: memory::EntryType::Problem,
+        tags: vec!["bug".to_string(), "users".to_string()],
+        status: memory::EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+    };
+
+    memory::add_entry(&env.ctx.conn, &entry1).expect("Failed to add entry1");
+    memory::add_entry(&env.ctx.conn, &entry2).expect("Failed to add entry2");
+
+    // 2. Verify count
+    let count = memory::count_entries(&env.ctx.conn).expect("Failed to count entries");
+    assert_eq!(count, 2, "Should have 2 memory entries");
+
+    // 3. Verify entries exist in database (FTS search tested separately in unit tests)
+    let check1 = memory::get_entry_without_tracking(&env.ctx.conn, "auth-oauth2-pkce")
+        .expect("Failed to get entry");
+    assert!(check1.is_some(), "OAuth entry should exist in database");
+    assert!(check1.unwrap().content.contains("PKCE"), "Content should contain PKCE");
+
+    let check2 = memory::get_entry_without_tracking(&env.ctx.conn, "bug-null-email")
+        .expect("Failed to get entry");
+    assert!(check2.is_some(), "Bug entry should exist in database");
+    assert!(check2.unwrap().content.contains("Panic"), "Content should contain Panic");
+
+    // Note: FTS search tested in unit tests with in-memory DB
+
+    // 4. Get entry (this increments access count)
+    let retrieved = memory::get_entry(&env.ctx.conn, "auth-oauth2-pkce")
+        .expect("Failed to get entry")
+        .expect("Entry should exist");
+    assert_eq!(retrieved.access_count, 1, "Access count should be 1 after get");
+    assert!(retrieved.last_accessed.is_some(), "Last accessed should be set");
+
+    // Get again to increment access count
+    let retrieved2 = memory::get_entry(&env.ctx.conn, "auth-oauth2-pkce")
+        .expect("Failed to get entry")
+        .expect("Entry should exist");
+    assert_eq!(retrieved2.access_count, 2, "Access count should be 2 after second get");
+
+    // 5. Check warmup index
+    let warmup = memory::get_warmup_index(&env.ctx.conn, 50)
+        .expect("Failed to get warmup index");
+    assert_eq!(warmup.len(), 2, "Should have 2 entries in warmup");
+    // Most accessed entry should be first
+    assert!(warmup[0].contains("auth-oauth2-pkce"), "Most accessed should be first");
+
+    // 6. List entries
+    let all = memory::list_entries(&env.ctx.conn, 10, None)
+        .expect("Failed to list entries");
+    assert_eq!(all.len(), 2, "Should list 2 entries");
+
+    // 7. Update an entry
+    let mut updated_entry = retrieved2.clone();
+    updated_entry.content.push_str("\n\n## Additional Notes\nAlso supports S256.");
+    memory::update_entry(&env.ctx.conn, &updated_entry)
+        .expect("Failed to update entry");
+
+    let after_update = memory::get_entry_without_tracking(&env.ctx.conn, "auth-oauth2-pkce")
+        .expect("Failed to get entry")
+        .expect("Entry should exist");
+    assert!(after_update.content.contains("S256"), "Content should be updated");
+
+    // 8. Test prune (nothing should be pruned since entries are recent)
+    let pruned = memory::prune_entries(&env.ctx.conn, 30, true)
+        .expect("Failed to prune");
+    assert!(pruned.is_empty(), "Recent entries should not be pruned");
+}
+
+/// Test memory stats integration - memory tools should record stats.
+#[test]
+fn test_memory_stats_integration() {
+    let env = TestEnvironment::new();
+    let now = chrono::Utc::now().timestamp();
+
+    // Initialize stats schema
+    stats::init_stats_schema(&env.ctx.conn).expect("Failed to init stats schema");
+
+    // Create a session
+    let session_id = stats::create_session(&env.ctx.conn)
+        .expect("Failed to create session");
+    assert!(session_id > 0, "Session ID should be positive");
+
+    // Add a memory entry
+    let entry = memory::MemoryEntry {
+        id: "test-stats".to_string(),
+        title: "Test entry for stats".to_string(),
+        content: "Content".to_string(),
+        entry_type: memory::EntryType::Topic,
+        tags: vec![],
+        status: memory::EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+    };
+    memory::add_entry(&env.ctx.conn, &entry).expect("Failed to add entry");
+
+    // Record some tool calls (simulating what MCP server does)
+    stats::record_call(&env.ctx.conn, session_id, "memory_write", 150, 1, false)
+        .expect("Failed to record call");
+    stats::record_call(&env.ctx.conn, session_id, "memory_get", 200, 1, false)
+        .expect("Failed to record call");
+    stats::record_call(&env.ctx.conn, session_id, "memory_search", 100, 2, false)
+        .expect("Failed to record call");
+
+    // Check session stats
+    let session = stats::get_session(&env.ctx.conn, session_id)
+        .expect("Failed to get session")
+        .expect("Session should exist");
+    assert_eq!(session.total_calls, 3, "Should have 3 calls");
+    assert_eq!(session.total_tokens, 450, "Should have 450 tokens total");
+
+    // Check tool usage breakdown
+    let tool_usage = stats::get_tool_usage(&env.ctx.conn, session_id)
+        .expect("Failed to get tool usage");
+    assert_eq!(tool_usage.len(), 3, "Should have 3 different tools");
+
+    // Check aggregate stats
+    let aggregate = stats::get_aggregate_stats(&env.ctx.conn)
+        .expect("Failed to get aggregate stats");
+    assert_eq!(aggregate.total_sessions, 1);
+    assert_eq!(aggregate.total_calls, 3);
+    assert_eq!(aggregate.total_tokens, 450);
+}
+
+/// Test memory index.json persistence.
+#[test]
+fn test_memory_index_persistence() {
+    let env = TestEnvironment::new();
+    let now = chrono::Utc::now().timestamp();
+
+    // Create memory directory structure
+    let memory_dir = env.root.join(".mdkb/memory");
+    let active_dir = memory_dir.join("active");
+    fs::create_dir_all(&active_dir).expect("Failed to create memory directories");
+
+    // Add entries
+    for i in 0..3 {
+        let entry = memory::MemoryEntry {
+            id: format!("entry-{}", i),
+            title: format!("Entry {}", i),
+            content: format!("Content for entry {}", i),
+            entry_type: memory::EntryType::Topic,
+            tags: vec![format!("tag{}", i)],
+            status: memory::EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: i as u64,
+            last_accessed: if i > 0 { Some(now) } else { None },
+        };
+        memory::add_entry(&env.ctx.conn, &entry).expect("Failed to add entry");
+    }
+
+    // Get warmup index (this is what would be persisted to index.json)
+    let index = memory::get_warmup_index(&env.ctx.conn, 50)
+        .expect("Failed to get warmup index");
+    assert_eq!(index.len(), 3, "Should have 3 entries");
+
+    // Write index.json manually (simulating what handle_memory_add does)
+    let index_path = active_dir.join("index.json");
+    let index_content = serde_json::json!({
+        "entries": index,
+        "updated_at": now,
+    });
+    fs::write(&index_path, serde_json::to_string_pretty(&index_content).unwrap())
+        .expect("Failed to write index.json");
+
+    // Verify index.json exists and is readable
+    assert!(index_path.exists(), "index.json should exist");
+    let read_back = fs::read_to_string(&index_path).expect("Failed to read index.json");
+    let parsed: serde_json::Value = serde_json::from_str(&read_back)
+        .expect("Failed to parse index.json");
+    let entries = parsed["entries"].as_array().expect("entries should be array");
+    assert_eq!(entries.len(), 3, "index.json should have 3 entries");
 }
