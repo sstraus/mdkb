@@ -50,6 +50,8 @@ pub struct McpServer {
     config: McpConfig,
     /// Current session ID for persistent stats.
     session_id: Arc<AtomicI64>,
+    /// Warmup instructions (loaded at startup, used in get_info).
+    warmup_instructions: Option<String>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -76,6 +78,20 @@ impl McpServer {
             metrics: Arc::new(UsageMetrics::new()),
             config,
             session_id: Arc::new(AtomicI64::new(0)),
+            warmup_instructions: None,
+        }
+    }
+
+    /// Create a new MCP server with warmup instructions pre-loaded.
+    pub fn with_warmup(root: PathBuf, config: McpConfig, warmup: Option<String>) -> Self {
+        Self {
+            root,
+            ctx: Arc::new(Mutex::new(None)),
+            tool_router: Self::tool_router(),
+            metrics: Arc::new(UsageMetrics::new()),
+            config,
+            session_id: Arc::new(AtomicI64::new(0)),
+            warmup_instructions: warmup,
         }
     }
 
@@ -440,6 +456,24 @@ impl McpServer {
                     aggregate.avg_tokens_per_call,
                 ));
             }
+
+            // Add per-tool breakdown including memory tools
+            if let Ok(tool_stats) = stats::get_aggregate_tool_usage(&ctx.conn) {
+                if !tool_stats.is_empty() {
+                    output.push_str("\n\nTool breakdown (all-time):");
+                    for tool in &tool_stats {
+                        let avg = if tool.call_count > 0 {
+                            tool.total_tokens as f64 / tool.call_count as f64
+                        } else {
+                            0.0
+                        };
+                        output.push_str(&format!(
+                            "\n  - {}: {} calls, {} tokens ({:.1} avg)",
+                            tool.tool_name, tool.call_count, tool.total_tokens, avg
+                        ));
+                    }
+                }
+            }
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -514,7 +548,7 @@ impl McpServer {
     }
 
     /// Write or update a memory entry.
-    #[tool(description = "Create or update a memory entry. Use for persisting important knowledge across sessions.")]
+    #[tool(description = "Create or update a memory entry. Use after: (1) solving a problem (type=problem, title=symptom), (2) making architectural decisions (type=decision, title=options), (3) learning patterns (type=topic, title=concept). Title max 50 chars, like a headline. ID should be slug format: 'auth-oauth2-pkce'.")]
     async fn mdkb_memory_write(
         &self,
         Parameters(params): Parameters<MemoryWriteParams>,
@@ -626,7 +660,7 @@ impl ServerHandler for McpServer {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 ..Default::default()
             },
-            instructions: None,
+            instructions: self.warmup_instructions.clone(),
         }
     }
 }
@@ -653,7 +687,11 @@ pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
         mcp_config.max_document_tokens
     );
 
-    let server = McpServer::with_config(root.clone(), mcp_config);
+    // Load memory warmup before starting server
+    let warmup_limit = 50; // TODO: get from memory config when added
+    let warmup = load_memory_warmup(&root, warmup_limit);
+
+    let server = McpServer::with_warmup(root.clone(), mcp_config, warmup);
     let (stdin, stdout) = rmcp::transport::io::stdio();
 
     tracing::info!("Starting mdkb MCP server...");
@@ -741,6 +779,81 @@ async fn run_file_watcher(
     }
 
     Ok(())
+}
+
+/// Build warmup instructions from memory index.
+///
+/// Creates a compact manifest of available memories for AI context injection.
+/// Format optimized for token efficiency (~30 tokens per entry).
+fn build_warmup_instructions(index: &[String]) -> String {
+    if index.is_empty() {
+        return String::new();
+    }
+
+    let mut instructions = String::from(
+        "# mdkb Memory Index\n\n\
+         You have access to persistent memory entries. Use these tools:\n\
+         - `mdkb_memory_get(id)`: Get full content of an entry\n\
+         - `mdkb_memory_write(id, title, content, type, tags)`: Save new knowledge\n\
+         - `mdkb_memory_search(query)`: Find entries beyond this index\n\n\
+         ## When to Write Memories\n\
+         - After solving a problem: type=problem, title=symptom\n\
+         - After making architectural decisions: type=decision, title=options\n\
+         - After learning important patterns: type=topic, title=concept\n\n\
+         ## Available Memories\n\n",
+    );
+
+    for entry in index {
+        instructions.push_str(entry);
+        instructions.push('\n');
+    }
+
+    instructions.push_str("\nUse `mdkb_memory_get(id)` to retrieve full content.\n");
+
+    instructions
+}
+
+/// Load memory warmup from database.
+///
+/// Returns formatted instructions for MCP server, or None if no memories exist.
+fn load_memory_warmup(root: &std::path::Path, limit: usize) -> Option<String> {
+    // Try to open context
+    let ctx = match Context::open(root) {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            tracing::debug!("No memory warmup: {}", e);
+            return None;
+        }
+    };
+
+    // Initialize schema if needed (for memory table)
+    if let Err(e) = crate::store::schema::init_schema(&ctx.conn) {
+        tracing::warn!("Failed to init schema for warmup: {}", e);
+        return None;
+    }
+
+    // Get warmup index
+    let index = match memory::get_warmup_index(&ctx.conn, limit) {
+        Ok(idx) => idx,
+        Err(e) => {
+            tracing::debug!("No memory index: {}", e);
+            return None;
+        }
+    };
+
+    if index.is_empty() {
+        return None;
+    }
+
+    let instructions = build_warmup_instructions(&index);
+    let tokens = count_tokens(&instructions);
+    tracing::info!(
+        "Memory warmup: {} entries, ~{} tokens",
+        index.len(),
+        tokens
+    );
+
+    Some(instructions)
 }
 
 /// Truncate text to a maximum length with ellipsis.
@@ -850,5 +963,51 @@ mod tests {
     fn test_apply_line_range_zero_start() {
         let result = apply_line_range("content", "0:5");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_build_warmup_instructions_empty() {
+        let index: Vec<String> = vec![];
+        let result = build_warmup_instructions(&index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_warmup_instructions_with_entries() {
+        let index = vec![
+            "auth-oauth2: OAuth2 PKCE implementation #auth #security".to_string(),
+            "bug-null-email: Null email panic fix #bug #users".to_string(),
+        ];
+        let result = build_warmup_instructions(&index);
+
+        // Check structure
+        assert!(result.contains("# mdkb Memory Index"));
+        assert!(result.contains("mdkb_memory_get"));
+        assert!(result.contains("mdkb_memory_write"));
+        assert!(result.contains("mdkb_memory_search"));
+
+        // Check guidance
+        assert!(result.contains("When to Write Memories"));
+        assert!(result.contains("type=problem"));
+        assert!(result.contains("type=decision"));
+        assert!(result.contains("type=topic"));
+
+        // Check entries included
+        assert!(result.contains("auth-oauth2: OAuth2 PKCE implementation #auth #security"));
+        assert!(result.contains("bug-null-email: Null email panic fix #bug #users"));
+    }
+
+    #[test]
+    fn test_build_warmup_instructions_token_budget() {
+        // 50 entries should be around 1.5K tokens
+        let mut index = Vec::new();
+        for i in 0..50 {
+            index.push(format!("entry-{i}: Some title for entry number {i} #tag1 #tag2"));
+        }
+        let result = build_warmup_instructions(&index);
+        let tokens = count_tokens(&result);
+
+        // Should be under 2K tokens for 50 entries
+        assert!(tokens < 2000, "Warmup exceeds token budget: {} tokens", tokens);
     }
 }

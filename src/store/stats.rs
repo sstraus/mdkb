@@ -298,6 +298,36 @@ pub fn get_recent_sessions(conn: &Connection, limit: usize) -> Result<Vec<Sessio
     Ok(results)
 }
 
+/// Get aggregate tool usage across all sessions.
+pub fn get_aggregate_tool_usage(conn: &Connection) -> Result<Vec<ToolUsageRecord>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            tool_name,
+            SUM(call_count) as calls,
+            SUM(total_tokens) as tokens,
+            SUM(total_results) as results
+        FROM tool_usage
+        GROUP BY tool_name
+        ORDER BY calls DESC
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map([], |row| {
+            Ok(ToolUsageRecord {
+                tool_name: row.get(0)?,
+                call_count: row.get(1)?,
+                total_tokens: row.get(2)?,
+                total_results: row.get(3)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
 /// Clear old sessions (keep last N).
 pub fn prune_sessions(conn: &Connection, keep_count: usize) -> Result<usize> {
     // Get the ID threshold - we want to delete sessions older than the Nth most recent
@@ -450,5 +480,42 @@ mod tests {
         assert_eq!(recent.len(), 3);
         // Most recent first
         assert!(recent[0].id > recent[1].id);
+    }
+
+    #[test]
+    fn test_aggregate_tool_usage() {
+        let conn = setup_db();
+
+        // Create sessions with various tool usage including memory tools
+        let s1 = create_session(&conn).unwrap();
+        record_call(&conn, s1, "search", 100, 5, false).unwrap();
+        record_call(&conn, s1, "memory_get", 50, 1, false).unwrap();
+        record_call(&conn, s1, "memory_write", 30, 1, false).unwrap();
+        end_session(&conn, s1).unwrap();
+
+        let s2 = create_session(&conn).unwrap();
+        record_call(&conn, s2, "search", 150, 3, false).unwrap();
+        record_call(&conn, s2, "memory_get", 75, 1, false).unwrap();
+        record_call(&conn, s2, "memory_search", 60, 2, false).unwrap();
+
+        let tool_stats = get_aggregate_tool_usage(&conn).unwrap();
+
+        // Verify we get all tools
+        assert!(tool_stats.len() >= 4);
+
+        // Verify search stats (should be highest)
+        let search = tool_stats.iter().find(|t| t.tool_name == "search").unwrap();
+        assert_eq!(search.call_count, 2);
+        assert_eq!(search.total_tokens, 250);
+
+        // Verify memory_get stats
+        let memory_get = tool_stats.iter().find(|t| t.tool_name == "memory_get").unwrap();
+        assert_eq!(memory_get.call_count, 2);
+        assert_eq!(memory_get.total_tokens, 125);
+
+        // Verify memory_write stats
+        let memory_write = tool_stats.iter().find(|t| t.tool_name == "memory_write").unwrap();
+        assert_eq!(memory_write.call_count, 1);
+        assert_eq!(memory_write.total_tokens, 30);
     }
 }
