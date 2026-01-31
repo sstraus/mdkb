@@ -137,3 +137,19 @@ fn test_search() {
     // ...
 }
 ```
+
+## Task Tracking (file-stories)
+
+This project uses file-based persistent task tracking. Tasks are stored in `stories/` directory with merge-safe IDs and dependency tracking.
+
+**Workflow:**
+- List tasks: `/wiz:stories list ready` (tasks ready to work on)
+- Create task: `/wiz:stories create P1 description`
+- Show task: `/wiz:stories show <id>`
+- Mark ready: `/wiz:stories ready <id>` (when dependencies met)
+- Mark complete: `/wiz:stories complete <id>` (when done)
+- Add dependency: `/wiz:stories depend <id> on <other-id>`
+
+**Status lifecycle:** `pending` → `ready` → `complete`
+
+See `/wiz:stories` help for detailed commands and patterns.
