@@ -18,6 +18,7 @@ pub mod cli;
 pub mod config;
 pub mod domain;
 pub mod error;
+pub mod mcp;
 pub mod store;
 
 // Re-export main types
