@@ -2,7 +2,19 @@
 
 use gray_matter::{Matter, engine::YAML};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// An evolution reference from frontmatter (supersedes/updates).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvolutionRef {
+    /// Path to the target document (relative to collection root).
+    pub path: String,
+    /// Optional scope for updates (e.g., "## Token Handling").
+    pub scope: Option<String>,
+    /// Optional reason for the evolution.
+    pub reason: Option<String>,
+}
 
 /// Parsed frontmatter result.
 #[derive(Debug, Clone, Default)]
@@ -18,6 +30,18 @@ pub struct ParsedDocument {
 
     /// Tags extracted from frontmatter.
     pub tags: Vec<String>,
+
+    /// Documents this supersedes (complete replacement).
+    pub supersedes: Vec<EvolutionRef>,
+
+    /// Documents this updates (partial modification).
+    pub updates: Vec<EvolutionRef>,
+
+    /// Documents this corrects (error fixes).
+    pub corrects: Vec<EvolutionRef>,
+
+    /// Documents this extends (additive content).
+    pub extends: Vec<EvolutionRef>,
 }
 
 /// Parse frontmatter from markdown content.
@@ -30,12 +54,20 @@ pub fn parse_frontmatter(content: &str) -> ParsedDocument {
 
     let title = extract_title(frontmatter.as_ref(), &body);
     let tags = extract_tags(frontmatter.as_ref());
+    let supersedes = extract_evolution_refs(frontmatter.as_ref(), "supersedes");
+    let updates = extract_evolution_refs(frontmatter.as_ref(), "updates");
+    let corrects = extract_evolution_refs(frontmatter.as_ref(), "corrects");
+    let extends = extract_evolution_refs(frontmatter.as_ref(), "extends");
 
     ParsedDocument {
         frontmatter,
         body,
         title,
         tags,
+        supersedes,
+        updates,
+        corrects,
+        extends,
     }
 }
 
@@ -98,6 +130,59 @@ pub fn extract_tags(frontmatter: Option<&Value>) -> Vec<String> {
             .filter(|t| !t.is_empty())
             .collect(),
         _ => Vec::new(),
+    }
+}
+
+/// Extract evolution references from frontmatter (supersedes, updates, etc.).
+///
+/// Supports two formats:
+/// 1. Array of objects: `[{path: "...", reason: "..."}]`
+/// 2. Array of strings: `["path1", "path2"]`
+/// 3. Single string: `"path"`
+pub fn extract_evolution_refs(frontmatter: Option<&Value>, field: &str) -> Vec<EvolutionRef> {
+    let Some(fm) = frontmatter else {
+        return Vec::new();
+    };
+
+    let Some(value) = fm.get(field) else {
+        return Vec::new();
+    };
+
+    match value {
+        // Array of objects or strings
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| parse_evolution_ref(v))
+            .collect(),
+        // Single object
+        Value::Object(_) => parse_evolution_ref(value).into_iter().collect(),
+        // Single string path
+        Value::String(s) => vec![EvolutionRef {
+            path: s.clone(),
+            scope: None,
+            reason: None,
+        }],
+        _ => Vec::new(),
+    }
+}
+
+/// Parse a single evolution reference from a JSON value.
+fn parse_evolution_ref(value: &Value) -> Option<EvolutionRef> {
+    match value {
+        // Object with path field
+        Value::Object(obj) => {
+            let path = obj.get("path")?.as_str()?.to_string();
+            let scope = obj.get("scope").and_then(|v| v.as_str()).map(String::from);
+            let reason = obj.get("reason").and_then(|v| v.as_str()).map(String::from);
+            Some(EvolutionRef { path, scope, reason })
+        }
+        // Simple string path
+        Value::String(s) => Some(EvolutionRef {
+            path: s.clone(),
+            scope: None,
+            reason: None,
+        }),
+        _ => None,
     }
 }
 
@@ -245,5 +330,163 @@ Body text.
 
         assert_eq!(parsed.title, Some("Complete Doc".to_string()));
         assert_eq!(parsed.tags, vec!["test", "demo"]);
+    }
+
+    // ==================== Evolution Extraction Tests ====================
+
+    #[test]
+    fn test_extract_supersedes_object_array() {
+        let content = r#"---
+title: Auth API v2
+supersedes:
+  - path: "docs/auth-api-v1.md"
+    reason: "Complete redesign with OAuth2"
+  - path: "docs/auth-legacy.md"
+    reason: "Deprecated"
+---
+
+Content here.
+"#;
+        let parsed = parse_frontmatter(content);
+
+        assert_eq!(parsed.supersedes.len(), 2);
+        assert_eq!(parsed.supersedes[0].path, "docs/auth-api-v1.md");
+        assert_eq!(parsed.supersedes[0].reason, Some("Complete redesign with OAuth2".to_string()));
+        assert_eq!(parsed.supersedes[1].path, "docs/auth-legacy.md");
+    }
+
+    #[test]
+    fn test_extract_supersedes_string_array() {
+        let content = r#"---
+title: New Doc
+supersedes:
+  - "old-doc.md"
+  - "another-old.md"
+---
+
+Content.
+"#;
+        let parsed = parse_frontmatter(content);
+
+        assert_eq!(parsed.supersedes.len(), 2);
+        assert_eq!(parsed.supersedes[0].path, "old-doc.md");
+        assert!(parsed.supersedes[0].reason.is_none());
+    }
+
+    #[test]
+    fn test_extract_supersedes_single_string() {
+        let content = r#"---
+title: New Doc
+supersedes: "old-doc.md"
+---
+
+Content.
+"#;
+        let parsed = parse_frontmatter(content);
+
+        assert_eq!(parsed.supersedes.len(), 1);
+        assert_eq!(parsed.supersedes[0].path, "old-doc.md");
+    }
+
+    #[test]
+    fn test_extract_updates_with_scope() {
+        let content = "---
+title: Security Update
+updates:
+  - path: \"docs/security.md\"
+    scope: \"Token Handling Section\"
+    reason: \"Added JWT support\"
+---
+
+Content.
+";
+        let parsed = parse_frontmatter(content);
+
+        assert_eq!(parsed.updates.len(), 1);
+        assert_eq!(parsed.updates[0].path, "docs/security.md");
+        assert_eq!(parsed.updates[0].scope, Some("Token Handling Section".to_string()));
+        assert_eq!(parsed.updates[0].reason, Some("Added JWT support".to_string()));
+    }
+
+    #[test]
+    fn test_extract_corrects() {
+        let content = r#"---
+title: Correction
+corrects:
+  - path: "docs/api.md"
+    reason: "Fixed incorrect endpoint documentation"
+---
+
+Content.
+"#;
+        let parsed = parse_frontmatter(content);
+
+        assert_eq!(parsed.corrects.len(), 1);
+        assert_eq!(parsed.corrects[0].path, "docs/api.md");
+    }
+
+    #[test]
+    fn test_extract_extends() {
+        let content = r#"---
+title: Extended Guide
+extends:
+  - path: "docs/intro.md"
+    reason: "Adding advanced topics"
+---
+
+Content.
+"#;
+        let parsed = parse_frontmatter(content);
+
+        assert_eq!(parsed.extends.len(), 1);
+        assert_eq!(parsed.extends[0].path, "docs/intro.md");
+    }
+
+    #[test]
+    fn test_extract_evolution_missing() {
+        let content = r#"---
+title: Plain Doc
+---
+
+Content.
+"#;
+        let parsed = parse_frontmatter(content);
+
+        assert!(parsed.supersedes.is_empty());
+        assert!(parsed.updates.is_empty());
+        assert!(parsed.corrects.is_empty());
+        assert!(parsed.extends.is_empty());
+    }
+
+    #[test]
+    fn test_extract_evolution_no_frontmatter() {
+        let content = "# Just a heading\n\nContent.";
+        let parsed = parse_frontmatter(content);
+
+        assert!(parsed.supersedes.is_empty());
+        assert!(parsed.updates.is_empty());
+    }
+
+    #[test]
+    fn test_extract_evolution_multiple_types() {
+        let content = "---
+title: Comprehensive Update
+supersedes:
+  - \"old-main.md\"
+updates:
+  - path: \"docs/related.md\"
+    scope: \"API Section\"
+extends:
+  - \"base-doc.md\"
+---
+
+Content.
+";
+        let parsed = parse_frontmatter(content);
+
+        assert_eq!(parsed.supersedes.len(), 1);
+        assert_eq!(parsed.updates.len(), 1);
+        assert_eq!(parsed.extends.len(), 1);
+        assert!(parsed.corrects.is_empty());
     }
 }

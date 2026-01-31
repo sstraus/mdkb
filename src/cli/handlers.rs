@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::domain::frontmatter::parse_frontmatter;
+use crate::domain::frontmatter::{parse_frontmatter, ParsedDocument};
 use crate::domain::{Collection, Document, SearchQuery, SearchResult, UpdateResult};
 use crate::error::{Error, ErrorKind, Result};
 use crate::store::collections;
@@ -563,7 +563,7 @@ fn update_collection(
             }
         };
 
-        // Parse frontmatter for title
+        // Parse frontmatter for title and evolution
         let parsed = parse_frontmatter(&content);
         let now = chrono::Utc::now().timestamp();
 
@@ -572,19 +572,29 @@ fn update_collection(
             collection: collection.name.clone(),
             relative_path: relative,
             hash: String::new(), // Will be computed by index_document
-            title: parsed.title,
-            metadata: parsed.frontmatter,
+            title: parsed.title.clone(),
+            metadata: parsed.frontmatter.clone(),
             file_modified_at: file_mtime,
             indexed_at: now,
         };
 
         // Use in-transaction version since we're inside a transaction
         match documents::index_document_in_tx(&ctx.conn, &doc, &content) {
-            Ok(_) => {
+            Ok(doc_id) => {
                 if existing_doc.is_some() {
                     result.updated += 1;
                 } else {
                     result.added += 1;
+                }
+
+                // Process evolution references from frontmatter
+                if has_evolution_refs(&parsed) {
+                    process_frontmatter_evolution(
+                        &ctx.conn,
+                        doc_id,
+                        &collection.name,
+                        &parsed,
+                    );
                 }
             }
             Err(e) => {
@@ -992,6 +1002,119 @@ pub fn handle_memory_prune(ctx: &Context, days: u32, dry_run: bool) -> Result<Ve
 }
 
 // ==================== Evolution Handlers ====================
+
+/// Process evolution references from frontmatter after document indexing.
+///
+/// This is called during the indexing phase to automatically create evolution
+/// relationships based on frontmatter fields like `supersedes`, `updates`, etc.
+/// Invalid references (pointing to non-existent documents) are logged as warnings
+/// but don't fail the indexing operation.
+fn process_frontmatter_evolution(
+    conn: &Connection,
+    source_doc_id: i64,
+    collection: &str,
+    parsed: &ParsedDocument,
+) {
+    // Helper to resolve path to doc ID
+    let resolve_path = |path: &str| -> Option<i64> {
+        // First try the path as-is in the same collection
+        if let Ok(Some(doc)) = documents::get_document_by_path(conn, collection, path) {
+            return Some(doc.id);
+        }
+        // Try without leading "./" or "/"
+        let clean_path = path.trim_start_matches("./").trim_start_matches('/');
+        if clean_path != path {
+            if let Ok(Some(doc)) = documents::get_document_by_path(conn, collection, clean_path) {
+                return Some(doc.id);
+            }
+        }
+        None
+    };
+
+    // Process supersedes
+    for evo_ref in &parsed.supersedes {
+        if let Some(target_id) = resolve_path(&evo_ref.path) {
+            let _ = evolution::add_evolution(
+                conn,
+                source_doc_id,
+                target_id,
+                RelationshipType::Supersedes,
+                None,
+                evo_ref.reason.as_deref(),
+            );
+        } else {
+            tracing::warn!(
+                "Evolution: supersedes reference '{}' not found, skipping",
+                evo_ref.path
+            );
+        }
+    }
+
+    // Process updates
+    for evo_ref in &parsed.updates {
+        if let Some(target_id) = resolve_path(&evo_ref.path) {
+            let _ = evolution::add_evolution(
+                conn,
+                source_doc_id,
+                target_id,
+                RelationshipType::Updates,
+                evo_ref.scope.as_deref(),
+                evo_ref.reason.as_deref(),
+            );
+        } else {
+            tracing::warn!(
+                "Evolution: updates reference '{}' not found, skipping",
+                evo_ref.path
+            );
+        }
+    }
+
+    // Process corrects
+    for evo_ref in &parsed.corrects {
+        if let Some(target_id) = resolve_path(&evo_ref.path) {
+            let _ = evolution::add_evolution(
+                conn,
+                source_doc_id,
+                target_id,
+                RelationshipType::Corrects,
+                None,
+                evo_ref.reason.as_deref(),
+            );
+        } else {
+            tracing::warn!(
+                "Evolution: corrects reference '{}' not found, skipping",
+                evo_ref.path
+            );
+        }
+    }
+
+    // Process extends
+    for evo_ref in &parsed.extends {
+        if let Some(target_id) = resolve_path(&evo_ref.path) {
+            let _ = evolution::add_evolution(
+                conn,
+                source_doc_id,
+                target_id,
+                RelationshipType::Extends,
+                None,
+                evo_ref.reason.as_deref(),
+            );
+        } else {
+            tracing::warn!(
+                "Evolution: extends reference '{}' not found, skipping",
+                evo_ref.path
+            );
+        }
+    }
+}
+
+/// Check if a parsed document has any evolution references.
+fn has_evolution_refs(parsed: &ParsedDocument) -> bool {
+    !parsed.supersedes.is_empty()
+        || !parsed.updates.is_empty()
+        || !parsed.corrects.is_empty()
+        || !parsed.extends.is_empty()
+}
 
 /// Resolve a document path or ID to a document ID.
 fn resolve_document_id(ctx: &Context, path_or_id: &str) -> Result<i64> {
@@ -1705,5 +1828,162 @@ mod tests {
         let results = handle_mget(&ctx, "*.md", None).expect("mget should succeed");
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("Hello World"));
+    }
+
+    // ==================== Evolution Frontmatter Tests ====================
+
+    #[test]
+    fn test_frontmatter_supersedes_creates_evolution() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+
+        // Create old document first
+        std::fs::write(
+            docs_dir.join("api-v1.md"),
+            "---\ntitle: API v1\n---\n\n# API v1\n\nOld API docs.",
+        )
+        .unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Create new document that supersedes the old one
+        std::fs::write(
+            docs_dir.join("api-v2.md"),
+            "---\ntitle: API v2\nsupersedes:\n  - path: \"api-v1.md\"\n    reason: \"Complete redesign\"\n---\n\n# API v2\n\nNew API.",
+        )
+        .unwrap();
+
+        // Re-index
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Get the new document and check its evolution chain
+        let v2_doc = documents::get_document_by_path(&ctx.conn, "docs", "api-v2.md")
+            .unwrap()
+            .expect("v2 should exist");
+
+        let chain = evolution::get_evolution_chain(&ctx.conn, v2_doc.id).unwrap();
+        assert_eq!(chain.len(), 1, "should have one evolution relationship");
+        assert_eq!(chain[0].relationship, RelationshipType::Supersedes);
+        assert_eq!(chain[0].reason, Some("Complete redesign".to_string()));
+
+        // Check the old document is marked as superseded
+        let (status, _) = evolution::get_document_status(&ctx.conn, chain[0].target_doc_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, evolution::DocumentStatus::Superseded);
+    }
+
+    #[test]
+    fn test_frontmatter_updates_with_scope() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+
+        // Create base document
+        std::fs::write(
+            docs_dir.join("security.md"),
+            "---\ntitle: Security Guide\n---\n\n# Security\n\nSecurity info.",
+        )
+        .unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Create update document
+        std::fs::write(
+            docs_dir.join("security-jwt.md"),
+            "---\ntitle: JWT Update\nupdates:\n  - path: \"security.md\"\n    scope: \"Token Handling\"\n    reason: \"JWT support\"\n---\n\nJWT info.",
+        )
+        .unwrap();
+
+        handle_update(&ctx, temp.path()).unwrap();
+
+        let jwt_doc = documents::get_document_by_path(&ctx.conn, "docs", "security-jwt.md")
+            .unwrap()
+            .expect("jwt doc should exist");
+
+        let chain = evolution::get_evolution_chain(&ctx.conn, jwt_doc.id).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].relationship, RelationshipType::Updates);
+        assert_eq!(chain[0].scope, Some("Token Handling".to_string()));
+
+        // Original document should still be current (updates don't supersede)
+        let (status, _) = evolution::get_document_status(&ctx.conn, chain[0].target_doc_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(status, evolution::DocumentStatus::Current);
+    }
+
+    #[test]
+    fn test_frontmatter_evolution_invalid_path_warns() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+
+        // Create document that references non-existent file
+        std::fs::write(
+            docs_dir.join("new.md"),
+            "---\ntitle: New Doc\nsupersedes:\n  - \"nonexistent.md\"\n---\n\nContent.",
+        )
+        .unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+
+        // Should not fail, just warn
+        let result = handle_update(&ctx, temp.path());
+        assert!(result.is_ok(), "update should succeed even with invalid reference");
+
+        // Document should be indexed
+        let doc = documents::get_document_by_path(&ctx.conn, "docs", "new.md")
+            .unwrap()
+            .expect("doc should exist");
+
+        // But no evolution chain
+        let chain = evolution::get_evolution_chain(&ctx.conn, doc.id).unwrap();
+        assert!(chain.is_empty(), "no relationships for invalid references");
+    }
+
+    #[test]
+    fn test_frontmatter_simple_string_supersedes() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+
+        // Create old document
+        std::fs::write(docs_dir.join("old.md"), "---\ntitle: Old\n---\n\nOld content.").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Create new document with simple string supersedes
+        std::fs::write(
+            docs_dir.join("new.md"),
+            "---\ntitle: New\nsupersedes: \"old.md\"\n---\n\nNew content.",
+        )
+        .unwrap();
+
+        handle_update(&ctx, temp.path()).unwrap();
+
+        let new_doc = documents::get_document_by_path(&ctx.conn, "docs", "new.md")
+            .unwrap()
+            .expect("new doc should exist");
+
+        let chain = evolution::get_evolution_chain(&ctx.conn, new_doc.id).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].relationship, RelationshipType::Supersedes);
     }
 }
