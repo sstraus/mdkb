@@ -1,0 +1,107 @@
+//! Domain layer - core business logic (hexagonal architecture).
+//!
+//! This layer contains pure business logic independent of storage or UI.
+//! All domain types are storage-agnostic and can be tested with mocks.
+
+use serde::{Deserialize, Serialize};
+
+/// A collection of documents from a directory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Collection {
+    /// Unique name for this collection.
+    pub name: String,
+
+    /// Base path for the collection.
+    pub path: String,
+
+    /// Glob pattern for matching files.
+    pub pattern: String,
+
+    /// Creation timestamp (Unix seconds).
+    pub created_at: i64,
+
+    /// Last update timestamp (Unix seconds).
+    pub updated_at: i64,
+}
+
+/// A document in the knowledge base.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Document {
+    /// Unique document ID.
+    pub id: i64,
+
+    /// Collection this document belongs to.
+    pub collection: String,
+
+    /// Relative path within the collection.
+    pub relative_path: String,
+
+    /// Content hash (SHA256).
+    pub hash: String,
+
+    /// Document title (from H1 or frontmatter).
+    pub title: Option<String>,
+
+    /// Parsed frontmatter metadata.
+    pub metadata: Option<serde_json::Value>,
+
+    /// File modification time (Unix seconds).
+    pub file_modified_at: i64,
+
+    /// Indexing time (Unix seconds).
+    pub indexed_at: i64,
+}
+
+/// Search query parameters.
+#[derive(Debug, Clone, Default)]
+pub struct SearchQuery {
+    /// The search text.
+    pub text: String,
+
+    /// Maximum results to return.
+    pub limit: usize,
+
+    /// Filter by collection name.
+    pub collection: Option<String>,
+
+    /// Filter by tags.
+    pub tags: Vec<String>,
+}
+
+/// A search result with score and snippets.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchResult {
+    /// Document ID.
+    pub id: i64,
+
+    /// Relative path.
+    pub path: String,
+
+    /// Document title.
+    pub title: Option<String>,
+
+    /// BM25 relevance score.
+    pub score: f64,
+
+    /// Matching snippets with highlights.
+    pub snippets: Vec<String>,
+}
+
+/// Index status information.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexStatus {
+    /// Total number of collections.
+    pub collections: usize,
+
+    /// Total number of indexed documents.
+    pub documents: usize,
+
+    /// Number of stale documents needing reindex.
+    pub stale_documents: usize,
+
+    /// Database size in bytes.
+    pub db_size_bytes: u64,
+
+    /// Last update timestamp.
+    pub last_updated: Option<i64>,
+}
