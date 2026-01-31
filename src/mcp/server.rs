@@ -23,7 +23,7 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
     EvolutionDirection, EvolutionParams, GetParams, MemoryGetParams, MemoryIndexParams,
-    MemorySearchParams, MemoryWriteParams, MultiGetParams, SearchParams,
+    MemorySearchParams, MemoryWriteParams, MetricsParams, MultiGetParams, SearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -402,80 +402,150 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Get usage metrics for all tools.
-    #[tool(description = "Get token usage metrics for all MCP tools (session and historical)")]
-    async fn mdkb_metrics(&self) -> Result<CallToolResult, McpError> {
+    /// Get usage and query performance metrics.
+    #[tool(description = "Get search performance metrics for self-evaluation. Includes token usage, query latency, zero-result rate, and quality scores. Use to understand query patterns, identify issues, and track improvements.")]
+    async fn mdkb_metrics(
+        &self,
+        Parameters(params): Parameters<MetricsParams>,
+    ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
+        let mut output = String::new();
+        let mut warnings: Vec<String> = Vec::new();
+
+        // Current session token usage
         let summary = self.metrics.summary();
-        let mut output = format!(
-            "=== Current Session ===\n\
+        output.push_str(&format!(
+            "=== Token Usage (Current Session) ===\n\
              Total calls: {}\n\
              Total tokens: {}\n\
-             Avg tokens/call: {:.1}\n\n\
-             Tool breakdown:\n\
-             - search:    {} calls, {} tokens ({:.1} avg)\n\
-             - get:       {} calls, {} tokens ({:.1} avg)\n\
-             - multi_get: {} calls, {} tokens ({:.1} avg)\n\
-             - status:    {} calls, {} tokens ({:.1} avg)\n\
-             - update:    {} calls, {} tokens ({:.1} avg)",
+             Avg tokens/call: {:.1}\n",
             summary.total_calls,
             summary.total_tokens,
             summary.avg_tokens_per_call,
-            summary.search.call_count,
-            summary.search.total_tokens,
-            summary.search.avg_tokens_per_call,
-            summary.get.call_count,
-            summary.get.total_tokens,
-            summary.get.avg_tokens_per_call,
-            summary.multi_get.call_count,
-            summary.multi_get.total_tokens,
-            summary.multi_get.avg_tokens_per_call,
-            summary.status.call_count,
-            summary.status.total_tokens,
-            summary.status.avg_tokens_per_call,
-            summary.update.call_count,
-            summary.update.total_tokens,
-            summary.update.avg_tokens_per_call,
-        );
+        ));
 
-        // Add historical stats from SQLite
+        // Query metrics from database
         let ctx_guard = self.ctx.lock().await;
         if let Some(ctx) = ctx_guard.as_ref() {
-            if let Ok(aggregate) = stats::get_aggregate_stats(&ctx.conn) {
+            // Get query metrics for the period
+            if let Ok(query_metrics) = stats::get_query_metrics(&ctx.conn, params.period_days) {
                 output.push_str(&format!(
-                    "\n\n=== All-Time Stats ===\n\
-                     Total sessions: {}\n\
-                     Total calls: {}\n\
-                     Total tokens: {}\n\
-                     Total truncations: {}\n\
-                     Avg tokens/call: {:.1}",
-                    aggregate.total_sessions,
-                    aggregate.total_calls,
-                    aggregate.total_tokens,
-                    aggregate.total_truncations,
-                    aggregate.avg_tokens_per_call,
+                    "\n=== Query Metrics (last {} days) ===\n\
+                     Total queries: {}\n\
+                     Zero-result rate: {:.1}%{}\n\
+                     Re-search rate: {:.1}%{}\n",
+                    params.period_days,
+                    query_metrics.total_queries,
+                    query_metrics.zero_result_rate,
+                    if query_metrics.zero_result_rate > 10.0 { " ⚠️" } else { " ✓" },
+                    query_metrics.re_search_rate,
+                    if query_metrics.re_search_rate > 15.0 { " ⚠️" } else { " ✓" },
                 ));
-            }
 
-            // Add per-tool breakdown including memory tools
-            if let Ok(tool_stats) = stats::get_aggregate_tool_usage(&ctx.conn) {
-                if !tool_stats.is_empty() {
-                    output.push_str("\n\nTool breakdown (all-time):");
-                    for tool in &tool_stats {
-                        let avg = if tool.call_count > 0 {
-                            tool.total_tokens as f64 / tool.call_count as f64
-                        } else {
-                            0.0
-                        };
-                        output.push_str(&format!(
-                            "\n  - {}: {} calls, {} tokens ({:.1} avg)",
-                            tool.tool_name, tool.call_count, tool.total_tokens, avg
+                // Check for warnings
+                if query_metrics.zero_result_rate > 10.0 {
+                    warnings.push(format!(
+                        "Zero-result rate {:.1}% > 10% threshold - queries not finding results",
+                        query_metrics.zero_result_rate
+                    ));
+                }
+                if query_metrics.re_search_rate > 15.0 {
+                    warnings.push(format!(
+                        "Re-search rate {:.1}% > 15% threshold - initial results may be poor",
+                        query_metrics.re_search_rate
+                    ));
+                }
+
+                // Latency section
+                if params.include_latency {
+                    output.push_str(&format!(
+                        "\nLatency:\n\
+                         - p50: {}ms{}\n\
+                         - p95: {}ms{}\n\
+                         - p99: {}ms{}\n",
+                        query_metrics.latency_p50,
+                        if query_metrics.latency_p50 > 100 { " ⚠️" } else { " ✓" },
+                        query_metrics.latency_p95,
+                        if query_metrics.latency_p95 > 300 { " ⚠️" } else { " ✓" },
+                        query_metrics.latency_p99,
+                        if query_metrics.latency_p99 > 500 { " ⚠️" } else { " ✓" },
+                    ));
+
+                    if query_metrics.latency_p99 > 500 {
+                        warnings.push(format!(
+                            "p99 latency {}ms > 500ms threshold - performance issue",
+                            query_metrics.latency_p99
+                        ));
+                    }
+                }
+
+                // Quality section
+                if params.include_quality {
+                    output.push_str(&format!(
+                        "\nScore Distribution:\n\
+                         - Excellent (>0.8): {:.1}%\n\
+                         - Good (0.5-0.8): {:.1}%\n\
+                         - Poor (<0.5): {:.1}%\n",
+                        query_metrics.score_above_80,
+                        query_metrics.score_50_to_80,
+                        query_metrics.score_below_50,
+                    ));
+
+                    if query_metrics.score_below_50 > 20.0 {
+                        warnings.push(format!(
+                            "Poor-score rate {:.1}% > 20% threshold - content quality or relevance issue",
+                            query_metrics.score_below_50
                         ));
                     }
                 }
             }
+
+            // Add latency by search type if requested
+            if params.include_latency {
+                if let Ok(latency_stats) = stats::get_query_latency_stats(&ctx.conn) {
+                    if !latency_stats.is_empty() {
+                        output.push_str("\nLatency by Search Type:");
+                        for stat in &latency_stats {
+                            output.push_str(&format!(
+                                "\n- {}: {:.1}ms avg, {}ms max ({} queries)",
+                                stat.search_type,
+                                stat.avg_latency_ms,
+                                stat.max_latency_ms,
+                                stat.count
+                            ));
+                        }
+                        output.push('\n');
+                    }
+                }
+            }
+
+            // All-time token stats
+            if let Ok(aggregate) = stats::get_aggregate_stats(&ctx.conn) {
+                output.push_str(&format!(
+                    "\n=== All-Time Token Stats ===\n\
+                     Total sessions: {}\n\
+                     Total calls: {}\n\
+                     Total tokens: {}\n",
+                    aggregate.total_sessions,
+                    aggregate.total_calls,
+                    aggregate.total_tokens,
+                ));
+            }
         }
+
+        // Add warnings section
+        if !warnings.is_empty() {
+            output.push_str("\n⚠️ Warnings:\n");
+            for warning in &warnings {
+                output.push_str(&format!("  - {}\n", warning));
+            }
+        } else {
+            output.push_str("\n✓ All metrics within acceptable ranges\n");
+        }
+
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("metrics", tokens, 1, false).await;
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }

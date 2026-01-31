@@ -103,6 +103,30 @@ pub struct MemorySearchParams {
     pub limit: usize,
 }
 
+/// Parameters for the metrics tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MetricsParams {
+    /// Number of days to analyze (default: 7).
+    #[serde(default = "default_period")]
+    pub period_days: u32,
+
+    /// Include latency percentiles (default: true).
+    #[serde(default = "default_true")]
+    pub include_latency: bool,
+
+    /// Include quality metrics (default: true).
+    #[serde(default = "default_true")]
+    pub include_quality: bool,
+}
+
+fn default_period() -> u32 {
+    7
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// Direction for evolution queries.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 #[serde(rename_all = "lowercase")]
@@ -180,5 +204,23 @@ mod tests {
         let json = r#"{"path": "docs/api.md", "direction": "descendants"}"#;
         let params: EvolutionParams = serde_json::from_str(json).unwrap();
         assert!(matches!(params.direction, EvolutionDirection::Descendants));
+    }
+
+    #[test]
+    fn test_metrics_params_defaults() {
+        let json = r#"{}"#;
+        let params: MetricsParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.period_days, 7);
+        assert!(params.include_latency);
+        assert!(params.include_quality);
+    }
+
+    #[test]
+    fn test_metrics_params_custom() {
+        let json = r#"{"period_days": 30, "include_latency": false, "include_quality": true}"#;
+        let params: MetricsParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.period_days, 30);
+        assert!(!params.include_latency);
+        assert!(params.include_quality);
     }
 }
