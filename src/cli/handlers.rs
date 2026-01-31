@@ -816,6 +816,7 @@ fn apply_line_range(content: &str, range: &str) -> Result<String> {
 // ==================== Memory Handlers ====================
 
 use crate::store::memory::{self, EntryStatus, EntryType, MemoryEntry};
+use crate::store::evolution::{self, Evolution, RelationshipType};
 
 /// Handle `mdkb memory add` command.
 pub fn handle_memory_add(
@@ -888,6 +889,232 @@ pub fn handle_memory_warmup(ctx: &Context, limit: usize) -> Result<Vec<String>> 
 /// Handle `mdkb memory rm` command.
 pub fn handle_memory_rm(ctx: &Context, id: &str) -> Result<bool> {
     memory::delete_entry(&ctx.conn, id)
+}
+
+/// Handle `mdkb memory prune` command.
+/// Archives entries not accessed within the given number of days.
+pub fn handle_memory_prune(ctx: &Context, days: u32, dry_run: bool) -> Result<Vec<String>> {
+    memory::prune_entries(&ctx.conn, days, dry_run)
+}
+
+// ==================== Evolution Handlers ====================
+
+/// Resolve a document path or ID to a document ID.
+fn resolve_document_id(ctx: &Context, path_or_id: &str) -> Result<i64> {
+    // Try to parse as ID first
+    if let Ok(id) = path_or_id.parse::<i64>() {
+        // Verify it exists
+        if documents::get_document(&ctx.conn, id)?.is_some() {
+            return Ok(id);
+        }
+    }
+
+    // Try as path - search across all collections
+    let all_collections = collections::list_collections(&ctx.conn)?;
+    for coll in &all_collections {
+        if let Some(doc) = documents::get_document_by_path(&ctx.conn, &coll.name, path_or_id)? {
+            return Ok(doc.id);
+        }
+    }
+
+    Err(Error::from(ErrorKind::DocumentNotFound {
+        id: path_or_id.to_string(),
+    }))
+}
+
+/// Handle `mdkb evolve supersedes` command.
+pub fn handle_evolve_supersedes(
+    ctx: &Context,
+    new: &str,
+    old: &str,
+    reason: Option<&str>,
+) -> Result<i64> {
+    let new_id = resolve_document_id(ctx, new)?;
+    let old_id = resolve_document_id(ctx, old)?;
+
+    evolution::add_evolution(
+        &ctx.conn,
+        new_id,
+        old_id,
+        RelationshipType::Supersedes,
+        None,
+        reason,
+    )
+}
+
+/// Handle `mdkb evolve updates` command.
+pub fn handle_evolve_updates(
+    ctx: &Context,
+    new: &str,
+    old: &str,
+    scope: Option<&str>,
+    reason: Option<&str>,
+) -> Result<i64> {
+    let new_id = resolve_document_id(ctx, new)?;
+    let old_id = resolve_document_id(ctx, old)?;
+
+    evolution::add_evolution(
+        &ctx.conn,
+        new_id,
+        old_id,
+        RelationshipType::Updates,
+        scope,
+        reason,
+    )
+}
+
+/// Handle `mdkb evolve corrects` command.
+pub fn handle_evolve_corrects(
+    ctx: &Context,
+    new: &str,
+    old: &str,
+    reason: Option<&str>,
+) -> Result<i64> {
+    let new_id = resolve_document_id(ctx, new)?;
+    let old_id = resolve_document_id(ctx, old)?;
+
+    evolution::add_evolution(
+        &ctx.conn,
+        new_id,
+        old_id,
+        RelationshipType::Corrects,
+        None,
+        reason,
+    )
+}
+
+/// Handle `mdkb evolve retracts` command.
+pub fn handle_evolve_retracts(
+    ctx: &Context,
+    new: &str,
+    old: &str,
+    reason: Option<&str>,
+) -> Result<i64> {
+    let new_id = resolve_document_id(ctx, new)?;
+    let old_id = resolve_document_id(ctx, old)?;
+
+    evolution::add_evolution(
+        &ctx.conn,
+        new_id,
+        old_id,
+        RelationshipType::Retracts,
+        None,
+        reason,
+    )
+}
+
+/// Handle `mdkb evolve extends` command.
+pub fn handle_evolve_extends(
+    ctx: &Context,
+    new: &str,
+    old: &str,
+    reason: Option<&str>,
+) -> Result<i64> {
+    let new_id = resolve_document_id(ctx, new)?;
+    let old_id = resolve_document_id(ctx, old)?;
+
+    evolution::add_evolution(
+        &ctx.conn,
+        new_id,
+        old_id,
+        RelationshipType::Extends,
+        None,
+        reason,
+    )
+}
+
+/// Evolution history entry for display.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EvolutionHistoryEntry {
+    pub doc_id: i64,
+    pub path: String,
+    pub title: Option<String>,
+    pub relationship: String,
+    pub scope: Option<String>,
+    pub reason: Option<String>,
+}
+
+/// Handle `mdkb history` command - show evolution chain.
+pub fn handle_history(ctx: &Context, path_or_id: &str) -> Result<Vec<EvolutionHistoryEntry>> {
+    let doc_id = resolve_document_id(ctx, path_or_id)?;
+
+    // Get what this document supersedes/extends
+    let forward = evolution::get_evolution_chain(&ctx.conn, doc_id)?;
+
+    // Get what supersedes/extends this document
+    let backward = evolution::get_superseded_by(&ctx.conn, doc_id)?;
+
+    let mut history = Vec::new();
+
+    // Add backward relationships (what superseded this)
+    for evo in backward {
+        if let Some(doc) = documents::get_document(&ctx.conn, evo.source_doc_id)? {
+            history.push(EvolutionHistoryEntry {
+                doc_id: doc.id,
+                path: doc.relative_path,
+                title: doc.title,
+                relationship: format!("{} (newer)", evo.relationship),
+                scope: evo.scope,
+                reason: evo.reason,
+            });
+        }
+    }
+
+    // Add forward relationships (what this supersedes)
+    for evo in forward {
+        if let Some(doc) = documents::get_document(&ctx.conn, evo.target_doc_id)? {
+            history.push(EvolutionHistoryEntry {
+                doc_id: doc.id,
+                path: doc.relative_path,
+                title: doc.title,
+                relationship: format!("{} (older)", evo.relationship),
+                scope: evo.scope,
+                reason: evo.reason,
+            });
+        }
+    }
+
+    Ok(history)
+}
+
+/// Handle `mdkb current` command - find current version of superseded doc.
+pub fn handle_current(ctx: &Context, path_or_id: &str) -> Result<Option<Document>> {
+    let doc_id = resolve_document_id(ctx, path_or_id)?;
+
+    // Follow the supersession chain until we find a current document
+    let mut current_id = doc_id;
+    let mut visited = std::collections::HashSet::new();
+
+    loop {
+        if visited.contains(&current_id) {
+            // Cycle detected, stop
+            break;
+        }
+        visited.insert(current_id);
+
+        // Check if current document is superseded
+        let superseded_by = evolution::get_superseded_by(&ctx.conn, current_id)?;
+
+        // Find a supersedes relationship (not just updates/corrects)
+        let supersession = superseded_by.iter().find(|e| {
+            e.relationship == RelationshipType::Supersedes
+        });
+
+        if let Some(evo) = supersession {
+            current_id = evo.source_doc_id;
+        } else {
+            // No supersession, this is the current version
+            break;
+        }
+    }
+
+    documents::get_document(&ctx.conn, current_id)
+}
+
+/// Handle `mdkb superseded-by` command - show what replaced this doc.
+pub fn handle_superseded_by(ctx: &Context, path_or_id: &str) -> Result<Vec<Evolution>> {
+    let doc_id = resolve_document_id(ctx, path_or_id)?;
+    evolution::get_superseded_by(&ctx.conn, doc_id)
 }
 
 #[cfg(test)]

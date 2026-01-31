@@ -45,10 +45,26 @@ pub fn init_stats_schema(conn: &Connection) -> Result<()> {
             FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
         );
 
+        -- Query events for latency/quality analysis
+        CREATE TABLE IF NOT EXISTS query_events (
+            id INTEGER PRIMARY KEY,
+            query_hash TEXT NOT NULL,       -- SHA256 of normalized query
+            query_text TEXT NOT NULL,       -- Original query text
+            search_type TEXT NOT NULL,      -- bm25, semantic, hybrid
+            result_count INTEGER NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            top_score REAL,
+            session_id INTEGER,
+            created_at INTEGER NOT NULL
+        );
+
         -- Indexes
         CREATE INDEX IF NOT EXISTS idx_tool_usage_session ON tool_usage(session_id);
         CREATE INDEX IF NOT EXISTS idx_call_log_session ON call_log(session_id);
         CREATE INDEX IF NOT EXISTS idx_call_log_tool ON call_log(tool_name);
+        CREATE INDEX IF NOT EXISTS idx_query_events_hash ON query_events(query_hash);
+        CREATE INDEX IF NOT EXISTS idx_query_events_type ON query_events(search_type);
+        CREATE INDEX IF NOT EXISTS idx_query_events_session ON query_events(session_id);
         "#,
     )?;
     Ok(())
@@ -328,6 +344,103 @@ pub fn get_aggregate_tool_usage(conn: &Connection) -> Result<Vec<ToolUsageRecord
     Ok(results)
 }
 
+// ==================== Query Events ====================
+
+/// Query event for latency and quality analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryEvent {
+    pub query_hash: String,
+    pub query_text: String,
+    pub search_type: String,
+    pub result_count: i64,
+    pub latency_ms: i64,
+    pub top_score: Option<f64>,
+    pub session_id: Option<i64>,
+}
+
+/// Compute hash of normalized query for de-duplication.
+pub fn hash_query(query: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    // Normalize: lowercase, trim, collapse whitespace
+    let normalized = query
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let result = hasher.finalize();
+    format!("{:x}", result)
+}
+
+/// Record a query event.
+pub fn record_query_event(conn: &Connection, event: &QueryEvent) -> Result<i64> {
+    let now = chrono::Utc::now().timestamp();
+
+    conn.execute(
+        r#"
+        INSERT INTO query_events (query_hash, query_text, search_type, result_count, latency_ms, top_score, session_id, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+        params![
+            event.query_hash,
+            event.query_text,
+            event.search_type,
+            event.result_count,
+            event.latency_ms,
+            event.top_score,
+            event.session_id,
+            now,
+        ],
+    )?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get query latency statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryLatencyStats {
+    pub search_type: String,
+    pub count: i64,
+    pub avg_latency_ms: f64,
+    pub max_latency_ms: i64,
+    pub zero_result_count: i64,
+}
+
+/// Get query latency statistics by search type.
+pub fn get_query_latency_stats(conn: &Connection) -> Result<Vec<QueryLatencyStats>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT
+            search_type,
+            COUNT(*) as count,
+            AVG(latency_ms) as avg_latency,
+            MAX(latency_ms) as max_latency,
+            SUM(CASE WHEN result_count = 0 THEN 1 ELSE 0 END) as zero_results
+        FROM query_events
+        GROUP BY search_type
+        ORDER BY count DESC
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map([], |row| {
+            Ok(QueryLatencyStats {
+                search_type: row.get(0)?,
+                count: row.get(1)?,
+                avg_latency_ms: row.get(2)?,
+                max_latency_ms: row.get(3)?,
+                zero_result_count: row.get(4)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
 /// Clear old sessions (keep last N).
 pub fn prune_sessions(conn: &Connection, keep_count: usize) -> Result<usize> {
     // Get the ID threshold - we want to delete sessions older than the Nth most recent
@@ -517,5 +630,85 @@ mod tests {
         let memory_write = tool_stats.iter().find(|t| t.tool_name == "memory_write").unwrap();
         assert_eq!(memory_write.call_count, 1);
         assert_eq!(memory_write.total_tokens, 30);
+    }
+
+    // ==================== Query Event Tests ====================
+
+    #[test]
+    fn test_hash_query_normalization() {
+        // Same query with different whitespace/case should hash the same
+        let h1 = hash_query("  How do I   configure  AUTH  ");
+        let h2 = hash_query("how do i configure auth");
+        let h3 = hash_query("HOW DO I CONFIGURE AUTH");
+
+        assert_eq!(h1, h2);
+        assert_eq!(h2, h3);
+
+        // Different queries should hash differently
+        let h4 = hash_query("different query");
+        assert_ne!(h1, h4);
+    }
+
+    #[test]
+    fn test_record_query_event() {
+        let conn = setup_db();
+
+        let event = QueryEvent {
+            query_hash: hash_query("test query"),
+            query_text: "test query".to_string(),
+            search_type: "hybrid".to_string(),
+            result_count: 5,
+            latency_ms: 42,
+            top_score: Some(0.85),
+            session_id: None,
+        };
+
+        let id = record_query_event(&conn, &event).unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn test_query_latency_stats() {
+        let conn = setup_db();
+
+        // Record several query events of different types
+        for i in 0..5 {
+            let event = QueryEvent {
+                query_hash: hash_query(&format!("query {i}")),
+                query_text: format!("query {i}"),
+                search_type: "hybrid".to_string(),
+                result_count: i as i64,
+                latency_ms: 10 + i as i64 * 5,
+                top_score: Some(0.8),
+                session_id: None,
+            };
+            record_query_event(&conn, &event).unwrap();
+        }
+
+        for i in 0..3 {
+            let event = QueryEvent {
+                query_hash: hash_query(&format!("bm25 query {i}")),
+                query_text: format!("bm25 query {i}"),
+                search_type: "bm25".to_string(),
+                result_count: 1,
+                latency_ms: 5 + i as i64 * 2,
+                top_score: Some(0.9),
+                session_id: None,
+            };
+            record_query_event(&conn, &event).unwrap();
+        }
+
+        let stats = get_query_latency_stats(&conn).unwrap();
+
+        // Should have stats for both types
+        assert_eq!(stats.len(), 2);
+
+        let hybrid = stats.iter().find(|s| s.search_type == "hybrid").unwrap();
+        assert_eq!(hybrid.count, 5);
+        assert!(hybrid.avg_latency_ms > 0.0);
+        assert_eq!(hybrid.zero_result_count, 1); // query 0 had 0 results
+
+        let bm25 = stats.iter().find(|s| s.search_type == "bm25").unwrap();
+        assert_eq!(bm25.count, 3);
     }
 }

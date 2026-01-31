@@ -101,6 +101,28 @@ pub enum Command {
     /// Manage memory entries for AI knowledge persistence
     #[command(subcommand)]
     Memory(MemoryCommand),
+
+    /// Manage document evolution relationships
+    #[command(subcommand)]
+    Evolve(EvolveCommand),
+
+    /// Show evolution history of a document
+    History {
+        /// Document path or ID
+        path: String,
+    },
+
+    /// Find current version of a superseded document
+    Current {
+        /// Document path or ID
+        path: String,
+    },
+
+    /// Show what superseded this document
+    SupersededBy {
+        /// Document path or ID
+        path: String,
+    },
 }
 
 /// Collection management subcommands.
@@ -201,6 +223,90 @@ pub enum MemoryCommand {
     Rm {
         /// Entry ID
         id: String,
+    },
+
+    /// Archive unused memory entries
+    Prune {
+        /// Days since last access to consider entry stale (default: 90)
+        #[arg(short, long, default_value = "90")]
+        days: u32,
+
+        /// Show what would be pruned without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+/// Evolution management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum EvolveCommand {
+    /// Mark a document as superseding another
+    Supersedes {
+        /// The new document (path or ID)
+        new: String,
+
+        /// The old document (path or ID)
+        old: String,
+
+        /// Reason for supersession
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+
+    /// Mark a document as updating another
+    Updates {
+        /// The updating document (path or ID)
+        new: String,
+
+        /// The updated document (path or ID)
+        old: String,
+
+        /// Scope (e.g., section path)
+        #[arg(short, long)]
+        scope: Option<String>,
+
+        /// Reason for update
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+
+    /// Mark a document as correcting another
+    Corrects {
+        /// The correcting document (path or ID)
+        new: String,
+
+        /// The corrected document (path or ID)
+        old: String,
+
+        /// Reason for correction
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+
+    /// Mark a document as retracting another
+    Retracts {
+        /// The retracting document (path or ID)
+        new: String,
+
+        /// The retracted document (path or ID)
+        old: String,
+
+        /// Reason for retraction
+        #[arg(short, long)]
+        reason: Option<String>,
+    },
+
+    /// Mark a document as extending another
+    Extends {
+        /// The extending document (path or ID)
+        new: String,
+
+        /// The extended document (path or ID)
+        old: String,
+
+        /// Reason for extension
+        #[arg(short, long)]
+        reason: Option<String>,
     },
 }
 

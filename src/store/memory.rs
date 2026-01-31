@@ -266,6 +266,52 @@ pub fn count_active_entries(conn: &Connection) -> Result<usize> {
     Ok(count as usize)
 }
 
+/// Prune entries not accessed in the given number of days.
+/// Marks entries as archived rather than deleting them.
+/// Returns the list of pruned entry IDs.
+pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<String>> {
+    let now = Utc::now().timestamp();
+    let cutoff = now - (days as i64 * 24 * 60 * 60);
+
+    // Find entries to prune:
+    // - status is 'active'
+    // - last_accessed is NULL (never accessed) and created_at < cutoff, OR
+    // - last_accessed is not NULL and last_accessed < cutoff
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id FROM memory_entries
+        WHERE status = 'active'
+        AND (
+            (last_accessed IS NULL AND created_at < ?1)
+            OR (last_accessed IS NOT NULL AND last_accessed < ?1)
+        )
+        "#,
+    )?;
+
+    let ids: Vec<String> = stmt
+        .query_map(params![cutoff], |row| row.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if !dry_run && !ids.is_empty() {
+        // Mark entries as archived
+        conn.execute(
+            r#"
+            UPDATE memory_entries
+            SET status = 'archived', updated_at = ?1
+            WHERE status = 'active'
+            AND (
+                (last_accessed IS NULL AND created_at < ?2)
+                OR (last_accessed IS NOT NULL AND last_accessed < ?2)
+            )
+            "#,
+            params![now, cutoff],
+        )?;
+    }
+
+    Ok(ids)
+}
+
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let tags_json: String = row.get(4)?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
@@ -511,5 +557,204 @@ mod tests {
 
         assert_eq!(count_entries(&conn).unwrap(), 3);
         assert_eq!(count_active_entries(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_prune_entries_no_stale() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+
+        // Entry accessed recently
+        let entry = MemoryEntry {
+            id: "recent".to_string(),
+            title: "Recent entry".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 1,
+            last_accessed: Some(now),
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        // Prune with 30 days - should find nothing
+        let pruned = prune_entries(&conn, 30, false).unwrap();
+        assert!(pruned.is_empty());
+
+        // Entry should still be active
+        let retrieved = get_entry_without_tracking(&conn, "recent").unwrap().unwrap();
+        assert_eq!(retrieved.status, EntryStatus::Active);
+    }
+
+    #[test]
+    fn test_prune_entries_stale_by_last_accessed() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
+
+        // Entry last accessed 100 days ago
+        let entry = MemoryEntry {
+            id: "stale".to_string(),
+            title: "Stale entry".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Problem,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: old_time,
+            updated_at: old_time,
+            superseded_by: None,
+            access_count: 5,
+            last_accessed: Some(old_time),
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        // Prune with 30 days - should find the entry
+        let pruned = prune_entries(&conn, 30, false).unwrap();
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0], "stale");
+
+        // Entry should now be archived
+        let retrieved = get_entry_without_tracking(&conn, "stale").unwrap().unwrap();
+        assert_eq!(retrieved.status, EntryStatus::Archived);
+    }
+
+    #[test]
+    fn test_prune_entries_stale_by_created_at() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
+
+        // Entry created 100 days ago, never accessed
+        let entry = MemoryEntry {
+            id: "never-used".to_string(),
+            title: "Never used entry".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Decision,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: old_time,
+            updated_at: old_time,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        // Prune with 30 days - should find the entry
+        let pruned = prune_entries(&conn, 30, false).unwrap();
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0], "never-used");
+    }
+
+    #[test]
+    fn test_prune_entries_dry_run() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
+
+        let entry = MemoryEntry {
+            id: "stale-dry".to_string(),
+            title: "Stale entry dry run".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: old_time,
+            updated_at: old_time,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        // Dry run - should report but not change
+        let pruned = prune_entries(&conn, 30, true).unwrap();
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0], "stale-dry");
+
+        // Entry should still be active (dry run)
+        let retrieved = get_entry_without_tracking(&conn, "stale-dry").unwrap().unwrap();
+        assert_eq!(retrieved.status, EntryStatus::Active);
+    }
+
+    #[test]
+    fn test_prune_entries_excludes_already_archived() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
+
+        // Already archived entry
+        let entry = MemoryEntry {
+            id: "already-archived".to_string(),
+            title: "Already archived".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Archived,
+            created_at: old_time,
+            updated_at: old_time,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        // Prune - should find nothing (already archived)
+        let pruned = prune_entries(&conn, 30, false).unwrap();
+        assert!(pruned.is_empty());
+    }
+
+    #[test]
+    fn test_prune_excludes_from_warmup() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
+
+        // Recent entry
+        let recent = MemoryEntry {
+            id: "recent".to_string(),
+            title: "Recent".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 10,
+            last_accessed: Some(now),
+        };
+        add_entry(&conn, &recent).unwrap();
+
+        // Stale entry
+        let stale = MemoryEntry {
+            id: "stale".to_string(),
+            title: "Stale".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: old_time,
+            updated_at: old_time,
+            superseded_by: None,
+            access_count: 5,
+            last_accessed: Some(old_time),
+        };
+        add_entry(&conn, &stale).unwrap();
+
+        // Before prune: both in warmup
+        let warmup = get_warmup_index(&conn, 50).unwrap();
+        assert_eq!(warmup.len(), 2);
+
+        // Prune
+        prune_entries(&conn, 30, false).unwrap();
+
+        // After prune: only recent in warmup
+        let warmup = get_warmup_index(&conn, 50).unwrap();
+        assert_eq!(warmup.len(), 1);
+        assert!(warmup[0].contains("recent"));
     }
 }

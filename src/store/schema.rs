@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -39,6 +39,9 @@ CREATE TABLE IF NOT EXISTS documents (
     metadata TEXT,
     file_modified_at INTEGER NOT NULL,
     indexed_at INTEGER NOT NULL,
+    status TEXT DEFAULT 'current',        -- current, superseded, retracted
+    status_reason TEXT,                   -- Reason for status change
+    version TEXT,                         -- Optional version identifier
     FOREIGN KEY(collection) REFERENCES collections(name) ON DELETE CASCADE,
     FOREIGN KEY(hash) REFERENCES content(hash),
     UNIQUE(collection, relative_path)
@@ -124,6 +127,22 @@ CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory_entries BEGIN
     INSERT INTO memory_fts(rowid, id, title, content)
     VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
 END;
+
+-- Evolution tracking for document relationships (RFC-style)
+CREATE TABLE IF NOT EXISTS evolution (
+    id INTEGER PRIMARY KEY,
+    source_doc_id INTEGER NOT NULL,      -- The newer/superseding document
+    target_doc_id INTEGER NOT NULL,      -- The older/superseded document
+    relationship TEXT NOT NULL,          -- supersedes, updates, corrects, retracts, extends
+    scope TEXT,                          -- NULL = full doc, or section path
+    reason TEXT,                         -- Explanation for the evolution
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(source_doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+    FOREIGN KEY(target_doc_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_evolution_source ON evolution(source_doc_id);
+CREATE INDEX IF NOT EXISTS idx_evolution_target ON evolution(target_doc_id);
 "#;
 
 /// SQL for setting BM25 column weights (title 10x, body 1x).
@@ -142,14 +161,60 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // Set BM25 weights
     conn.execute_batch(BM25_WEIGHTS_SQL)?;
 
-    // Set schema version if not set
+    // Check for migrations
     let current = get_schema_version(conn)?;
-    if current.is_none() {
-        conn.execute(
-            "INSERT INTO schema_version (version) VALUES (?)",
-            [SCHEMA_VERSION],
-        )?;
+    match current {
+        None => {
+            // Fresh database
+            conn.execute(
+                "INSERT INTO schema_version (version) VALUES (?)",
+                [SCHEMA_VERSION],
+            )?;
+        }
+        Some(v) if v < SCHEMA_VERSION => {
+            // Run migrations
+            migrate_schema(conn, v)?;
+        }
+        _ => {
+            // Up to date
+        }
     }
+
+    Ok(())
+}
+
+/// Migrate schema from old version to current.
+fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
+    // Migration from v1 to v2: add status/version columns to documents and evolution table
+    if from_version < 2 {
+        // Add new columns to documents table if they don't exist
+        // SQLite doesn't have IF NOT EXISTS for ALTER TABLE, so we check first
+        let has_status: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('documents') WHERE name = 'status'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !has_status {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE documents ADD COLUMN status TEXT DEFAULT 'current';
+                ALTER TABLE documents ADD COLUMN status_reason TEXT;
+                ALTER TABLE documents ADD COLUMN version TEXT;
+                "#,
+            )?;
+        }
+
+        // Evolution table is created by SCHEMA_SQL with IF NOT EXISTS
+    }
+
+    // Update schema version
+    conn.execute(
+        "UPDATE schema_version SET version = ?",
+        [SCHEMA_VERSION],
+    )?;
 
     Ok(())
 }
@@ -695,5 +760,125 @@ mod tests {
                 .any(|i| i.contains("documents") || i.contains("doc")),
             "should have document-related indexes"
         );
+    }
+
+    // ==================== Evolution Table Tests ====================
+
+    #[test]
+    fn test_evolution_table_exists() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evolution'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(exists, "evolution table should exist");
+    }
+
+    #[test]
+    fn test_evolution_indexes_exist() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_evolution_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(
+            indexes.iter().any(|i| i.contains("source")),
+            "should have idx_evolution_source index"
+        );
+        assert!(
+            indexes.iter().any(|i| i.contains("target")),
+            "should have idx_evolution_target index"
+        );
+    }
+
+    #[test]
+    fn test_documents_has_status_columns() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        // Check status column exists
+        let has_status: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('documents') WHERE name = 'status'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_status, "documents table should have status column");
+
+        // Check status_reason column exists
+        let has_reason: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('documents') WHERE name = 'status_reason'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_reason, "documents table should have status_reason column");
+
+        // Check version column exists
+        let has_version: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('documents') WHERE name = 'version'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_version, "documents table should have version column");
+    }
+
+    #[test]
+    fn test_documents_status_default() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        // Set up collection and content first
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ["docs", "./docs", "**/*.md", "1706700000", "1706700000"],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
+            ["hash123", "# Test", "1706700000"],
+        ).unwrap();
+
+        // Insert document without specifying status
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, title, file_modified_at, indexed_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            ["docs", "test.md", "hash123", "Test", "1706700000", "1706700000"],
+        ).unwrap();
+
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM documents WHERE relative_path = 'test.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(status, "current", "default status should be 'current'");
+    }
+
+    #[test]
+    fn test_schema_version_is_2() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        let version = get_schema_version(&conn).unwrap().unwrap();
+        assert_eq!(version, 2, "schema version should be 2");
     }
 }

@@ -15,12 +15,15 @@ use tracing_subscriber::EnvFilter;
 
 use mdkb::Result;
 use mdkb::cli::handlers::{
-    Context, EmbedResult, StatsResult, handle_collection_add, handle_collection_list, handle_collection_remove,
-    handle_collection_rename, handle_embed, handle_get, handle_hybrid_search, handle_init,
-    handle_memory_add, handle_memory_list, handle_memory_rm, handle_memory_search,
-    handle_memory_show, handle_memory_warmup, handle_mget, handle_stats, handle_status, handle_update,
+    Context, EmbedResult, EvolutionHistoryEntry, StatsResult, handle_collection_add, handle_collection_list,
+    handle_collection_remove, handle_collection_rename, handle_current, handle_embed, handle_evolve_corrects,
+    handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
+    handle_get, handle_history, handle_hybrid_search, handle_init, handle_memory_add, handle_memory_list,
+    handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
+    handle_mget, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
-use mdkb::cli::{Cli, CollectionCommand, Command, MemoryCommand, OutputFormat};
+use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, MemoryCommand, OutputFormat};
+use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
 use mdkb::mcp::server::run_server;
 
@@ -169,7 +172,54 @@ async fn main() -> Result<()> {
                         println!("Memory entry '{id}' not found");
                     }
                 }
+                MemoryCommand::Prune { days, dry_run } => {
+                    let pruned = handle_memory_prune(&ctx, days, dry_run)?;
+                    format_prune_result(&pruned, days, dry_run, cli.format);
+                }
             }
+        }
+        Command::Evolve(cmd) => {
+            let ctx = Context::open(&cwd)?;
+            match cmd {
+                EvolveCommand::Supersedes { new, old, reason } => {
+                    let id = handle_evolve_supersedes(&ctx, &new, &old, reason.as_deref())?;
+                    println!("Created evolution relationship #{id}: {new} supersedes {old}");
+                }
+                EvolveCommand::Updates { new, old, scope, reason } => {
+                    let id = handle_evolve_updates(&ctx, &new, &old, scope.as_deref(), reason.as_deref())?;
+                    println!("Created evolution relationship #{id}: {new} updates {old}");
+                }
+                EvolveCommand::Corrects { new, old, reason } => {
+                    let id = handle_evolve_corrects(&ctx, &new, &old, reason.as_deref())?;
+                    println!("Created evolution relationship #{id}: {new} corrects {old}");
+                }
+                EvolveCommand::Retracts { new, old, reason } => {
+                    let id = handle_evolve_retracts(&ctx, &new, &old, reason.as_deref())?;
+                    println!("Created evolution relationship #{id}: {new} retracts {old}");
+                }
+                EvolveCommand::Extends { new, old, reason } => {
+                    let id = handle_evolve_extends(&ctx, &new, &old, reason.as_deref())?;
+                    println!("Created evolution relationship #{id}: {new} extends {old}");
+                }
+            }
+        }
+        Command::History { path } => {
+            let ctx = Context::open(&cwd)?;
+            let history = handle_history(&ctx, &path)?;
+            format_evolution_history(&history, cli.format);
+        }
+        Command::Current { path } => {
+            let ctx = Context::open(&cwd)?;
+            if let Some(doc) = handle_current(&ctx, &path)? {
+                format_current_document(&doc, cli.format);
+            } else {
+                println!("No current version found for '{path}'");
+            }
+        }
+        Command::SupersededBy { path } => {
+            let ctx = Context::open(&cwd)?;
+            let evolutions = handle_superseded_by(&ctx, &path)?;
+            format_superseded_by(&evolutions, cli.format);
         }
     }
 
@@ -505,6 +555,161 @@ fn format_warmup_index(index: &[String], format: OutputFormat) {
             println!("## Memory Index ({} entries)\n", index.len());
             for line in index {
                 println!("- {line}");
+            }
+        }
+    }
+}
+
+fn format_prune_result(pruned: &[String], days: u32, dry_run: bool, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "dry_run": dry_run,
+                "days": days,
+                "count": pruned.len(),
+                "entries": pruned,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id");
+            for id in pruned {
+                println!("{}", id);
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            if pruned.is_empty() {
+                println!("No entries to prune (all entries accessed within {} days).", days);
+            } else if dry_run {
+                println!("Would archive {} entries not accessed in {} days:", pruned.len(), days);
+                for id in pruned {
+                    println!("  - {}", id);
+                }
+            } else {
+                println!("Archived {} entries not accessed in {} days:", pruned.len(), days);
+                for id in pruned {
+                    println!("  - {}", id);
+                }
+            }
+        }
+    }
+}
+
+fn format_evolution_history(history: &[EvolutionHistoryEntry], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(history).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("doc_id,path,title,relationship,scope,reason");
+            for h in history {
+                println!(
+                    "{},{},{},{},{},{}",
+                    h.doc_id,
+                    h.path,
+                    h.title.as_deref().unwrap_or(""),
+                    h.relationship,
+                    h.scope.as_deref().unwrap_or(""),
+                    h.reason.as_deref().unwrap_or(""),
+                );
+            }
+        }
+        OutputFormat::Markdown => {
+            if history.is_empty() {
+                println!("No evolution history found.");
+            } else {
+                println!("| ID | Path | Title | Relationship | Scope | Reason |");
+                println!("|----|------|-------|--------------|-------|--------|");
+                for h in history {
+                    println!(
+                        "| {} | {} | {} | {} | {} | {} |",
+                        h.doc_id,
+                        h.path,
+                        h.title.as_deref().unwrap_or("-"),
+                        h.relationship,
+                        h.scope.as_deref().unwrap_or("-"),
+                        h.reason.as_deref().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+        OutputFormat::Text => {
+            if history.is_empty() {
+                println!("No evolution history found.");
+            } else {
+                println!("Evolution history ({} relationships):", history.len());
+                for h in history {
+                    let title = h.title.as_deref().unwrap_or("(untitled)");
+                    println!(
+                        "  [{}] {} - {} ({})",
+                        h.doc_id, h.path, title, h.relationship
+                    );
+                    if let Some(scope) = &h.scope {
+                        println!("      Scope: {}", scope);
+                    }
+                    if let Some(reason) = &h.reason {
+                        println!("      Reason: {}", reason);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn format_current_document(doc: &mdkb::domain::Document, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(doc).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id,collection,path,title");
+            println!(
+                "{},{},{},{}",
+                doc.id,
+                doc.collection,
+                doc.relative_path,
+                doc.title.as_deref().unwrap_or(""),
+            );
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            let title = doc.title.as_deref().unwrap_or("(untitled)");
+            println!("Current version: [{}] {}:{} - {}", doc.id, doc.collection, doc.relative_path, title);
+        }
+    }
+}
+
+fn format_superseded_by(evolutions: &[Evolution], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(evolutions).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id,source_doc_id,relationship,scope,reason");
+            for e in evolutions {
+                println!(
+                    "{},{},{},{},{}",
+                    e.id,
+                    e.source_doc_id,
+                    e.relationship,
+                    e.scope.as_deref().unwrap_or(""),
+                    e.reason.as_deref().unwrap_or(""),
+                );
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            if evolutions.is_empty() {
+                println!("This document has not been superseded.");
+            } else {
+                println!("Superseded by ({} relationships):", evolutions.len());
+                for e in evolutions {
+                    println!("  - Doc #{} ({}", e.source_doc_id, e.relationship);
+                    if let Some(scope) = &e.scope {
+                        println!("    Scope: {}", scope);
+                    }
+                    if let Some(reason) = &e.reason {
+                        println!("    Reason: {}", reason);
+                    }
+                }
             }
         }
     }

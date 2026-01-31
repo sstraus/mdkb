@@ -2,6 +2,7 @@
 
 pub mod collections;
 pub mod documents;
+pub mod evolution;
 pub mod hybrid;
 pub mod memory;
 pub mod schema;
