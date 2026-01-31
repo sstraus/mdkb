@@ -103,6 +103,30 @@ pub struct MemorySearchParams {
     pub limit: usize,
 }
 
+/// Direction for evolution queries.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EvolutionDirection {
+    /// Show documents this one supersedes/updates.
+    Ancestors,
+    /// Show documents that supersede/update this one.
+    Descendants,
+    /// Show both ancestors and descendants.
+    #[default]
+    Both,
+}
+
+/// Parameters for the evolution tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct EvolutionParams {
+    /// Document ID or path to query.
+    pub path: String,
+
+    /// Direction: ancestors (what this supersedes), descendants (what supersedes this), or both.
+    #[serde(default)]
+    pub direction: EvolutionDirection,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +161,24 @@ mod tests {
         let params: GetParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.id, "123");
         assert!(params.lines.is_none());
+    }
+
+    #[test]
+    fn test_evolution_params_default_direction() {
+        let json = r#"{"path": "docs/api.md"}"#;
+        let params: EvolutionParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.path, "docs/api.md");
+        assert!(matches!(params.direction, EvolutionDirection::Both));
+    }
+
+    #[test]
+    fn test_evolution_params_with_direction() {
+        let json = r#"{"path": "docs/api.md", "direction": "ancestors"}"#;
+        let params: EvolutionParams = serde_json::from_str(json).unwrap();
+        assert!(matches!(params.direction, EvolutionDirection::Ancestors));
+
+        let json = r#"{"path": "docs/api.md", "direction": "descendants"}"#;
+        let params: EvolutionParams = serde_json::from_str(json).unwrap();
+        assert!(matches!(params.direction, EvolutionDirection::Descendants));
     }
 }

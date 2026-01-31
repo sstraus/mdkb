@@ -18,12 +18,12 @@ use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_up
 use crate::config::McpConfig;
 use crate::domain::SearchResult;
 use crate::metrics::{count_tokens, truncate_with_continuation, truncate_with_ellipsis, UsageMetrics};
-use crate::store::{collections, documents, memory, search, stats};
+use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    GetParams, MemoryGetParams, MemoryIndexParams, MemorySearchParams, MemoryWriteParams,
-    MultiGetParams, SearchParams,
+    EvolutionDirection, EvolutionParams, GetParams, MemoryGetParams, MemoryIndexParams,
+    MemorySearchParams, MemoryWriteParams, MultiGetParams, SearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -648,6 +648,140 @@ impl McpServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    /// Query document evolution history.
+    #[tool(description = "Trace document evolution - what supersedes it, what it supersedes. Use when checking if a document is current or finding latest version.")]
+    async fn mdkb_evolution(
+        &self,
+        Parameters(params): Parameters<EvolutionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        // Resolve document path to ID
+        let doc = resolve_document(&ctx.conn, &params.path)
+            .map_err(|e| mcp_error(format!("Document not found: {}", e)))?;
+
+        let mut output = format!("Evolution for {}:\n\n", params.path);
+
+        // Get ancestors (what this document supersedes/updates)
+        let show_ancestors = matches!(
+            params.direction,
+            EvolutionDirection::Ancestors | EvolutionDirection::Both
+        );
+
+        // Get descendants (what supersedes/updates this document)
+        let show_descendants = matches!(
+            params.direction,
+            EvolutionDirection::Descendants | EvolutionDirection::Both
+        );
+
+        if show_ancestors {
+            output.push_str("Ancestors (what this supersedes):\n");
+            let ancestors = evolution::get_evolution_chain(&ctx.conn, doc.id)
+                .map_err(|e| mcp_error(format!("Failed to get ancestors: {}", e)))?;
+
+            if ancestors.is_empty() {
+                output.push_str("  (none - this may be an original document)\n");
+            } else {
+                for evo in &ancestors {
+                    // Get target document info
+                    if let Ok(Some(target)) = documents::get_document(&ctx.conn, evo.target_doc_id) {
+                        output.push_str(&format!(
+                            "  └── {} ({}, {})\n",
+                            target.relative_path,
+                            evo.relationship,
+                            format_timestamp(evo.created_at)
+                        ));
+                        if let Some(ref scope) = evo.scope {
+                            output.push_str(&format!("      Scope: {}\n", scope));
+                        }
+                        if let Some(ref reason) = evo.reason {
+                            output.push_str(&format!("      Reason: {}\n", reason));
+                        }
+                    }
+                }
+            }
+            output.push('\n');
+        }
+
+        if show_descendants {
+            output.push_str("Descendants (what supersedes this):\n");
+            let descendants = evolution::get_superseded_by(&ctx.conn, doc.id)
+                .map_err(|e| mcp_error(format!("Failed to get descendants: {}", e)))?;
+
+            if descendants.is_empty() {
+                output.push_str("  (none - this is the current version)\n");
+            } else {
+                for evo in &descendants {
+                    // Get source document info (the one that supersedes this)
+                    if let Ok(Some(source)) = documents::get_document(&ctx.conn, evo.source_doc_id) {
+                        output.push_str(&format!(
+                            "  └── {} ({}, {})\n",
+                            source.relative_path,
+                            evo.relationship,
+                            format_timestamp(evo.created_at)
+                        ));
+                        if let Some(ref scope) = evo.scope {
+                            output.push_str(&format!("      Scope: {}\n", scope));
+                        }
+                        if let Some(ref reason) = evo.reason {
+                            output.push_str(&format!("      Reason: {}\n", reason));
+                        }
+                    }
+                }
+            }
+            output.push('\n');
+        }
+
+        // Get document status
+        if let Ok(Some((status, reason))) = evolution::get_document_status(&ctx.conn, doc.id) {
+            output.push_str(&format!("Status: {:?}\n", status));
+            if let Some(r) = reason {
+                output.push_str(&format!("Status reason: {}\n", r));
+            }
+        }
+
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("evolution", tokens, 1, false).await;
+        tracing::debug!("mdkb_evolution: {} tokens", tokens);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+}
+
+/// Resolve a document by path or ID.
+fn resolve_document(conn: &rusqlite::Connection, path_or_id: &str) -> crate::error::Result<crate::domain::Document> {
+    // Try to parse as ID first
+    if let Ok(id) = path_or_id.parse::<i64>() {
+        if let Some(doc) = documents::get_document(conn, id)? {
+            return Ok(doc);
+        }
+    }
+
+    // Try as path in all collections
+    let all_collections = collections::list_collections(conn)?;
+    for coll in &all_collections {
+        if let Some(doc) = documents::get_document_by_path(conn, &coll.name, path_or_id)? {
+            return Ok(doc);
+        }
+    }
+
+    Err(crate::error::Error::from(crate::error::ErrorKind::DocumentNotFound {
+        id: path_or_id.to_string(),
+    }))
+}
+
+/// Format a Unix timestamp as an ISO date string.
+fn format_timestamp(timestamp: i64) -> String {
+    use chrono::{DateTime, Utc};
+    DateTime::<Utc>::from_timestamp(timestamp, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[tool_handler]
