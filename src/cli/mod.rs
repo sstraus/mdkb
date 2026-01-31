@@ -1,5 +1,7 @@
 //! CLI layer - command parsing and execution with clap.
 
+pub mod handlers;
+
 use clap::{Parser, Subcommand};
 
 /// mdkb - Local markdown knowledge base with semantic search.

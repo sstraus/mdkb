@@ -1,9 +1,15 @@
 //! mdkb - Local markdown knowledge base CLI.
 
+use std::env;
+
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
-use mdkb::cli::{Cli, Command, CollectionCommand};
+use mdkb::cli::handlers::{
+    handle_collection_add, handle_collection_list, handle_collection_remove,
+    handle_collection_rename, handle_get, handle_init, handle_search, handle_status, Context,
+};
+use mdkb::cli::{Cli, CollectionCommand, Command, OutputFormat};
 use mdkb::Result;
 
 fn main() -> Result<()> {
@@ -18,42 +24,62 @@ fn main() -> Result<()> {
     };
 
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env()
-                .add_directive(level.into()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive(level.into()))
         .with_writer(std::io::stderr)
         .init();
 
     tracing::debug!("mdkb starting with verbosity level {}", cli.verbose);
 
+    let cwd = env::current_dir()?;
+
     match cli.command {
         Command::Init => {
             tracing::info!("Initializing mdkb...");
-            println!("mdkb init: not yet implemented");
+            handle_init(&cwd)?;
+            println!("Initialized .mdkb/ in {}", cwd.display());
         }
-        Command::Collection(cmd) => match cmd {
-            CollectionCommand::Add { name, path, pattern } => {
-                println!("collection add {name} {path} (pattern: {pattern}): not yet implemented");
+        Command::Collection(cmd) => {
+            let ctx = Context::open(&cwd)?;
+            match cmd {
+                CollectionCommand::Add { name, path, pattern } => {
+                    handle_collection_add(&ctx, &name, &path, &pattern)?;
+                    println!("Added collection '{name}'");
+                }
+                CollectionCommand::Remove { name } => {
+                    if handle_collection_remove(&ctx, &name)? {
+                        println!("Removed collection '{name}'");
+                    } else {
+                        println!("Collection '{name}' not found");
+                    }
+                }
+                CollectionCommand::List => {
+                    let collections = handle_collection_list(&ctx)?;
+                    format_collections(&collections, cli.format);
+                }
+                CollectionCommand::Rename { old_name, new_name } => {
+                    handle_collection_rename(&ctx, &old_name, &new_name)?;
+                    println!("Renamed collection '{old_name}' to '{new_name}'");
+                }
             }
-            CollectionCommand::Remove { name } => {
-                println!("collection remove {name}: not yet implemented");
-            }
-            CollectionCommand::List => {
-                println!("collection list: not yet implemented");
-            }
-            CollectionCommand::Rename { old_name, new_name } => {
-                println!("collection rename {old_name} -> {new_name}: not yet implemented");
-            }
-        },
-        Command::Search { query, limit, collection } => {
-            println!("search '{query}' (limit: {limit}, collection: {collection:?}): not yet implemented");
+        }
+        Command::Search {
+            query,
+            limit,
+            collection,
+        } => {
+            let ctx = Context::open(&cwd)?;
+            let results = handle_search(&ctx, &query, limit, collection.as_deref())?;
+            format_search_results(&results, cli.format);
         }
         Command::Get { id, lines } => {
-            println!("get {id} (lines: {lines:?}): not yet implemented");
+            let ctx = Context::open(&cwd)?;
+            let (doc, content) = handle_get(&ctx, &id, lines.as_deref())?;
+            format_document(&doc, &content, cli.format);
         }
         Command::Status => {
-            println!("status: not yet implemented");
+            let ctx = Context::open(&cwd)?;
+            let status = handle_status(&ctx)?;
+            format_status(&status, cli.format);
         }
         Command::Update => {
             println!("update: not yet implemented");
@@ -65,4 +91,119 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn format_collections(collections: &[mdkb::domain::Collection], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(collections).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("name,path,pattern,created_at,updated_at");
+            for c in collections {
+                println!(
+                    "{},{},{},{},{}",
+                    c.name, c.path, c.pattern, c.created_at, c.updated_at
+                );
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("| Name | Path | Pattern |");
+            println!("|------|------|---------|");
+            for c in collections {
+                println!("| {} | {} | {} |", c.name, c.path, c.pattern);
+            }
+        }
+        OutputFormat::Text => {
+            if collections.is_empty() {
+                println!("No collections found.");
+            } else {
+                for c in collections {
+                    println!("{}: {} ({})", c.name, c.path, c.pattern);
+                }
+            }
+        }
+    }
+}
+
+fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(results).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id,path,title,score");
+            for r in results {
+                println!(
+                    "{},{},{},{}",
+                    r.id,
+                    r.path,
+                    r.title.as_deref().unwrap_or(""),
+                    r.score
+                );
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("| ID | Path | Title | Score |");
+            println!("|----|------|-------|-------|");
+            for r in results {
+                println!(
+                    "| {} | {} | {} | {:.2} |",
+                    r.id,
+                    r.path,
+                    r.title.as_deref().unwrap_or("-"),
+                    r.score
+                );
+            }
+        }
+        OutputFormat::Text => {
+            if results.is_empty() {
+                println!("No results found.");
+            } else {
+                for r in results {
+                    let title = r.title.as_deref().unwrap_or("(untitled)");
+                    println!("[{}] {} - {} (score: {:.2})", r.id, r.path, title, r.score);
+                }
+            }
+        }
+    }
+}
+
+fn format_document(doc: &mdkb::domain::Document, content: &str, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "document": doc,
+                "content": content,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        _ => {
+            println!("{}", content);
+        }
+    }
+}
+
+fn format_status(status: &mdkb::domain::IndexStatus, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(status).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("collections,documents,stale,db_size_bytes");
+            println!(
+                "{},{},{},{}",
+                status.collections, status.documents, status.stale_documents, status.db_size_bytes
+            );
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("Collections: {}", status.collections);
+            println!("Documents:   {}", status.documents);
+            println!("Stale:       {}", status.stale_documents);
+            println!("DB Size:     {} bytes", status.db_size_bytes);
+            if let Some(ts) = status.last_updated {
+                println!("Last Update: {}", ts);
+            }
+        }
+    }
 }
