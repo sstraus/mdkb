@@ -16,6 +16,10 @@ pub struct SearchParams {
     /// Optional collection filter.
     #[serde(default)]
     pub collection: Option<String>,
+
+    /// Include superseded/retracted documents (default: false).
+    #[serde(default)]
+    pub include_superseded: bool,
 }
 
 fn default_limit() -> usize {

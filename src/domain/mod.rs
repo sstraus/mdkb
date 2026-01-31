@@ -70,6 +70,9 @@ pub struct SearchQuery {
 
     /// Filter by tags.
     pub tags: Vec<String>,
+
+    /// Include superseded/retracted documents (default: false).
+    pub include_superseded: bool,
 }
 
 /// A search result with score and snippets.
@@ -92,6 +95,14 @@ pub struct SearchResult {
 
     /// Matching snippets with highlights.
     pub snippets: Vec<String>,
+
+    /// Document status (current, superseded, retracted).
+    #[serde(default)]
+    pub status: Option<String>,
+
+    /// Path of document that superseded this one, if any.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
 }
 
 /// Index status information.

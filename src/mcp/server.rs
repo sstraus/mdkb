@@ -182,6 +182,7 @@ impl McpServer {
             &params.query,
             params.limit,
             params.collection.as_deref(),
+            params.include_superseded,
         )
         .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
@@ -938,6 +939,8 @@ mod tests {
             title: Some("README".to_string()),
             score: -5.5,
             snippets: vec!["...matching text...".to_string()],
+            status: None,
+            superseded_by: None,
         }];
         let output = format_search_results(&results);
         assert!(output.contains("[1]"));

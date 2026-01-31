@@ -86,6 +86,7 @@ impl<'a> McpClient<'a> {
             limit,
             collection: collection.map(String::from),
             tags: vec![],
+            include_superseded: false,
         };
 
         search::search(&self.env.ctx.conn, &search_query)

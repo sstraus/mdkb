@@ -174,6 +174,7 @@ pub fn handle_search(
         limit,
         collection: collection.map(String::from),
         tags: vec![],
+        include_superseded: false,
     };
 
     search::search(&ctx.conn, &query)
@@ -228,6 +229,8 @@ pub fn handle_vsearch(
                 title: doc.title.clone(),
                 score: 1.0 - f64::from(distance), // Convert distance to similarity
                 snippets: vec![],
+                status: None,
+                superseded_by: None,
             });
 
             // Stop once we have enough results
@@ -249,6 +252,7 @@ pub fn handle_hybrid_search(
     query_text: &str,
     limit: usize,
     collection: Option<&str>,
+    include_superseded: bool,
 ) -> Result<Vec<SearchResult>> {
     // Get BM25 results
     let bm25_query = SearchQuery {
@@ -256,6 +260,7 @@ pub fn handle_hybrid_search(
         limit: limit * 2, // Get more for fusion
         collection: collection.map(String::from),
         tags: vec![],
+        include_superseded,
     };
     let bm25_results = search::search(&ctx.conn, &bm25_query)?;
 
@@ -300,6 +305,8 @@ pub fn handle_hybrid_search(
                 title: doc.title.clone(),
                 score,
                 snippets: vec![],
+                status: None, // Will be populated from BM25 results if available
+                superseded_by: None,
             });
 
             // Stop once we have enough results

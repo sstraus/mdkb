@@ -53,6 +53,10 @@ pub enum Command {
         /// Filter by collection
         #[arg(short, long)]
         collection: Option<String>,
+
+        /// Include superseded/retracted documents
+        #[arg(long)]
+        include_superseded: bool,
     },
 
     /// Retrieve a document by ID or path

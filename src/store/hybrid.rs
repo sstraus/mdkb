@@ -90,6 +90,8 @@ mod tests {
             title: Some(format!("Document {}", id)),
             score,
             snippets: vec![],
+            status: None,
+            superseded_by: None,
         }
     }
 

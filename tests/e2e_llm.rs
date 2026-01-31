@@ -296,7 +296,7 @@ fn test_hybrid_search_combines_bm25_and_vector() {
     handle_embed(&ctx).expect("embed failed");
 
     // Hybrid search should find results
-    let results = handle_hybrid_search(&ctx, "error handling in programming", 10, None)
+    let results = handle_hybrid_search(&ctx, "error handling in programming", 10, None, false)
         .expect("hybrid search failed");
 
     assert!(!results.is_empty(), "hybrid search should return results");
@@ -324,7 +324,7 @@ fn test_hybrid_search_with_exact_term() {
     handle_embed(&ctx).expect("embed failed");
 
     // Search for exact term that only appears in one doc
-    let results = handle_hybrid_search(&ctx, "CSRF anti-CSRF tokens", 10, None)
+    let results = handle_hybrid_search(&ctx, "CSRF anti-CSRF tokens", 10, None, false)
         .expect("hybrid search failed");
 
     assert!(!results.is_empty(), "should find results");

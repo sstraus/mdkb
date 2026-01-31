@@ -86,9 +86,10 @@ async fn main() -> Result<()> {
             query,
             limit,
             collection,
+            include_superseded,
         } => {
             let ctx = Context::open(&cwd)?;
-            let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref())?;
+            let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref(), include_superseded)?;
             format_search_results(&results, cli.format);
         }
         Command::Get { id, lines } => {

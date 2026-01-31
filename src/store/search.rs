@@ -4,27 +4,52 @@ use crate::domain::{IndexStatus, SearchQuery, SearchResult};
 use crate::error::Result;
 use rusqlite::{Connection, params};
 
-/// Perform BM25 full-text search.
+/// Perform BM25 full-text search with optional evolution filtering.
+///
+/// By default, only returns documents with status 'current' (or NULL for legacy docs).
+/// With `include_superseded`, returns all documents with status markers.
 pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult>> {
     let mut search_results = Vec::new();
 
+    // Build status filter clause
+    let status_filter = if query.include_superseded {
+        "" // No filter - include all statuses
+    } else {
+        // Default: only current documents (status IS NULL for legacy, or 'current')
+        "AND (d.status IS NULL OR d.status = 'current')"
+    };
+
+    // Score penalty for superseded documents when included
+    let score_expr = if query.include_superseded {
+        // Apply penalty to superseded/retracted docs (lower score = better in BM25)
+        "CASE WHEN d.status IN ('superseded', 'retracted') THEN bm25(documents_fts) + 0.5 ELSE bm25(documents_fts) END"
+    } else {
+        "bm25(documents_fts)"
+    };
+
     // Build FTS5 query with optional collection filter
     if let Some(ref collection) = query.collection {
-        let sql = r#"
-            SELECT d.id, d.collection, d.relative_path, d.title, bm25(documents_fts) as score,
-                   snippet(documents_fts, 1, '<b>', '</b>', '...', 32) as snippet
+        let sql = format!(
+            r#"
+            SELECT d.id, d.collection, d.relative_path, d.title,
+                   {score_expr} as score,
+                   snippet(documents_fts, 1, '<b>', '</b>', '...', 32) as snippet,
+                   d.status
             FROM documents_fts f
             JOIN documents d ON d.id = f.rowid
             WHERE documents_fts MATCH ?1 AND d.collection = ?2
-            ORDER BY bm25(documents_fts)
+            {status_filter}
+            ORDER BY {score_expr}
             LIMIT ?3
-        "#;
+        "#
+        );
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
             params![&query.text, collection, query.limit as i64],
             |row| {
                 let snippet: Option<String> = row.get(5)?;
+                let status: Option<String> = row.get(6)?;
                 Ok(SearchResult {
                     id: row.get(0)?,
                     collection: row.get(1)?,
@@ -32,6 +57,8 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
                     title: row.get(3)?,
                     score: row.get(4)?,
                     snippets: snippet.map(|s| vec![s]).unwrap_or_default(),
+                    status,
+                    superseded_by: None, // Populated later if needed
                 })
             },
         )?;
@@ -40,19 +67,25 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
             search_results.push(result?);
         }
     } else {
-        let sql = r#"
-            SELECT d.id, d.collection, d.relative_path, d.title, bm25(documents_fts) as score,
-                   snippet(documents_fts, 1, '<b>', '</b>', '...', 32) as snippet
+        let sql = format!(
+            r#"
+            SELECT d.id, d.collection, d.relative_path, d.title,
+                   {score_expr} as score,
+                   snippet(documents_fts, 1, '<b>', '</b>', '...', 32) as snippet,
+                   d.status
             FROM documents_fts f
             JOIN documents d ON d.id = f.rowid
             WHERE documents_fts MATCH ?1
-            ORDER BY bm25(documents_fts)
+            {status_filter}
+            ORDER BY {score_expr}
             LIMIT ?2
-        "#;
+        "#
+        );
 
-        let mut stmt = conn.prepare(sql)?;
+        let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params![&query.text, query.limit as i64], |row| {
             let snippet: Option<String> = row.get(5)?;
+            let status: Option<String> = row.get(6)?;
             Ok(SearchResult {
                 id: row.get(0)?,
                 collection: row.get(1)?,
@@ -60,6 +93,8 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
                 title: row.get(3)?,
                 score: row.get(4)?,
                 snippets: snippet.map(|s| vec![s]).unwrap_or_default(),
+                status,
+                superseded_by: None, // Populated later if needed
             })
         })?;
 
@@ -68,7 +103,38 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
         }
     }
 
+    // If including superseded docs, populate the superseded_by field
+    if query.include_superseded {
+        populate_superseded_by(conn, &mut search_results)?;
+    }
+
     Ok(search_results)
+}
+
+/// Populate the superseded_by field for search results.
+fn populate_superseded_by(conn: &Connection, results: &mut [SearchResult]) -> Result<()> {
+    for result in results.iter_mut() {
+        if result.status.as_deref() == Some("superseded") {
+            // Find what document superseded this one
+            let superseding = conn.query_row(
+                r#"
+                SELECT d.relative_path
+                FROM evolution e
+                JOIN documents d ON d.id = e.source_doc_id
+                WHERE e.target_doc_id = ?1 AND e.relationship = 'supersedes'
+                ORDER BY e.created_at DESC
+                LIMIT 1
+            "#,
+                params![result.id],
+                |row| row.get(0),
+            );
+
+            if let Ok(path) = superseding {
+                result.superseded_by = Some(path);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Get index status.
@@ -184,6 +250,7 @@ mod tests {
             limit: 10,
             collection: None,
             tags: vec![],
+            include_superseded: false,
         };
 
         let results = search(&conn, &query).expect("search should succeed");
@@ -204,6 +271,7 @@ mod tests {
             limit: 1,
             collection: None,
             tags: vec![],
+            include_superseded: false,
         };
 
         let results = search(&conn, &query).expect("search should succeed");
@@ -219,6 +287,7 @@ mod tests {
             limit: 10,
             collection: None,
             tags: vec![],
+            include_superseded: false,
         };
 
         let results = search(&conn, &query).expect("search should succeed");
@@ -261,6 +330,7 @@ mod tests {
             limit: 10,
             collection: Some("docs".to_string()),
             tags: vec![],
+            include_superseded: false,
         };
 
         let results = search(&conn, &query).expect("search should succeed");
@@ -282,6 +352,7 @@ mod tests {
             limit: 10,
             collection: None,
             tags: vec![],
+            include_superseded: false,
         };
 
         let results = search(&conn, &query).expect("search should succeed");
@@ -310,6 +381,7 @@ mod tests {
             limit: 10,
             collection: None,
             tags: vec![],
+            include_superseded: false,
         };
 
         let results = search(&conn, &query).expect("search should succeed");
@@ -337,5 +409,135 @@ mod tests {
         let status = get_status(&conn).expect("status should succeed");
         assert_eq!(status.collections, 1);
         assert_eq!(status.documents, 3);
+    }
+
+    // ==================== Evolution Filtering Tests ====================
+
+    #[test]
+    fn test_search_excludes_superseded_by_default() {
+        let conn = setup_db_with_docs();
+        let now = Utc::now().timestamp();
+
+        // Add a document and mark it as superseded
+        let doc = Document {
+            id: 0,
+            collection: "docs".to_string(),
+            relative_path: "rust-old.md".to_string(),
+            hash: String::new(),
+            title: Some("Old Rust Guide".to_string()),
+            metadata: None,
+            file_modified_at: now,
+            indexed_at: now,
+        };
+        index_document(&conn, &doc, "Old Rust programming guide, now superseded.").unwrap();
+
+        // Mark it as superseded
+        conn.execute(
+            "UPDATE documents SET status = 'superseded' WHERE relative_path = 'rust-old.md'",
+            [],
+        ).unwrap();
+
+        // Search without include_superseded (default)
+        let query = SearchQuery {
+            text: "rust".to_string(),
+            limit: 10,
+            collection: None,
+            tags: vec![],
+            include_superseded: false,
+        };
+
+        let results = search(&conn, &query).expect("search should succeed");
+
+        // Should only find the non-superseded docs (2 from setup)
+        let paths: Vec<_> = results.iter().map(|r| r.path.as_str()).collect();
+        assert!(!paths.contains(&"rust-old.md"), "superseded doc should be excluded");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_search_includes_superseded_with_flag() {
+        let conn = setup_db_with_docs();
+        let now = Utc::now().timestamp();
+
+        // Add a document and mark it as superseded
+        let doc = Document {
+            id: 0,
+            collection: "docs".to_string(),
+            relative_path: "rust-old.md".to_string(),
+            hash: String::new(),
+            title: Some("Old Rust Guide".to_string()),
+            metadata: None,
+            file_modified_at: now,
+            indexed_at: now,
+        };
+        index_document(&conn, &doc, "Old Rust programming guide, now superseded.").unwrap();
+
+        // Mark it as superseded
+        conn.execute(
+            "UPDATE documents SET status = 'superseded' WHERE relative_path = 'rust-old.md'",
+            [],
+        ).unwrap();
+
+        // Search with include_superseded
+        let query = SearchQuery {
+            text: "rust".to_string(),
+            limit: 10,
+            collection: None,
+            tags: vec![],
+            include_superseded: true,
+        };
+
+        let results = search(&conn, &query).expect("search should succeed");
+
+        // Should find all rust docs including superseded
+        let paths: Vec<_> = results.iter().map(|r| r.path.as_str()).collect();
+        assert!(paths.contains(&"rust-old.md"), "superseded doc should be included");
+        assert_eq!(results.len(), 3); // 2 from setup + 1 superseded
+    }
+
+    #[test]
+    fn test_search_result_status_field() {
+        let conn = setup_db_with_docs();
+        let now = Utc::now().timestamp();
+
+        // Add a document and mark it as superseded
+        let doc = Document {
+            id: 0,
+            collection: "docs".to_string(),
+            relative_path: "rust-old.md".to_string(),
+            hash: String::new(),
+            title: Some("Old Rust Guide".to_string()),
+            metadata: None,
+            file_modified_at: now,
+            indexed_at: now,
+        };
+        index_document(&conn, &doc, "Old Rust programming guide.").unwrap();
+
+        conn.execute(
+            "UPDATE documents SET status = 'superseded' WHERE relative_path = 'rust-old.md'",
+            [],
+        ).unwrap();
+
+        // Search with include_superseded
+        let query = SearchQuery {
+            text: "rust".to_string(),
+            limit: 10,
+            collection: None,
+            tags: vec![],
+            include_superseded: true,
+        };
+
+        let results = search(&conn, &query).expect("search should succeed");
+
+        // Find the superseded doc and check its status
+        let superseded = results.iter().find(|r| r.path == "rust-old.md").unwrap();
+        assert_eq!(superseded.status, Some("superseded".to_string()));
+
+        // Other docs should have NULL/None status or "current"
+        let current = results.iter().find(|r| r.path == "rust-basics.md").unwrap();
+        assert!(
+            current.status.is_none() || current.status.as_deref() == Some("current"),
+            "current doc should have NULL or 'current' status"
+        );
     }
 }
