@@ -73,6 +73,11 @@ impl Context {
             std::fs::create_dir_all(&mdkb_dir)?;
         }
 
+        // Create memory directories
+        let memory_dir = mdkb_dir.join("memory");
+        std::fs::create_dir_all(memory_dir.join("entries"))?;
+        std::fs::create_dir_all(memory_dir.join("archive"))?;
+
         // Create default config
         let config = Config::default();
         let config_str = toml::to_string_pretty(&config)?;
@@ -92,6 +97,11 @@ impl Context {
             config_path,
             db_path,
         })
+    }
+
+    /// Get the memory directory path.
+    pub fn memory_dir(&self) -> PathBuf {
+        self.db_path.parent().unwrap().join("memory")
     }
 }
 
@@ -818,6 +828,71 @@ fn apply_line_range(content: &str, range: &str) -> Result<String> {
 use crate::store::memory::{self, EntryStatus, EntryType, MemoryEntry};
 use crate::store::evolution::{self, Evolution, RelationshipType};
 
+/// Memory index.json structure.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MemoryIndex {
+    pub updated: String,
+    pub entries: Vec<String>,
+}
+
+/// Generate and save memory index.json file.
+pub fn generate_memory_index(ctx: &Context) -> Result<()> {
+    let index = memory::get_warmup_index(&ctx.conn, 50)?;
+    let now = chrono::Utc::now().to_rfc3339();
+
+    let memory_index = MemoryIndex {
+        updated: now,
+        entries: index,
+    };
+
+    let index_path = ctx.memory_dir().join("index.json");
+    let json = serde_json::to_string_pretty(&memory_index)?;
+    std::fs::write(index_path, json)?;
+
+    Ok(())
+}
+
+/// Load memory index from index.json (fast warmup).
+pub fn load_memory_index(ctx: &Context) -> Result<Option<MemoryIndex>> {
+    let index_path = ctx.memory_dir().join("index.json");
+    if !index_path.exists() {
+        return Ok(None);
+    }
+
+    let content = std::fs::read_to_string(index_path)?;
+    let index: MemoryIndex = serde_json::from_str(&content)?;
+    Ok(Some(index))
+}
+
+/// Save a memory entry to disk as markdown (for backup).
+fn save_entry_to_disk(ctx: &Context, entry: &MemoryEntry) -> Result<()> {
+    let entry_path = ctx.memory_dir().join("entries").join(format!("{}.md", entry.id));
+
+    let mut content = String::new();
+    content.push_str("---\n");
+    content.push_str(&format!("id: {}\n", entry.id));
+    content.push_str(&format!("title: {}\n", entry.title));
+    content.push_str(&format!("type: {}\n", entry.entry_type));
+    content.push_str(&format!("tags: [{}]\n", entry.tags.join(", ")));
+    content.push_str(&format!("status: {}\n", entry.status));
+    content.push_str("---\n\n");
+    content.push_str(&entry.content);
+
+    std::fs::write(entry_path, content)?;
+    Ok(())
+}
+
+/// Move an entry to archive directory.
+fn archive_entry_on_disk(ctx: &Context, id: &str) -> Result<()> {
+    let entry_path = ctx.memory_dir().join("entries").join(format!("{}.md", id));
+    let archive_path = ctx.memory_dir().join("archive").join(format!("{}.md", id));
+
+    if entry_path.exists() {
+        std::fs::rename(entry_path, archive_path)?;
+    }
+    Ok(())
+}
+
 /// Handle `mdkb memory add` command.
 pub fn handle_memory_add(
     ctx: &Context,
@@ -852,6 +927,11 @@ pub fn handle_memory_add(
     };
 
     memory::add_entry(&ctx.conn, &entry)?;
+
+    // Save to disk and regenerate index
+    let _ = save_entry_to_disk(ctx, &entry);
+    let _ = generate_memory_index(ctx);
+
     Ok(())
 }
 
@@ -888,13 +968,27 @@ pub fn handle_memory_warmup(ctx: &Context, limit: usize) -> Result<Vec<String>> 
 
 /// Handle `mdkb memory rm` command.
 pub fn handle_memory_rm(ctx: &Context, id: &str) -> Result<bool> {
-    memory::delete_entry(&ctx.conn, id)
+    let deleted = memory::delete_entry(&ctx.conn, id)?;
+    if deleted {
+        // Archive from disk and regenerate index
+        let _ = archive_entry_on_disk(ctx, id);
+        let _ = generate_memory_index(ctx);
+    }
+    Ok(deleted)
 }
 
 /// Handle `mdkb memory prune` command.
 /// Archives entries not accessed within the given number of days.
 pub fn handle_memory_prune(ctx: &Context, days: u32, dry_run: bool) -> Result<Vec<String>> {
-    memory::prune_entries(&ctx.conn, days, dry_run)
+    let pruned = memory::prune_entries(&ctx.conn, days, dry_run)?;
+    if !dry_run && !pruned.is_empty() {
+        // Archive entries from disk and regenerate index
+        for id in &pruned {
+            let _ = archive_entry_on_disk(ctx, id);
+        }
+        let _ = generate_memory_index(ctx);
+    }
+    Ok(pruned)
 }
 
 // ==================== Evolution Handlers ====================
@@ -1137,6 +1231,75 @@ mod tests {
         assert!(temp.path().join(".mdkb").exists());
         assert!(temp.path().join(".mdkb/config.toml").exists());
         assert!(temp.path().join(".mdkb/index.sqlite").exists());
+    }
+
+    #[test]
+    fn test_handle_init_creates_memory_directories() {
+        let temp = setup_temp_dir();
+
+        handle_init(temp.path()).expect("init should succeed");
+
+        // Memory directories should be created
+        assert!(temp.path().join(".mdkb/memory").exists());
+        assert!(temp.path().join(".mdkb/memory/entries").exists());
+        assert!(temp.path().join(".mdkb/memory/archive").exists());
+    }
+
+    #[test]
+    fn test_memory_add_creates_index_json() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        // Add a memory entry
+        handle_memory_add(
+            &ctx,
+            "test-entry",
+            "Test Entry",
+            "topic",
+            Some("test,example"),
+            "# Test content\n\nThis is test content.",
+        ).expect("add memory should succeed");
+
+        // index.json should be created
+        let index_path = temp.path().join(".mdkb/memory/index.json");
+        assert!(index_path.exists(), "index.json should be created");
+
+        // Entry file should be created
+        let entry_path = temp.path().join(".mdkb/memory/entries/test-entry.md");
+        assert!(entry_path.exists(), "entry file should be created");
+
+        // Load and verify index
+        let index = load_memory_index(&ctx).expect("load index should succeed");
+        assert!(index.is_some(), "index should load");
+        let index = index.unwrap();
+        assert_eq!(index.entries.len(), 1);
+        assert!(index.entries[0].contains("test-entry"));
+    }
+
+    #[test]
+    fn test_memory_rm_updates_index_json() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        // Add an entry
+        handle_memory_add(&ctx, "to-delete", "To Delete", "topic", None, "Content").unwrap();
+
+        // Verify it exists
+        let index = load_memory_index(&ctx).unwrap().unwrap();
+        assert_eq!(index.entries.len(), 1);
+
+        // Delete it
+        handle_memory_rm(&ctx, "to-delete").expect("rm should succeed");
+
+        // index.json should be updated (empty now)
+        let index = load_memory_index(&ctx).unwrap().unwrap();
+        assert_eq!(index.entries.len(), 0);
+
+        // Entry should be in archive
+        let archive_path = temp.path().join(".mdkb/memory/archive/to-delete.md");
+        assert!(archive_path.exists(), "entry should be archived");
     }
 
     #[test]
