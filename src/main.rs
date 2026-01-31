@@ -199,6 +199,17 @@ async fn main() -> Result<()> {
                     let pruned = handle_memory_prune(&ctx, days, dry_run)?;
                     format_prune_result(&pruned, days, dry_run, cli.format);
                 }
+                #[cfg(feature = "llm")]
+                MemoryCommand::Condense { tag, dry_run, interactive, min_entries } => {
+                    let result = mdkb::cli::handlers::handle_memory_condense(
+                        &ctx,
+                        tag.as_deref(),
+                        dry_run,
+                        interactive,
+                        min_entries,
+                    )?;
+                    format_condense_result(&result, dry_run, cli.format);
+                }
             }
         }
         Command::Evolve(cmd) => {
@@ -613,6 +624,68 @@ fn format_prune_result(pruned: &[String], days: u32, dry_run: bool, format: Outp
                 for id in pruned {
                     println!("  - {}", id);
                 }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "llm")]
+fn format_condense_result(result: &mdkb::cli::handlers::CondenseResult, dry_run: bool, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "dry_run": dry_run,
+                "groups": result.groups.iter().map(|g| {
+                    serde_json::json!({
+                        "entry_ids": g.entry_ids,
+                        "common_tags": g.common_tags,
+                        "proposed_id": g.proposed_id,
+                        "proposed_title": g.proposed_title,
+                    })
+                }).collect::<Vec<_>>(),
+                "consolidated_count": result.consolidated_count,
+                "merged_count": result.merged_count,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("proposed_id,entry_ids,common_tags");
+            for g in &result.groups {
+                println!("{},{},{}",
+                    g.proposed_id,
+                    g.entry_ids.join(";"),
+                    g.common_tags.join(";")
+                );
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            if result.groups.is_empty() {
+                println!("No groups of related entries found to condense.");
+                return;
+            }
+
+            if dry_run {
+                println!("=== Proposed Consolidations (dry run) ===\n");
+            } else {
+                println!("=== Consolidation Complete ===\n");
+            }
+
+            for (i, g) in result.groups.iter().enumerate() {
+                println!("Group {}: {} entries -> {}", i + 1, g.entry_ids.len(), g.proposed_id);
+                println!("  Tags: {}", g.common_tags.join(", "));
+                println!("  Entries:");
+                for id in &g.entry_ids {
+                    println!("    - {}", id);
+                }
+                if let Some(title) = &g.proposed_title {
+                    println!("  Proposed title: {}", title);
+                }
+                println!();
+            }
+
+            if !dry_run {
+                println!("Consolidated {} entries into {} merged entries.",
+                    result.consolidated_count, result.merged_count);
             }
         }
     }

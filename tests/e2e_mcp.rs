@@ -1394,3 +1394,214 @@ fn test_memory_index_persistence() {
     let entries = parsed["entries"].as_array().expect("entries should be array");
     assert_eq!(entries.len(), 3, "index.json should have 3 entries");
 }
+
+/// Test: Related entries are found correctly by tag overlap (007-cg8h)
+#[test]
+#[cfg(feature = "llm")]
+fn test_memory_condense_finds_related() {
+    use mdkb::cli::handlers::find_related_entries;
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = dir.path();
+
+    // Initialize mdkb
+    let ctx = Context::init(root).expect("Failed to init context");
+
+    // Add entries with overlapping tags
+    let now = chrono::Utc::now().timestamp();
+
+    // Entry 1: auth + jwt
+    let e1 = mdkb::store::memory::MemoryEntry {
+        id: "auth-jwt-basics".to_string(),
+        title: "JWT Basics".to_string(),
+        content: "JWT authentication basics".to_string(),
+        entry_type: mdkb::store::memory::EntryType::Topic,
+        tags: vec!["auth".to_string(), "jwt".to_string()],
+        status: mdkb::store::memory::EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+    };
+
+    // Entry 2: auth + jwt
+    let e2 = mdkb::store::memory::MemoryEntry {
+        id: "auth-jwt-refresh".to_string(),
+        title: "JWT Refresh".to_string(),
+        content: "How to refresh JWT tokens".to_string(),
+        entry_type: mdkb::store::memory::EntryType::Topic,
+        tags: vec!["auth".to_string(), "jwt".to_string()],
+        status: mdkb::store::memory::EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+    };
+
+    // Entry 3: auth + jwt
+    let e3 = mdkb::store::memory::MemoryEntry {
+        id: "auth-jwt-expiry".to_string(),
+        title: "JWT Expiry".to_string(),
+        content: "Handling JWT expiry".to_string(),
+        entry_type: mdkb::store::memory::EntryType::Topic,
+        tags: vec!["auth".to_string(), "jwt".to_string()],
+        status: mdkb::store::memory::EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+    };
+
+    // Entry 4: different tags (should not be grouped)
+    let e4 = mdkb::store::memory::MemoryEntry {
+        id: "database-setup".to_string(),
+        title: "Database Setup".to_string(),
+        content: "How to set up database".to_string(),
+        entry_type: mdkb::store::memory::EntryType::Topic,
+        tags: vec!["database".to_string(), "setup".to_string()],
+        status: mdkb::store::memory::EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+    };
+
+    mdkb::store::memory::add_entry(&ctx.conn, &e1).expect("add e1");
+    mdkb::store::memory::add_entry(&ctx.conn, &e2).expect("add e2");
+    mdkb::store::memory::add_entry(&ctx.conn, &e3).expect("add e3");
+    mdkb::store::memory::add_entry(&ctx.conn, &e4).expect("add e4");
+
+    // Find related entries with min_entries=3
+    let groups = find_related_entries(&ctx, None, 3)
+        .expect("find_related_entries failed");
+
+    // Should find exactly one group (the 3 auth+jwt entries)
+    assert_eq!(groups.len(), 1, "Should find exactly one group");
+    let group = &groups[0];
+    assert_eq!(group.entry_ids.len(), 3, "Group should have 3 entries");
+    assert!(group.common_tags.contains(&"auth".to_string()));
+    assert!(group.common_tags.contains(&"jwt".to_string()));
+
+    // database-setup should NOT be in any group
+    assert!(!group.entry_ids.contains(&"database-setup".to_string()));
+}
+
+/// Test: Condense dry run shows proposed merges without modifying (007-cg8h)
+#[test]
+#[cfg(feature = "llm")]
+fn test_memory_condense_dry_run() {
+    use mdkb::cli::handlers::handle_memory_condense;
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = dir.path();
+
+    // Initialize mdkb
+    let ctx = Context::init(root).expect("Failed to init context");
+
+    // Add entries with overlapping tags
+    let now = chrono::Utc::now().timestamp();
+    for i in 1..=4 {
+        let entry = mdkb::store::memory::MemoryEntry {
+            id: format!("api-entry-{}", i),
+            title: format!("API Entry {}", i),
+            content: format!("API content {}", i),
+            entry_type: mdkb::store::memory::EntryType::Topic,
+            tags: vec!["api".to_string(), "rest".to_string()],
+            status: mdkb::store::memory::EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+        };
+        mdkb::store::memory::add_entry(&ctx.conn, &entry).expect("add entry");
+    }
+
+    // Run condense in dry-run mode
+    let result = handle_memory_condense(&ctx, None, true, false, 3)
+        .expect("condense failed");
+
+    // Should find groups but NOT make changes
+    assert!(!result.groups.is_empty(), "Should find groups");
+    assert_eq!(result.merged_count, 0, "Dry run should not create merges");
+    assert_eq!(result.consolidated_count, 0, "Dry run should not consolidate");
+
+    // Proposed content should be generated
+    assert!(result.groups[0].proposed_title.is_some());
+    assert!(result.groups[0].proposed_content.is_some());
+
+    // All original entries should still be Active
+    let entries = mdkb::store::memory::list_entries(
+        &ctx.conn,
+        100,
+        Some(mdkb::store::memory::EntryStatus::Active)
+    ).expect("list entries");
+    assert_eq!(entries.len(), 4, "All entries should still be active");
+}
+
+/// Test: Condense creates merged entry and supersedes originals (007-cg8h)
+#[test]
+#[cfg(feature = "llm")]
+fn test_memory_condense_creates_merged_entry() {
+    use mdkb::cli::handlers::handle_memory_condense;
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = dir.path();
+
+    // Initialize mdkb
+    let ctx = Context::init(root).expect("Failed to init context");
+
+    // Add entries with overlapping tags
+    let now = chrono::Utc::now().timestamp();
+    for i in 1..=3 {
+        let entry = mdkb::store::memory::MemoryEntry {
+            id: format!("config-entry-{}", i),
+            title: format!("Config Entry {}", i),
+            content: format!("Config content {}", i),
+            entry_type: mdkb::store::memory::EntryType::Topic,
+            tags: vec!["config".to_string()],
+            status: mdkb::store::memory::EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+        };
+        mdkb::store::memory::add_entry(&ctx.conn, &entry).expect("add entry");
+    }
+
+    // Run condense (not dry-run)
+    let result = handle_memory_condense(&ctx, None, false, false, 3)
+        .expect("condense failed");
+
+    // Should have merged
+    assert_eq!(result.merged_count, 1, "Should create one merged entry");
+    assert_eq!(result.consolidated_count, 3, "Should consolidate 3 entries");
+
+    // Original entries should be superseded
+    let superseded = mdkb::store::memory::list_entries(
+        &ctx.conn,
+        100,
+        Some(mdkb::store::memory::EntryStatus::Superseded)
+    ).expect("list superseded");
+    assert_eq!(superseded.len(), 3, "3 entries should be superseded");
+
+    // Each should have superseded_by pointing to the merged entry
+    for entry in &superseded {
+        assert!(entry.superseded_by.is_some());
+        assert!(entry.superseded_by.as_ref().unwrap().contains("consolidated"));
+    }
+
+    // New active entries should be just 1 (the merged one)
+    let active = mdkb::store::memory::list_entries(
+        &ctx.conn,
+        100,
+        Some(mdkb::store::memory::EntryStatus::Active)
+    ).expect("list active");
+    assert_eq!(active.len(), 1, "Should have 1 active (merged) entry");
+    assert!(active[0].id.contains("consolidated"));
+}

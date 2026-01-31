@@ -275,6 +275,26 @@ pub enum MemoryCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Consolidate related memory entries (requires --features llm)
+    #[cfg(feature = "llm")]
+    Condense {
+        /// Filter by tag (optional, condenses all if not specified)
+        #[arg(short, long)]
+        tag: Option<String>,
+
+        /// Show proposed merges without making changes
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Ask for confirmation before each merge
+        #[arg(short, long)]
+        interactive: bool,
+
+        /// Minimum entries needed to consider condensing (default: 3)
+        #[arg(long, default_value = "3")]
+        min_entries: usize,
+    },
 }
 
 /// Evolution management subcommands.

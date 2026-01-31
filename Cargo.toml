@@ -72,6 +72,10 @@ indicatif = "0.17"
 # Token counting for usage metrics
 tiktoken-rs = "0.6"
 
+[features]
+default = []
+llm = []  # Enable LLM-powered features like memory condense
+
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
