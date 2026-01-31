@@ -29,7 +29,7 @@
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| sqlite-vec O(n) scaling | Medium | Consider vectorlite for >50k docs |
+| sqlite-vec O(n) scaling | Medium | Consider LanceDB (pure Rust, ANN) for >10k docs |
 | No fuzzy matching | Medium | Add trigram tokenizer or strsim preprocessing |
 | Missing frontmatter support | High | Add YAML parsing with `serde_yaml` |
 | Journal entry sprawl | Medium | Archive strategy + reflection consolidation |
