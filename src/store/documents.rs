@@ -2,7 +2,7 @@
 
 use crate::domain::Document;
 use crate::error::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 /// Compute SHA256 hash of content.
@@ -180,9 +180,9 @@ pub fn list_documents(conn: &Connection, collection: &str) -> Result<Vec<Documen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::Collection;
     use crate::store::collections::add_collection;
     use crate::store::schema::init_schema;
-    use crate::domain::Collection;
     use chrono::Utc;
 
     fn setup_db() -> Connection {
@@ -378,13 +378,17 @@ mod tests {
 
         // Add another collection
         let now = Utc::now().timestamp();
-        add_collection(&conn, &Collection {
-            name: "notes".to_string(),
-            path: "./notes".to_string(),
-            pattern: "**/*.md".to_string(),
-            created_at: now,
-            updated_at: now,
-        }).unwrap();
+        add_collection(
+            &conn,
+            &Collection {
+                name: "notes".to_string(),
+                path: "./notes".to_string(),
+                pattern: "**/*.md".to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .unwrap();
 
         index_document(&conn, &make_doc("docs", "doc.md", None), "docs content").unwrap();
         index_document(&conn, &make_doc("notes", "note.md", None), "notes content").unwrap();

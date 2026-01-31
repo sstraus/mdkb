@@ -2,7 +2,7 @@
 
 use crate::domain::{IndexStatus, SearchQuery, SearchResult};
 use crate::error::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 /// Perform BM25 full-text search.
 pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult>> {
@@ -21,16 +21,19 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
         "#;
 
         let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map(params![&query.text, collection, query.limit as i64], |row| {
-            let snippet: Option<String> = row.get(4)?;
-            Ok(SearchResult {
-                id: row.get(0)?,
-                path: row.get(1)?,
-                title: row.get(2)?,
-                score: row.get(3)?,
-                snippets: snippet.map(|s| vec![s]).unwrap_or_default(),
-            })
-        })?;
+        let rows = stmt.query_map(
+            params![&query.text, collection, query.limit as i64],
+            |row| {
+                let snippet: Option<String> = row.get(4)?;
+                Ok(SearchResult {
+                    id: row.get(0)?,
+                    path: row.get(1)?,
+                    title: row.get(2)?,
+                    score: row.get(3)?,
+                    snippets: snippet.map(|s| vec![s]).unwrap_or_default(),
+                })
+            },
+        )?;
 
         for result in rows {
             search_results.push(result?);
@@ -68,32 +71,26 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
 
 /// Get index status.
 pub fn get_status(conn: &Connection) -> Result<IndexStatus> {
-    let collections: usize = conn.query_row(
-        "SELECT COUNT(*) FROM collections",
-        [],
-        |row| row.get(0),
-    )?;
+    let collections: usize =
+        conn.query_row("SELECT COUNT(*) FROM collections", [], |row| row.get(0))?;
 
-    let documents: usize = conn.query_row(
-        "SELECT COUNT(*) FROM documents",
-        [],
-        |row| row.get(0),
-    )?;
+    let documents: usize =
+        conn.query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))?;
 
     let last_updated: Option<i64> = conn
-        .query_row(
-            "SELECT MAX(indexed_at) FROM documents",
-            [],
-            |row| row.get(0),
-        )
+        .query_row("SELECT MAX(indexed_at) FROM documents", [], |row| {
+            row.get(0)
+        })
         .ok()
         .flatten();
 
     // Get database file size (0 for in-memory)
     let db_size_bytes: u64 = conn
-        .query_row("SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()", [], |row| {
-            row.get::<_, i64>(0).map(|v| v as u64)
-        })
+        .query_row(
+            "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+            [],
+            |row| row.get::<_, i64>(0).map(|v| v as u64),
+        )
         .unwrap_or(0);
 
     Ok(IndexStatus {
@@ -109,10 +106,10 @@ pub fn get_status(conn: &Connection) -> Result<IndexStatus> {
 mod tests {
     use super::*;
     use crate::domain::Collection;
+    use crate::domain::Document;
     use crate::store::collections::add_collection;
     use crate::store::documents::index_document;
     use crate::store::schema::init_schema;
-    use crate::domain::Document;
     use chrono::Utc;
 
     fn setup_db() -> Connection {
@@ -140,9 +137,21 @@ mod tests {
 
         // Add test documents
         let docs = [
-            ("rust-basics.md", "Rust Basics", "Rust is a systems programming language focused on safety."),
-            ("python-intro.md", "Python Introduction", "Python is a high-level programming language."),
-            ("rust-advanced.md", "Advanced Rust", "Advanced Rust concepts including lifetimes and async."),
+            (
+                "rust-basics.md",
+                "Rust Basics",
+                "Rust is a systems programming language focused on safety.",
+            ),
+            (
+                "python-intro.md",
+                "Python Introduction",
+                "Python is a high-level programming language.",
+            ),
+            (
+                "rust-advanced.md",
+                "Advanced Rust",
+                "Advanced Rust concepts including lifetimes and async.",
+            ),
         ];
 
         for (path, title, content) in docs {

@@ -42,7 +42,10 @@ pub fn extract_wiki_links(content: &str) -> Vec<WikiLink> {
         let clean_line = remove_inline_code(line);
 
         for caps in link_regex.captures_iter(&clean_line) {
-            let target = caps.get(1).map(|m| m.as_str().to_string()).unwrap_or_default();
+            let target = caps
+                .get(1)
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_default();
             let display_text = caps.get(2).map(|m| m.as_str().to_string());
 
             links.push(WikiLink {

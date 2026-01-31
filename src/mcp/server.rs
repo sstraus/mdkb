@@ -4,14 +4,16 @@ use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use rmcp::handler::server::tool::{Parameters, ToolRouter};
-use rmcp::handler::server::ServerHandler;
-use rmcp::model::{CallToolResult, Content, ErrorCode, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::ServiceExt;
-use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError};
+use rmcp::handler::server::ServerHandler;
+use rmcp::handler::server::tool::{Parameters, ToolRouter};
+use rmcp::model::{
+    CallToolResult, Content, ErrorCode, Implementation, ServerCapabilities, ServerInfo,
+};
+use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
-use crate::cli::handlers::{handle_mget, handle_update, Context};
+use crate::cli::handlers::{Context, handle_mget, handle_update};
 #[cfg(feature = "llm")]
 use crate::cli::handlers::{handle_hybrid_search, handle_vsearch};
 use crate::domain::{SearchQuery, SearchResult};
@@ -217,8 +219,13 @@ impl McpServer {
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            let results = handle_vsearch(ctx, &params.query, params.limit, params.collection.as_deref())
-                .map_err(|e| mcp_error(format!("Vector search failed: {}", e)))?;
+            let results = handle_vsearch(
+                ctx,
+                &params.query,
+                params.limit,
+                params.collection.as_deref(),
+            )
+            .map_err(|e| mcp_error(format!("Vector search failed: {}", e)))?;
 
             let output = format_search_results(&results);
             Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -232,7 +239,9 @@ impl McpServer {
     }
 
     /// Hybrid search combining keyword and semantic search with RRF fusion.
-    #[tool(description = "Hybrid search combining BM25 and vector search with RRF fusion (requires LLM feature)")]
+    #[tool(
+        description = "Hybrid search combining BM25 and vector search with RRF fusion (requires LLM feature)"
+    )]
     async fn mdkb_query(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -246,8 +255,13 @@ impl McpServer {
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            let results = handle_hybrid_search(ctx, &params.query, params.limit, params.collection.as_deref())
-                .map_err(|e| mcp_error(format!("Hybrid search failed: {}", e)))?;
+            let results = handle_hybrid_search(
+                ctx,
+                &params.query,
+                params.limit,
+                params.collection.as_deref(),
+            )
+            .map_err(|e| mcp_error(format!("Hybrid search failed: {}", e)))?;
 
             let output = format_search_results(&results);
             Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -296,12 +310,12 @@ pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
     let service = server
         .serve((stdin, stdout))
         .await
-        .map_err(|e| crate::error::Error::Mcp(format!("Failed to start server: {}", e)))?;
+        .map_err(|e| crate::error::Error::mcp(format!("Failed to start server: {e}")))?;
 
     service
         .waiting()
         .await
-        .map_err(|e| crate::error::Error::Mcp(format!("Server error: {}", e)))?;
+        .map_err(|e| crate::error::Error::mcp(format!("Server error: {e}")))?;
 
     Ok(())
 }

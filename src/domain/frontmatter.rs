@@ -1,6 +1,6 @@
 //! Frontmatter (YAML) parsing from markdown files.
 
-use gray_matter::{engine::YAML, Matter};
+use gray_matter::{Matter, engine::YAML};
 use regex::Regex;
 use serde_json::Value;
 

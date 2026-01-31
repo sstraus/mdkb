@@ -1,8 +1,8 @@
 //! Collection storage operations.
 
 use crate::domain::Collection;
-use crate::error::{Error, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use crate::error::{ErrorKind, Result};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Add a new collection.
 pub fn add_collection(conn: &Connection, collection: &Collection) -> Result<()> {
@@ -74,9 +74,10 @@ pub fn rename_collection(conn: &Connection, old_name: &str, new_name: &str) -> R
     )?;
 
     if rows_affected == 0 {
-        return Err(Error::CollectionNotFound {
+        return Err(ErrorKind::CollectionNotFound {
             name: old_name.to_string(),
-        });
+        }
+        .into());
     }
     Ok(())
 }
@@ -192,7 +193,9 @@ mod tests {
         rename_collection(&conn, "old_name", "new_name").expect("rename should succeed");
 
         assert!(get_collection(&conn, "old_name").unwrap().is_none());
-        let renamed = get_collection(&conn, "new_name").unwrap().expect("should exist");
+        let renamed = get_collection(&conn, "new_name")
+            .unwrap()
+            .expect("should exist");
         assert_eq!(renamed.path, "./path");
     }
 

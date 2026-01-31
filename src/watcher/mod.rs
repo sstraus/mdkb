@@ -6,10 +6,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode};
-use notify_debouncer_mini::{new_debouncer, Debouncer};
+use notify_debouncer_mini::{Debouncer, new_debouncer};
 use tokio::sync::mpsc;
 
-use crate::error::{Error, Result};
+use crate::error::{ErrorKind, Result};
 
 /// File change event.
 #[derive(Debug, Clone)]
@@ -71,7 +71,7 @@ impl FileWatcher {
                 }
             },
         )
-        .map_err(|e| Error::Watcher(format!("Failed to create watcher: {}", e)))?;
+        .map_err(|e| ErrorKind::Watcher(format!("Failed to create watcher: {e}")))?;
 
         Ok(Self {
             _debouncer: debouncer,
@@ -84,7 +84,8 @@ impl FileWatcher {
         self._debouncer
             .watcher()
             .watch(path.as_ref(), RecursiveMode::Recursive)
-            .map_err(|e| Error::Watcher(format!("Failed to watch {}: {}", path.display(), e)))
+            .map_err(|e| ErrorKind::Watcher(format!("Failed to watch {}: {e}", path.display())))?;
+        Ok(())
     }
 
     /// Stop watching a path.
@@ -92,7 +93,10 @@ impl FileWatcher {
         self._debouncer
             .watcher()
             .unwatch(path.as_ref())
-            .map_err(|e| Error::Watcher(format!("Failed to unwatch {}: {}", path.display(), e)))
+            .map_err(|e| {
+                ErrorKind::Watcher(format!("Failed to unwatch {}: {e}", path.display()))
+            })?;
+        Ok(())
     }
 
     /// Receive the next file change event.

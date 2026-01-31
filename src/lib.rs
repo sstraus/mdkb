@@ -25,4 +25,4 @@ pub mod watcher;
 
 // Re-export main types
 pub use config::Config;
-pub use error::{Error, Result};
+pub use error::{Error, ErrorKind, Result};

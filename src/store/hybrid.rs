@@ -133,10 +133,7 @@ mod tests {
 
     #[test]
     fn test_rrf_fusion_bm25_only() {
-        let bm25 = vec![
-            make_bm25_result(1, -5.0),
-            make_bm25_result(2, -6.0),
-        ];
+        let bm25 = vec![make_bm25_result(1, -5.0), make_bm25_result(2, -6.0)];
 
         let vector: Vec<(i64, f32)> = vec![];
         let config = HybridConfig::default();
@@ -149,10 +146,7 @@ mod tests {
     #[test]
     fn test_rrf_fusion_vector_only() {
         let bm25: Vec<SearchResult> = vec![];
-        let vector = vec![
-            (1, 0.1),
-            (2, 0.2),
-        ];
+        let vector = vec![(1, 0.1), (2, 0.2)];
 
         let config = HybridConfig::default();
         let fused = rrf_fusion(&bm25, &vector, &config);
@@ -163,11 +157,7 @@ mod tests {
 
     #[test]
     fn test_normalize_scores() {
-        let mut scores = vec![
-            (1, 0.02),
-            (2, 0.01),
-            (3, 0.015),
-        ];
+        let mut scores = vec![(1, 0.02), (2, 0.01), (3, 0.015)];
 
         normalize_scores(&mut scores);
 
@@ -185,10 +175,7 @@ mod tests {
 
     #[test]
     fn test_normalize_scores_equal() {
-        let mut scores = vec![
-            (1, 0.5),
-            (2, 0.5),
-        ];
+        let mut scores = vec![(1, 0.5), (2, 0.5)];
 
         normalize_scores(&mut scores);
 

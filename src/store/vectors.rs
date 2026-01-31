@@ -2,7 +2,7 @@
 //!
 //! Uses sqlite-vec for vector similarity search.
 
-use rusqlite::{ffi::sqlite3_auto_extension, params, Connection};
+use rusqlite::{Connection, ffi::sqlite3_auto_extension, params};
 use sqlite_vec::sqlite3_vec_init;
 use zerocopy::AsBytes;
 
@@ -12,9 +12,7 @@ use crate::error::Result;
 /// Must be called once before opening any connections that use vectors.
 pub fn init_sqlite_vec() {
     unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite3_vec_init as *const (),
-        )));
+        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
     }
 }
 
@@ -185,7 +183,9 @@ mod tests {
 
     /// Create a test embedding with the correct dimension.
     fn test_embedding(seed: f32) -> Vec<f32> {
-        (0..EMBEDDING_DIM).map(|i| seed + i as f32 * 0.001).collect()
+        (0..EMBEDDING_DIM)
+            .map(|i| seed + i as f32 * 0.001)
+            .collect()
     }
 
     #[test]
@@ -212,7 +212,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES ('abc', 'test', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', 'test.md', 'abc', 0, 0)",
             [],
@@ -241,7 +242,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES ('abc', 'test', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', 'test.md', 'abc', 0, 0)",
             [],

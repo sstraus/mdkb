@@ -4,18 +4,18 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::domain::frontmatter::parse_frontmatter;
-use crate::domain::{Collection, Document, SearchQuery, UpdateResult};
 #[cfg(feature = "llm")]
 use crate::domain::SearchResult;
-use crate::error::{Error, Result};
+use crate::domain::frontmatter::parse_frontmatter;
+use crate::domain::{Collection, Document, SearchQuery, UpdateResult};
+use crate::error::{Error, ErrorKind, Result};
 use crate::store::collections;
 use crate::store::documents;
+#[cfg(feature = "llm")]
+use crate::store::hybrid;
 use crate::store::schema;
 use crate::store::search;
 use crate::store::vectors;
-#[cfg(feature = "llm")]
-use crate::store::hybrid;
 use globset::Glob;
 use rusqlite::Connection;
 use walkdir::WalkDir;
@@ -39,9 +39,10 @@ impl Context {
         let db_path = mdkb_dir.join("index.sqlite");
 
         if !mdkb_dir.exists() {
-            return Err(Error::DatabaseNotFound {
+            return Err(ErrorKind::DatabaseNotFound {
                 path: db_path.clone(),
-            });
+            }
+            .into());
         }
 
         let conn = Connection::open(&db_path)?;
@@ -94,7 +95,7 @@ pub fn handle_init(root: impl AsRef<Path>) -> Result<()> {
     let mdkb_dir = root.join(".mdkb");
 
     if mdkb_dir.exists() {
-        return Err(Error::Other(format!(
+        return Err(Error::other(format!(
             "mdkb already initialized at {}",
             mdkb_dir.display()
         )));
@@ -268,15 +269,18 @@ pub fn handle_get(
         None
     };
 
-    let doc = doc.ok_or_else(|| Error::DocumentNotFound {
-        id: id_or_path.to_string(),
+    let doc = doc.ok_or_else(|| {
+        Error::from(ErrorKind::DocumentNotFound {
+            id: id_or_path.to_string(),
+        })
     })?;
 
     // Get content
-    let content = documents::get_content(&ctx.conn, &doc.hash)?
-        .ok_or_else(|| Error::DocumentNotFound {
+    let content = documents::get_content(&ctx.conn, &doc.hash)?.ok_or_else(|| {
+        Error::from(ErrorKind::DocumentNotFound {
             id: id_or_path.to_string(),
-        })?;
+        })
+    })?;
 
     // Apply line range if specified
     let content = if let Some(range) = lines {
@@ -295,7 +299,7 @@ pub fn handle_mget(
     collection_filter: Option<&str>,
 ) -> Result<Vec<(Document, String)>> {
     let glob = Glob::new(pattern)
-        .map_err(|e| Error::Other(format!("Invalid glob pattern '{}': {}", pattern, e)))?
+        .map_err(|e| Error::other(format!("Invalid glob pattern '{}': {}", pattern, e)))?
         .compile_matcher();
 
     // Get all documents, optionally filtered by collection
@@ -361,7 +365,12 @@ fn update_collection(
 
     // Build glob matcher
     let glob = Glob::new(&collection.pattern)
-        .map_err(|e| Error::Other(format!("Invalid glob pattern '{}': {}", collection.pattern, e)))?
+        .map_err(|e| {
+            Error::other(format!(
+                "Invalid glob pattern '{}': {}",
+                collection.pattern, e
+            ))
+        })?
         .compile_matcher();
 
     // Get existing documents for this collection
@@ -395,7 +404,11 @@ fn update_collection(
         let metadata = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(e) => {
-                result.errors.push(format!("Failed to read metadata for {}: {}", path.display(), e));
+                result.errors.push(format!(
+                    "Failed to read metadata for {}: {}",
+                    path.display(),
+                    e
+                ));
                 continue;
             }
         };
@@ -424,7 +437,9 @@ fn update_collection(
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(e) => {
-                result.errors.push(format!("Failed to read {}: {}", path.display(), e));
+                result
+                    .errors
+                    .push(format!("Failed to read {}: {}", path.display(), e));
                 continue;
             }
         };
@@ -453,19 +468,25 @@ fn update_collection(
                 }
             }
             Err(e) => {
-                result.errors.push(format!("Failed to index {}: {}", path.display(), e));
+                result
+                    .errors
+                    .push(format!("Failed to index {}: {}", path.display(), e));
             }
         }
     }
 
     // Remove documents for deleted files
     for deleted_path in existing_paths {
-        if let Some(doc) = documents::get_document_by_path(&ctx.conn, &collection.name, &deleted_path)? {
+        if let Some(doc) =
+            documents::get_document_by_path(&ctx.conn, &collection.name, &deleted_path)?
+        {
             match documents::delete_document(&ctx.conn, doc.id) {
                 Ok(true) => result.removed += 1,
                 Ok(false) => {}
                 Err(e) => {
-                    result.errors.push(format!("Failed to remove {}: {}", deleted_path, e));
+                    result
+                        .errors
+                        .push(format!("Failed to remove {}: {}", deleted_path, e));
                 }
             }
         }
@@ -547,7 +568,7 @@ pub struct EmbedResult {
 fn apply_line_range(content: &str, range: &str) -> Result<String> {
     let parts: Vec<&str> = range.split(':').collect();
     if parts.len() != 2 {
-        return Err(Error::Other(format!(
+        return Err(Error::other(format!(
             "Invalid line range format: '{}', expected 'start:end'",
             range
         )));
@@ -555,16 +576,16 @@ fn apply_line_range(content: &str, range: &str) -> Result<String> {
 
     let start: usize = parts[0]
         .parse()
-        .map_err(|_| Error::Other(format!("Invalid start line: '{}'", parts[0])))?;
+        .map_err(|_| Error::other(format!("Invalid start line: '{}'", parts[0])))?;
     let end: usize = parts[1]
         .parse()
-        .map_err(|_| Error::Other(format!("Invalid end line: '{}'", parts[1])))?;
+        .map_err(|_| Error::other(format!("Invalid end line: '{}'", parts[1])))?;
 
     if start == 0 {
-        return Err(Error::Other("Line numbers start at 1".to_string()));
+        return Err(Error::other("Line numbers start at 1"));
     }
     if end < start {
-        return Err(Error::Other(format!(
+        return Err(Error::other(format!(
             "End line ({}) must be >= start line ({})",
             end, start
         )));
@@ -639,8 +660,7 @@ mod tests {
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
-        handle_collection_add(&ctx, "docs", "./docs", "**/*.md")
-            .expect("add should succeed");
+        handle_collection_add(&ctx, "docs", "./docs", "**/*.md").expect("add should succeed");
 
         let collections = handle_collection_list(&ctx).unwrap();
         assert_eq!(collections.len(), 1);

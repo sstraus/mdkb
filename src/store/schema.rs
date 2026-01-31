@@ -134,7 +134,6 @@ pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
 
     fn setup_db() -> Connection {
         Connection::open_in_memory().expect("failed to open in-memory db")
@@ -278,7 +277,10 @@ mod tests {
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             [hash, "different body", "1706700000"],
         );
-        assert!(result.is_err(), "duplicate hash should fail (deduplication)");
+        assert!(
+            result.is_err(),
+            "duplicate hash should fail (deduplication)"
+        );
     }
 
     // ==================== Documents Table Tests ====================
@@ -350,11 +352,13 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["hash1", "body1", "1706700000"],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["hash2", "body2", "1706700000"],
-        ).unwrap();
+        )
+        .unwrap();
 
         // First document
         conn.execute(
@@ -370,7 +374,10 @@ mod tests {
              VALUES (?, ?, ?, ?, ?, ?)",
             ["docs", "readme.md", "hash2", "Test 2", "1706700000", "1706700000"],
         );
-        assert!(result.is_err(), "duplicate path in same collection should fail");
+        assert!(
+            result.is_err(),
+            "duplicate path in same collection should fail"
+        );
     }
 
     #[test]
@@ -381,7 +388,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["hash1", "body", "1706700000"],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Insert document with non-existent collection should fail
         let result = conn.execute(
@@ -389,7 +397,10 @@ mod tests {
              VALUES (?, ?, ?, ?, ?, ?)",
             ["nonexistent", "readme.md", "hash1", "Test", "1706700000", "1706700000"],
         );
-        assert!(result.is_err(), "foreign key constraint should prevent invalid collection");
+        assert!(
+            result.is_err(),
+            "foreign key constraint should prevent invalid collection"
+        );
     }
 
     // ==================== FTS5 Tests ====================
@@ -441,8 +452,13 @@ mod tests {
         ).unwrap();
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
-            ["hash1", "The runners are running quickly through the park", "1706700000"],
-        ).unwrap();
+            [
+                "hash1",
+                "The runners are running quickly through the park",
+                "1706700000",
+            ],
+        )
+        .unwrap();
 
         // Insert document (should trigger FTS update via trigger)
         conn.execute(
@@ -460,7 +476,10 @@ mod tests {
             )
             .expect("FTS search should work");
 
-        assert_eq!(count, 1, "stemmed search for 'run' should find document with 'running'");
+        assert_eq!(
+            count, 1,
+            "stemmed search for 'run' should find document with 'running'"
+        );
     }
 
     #[test]
@@ -478,7 +497,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["hash1", "This is about programming.", "1706700000"],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (collection, relative_path, hash, title, file_modified_at, indexed_at)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -488,8 +508,13 @@ mod tests {
         // Doc 2: "rust" in body only
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
-            ["hash2", "Rust is a systems programming language.", "1706700000"],
-        ).unwrap();
+            [
+                "hash2",
+                "Rust is a systems programming language.",
+                "1706700000",
+            ],
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (collection, relative_path, hash, title, file_modified_at, indexed_at)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -529,7 +554,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["hash1", "Searchable body content here", "1706700000"],
-        ).unwrap();
+        )
+        .unwrap();
 
         // FTS should be empty before document insert
         let count_before: i32 = conn
@@ -574,7 +600,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["hash1", "Body content", "1706700000"],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (collection, relative_path, hash, title, file_modified_at, indexed_at)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -605,7 +632,9 @@ mod tests {
         init_schema(&conn).expect("init_schema failed");
 
         let indexes: Vec<String> = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'",
+            )
             .unwrap()
             .query_map([], |row| row.get(0))
             .unwrap()
@@ -614,7 +643,9 @@ mod tests {
 
         // Should have at least these indexes
         assert!(
-            indexes.iter().any(|i| i.contains("documents") || i.contains("doc")),
+            indexes
+                .iter()
+                .any(|i| i.contains("documents") || i.contains("doc")),
             "should have document-related indexes"
         );
     }

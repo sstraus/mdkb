@@ -1,20 +1,28 @@
 //! mdkb - Local markdown knowledge base CLI.
 
+use mimalloc::MiMalloc;
 use std::env;
+
+/// Use mimalloc as the global allocator for improved performance.
+/// Per Pragmatic Rust Guidelines (M-USE-ALLOCATOR-OPTIMIZED), mimalloc provides
+/// better performance than the default allocator, especially for multi-threaded
+/// workloads and frequent small allocations.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
+use mdkb::Result;
 use mdkb::cli::handlers::{
-    handle_collection_add, handle_collection_list, handle_collection_remove,
+    Context, handle_collection_add, handle_collection_list, handle_collection_remove,
     handle_collection_rename, handle_get, handle_init, handle_mget, handle_search, handle_status,
-    handle_update, Context,
+    handle_update,
 };
 #[cfg(feature = "llm")]
-use mdkb::cli::handlers::{handle_embed, handle_hybrid_search, handle_vsearch, EmbedResult};
+use mdkb::cli::handlers::{EmbedResult, handle_embed, handle_hybrid_search, handle_vsearch};
 use mdkb::cli::{Cli, CollectionCommand, Command, OutputFormat};
 use mdkb::mcp::server::run_server;
-use mdkb::Result;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,7 +54,11 @@ async fn main() -> Result<()> {
         Command::Collection(cmd) => {
             let ctx = Context::open(&cwd)?;
             match cmd {
-                CollectionCommand::Add { name, path, pattern } => {
+                CollectionCommand::Add {
+                    name,
+                    path,
+                    pattern,
+                } => {
                     handle_collection_add(&ctx, &name, &path, &pattern)?;
                     println!("Added collection '{name}'");
                 }
@@ -117,7 +129,10 @@ async fn main() -> Result<()> {
             let (doc, content) = handle_get(&ctx, &id, lines.as_deref())?;
             format_document(&doc, &content, cli.format);
         }
-        Command::Mget { pattern, collection } => {
+        Command::Mget {
+            pattern,
+            collection,
+        } => {
             let ctx = Context::open(&cwd)?;
             let results = handle_mget(&ctx, &pattern, collection.as_deref())?;
             format_mget_results(&results, cli.format);
@@ -277,7 +292,11 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
             println!("added,updated,removed,unchanged,errors");
             println!(
                 "{},{},{},{},{}",
-                result.added, result.updated, result.removed, result.unchanged, result.errors.len()
+                result.added,
+                result.updated,
+                result.removed,
+                result.unchanged,
+                result.errors.len()
             );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
@@ -357,7 +376,12 @@ fn format_embed_result(result: &EmbedResult, format: OutputFormat) {
         }
         OutputFormat::Csv => {
             println!("generated,skipped,errors");
-            println!("{},{},{}", result.generated, result.skipped, result.errors.len());
+            println!(
+                "{},{},{}",
+                result.generated,
+                result.skipped,
+                result.errors.len()
+            );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             println!("Generated: {}", result.generated);

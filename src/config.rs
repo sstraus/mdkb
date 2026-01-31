@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::error::{ErrorKind, Result};
 
 /// Main configuration structure.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,7 +151,7 @@ impl Default for IndexingConfig {
     fn default() -> Self {
         Self {
             default_pattern: "**/*.md".to_string(),
-            debounce_ms: 100,
+            debounce_ms: DEFAULT_DEBOUNCE_MS,
             parse_frontmatter: true,
             parse_wikilinks: true,
             index_headings: true,
@@ -163,8 +163,8 @@ impl Default for ChunkingConfig {
     fn default() -> Self {
         Self {
             strategy: "markdown".to_string(),
-            max_tokens: 512,
-            overlap_tokens: 64,
+            max_tokens: DEFAULT_MAX_TOKENS,
+            overlap_tokens: DEFAULT_OVERLAP_TOKENS,
             include_header_path: true,
         }
     }
@@ -175,10 +175,10 @@ impl Default for SearchConfig {
         Self {
             default_limit: 10,
             min_score: 0.0,
-            rrf_k: 60,
-            bm25_weight: 1.0,
-            vector_weight: 0.7,
-            rerank_top_k: 50,
+            rrf_k: DEFAULT_RRF_K,
+            bm25_weight: DEFAULT_BM25_WEIGHT,
+            vector_weight: DEFAULT_VECTOR_WEIGHT,
+            rerank_top_k: DEFAULT_RERANK_TOP_K,
         }
     }
 }
@@ -188,7 +188,7 @@ impl Default for MemoryConfig {
         Self {
             enabled: true,
             directory: "memory".to_string(),
-            warmup_limit: 50,
+            warmup_limit: DEFAULT_WARMUP_LIMIT,
             title_max_chars: 50,
             order_by: "access_count".to_string(),
             track_access: true,
@@ -205,7 +205,7 @@ impl Default for ModelsConfig {
             reranker_file: "bge-reranker-base.Q4_K_M.gguf".to_string(),
             condense_repo: "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
             condense_file: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
-            inactivity_timeout_secs: 120,
+            inactivity_timeout_secs: DEFAULT_INACTIVITY_TIMEOUT_SECS,
         }
     }
 }
@@ -217,16 +217,67 @@ const VALID_CHUNKING_STRATEGIES: &[&str] = &["fixed", "markdown", "semantic"];
 const VALID_ORDER_BY: &[&str] = &["access_count", "updated_at", "created_at"];
 
 /// Minimum allowed max_tokens for chunking.
+/// 64 tokens is the minimum practical size for semantic coherence.
 const MIN_MAX_TOKENS: usize = 64;
+
+// =============================================================================
+// Default value constants with documentation
+// =============================================================================
+
+/// Default debounce interval for file watcher (milliseconds).
+/// 100ms provides responsive updates while batching rapid file saves together.
+/// This is fast enough for interactive use but avoids redundant reindexing
+/// when editors save files multiple times in quick succession.
+const DEFAULT_DEBOUNCE_MS: u64 = 100;
+
+/// Maximum tokens per chunk for embedding models.
+/// 512 is the typical context limit for embedding models like nomic-embed-text.
+/// Larger values may truncate; smaller values reduce semantic coherence.
+const DEFAULT_MAX_TOKENS: usize = 512;
+
+/// Token overlap between consecutive chunks.
+/// 64 tokens (~12.5% of 512) maintains context continuity across chunk boundaries
+/// without excessive redundancy.
+const DEFAULT_OVERLAP_TOKENS: usize = 64;
+
+/// RRF (Reciprocal Rank Fusion) constant k.
+/// Standard value from Cormack et al. (2009) "Reciprocal Rank Fusion outperforms
+/// Condorcet and individual Rank Learning Methods". k=60 balances contributions
+/// from different ranking sources; lower values favor top-ranked results more.
+const DEFAULT_RRF_K: u32 = 60;
+
+/// BM25 weight in hybrid search.
+/// 1.0 gives full weight to keyword/lexical matching.
+const DEFAULT_BM25_WEIGHT: f64 = 1.0;
+
+/// Vector similarity weight in hybrid search.
+/// 0.7 gives semantic search slightly less influence than BM25, reflecting that
+/// exact keyword matches are often more reliable than semantic similarity.
+const DEFAULT_VECTOR_WEIGHT: f64 = 0.7;
+
+/// Top-k candidates for reranking.
+/// 50 provides a good balance: enough candidates for the reranker to find good
+/// results, but not so many that reranking becomes slow.
+const DEFAULT_RERANK_TOP_K: usize = 50;
+
+/// Maximum documents in memory warmup index.
+/// 50 entries is enough for common documents without excessive memory use.
+const DEFAULT_WARMUP_LIMIT: usize = 50;
+
+/// Model inactivity timeout before unloading (seconds).
+/// 2 minutes allows for interactive use patterns while freeing memory
+/// when the user has moved on to other tasks.
+const DEFAULT_INACTIVITY_TIMEOUT_SECS: u64 = 120;
 
 impl Config {
     /// Load configuration from a TOML file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {
-            return Err(Error::ConfigNotFound {
+            return Err(ErrorKind::ConfigNotFound {
                 path: path.to_path_buf(),
-            });
+            }
+            .into());
         }
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
@@ -256,43 +307,45 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         // Search validation
         if self.search.default_limit == 0 {
-            return Err(Error::ConfigInvalid {
+            return Err(ErrorKind::ConfigInvalid {
                 field: "search.default_limit".to_string(),
                 message: "must be greater than 0".to_string(),
-            });
+            }
+            .into());
         }
 
         // Chunking validation
         if !VALID_CHUNKING_STRATEGIES.contains(&self.chunking.strategy.as_str()) {
-            return Err(Error::ConfigInvalid {
+            return Err(ErrorKind::ConfigInvalid {
                 field: "chunking.strategy".to_string(),
-                message: format!(
-                    "must be one of: {}",
-                    VALID_CHUNKING_STRATEGIES.join(", ")
-                ),
-            });
+                message: format!("must be one of: {}", VALID_CHUNKING_STRATEGIES.join(", ")),
+            }
+            .into());
         }
 
         if self.chunking.max_tokens < MIN_MAX_TOKENS {
-            return Err(Error::ConfigInvalid {
+            return Err(ErrorKind::ConfigInvalid {
                 field: "chunking.max_tokens".to_string(),
                 message: format!("must be at least {MIN_MAX_TOKENS}"),
-            });
+            }
+            .into());
         }
 
         if self.chunking.overlap_tokens >= self.chunking.max_tokens {
-            return Err(Error::ConfigInvalid {
+            return Err(ErrorKind::ConfigInvalid {
                 field: "chunking.overlap_tokens".to_string(),
                 message: "must be less than max_tokens".to_string(),
-            });
+            }
+            .into());
         }
 
         // Memory validation
         if !VALID_ORDER_BY.contains(&self.memory.order_by.as_str()) {
-            return Err(Error::ConfigInvalid {
+            return Err(ErrorKind::ConfigInvalid {
                 field: "memory.order_by".to_string(),
                 message: format!("must be one of: {}", VALID_ORDER_BY.join(", ")),
-            });
+            }
+            .into());
         }
 
         Ok(())

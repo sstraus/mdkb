@@ -15,5 +15,5 @@ pub use embeddings::EmbeddingModel;
 /// Placeholder for when LLM feature is disabled.
 #[cfg(not(feature = "llm"))]
 pub fn llm_not_available() -> crate::error::Error {
-    crate::error::Error::Other("LLM features require --features llm".to_string())
+    crate::error::Error::other("LLM features require --features llm")
 }

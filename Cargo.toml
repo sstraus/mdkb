@@ -5,6 +5,7 @@ edition = "2024"
 description = "Local markdown knowledge base with semantic search"
 license = "MIT"
 repository = "https://github.com/user/mdkb"
+readme = "README.md"
 keywords = ["markdown", "knowledge-base", "search", "mcp"]
 categories = ["command-line-utilities", "text-processing"]
 
@@ -48,6 +49,9 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Allocator (M-USE-ALLOCATOR-OPTIMIZED)
+mimalloc = "0.1"
+
 # Utilities
 sha2 = "0.10"
 walkdir = "2"
@@ -61,13 +65,13 @@ pulldown-cmark = "0.12"
 regex = "1"
 
 # LLM (Phase 3+)
-llama_cpp_rs = { version = "0.3", optional = true }
+llama-cpp-2 = { version = "0.1", optional = true }
 hf-hub = { version = "0.3", optional = true }
 indicatif = { version = "0.17", optional = true }
 
 [features]
 default = []
-llm = ["llama_cpp_rs", "hf-hub", "indicatif"]
+llm = ["llama-cpp-2", "hf-hub", "indicatif"]
 
 [dev-dependencies]
 tempfile = "3"
@@ -78,3 +82,51 @@ predicates = "3"
 lto = true
 codegen-units = 1
 strip = true
+
+# Lint configuration per Pragmatic Rust Guidelines (M-STATIC-VERIFICATION)
+[lints.rust]
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Cargo lints disabled - multiple dependency versions are from transitive deps
+# cargo = { level = "warn", priority = -1 }
+# Opt-out of overly strict pedantic lints
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+# These are cosmetic and not worth fixing everywhere
+needless_raw_string_hashes = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+doc_markdown = "allow"
+items_after_statements = "allow"
+uninlined_format_args = "allow"
+# Error struct is large due to backtrace, which is intentional
+result_large_err = "allow"
+# Collapsible if statements can be more readable separated
+collapsible_if = "allow"
+# map().unwrap_or() is more readable than map_or() in many cases
+map_unwrap_or = "allow"
+# Redundant closures can be clearer
+redundant_closure_for_method_calls = "allow"
+# These are stylistic preferences or unavoidable
+needless_pass_by_value = "allow"
+used_underscore_binding = "allow"
+case_sensitive_file_extension_comparison = "allow"
+needless_update = "allow"
+double_must_use = "allow"
+implicit_clone = "allow"
+missing_transmute_annotations = "allow"
+default_trait_access = "allow"
+format_push_string = "allow"
+derivable_impls = "allow"
