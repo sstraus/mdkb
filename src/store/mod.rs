@@ -1,6 +1,9 @@
 //! Storage layer - SQLite with FTS5 for full-text search.
 
+pub mod collections;
+pub mod documents;
 pub mod schema;
+pub mod search;
 
 use std::path::Path;
 
