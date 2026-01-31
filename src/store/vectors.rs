@@ -11,6 +11,10 @@ use crate::error::Result;
 /// Initialize sqlite-vec extension globally.
 /// Must be called once before opening any connections that use vectors.
 pub fn init_sqlite_vec() {
+    // SAFETY: sqlite3_vec_init is an extern "C" function with the signature expected by
+    // sqlite3_auto_extension: `fn(*mut sqlite3, **mut c_char, *const sqlite3_api_routines) -> c_int`.
+    // The transmute converts the function pointer to the type expected by the SQLite C API.
+    // This is the standard pattern for registering SQLite extensions via rusqlite's ffi.
     unsafe {
         sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
     }
@@ -69,9 +73,15 @@ pub fn store_embedding(
     )?;
 
     // Store in vector index
+    // Note: sqlite-vec virtual tables don't support INSERT OR REPLACE,
+    // so we need to delete first then insert
+    conn.execute(
+        "DELETE FROM vec_documents WHERE document_id = ?1",
+        params![document_id],
+    )?;
     conn.execute(
         r#"
-        INSERT OR REPLACE INTO vec_documents (document_id, embedding)
+        INSERT INTO vec_documents (document_id, embedding)
         VALUES (?1, ?2)
         "#,
         params![document_id, embedding_bytes],
@@ -255,5 +265,179 @@ mod tests {
         store_embedding(&conn, 1, &embedding, "test").unwrap();
 
         assert!(has_embedding(&conn, 1).unwrap());
+    }
+
+    #[test]
+    fn test_delete_embedding() {
+        let conn = setup_db();
+
+        // Setup document
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at) VALUES ('test', '.', '*.md', 0, 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('abc', 'test', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', 'test.md', 'abc', 0, 0)",
+            [],
+        ).unwrap();
+
+        let embedding = test_embedding(0.5);
+        store_embedding(&conn, 1, &embedding, "test").unwrap();
+        assert!(has_embedding(&conn, 1).unwrap());
+
+        let deleted = delete_embedding(&conn, 1).unwrap();
+        assert!(deleted);
+        assert!(!has_embedding(&conn, 1).unwrap());
+
+        // Deleting again should return false
+        let deleted_again = delete_embedding(&conn, 1).unwrap();
+        assert!(!deleted_again);
+    }
+
+    #[test]
+    fn test_count_embeddings() {
+        let conn = setup_db();
+
+        // Setup documents
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at) VALUES ('test', '.', '*.md', 0, 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('abc', 'test1', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('def', 'test2', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', 'test1.md', 'abc', 0, 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', 'test2.md', 'def', 0, 0)",
+            [],
+        ).unwrap();
+
+        assert_eq!(count_embeddings(&conn).unwrap(), 0);
+
+        store_embedding(&conn, 1, &test_embedding(0.1), "test").unwrap();
+        assert_eq!(count_embeddings(&conn).unwrap(), 1);
+
+        store_embedding(&conn, 2, &test_embedding(0.2), "test").unwrap();
+        assert_eq!(count_embeddings(&conn).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_vector_search() {
+        let conn = setup_db();
+
+        // Setup documents
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at) VALUES ('test', '.', '*.md', 0, 0)",
+            [],
+        ).unwrap();
+
+        for i in 1..=5 {
+            conn.execute(
+                "INSERT INTO content (hash, body, created_at) VALUES (?1, ?2, 0)",
+                params![format!("hash{}", i), format!("content{}", i)],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', ?1, ?2, 0, 0)",
+                params![format!("doc{}.md", i), format!("hash{}", i)],
+            ).unwrap();
+        }
+
+        // Store embeddings with different seeds (simulating different content)
+        for i in 1..=5 {
+            let embedding = test_embedding(i as f32 * 0.1);
+            store_embedding(&conn, i, &embedding, "test").unwrap();
+        }
+
+        // Search with a query embedding similar to doc 3
+        let query = test_embedding(0.29); // Close to doc 3 (0.3)
+        let results = vector_search(&conn, &query, 3).unwrap();
+
+        assert_eq!(results.len(), 3);
+        // Doc 3 should be closest (has seed 0.3, closest to 0.29)
+        assert_eq!(results[0].0, 3);
+    }
+
+    #[test]
+    fn test_vector_search_limit() {
+        let conn = setup_db();
+
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at) VALUES ('test', '.', '*.md', 0, 0)",
+            [],
+        ).unwrap();
+
+        for i in 1..=10 {
+            conn.execute(
+                "INSERT INTO content (hash, body, created_at) VALUES (?1, ?2, 0)",
+                params![format!("hash{}", i), format!("content{}", i)],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', ?1, ?2, 0, 0)",
+                params![format!("doc{}.md", i), format!("hash{}", i)],
+            ).unwrap();
+            store_embedding(&conn, i, &test_embedding(i as f32 * 0.1), "test").unwrap();
+        }
+
+        let query = test_embedding(0.5);
+
+        let results_5 = vector_search(&conn, &query, 5).unwrap();
+        assert_eq!(results_5.len(), 5);
+
+        let results_3 = vector_search(&conn, &query, 3).unwrap();
+        assert_eq!(results_3.len(), 3);
+    }
+
+    #[test]
+    fn test_vector_search_empty() {
+        let conn = setup_db();
+
+        let query = test_embedding(0.5);
+        let results = vector_search(&conn, &query, 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_embedding_update_replaces() {
+        let conn = setup_db();
+
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at) VALUES ('test', '.', '*.md', 0, 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('abc', 'test', 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', 'test.md', 'abc', 0, 0)",
+            [],
+        ).unwrap();
+
+        // Store initial embedding
+        let embedding1 = test_embedding(0.1);
+        store_embedding(&conn, 1, &embedding1, "model-v1").unwrap();
+
+        // Update with new embedding
+        let embedding2 = test_embedding(0.9);
+        store_embedding(&conn, 1, &embedding2, "model-v2").unwrap();
+
+        // Should still have only one embedding
+        assert_eq!(count_embeddings(&conn).unwrap(), 1);
+
+        // Retrieved embedding should be the updated one
+        let retrieved = get_embedding(&conn, 1).unwrap().unwrap();
+        assert!((retrieved[0] - 0.9).abs() < 0.001);
     }
 }

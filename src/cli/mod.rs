@@ -114,6 +114,17 @@ pub enum Command {
 
     /// Start MCP server
     Serve,
+
+    /// Show usage statistics
+    Stats {
+        /// Show last N sessions (default: 5)
+        #[arg(short, long, default_value = "5")]
+        sessions: usize,
+
+        /// Show aggregate stats only
+        #[arg(short, long)]
+        aggregate: bool,
+    },
 }
 
 /// Collection management subcommands.

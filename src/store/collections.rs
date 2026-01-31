@@ -66,6 +66,16 @@ pub fn remove_collection(conn: &Connection, name: &str) -> Result<bool> {
     Ok(rows_affected > 0)
 }
 
+/// Get the number of documents in a collection.
+pub fn get_collection_document_count(conn: &Connection, name: &str) -> Result<i64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM documents WHERE collection = ?1",
+        params![name],
+        |row| row.get(0),
+    )?;
+    Ok(count)
+}
+
 /// Rename a collection.
 pub fn rename_collection(conn: &Connection, old_name: &str, new_name: &str) -> Result<()> {
     let rows_affected = conn.execute(
@@ -215,5 +225,39 @@ mod tests {
 
         let result = rename_collection(&conn, "first", "second");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_get_collection_document_count() {
+        let conn = setup_db();
+        add_collection(&conn, &make_collection("docs", "./docs")).unwrap();
+
+        // Initially zero
+        let count = get_collection_document_count(&conn, "docs").unwrap();
+        assert_eq!(count, 0);
+
+        // Need content for foreign key
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES (?1, ?2, ?3)",
+            params!["hash1", "body1", now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES (?1, ?2, ?3)",
+            params!["hash2", "body2", now],
+        ).unwrap();
+
+        // Add some documents
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["docs", "file1.md", "hash1", now, now],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params!["docs", "file2.md", "hash2", now, now],
+        ).unwrap();
+
+        let count = get_collection_document_count(&conn, "docs").unwrap();
+        assert_eq!(count, 2);
     }
 }

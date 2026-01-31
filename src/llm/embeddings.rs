@@ -27,8 +27,38 @@ pub struct EmbeddingModel {
     model: LlamaModel,
 }
 
+impl std::fmt::Debug for EmbeddingModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingModel")
+            .field("repo", &DEFAULT_EMBEDDING_REPO)
+            .finish_non_exhaustive()
+    }
+}
+
 impl EmbeddingModel {
     /// Load the embedding model, downloading if necessary.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use mdkb::llm::EmbeddingModel;
+    ///
+    /// // Load default model (nomic-embed-text)
+    /// let model = EmbeddingModel::load(None, None)?;
+    ///
+    /// // Load custom model
+    /// let model = EmbeddingModel::load(
+    ///     Some("my-org/my-embedding-model"),
+    ///     Some("model.Q4_K_M.gguf"),
+    /// )?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Model download from HuggingFace fails
+    /// - LLM backend initialization fails
+    /// - Model file loading fails
     pub fn load(repo: Option<&str>, file: Option<&str>) -> Result<Self> {
         let repo = repo.unwrap_or(DEFAULT_EMBEDDING_REPO);
         let file = file.unwrap_or(DEFAULT_EMBEDDING_FILE);

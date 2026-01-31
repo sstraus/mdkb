@@ -15,12 +15,10 @@ use tracing_subscriber::EnvFilter;
 
 use mdkb::Result;
 use mdkb::cli::handlers::{
-    Context, handle_collection_add, handle_collection_list, handle_collection_remove,
-    handle_collection_rename, handle_get, handle_init, handle_mget, handle_search, handle_status,
-    handle_update,
+    Context, EmbedResult, StatsResult, handle_collection_add, handle_collection_list, handle_collection_remove,
+    handle_collection_rename, handle_embed, handle_get, handle_hybrid_search, handle_init,
+    handle_mget, handle_search, handle_stats, handle_status, handle_update, handle_vsearch,
 };
-#[cfg(feature = "llm")]
-use mdkb::cli::handlers::{EmbedResult, handle_embed, handle_hybrid_search, handle_vsearch};
 use mdkb::cli::{Cli, CollectionCommand, Command, OutputFormat};
 use mdkb::mcp::server::run_server;
 
@@ -93,36 +91,18 @@ async fn main() -> Result<()> {
             limit,
             collection,
         } => {
-            #[cfg(feature = "llm")]
-            {
-                let ctx = Context::open(&cwd)?;
-                let results = handle_vsearch(&ctx, &query, limit, collection.as_deref())?;
-                format_search_results(&results, cli.format);
-            }
-            #[cfg(not(feature = "llm"))]
-            {
-                let _ = (query, limit, collection);
-                eprintln!("Error: vsearch requires --features llm");
-                std::process::exit(1);
-            }
+            let ctx = Context::open(&cwd)?;
+            let results = handle_vsearch(&ctx, &query, limit, collection.as_deref())?;
+            format_search_results(&results, cli.format);
         }
         Command::Query {
             query,
             limit,
             collection,
         } => {
-            #[cfg(feature = "llm")]
-            {
-                let ctx = Context::open(&cwd)?;
-                let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref())?;
-                format_search_results(&results, cli.format);
-            }
-            #[cfg(not(feature = "llm"))]
-            {
-                let _ = (query, limit, collection);
-                eprintln!("Error: query (hybrid search) requires --features llm");
-                std::process::exit(1);
-            }
+            let ctx = Context::open(&cwd)?;
+            let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref())?;
+            format_search_results(&results, cli.format);
         }
         Command::Get { id, lines } => {
             let ctx = Context::open(&cwd)?;
@@ -148,20 +128,17 @@ async fn main() -> Result<()> {
             format_update_result(&result, cli.format);
         }
         Command::Embed => {
-            #[cfg(feature = "llm")]
-            {
-                let ctx = Context::open(&cwd)?;
-                let result = handle_embed(&ctx)?;
-                format_embed_result(&result, cli.format);
-            }
-            #[cfg(not(feature = "llm"))]
-            {
-                eprintln!("Error: embed requires --features llm");
-                std::process::exit(1);
-            }
+            let ctx = Context::open(&cwd)?;
+            let result = handle_embed(&ctx)?;
+            format_embed_result(&result, cli.format);
         }
         Command::Serve => {
             run_server(cwd).await?;
+        }
+        Command::Stats { sessions, aggregate } => {
+            let ctx = Context::open(&cwd)?;
+            let result = handle_stats(&ctx, sessions, aggregate)?;
+            format_stats_result(&result, cli.format);
         }
     }
 
@@ -363,7 +340,6 @@ fn format_mget_results(results: &[(mdkb::domain::Document, String)], format: Out
     }
 }
 
-#[cfg(feature = "llm")]
 fn format_embed_result(result: &EmbedResult, format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -390,6 +366,68 @@ fn format_embed_result(result: &EmbedResult, format: OutputFormat) {
                 println!("Errors:    {}", result.errors.len());
                 for err in &result.errors {
                     println!("  - {}", err);
+                }
+            }
+        }
+    }
+}
+
+fn format_stats_result(result: &StatsResult, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(result).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("total_sessions,total_calls,total_tokens,total_truncations,avg_tokens_per_call");
+            println!(
+                "{},{},{},{},{:.1}",
+                result.aggregate.total_sessions,
+                result.aggregate.total_calls,
+                result.aggregate.total_tokens,
+                result.aggregate.total_truncations,
+                result.aggregate.avg_tokens_per_call,
+            );
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("=== Aggregate Stats ===");
+            println!("Total sessions:    {}", result.aggregate.total_sessions);
+            println!("Total calls:       {}", result.aggregate.total_calls);
+            println!("Total tokens:      {}", result.aggregate.total_tokens);
+            println!("Total truncations: {}", result.aggregate.total_truncations);
+            println!(
+                "Avg tokens/call:   {:.1}",
+                result.aggregate.avg_tokens_per_call
+            );
+
+            if !result.sessions.is_empty() {
+                println!("\n=== Recent Sessions ===");
+                for session in &result.sessions {
+                    let status = if session.ended_at.is_some() {
+                        "ended"
+                    } else {
+                        "active"
+                    };
+                    // Format timestamp as human-readable
+                    let started = chrono::DateTime::from_timestamp(session.started_at, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    println!(
+                        "\nSession {} - {} ({}):",
+                        session.id, started, status
+                    );
+                    println!("  Calls:       {}", session.total_calls);
+                    println!("  Tokens:      {}", session.total_tokens);
+                    println!("  Truncations: {}", session.truncation_count);
+
+                    if !session.tool_usage.is_empty() {
+                        println!("  Tools:");
+                        for tool in &session.tool_usage {
+                            println!(
+                                "    - {}: {} calls, {} tokens",
+                                tool.tool_name, tool.call_count, tool.total_tokens
+                            );
+                        }
+                    }
                 }
             }
         }

@@ -66,8 +66,5 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build (default features)
+      - name: Build release
         run: cargo build --release
-
-      - name: Build (with LLM)
-        run: cargo build --release --features llm

@@ -191,4 +191,154 @@ mod tests {
         assert!((config.bm25_weight - 1.0).abs() < 0.001);
         assert!((config.vector_weight - 0.7).abs() < 0.001);
     }
+
+    #[test]
+    fn test_rrf_weight_effects() {
+        let bm25 = vec![
+            make_bm25_result(1, -5.0), // BM25 prefers doc 1
+            make_bm25_result(2, -6.0),
+        ];
+        let vector = vec![
+            (2, 0.1), // Vector prefers doc 2
+            (1, 0.2),
+        ];
+
+        // Heavy BM25 weight should favor doc 1
+        let bm25_heavy = HybridConfig {
+            rrf_k: 60.0,
+            bm25_weight: 10.0,
+            vector_weight: 0.1,
+        };
+        let fused_bm25 = rrf_fusion(&bm25, &vector, &bm25_heavy);
+        assert_eq!(fused_bm25[0].0, 1);
+
+        // Heavy vector weight should favor doc 2
+        let vector_heavy = HybridConfig {
+            rrf_k: 60.0,
+            bm25_weight: 0.1,
+            vector_weight: 10.0,
+        };
+        let fused_vector = rrf_fusion(&bm25, &vector, &vector_heavy);
+        assert_eq!(fused_vector[0].0, 2);
+    }
+
+    #[test]
+    fn test_rrf_k_effect() {
+        let bm25 = vec![
+            make_bm25_result(1, -5.0),
+            make_bm25_result(2, -6.0),
+            make_bm25_result(3, -7.0),
+        ];
+        let vector: Vec<(i64, f32)> = vec![];
+
+        // Lower k = more emphasis on rank differences
+        let low_k = HybridConfig {
+            rrf_k: 1.0,
+            bm25_weight: 1.0,
+            vector_weight: 0.0,
+        };
+        let fused_low = rrf_fusion(&bm25, &vector, &low_k);
+
+        // Higher k = flattens rank differences
+        let high_k = HybridConfig {
+            rrf_k: 100.0,
+            bm25_weight: 1.0,
+            vector_weight: 0.0,
+        };
+        let fused_high = rrf_fusion(&bm25, &vector, &high_k);
+
+        // Score gap between rank 1 and 3 should be larger with low k
+        let gap_low = fused_low[0].1 - fused_low[2].1;
+        let gap_high = fused_high[0].1 - fused_high[2].1;
+        assert!(gap_low > gap_high);
+    }
+
+    #[test]
+    fn test_normalize_preserves_order() {
+        let mut scores = vec![(5, 0.05), (3, 0.03), (1, 0.01), (4, 0.04), (2, 0.02)];
+        let original_order: Vec<i64> = scores.iter().map(|(id, _)| *id).collect();
+
+        normalize_scores(&mut scores);
+
+        // Order should be preserved
+        let normalized_order: Vec<i64> = scores.iter().map(|(id, _)| *id).collect();
+        assert_eq!(original_order, normalized_order);
+
+        // Scores should be in [0, 1]
+        for (_, score) in &scores {
+            assert!(*score >= 0.0 && *score <= 1.0);
+        }
+
+        // Highest original score should become 1.0
+        assert!((scores[0].1 - 1.0).abs() < 0.001);
+        // Lowest original score should become 0.0
+        assert!((scores[2].1 - 0.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_rrf_many_results() {
+        // Test with many results to verify scalability
+        let bm25: Vec<SearchResult> = (1..=50)
+            .map(|i| make_bm25_result(i, -(i as f64)))
+            .collect();
+        let vector: Vec<(i64, f32)> = (51..=100).map(|i| (i, i as f32 * 0.01)).collect();
+
+        let config = HybridConfig::default();
+        let fused = rrf_fusion(&bm25, &vector, &config);
+
+        // Should have all 100 documents
+        assert_eq!(fused.len(), 100);
+
+        // All scores should be positive
+        for (_, score) in &fused {
+            assert!(*score > 0.0);
+        }
+
+        // BM25 docs should generally rank higher due to higher weight
+        let top_10: Vec<i64> = fused.iter().take(10).map(|(id, _)| *id).collect();
+        let bm25_in_top10 = top_10.iter().filter(|id| **id <= 50).count();
+        assert!(bm25_in_top10 >= 7); // Most of top 10 should be from BM25
+    }
+
+    #[test]
+    fn test_rrf_duplicate_in_both_lists() {
+        // Same document appearing in both lists should get boosted
+        let bm25 = vec![make_bm25_result(1, -5.0)];
+        let vector = vec![(1, 0.1)];
+
+        let config = HybridConfig::default();
+        let fused = rrf_fusion(&bm25, &vector, &config);
+
+        assert_eq!(fused.len(), 1);
+        // Should have contributions from both lists
+        let expected_score =
+            config.bm25_weight / (config.rrf_k + 1.0) + config.vector_weight / (config.rrf_k + 1.0);
+        assert!((fused[0].1 - expected_score).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_normalize_single_score() {
+        let mut scores = vec![(1, 0.5)];
+        normalize_scores(&mut scores);
+        // Single score should become 1.0 (range is 0, so all equal case)
+        assert!((scores[0].1 - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_rrf_score_calculation() {
+        // Verify exact RRF score calculation
+        let bm25 = vec![make_bm25_result(1, -5.0)];
+        let vector: Vec<(i64, f32)> = vec![];
+
+        let config = HybridConfig {
+            rrf_k: 60.0,
+            bm25_weight: 1.0,
+            vector_weight: 0.7,
+        };
+        let fused = rrf_fusion(&bm25, &vector, &config);
+
+        // RRF score = bm25_weight / (k + rank + 1) = 1.0 / (60 + 0 + 1) = 1/61
+        let expected = 1.0 / 61.0;
+        assert!((fused[0].1 - expected).abs() < 0.0001);
+    }
 }

@@ -4,14 +4,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-#[cfg(feature = "llm")]
-use crate::domain::SearchResult;
 use crate::domain::frontmatter::parse_frontmatter;
-use crate::domain::{Collection, Document, SearchQuery, UpdateResult};
+use crate::domain::{Collection, Document, SearchQuery, SearchResult, UpdateResult};
 use crate::error::{Error, ErrorKind, Result};
 use crate::store::collections;
 use crate::store::documents;
-#[cfg(feature = "llm")]
 use crate::store::hybrid;
 use crate::store::schema;
 use crate::store::search;
@@ -28,6 +25,15 @@ pub struct Context {
     pub config_path: PathBuf,
     /// Database path.
     pub db_path: PathBuf,
+}
+
+impl std::fmt::Debug for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Context")
+            .field("config_path", &self.config_path)
+            .field("db_path", &self.db_path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Context {
@@ -106,7 +112,18 @@ pub fn handle_init(root: impl AsRef<Path>) -> Result<()> {
 }
 
 /// Handle `mdkb collection add` command.
+///
+/// Validates that the collection path doesn't escape the root directory
+/// to prevent path traversal attacks.
 pub fn handle_collection_add(ctx: &Context, name: &str, path: &str, pattern: &str) -> Result<()> {
+    // Validate path doesn't contain traversal patterns (fixes P2-SEC-001)
+    if path.contains("..") {
+        return Err(Error::other(format!(
+            "Collection path '{}' contains path traversal pattern '..'",
+            path
+        )));
+    }
+
     let now = chrono::Utc::now().timestamp();
     let collection = Collection {
         name: name.to_string(),
@@ -153,28 +170,40 @@ pub fn handle_search(
 }
 
 /// Handle `mdkb vsearch` command - vector semantic search.
-#[cfg(feature = "llm")]
+///
+/// Uses batch document retrieval to avoid N+1 queries.
+/// Uses cached model to avoid 2-5 second load time per request.
 pub fn handle_vsearch(
     ctx: &Context,
     query_text: &str,
     limit: usize,
     collection: Option<&str>,
 ) -> Result<Vec<SearchResult>> {
-    use crate::llm::EmbeddingModel;
-
-    // Load embedding model
-    let model = EmbeddingModel::load(None, None)?;
+    // Use cached model to avoid reloading (fixes P1-PERF-003)
+    let model = crate::llm::get_cached_model()?;
 
     // Generate query embedding
     let query_embedding = model.embed_query(query_text)?;
 
-    // Perform vector search
-    let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, limit)?;
+    // Perform vector search - get more results to account for collection filtering
+    let fetch_limit = if collection.is_some() { limit * 2 } else { limit };
+    let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, fetch_limit)?;
 
-    // Convert to SearchResult format
+    if vector_results.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Batch retrieve all documents in a single query (fixes N+1 query pattern)
+    let doc_ids: Vec<i64> = vector_results.iter().map(|(id, _)| *id).collect();
+    let docs = documents::get_documents_batch(&ctx.conn, &doc_ids)?;
+
+    // Build a map for quick lookup
+    let doc_map: std::collections::HashMap<i64, _> = docs.into_iter().map(|d| (d.id, d)).collect();
+
+    // Convert to SearchResult format, preserving order from vector search
     let mut results = Vec::new();
     for (doc_id, distance) in vector_results {
-        if let Some(doc) = documents::get_document(&ctx.conn, doc_id)? {
+        if let Some(doc) = doc_map.get(&doc_id) {
             // Filter by collection if specified
             if let Some(coll) = collection {
                 if doc.collection != coll {
@@ -186,9 +215,14 @@ pub fn handle_vsearch(
                 id: doc.id,
                 path: doc.relative_path.clone(),
                 title: doc.title.clone(),
-                score: 1.0 - distance as f64, // Convert distance to similarity
+                score: 1.0 - f64::from(distance), // Convert distance to similarity
                 snippets: vec![],
             });
+
+            // Stop once we have enough results
+            if results.len() >= limit {
+                break;
+            }
         }
     }
 
@@ -196,15 +230,15 @@ pub fn handle_vsearch(
 }
 
 /// Handle `mdkb query` command - hybrid search with RRF fusion.
-#[cfg(feature = "llm")]
+///
+/// Uses batch document retrieval to avoid N+1 queries.
+/// Uses cached model to avoid 2-5 second load time per request.
 pub fn handle_hybrid_search(
     ctx: &Context,
     query_text: &str,
     limit: usize,
     collection: Option<&str>,
 ) -> Result<Vec<SearchResult>> {
-    use crate::llm::EmbeddingModel;
-
     // Get BM25 results
     let bm25_query = SearchQuery {
         text: query_text.to_string(),
@@ -214,8 +248,8 @@ pub fn handle_hybrid_search(
     };
     let bm25_results = search::search(&ctx.conn, &bm25_query)?;
 
-    // Load embedding model and get vector results
-    let model = EmbeddingModel::load(None, None)?;
+    // Use cached model to avoid reloading (fixes P1-PERF-003)
+    let model = crate::llm::get_cached_model()?;
     let query_embedding = model.embed_query(query_text)?;
     let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, limit * 2)?;
 
@@ -226,10 +260,21 @@ pub fn handle_hybrid_search(
     // Normalize scores
     hybrid::normalize_scores(&mut fused);
 
-    // Convert to SearchResult format
+    if fused.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Batch retrieve all documents in a single query (fixes N+1 query pattern)
+    let doc_ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
+    let docs = documents::get_documents_batch(&ctx.conn, &doc_ids)?;
+
+    // Build a map for quick lookup
+    let doc_map: std::collections::HashMap<i64, _> = docs.into_iter().map(|d| (d.id, d)).collect();
+
+    // Convert to SearchResult format, preserving RRF order
     let mut results = Vec::new();
-    for (doc_id, score) in fused.into_iter().take(limit) {
-        if let Some(doc) = documents::get_document(&ctx.conn, doc_id)? {
+    for (doc_id, score) in fused {
+        if let Some(doc) = doc_map.get(&doc_id) {
             // Filter by collection if specified
             if let Some(coll) = collection {
                 if doc.collection != coll {
@@ -244,6 +289,11 @@ pub fn handle_hybrid_search(
                 score,
                 snippets: vec![],
             });
+
+            // Stop once we have enough results
+            if results.len() >= limit {
+                break;
+            }
         }
     }
 
@@ -293,6 +343,8 @@ pub fn handle_get(
 }
 
 /// Handle `mdkb mget` command - batch retrieval by pattern.
+///
+/// Uses batch content retrieval to avoid N+1 queries.
 pub fn handle_mget(
     ctx: &Context,
     pattern: &str,
@@ -304,7 +356,7 @@ pub fn handle_mget(
 
     // Get all documents, optionally filtered by collection
     let all_collections = collections::list_collections(&ctx.conn)?;
-    let mut results = Vec::new();
+    let mut matching_docs = Vec::new();
 
     for coll in &all_collections {
         // Skip if collection filter doesn't match
@@ -318,14 +370,25 @@ pub fn handle_mget(
 
         for doc in docs {
             // Check if path matches pattern
-            if !glob.is_match(&doc.relative_path) {
-                continue;
+            if glob.is_match(&doc.relative_path) {
+                matching_docs.push(doc);
             }
+        }
+    }
 
-            // Get content
-            if let Some(content) = documents::get_content(&ctx.conn, &doc.hash)? {
-                results.push((doc, content));
-            }
+    if matching_docs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Batch retrieve all content in a single query (fixes N+1 query pattern)
+    let hashes: Vec<&str> = matching_docs.iter().map(|d| d.hash.as_str()).collect();
+    let content_map = documents::get_content_batch(&ctx.conn, &hashes)?;
+
+    // Combine documents with their content
+    let mut results = Vec::new();
+    for doc in matching_docs {
+        if let Some(content) = content_map.get(&doc.hash) {
+            results.push((doc, content.clone()));
         }
     }
 
@@ -333,16 +396,41 @@ pub fn handle_mget(
 }
 
 /// Handle `mdkb update` command - differential reindex.
+///
+/// Wraps all collection updates in a single transaction to ensure atomicity.
+/// If any operation fails, the entire update is rolled back.
 pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResult> {
     let root = root.as_ref();
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult::default();
 
-    for coll in &collections {
-        update_collection(ctx, root, coll, &mut result)?;
-    }
+    // Begin transaction for all updates
+    documents::begin_transaction(&ctx.conn)?;
 
-    Ok(result)
+    match update_all_collections(ctx, root, &collections, &mut result) {
+        Ok(()) => {
+            documents::commit_transaction(&ctx.conn)?;
+            Ok(result)
+        }
+        Err(e) => {
+            // Rollback on error
+            let _ = documents::rollback_transaction(&ctx.conn);
+            Err(e)
+        }
+    }
+}
+
+/// Update all collections within a transaction.
+fn update_all_collections(
+    ctx: &Context,
+    root: &Path,
+    collections: &[Collection],
+    result: &mut UpdateResult,
+) -> Result<()> {
+    for coll in collections {
+        update_collection(ctx, root, coll, result)?;
+    }
+    Ok(())
 }
 
 /// Update a single collection by scanning for file changes.
@@ -361,6 +449,25 @@ fn update_collection(
             base_path.display()
         ));
         return Ok(());
+    }
+
+    // Validate path stays within root to prevent path traversal (fixes P2-SEC-001)
+    let canonical_root = root.canonicalize().map_err(|e| {
+        Error::other(format!("Failed to canonicalize root path: {}", e))
+    })?;
+    let canonical_base = base_path.canonicalize().map_err(|e| {
+        Error::other(format!(
+            "Failed to canonicalize collection path '{}': {}",
+            base_path.display(),
+            e
+        ))
+    })?;
+
+    if !canonical_base.starts_with(&canonical_root) {
+        return Err(Error::other(format!(
+            "Collection path '{}' escapes root directory (path traversal blocked)",
+            collection.path
+        )));
     }
 
     // Build glob matcher
@@ -459,7 +566,8 @@ fn update_collection(
             indexed_at: now,
         };
 
-        match documents::index_document(&ctx.conn, &doc, &content) {
+        // Use in-transaction version since we're inside a transaction
+        match documents::index_document_in_tx(&ctx.conn, &doc, &content) {
             Ok(_) => {
                 if existing_doc.is_some() {
                     result.updated += 1;
@@ -497,14 +605,14 @@ fn update_collection(
 
 /// Generate embeddings for all documents that don't have them.
 /// This is a separate operation that can be run after update.
-#[cfg(feature = "llm")]
+///
+/// Uses batch content retrieval to avoid N+1 queries.
+/// Uses cached model to avoid 2-5 second load time per request.
 pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
-    use crate::llm::EmbeddingModel;
-
     let mut result = EmbedResult::default();
 
-    // Load embedding model
-    let model = EmbeddingModel::load(None, None)?;
+    // Use cached model to avoid reloading (fixes P1-PERF-003)
+    let model = crate::llm::get_cached_model()?;
 
     // Get all documents
     let all_collections = collections::list_collections(&ctx.conn)?;
@@ -512,24 +620,33 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
     for coll in &all_collections {
         let docs = documents::list_documents(&ctx.conn, &coll.name)?;
 
+        // Filter to docs that need embedding
+        let mut docs_needing_embedding = Vec::new();
         for doc in docs {
-            // Skip if already has embedding
             if vectors::has_embedding(&ctx.conn, doc.id)? {
                 result.skipped += 1;
-                continue;
+            } else {
+                docs_needing_embedding.push(doc);
             }
+        }
 
-            // Get content
-            let content = match documents::get_content(&ctx.conn, &doc.hash)? {
-                Some(c) => c,
-                None => {
-                    result.errors.push(format!("No content for doc {}", doc.id));
-                    continue;
-                }
+        if docs_needing_embedding.is_empty() {
+            continue;
+        }
+
+        // Batch retrieve all content in a single query (fixes N+1 query pattern)
+        let hashes: Vec<&str> = docs_needing_embedding.iter().map(|d| d.hash.as_str()).collect();
+        let content_map = documents::get_content_batch(&ctx.conn, &hashes)?;
+
+        for doc in docs_needing_embedding {
+            // Get content from batch result
+            let Some(content) = content_map.get(&doc.hash) else {
+                result.errors.push(format!("No content for doc {}", doc.id));
+                continue;
             };
 
             // Generate embedding
-            match model.embed(&content) {
+            match model.embed(content) {
                 Ok(embedding) => {
                     vectors::store_embedding(
                         &ctx.conn,
@@ -553,7 +670,6 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
 }
 
 /// Result of embedding generation.
-#[cfg(feature = "llm")]
 #[derive(Debug, Clone, Default)]
 pub struct EmbedResult {
     /// Number of embeddings generated.
@@ -562,6 +678,99 @@ pub struct EmbedResult {
     pub skipped: usize,
     /// Errors encountered.
     pub errors: Vec<String>,
+}
+
+/// Stats result from handle_stats.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct StatsResult {
+    /// Aggregate stats across all sessions.
+    pub aggregate: AggregateStats,
+    /// Recent sessions.
+    pub sessions: Vec<SessionStats>,
+}
+
+/// Aggregate stats.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct AggregateStats {
+    pub total_sessions: i64,
+    pub total_calls: i64,
+    pub total_tokens: i64,
+    pub total_truncations: i64,
+    pub avg_tokens_per_call: f64,
+}
+
+/// Session stats.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionStats {
+    pub id: i64,
+    pub started_at: i64,
+    pub ended_at: Option<i64>,
+    pub total_calls: i64,
+    pub total_tokens: i64,
+    pub truncation_count: i64,
+    pub tool_usage: Vec<ToolUsageStats>,
+}
+
+/// Tool usage within a session.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolUsageStats {
+    pub tool_name: String,
+    pub call_count: i64,
+    pub total_tokens: i64,
+    pub total_results: i64,
+}
+
+/// Handle stats command.
+pub fn handle_stats(ctx: &Context, sessions: usize, aggregate_only: bool) -> Result<StatsResult> {
+    use crate::store::stats;
+
+    // Initialize schema if needed
+    stats::init_stats_schema(&ctx.conn)?;
+
+    let agg = stats::get_aggregate_stats(&ctx.conn)?;
+    let aggregate = AggregateStats {
+        total_sessions: agg.total_sessions,
+        total_calls: agg.total_calls,
+        total_tokens: agg.total_tokens,
+        total_truncations: agg.total_truncations,
+        avg_tokens_per_call: agg.avg_tokens_per_call,
+    };
+
+    let sessions_list = if aggregate_only {
+        vec![]
+    } else {
+        let recent = stats::get_recent_sessions(&ctx.conn, sessions)?;
+        recent
+            .into_iter()
+            .map(|s| {
+                let tool_usage = stats::get_tool_usage(&ctx.conn, s.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|t| ToolUsageStats {
+                        tool_name: t.tool_name,
+                        call_count: t.call_count,
+                        total_tokens: t.total_tokens,
+                        total_results: t.total_results,
+                    })
+                    .collect();
+
+                SessionStats {
+                    id: s.id,
+                    started_at: s.started_at,
+                    ended_at: s.ended_at,
+                    total_calls: s.total_calls,
+                    total_tokens: s.total_tokens,
+                    truncation_count: s.truncation_count,
+                    tool_usage,
+                }
+            })
+            .collect()
+    };
+
+    Ok(StatsResult {
+        aggregate,
+        sessions: sessions_list,
+    })
 }
 
 /// Apply line range (e.g., "10:50") to content.

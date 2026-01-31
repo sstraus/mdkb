@@ -20,9 +20,12 @@ pub mod domain;
 pub mod error;
 pub mod llm;
 pub mod mcp;
+pub mod metrics;
 pub mod store;
 pub mod watcher;
 
 // Re-export main types
+#[doc(inline)]
 pub use config::Config;
+#[doc(inline)]
 pub use error::{Error, ErrorKind, Result};

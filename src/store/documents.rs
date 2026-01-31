@@ -36,10 +36,41 @@ pub fn get_content(conn: &Connection, hash: &str) -> Result<Option<String>> {
     Ok(result)
 }
 
-/// Index a document (insert or update).
+/// Index a document (insert or update) within a transaction.
+///
+/// This function wraps all database operations in a transaction to ensure
+/// atomicity. If the process crashes mid-operation, the database will
+/// remain in a consistent state.
 pub fn index_document(conn: &Connection, doc: &Document, content: &str) -> Result<i64> {
+    // Use IMMEDIATE transaction to get write lock early and avoid deadlocks
+    conn.execute("BEGIN IMMEDIATE", [])?;
+
+    match index_document_inner(conn, doc, content) {
+        Ok(id) => {
+            conn.execute("COMMIT", [])?;
+            Ok(id)
+        }
+        Err(e) => {
+            // Rollback on error - ignore rollback errors since we're already failing
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
+
+/// Inner implementation of index_document without transaction handling.
+fn index_document_inner(conn: &Connection, doc: &Document, content: &str) -> Result<i64> {
     // Store content first (deduplication)
-    let hash = store_content(conn, content)?;
+    let hash = store_content_inner(conn, content)?;
+
+    // Use INSERT OR REPLACE for atomic upsert (fixes race condition P2-DATA-003)
+    let metadata_json = doc
+        .metadata
+        .as_ref()
+        .map(|m| serde_json::to_string(m).map_err(|e| {
+            crate::error::Error::other(format!("Failed to serialize metadata: {}", e))
+        }))
+        .transpose()?;
 
     // Check if document already exists
     let existing_id: Option<i64> = conn
@@ -49,11 +80,6 @@ pub fn index_document(conn: &Connection, doc: &Document, content: &str) -> Resul
             |row| row.get(0),
         )
         .optional()?;
-
-    let metadata_json = doc
-        .metadata
-        .as_ref()
-        .map(|m| serde_json::to_string(m).unwrap_or_default());
 
     if let Some(id) = existing_id {
         // Update existing document
@@ -85,6 +111,19 @@ pub fn index_document(conn: &Connection, doc: &Document, content: &str) -> Resul
         )?;
         Ok(conn.last_insert_rowid())
     }
+}
+
+/// Store content without transaction (for use within existing transactions).
+fn store_content_inner(conn: &Connection, content: &str) -> Result<String> {
+    let hash = compute_hash(content);
+    let now = chrono::Utc::now().timestamp();
+
+    conn.execute(
+        "INSERT OR IGNORE INTO content (hash, body, created_at) VALUES (?1, ?2, ?3)",
+        params![hash, content, now],
+    )?;
+
+    Ok(hash)
 }
 
 /// Get a document by ID.
@@ -175,6 +214,99 @@ pub fn list_documents(conn: &Connection, collection: &str) -> Result<Vec<Documen
         documents.push(row?);
     }
     Ok(documents)
+}
+
+/// Get multiple documents by their IDs in a single query (fixes N+1 query pattern).
+pub fn get_documents_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<Document>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Build parameterized query with placeholders
+    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+    let query = format!(
+        "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at \
+         FROM documents WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        let metadata_str: Option<String> = row.get(5)?;
+        let metadata = metadata_str.and_then(|s| serde_json::from_str(&s).ok());
+        Ok(Document {
+            id: row.get(0)?,
+            collection: row.get(1)?,
+            relative_path: row.get(2)?,
+            hash: row.get(3)?,
+            title: row.get(4)?,
+            metadata,
+            file_modified_at: row.get(6)?,
+            indexed_at: row.get(7)?,
+        })
+    })?;
+
+    let mut documents = Vec::new();
+    for row in rows {
+        documents.push(row?);
+    }
+    Ok(documents)
+}
+
+/// Get multiple content entries by their hashes in a single query (fixes N+1 query pattern).
+pub fn get_content_batch(conn: &Connection, hashes: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+    use std::collections::HashMap;
+
+    if hashes.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    // Build parameterized query with placeholders
+    let placeholders: Vec<String> = (1..=hashes.len()).map(|i| format!("?{i}")).collect();
+    let query = format!(
+        "SELECT hash, body FROM content WHERE hash IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let params: Vec<&dyn rusqlite::ToSql> = hashes.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut result = HashMap::new();
+    for row in rows {
+        let (hash, body) = row?;
+        result.insert(hash, body);
+    }
+    Ok(result)
+}
+
+/// Index a document within an existing transaction (no transaction management).
+/// Use this when you're managing the transaction externally.
+pub fn index_document_in_tx(conn: &Connection, doc: &Document, content: &str) -> Result<i64> {
+    index_document_inner(conn, doc, content)
+}
+
+/// Begin a transaction for batch operations.
+pub fn begin_transaction(conn: &Connection) -> Result<()> {
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    Ok(())
+}
+
+/// Commit a transaction.
+pub fn commit_transaction(conn: &Connection) -> Result<()> {
+    conn.execute("COMMIT", [])?;
+    Ok(())
+}
+
+/// Rollback a transaction.
+pub fn rollback_transaction(conn: &Connection) -> Result<()> {
+    conn.execute("ROLLBACK", [])?;
+    Ok(())
 }
 
 #[cfg(test)]

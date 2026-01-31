@@ -5,6 +5,7 @@ pub mod documents;
 pub mod hybrid;
 pub mod schema;
 pub mod search;
+pub mod stats;
 pub mod vectors;
 
 use std::path::Path;
@@ -16,8 +17,27 @@ pub struct Store {
     conn: rusqlite::Connection,
 }
 
+impl std::fmt::Debug for Store {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Store").finish_non_exhaustive()
+    }
+}
+
 impl Store {
     /// Open or create a database at the given path.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use mdkb::store::Store;
+    ///
+    /// let store = Store::open(".mdkb/index.sqlite")?;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database file can't be created or opened,
+    /// or if SQLite initialization fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = rusqlite::Connection::open(path)?;
         let store = Self { conn };

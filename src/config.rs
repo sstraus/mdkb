@@ -24,6 +24,9 @@ pub struct Config {
 
     /// LLM models configuration (Phase 3+).
     pub models: ModelsConfig,
+
+    /// MCP server configuration.
+    pub mcp: McpConfig,
 }
 
 /// Indexing settings.
@@ -135,6 +138,23 @@ pub struct ModelsConfig {
     pub inactivity_timeout_secs: u64,
 }
 
+/// MCP server settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Maximum tokens per response (0 = unlimited).
+    pub max_response_tokens: usize,
+
+    /// Maximum tokens per document in multi_get (0 = unlimited).
+    pub max_document_tokens: usize,
+
+    /// Truncate content with ellipsis when exceeding limits.
+    pub truncate_with_ellipsis: bool,
+
+    /// Include token count in response metadata.
+    pub include_token_count: bool,
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -143,6 +163,7 @@ impl Default for Config {
             search: SearchConfig::default(),
             memory: MemoryConfig::default(),
             models: ModelsConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -210,6 +231,17 @@ impl Default for ModelsConfig {
     }
 }
 
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            max_response_tokens: DEFAULT_MAX_RESPONSE_TOKENS,
+            max_document_tokens: DEFAULT_MAX_DOCUMENT_TOKENS,
+            truncate_with_ellipsis: true,
+            include_token_count: false,
+        }
+    }
+}
+
 /// Valid chunking strategies.
 const VALID_CHUNKING_STRATEGIES: &[&str] = &["fixed", "markdown", "semantic"];
 
@@ -255,6 +287,16 @@ const DEFAULT_BM25_WEIGHT: f64 = 1.0;
 /// exact keyword matches are often more reliable than semantic similarity.
 const DEFAULT_VECTOR_WEIGHT: f64 = 0.7;
 
+/// Maximum tokens per MCP response.
+/// 50,000 tokens is a reasonable limit that fits within most LLM context windows
+/// while providing substantial content. Set to 0 for unlimited.
+const DEFAULT_MAX_RESPONSE_TOKENS: usize = 50_000;
+
+/// Maximum tokens per document in multi_get.
+/// 10,000 tokens per document prevents single large files from consuming
+/// the entire response budget. Set to 0 for unlimited.
+const DEFAULT_MAX_DOCUMENT_TOKENS: usize = 10_000;
+
 /// Top-k candidates for reranking.
 /// 50 provides a good balance: enough candidates for the reranker to find good
 /// results, but not so many that reranking becomes slow.
@@ -271,6 +313,21 @@ const DEFAULT_INACTIVITY_TIMEOUT_SECS: u64 = 120;
 
 impl Config {
     /// Load configuration from a TOML file.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use mdkb::Config;
+    ///
+    /// let config = Config::load(".mdkb/config.toml")?;
+    /// println!("Search limit: {}", config.search.default_limit);
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ErrorKind::ConfigNotFound`] if the file doesn't exist.
+    /// Returns [`ErrorKind::Io`] if the file can't be read.
+    /// Returns [`ErrorKind::TomlParse`] if the TOML is malformed.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if !path.exists() {

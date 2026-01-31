@@ -9,4 +9,5 @@
 pub mod server;
 pub mod tools;
 
+#[doc(inline)]
 pub use server::McpServer;

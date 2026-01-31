@@ -50,6 +50,12 @@ pub struct FileWatcher {
     receiver: mpsc::Receiver<FileChange>,
 }
 
+impl std::fmt::Debug for FileWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileWatcher").finish_non_exhaustive()
+    }
+}
+
 impl FileWatcher {
     /// Create a new file watcher.
     pub fn new(config: WatcherConfig) -> Result<Self> {

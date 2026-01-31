@@ -2,6 +2,7 @@
 
 use std::borrow::Cow;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use rmcp::ServiceExt;
@@ -13,11 +14,11 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
-use crate::cli::handlers::{Context, handle_mget, handle_update};
-#[cfg(feature = "llm")]
-use crate::cli::handlers::{handle_hybrid_search, handle_vsearch};
+use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_update, handle_vsearch};
+use crate::config::McpConfig;
 use crate::domain::{SearchQuery, SearchResult};
-use crate::store::{collections, documents, search};
+use crate::metrics::{count_tokens, truncate_with_continuation, truncate_with_ellipsis, UsageMetrics};
+use crate::store::{collections, documents, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{GetParams, MultiGetParams, SearchParams};
@@ -40,28 +41,108 @@ pub struct McpServer {
     ctx: Arc<Mutex<Option<Context>>>,
     /// Tool router.
     tool_router: ToolRouter<Self>,
+    /// Usage metrics tracker (in-memory).
+    metrics: Arc<UsageMetrics>,
+    /// MCP configuration.
+    config: McpConfig,
+    /// Current session ID for persistent stats.
+    session_id: Arc<AtomicI64>,
+}
+
+impl std::fmt::Debug for McpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpServer")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
 }
 
 #[tool_router]
 impl McpServer {
-    /// Create a new MCP server.
+    /// Create a new MCP server with default config.
     pub fn new(root: PathBuf) -> Self {
+        Self::with_config(root, McpConfig::default())
+    }
+
+    /// Create a new MCP server with custom config.
+    pub fn with_config(root: PathBuf, config: McpConfig) -> Self {
         Self {
             root,
             ctx: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
+            metrics: Arc::new(UsageMetrics::new()),
+            config,
+            session_id: Arc::new(AtomicI64::new(0)),
         }
     }
 
-    /// Initialize the database connection.
+    /// Get the usage metrics.
+    pub fn metrics(&self) -> &UsageMetrics {
+        &self.metrics
+    }
+
+    /// Apply token limit to output, truncating if necessary.
+    fn apply_token_limit(&self, output: String) -> String {
+        let max = self.config.max_response_tokens;
+        if max == 0 {
+            return output;
+        }
+
+        let tokens = count_tokens(&output);
+        if tokens <= max {
+            return output;
+        }
+
+        if self.config.truncate_with_ellipsis {
+            truncate_with_ellipsis(&output, max)
+        } else {
+            crate::metrics::tokens::truncate_to_tokens(&output, max).0
+        }
+    }
+
+    /// Initialize the database connection and stats session.
     async fn ensure_context(&self) -> Result<(), McpError> {
         let mut ctx_guard = self.ctx.lock().await;
         if ctx_guard.is_none() {
             let ctx = Context::open(&self.root)
                 .map_err(|e| mcp_error(format!("Failed to open database: {}", e)))?;
+
+            // Initialize stats schema
+            stats::init_stats_schema(&ctx.conn)
+                .map_err(|e| mcp_error(format!("Failed to init stats schema: {}", e)))?;
+
+            // Create a new session if we don't have one
+            if self.session_id.load(Ordering::Relaxed) == 0 {
+                let session_id = stats::create_session(&ctx.conn)
+                    .map_err(|e| mcp_error(format!("Failed to create session: {}", e)))?;
+                self.session_id.store(session_id, Ordering::Relaxed);
+                tracing::info!("Started stats session {}", session_id);
+            }
+
             *ctx_guard = Some(ctx);
         }
         Ok(())
+    }
+
+    /// Record a tool call to persistent stats.
+    async fn record_persistent_call(
+        &self,
+        tool_name: &str,
+        tokens: usize,
+        results: usize,
+        truncated: bool,
+    ) {
+        let session_id = self.session_id.load(Ordering::Relaxed);
+        if session_id == 0 {
+            return; // No session yet
+        }
+
+        let ctx_guard = self.ctx.lock().await;
+        if let Some(ctx) = ctx_guard.as_ref() {
+            if let Err(e) = stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated) {
+                tracing::warn!("Failed to record call stats: {}", e);
+            }
+        }
     }
 
     /// Search documents using BM25 full-text search.
@@ -88,6 +169,12 @@ impl McpServer {
             .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
         let output = format_search_results(&results);
+        let tokens = count_tokens(&output);
+        let result_count = results.len();
+        self.metrics.record_search(tokens, result_count);
+        self.record_persistent_call("search", tokens, result_count, false).await;
+        tracing::debug!("mdkb_search: {} tokens, {} results", tokens, result_count);
+
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -125,6 +212,60 @@ impl McpServer {
             content
         };
 
+        // Apply token limit with continuation guidance
+        let max_tokens = self.config.max_response_tokens;
+        let (output, truncated) = if max_tokens > 0 {
+            let result = truncate_with_continuation(&output, max_tokens, doc.id);
+            (result.content, result.truncated)
+        } else {
+            (output, false)
+        };
+
+        let tokens = count_tokens(&output);
+        self.metrics.record_get(tokens);
+        self.record_persistent_call("get", tokens, 1, truncated).await;
+        tracing::debug!("mdkb_get: {} tokens, truncated={}", tokens, truncated);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// List all collections.
+    #[tool(description = "List all indexed collections with their paths and document counts")]
+    async fn mdkb_list_collections(&self) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        let coll_list = collections::list_collections(&ctx.conn)
+            .map_err(|e| mcp_error(format!("Failed to list collections: {}", e)))?;
+
+        if coll_list.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No collections found. Use 'mdkb collection add <name> <path>' to add one.",
+            )]));
+        }
+
+        let mut output = String::from("Collections:\n");
+        for coll in &coll_list {
+            // Get document count for this collection
+            let doc_count = collections::get_collection_document_count(&ctx.conn, &coll.name)
+                .unwrap_or(0);
+            output.push_str(&format!(
+                "- {} ({}): {} documents\n  Pattern: {}\n",
+                coll.name,
+                coll.path,
+                doc_count,
+                coll.pattern
+            ));
+        }
+
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("list_collections", tokens, coll_list.len(), false).await;
+        tracing::debug!("mdkb_list_collections: {} tokens, {} collections", tokens, coll_list.len());
+
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -146,6 +287,11 @@ impl McpServer {
             status.collections, status.documents, status.stale_documents, status.db_size_bytes
         );
 
+        let tokens = count_tokens(&output);
+        self.metrics.record_status(tokens);
+        self.record_persistent_call("status", tokens, 1, false).await;
+        tracing::debug!("mdkb_status: {} tokens", tokens);
+
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -166,6 +312,11 @@ impl McpServer {
             "Added: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
             result.added, result.updated, result.removed, result.unchanged
         );
+
+        let tokens = count_tokens(&output);
+        self.metrics.record_update(tokens);
+        self.record_persistent_call("update", tokens, 1, false).await;
+        tracing::debug!("mdkb_update: {} tokens", tokens);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -193,85 +344,174 @@ impl McpServer {
         }
 
         let mut output = format!("Found {} documents:\n\n", results.len());
+        let doc_limit = self.config.max_document_tokens;
+
         for (doc, content) in &results {
             let title = doc.title.as_deref().unwrap_or("(untitled)");
+
+            // Apply per-document token limit if configured
+            let truncated_content = if doc_limit > 0 {
+                let content_tokens = count_tokens(content);
+                if content_tokens > doc_limit {
+                    if self.config.truncate_with_ellipsis {
+                        truncate_with_ellipsis(content, doc_limit)
+                    } else {
+                        crate::metrics::tokens::truncate_to_tokens(content, doc_limit).0
+                    }
+                } else {
+                    content.clone()
+                }
+            } else {
+                content.clone()
+            };
+
             output.push_str(&format!(
                 "=== [{}] {} - {} ===\n{}\n\n",
-                doc.id, doc.relative_path, title, content
+                doc.id, doc.relative_path, title, truncated_content
             ));
         }
+
+        // Apply overall response limit
+        let original_len = output.len();
+        let output = self.apply_token_limit(output);
+        let truncated = output.len() < original_len;
+        let tokens = count_tokens(&output);
+        let result_count = results.len();
+        self.metrics.record_multi_get(tokens, result_count);
+        self.record_persistent_call("multi_get", tokens, result_count, truncated).await;
+        tracing::debug!("mdkb_multi_get: {} tokens, {} docs, truncated={}", tokens, result_count, truncated);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     /// Semantic vector search using document embeddings.
-    #[tool(description = "Semantic vector search using document embeddings (requires LLM feature)")]
+    #[tool(description = "Semantic vector search using document embeddings")]
     async fn mdkb_vsearch(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        #[cfg(feature = "llm")]
-        {
-            self.ensure_context().await?;
+        self.ensure_context().await?;
 
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            let results = handle_vsearch(
-                ctx,
-                &params.query,
-                params.limit,
-                params.collection.as_deref(),
-            )
-            .map_err(|e| mcp_error(format!("Vector search failed: {}", e)))?;
+        let results = handle_vsearch(
+            ctx,
+            &params.query,
+            params.limit,
+            params.collection.as_deref(),
+        )
+        .map_err(|e| mcp_error(format!("Vector search failed: {}", e)))?;
 
-            let output = format_search_results(&results);
-            Ok(CallToolResult::success(vec![Content::text(output)]))
-        }
+        let output = format_search_results(&results);
+        let tokens = count_tokens(&output);
+        let result_count = results.len();
+        self.metrics.record_vsearch(tokens, result_count);
+        self.record_persistent_call("vsearch", tokens, result_count, false).await;
+        tracing::debug!("mdkb_vsearch: {} tokens, {} results", tokens, result_count);
 
-        #[cfg(not(feature = "llm"))]
-        {
-            let _ = params;
-            Err(mcp_error("Vector search requires --features llm"))
-        }
+        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     /// Hybrid search combining keyword and semantic search with RRF fusion.
-    #[tool(
-        description = "Hybrid search combining BM25 and vector search with RRF fusion (requires LLM feature)"
-    )]
+    #[tool(description = "Hybrid search combining BM25 and vector search with RRF fusion")]
     async fn mdkb_query(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        #[cfg(feature = "llm")]
-        {
-            self.ensure_context().await?;
+        self.ensure_context().await?;
 
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            let results = handle_hybrid_search(
-                ctx,
-                &params.query,
-                params.limit,
-                params.collection.as_deref(),
-            )
-            .map_err(|e| mcp_error(format!("Hybrid search failed: {}", e)))?;
+        let results = handle_hybrid_search(
+            ctx,
+            &params.query,
+            params.limit,
+            params.collection.as_deref(),
+        )
+        .map_err(|e| mcp_error(format!("Hybrid search failed: {}", e)))?;
 
-            let output = format_search_results(&results);
-            Ok(CallToolResult::success(vec![Content::text(output)]))
+        let output = format_search_results(&results);
+        let tokens = count_tokens(&output);
+        let result_count = results.len();
+        self.metrics.record_query(tokens, result_count);
+        self.record_persistent_call("query", tokens, result_count, false).await;
+        tracing::debug!("mdkb_query: {} tokens, {} results", tokens, result_count);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Get usage metrics for all tools.
+    #[tool(description = "Get token usage metrics for all MCP tools (session and historical)")]
+    async fn mdkb_metrics(&self) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let summary = self.metrics.summary();
+        let mut output = format!(
+            "=== Current Session ===\n\
+             Total calls: {}\n\
+             Total tokens: {}\n\
+             Avg tokens/call: {:.1}\n\n\
+             Tool breakdown:\n\
+             - search:    {} calls, {} tokens ({:.1} avg)\n\
+             - vsearch:   {} calls, {} tokens ({:.1} avg)\n\
+             - query:     {} calls, {} tokens ({:.1} avg)\n\
+             - get:       {} calls, {} tokens ({:.1} avg)\n\
+             - multi_get: {} calls, {} tokens ({:.1} avg)\n\
+             - status:    {} calls, {} tokens ({:.1} avg)\n\
+             - update:    {} calls, {} tokens ({:.1} avg)",
+            summary.total_calls,
+            summary.total_tokens,
+            summary.avg_tokens_per_call,
+            summary.search.call_count,
+            summary.search.total_tokens,
+            summary.search.avg_tokens_per_call,
+            summary.vsearch.call_count,
+            summary.vsearch.total_tokens,
+            summary.vsearch.avg_tokens_per_call,
+            summary.query.call_count,
+            summary.query.total_tokens,
+            summary.query.avg_tokens_per_call,
+            summary.get.call_count,
+            summary.get.total_tokens,
+            summary.get.avg_tokens_per_call,
+            summary.multi_get.call_count,
+            summary.multi_get.total_tokens,
+            summary.multi_get.avg_tokens_per_call,
+            summary.status.call_count,
+            summary.status.total_tokens,
+            summary.status.avg_tokens_per_call,
+            summary.update.call_count,
+            summary.update.total_tokens,
+            summary.update.avg_tokens_per_call,
+        );
+
+        // Add historical stats from SQLite
+        let ctx_guard = self.ctx.lock().await;
+        if let Some(ctx) = ctx_guard.as_ref() {
+            if let Ok(aggregate) = stats::get_aggregate_stats(&ctx.conn) {
+                output.push_str(&format!(
+                    "\n\n=== All-Time Stats ===\n\
+                     Total sessions: {}\n\
+                     Total calls: {}\n\
+                     Total tokens: {}\n\
+                     Total truncations: {}\n\
+                     Avg tokens/call: {:.1}",
+                    aggregate.total_sessions,
+                    aggregate.total_calls,
+                    aggregate.total_tokens,
+                    aggregate.total_truncations,
+                    aggregate.avg_tokens_per_call,
+                ));
+            }
         }
 
-        #[cfg(not(feature = "llm"))]
-        {
-            let _ = params;
-            Err(mcp_error("Hybrid search requires --features llm"))
-        }
+        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 }
 
@@ -293,7 +533,27 @@ impl ServerHandler for McpServer {
 
 /// Run the MCP server on stdio with file watching.
 pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
-    let server = McpServer::new(root.clone());
+    // Load config if available
+    let config_path = root.join(".mdkb/config.toml");
+    let mcp_config = if config_path.exists() {
+        match crate::Config::load(&config_path) {
+            Ok(config) => config.mcp,
+            Err(e) => {
+                tracing::warn!("Failed to load config, using defaults: {}", e);
+                McpConfig::default()
+            }
+        }
+    } else {
+        McpConfig::default()
+    };
+
+    tracing::info!(
+        "MCP config: max_response_tokens={}, max_document_tokens={}",
+        mcp_config.max_response_tokens,
+        mcp_config.max_document_tokens
+    );
+
+    let server = McpServer::with_config(root.clone(), mcp_config);
     let (stdin, stdout) = rmcp::transport::io::stdio();
 
     tracing::info!("Starting mdkb MCP server...");
