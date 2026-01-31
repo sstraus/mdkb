@@ -10,6 +10,8 @@ use mdkb::cli::handlers::{
     handle_collection_rename, handle_get, handle_init, handle_mget, handle_search, handle_status,
     handle_update, Context,
 };
+#[cfg(feature = "llm")]
+use mdkb::cli::handlers::{handle_embed, handle_hybrid_search, handle_vsearch, EmbedResult};
 use mdkb::cli::{Cli, CollectionCommand, Command, OutputFormat};
 use mdkb::mcp::server::run_server;
 use mdkb::Result;
@@ -129,6 +131,19 @@ async fn main() -> Result<()> {
             let ctx = Context::open(&cwd)?;
             let result = handle_update(&ctx, &cwd)?;
             format_update_result(&result, cli.format);
+        }
+        Command::Embed => {
+            #[cfg(feature = "llm")]
+            {
+                let ctx = Context::open(&cwd)?;
+                let result = handle_embed(&ctx)?;
+                format_embed_result(&result, cli.format);
+            }
+            #[cfg(not(feature = "llm"))]
+            {
+                eprintln!("Error: embed requires --features llm");
+                std::process::exit(1);
+            }
         }
         Command::Serve => {
             run_server(cwd).await?;
@@ -323,6 +338,34 @@ fn format_mget_results(results: &[(mdkb::domain::Document, String)], format: Out
                     let title = doc.title.as_deref().unwrap_or("(untitled)");
                     println!("=== [{}] {} - {} ===", doc.id, doc.relative_path, title);
                     println!("{}\n", content);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "llm")]
+fn format_embed_result(result: &EmbedResult, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "generated": result.generated,
+                "skipped": result.skipped,
+                "errors": result.errors,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("generated,skipped,errors");
+            println!("{},{},{}", result.generated, result.skipped, result.errors.len());
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("Generated: {}", result.generated);
+            println!("Skipped:   {}", result.skipped);
+            if !result.errors.is_empty() {
+                println!("Errors:    {}", result.errors.len());
+                for err in &result.errors {
+                    println!("  - {}", err);
                 }
             }
         }

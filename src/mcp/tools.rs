@@ -36,8 +36,12 @@ pub struct GetParams {
 /// Parameters for the multi_get tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct MultiGetParams {
-    /// Pattern to match (glob or regex).
+    /// Pattern to match (glob).
     pub pattern: String,
+
+    /// Optional collection filter.
+    #[serde(default)]
+    pub collection: Option<String>,
 }
 
 #[cfg(test)]

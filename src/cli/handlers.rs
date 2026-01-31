@@ -6,11 +6,16 @@ use std::path::{Path, PathBuf};
 use crate::config::Config;
 use crate::domain::frontmatter::parse_frontmatter;
 use crate::domain::{Collection, Document, SearchQuery, UpdateResult};
+#[cfg(feature = "llm")]
+use crate::domain::SearchResult;
 use crate::error::{Error, Result};
 use crate::store::collections;
 use crate::store::documents;
 use crate::store::schema;
 use crate::store::search;
+use crate::store::vectors;
+#[cfg(feature = "llm")]
+use crate::store::hybrid;
 use globset::Glob;
 use rusqlite::Connection;
 use walkdir::WalkDir;
@@ -66,10 +71,14 @@ impl Context {
         let config_str = toml::to_string_pretty(&config)?;
         std::fs::write(&config_path, config_str)?;
 
+        // Initialize sqlite-vec extension
+        vectors::init_sqlite_vec();
+
         // Create and initialize database
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::init_schema(&conn)?;
+        vectors::init_vector_schema(&conn)?;
 
         Ok(Self {
             conn,
@@ -140,6 +149,104 @@ pub fn handle_search(
     };
 
     search::search(&ctx.conn, &query)
+}
+
+/// Handle `mdkb vsearch` command - vector semantic search.
+#[cfg(feature = "llm")]
+pub fn handle_vsearch(
+    ctx: &Context,
+    query_text: &str,
+    limit: usize,
+    collection: Option<&str>,
+) -> Result<Vec<SearchResult>> {
+    use crate::llm::EmbeddingModel;
+
+    // Load embedding model
+    let model = EmbeddingModel::load(None, None)?;
+
+    // Generate query embedding
+    let query_embedding = model.embed_query(query_text)?;
+
+    // Perform vector search
+    let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, limit)?;
+
+    // Convert to SearchResult format
+    let mut results = Vec::new();
+    for (doc_id, distance) in vector_results {
+        if let Some(doc) = documents::get_document(&ctx.conn, doc_id)? {
+            // Filter by collection if specified
+            if let Some(coll) = collection {
+                if doc.collection != coll {
+                    continue;
+                }
+            }
+
+            results.push(SearchResult {
+                id: doc.id,
+                path: doc.relative_path.clone(),
+                title: doc.title.clone(),
+                score: 1.0 - distance as f64, // Convert distance to similarity
+                snippets: vec![],
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+/// Handle `mdkb query` command - hybrid search with RRF fusion.
+#[cfg(feature = "llm")]
+pub fn handle_hybrid_search(
+    ctx: &Context,
+    query_text: &str,
+    limit: usize,
+    collection: Option<&str>,
+) -> Result<Vec<SearchResult>> {
+    use crate::llm::EmbeddingModel;
+
+    // Get BM25 results
+    let bm25_query = SearchQuery {
+        text: query_text.to_string(),
+        limit: limit * 2, // Get more for fusion
+        collection: collection.map(String::from),
+        tags: vec![],
+    };
+    let bm25_results = search::search(&ctx.conn, &bm25_query)?;
+
+    // Load embedding model and get vector results
+    let model = EmbeddingModel::load(None, None)?;
+    let query_embedding = model.embed_query(query_text)?;
+    let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, limit * 2)?;
+
+    // Fuse results using RRF
+    let config = hybrid::HybridConfig::default();
+    let mut fused = hybrid::rrf_fusion(&bm25_results, &vector_results, &config);
+
+    // Normalize scores
+    hybrid::normalize_scores(&mut fused);
+
+    // Convert to SearchResult format
+    let mut results = Vec::new();
+    for (doc_id, score) in fused.into_iter().take(limit) {
+        if let Some(doc) = documents::get_document(&ctx.conn, doc_id)? {
+            // Filter by collection if specified
+            if let Some(coll) = collection {
+                if doc.collection != coll {
+                    continue;
+                }
+            }
+
+            results.push(SearchResult {
+                id: doc.id,
+                path: doc.relative_path.clone(),
+                title: doc.title.clone(),
+                score,
+                snippets: vec![],
+            });
+        }
+    }
+
+    Ok(results)
 }
 
 /// Handle `mdkb status` command.
@@ -365,6 +472,75 @@ fn update_collection(
     }
 
     Ok(())
+}
+
+/// Generate embeddings for all documents that don't have them.
+/// This is a separate operation that can be run after update.
+#[cfg(feature = "llm")]
+pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
+    use crate::llm::EmbeddingModel;
+
+    let mut result = EmbedResult::default();
+
+    // Load embedding model
+    let model = EmbeddingModel::load(None, None)?;
+
+    // Get all documents
+    let all_collections = collections::list_collections(&ctx.conn)?;
+
+    for coll in &all_collections {
+        let docs = documents::list_documents(&ctx.conn, &coll.name)?;
+
+        for doc in docs {
+            // Skip if already has embedding
+            if vectors::has_embedding(&ctx.conn, doc.id)? {
+                result.skipped += 1;
+                continue;
+            }
+
+            // Get content
+            let content = match documents::get_content(&ctx.conn, &doc.hash)? {
+                Some(c) => c,
+                None => {
+                    result.errors.push(format!("No content for doc {}", doc.id));
+                    continue;
+                }
+            };
+
+            // Generate embedding
+            match model.embed(&content) {
+                Ok(embedding) => {
+                    vectors::store_embedding(
+                        &ctx.conn,
+                        doc.id,
+                        &embedding,
+                        crate::llm::embeddings::DEFAULT_EMBEDDING_REPO,
+                    )?;
+                    result.generated += 1;
+                }
+                Err(e) => {
+                    result.errors.push(format!(
+                        "Failed to embed doc {} ({}): {}",
+                        doc.id, doc.relative_path, e
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+/// Result of embedding generation.
+#[cfg(feature = "llm")]
+#[derive(Debug, Clone, Default)]
+pub struct EmbedResult {
+    /// Number of embeddings generated.
+    pub generated: usize,
+    /// Number of documents skipped (already have embeddings).
+    pub skipped: usize,
+    /// Errors encountered.
+    pub errors: Vec<String>,
 }
 
 /// Apply line range (e.g., "10:50") to content.

@@ -109,6 +109,9 @@ pub enum Command {
     /// Trigger differential reindex
     Update,
 
+    /// Generate embeddings for documents (requires --features llm)
+    Embed,
+
     /// Start MCP server
     Serve,
 }

@@ -11,12 +11,12 @@ use rmcp::ServiceExt;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError};
 use tokio::sync::Mutex;
 
-use crate::cli::handlers::{handle_update, Context};
+use crate::cli::handlers::{handle_mget, handle_update, Context};
 use crate::domain::{SearchQuery, SearchResult};
 use crate::store::{collections, documents, search};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
-use super::tools::{GetParams, SearchParams};
+use super::tools::{GetParams, MultiGetParams, SearchParams};
 
 /// Create an MCP error from a message.
 fn mcp_error(message: impl Into<Cow<'static, str>>) -> McpError {
@@ -141,6 +141,61 @@ impl McpServer {
             "Collections: {}\nDocuments: {}\nStale: {}\nDB Size: {} bytes",
             status.collections, status.documents, status.stale_documents, status.db_size_bytes
         );
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Trigger reindex of all collections.
+    #[tool(description = "Trigger a differential reindex of all collections")]
+    async fn mdkb_update(&self) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let mut ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_mut()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        let result = handle_update(ctx, &self.root)
+            .map_err(|e| mcp_error(format!("Update failed: {}", e)))?;
+
+        let output = format!(
+            "Added: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
+            result.added, result.updated, result.removed, result.unchanged
+        );
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Retrieve multiple documents by pattern.
+    #[tool(description = "Retrieve multiple documents matching a glob pattern")]
+    async fn mdkb_multi_get(
+        &self,
+        Parameters(params): Parameters<MultiGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        let results = handle_mget(ctx, &params.pattern, params.collection.as_deref())
+            .map_err(|e| mcp_error(format!("Multi-get failed: {}", e)))?;
+
+        if results.is_empty() {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No documents found.",
+            )]));
+        }
+
+        let mut output = format!("Found {} documents:\n\n", results.len());
+        for (doc, content) in &results {
+            let title = doc.title.as_deref().unwrap_or("(untitled)");
+            output.push_str(&format!(
+                "=== [{}] {} - {} ===\n{}\n\n",
+                doc.id, doc.relative_path, title, content
+            ));
+        }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
