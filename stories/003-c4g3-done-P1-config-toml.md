@@ -1,7 +1,7 @@
 ---
 id: 003-c4g3
 title: Configuration system - TOML parsing, defaults, per-repo config
-status: pending
+status: done
 priority: P1
 created: 2026-01-31
 updated: 2026-01-31
@@ -14,13 +14,13 @@ Implement TOML configuration system for .mdkb/config.toml with sensible defaults
 
 ## Acceptance Criteria
 
-- [ ] Config struct with serde serialization
-- [ ] Load from .mdkb/config.toml with fallback to defaults
-- [ ] Sections: [indexing], [chunking], [search], [memory], [models]
-- [ ] Validation of config values on load
-- [ ] Default config generation for new projects
-- [ ] Environment variable override support
-- [ ] Tests for parsing and defaults
+- [x] Config struct with serde serialization
+- [x] Load from .mdkb/config.toml with fallback to defaults
+- [x] Sections: [indexing], [chunking], [search], [memory], [models]
+- [x] Validation of config values on load
+- [x] Default config generation for new projects
+- [x] Environment variable override support
+- [x] Tests for parsing and defaults (19 tests)
 
 ## Implementation Notes
 
@@ -33,4 +33,8 @@ Config sections:
 
 ## Work Log
 
-[To be filled during implementation]
+2026-01-31: Completed with TDD
+- Added ModelsConfig section (embedding, reranker, condense repos/files)
+- Implemented validate() method with field validation
+- Implemented from_env_with_defaults() for env var overrides
+- 19 passing tests covering all acceptance criteria
