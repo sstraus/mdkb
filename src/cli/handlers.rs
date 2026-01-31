@@ -181,6 +181,46 @@ pub fn handle_get(
     Ok((doc, content))
 }
 
+/// Handle `mdkb mget` command - batch retrieval by pattern.
+pub fn handle_mget(
+    ctx: &Context,
+    pattern: &str,
+    collection_filter: Option<&str>,
+) -> Result<Vec<(Document, String)>> {
+    let glob = Glob::new(pattern)
+        .map_err(|e| Error::Other(format!("Invalid glob pattern '{}': {}", pattern, e)))?
+        .compile_matcher();
+
+    // Get all documents, optionally filtered by collection
+    let all_collections = collections::list_collections(&ctx.conn)?;
+    let mut results = Vec::new();
+
+    for coll in &all_collections {
+        // Skip if collection filter doesn't match
+        if let Some(filter) = collection_filter {
+            if coll.name != filter {
+                continue;
+            }
+        }
+
+        let docs = documents::list_documents(&ctx.conn, &coll.name)?;
+
+        for doc in docs {
+            // Check if path matches pattern
+            if !glob.is_match(&doc.relative_path) {
+                continue;
+            }
+
+            // Get content
+            if let Some(content) = documents::get_content(&ctx.conn, &doc.hash)? {
+                results.push((doc, content));
+            }
+        }
+    }
+
+    Ok(results)
+}
+
 /// Handle `mdkb update` command - differential reindex.
 pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResult> {
     let root = root.as_ref();
@@ -694,5 +734,102 @@ mod tests {
 
         let result = handle_update(&ctx, temp.path()).expect("update should succeed");
         assert_eq!(result.added, 2);
+    }
+
+    // ==================== Mget Tests ====================
+
+    #[test]
+    fn test_handle_mget_empty_index() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let results = handle_mget(&ctx, "**/*.md", None).expect("mget should succeed");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_handle_mget_matches_pattern() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create and index docs
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# README").unwrap();
+        std::fs::write(docs_dir.join("guide.md"), "# Guide").unwrap();
+        std::fs::write(docs_dir.join("notes.txt"), "Notes").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Pattern matches only .md files
+        let results = handle_mget(&ctx, "*.md", None).expect("mget should succeed");
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_handle_mget_with_collection_filter() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create two collections
+        let docs_dir = temp.path().join("docs");
+        let notes_dir = temp.path().join("notes");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::create_dir(&notes_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# Doc README").unwrap();
+        std::fs::write(notes_dir.join("readme.md"), "# Note README").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_collection_add(&ctx, "notes", "notes", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Filter to only docs collection
+        let results = handle_mget(&ctx, "*.md", Some("docs")).expect("mget should succeed");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.collection, "docs");
+    }
+
+    #[test]
+    fn test_handle_mget_nested_pattern() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create nested structure
+        let docs_dir = temp.path().join("docs");
+        let sub_dir = docs_dir.join("api");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# README").unwrap();
+        std::fs::write(sub_dir.join("endpoints.md"), "# API").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Pattern matches nested files
+        let results = handle_mget(&ctx, "api/*.md", None).expect("mget should succeed");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].0.relative_path.contains("api"));
+    }
+
+    #[test]
+    fn test_handle_mget_returns_content() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# Hello World\n\nContent here.").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        let results = handle_mget(&ctx, "*.md", None).expect("mget should succeed");
+        assert_eq!(results.len(), 1);
+        assert!(results[0].1.contains("Hello World"));
     }
 }

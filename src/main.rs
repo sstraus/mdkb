@@ -7,8 +7,8 @@ use tracing_subscriber::EnvFilter;
 
 use mdkb::cli::handlers::{
     handle_collection_add, handle_collection_list, handle_collection_remove,
-    handle_collection_rename, handle_get, handle_init, handle_search, handle_status, handle_update,
-    Context,
+    handle_collection_rename, handle_get, handle_init, handle_mget, handle_search, handle_status,
+    handle_update, Context,
 };
 use mdkb::cli::{Cli, CollectionCommand, Command, OutputFormat};
 use mdkb::mcp::server::run_server;
@@ -78,6 +78,11 @@ async fn main() -> Result<()> {
             let ctx = Context::open(&cwd)?;
             let (doc, content) = handle_get(&ctx, &id, lines.as_deref())?;
             format_document(&doc, &content, cli.format);
+        }
+        Command::Mget { pattern, collection } => {
+            let ctx = Context::open(&cwd)?;
+            let results = handle_mget(&ctx, &pattern, collection.as_deref())?;
+            format_mget_results(&results, cli.format);
         }
         Command::Status => {
             let ctx = Context::open(&cwd)?;
@@ -233,6 +238,55 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
                 println!("Errors:    {}", result.errors.len());
                 for err in &result.errors {
                     println!("  - {}", err);
+                }
+            }
+        }
+    }
+}
+
+fn format_mget_results(results: &[(mdkb::domain::Document, String)], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let output: Vec<_> = results
+                .iter()
+                .map(|(doc, content)| {
+                    serde_json::json!({
+                        "document": doc,
+                        "content": content,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id,collection,path,title");
+            for (doc, _) in results {
+                println!(
+                    "{},{},{},{}",
+                    doc.id,
+                    doc.collection,
+                    doc.relative_path,
+                    doc.title.as_deref().unwrap_or("")
+                );
+            }
+        }
+        OutputFormat::Markdown => {
+            for (doc, content) in results {
+                let title = doc.title.as_deref().unwrap_or(&doc.relative_path);
+                println!("## {} ({})\n", title, doc.relative_path);
+                println!("{}\n", content);
+                println!("---\n");
+            }
+        }
+        OutputFormat::Text => {
+            if results.is_empty() {
+                println!("No documents found.");
+            } else {
+                println!("Found {} documents:\n", results.len());
+                for (doc, content) in results {
+                    let title = doc.title.as_deref().unwrap_or("(untitled)");
+                    println!("=== [{}] {} - {} ===", doc.id, doc.relative_path, title);
+                    println!("{}\n", content);
                 }
             }
         }

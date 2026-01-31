@@ -65,6 +65,16 @@ pub enum Command {
         lines: Option<String>,
     },
 
+    /// Retrieve multiple documents by pattern
+    Mget {
+        /// Glob pattern to match paths (e.g., "docs/*.md")
+        pattern: String,
+
+        /// Filter by collection
+        #[arg(short, long)]
+        collection: Option<String>,
+    },
+
     /// Show index status
     Status,
 
