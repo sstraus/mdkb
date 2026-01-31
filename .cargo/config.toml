@@ -1,0 +1,40 @@
+# Cargo build configuration for mdkb
+#
+# CPU Compatibility:
+# The llama-cpp-2 crate compiles ggml with native CPU detection by default.
+# For older CPUs without AVX2 (like Ivy Bridge i7-3720QM), we need to specify
+# the exact target CPU to avoid illegal instruction errors at runtime.
+#
+# Supported targets:
+# - ivybridge: Intel 3rd gen (2012) - AVX, no AVX2
+# - haswell: Intel 4th gen (2013) - AVX2, FMA
+# - native: Use current CPU features (default, may not work on older CPUs)
+#
+# To build for maximum compatibility (slower but works everywhere):
+# RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
+
+# x86-64: Target Ivy Bridge for compatibility with old CPUs (no AVX2)
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=ivybridge"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=ivybridge"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=ivybridge"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-cpu=ivybridge"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=ivybridge"]
+
+# ARM64: Use native features (required for ring crate on Apple Silicon)
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]

@@ -1,0 +1,252 @@
+# Hooks
+
+mdkb ships a hook dispatcher (`mdkb hook <event>`) that plugs into Claude
+Code and Codex CLI lifecycle events. When registered, it injects relevant
+memory into context automatically — no tool call required — and keeps the
+code index fresh after edits.
+
+## Why hooks
+
+Without hooks, the assistant may ignore `mcp__mdkb__search` and answer
+from stale training data. Hooks make recall proactive:
+
+- **SessionStart** — inject a warmup block listing recently-accessed
+  memory entries as soon as a session opens.
+- **UserPromptSubmit** — match the user's prompt against the memory FTS
+  index and inject the top-N entries before the assistant replies.
+- **PreToolUse** — intercept `Grep` calls and suggest `mdkb search` /
+  `mdkb code` CLI commands when the pattern looks like an identifier or
+  definition search. Works without MCP.
+- **PostToolUse** — when `Edit` / `Write` / `MultiEdit` / `NotebookEdit`
+  touches a file, append it to `.mdkb/reindex-queue.jsonl` so the next
+  `mdkb update` pass picks it up.
+
+All hooks are fire-and-forget: internal errors are logged to stderr and
+swallowed — the host CLI is never blocked by mdkb.
+
+## Install
+
+```bash
+# Claude Code, project-scoped (writes .claude/settings.local.json)
+mdkb setup hooks claude --scope local
+
+# Claude Code, user-scoped (writes ~/.claude/settings.json)
+mdkb setup hooks claude --scope user
+
+# Codex CLI (writes ~/.codex/hooks.json)
+mdkb setup hooks codex
+```
+
+Restart the host CLI after setup. Re-running is idempotent: existing
+hook entries are replaced, unrelated settings are preserved.
+
+### Disable individual events at install time
+
+```bash
+mdkb setup hooks claude --disable post-tool-use
+mdkb setup hooks claude --disable user-prompt-submit,post-tool-use
+```
+
+Valid values: `session-start`, `user-prompt-submit`, `pre-tool-use`, `post-tool-use`.
+
+### Dry run
+
+```bash
+mdkb setup hooks claude --dry-run
+```
+
+Prints the merged settings JSON to stdout without writing.
+
+## Event contracts
+
+Every handler reads the event JSON from stdin and writes a JSON object
+to stdout. Exit code is always 0. When a hook has nothing to contribute,
+it returns `{}` (empty object).
+
+### SessionStart
+
+Input: any JSON (ignored).
+
+Output (when memory is non-empty):
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart",
+    "additionalContext": "## mdkb memory warmup\n\n- [topic] …\n- [decision] …\n"
+  }
+}
+```
+
+### UserPromptSubmit
+
+Input:
+
+```json
+{ "prompt": "how does the hook dispatcher work?" }
+```
+
+Empty or wrap-up prompts (`/clear`, `/compact`, `/exit`, `/quit`,
+`/wrapup`) are skipped. The handler tokenizes the prompt, strips
+stopwords and sub-3-char fragments, and runs an FTS5 OR query against
+the memory index.
+
+Output (when matches are found):
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": "## mdkb: relevant context\n\n- [hooks-topic] Hook dispatcher architecture — The mdkb hook dispatcher reads stdin and writes JSON to stdout …\n"
+  }
+}
+```
+
+### PreToolUse
+
+Input:
+
+```json
+{
+  "tool_name": "Grep",
+  "tool_input": { "pattern": "handleAuth", "path": "src/" }
+}
+```
+
+Only `Grep` is intercepted (via the `matcher` field in settings).
+The handler classifies the grep pattern:
+
+- **Pure identifier** (e.g. `handleAuth`) → suggests `mdkb search --scope symbols`
+- **Definition search** (e.g. `func handleAuth`, `fn handle_auth`) →
+  suggests `mdkb code callers`
+- **Callsite pattern** (e.g. `handleAuth(`) → suggests `mdkb code callers`
+- **Other patterns** → no suggestion (returns `{}`)
+
+Output (when a suggestion applies):
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "additionalContext": "Use '/path/to/mdkb search --scope symbols \"handleAuth\"' via Bash.\n"
+  }
+}
+```
+
+The binary path is resolved via `current_exe()` so suggestions work
+regardless of installation location.
+
+### PostToolUse
+
+Input:
+
+```json
+{
+  "tool_name": "Edit",
+  "tool_input": { "file_path": "/abs/path/to/file.rs" }
+}
+```
+
+Only `Edit`, `Write`, `MultiEdit`, `NotebookEdit` are tracked. For
+notebooks the handler also reads `tool_input.notebook_path`.
+
+Effect: sends the edited file path to the daemon's watcher channel
+(`reindex_tx`) for immediate reindex. The path is first validated
+via `canonicalize_under_cwd()` to reject traversal attempts.
+
+Output: `{"queued": true}` on success, `{}` when skipped or on error
+(PostToolUse must never return `additionalContext`).
+
+## Configuration
+
+All toggles live under `[hooks]` in `.mdkb/config.toml`:
+
+```toml
+[hooks]
+session_start_enabled = true
+user_prompt_submit_enabled = true
+pre_tool_use_enabled = true
+post_tool_use_enabled = true
+
+# Max recall results injected on UserPromptSubmit.
+recall_limit = 5
+
+# Latency budget in milliseconds. If a hook exceeds this,
+# the overrun is appended to .mdkb/hook-slow.jsonl and the
+# output may be truncated with a notice.
+latency_budget_ms = 200
+
+# Minimum hybrid score for a recall result to be injected.
+min_recall_score = 0.3
+```
+
+Defaults are safe for interactive use; tune `recall_limit` higher if
+you want more context, lower if the assistant is getting too much
+noise on every prompt.
+
+## Opt out
+
+Three ways, in order of granularity:
+
+1. **Per-project file marker** — create an empty `.mdkbignore-hooks`
+   file at the repo root. All three hooks return `{}` immediately for
+   any working directory under that marker. Useful for one-off repos
+   where you do not want mdkb to participate even if hooks are
+   globally installed.
+2. **Per-event config toggle** — set
+   `session_start_enabled = false` (or the other two) in
+   `.mdkb/config.toml`.
+3. **Uninstall** — `mdkb setup remove hooks claude --scope local|user`
+   or `mdkb setup remove hooks codex`. Or remove the `_managedBy: "mdkb"`
+   entries manually from the settings file.
+
+The `.mdkbignore-hooks` marker is looked up by walking ancestor
+directories up to `$HOME`; it is never searched above the user home
+directory.
+
+## Troubleshooting
+
+### Hooks aren't firing
+
+1. Restart the host CLI after `mdkb setup hooks …`.
+2. Verify the settings file contains an `mdkb hook <event>` entry for
+   the relevant event.
+3. Run the dispatcher manually:
+
+   ```bash
+   echo '{}' | mdkb hook session-start
+   echo '{"prompt":"test"}' | mdkb hook user-prompt-submit
+   ```
+
+   Both should print a JSON object to stdout and exit 0.
+
+### Recall is empty
+
+- `search_entries_fts` requires at least one indexed memory entry. Run
+  `mdkb memory list` and confirm the DB is populated.
+- Conversational prompts with only stopwords (e.g. "what is this?")
+  produce no tokens and are skipped by design.
+
+### Slow hooks
+
+Any hook that exceeds `latency_budget_ms` logs a line to
+`.mdkb/hook-slow.jsonl`:
+
+```json
+{"event":"session-start","elapsed_ms":412,"budget_ms":200,"ts":…}
+```
+
+Use this to tune the budget or diagnose cold-start issues.
+
+### Edited files not reindexing
+
+PostToolUse sends edited paths to the daemon's watcher channel. If
+the daemon is not running, the path is lost. Restart the daemon with
+`mdkb daemon restart` or run `mdkb update` for a full differential
+reindex.
+
+## Automated verification
+
+The hook contract is covered end-to-end by `tests/e2e_hooks.rs`,
+which spawns the real `mdkb` binary and asserts that warmup, recall,
+and reindex-queue output matches the spec.

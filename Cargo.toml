@@ -1,0 +1,191 @@
+[package]
+name = "mdkb"
+version = "3.0.5"
+edition = "2024"
+description = "Persistent memory, hybrid search, and code intelligence for Claude Code and Codex — with CLI, lifecycle hooks, and MCP"
+license = "MIT"
+repository = "https://github.com/sstraus/mdkb"
+readme = "README.md"
+keywords = ["markdown", "knowledge-base", "search", "mcp"]
+categories = ["command-line-utilities", "text-processing"]
+
+[[bin]]
+name = "mdkb"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+sqlite-vec = "0.1"
+zerocopy = { version = "0.7", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+toml_edit = "0.22"
+schemars = "1"
+
+# Frontmatter parsing
+gray_matter = "0.2"
+
+# Async (for MCP)
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
+
+# Concurrent collections
+dashmap = "6"
+
+# Advisory file locking (daemon singleton)
+fs4 = "0.12"
+
+# Unix syscalls (daemon lifecycle: kill, fork, setsid, dup2)
+libc = "0.2"
+
+# MCP protocol
+rmcp = { version = "0.14", features = ["server", "transport-io"] }
+
+# HTTP server (for MCP HTTP transport)
+axum = { version = "0.8", optional = true }
+tower = { version = "0.5", optional = true }
+
+# File watching
+notify = "6"
+notify-debouncer-mini = "0.4"
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Allocator (M-USE-ALLOCATOR-OPTIMIZED)
+mimalloc = "0.1"
+libmimalloc-sys = { version = "0.1", features = ["extended"] }
+
+# Text diffing (memory revision history)
+similar = "2"
+
+# Atomic file writes (temp-file + rename for settings.json / hooks.json)
+tempfile = "3"
+
+# Utilities
+sha2 = "0.10"
+walkdir = "2"
+glob = "0.3"
+globset = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "5"
+
+# Markdown parsing
+pulldown-cmark = "0.12"
+regex = "1"
+
+# Embedding - semantic search with local ONNX models
+fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
+
+# Token counting for usage metrics
+tiktoken-rs = "0.6"
+
+# Code intelligence - tree-sitter parsing
+tree-sitter = "0.26.5"
+tree-sitter-rust = "0.24.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.1"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.1"
+tree-sitter-kotlin-codanna = "0.3.9"
+tree-sitter-php = "0.24.2"
+tree-sitter-swift = "0.7.1"
+tree-sitter-lua = "0.4.1"
+tree-sitter-gdscript = "6.1.0"
+
+# Code intelligence - indexing pipeline
+crossbeam-channel = "0.5"
+ignore = "0.4"
+rayon = "1.10"
+
+
+# HTTP server auth (constant-time token comparison)
+subtle = { version = "2", optional = true }
+
+# HTTPS server (self-signed certs)
+rcgen = { version = "0.13", optional = true }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"], optional = true }
+rustls = { version = "0.23", features = ["ring"], default-features = false, optional = true }
+
+[features]
+default = []
+llm = []  # Enable LLM-powered features like memory condense
+http-server = ["dep:axum", "dep:tower", "dep:subtle", "rmcp/transport-streamable-http-server"]
+https-server = ["http-server", "dep:rcgen", "dep:axum-server", "dep:rustls"]
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+# Enable the rmcp client only for tests so we can drive the daemon's
+# rmcp-over-unix endpoint with a real handshake.
+rmcp = { version = "0.14", features = ["server", "transport-io", "client"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# Lint configuration per Pragmatic Rust Guidelines (M-STATIC-VERIFICATION)
+[lints.rust]
+missing_debug_implementations = "warn"
+redundant_imports = "warn"
+trivial_numeric_casts = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Cargo lints disabled - multiple dependency versions are from transitive deps
+# cargo = { level = "warn", priority = -1 }
+# Opt-out of overly strict pedantic lints
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+too_many_lines = "allow"
+# These are cosmetic and not worth fixing everywhere
+needless_raw_string_hashes = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+doc_markdown = "allow"
+items_after_statements = "allow"
+uninlined_format_args = "allow"
+# Error struct is large due to backtrace, which is intentional
+result_large_err = "allow"
+# Collapsible if statements can be more readable separated
+collapsible_if = "allow"
+# map().unwrap_or() is more readable than map_or() in many cases
+map_unwrap_or = "allow"
+# Redundant closures can be clearer
+redundant_closure_for_method_calls = "allow"
+# These are stylistic preferences or unavoidable
+needless_pass_by_value = "allow"
+used_underscore_binding = "allow"
+case_sensitive_file_extension_comparisons = "allow"
+cast_possible_wrap = "allow"
+needless_update = "allow"
+double_must_use = "allow"
+implicit_clone = "allow"
+missing_transmute_annotations = "allow"
+default_trait_access = "allow"
+format_push_string = "allow"
+derivable_impls = "allow"

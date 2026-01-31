@@ -1,0 +1,129 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x64
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: linux-x64
+          # Linux ARM64 (native ARM64 runner)
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            name: linux-arm64
+          # macOS x64 (cross-compiled from ARM64 runner)
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: macos-x64
+          # macOS ARM64 (native Apple Silicon runner)
+          # RUSTFLAGS: ring 0.17.14 needs explicit cpu features (briansmith/ring#2527)
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: macos-arm64
+            rustflags: '-C target-cpu=apple-m1'
+          # Windows x64
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            name: windows-x64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags || '' }}
+
+      # Package binary
+      - name: Package binary (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          cd target/${{ matrix.target }}/release
+          cp mdkb mdkb-${{ matrix.name }}
+          sha256sum mdkb-${{ matrix.name }} > mdkb-${{ matrix.name }}.sha256
+
+      - name: Package binary (macOS)
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          cd target/${{ matrix.target }}/release
+          cp mdkb mdkb-${{ matrix.name }}
+          shasum -a 256 mdkb-${{ matrix.name }} > mdkb-${{ matrix.name }}.sha256
+
+      - name: Package binary (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          cd target/${{ matrix.target }}/release
+          Copy-Item mdkb.exe mdkb-${{ matrix.name }}.exe
+          (Get-FileHash mdkb-${{ matrix.name }}.exe -Algorithm SHA256).Hash.ToLower() + "  mdkb-${{ matrix.name }}.exe" | Out-File -Encoding ASCII mdkb-${{ matrix.name }}.exe.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdkb-${{ matrix.name }}
+          path: |
+            target/${{ matrix.target }}/release/mdkb-${{ matrix.name }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}
+            target/${{ matrix.target }}/release/mdkb-${{ matrix.name }}${{ matrix.os == 'windows-latest' && '.exe' || '' }}.sha256
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name 'mdkb-*' -o -name '*.sha256' \) -exec cp {} release/ \;
+          cd release
+          cat *.sha256 > checksums.txt
+          ls -la
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            release/mdkb-*
+            release/checksums.txt
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew tap
+        if: ${{ !contains(github.ref, '-rc') && !contains(github.ref, '-beta') && !contains(github.ref, '-alpha') }}
+        run: |
+          gh api repos/sstraus/homebrew-tap/dispatches \
+            -f event_type=release-published \
+            -f 'client_payload[repo]=mdkb' \
+            -f 'client_payload[version]=${{ github.ref_name }}'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
