@@ -12,6 +12,8 @@ use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError};
 use tokio::sync::Mutex;
 
 use crate::cli::handlers::{handle_mget, handle_update, Context};
+#[cfg(feature = "llm")]
+use crate::cli::handlers::{handle_hybrid_search, handle_vsearch};
 use crate::domain::{SearchQuery, SearchResult};
 use crate::store::{collections, documents, search};
 use crate::watcher::{FileWatcher, WatcherConfig};
@@ -198,6 +200,64 @@ impl McpServer {
         }
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Semantic vector search using document embeddings.
+    #[tool(description = "Semantic vector search using document embeddings (requires LLM feature)")]
+    async fn mdkb_vsearch(
+        &self,
+        Parameters(params): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(feature = "llm")]
+        {
+            self.ensure_context().await?;
+
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let results = handle_vsearch(ctx, &params.query, params.limit, params.collection.as_deref())
+                .map_err(|e| mcp_error(format!("Vector search failed: {}", e)))?;
+
+            let output = format_search_results(&results);
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+
+        #[cfg(not(feature = "llm"))]
+        {
+            let _ = params;
+            Err(mcp_error("Vector search requires --features llm"))
+        }
+    }
+
+    /// Hybrid search combining keyword and semantic search with RRF fusion.
+    #[tool(description = "Hybrid search combining BM25 and vector search with RRF fusion (requires LLM feature)")]
+    async fn mdkb_query(
+        &self,
+        Parameters(params): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(feature = "llm")]
+        {
+            self.ensure_context().await?;
+
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let results = handle_hybrid_search(ctx, &params.query, params.limit, params.collection.as_deref())
+                .map_err(|e| mcp_error(format!("Hybrid search failed: {}", e)))?;
+
+            let output = format_search_results(&results);
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+
+        #[cfg(not(feature = "llm"))]
+        {
+            let _ = params;
+            Err(mcp_error("Hybrid search requires --features llm"))
+        }
     }
 }
 
