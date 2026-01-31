@@ -1137,38 +1137,13 @@ fn find_common_tags(entries: &[&memory::MemoryEntry]) -> Vec<String> {
     result
 }
 
-/// Generate consolidated content using LLM.
+/// Generate consolidated content for memory entries.
+/// Currently uses heuristic-based concatenation.
+/// TODO: When llama-cpp-rs is integrated, use LLM for smarter consolidation.
 #[cfg(feature = "llm")]
 pub fn generate_consolidated_content(
     entries: &[memory::MemoryEntry],
 ) -> Result<(String, String)> {
-    // Build prompt for LLM
-    let mut prompt = String::from(
-        "You are consolidating multiple related knowledge base entries into a single comprehensive entry.\n\n\
-         Your task:\n\
-         1. Read all entries below\n\
-         2. Create a single consolidated entry that preserves ALL information\n\
-         3. Organize information logically (no duplicates)\n\
-         4. Return ONLY the consolidated content in Markdown format\n\n\
-         Entries to consolidate:\n\n"
-    );
-
-    for entry in entries {
-        prompt.push_str(&format!(
-            "--- Entry: {} ---\n# {}\n{}\n\n",
-            entry.id, entry.title, entry.content
-        ));
-    }
-
-    prompt.push_str(
-        "\n---\n\n\
-         Consolidated entry (Markdown format, start with # title):\n"
-    );
-
-    // Use local LLM to generate content
-    // For now, use a simple concatenation as fallback
-    // Real implementation would call llama-cpp-rs
-
     // Generate title from common elements
     let title = if entries.len() == 1 {
         entries[0].title.clone()
@@ -1219,7 +1194,6 @@ pub fn handle_memory_condense(
     ctx: &Context,
     tag_filter: Option<&str>,
     dry_run: bool,
-    _interactive: bool,
     min_entries: usize,
 ) -> Result<CondenseResult> {
     let mut result = CondenseResult {
@@ -1260,7 +1234,9 @@ pub fn handle_memory_condense(
                 id: group.proposed_id.clone(),
                 title,
                 content,
-                entry_type: entries[0].entry_type,
+                entry_type: entries.first()
+                    .map(|e| e.entry_type)
+                    .unwrap_or(memory::EntryType::Topic),
                 tags: group.common_tags.clone(),
                 status: memory::EntryStatus::Active,
                 created_at: now,
@@ -1270,18 +1246,30 @@ pub fn handle_memory_condense(
                 last_accessed: None,
             };
 
-            memory::add_entry(&ctx.conn, &merged_entry)?;
+            // Use transaction to ensure atomicity - either all changes succeed or none
+            documents::begin_transaction(&ctx.conn)?;
+            match (|| -> Result<()> {
+                memory::add_entry(&ctx.conn, &merged_entry)?;
 
-            // Mark original entries as superseded
-            for entry in &entries {
-                let mut updated = entry.clone();
-                updated.status = memory::EntryStatus::Superseded;
-                updated.superseded_by = Some(group.proposed_id.clone());
-                memory::update_entry(&ctx.conn, &updated)?;
+                // Mark original entries as superseded
+                for entry in &entries {
+                    let mut updated = entry.clone();
+                    updated.status = memory::EntryStatus::Superseded;
+                    updated.superseded_by = Some(group.proposed_id.clone());
+                    memory::update_entry(&ctx.conn, &updated)?;
+                }
+                Ok(())
+            })() {
+                Ok(()) => {
+                    documents::commit_transaction(&ctx.conn)?;
+                    result.merged_count += 1;
+                    result.consolidated_count += entries.len();
+                }
+                Err(e) => {
+                    let _ = documents::rollback_transaction(&ctx.conn);
+                    return Err(e);
+                }
             }
-
-            result.merged_count += 1;
-            result.consolidated_count += entries.len();
         }
 
         result.groups.push(group);
@@ -2311,6 +2299,12 @@ pub struct ExperimentCreateResult {
     pub name: String,
 }
 
+/// Maximum size for experiment JSON configs (10KB).
+const MAX_CONFIG_SIZE: usize = 10_000;
+
+/// Maximum length for experiment names.
+const MAX_NAME_LENGTH: usize = 100;
+
 /// Handle `mdkb experiment create`.
 pub fn handle_experiment_create(
     ctx: &Context,
@@ -2321,16 +2315,47 @@ pub fn handle_experiment_create(
     split: f64,
     min_samples: i64,
 ) -> Result<ExperimentCreateResult> {
+    // Validate name length and format
+    if name.is_empty() || name.len() > MAX_NAME_LENGTH {
+        return Err(Error::from(ErrorKind::Config(
+            format!("Experiment name must be 1-{} characters", MAX_NAME_LENGTH)
+        )));
+    }
+    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+        return Err(Error::from(ErrorKind::Config(
+            "Experiment name must contain only alphanumeric characters, hyphens, and underscores".to_string()
+        )));
+    }
+
+    // Validate config sizes before parsing
+    if config_a.len() > MAX_CONFIG_SIZE {
+        return Err(Error::from(ErrorKind::Config(
+            format!("config-a exceeds maximum size of {} bytes", MAX_CONFIG_SIZE)
+        )));
+    }
+    if config_b.len() > MAX_CONFIG_SIZE {
+        return Err(Error::from(ErrorKind::Config(
+            format!("config-b exceeds maximum size of {} bytes", MAX_CONFIG_SIZE)
+        )));
+    }
+
     // Validate JSON configs
-    let _ = serde_json::from_str::<serde_json::Value>(config_a)
+    serde_json::from_str::<serde_json::Value>(config_a)
         .map_err(|e| Error::from(ErrorKind::Config(format!("Invalid config-a JSON: {e}"))))?;
-    let _ = serde_json::from_str::<serde_json::Value>(config_b)
+    serde_json::from_str::<serde_json::Value>(config_b)
         .map_err(|e| Error::from(ErrorKind::Config(format!("Invalid config-b JSON: {e}"))))?;
 
     // Validate split
     if !(0.0..=1.0).contains(&split) {
         return Err(Error::from(ErrorKind::Config(
             "Traffic split must be between 0.0 and 1.0".to_string()
+        )));
+    }
+
+    // Validate min_samples
+    if min_samples < 1 || min_samples > 10_000 {
+        return Err(Error::from(ErrorKind::Config(
+            "min_samples must be between 1 and 10,000".to_string()
         )));
     }
 

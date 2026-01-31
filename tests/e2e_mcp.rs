@@ -1522,7 +1522,7 @@ fn test_memory_condense_dry_run() {
     }
 
     // Run condense in dry-run mode
-    let result = handle_memory_condense(&ctx, None, true, false, 3)
+    let result = handle_memory_condense(&ctx, None, true, 3)
         .expect("condense failed");
 
     // Should find groups but NOT make changes
@@ -1575,7 +1575,7 @@ fn test_memory_condense_creates_merged_entry() {
     }
 
     // Run condense (not dry-run)
-    let result = handle_memory_condense(&ctx, None, false, false, 3)
+    let result = handle_memory_condense(&ctx, None, false, 3)
         .expect("condense failed");
 
     // Should have merged

@@ -201,12 +201,11 @@ async fn main() -> Result<()> {
                     format_prune_result(&pruned, days, dry_run, cli.format);
                 }
                 #[cfg(feature = "llm")]
-                MemoryCommand::Condense { tag, dry_run, interactive, min_entries } => {
+                MemoryCommand::Condense { tag, dry_run, interactive: _, min_entries } => {
                     let result = mdkb::cli::handlers::handle_memory_condense(
                         &ctx,
                         tag.as_deref(),
                         dry_run,
-                        interactive,
                         min_entries,
                     )?;
                     format_condense_result(&result, dry_run, cli.format);

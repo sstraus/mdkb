@@ -237,7 +237,7 @@ pub fn get_tool_usage(conn: &Connection, session_id: i64) -> Result<Vec<ToolUsag
                 total_results: row.get(3)?,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| tracing::warn!("Row query error: {}", e)).ok())
         .collect();
 
     Ok(results)
@@ -308,7 +308,7 @@ pub fn get_recent_sessions(conn: &Connection, limit: usize) -> Result<Vec<Sessio
                 truncation_count: row.get(5)?,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| tracing::warn!("Row query error: {}", e)).ok())
         .collect();
 
     Ok(results)
@@ -338,7 +338,7 @@ pub fn get_aggregate_tool_usage(conn: &Connection) -> Result<Vec<ToolUsageRecord
                 total_results: row.get(3)?,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| tracing::warn!("Row query error: {}", e)).ok())
         .collect();
 
     Ok(results)
@@ -435,7 +435,7 @@ pub fn get_query_latency_stats(conn: &Connection) -> Result<Vec<QueryLatencyStat
                 zero_result_count: row.get(4)?,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| tracing::warn!("Row query error: {}", e)).ok())
         .collect();
 
     Ok(results)
@@ -612,7 +612,7 @@ pub fn export_query_events(conn: &Connection, days: u32) -> Result<Vec<QueryEven
                 session_id: row.get(6)?,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| tracing::warn!("Row query error: {}", e)).ok())
         .collect();
 
     Ok(results)
@@ -911,6 +911,19 @@ impl std::fmt::Display for ExperimentStatus {
     }
 }
 
+impl TryFrom<&str> for ExperimentStatus {
+    type Error = crate::Error;
+
+    fn try_from(s: &str) -> std::result::Result<Self, Self::Error> {
+        match s {
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "cancelled" => Ok(Self::Cancelled),
+            _ => Err(crate::Error::config(format!("Invalid experiment status: {}", s))),
+        }
+    }
+}
+
 /// A/B experiment definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Experiment {
@@ -1014,12 +1027,10 @@ pub fn get_experiment(conn: &Connection, name: &str) -> Result<Option<Experiment
 
     let result = stmt.query_row(params![name], |row| {
         let status_str: String = row.get(6)?;
-        let status = match status_str.as_str() {
-            "running" => ExperimentStatus::Running,
-            "completed" => ExperimentStatus::Completed,
-            "cancelled" => ExperimentStatus::Cancelled,
-            _ => ExperimentStatus::Running,
-        };
+        let status = ExperimentStatus::try_from(status_str.as_str()).unwrap_or_else(|e| {
+            tracing::warn!("Invalid experiment status in DB: {}", e);
+            ExperimentStatus::Running
+        });
 
         Ok(Experiment {
             id: row.get(0)?,
@@ -1070,7 +1081,7 @@ pub fn get_active_experiments(conn: &Connection) -> Result<Vec<Experiment>> {
                 winner: row.get(10)?,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| tracing::warn!("Row query error: {}", e)).ok())
         .collect();
 
     Ok(results)
@@ -1134,12 +1145,35 @@ pub struct VariantStats {
 }
 
 /// Get statistics for a variant in an experiment.
+/// Uses a single aggregated query for efficiency instead of multiple queries.
 pub fn get_variant_stats(conn: &Connection, experiment_id: i64, variant: &str) -> Result<VariantStats> {
-    let sample_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM experiment_results WHERE experiment_id = ?1 AND variant = ?2",
+    // Single query for all aggregate stats (except p95 which needs sorted access)
+    let result: std::result::Result<(i64, f64, f64, i64), _> = conn.query_row(
+        r#"
+        SELECT
+            COUNT(*) as sample_count,
+            COALESCE(AVG(score), 0.0) as avg_score,
+            COALESCE(AVG(latency_ms), 0.0) as avg_latency,
+            SUM(CASE WHEN result_count = 0 THEN 1 ELSE 0 END) as zero_results
+        FROM experiment_results
+        WHERE experiment_id = ?1 AND variant = ?2
+        "#,
         params![experiment_id, variant],
-        |row| row.get(0),
-    )?;
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    );
+
+    let (sample_count, avg_score, avg_latency, zero_results) = match result {
+        Ok(r) => r,
+        Err(_) => return Ok(VariantStats {
+            variant: variant.to_string(),
+            sample_count: 0,
+            avg_score: 0.0,
+            avg_latency_ms: 0.0,
+            p95_latency_ms: 0,
+            zero_result_rate: 0.0,
+            score_variance: 0.0,
+        }),
+    };
 
     if sample_count == 0 {
         return Ok(VariantStats {
@@ -1153,19 +1187,9 @@ pub fn get_variant_stats(conn: &Connection, experiment_id: i64, variant: &str) -
         });
     }
 
-    let avg_score: f64 = conn.query_row(
-        "SELECT AVG(score) FROM experiment_results WHERE experiment_id = ?1 AND variant = ?2",
-        params![experiment_id, variant],
-        |row| row.get(0),
-    )?;
+    let zero_result_rate = (zero_results as f64 / sample_count as f64) * 100.0;
 
-    let avg_latency: f64 = conn.query_row(
-        "SELECT AVG(latency_ms) FROM experiment_results WHERE experiment_id = ?1 AND variant = ?2",
-        params![experiment_id, variant],
-        |row| row.get(0),
-    )?;
-
-    // P95 latency
+    // P95 latency (requires sorted access)
     let p95_idx = ((sample_count as f64 * 0.95).ceil() as i64).max(1) - 1;
     let p95_latency: i64 = conn.query_row(
         r#"
@@ -1178,18 +1202,10 @@ pub fn get_variant_stats(conn: &Connection, experiment_id: i64, variant: &str) -
         |row| row.get(0),
     ).unwrap_or(0);
 
-    // Zero result rate
-    let zero_results: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM experiment_results WHERE experiment_id = ?1 AND variant = ?2 AND result_count = 0",
-        params![experiment_id, variant],
-        |row| row.get(0),
-    )?;
-    let zero_result_rate = (zero_results as f64 / sample_count as f64) * 100.0;
-
     // Score variance for significance testing
     let score_variance: f64 = conn.query_row(
         r#"
-        SELECT AVG((score - ?1) * (score - ?1))
+        SELECT COALESCE(AVG((score - ?1) * (score - ?1)), 0.0)
         FROM experiment_results
         WHERE experiment_id = ?2 AND variant = ?3
         "#,
@@ -1252,13 +1268,7 @@ pub fn calculate_significance(stats_a: &VariantStats, stats_b: &VariantStats) ->
     // t-statistic
     let t_stat = (stats_a.avg_score - stats_b.avg_score) / se;
 
-    // Degrees of freedom (Welch's approximation)
-    let df_num = ((var_a / n_a) + (var_b / n_b)).powi(2);
-    let df_den = ((var_a / n_a).powi(2) / (n_a - 1.0)) + ((var_b / n_b).powi(2) / (n_b - 1.0));
-    let _df = if df_den > 0.0 { df_num / df_den } else { n_a + n_b - 2.0 };
-
-    // Approximate p-value using normal distribution for large samples
-    // For proper implementation, would use Student's t-distribution
+    // Approximate p-value using normal distribution (valid for large samples n > 30)
     let p_value = 2.0 * (1.0 - normal_cdf(t_stat.abs()));
 
     // Effect size (Cohen's d)
@@ -1375,12 +1385,10 @@ pub fn list_experiments(conn: &Connection) -> Result<Vec<Experiment>> {
     let results = stmt
         .query_map([], |row| {
             let status_str: String = row.get(6)?;
-            let status = match status_str.as_str() {
-                "running" => ExperimentStatus::Running,
-                "completed" => ExperimentStatus::Completed,
-                "cancelled" => ExperimentStatus::Cancelled,
-                _ => ExperimentStatus::Running,
-            };
+            let status = ExperimentStatus::try_from(status_str.as_str()).unwrap_or_else(|e| {
+                tracing::warn!("Invalid experiment status in DB: {}", e);
+                ExperimentStatus::Running
+            });
 
             Ok(Experiment {
                 id: row.get(0)?,
@@ -1396,7 +1404,7 @@ pub fn list_experiments(conn: &Connection) -> Result<Vec<Experiment>> {
                 winner: row.get(10)?,
             })
         })?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| r.map_err(|e| tracing::warn!("Row query error: {}", e)).ok())
         .collect();
 
     Ok(results)
