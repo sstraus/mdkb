@@ -14,9 +14,9 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
-use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_update, handle_vsearch};
+use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_update};
 use crate::config::McpConfig;
-use crate::domain::{SearchQuery, SearchResult};
+use crate::domain::SearchResult;
 use crate::metrics::{count_tokens, truncate_with_continuation, truncate_with_ellipsis, UsageMetrics};
 use crate::store::{collections, documents, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
@@ -145,8 +145,8 @@ impl McpServer {
         }
     }
 
-    /// Search documents using BM25 full-text search.
-    #[tool(description = "Search markdown documents using BM25 full-text search")]
+    /// Search documents using hybrid search (BM25 + semantic with RRF fusion).
+    #[tool(description = "Search markdown documents using hybrid search (combines keyword and semantic search)")]
     async fn mdkb_search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -158,15 +158,13 @@ impl McpServer {
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        let query = SearchQuery {
-            text: params.query,
-            limit: params.limit,
-            collection: params.collection,
-            tags: vec![],
-        };
-
-        let results = search::search(&ctx.conn, &query)
-            .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
+        let results = handle_hybrid_search(
+            ctx,
+            &params.query,
+            params.limit,
+            params.collection.as_deref(),
+        )
+        .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
         let output = format_search_results(&results);
         let tokens = count_tokens(&output);
@@ -384,68 +382,6 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Semantic vector search using document embeddings.
-    #[tool(description = "Semantic vector search using document embeddings")]
-    async fn mdkb_vsearch(
-        &self,
-        Parameters(params): Parameters<SearchParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-        let results = handle_vsearch(
-            ctx,
-            &params.query,
-            params.limit,
-            params.collection.as_deref(),
-        )
-        .map_err(|e| mcp_error(format!("Vector search failed: {}", e)))?;
-
-        let output = format_search_results(&results);
-        let tokens = count_tokens(&output);
-        let result_count = results.len();
-        self.metrics.record_vsearch(tokens, result_count);
-        self.record_persistent_call("vsearch", tokens, result_count, false).await;
-        tracing::debug!("mdkb_vsearch: {} tokens, {} results", tokens, result_count);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Hybrid search combining keyword and semantic search with RRF fusion.
-    #[tool(description = "Hybrid search combining BM25 and vector search with RRF fusion")]
-    async fn mdkb_query(
-        &self,
-        Parameters(params): Parameters<SearchParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-        let results = handle_hybrid_search(
-            ctx,
-            &params.query,
-            params.limit,
-            params.collection.as_deref(),
-        )
-        .map_err(|e| mcp_error(format!("Hybrid search failed: {}", e)))?;
-
-        let output = format_search_results(&results);
-        let tokens = count_tokens(&output);
-        let result_count = results.len();
-        self.metrics.record_query(tokens, result_count);
-        self.record_persistent_call("query", tokens, result_count, false).await;
-        tracing::debug!("mdkb_query: {} tokens, {} results", tokens, result_count);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
     /// Get usage metrics for all tools.
     #[tool(description = "Get token usage metrics for all MCP tools (session and historical)")]
     async fn mdkb_metrics(&self) -> Result<CallToolResult, McpError> {
@@ -459,8 +395,6 @@ impl McpServer {
              Avg tokens/call: {:.1}\n\n\
              Tool breakdown:\n\
              - search:    {} calls, {} tokens ({:.1} avg)\n\
-             - vsearch:   {} calls, {} tokens ({:.1} avg)\n\
-             - query:     {} calls, {} tokens ({:.1} avg)\n\
              - get:       {} calls, {} tokens ({:.1} avg)\n\
              - multi_get: {} calls, {} tokens ({:.1} avg)\n\
              - status:    {} calls, {} tokens ({:.1} avg)\n\
@@ -471,12 +405,6 @@ impl McpServer {
             summary.search.call_count,
             summary.search.total_tokens,
             summary.search.avg_tokens_per_call,
-            summary.vsearch.call_count,
-            summary.vsearch.total_tokens,
-            summary.vsearch.avg_tokens_per_call,
-            summary.query.call_count,
-            summary.query.total_tokens,
-            summary.query.avg_tokens_per_call,
             summary.get.call_count,
             summary.get.total_tokens,
             summary.get.avg_tokens_per_call,
@@ -653,8 +581,8 @@ fn format_search_results(results: &[SearchResult]) -> String {
     for r in results {
         let title = r.title.as_deref().unwrap_or("(untitled)");
         output.push_str(&format!(
-            "[{}] {} - {} (score: {:.2})\n",
-            r.id, r.path, title, r.score
+            "[{}] {}:{} - {} (score: {:.2})\n",
+            r.id, r.collection, r.path, title, r.score
         ));
         for snippet in &r.snippets {
             output.push_str(&format!("  {}\n", snippet));
@@ -710,6 +638,7 @@ mod tests {
     fn test_format_search_results_with_results() {
         let results = vec![SearchResult {
             id: 1,
+            collection: "docs".to_string(),
             path: "readme.md".to_string(),
             title: Some("README".to_string()),
             score: -5.5,
@@ -717,6 +646,7 @@ mod tests {
         }];
         let output = format_search_results(&results);
         assert!(output.contains("[1]"));
+        assert!(output.contains("docs"));
         assert!(output.contains("readme.md"));
         assert!(output.contains("README"));
     }

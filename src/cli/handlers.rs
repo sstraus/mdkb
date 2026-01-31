@@ -213,6 +213,7 @@ pub fn handle_vsearch(
 
             results.push(SearchResult {
                 id: doc.id,
+                collection: doc.collection.clone(),
                 path: doc.relative_path.clone(),
                 title: doc.title.clone(),
                 score: 1.0 - f64::from(distance), // Convert distance to similarity
@@ -284,6 +285,7 @@ pub fn handle_hybrid_search(
 
             results.push(SearchResult {
                 id: doc.id,
+                collection: doc.collection.clone(),
                 path: doc.relative_path.clone(),
                 title: doc.title.clone(),
                 score,

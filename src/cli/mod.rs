@@ -41,36 +41,8 @@ pub enum Command {
     #[command(subcommand)]
     Collection(CollectionCommand),
 
-    /// Search documents (BM25 full-text)
+    /// Search documents (hybrid: combines BM25 + semantic with RRF fusion)
     Search {
-        /// Search query
-        query: String,
-
-        /// Maximum number of results
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-
-        /// Filter by collection
-        #[arg(short, long)]
-        collection: Option<String>,
-    },
-
-    /// Semantic vector search (requires --features llm)
-    Vsearch {
-        /// Search query
-        query: String,
-
-        /// Maximum number of results
-        #[arg(short, long, default_value = "10")]
-        limit: usize,
-
-        /// Filter by collection
-        #[arg(short, long)]
-        collection: Option<String>,
-    },
-
-    /// Hybrid search with reranking (requires --features llm)
-    Query {
         /// Search query
         query: String,
 
@@ -109,7 +81,7 @@ pub enum Command {
     /// Trigger differential reindex
     Update,
 
-    /// Generate embeddings for documents (requires --features llm)
+    /// Generate embeddings for documents
     Embed,
 
     /// Start MCP server

@@ -40,12 +40,8 @@ impl ToolUsage {
 /// Global usage metrics tracker.
 #[derive(Debug, Default)]
 pub struct UsageMetrics {
-    /// Search tool usage (mdkb_search).
+    /// Search tool usage (mdkb_search - hybrid search).
     pub search: Mutex<ToolUsage>,
-    /// Vector search usage (mdkb_vsearch).
-    pub vsearch: Mutex<ToolUsage>,
-    /// Hybrid search usage (mdkb_query).
-    pub query: Mutex<ToolUsage>,
     /// Document retrieval usage (mdkb_get).
     pub get: Mutex<ToolUsage>,
     /// Batch retrieval usage (mdkb_multi_get).
@@ -67,27 +63,9 @@ impl UsageMetrics {
         Self::default()
     }
 
-    /// Record a search tool call.
+    /// Record a search tool call (hybrid search).
     pub fn record_search(&self, tokens: usize, results: usize) {
         if let Ok(mut usage) = self.search.lock() {
-            usage.record(tokens, results);
-        }
-        self.total_tokens.fetch_add(tokens as u64, Ordering::Relaxed);
-        self.total_calls.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record a vector search tool call.
-    pub fn record_vsearch(&self, tokens: usize, results: usize) {
-        if let Ok(mut usage) = self.vsearch.lock() {
-            usage.record(tokens, results);
-        }
-        self.total_tokens.fetch_add(tokens as u64, Ordering::Relaxed);
-        self.total_calls.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Record a hybrid search tool call.
-    pub fn record_query(&self, tokens: usize, results: usize) {
-        if let Ok(mut usage) = self.query.lock() {
             usage.record(tokens, results);
         }
         self.total_tokens.fetch_add(tokens as u64, Ordering::Relaxed);
@@ -157,8 +135,6 @@ impl UsageMetrics {
             total_tokens: self.total_tokens(),
             avg_tokens_per_call: self.avg_tokens_per_call(),
             search: self.search.lock().map(|u| u.clone()).unwrap_or_default(),
-            vsearch: self.vsearch.lock().map(|u| u.clone()).unwrap_or_default(),
-            query: self.query.lock().map(|u| u.clone()).unwrap_or_default(),
             get: self.get.lock().map(|u| u.clone()).unwrap_or_default(),
             multi_get: self.multi_get.lock().map(|u| u.clone()).unwrap_or_default(),
             status: self.status.lock().map(|u| u.clone()).unwrap_or_default(),
@@ -174,8 +150,6 @@ pub struct UsageSummary {
     pub total_tokens: u64,
     pub avg_tokens_per_call: f64,
     pub search: ToolUsage,
-    pub vsearch: ToolUsage,
-    pub query: ToolUsage,
     pub get: ToolUsage,
     pub multi_get: ToolUsage,
     pub status: ToolUsage,

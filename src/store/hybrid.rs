@@ -85,6 +85,7 @@ mod tests {
     fn make_bm25_result(id: i64, score: f64) -> SearchResult {
         SearchResult {
             id,
+            collection: "docs".to_string(),
             path: format!("doc{}.md", id),
             title: Some(format!("Document {}", id)),
             score,

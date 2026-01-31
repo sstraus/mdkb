@@ -17,7 +17,7 @@ use mdkb::Result;
 use mdkb::cli::handlers::{
     Context, EmbedResult, StatsResult, handle_collection_add, handle_collection_list, handle_collection_remove,
     handle_collection_rename, handle_embed, handle_get, handle_hybrid_search, handle_init,
-    handle_mget, handle_search, handle_stats, handle_status, handle_update, handle_vsearch,
+    handle_mget, handle_stats, handle_status, handle_update,
 };
 use mdkb::cli::{Cli, CollectionCommand, Command, OutputFormat};
 use mdkb::mcp::server::run_server;
@@ -78,24 +78,6 @@ async fn main() -> Result<()> {
             }
         }
         Command::Search {
-            query,
-            limit,
-            collection,
-        } => {
-            let ctx = Context::open(&cwd)?;
-            let results = handle_search(&ctx, &query, limit, collection.as_deref())?;
-            format_search_results(&results, cli.format);
-        }
-        Command::Vsearch {
-            query,
-            limit,
-            collection,
-        } => {
-            let ctx = Context::open(&cwd)?;
-            let results = handle_vsearch(&ctx, &query, limit, collection.as_deref())?;
-            format_search_results(&results, cli.format);
-        }
-        Command::Query {
             query,
             limit,
             collection,
@@ -184,11 +166,12 @@ fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputF
             println!("{}", serde_json::to_string_pretty(results).unwrap());
         }
         OutputFormat::Csv => {
-            println!("id,path,title,score");
+            println!("id,collection,path,title,score");
             for r in results {
                 println!(
-                    "{},{},{},{}",
+                    "{},{},{},{},{}",
                     r.id,
+                    r.collection,
                     r.path,
                     r.title.as_deref().unwrap_or(""),
                     r.score
@@ -196,12 +179,13 @@ fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputF
             }
         }
         OutputFormat::Markdown => {
-            println!("| ID | Path | Title | Score |");
-            println!("|----|------|-------|-------|");
+            println!("| ID | Collection | Path | Title | Score |");
+            println!("|----|------------|------|-------|-------|");
             for r in results {
                 println!(
-                    "| {} | {} | {} | {:.2} |",
+                    "| {} | {} | {} | {} | {:.2} |",
                     r.id,
+                    r.collection,
                     r.path,
                     r.title.as_deref().unwrap_or("-"),
                     r.score
@@ -214,7 +198,7 @@ fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputF
             } else {
                 for r in results {
                     let title = r.title.as_deref().unwrap_or("(untitled)");
-                    println!("[{}] {} - {} (score: {:.2})", r.id, r.path, title, r.score);
+                    println!("[{}] {}:{} - {} (score: {:.2})", r.id, r.collection, r.path, title, r.score);
                 }
             }
         }

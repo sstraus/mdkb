@@ -11,7 +11,7 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
     // Build FTS5 query with optional collection filter
     if let Some(ref collection) = query.collection {
         let sql = r#"
-            SELECT d.id, d.relative_path, d.title, bm25(documents_fts) as score,
+            SELECT d.id, d.collection, d.relative_path, d.title, bm25(documents_fts) as score,
                    snippet(documents_fts, 1, '<b>', '</b>', '...', 32) as snippet
             FROM documents_fts f
             JOIN documents d ON d.id = f.rowid
@@ -24,12 +24,13 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
         let rows = stmt.query_map(
             params![&query.text, collection, query.limit as i64],
             |row| {
-                let snippet: Option<String> = row.get(4)?;
+                let snippet: Option<String> = row.get(5)?;
                 Ok(SearchResult {
                     id: row.get(0)?,
-                    path: row.get(1)?,
-                    title: row.get(2)?,
-                    score: row.get(3)?,
+                    collection: row.get(1)?,
+                    path: row.get(2)?,
+                    title: row.get(3)?,
+                    score: row.get(4)?,
                     snippets: snippet.map(|s| vec![s]).unwrap_or_default(),
                 })
             },
@@ -40,7 +41,7 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
         }
     } else {
         let sql = r#"
-            SELECT d.id, d.relative_path, d.title, bm25(documents_fts) as score,
+            SELECT d.id, d.collection, d.relative_path, d.title, bm25(documents_fts) as score,
                    snippet(documents_fts, 1, '<b>', '</b>', '...', 32) as snippet
             FROM documents_fts f
             JOIN documents d ON d.id = f.rowid
@@ -51,12 +52,13 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
 
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(params![&query.text, query.limit as i64], |row| {
-            let snippet: Option<String> = row.get(4)?;
+            let snippet: Option<String> = row.get(5)?;
             Ok(SearchResult {
                 id: row.get(0)?,
-                path: row.get(1)?,
-                title: row.get(2)?,
-                score: row.get(3)?,
+                collection: row.get(1)?,
+                path: row.get(2)?,
+                title: row.get(3)?,
+                score: row.get(4)?,
                 snippets: snippet.map(|s| vec![s]).unwrap_or_default(),
             })
         })?;

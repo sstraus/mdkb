@@ -78,6 +78,9 @@ pub struct SearchResult {
     /// Document ID.
     pub id: i64,
 
+    /// Collection name.
+    pub collection: String,
+
     /// Relative path.
     pub path: String,
 
