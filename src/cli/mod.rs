@@ -97,6 +97,10 @@ pub enum Command {
         #[arg(short, long)]
         aggregate: bool,
     },
+
+    /// Manage memory entries for AI knowledge persistence
+    #[command(subcommand)]
+    Memory(MemoryCommand),
 }
 
 /// Collection management subcommands.
@@ -131,6 +135,72 @@ pub enum CollectionCommand {
 
         /// New name
         new_name: String,
+    },
+}
+
+/// Memory management subcommands.
+#[derive(Subcommand, Debug)]
+pub enum MemoryCommand {
+    /// Add a new memory entry
+    Add {
+        /// Entry ID (slug, e.g., "auth-oauth2-flow")
+        id: String,
+
+        /// Concise title (max 50 chars)
+        #[arg(short, long)]
+        title: String,
+
+        /// Entry type
+        #[arg(short = 'T', long, default_value = "topic")]
+        entry_type: String,
+
+        /// Tags (comma-separated)
+        #[arg(long)]
+        tags: Option<String>,
+
+        /// Content (if not provided, reads from stdin)
+        #[arg(short, long)]
+        content: Option<String>,
+    },
+
+    /// Show a memory entry
+    Show {
+        /// Entry ID
+        id: String,
+    },
+
+    /// List memory entries
+    List {
+        /// Maximum entries to show
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+
+        /// Filter by status (active, superseded, archived)
+        #[arg(short, long)]
+        status: Option<String>,
+    },
+
+    /// Search memory entries
+    Search {
+        /// Search query
+        query: String,
+
+        /// Maximum results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// Get warmup index (compact list for AI session start)
+    Warmup {
+        /// Maximum entries
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+
+    /// Delete a memory entry
+    Rm {
+        /// Entry ID
+        id: String,
     },
 }
 

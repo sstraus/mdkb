@@ -12,27 +12,13 @@ AI assistants are limited by context windows. When your codebase has extensive d
 2. **Searching** with hybrid retrieval (keyword + semantic)
 3. **Exposing** results through MCP so Claude can query your docs on demand
 
-## Features
-
-- **Per-repo storage** - `.mdkb/` directory in your project, gitignore-friendly
-- **Hybrid search** - Combines BM25 keyword matching with semantic vector search using RRF fusion
-- **Local LLM** - Embeddings generated locally with a small GGUF model (~100MB)
-- **MCP server** - Integrates directly with Claude Code
-- **File watching** - Auto-reindex when files change (in MCP mode)
-- **Differential indexing** - Only reindex modified files
-- **Smart exclusions** - Ignores `.git/`, `node_modules/`, skill files, etc.
-
 ## Installation
 
 ```bash
-# Clone and build
-git clone <repo-url>
-cd mdkb
-cargo build --release
-
-# Add to PATH or copy binary
-cp target/release/mdkb ~/.local/bin/
+cargo install --path .
 ```
+
+Or download a pre-built binary from [Releases](https://github.com/user/mdkb/releases).
 
 ## Quick Start
 
@@ -45,88 +31,100 @@ mdkb init
 mdkb collection add docs ./docs
 mdkb collection add wiki ./wiki --pattern "**/*.md"
 
-# Index files and generate embeddings
-mdkb update    # Index text content
-mdkb embed     # Generate semantic embeddings (first run downloads ~100MB model)
+# Index files
+mdkb update
+
+# Generate semantic embeddings (downloads ~100MB model on first run)
+mdkb embed
 
 # Search
 mdkb search "authentication flow"
-mdkb search "how to handle errors" -c docs  # Filter to docs collection
+mdkb search "how to handle errors" -c docs
 ```
 
-## How Hybrid Search Works
+## Search
 
-mdkb combines two search strategies for better results:
+mdkb uses hybrid search combining two strategies:
 
-### 1. BM25 Keyword Search
-Traditional full-text search using SQLite FTS5. Good for exact terms:
-- "OAuth2 callback" finds documents with those exact words
-- Fast, no embeddings required
+- **BM25 keyword search** - Traditional full-text search. "OAuth2 callback" finds documents with those exact words.
+- **Semantic vector search** - Understands meaning. "how to authenticate users" finds docs about "login", "OAuth", "JWT".
 
-### 2. Semantic Vector Search
-Uses a local embedding model to understand meaning:
-- "how to authenticate users" finds docs about "login", "OAuth", "JWT"
-- Requires running `mdkb embed` to generate vectors
-
-### 3. RRF Fusion
-Results from both methods are merged using Reciprocal Rank Fusion:
-- Documents appearing in both lists rank higher
-- Balances precision (keywords) with recall (semantics)
-
-## CLI Commands
+Results are merged using Reciprocal Rank Fusion (RRF), so documents matching both keyword and meaning rank highest.
 
 ```bash
-# Initialization
-mdkb init                      # Create .mdkb/ directory
-
-# Collections
-mdkb collection add <name> <path> [--pattern <glob>]
-mdkb collection remove <name>
-mdkb collection list
-mdkb collection rename <old> <new>
-
-# Search & Retrieval
-mdkb search <query> [-l N] [-c NAME]   # Hybrid search
-mdkb get <id|path> [--lines 10:50]     # Retrieve document by ID
-mdkb mget <pattern> [-c NAME]          # Batch retrieve by glob
-
-# Indexing
-mdkb update                    # Differential text reindex
-mdkb embed                     # Generate/update embeddings
-mdkb status                    # Show index statistics
-
-# Server
-mdkb serve                     # Start MCP server
-mdkb stats [-s N] [-a]         # Usage statistics
+mdkb search <query> [-l LIMIT] [-c COLLECTION]
 ```
 
-### Options
-
-| Option | Description |
-|--------|-------------|
-| `-l, --limit N` | Maximum results to return (default: 10) |
-| `-c, --collection NAME` | Filter to a specific collection |
-| `--format FORMAT` | Output: `text`, `json`, `csv`, `markdown` |
-| `-v, -vv, -vvv` | Increase verbosity (info, debug, trace) |
-
-### Search Output
-
-Results show `[id] collection:path - title (score)`:
+Output format: `[id] collection:path - title (score)`
 
 ```
 [42] docs:api/auth.md - Authentication Guide (score: 0.85)
 [17] notes:security.md - Security Notes (score: 0.72)
 ```
 
-Use the ID to retrieve full content: `mdkb get 42`
+Use `mdkb get 42` to retrieve full document content.
 
-## MCP Server Integration
+## Collections
 
-mdkb implements the [Model Context Protocol](https://modelcontextprotocol.io/) to integrate with Claude Code and other MCP-compatible AI assistants.
+Collections group documents by source directory:
 
-### Setup with Claude Code
+```bash
+mdkb collection add <name> <path> [--pattern <glob>]
+mdkb collection list
+mdkb collection remove <name>
+mdkb collection rename <old> <new>
+```
 
-Add to your Claude Code MCP configuration (`~/.claude/mcp_servers.json`):
+The pattern defaults to `**/*.md`. Use `-c <name>` on search/get commands to filter by collection.
+
+## Document Retrieval
+
+```bash
+mdkb get <id|path>              # Get document by ID or path
+mdkb get 42 --lines 10:50       # Get specific line range
+mdkb mget "*.md" [-c NAME]      # Batch retrieve by glob pattern
+```
+
+## Memory
+
+Memory entries persist AI knowledge across sessions. Store decisions, learned patterns, and project context:
+
+```bash
+# Add a memory entry
+mdkb memory add auth-patterns -t "OAuth2 PKCE Flow" -T topic --tags auth,security \
+  -c "Always use PKCE for public clients. Store refresh tokens securely..."
+
+# Show entry
+mdkb memory show auth-patterns
+
+# List entries (ranked by access count)
+mdkb memory list
+
+# Search memories
+mdkb memory search "authentication"
+
+# Get warmup index (compact list for session start)
+mdkb memory warmup
+```
+
+Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices).
+
+### How AIs Use Memory
+
+1. **Session start**: AI calls `mdkb_memory_index` to get top 50 entries (~1.5K tokens)
+2. **On demand**: AI calls `mdkb_memory_get` for full entry content
+3. **Learning**: AI calls `mdkb_memory_write` to persist new knowledge
+4. **Finding**: AI calls `mdkb_memory_search` to find related entries
+
+Access counts track which entries are most useful, ensuring the warmup index prioritizes frequently-used knowledge.
+
+## MCP Server
+
+mdkb implements the [Model Context Protocol](https://modelcontextprotocol.io/) to integrate with Claude Code.
+
+### Setup
+
+Add to `~/.claude/mcp_servers.json`:
 
 ```json
 {
@@ -138,52 +136,25 @@ Add to your Claude Code MCP configuration (`~/.claude/mcp_servers.json`):
 }
 ```
 
-Or for multiple projects, use the global installation:
-
-```json
-{
-  "mdkb-myproject": {
-    "command": "/home/user/.local/bin/mdkb",
-    "args": ["serve"],
-    "cwd": "/home/user/projects/myproject"
-  }
-}
-```
-
-### What Claude Sees
-
-When configured, Claude Code has access to these tools:
+### Available Tools
 
 | Tool | Description |
 |------|-------------|
-| `mdkb_search` | Search documents with hybrid retrieval |
-| `mdkb_get` | Retrieve full document content by ID |
-| `mdkb_multi_get` | Batch retrieve documents by glob pattern |
+| `mdkb_search` | Hybrid search (keyword + semantic) |
+| `mdkb_get` | Retrieve document by ID (supports line ranges) |
+| `mdkb_multi_get` | Batch retrieve by glob pattern |
 | `mdkb_list_collections` | List available collections |
 | `mdkb_status` | Check index health |
-| `mdkb_update` | Trigger reindex (after file changes) |
+| `mdkb_update` | Trigger reindex |
 | `mdkb_metrics` | View token usage statistics |
-
-### Example Interaction
-
-```
-User: How does authentication work in this project?
-
-Claude: Let me search the documentation.
-[Calls mdkb_search with query "authentication"]
-
-Claude: I found relevant docs. Let me read the authentication guide.
-[Calls mdkb_get with id 42]
-
-Claude: Based on the documentation, authentication uses JWT tokens...
-```
+| `mdkb_memory_index` | Get warmup index for session start |
+| `mdkb_memory_get` | Retrieve full memory entry |
+| `mdkb_memory_write` | Create or update memory entry |
+| `mdkb_memory_search` | Search memory entries |
 
 ### File Watching
 
-In MCP mode, mdkb watches collection paths for changes and automatically reindexes:
-- New files are indexed within 100ms
-- Modified files are re-indexed
-- Deleted files are removed from the index
+In MCP mode, mdkb watches collection paths and automatically reindexes when files change.
 
 ## Configuration
 
@@ -197,76 +168,39 @@ default_limit = 10
 debounce_ms = 100
 
 [mcp]
-max_response_tokens = 4000      # Truncate long responses
-max_document_tokens = 2000      # Per-document limit in multi_get
-truncate_with_ellipsis = true   # Add "..." when truncating
+max_response_tokens = 4000
+max_document_tokens = 2000
 ```
 
-### Environment Overrides
-
-```bash
-MDKB_SEARCH_LIMIT=20 mdkb search "query"
-MDKB_MCP_MAX_TOKENS=8000 mdkb serve
-```
+Environment overrides: `MDKB_SEARCH_LIMIT=20`, `MDKB_MCP_MAX_TOKENS=8000`
 
 ## Storage
 
-All data stays in your project:
+All data stays local in `.mdkb/`:
 
 ```
 .mdkb/
-├── config.toml      # Configuration
-├── index.sqlite     # SQLite database (FTS5 + vectors)
-└── models/          # Downloaded GGUF models
+├── config.toml
+├── index.sqlite
+└── models/
     └── bge-small-en-v1.5-q8_0.gguf
 ```
 
-Add `.mdkb/` to your `.gitignore` - the index can be regenerated.
+Add `.mdkb/` to `.gitignore` - it can be regenerated with `mdkb update && mdkb embed`.
 
 ## Default Exclusions
 
 These paths are never indexed:
 
 ```
-**/SKILL.md
-**/skills/**
-**/.claude/**
 **/.git/**
+**/.mdkb/**
+**/.claude/**
 **/node_modules/**
 **/target/**
-**/.mdkb/**
+**/SKILL.md
+**/skills/**
 ```
-
-## Architecture
-
-```
-┌─────────────────┐     ┌─────────────────┐
-│   Claude Code   │────▶│   MCP Server    │
-│  (or other AI)  │◀────│  (mdkb serve)   │
-└─────────────────┘     └────────┬────────┘
-                                 │
-                    ┌────────────┴────────────┐
-                    │                         │
-              ┌─────▼─────┐           ┌───────▼───────┐
-              │  SQLite   │           │  File Watcher │
-              │  FTS5 +   │           │   (notify)    │
-              │  Vectors  │           └───────────────┘
-              └───────────┘
-```
-
-**Components:**
-- **CLI** (`clap`) - Command-line interface
-- **MCP Server** (`rmcp`) - JSON-RPC over stdio
-- **Storage** (`rusqlite` + `sqlite-vec`) - FTS5 for keywords, sqlite-vec for embeddings
-- **LLM** (`llama-cpp-rs`) - Local embedding generation
-- **Watcher** (`notify`) - File system monitoring
-
-## Performance
-
-- **Indexing**: ~1000 docs/second (text only)
-- **Embeddings**: ~10 docs/second (depends on hardware)
-- **Search**: <10ms for most queries
-- **Memory**: ~50MB base + model size (~100MB when generating embeddings)
 
 ## License
 

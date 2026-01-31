@@ -77,6 +77,53 @@ CREATE TRIGGER IF NOT EXISTS documents_au AFTER UPDATE ON documents BEGIN
     INSERT INTO documents_fts(rowid, title, body)
     SELECT NEW.id, NEW.title, c.body FROM content c WHERE c.hash = NEW.hash;
 END;
+
+-- Memory entries for AI knowledge persistence
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id TEXT PRIMARY KEY,              -- slug: "auth-oauth2-flow"
+    title TEXT NOT NULL,              -- Concise title (max 50 chars)
+    content TEXT NOT NULL,            -- Full markdown content
+    entry_type TEXT NOT NULL,         -- topic, problem, decision
+    tags TEXT NOT NULL DEFAULT '[]',  -- JSON array: ["auth", "security"]
+    status TEXT DEFAULT 'active',     -- active, superseded, archived
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    superseded_by TEXT,               -- ID of newer entry
+    access_count INTEGER DEFAULT 0,   -- Track usage for ranking
+    last_accessed INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
+CREATE INDEX IF NOT EXISTS idx_memory_status ON memory_entries(status);
+CREATE INDEX IF NOT EXISTS idx_memory_access ON memory_entries(access_count DESC);
+
+-- FTS for memory content search
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
+    id,
+    title,
+    content,
+    tokenize = 'porter unicode61',
+    content='',
+    content_rowid='rowid'
+);
+
+-- Triggers to keep memory FTS in sync
+CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory_entries BEGIN
+    INSERT INTO memory_fts(rowid, id, title, content)
+    VALUES ((SELECT rowid FROM memory_entries WHERE id = NEW.id), NEW.id, NEW.title, NEW.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory_entries BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, id, title, content)
+    VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory_entries BEGIN
+    INSERT INTO memory_fts(memory_fts, rowid, id, title, content)
+    VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content);
+    INSERT INTO memory_fts(rowid, id, title, content)
+    VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
+END;
 "#;
 
 /// SQL for setting BM25 column weights (title 10x, body 1x).

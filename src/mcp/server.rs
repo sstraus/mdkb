@@ -18,10 +18,13 @@ use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_up
 use crate::config::McpConfig;
 use crate::domain::SearchResult;
 use crate::metrics::{count_tokens, truncate_with_continuation, truncate_with_ellipsis, UsageMetrics};
-use crate::store::{collections, documents, search, stats};
+use crate::store::{collections, documents, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
-use super::tools::{GetParams, MultiGetParams, SearchParams};
+use super::tools::{
+    GetParams, MemoryGetParams, MemoryIndexParams, MemorySearchParams, MemoryWriteParams,
+    MultiGetParams, SearchParams,
+};
 
 /// Create an MCP error from a message.
 fn mcp_error(message: impl Into<Cow<'static, str>>) -> McpError {
@@ -441,6 +444,175 @@ impl McpServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    /// Get memory warmup index (compact list for AI session start).
+    #[tool(description = "Get memory index for session warmup (~50 entries, compact format). Call this at session start to load context.")]
+    async fn mdkb_memory_index(
+        &self,
+        Parameters(params): Parameters<MemoryIndexParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        let index = memory::get_warmup_index(&ctx.conn, params.limit)
+            .map_err(|e| mcp_error(format!("Failed to get memory index: {}", e)))?;
+
+        let output = if index.is_empty() {
+            "No memory entries found.".to_string()
+        } else {
+            format!("Memory index ({} entries):\n{}", index.len(), index.join("\n"))
+        };
+
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("memory_index", tokens, index.len(), false).await;
+        tracing::debug!("mdkb_memory_index: {} tokens, {} entries", tokens, index.len());
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Retrieve a memory entry by ID.
+    #[tool(description = "Retrieve full content of a memory entry by ID")]
+    async fn mdkb_memory_get(
+        &self,
+        Parameters(params): Parameters<MemoryGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        let entry = memory::get_entry(&ctx.conn, &params.id)
+            .map_err(|e| mcp_error(format!("Failed to get memory entry: {}", e)))?
+            .ok_or_else(|| mcp_error(format!("Memory entry not found: {}", params.id)))?;
+
+        let output = format!(
+            "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times\n\n{}",
+            entry.title,
+            entry.id,
+            entry.entry_type,
+            entry.status,
+            if entry.tags.is_empty() {
+                "none".to_string()
+            } else {
+                entry.tags.join(", ")
+            },
+            entry.access_count,
+            entry.content
+        );
+
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("memory_get", tokens, 1, false).await;
+        tracing::debug!("mdkb_memory_get: {} tokens", tokens);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Write or update a memory entry.
+    #[tool(description = "Create or update a memory entry. Use for persisting important knowledge across sessions.")]
+    async fn mdkb_memory_write(
+        &self,
+        Parameters(params): Parameters<MemoryWriteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        // Check if entry exists
+        let existing = memory::get_entry(&ctx.conn, &params.id)
+            .map_err(|e| mcp_error(format!("Failed to check existing entry: {}", e)))?;
+
+        // Parse entry type
+        let entry_type: memory::EntryType = params
+            .entry_type
+            .parse()
+            .map_err(|e: String| mcp_error(e))?;
+
+        let now = chrono::Utc::now().timestamp();
+
+        let output = if let Some(mut existing_entry) = existing {
+            // Update existing entry
+            existing_entry.title = params.title.clone();
+            existing_entry.content = params.content.clone();
+            existing_entry.entry_type = entry_type;
+            existing_entry.tags = params.tags.clone();
+            memory::update_entry(&ctx.conn, &existing_entry)
+                .map_err(|e| mcp_error(format!("Failed to update memory entry: {}", e)))?;
+            format!("Updated memory entry: {}", params.id)
+        } else {
+            // Create new entry
+            let entry = memory::MemoryEntry {
+                id: params.id.clone(),
+                title: params.title.clone(),
+                content: params.content.clone(),
+                entry_type,
+                tags: params.tags.clone(),
+                status: memory::EntryStatus::Active,
+                created_at: now,
+                updated_at: now,
+                superseded_by: None,
+                access_count: 0,
+                last_accessed: None,
+            };
+            memory::add_entry(&ctx.conn, &entry)
+                .map_err(|e| mcp_error(format!("Failed to create memory entry: {}", e)))?;
+            format!("Created memory entry: {}", params.id)
+        };
+
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("memory_write", tokens, 1, false).await;
+        tracing::debug!("mdkb_memory_write: {}", output);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Search memory entries.
+    #[tool(description = "Search memory entries by keyword")]
+    async fn mdkb_memory_search(
+        &self,
+        Parameters(params): Parameters<MemorySearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        let entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
+            .map_err(|e| mcp_error(format!("Failed to search memory: {}", e)))?;
+
+        let output = if entries.is_empty() {
+            "No matching memory entries found.".to_string()
+        } else {
+            let mut out = format!("Found {} memory entries:\n\n", entries.len());
+            for entry in &entries {
+                out.push_str(&format!(
+                    "- [{}] {} ({}): {}\n",
+                    entry.id,
+                    entry.title,
+                    entry.entry_type,
+                    truncate_text(&entry.content, 100)
+                ));
+            }
+            out
+        };
+
+        let tokens = count_tokens(&output);
+        let result_count = entries.len();
+        self.record_persistent_call("memory_search", tokens, result_count, false).await;
+        tracing::debug!("mdkb_memory_search: {} tokens, {} results", tokens, result_count);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
 }
 
 #[tool_handler]
@@ -569,6 +741,16 @@ async fn run_file_watcher(
     }
 
     Ok(())
+}
+
+/// Truncate text to a maximum length with ellipsis.
+fn truncate_text(text: &str, max_len: usize) -> String {
+    let text = text.replace('\n', " ");
+    if text.len() <= max_len {
+        text
+    } else {
+        format!("{}...", &text[..max_len.saturating_sub(3)])
+    }
 }
 
 /// Format search results for output.

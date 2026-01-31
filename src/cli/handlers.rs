@@ -813,6 +813,83 @@ fn apply_line_range(content: &str, range: &str) -> Result<String> {
     Ok(lines[start_idx..end_idx].join("\n"))
 }
 
+// ==================== Memory Handlers ====================
+
+use crate::store::memory::{self, EntryStatus, EntryType, MemoryEntry};
+
+/// Handle `mdkb memory add` command.
+pub fn handle_memory_add(
+    ctx: &Context,
+    id: &str,
+    title: &str,
+    entry_type: &str,
+    tags: Option<&str>,
+    content: &str,
+) -> Result<()> {
+    let entry_type: EntryType = entry_type
+        .parse()
+        .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
+
+    let tags: Vec<String> = tags
+        .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_default();
+
+    let now = chrono::Utc::now().timestamp();
+
+    let entry = MemoryEntry {
+        id: id.to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        entry_type,
+        tags,
+        status: EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+    };
+
+    memory::add_entry(&ctx.conn, &entry)?;
+    Ok(())
+}
+
+/// Handle `mdkb memory show` command.
+pub fn handle_memory_show(ctx: &Context, id: &str) -> Result<Option<MemoryEntry>> {
+    memory::get_entry(&ctx.conn, id)
+}
+
+/// Handle `mdkb memory list` command.
+pub fn handle_memory_list(
+    ctx: &Context,
+    limit: usize,
+    status: Option<&str>,
+) -> Result<Vec<MemoryEntry>> {
+    let status_filter = status
+        .map(|s| {
+            s.parse::<EntryStatus>()
+                .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))
+        })
+        .transpose()?;
+
+    memory::list_entries(&ctx.conn, limit, status_filter)
+}
+
+/// Handle `mdkb memory search` command.
+pub fn handle_memory_search(ctx: &Context, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+    memory::search_entries(&ctx.conn, query, limit)
+}
+
+/// Handle `mdkb memory warmup` command.
+pub fn handle_memory_warmup(ctx: &Context, limit: usize) -> Result<Vec<String>> {
+    memory::get_warmup_index(&ctx.conn, limit)
+}
+
+/// Handle `mdkb memory rm` command.
+pub fn handle_memory_rm(ctx: &Context, id: &str) -> Result<bool> {
+    memory::delete_entry(&ctx.conn, id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -44,6 +44,61 @@ pub struct MultiGetParams {
     pub collection: Option<String>,
 }
 
+/// Parameters for the memory index tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryIndexParams {
+    /// Maximum entries to return (default: 50).
+    #[serde(default = "default_memory_limit")]
+    pub limit: usize,
+}
+
+fn default_memory_limit() -> usize {
+    50
+}
+
+/// Parameters for the memory get tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryGetParams {
+    /// Memory entry ID.
+    pub id: String,
+}
+
+/// Parameters for the memory write tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryWriteParams {
+    /// Entry ID (slug, e.g., "auth-oauth2-flow").
+    pub id: String,
+
+    /// Concise title (max 50 chars).
+    pub title: String,
+
+    /// Full content.
+    pub content: String,
+
+    /// Entry type: topic, problem, or decision.
+    #[serde(default = "default_entry_type")]
+    pub entry_type: String,
+
+    /// Tags for categorization.
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+fn default_entry_type() -> String {
+    "topic".to_string()
+}
+
+/// Parameters for the memory search tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemorySearchParams {
+    /// Search query.
+    pub query: String,
+
+    /// Maximum results (default: 10).
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

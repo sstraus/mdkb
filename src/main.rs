@@ -17,9 +17,11 @@ use mdkb::Result;
 use mdkb::cli::handlers::{
     Context, EmbedResult, StatsResult, handle_collection_add, handle_collection_list, handle_collection_remove,
     handle_collection_rename, handle_embed, handle_get, handle_hybrid_search, handle_init,
-    handle_mget, handle_stats, handle_status, handle_update,
+    handle_memory_add, handle_memory_list, handle_memory_rm, handle_memory_search,
+    handle_memory_show, handle_memory_warmup, handle_mget, handle_stats, handle_status, handle_update,
 };
-use mdkb::cli::{Cli, CollectionCommand, Command, OutputFormat};
+use mdkb::cli::{Cli, CollectionCommand, Command, MemoryCommand, OutputFormat};
+use mdkb::store::memory::MemoryEntry;
 use mdkb::mcp::server::run_server;
 
 #[tokio::main]
@@ -121,6 +123,53 @@ async fn main() -> Result<()> {
             let ctx = Context::open(&cwd)?;
             let result = handle_stats(&ctx, sessions, aggregate)?;
             format_stats_result(&result, cli.format);
+        }
+        Command::Memory(cmd) => {
+            let ctx = Context::open(&cwd)?;
+            match cmd {
+                MemoryCommand::Add {
+                    id,
+                    title,
+                    entry_type,
+                    tags,
+                    content,
+                } => {
+                    let content = content.unwrap_or_else(|| {
+                        use std::io::Read;
+                        let mut buf = String::new();
+                        std::io::stdin().read_to_string(&mut buf).unwrap_or_default();
+                        buf
+                    });
+                    handle_memory_add(&ctx, &id, &title, &entry_type, tags.as_deref(), &content)?;
+                    println!("Added memory entry '{id}'");
+                }
+                MemoryCommand::Show { id } => {
+                    if let Some(entry) = handle_memory_show(&ctx, &id)? {
+                        format_memory_entry(&entry, cli.format);
+                    } else {
+                        println!("Memory entry '{id}' not found");
+                    }
+                }
+                MemoryCommand::List { limit, status } => {
+                    let entries = handle_memory_list(&ctx, limit, status.as_deref())?;
+                    format_memory_list(&entries, cli.format);
+                }
+                MemoryCommand::Search { query, limit } => {
+                    let entries = handle_memory_search(&ctx, &query, limit)?;
+                    format_memory_list(&entries, cli.format);
+                }
+                MemoryCommand::Warmup { limit } => {
+                    let index = handle_memory_warmup(&ctx, limit)?;
+                    format_warmup_index(&index, cli.format);
+                }
+                MemoryCommand::Rm { id } => {
+                    if handle_memory_rm(&ctx, &id)? {
+                        println!("Deleted memory entry '{id}'");
+                    } else {
+                        println!("Memory entry '{id}' not found");
+                    }
+                }
+            }
         }
     }
 
@@ -351,6 +400,111 @@ fn format_embed_result(result: &EmbedResult, format: OutputFormat) {
                 for err in &result.errors {
                     println!("  - {}", err);
                 }
+            }
+        }
+    }
+}
+
+fn format_memory_entry(entry: &MemoryEntry, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(entry).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id,title,type,status,tags,access_count");
+            println!(
+                "{},{},{},{},{},{}",
+                entry.id,
+                entry.title,
+                entry.entry_type,
+                entry.status,
+                entry.tags.join(";"),
+                entry.access_count
+            );
+        }
+        OutputFormat::Markdown => {
+            println!("# {}\n", entry.title);
+            println!("**ID:** {}", entry.id);
+            println!("**Type:** {}", entry.entry_type);
+            println!("**Tags:** {}", entry.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
+            println!("**Access count:** {}\n", entry.access_count);
+            println!("---\n");
+            println!("{}", entry.content);
+        }
+        OutputFormat::Text => {
+            println!("[{}] {} ({})", entry.id, entry.title, entry.entry_type);
+            if !entry.tags.is_empty() {
+                println!("Tags: {}", entry.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
+            }
+            println!("Access count: {}", entry.access_count);
+            println!("\n{}", entry.content);
+        }
+    }
+}
+
+fn format_memory_list(entries: &[MemoryEntry], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(entries).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id,title,type,status,tags,access_count");
+            for e in entries {
+                println!(
+                    "{},{},{},{},{},{}",
+                    e.id,
+                    e.title,
+                    e.entry_type,
+                    e.status,
+                    e.tags.join(";"),
+                    e.access_count
+                );
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("| ID | Title | Type | Tags | Access |");
+            println!("|----|-------|------|------|--------|");
+            for e in entries {
+                let tags = e.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
+                println!("| {} | {} | {} | {} | {} |", e.id, e.title, e.entry_type, tags, e.access_count);
+            }
+        }
+        OutputFormat::Text => {
+            if entries.is_empty() {
+                println!("No memory entries found.");
+            } else {
+                for e in entries {
+                    let tags = e.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
+                    println!("[{}] {} ({}) {} - {} accesses", e.id, e.title, e.entry_type, tags, e.access_count);
+                }
+            }
+        }
+    }
+}
+
+fn format_warmup_index(index: &[String], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "count": index.len(),
+                "entries": index,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv | OutputFormat::Text => {
+            if index.is_empty() {
+                println!("Memory ({} entries):", index.len());
+            } else {
+                println!("Memory ({} entries):", index.len());
+                for line in index {
+                    println!("{line}");
+                }
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("## Memory Index ({} entries)\n", index.len());
+            for line in index {
+                println!("- {line}");
             }
         }
     }
