@@ -11,9 +11,10 @@ use rmcp::ServiceExt;
 use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError};
 use tokio::sync::Mutex;
 
-use crate::cli::handlers::Context;
+use crate::cli::handlers::{handle_update, Context};
 use crate::domain::{SearchQuery, SearchResult};
-use crate::store::{documents, search};
+use crate::store::{collections, documents, search};
+use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{GetParams, SearchParams};
 
@@ -161,12 +162,21 @@ impl ServerHandler for McpServer {
     }
 }
 
-/// Run the MCP server on stdio.
+/// Run the MCP server on stdio with file watching.
 pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
-    let server = McpServer::new(root);
+    let server = McpServer::new(root.clone());
     let (stdin, stdout) = rmcp::transport::io::stdio();
 
     tracing::info!("Starting mdkb MCP server...");
+
+    // Start file watcher in background
+    let watcher_root = root.clone();
+    let watcher_ctx = server.ctx.clone();
+    tokio::spawn(async move {
+        if let Err(e) = run_file_watcher(watcher_root, watcher_ctx).await {
+            tracing::error!("File watcher error: {}", e);
+        }
+    });
 
     let service = server
         .serve((stdin, stdout))
@@ -177,6 +187,69 @@ pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
         .waiting()
         .await
         .map_err(|e| crate::error::Error::Mcp(format!("Server error: {}", e)))?;
+
+    Ok(())
+}
+
+/// Run the file watcher and trigger reindex on changes.
+async fn run_file_watcher(
+    root: PathBuf,
+    ctx: Arc<Mutex<Option<Context>>>,
+) -> crate::error::Result<()> {
+    let config = WatcherConfig::default();
+    let mut watcher = FileWatcher::new(config)?;
+
+    // Open context to get collection paths
+    let ctx_guard = ctx.lock().await;
+    if ctx_guard.is_none() {
+        // Context not yet initialized, will be initialized on first tool call
+        drop(ctx_guard);
+        return Ok(());
+    }
+
+    let collection_list = {
+        let ctx_ref = ctx_guard.as_ref().unwrap();
+        collections::list_collections(&ctx_ref.conn)?
+    };
+    drop(ctx_guard);
+
+    // Watch all collection paths
+    for coll in &collection_list {
+        let path = root.join(&coll.path);
+        if path.exists() {
+            if let Err(e) = watcher.watch(&path) {
+                tracing::warn!("Failed to watch {}: {}", path.display(), e);
+            } else {
+                tracing::info!("Watching collection '{}' at {}", coll.name, path.display());
+            }
+        }
+    }
+
+    // Process file changes
+    while let Some(change) = watcher.recv().await {
+        tracing::debug!("File change detected: {:?}", change.path);
+
+        // Re-acquire context and trigger update
+        let mut ctx_guard = ctx.lock().await;
+        if let Some(ctx_ref) = ctx_guard.as_mut() {
+            // Check if the changed file matches any collection pattern
+            match handle_update(ctx_ref, &root) {
+                Ok(result) => {
+                    if result.added > 0 || result.updated > 0 || result.removed > 0 {
+                        tracing::info!(
+                            "Reindexed: {} added, {} updated, {} removed",
+                            result.added,
+                            result.updated,
+                            result.removed
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Reindex failed: {}", e);
+                }
+            }
+        }
+    }
 
     Ok(())
 }

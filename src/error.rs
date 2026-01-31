@@ -67,6 +67,10 @@ pub enum Error {
     #[error("MCP server error: {0}")]
     Mcp(String),
 
+    // Watcher errors
+    #[error("file watcher error: {0}")]
+    Watcher(String),
+
     // Serialization errors
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
