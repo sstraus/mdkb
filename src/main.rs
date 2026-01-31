@@ -20,9 +20,10 @@ use mdkb::cli::handlers::{
     handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_get, handle_history, handle_hybrid_search, handle_init, handle_memory_add, handle_memory_list,
     handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
+    handle_metrics_export, handle_metrics_latency, handle_metrics_show,
     handle_mget, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
-use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, MemoryCommand, OutputFormat};
+use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, MemoryCommand, MetricsCommand, OutputFormat};
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
 use mdkb::mcp::server::run_server;
@@ -127,6 +128,27 @@ async fn main() -> Result<()> {
             let ctx = Context::open(&cwd)?;
             let result = handle_stats(&ctx, sessions, aggregate)?;
             format_stats_result(&result, cli.format);
+        }
+        Command::Metrics(cmd) => {
+            let ctx = Context::open(&cwd)?;
+            match cmd {
+                MetricsCommand::Show { period } => {
+                    let metrics = handle_metrics_show(&ctx, period)?;
+                    format_metrics_summary(&metrics, period, cli.format);
+                }
+                MetricsCommand::Latency { period } => {
+                    let stats = handle_metrics_latency(&ctx)?;
+                    format_latency_stats(&stats, period, cli.format);
+                }
+                MetricsCommand::Quality { period } => {
+                    let metrics = handle_metrics_show(&ctx, period)?;
+                    format_quality_metrics(&metrics, period, cli.format);
+                }
+                MetricsCommand::Export { period } => {
+                    let events = handle_metrics_export(&ctx, period)?;
+                    format_metrics_export(&events, cli.format);
+                }
+            }
         }
         Command::Memory(cmd) => {
             let ctx = Context::open(&cwd)?;
@@ -773,6 +795,166 @@ fn format_stats_result(result: &StatsResult, format: OutputFormat) {
                         }
                     }
                 }
+            }
+        }
+    }
+}
+
+fn format_metrics_summary(metrics: &mdkb::store::stats::QueryMetricsSummary, period: u32, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(metrics).unwrap_or_default());
+        }
+        OutputFormat::Csv => {
+            println!("total_queries,zero_result_rate,re_search_rate,latency_p50,latency_p95,latency_p99");
+            println!(
+                "{},{:.1},{:.1},{},{},{}",
+                metrics.total_queries, metrics.zero_result_rate, metrics.re_search_rate,
+                metrics.latency_p50, metrics.latency_p95, metrics.latency_p99
+            );
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("=== Query Metrics (last {} days) ===\n", period);
+            println!("Total queries: {}", metrics.total_queries);
+            println!("Zero-result rate: {:.1}%{}", metrics.zero_result_rate,
+                if metrics.zero_result_rate > 10.0 { " ⚠️ High - queries not finding results" } else { "" });
+            println!("Re-search rate: {:.1}%{}", metrics.re_search_rate,
+                if metrics.re_search_rate > 15.0 { " ⚠️ High - initial results may be poor" } else { "" });
+            println!();
+            println!("Latency:");
+            println!("  p50: {}ms", metrics.latency_p50);
+            println!("  p95: {}ms", metrics.latency_p95);
+            println!("  p99: {}ms{}", metrics.latency_p99,
+                if metrics.latency_p99 > 500 { " ⚠️ Slow - performance issue" } else { "" });
+            println!();
+            println!("Score distribution:");
+            println!("  > 0.8: {:.1}%", metrics.score_above_80);
+            println!("  0.5-0.8: {:.1}%", metrics.score_50_to_80);
+            println!("  < 0.5: {:.1}%", metrics.score_below_50);
+        }
+    }
+}
+
+fn format_latency_stats(stats: &[mdkb::store::stats::QueryLatencyStats], period: u32, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(stats).unwrap_or_default());
+        }
+        OutputFormat::Csv => {
+            println!("search_type,count,avg_latency_ms,max_latency_ms,zero_result_count");
+            for s in stats {
+                println!(
+                    "{},{},{:.1},{},{}",
+                    s.search_type, s.count, s.avg_latency_ms, s.max_latency_ms, s.zero_result_count
+                );
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("=== Latency Breakdown (last {} days) ===\n", period);
+            if stats.is_empty() {
+                println!("No query data available.");
+            } else {
+                for s in stats {
+                    println!("{} search:", s.search_type);
+                    println!("  Total queries: {}", s.count);
+                    println!("  Avg latency: {:.1}ms", s.avg_latency_ms);
+                    println!("  Max latency: {}ms", s.max_latency_ms);
+                    println!("  Zero results: {} ({:.1}%)",
+                        s.zero_result_count,
+                        if s.count > 0 { (s.zero_result_count as f64 / s.count as f64) * 100.0 } else { 0.0 });
+                    println!();
+                }
+            }
+        }
+    }
+}
+
+fn format_quality_metrics(metrics: &mdkb::store::stats::QueryMetricsSummary, period: u32, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let quality = serde_json::json!({
+                "period_days": period,
+                "total_queries": metrics.total_queries,
+                "zero_result_rate": metrics.zero_result_rate,
+                "re_search_rate": metrics.re_search_rate,
+                "score_distribution": {
+                    "above_80": metrics.score_above_80,
+                    "50_to_80": metrics.score_50_to_80,
+                    "below_50": metrics.score_below_50
+                }
+            });
+            println!("{}", serde_json::to_string_pretty(&quality).unwrap_or_default());
+        }
+        OutputFormat::Csv => {
+            println!("period_days,total_queries,zero_result_rate,re_search_rate,score_above_80,score_50_to_80,score_below_50");
+            println!("{},{},{:.1},{:.1},{:.1},{:.1},{:.1}",
+                period, metrics.total_queries, metrics.zero_result_rate, metrics.re_search_rate,
+                metrics.score_above_80, metrics.score_50_to_80, metrics.score_below_50);
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("=== Search Quality Analysis (last {} days) ===\n", period);
+            println!("Total queries analyzed: {}\n", metrics.total_queries);
+
+            // Zero result analysis
+            println!("Zero-result rate: {:.1}%", metrics.zero_result_rate);
+            if metrics.zero_result_rate > 10.0 {
+                println!("  ⚠️  Consider:");
+                println!("    - Adding more content to the knowledge base");
+                println!("    - Checking query terms for typos");
+                println!("    - Expanding synonyms in indexed content");
+            }
+            println!();
+
+            // Re-search analysis
+            println!("Re-search rate: {:.1}%", metrics.re_search_rate);
+            if metrics.re_search_rate > 15.0 {
+                println!("  ⚠️  Consider:");
+                println!("    - Improving document titles");
+                println!("    - Adding better keywords to content");
+                println!("    - Reviewing search result ordering");
+            }
+            println!();
+
+            // Score distribution
+            println!("Score distribution (queries with results):");
+            println!("  Excellent (> 0.8): {:.1}%", metrics.score_above_80);
+            println!("  Good (0.5-0.8):    {:.1}%", metrics.score_50_to_80);
+            println!("  Poor (< 0.5):      {:.1}%", metrics.score_below_50);
+            if metrics.score_below_50 > 20.0 {
+                println!("\n  ⚠️  High percentage of poor-scoring results.");
+                println!("    Consider improving content quality or relevance.");
+            }
+        }
+    }
+}
+
+fn format_metrics_export(events: &[mdkb::store::stats::QueryEvent], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(events).unwrap_or_default());
+        }
+        OutputFormat::Csv => {
+            println!("query_hash,query_text,search_type,result_count,latency_ms,top_score");
+            for e in events {
+                println!("{},{},{},{},{},{}",
+                    e.query_hash,
+                    e.query_text.replace(',', ";"),
+                    e.search_type,
+                    e.result_count,
+                    e.latency_ms,
+                    e.top_score.map(|s| format!("{:.3}", s)).unwrap_or_default());
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("Query events ({} total):\n", events.len());
+            for (i, e) in events.iter().take(20).enumerate() {
+                println!("{}. \"{}\"", i + 1, e.query_text);
+                println!("   Type: {} | Results: {} | Latency: {}ms | Score: {}",
+                    e.search_type, e.result_count, e.latency_ms,
+                    e.top_score.map(|s| format!("{:.2}", s)).unwrap_or_else(|| "N/A".to_string()));
+            }
+            if events.len() > 20 {
+                println!("\n... and {} more events (use --json or --csv for full export)", events.len() - 20);
             }
         }
     }

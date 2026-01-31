@@ -102,6 +102,10 @@ pub enum Command {
         aggregate: bool,
     },
 
+    /// Query metrics and search quality analysis
+    #[command(subcommand)]
+    Metrics(MetricsCommand),
+
     /// Manage memory entries for AI knowledge persistence
     #[command(subcommand)]
     Memory(MemoryCommand),
@@ -161,6 +165,38 @@ pub enum CollectionCommand {
 
         /// New name
         new_name: String,
+    },
+}
+
+/// Metrics subcommands.
+#[derive(Subcommand, Debug)]
+pub enum MetricsCommand {
+    /// Show query metrics summary
+    Show {
+        /// Period in days (default: 7)
+        #[arg(short, long, default_value = "7")]
+        period: u32,
+    },
+
+    /// Show latency breakdown
+    Latency {
+        /// Period in days (default: 7)
+        #[arg(short, long, default_value = "7")]
+        period: u32,
+    },
+
+    /// Show search quality metrics
+    Quality {
+        /// Period in days (default: 7)
+        #[arg(short, long, default_value = "7")]
+        period: u32,
+    },
+
+    /// Export metrics data
+    Export {
+        /// Period in days (default: 7)
+        #[arg(short, long, default_value = "7")]
+        period: u32,
     },
 }
 

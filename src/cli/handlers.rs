@@ -12,6 +12,7 @@ use crate::store::documents;
 use crate::store::hybrid;
 use crate::store::schema;
 use crate::store::search;
+use crate::store::stats;
 use crate::store::vectors;
 use globset::Glob;
 use rusqlite::Connection;
@@ -751,8 +752,6 @@ pub struct ToolUsageStats {
 
 /// Handle stats command.
 pub fn handle_stats(ctx: &Context, sessions: usize, aggregate_only: bool) -> Result<StatsResult> {
-    use crate::store::stats;
-
     // Initialize schema if needed
     stats::init_stats_schema(&ctx.conn)?;
 
@@ -1339,6 +1338,26 @@ pub fn handle_current(ctx: &Context, path_or_id: &str) -> Result<Option<Document
 pub fn handle_superseded_by(ctx: &Context, path_or_id: &str) -> Result<Vec<Evolution>> {
     let doc_id = resolve_document_id(ctx, path_or_id)?;
     evolution::get_superseded_by(&ctx.conn, doc_id)
+}
+
+// ==================== Metrics Handlers ====================
+
+/// Handle `mdkb metrics show` command.
+pub fn handle_metrics_show(ctx: &Context, period: u32) -> Result<stats::QueryMetricsSummary> {
+    stats::init_stats_schema(&ctx.conn)?;
+    stats::get_query_metrics(&ctx.conn, period)
+}
+
+/// Handle `mdkb metrics latency` command.
+pub fn handle_metrics_latency(ctx: &Context) -> Result<Vec<stats::QueryLatencyStats>> {
+    stats::init_stats_schema(&ctx.conn)?;
+    stats::get_query_latency_stats(&ctx.conn)
+}
+
+/// Handle `mdkb metrics export` command.
+pub fn handle_metrics_export(ctx: &Context, period: u32) -> Result<Vec<stats::QueryEvent>> {
+    stats::init_stats_schema(&ctx.conn)?;
+    stats::export_query_events(&ctx.conn, period)
 }
 
 #[cfg(test)]

@@ -441,6 +441,183 @@ pub fn get_query_latency_stats(conn: &Connection) -> Result<Vec<QueryLatencyStat
     Ok(results)
 }
 
+/// Query metrics summary for a period.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryMetricsSummary {
+    pub total_queries: i64,
+    pub zero_result_rate: f64,
+    pub re_search_rate: f64,
+    pub latency_p50: i64,
+    pub latency_p95: i64,
+    pub latency_p99: i64,
+    pub score_above_80: f64,  // % of queries with top_score > 0.8
+    pub score_50_to_80: f64,  // % with 0.5 <= top_score <= 0.8
+    pub score_below_50: f64,  // % with top_score < 0.5
+}
+
+/// Get comprehensive query metrics for a period.
+pub fn get_query_metrics(conn: &Connection, days: u32) -> Result<QueryMetricsSummary> {
+    let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 24 * 60 * 60);
+
+    // Total queries
+    let total_queries: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM query_events WHERE created_at >= ?1",
+        params![cutoff],
+        |row| row.get(0),
+    )?;
+
+    if total_queries == 0 {
+        return Ok(QueryMetricsSummary {
+            total_queries: 0,
+            zero_result_rate: 0.0,
+            re_search_rate: 0.0,
+            latency_p50: 0,
+            latency_p95: 0,
+            latency_p99: 0,
+            score_above_80: 0.0,
+            score_50_to_80: 0.0,
+            score_below_50: 0.0,
+        });
+    }
+
+    // Zero result rate
+    let zero_results: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM query_events WHERE created_at >= ?1 AND result_count = 0",
+        params![cutoff],
+        |row| row.get(0),
+    )?;
+    let zero_result_rate = (zero_results as f64 / total_queries as f64) * 100.0;
+
+    // Re-search rate (same query hash within 30 seconds)
+    let re_searches: i64 = conn.query_row(
+        r#"
+        SELECT COUNT(*) FROM query_events e1
+        WHERE e1.created_at >= ?1
+        AND EXISTS (
+            SELECT 1 FROM query_events e2
+            WHERE e2.query_hash = e1.query_hash
+            AND e2.id != e1.id
+            AND e2.created_at BETWEEN e1.created_at - 30 AND e1.created_at + 30
+        )
+        "#,
+        params![cutoff],
+        |row| row.get(0),
+    )?;
+    let re_search_rate = (re_searches as f64 / total_queries as f64) * 100.0;
+
+    // Latency percentiles
+    let latency_p50 = get_percentile(conn, cutoff, 50)?;
+    let latency_p95 = get_percentile(conn, cutoff, 95)?;
+    let latency_p99 = get_percentile(conn, cutoff, 99)?;
+
+    // Score distribution (only for queries with results)
+    let with_scores: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM query_events WHERE created_at >= ?1 AND top_score IS NOT NULL",
+        params![cutoff],
+        |row| row.get(0),
+    )?;
+
+    let (score_above_80, score_50_to_80, score_below_50) = if with_scores > 0 {
+        let above_80: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM query_events WHERE created_at >= ?1 AND top_score > 0.8",
+            params![cutoff],
+            |row| row.get(0),
+        )?;
+
+        let between: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM query_events WHERE created_at >= ?1 AND top_score >= 0.5 AND top_score <= 0.8",
+            params![cutoff],
+            |row| row.get(0),
+        )?;
+
+        let below_50: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM query_events WHERE created_at >= ?1 AND top_score < 0.5",
+            params![cutoff],
+            |row| row.get(0),
+        )?;
+
+        (
+            (above_80 as f64 / with_scores as f64) * 100.0,
+            (between as f64 / with_scores as f64) * 100.0,
+            (below_50 as f64 / with_scores as f64) * 100.0,
+        )
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+
+    Ok(QueryMetricsSummary {
+        total_queries,
+        zero_result_rate,
+        re_search_rate,
+        latency_p50,
+        latency_p95,
+        latency_p99,
+        score_above_80,
+        score_50_to_80,
+        score_below_50,
+    })
+}
+
+/// Get a specific latency percentile.
+fn get_percentile(conn: &Connection, cutoff: i64, percentile: u8) -> Result<i64> {
+    // SQLite doesn't have built-in percentile, so we calculate manually
+    let total: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM query_events WHERE created_at >= ?1",
+        params![cutoff],
+        |row| row.get(0),
+    )?;
+
+    if total == 0 {
+        return Ok(0);
+    }
+
+    let offset = (total as f64 * (percentile as f64 / 100.0)).floor() as i64;
+
+    let result: i64 = conn.query_row(
+        r#"
+        SELECT latency_ms FROM query_events
+        WHERE created_at >= ?1
+        ORDER BY latency_ms
+        LIMIT 1 OFFSET ?2
+        "#,
+        params![cutoff, offset.max(0).min(total - 1)],
+        |row| row.get(0),
+    )?;
+
+    Ok(result)
+}
+
+/// Export query events for a period.
+pub fn export_query_events(conn: &Connection, days: u32) -> Result<Vec<QueryEvent>> {
+    let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 24 * 60 * 60);
+
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT query_hash, query_text, search_type, result_count, latency_ms, top_score, session_id
+        FROM query_events
+        WHERE created_at >= ?1
+        ORDER BY created_at DESC
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![cutoff], |row| {
+            Ok(QueryEvent {
+                query_hash: row.get(0)?,
+                query_text: row.get(1)?,
+                search_type: row.get(2)?,
+                result_count: row.get(3)?,
+                latency_ms: row.get(4)?,
+                top_score: row.get(5)?,
+                session_id: row.get(6)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
 /// Clear old sessions (keep last N).
 pub fn prune_sessions(conn: &Connection, keep_count: usize) -> Result<usize> {
     // Get the ID threshold - we want to delete sessions older than the Nth most recent
