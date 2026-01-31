@@ -109,3 +109,22 @@ pub struct IndexStatus {
     /// Last update timestamp.
     pub last_updated: Option<i64>,
 }
+
+/// Result of an update operation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpdateResult {
+    /// Number of new documents indexed.
+    pub added: usize,
+
+    /// Number of documents updated (content changed).
+    pub updated: usize,
+
+    /// Number of documents removed (file deleted).
+    pub removed: usize,
+
+    /// Number of documents unchanged (skipped).
+    pub unchanged: usize,
+
+    /// Errors encountered during indexing.
+    pub errors: Vec<String>,
+}

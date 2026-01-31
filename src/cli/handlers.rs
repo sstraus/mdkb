@@ -1,15 +1,19 @@
 //! CLI command handlers.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::domain::{Collection, SearchQuery};
+use crate::domain::frontmatter::parse_frontmatter;
+use crate::domain::{Collection, Document, SearchQuery, UpdateResult};
 use crate::error::{Error, Result};
 use crate::store::collections;
 use crate::store::documents;
 use crate::store::schema;
 use crate::store::search;
+use globset::Glob;
 use rusqlite::Connection;
+use walkdir::WalkDir;
 
 /// Context for CLI operations.
 pub struct Context {
@@ -175,6 +179,152 @@ pub fn handle_get(
     };
 
     Ok((doc, content))
+}
+
+/// Handle `mdkb update` command - differential reindex.
+pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResult> {
+    let root = root.as_ref();
+    let collections = collections::list_collections(&ctx.conn)?;
+    let mut result = UpdateResult::default();
+
+    for coll in &collections {
+        update_collection(ctx, root, coll, &mut result)?;
+    }
+
+    Ok(result)
+}
+
+/// Update a single collection by scanning for file changes.
+fn update_collection(
+    ctx: &Context,
+    root: &Path,
+    collection: &Collection,
+    result: &mut UpdateResult,
+) -> Result<()> {
+    let base_path = root.join(&collection.path);
+
+    if !base_path.exists() {
+        result.errors.push(format!(
+            "Collection '{}' path does not exist: {}",
+            collection.name,
+            base_path.display()
+        ));
+        return Ok(());
+    }
+
+    // Build glob matcher
+    let glob = Glob::new(&collection.pattern)
+        .map_err(|e| Error::Other(format!("Invalid glob pattern '{}': {}", collection.pattern, e)))?
+        .compile_matcher();
+
+    // Get existing documents for this collection
+    let existing_docs = documents::list_documents(&ctx.conn, &collection.name)?;
+    let mut existing_paths: HashSet<String> = existing_docs
+        .iter()
+        .map(|d| d.relative_path.clone())
+        .collect();
+
+    // Walk directory and process files
+    for entry in WalkDir::new(&base_path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        let relative = match path.strip_prefix(&base_path) {
+            Ok(rel) => rel.to_string_lossy().to_string(),
+            Err(_) => continue,
+        };
+
+        // Check if file matches glob pattern
+        if !glob.is_match(&relative) {
+            continue;
+        }
+
+        // Remove from existing set (to track deletions)
+        existing_paths.remove(&relative);
+
+        // Get file modification time
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                result.errors.push(format!("Failed to read metadata for {}: {}", path.display(), e));
+                continue;
+            }
+        };
+
+        let file_mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        // Check if document exists and compare mtime
+        let existing_doc = documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
+
+        let needs_index = match &existing_doc {
+            Some(doc) => file_mtime > doc.indexed_at,
+            None => true,
+        };
+
+        if !needs_index {
+            result.unchanged += 1;
+            continue;
+        }
+
+        // Read and index the file
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                result.errors.push(format!("Failed to read {}: {}", path.display(), e));
+                continue;
+            }
+        };
+
+        // Parse frontmatter for title
+        let parsed = parse_frontmatter(&content);
+        let now = chrono::Utc::now().timestamp();
+
+        let doc = Document {
+            id: existing_doc.as_ref().map(|d| d.id).unwrap_or(0),
+            collection: collection.name.clone(),
+            relative_path: relative,
+            hash: String::new(), // Will be computed by index_document
+            title: parsed.title,
+            metadata: parsed.frontmatter,
+            file_modified_at: file_mtime,
+            indexed_at: now,
+        };
+
+        match documents::index_document(&ctx.conn, &doc, &content) {
+            Ok(_) => {
+                if existing_doc.is_some() {
+                    result.updated += 1;
+                } else {
+                    result.added += 1;
+                }
+            }
+            Err(e) => {
+                result.errors.push(format!("Failed to index {}: {}", path.display(), e));
+            }
+        }
+    }
+
+    // Remove documents for deleted files
+    for deleted_path in existing_paths {
+        if let Some(doc) = documents::get_document_by_path(&ctx.conn, &collection.name, &deleted_path)? {
+            match documents::delete_document(&ctx.conn, doc.id) {
+                Ok(true) => result.removed += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    result.errors.push(format!("Failed to remove {}: {}", deleted_path, e));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Apply line range (e.g., "10:50") to content.
@@ -408,5 +558,141 @@ mod tests {
     fn test_apply_line_range_end_before_start() {
         let result = apply_line_range("content", "5:2");
         assert!(result.is_err());
+    }
+
+    // ==================== Update Tests ====================
+
+    #[test]
+    fn test_handle_update_empty_collections() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(result.added, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.removed, 0);
+        assert_eq!(result.unchanged, 0);
+    }
+
+    #[test]
+    fn test_handle_update_indexes_new_files() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create a docs directory with a markdown file
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# Test\n\nContent").unwrap();
+
+        // Add collection
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(result.added, 1);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.unchanged, 0);
+    }
+
+    #[test]
+    fn test_handle_update_skips_unchanged_files() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create a docs directory with a markdown file
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# Test\n\nContent").unwrap();
+
+        // Add collection and index
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Run update again - should skip unchanged
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(result.added, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.unchanged, 1);
+    }
+
+    #[test]
+    fn test_handle_update_reindexes_modified_files() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create a docs directory with a markdown file
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        let file_path = docs_dir.join("readme.md");
+        std::fs::write(&file_path, "# Test\n\nOld Content").unwrap();
+
+        // Add collection and index
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Wait for filesystem mtime granularity (most systems have 1-second precision)
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Modify the file to update mtime
+        let new_content = "# Test\n\nNew Content - Modified";
+        std::fs::write(&file_path, new_content).unwrap();
+
+        // Run update again - should detect modification
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(result.added, 0);
+        assert_eq!(result.updated, 1);
+        assert_eq!(result.unchanged, 0);
+    }
+
+    #[test]
+    fn test_handle_update_removes_deleted_files() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create a docs directory with a markdown file
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        let file_path = docs_dir.join("readme.md");
+        std::fs::write(&file_path, "# Test\n\nContent").unwrap();
+
+        // Add collection and index
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Delete the file
+        std::fs::remove_file(&file_path).unwrap();
+
+        // Run update - should detect deletion
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(result.added, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.removed, 1);
+        assert_eq!(result.unchanged, 0);
+    }
+
+    #[test]
+    fn test_handle_update_multiple_collections() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create two directories
+        let docs_dir = temp.path().join("docs");
+        let notes_dir = temp.path().join("notes");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::create_dir(&notes_dir).unwrap();
+        std::fs::write(docs_dir.join("doc.md"), "# Doc").unwrap();
+        std::fs::write(notes_dir.join("note.md"), "# Note").unwrap();
+
+        // Add two collections
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_collection_add(&ctx, "notes", "notes", "**/*.md").unwrap();
+
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(result.added, 2);
     }
 }

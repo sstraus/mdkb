@@ -7,12 +7,15 @@ use tracing_subscriber::EnvFilter;
 
 use mdkb::cli::handlers::{
     handle_collection_add, handle_collection_list, handle_collection_remove,
-    handle_collection_rename, handle_get, handle_init, handle_search, handle_status, Context,
+    handle_collection_rename, handle_get, handle_init, handle_search, handle_status, handle_update,
+    Context,
 };
 use mdkb::cli::{Cli, CollectionCommand, Command, OutputFormat};
+use mdkb::mcp::server::run_server;
 use mdkb::Result;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse_args();
 
     // Set up tracing based on verbosity
@@ -82,11 +85,12 @@ fn main() -> Result<()> {
             format_status(&status, cli.format);
         }
         Command::Update => {
-            println!("update: not yet implemented");
+            let ctx = Context::open(&cwd)?;
+            let result = handle_update(&ctx, &cwd)?;
+            format_update_result(&result, cli.format);
         }
         Command::Serve => {
-            tracing::info!("Starting MCP server...");
-            println!("serve: not yet implemented");
+            run_server(cwd).await?;
         }
     }
 
@@ -203,6 +207,33 @@ fn format_status(status: &mdkb::domain::IndexStatus, format: OutputFormat) {
             println!("DB Size:     {} bytes", status.db_size_bytes);
             if let Some(ts) = status.last_updated {
                 println!("Last Update: {}", ts);
+            }
+        }
+    }
+}
+
+fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(result).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("added,updated,removed,unchanged,errors");
+            println!(
+                "{},{},{},{},{}",
+                result.added, result.updated, result.removed, result.unchanged, result.errors.len()
+            );
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("Added:     {}", result.added);
+            println!("Updated:   {}", result.updated);
+            println!("Removed:   {}", result.removed);
+            println!("Unchanged: {}", result.unchanged);
+            if !result.errors.is_empty() {
+                println!("Errors:    {}", result.errors.len());
+                for err in &result.errors {
+                    println!("  - {}", err);
+                }
             }
         }
     }

@@ -5,8 +5,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use rmcp::handler::server::tool::{Parameters, ToolRouter};
-use rmcp::model::{CallToolResult, Content, ErrorCode};
-use rmcp::{tool, tool_router, ErrorData as McpError};
+use rmcp::handler::server::ServerHandler;
+use rmcp::model::{CallToolResult, Content, ErrorCode, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::ServiceExt;
+use rmcp::{tool, tool_handler, tool_router, ErrorData as McpError};
 use tokio::sync::Mutex;
 
 use crate::cli::handlers::Context;
@@ -141,6 +143,42 @@ impl McpServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+}
+
+#[tool_handler]
+impl ServerHandler for McpServer {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo {
+            protocol_version: Default::default(),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation {
+                name: "mdkb".to_string(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                ..Default::default()
+            },
+            instructions: None,
+        }
+    }
+}
+
+/// Run the MCP server on stdio.
+pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
+    let server = McpServer::new(root);
+    let (stdin, stdout) = rmcp::transport::io::stdio();
+
+    tracing::info!("Starting mdkb MCP server...");
+
+    let service = server
+        .serve((stdin, stdout))
+        .await
+        .map_err(|e| crate::error::Error::Mcp(format!("Failed to start server: {}", e)))?;
+
+    service
+        .waiting()
+        .await
+        .map_err(|e| crate::error::Error::Mcp(format!("Server error: {}", e)))?;
+
+    Ok(())
 }
 
 /// Format search results for output.
