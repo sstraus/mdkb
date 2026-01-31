@@ -1,5 +1,7 @@
 //! Storage layer - SQLite with FTS5 for full-text search.
 
+pub mod schema;
+
 use std::path::Path;
 
 use crate::error::Result;
