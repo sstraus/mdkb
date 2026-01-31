@@ -41,8 +41,36 @@ pub enum Command {
     #[command(subcommand)]
     Collection(CollectionCommand),
 
-    /// Search documents
+    /// Search documents (BM25 full-text)
     Search {
+        /// Search query
+        query: String,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+
+        /// Filter by collection
+        #[arg(short, long)]
+        collection: Option<String>,
+    },
+
+    /// Semantic vector search (requires --features llm)
+    Vsearch {
+        /// Search query
+        query: String,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+
+        /// Filter by collection
+        #[arg(short, long)]
+        collection: Option<String>,
+    },
+
+    /// Hybrid search with reranking (requires --features llm)
+    Query {
         /// Search query
         query: String,
 

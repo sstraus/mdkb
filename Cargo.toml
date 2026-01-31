@@ -18,7 +18,8 @@ clap = { version = "4", features = ["derive", "env"] }
 
 # Storage
 rusqlite = { version = "0.32", features = ["bundled"] }
-# sqlite-vec = "0.1"  # Phase 3: Vector storage
+sqlite-vec = "0.1"
+zerocopy = { version = "0.7", features = ["derive"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

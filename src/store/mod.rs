@@ -4,6 +4,7 @@ pub mod collections;
 pub mod documents;
 pub mod schema;
 pub mod search;
+pub mod vectors;
 
 use std::path::Path;
 

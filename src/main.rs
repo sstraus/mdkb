@@ -74,6 +74,42 @@ async fn main() -> Result<()> {
             let results = handle_search(&ctx, &query, limit, collection.as_deref())?;
             format_search_results(&results, cli.format);
         }
+        Command::Vsearch {
+            query,
+            limit,
+            collection,
+        } => {
+            #[cfg(feature = "llm")]
+            {
+                let ctx = Context::open(&cwd)?;
+                let results = handle_vsearch(&ctx, &query, limit, collection.as_deref())?;
+                format_search_results(&results, cli.format);
+            }
+            #[cfg(not(feature = "llm"))]
+            {
+                let _ = (query, limit, collection);
+                eprintln!("Error: vsearch requires --features llm");
+                std::process::exit(1);
+            }
+        }
+        Command::Query {
+            query,
+            limit,
+            collection,
+        } => {
+            #[cfg(feature = "llm")]
+            {
+                let ctx = Context::open(&cwd)?;
+                let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref())?;
+                format_search_results(&results, cli.format);
+            }
+            #[cfg(not(feature = "llm"))]
+            {
+                let _ = (query, limit, collection);
+                eprintln!("Error: query (hybrid search) requires --features llm");
+                std::process::exit(1);
+            }
+        }
         Command::Get { id, lines } => {
             let ctx = Context::open(&cwd)?;
             let (doc, content) = handle_get(&ctx, &id, lines.as_deref())?;
