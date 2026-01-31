@@ -1605,3 +1605,159 @@ fn test_memory_condense_creates_merged_entry() {
     assert_eq!(active.len(), 1, "Should have 1 active (merged) entry");
     assert!(active[0].id.contains("consolidated"));
 }
+
+// ==================== A/B Experiment Tests ====================
+
+/// Test: Experiment create, status, and end lifecycle (017-mq8r)
+#[test]
+fn test_experiment_lifecycle() {
+    use mdkb::cli::handlers::{
+        handle_experiment_create, handle_experiment_status, handle_experiment_end,
+        handle_experiment_list,
+    };
+    use mdkb::store::stats::{
+        init_experiments_schema, record_experiment_result, ExperimentResult,
+        get_experiment, ExperimentStatus,
+    };
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = dir.path();
+
+    // Initialize mdkb
+    let ctx = Context::init(root).expect("Failed to init context");
+    init_experiments_schema(&ctx.conn).expect("init schema");
+
+    // Create an experiment
+    let result = handle_experiment_create(
+        &ctx,
+        "test-chunking",
+        Some("Test fixed vs markdown chunking"),
+        r#"{"strategy":"fixed","size":500}"#,
+        r#"{"strategy":"markdown"}"#,
+        0.5,
+        5,  // Low min_samples for testing
+    ).expect("create experiment");
+
+    assert_eq!(result.name, "test-chunking");
+    assert!(result.id > 0);
+
+    // Check it's in the list
+    let experiments = handle_experiment_list(&ctx, false).expect("list");
+    assert_eq!(experiments.len(), 1);
+    assert_eq!(experiments[0].name, "test-chunking");
+
+    // Check running only
+    let running = handle_experiment_list(&ctx, true).expect("list running");
+    assert_eq!(running.len(), 1);
+
+    // Record some results for both variants
+    let exp = get_experiment(&ctx.conn, "test-chunking").expect("get").expect("exp exists");
+
+    for i in 0..6 {
+        record_experiment_result(&ctx.conn, &ExperimentResult {
+            experiment_id: exp.id,
+            variant: "A".to_string(),
+            query_hash: format!("hash-a-{i}"),
+            latency_ms: 20 + i as i64,
+            score: 0.7 + (i as f64 * 0.01),
+            result_count: 5,
+            created_at: 0,
+        }).expect("record A");
+
+        record_experiment_result(&ctx.conn, &ExperimentResult {
+            experiment_id: exp.id,
+            variant: "B".to_string(),
+            query_hash: format!("hash-b-{i}"),
+            latency_ms: 22 + i as i64,
+            score: 0.8 + (i as f64 * 0.01),
+            result_count: 6,
+            created_at: 0,
+        }).expect("record B");
+    }
+
+    // Check status
+    let status = handle_experiment_status(&ctx, "test-chunking")
+        .expect("status")
+        .expect("status exists");
+
+    assert_eq!(status.variant_a.sample_count, 6);
+    assert_eq!(status.variant_b.sample_count, 6);
+    assert!(status.has_min_samples);
+    // B should have higher avg score
+    assert!(status.variant_b.avg_score > status.variant_a.avg_score);
+
+    // End the experiment (auto-determine winner)
+    let winner = handle_experiment_end(&ctx, "test-chunking", None)
+        .expect("end");
+
+    // B should win since it has higher scores
+    assert_eq!(winner.as_deref(), Some("B"));
+
+    // Verify experiment is completed
+    let exp_after = get_experiment(&ctx.conn, "test-chunking")
+        .expect("get after")
+        .expect("exists");
+    assert_eq!(exp_after.status, ExperimentStatus::Completed);
+    assert_eq!(exp_after.winner.as_deref(), Some("B"));
+
+    // No running experiments now
+    let running_after = handle_experiment_list(&ctx, true).expect("list running after");
+    assert_eq!(running_after.len(), 0);
+}
+
+/// Test: Consistent variant assignment for same query hash (017-mq8r)
+#[test]
+fn test_experiment_consistent_routing() {
+    use mdkb::store::stats::{init_experiments_schema, create_experiment, get_experiment, get_experiment_variant};
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = dir.path();
+
+    let ctx = Context::init(root).expect("Failed to init context");
+    init_experiments_schema(&ctx.conn).expect("init schema");
+
+    create_experiment(&ctx.conn, "routing-test", None, "{}", "{}", 0.5, 10).expect("create");
+    let exp = get_experiment(&ctx.conn, "routing-test").expect("get").expect("exists");
+
+    // Same query hash should always get same variant
+    let query_hash = "test-query-hash-123";
+    let variant1 = get_experiment_variant(&exp, query_hash);
+    let variant2 = get_experiment_variant(&exp, query_hash);
+    let variant3 = get_experiment_variant(&exp, query_hash);
+
+    assert_eq!(variant1, variant2);
+    assert_eq!(variant2, variant3);
+
+    // Different query hash might get different variant (probabilistic)
+    // Just verify it returns valid variants
+    let variant_other = get_experiment_variant(&exp, "different-hash");
+    assert!(variant_other == "A" || variant_other == "B");
+}
+
+/// Test: Cancel experiment without winner (017-mq8r)
+#[test]
+fn test_experiment_cancel() {
+    use mdkb::cli::handlers::{handle_experiment_create, handle_experiment_cancel, handle_experiment_list};
+    use mdkb::store::stats::{init_experiments_schema, get_experiment, ExperimentStatus};
+
+    let dir = tempfile::tempdir().expect("Failed to create temp dir");
+    let root = dir.path();
+
+    let ctx = Context::init(root).expect("Failed to init context");
+    init_experiments_schema(&ctx.conn).expect("init schema");
+
+    handle_experiment_create(&ctx, "cancel-test", None, "{}", "{}", 0.5, 100).expect("create");
+
+    // Cancel it
+    handle_experiment_cancel(&ctx, "cancel-test").expect("cancel");
+
+    // Verify it's cancelled
+    let exp = get_experiment(&ctx.conn, "cancel-test").expect("get").expect("exists");
+    assert_eq!(exp.status, ExperimentStatus::Cancelled);
+    assert!(exp.ended_at.is_some());
+    assert!(exp.winner.is_none());
+
+    // No running experiments
+    let running = handle_experiment_list(&ctx, true).expect("list running");
+    assert_eq!(running.len(), 0);
+}

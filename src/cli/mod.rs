@@ -131,6 +131,69 @@ pub enum Command {
         /// Document path or ID
         path: String,
     },
+
+    /// Manage A/B experiments
+    #[command(subcommand)]
+    Experiment(ExperimentCommand),
+}
+
+/// A/B Experiment subcommands.
+#[derive(Subcommand, Debug)]
+pub enum ExperimentCommand {
+    /// Create a new A/B experiment
+    Create {
+        /// Experiment name (unique identifier)
+        name: String,
+
+        /// JSON config for variant A
+        #[arg(long)]
+        config_a: String,
+
+        /// JSON config for variant B
+        #[arg(long)]
+        config_b: String,
+
+        /// Description of the experiment
+        #[arg(short, long)]
+        description: Option<String>,
+
+        /// Traffic split to variant A (0.0-1.0, default 0.5)
+        #[arg(short, long, default_value = "0.5")]
+        split: f64,
+
+        /// Minimum samples per variant before significance calculation
+        #[arg(short, long, default_value = "100")]
+        min_samples: i64,
+    },
+
+    /// Show experiment status with metrics
+    Status {
+        /// Experiment name
+        name: String,
+    },
+
+    /// End an experiment and record winner
+    End {
+        /// Experiment name
+        name: String,
+
+        /// Winning variant (A or B), auto-determined if not specified
+        #[arg(short, long)]
+        winner: Option<String>,
+    },
+
+    /// Cancel an experiment without a winner
+    Cancel {
+        /// Experiment name
+        name: String,
+    },
+
+    /// List all experiments
+    List {
+        /// Show only running experiments
+        #[arg(short, long)]
+        running: bool,
+    },
 }
 
 /// Collection management subcommands.

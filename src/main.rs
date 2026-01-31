@@ -18,12 +18,13 @@ use mdkb::cli::handlers::{
     Context, EmbedResult, EvolutionHistoryEntry, StatsResult, handle_collection_add, handle_collection_list,
     handle_collection_remove, handle_collection_rename, handle_current, handle_embed, handle_evolve_corrects,
     handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
-    handle_get, handle_history, handle_hybrid_search, handle_init, handle_memory_add, handle_memory_list,
-    handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
-    handle_metrics_export, handle_metrics_latency, handle_metrics_show,
+    handle_experiment_cancel, handle_experiment_create, handle_experiment_end, handle_experiment_list,
+    handle_experiment_status, handle_get, handle_history, handle_hybrid_search, handle_init, handle_memory_add,
+    handle_memory_list, handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show,
+    handle_memory_warmup, handle_metrics_export, handle_metrics_latency, handle_metrics_show,
     handle_mget, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
-use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, MemoryCommand, MetricsCommand, OutputFormat};
+use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, MemoryCommand, MetricsCommand, OutputFormat};
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
 use mdkb::mcp::server::run_server;
@@ -254,6 +255,53 @@ async fn main() -> Result<()> {
             let ctx = Context::open(&cwd)?;
             let evolutions = handle_superseded_by(&ctx, &path)?;
             format_superseded_by(&evolutions, cli.format);
+        }
+        Command::Experiment(cmd) => {
+            let ctx = Context::open(&cwd)?;
+            match cmd {
+                ExperimentCommand::Create {
+                    name,
+                    config_a,
+                    config_b,
+                    description,
+                    split,
+                    min_samples,
+                } => {
+                    let result = handle_experiment_create(
+                        &ctx,
+                        &name,
+                        description.as_deref(),
+                        &config_a,
+                        &config_b,
+                        split,
+                        min_samples,
+                    )?;
+                    println!("Created experiment '{}' (ID: {})", result.name, result.id);
+                }
+                ExperimentCommand::Status { name } => {
+                    if let Some(status) = handle_experiment_status(&ctx, &name)? {
+                        format_experiment_status(&status, cli.format);
+                    } else {
+                        println!("Experiment '{name}' not found");
+                    }
+                }
+                ExperimentCommand::End { name, winner } => {
+                    let actual_winner = handle_experiment_end(&ctx, &name, winner.as_deref())?;
+                    if let Some(w) = actual_winner {
+                        println!("Experiment '{name}' ended with winner: {w}");
+                    } else {
+                        println!("Experiment '{name}' ended with no significant winner");
+                    }
+                }
+                ExperimentCommand::Cancel { name } => {
+                    handle_experiment_cancel(&ctx, &name)?;
+                    println!("Experiment '{name}' cancelled");
+                }
+                ExperimentCommand::List { running } => {
+                    let experiments = handle_experiment_list(&ctx, running)?;
+                    format_experiment_list(&experiments, cli.format);
+                }
+            }
         }
     }
 
@@ -1028,6 +1076,119 @@ fn format_metrics_export(events: &[mdkb::store::stats::QueryEvent], format: Outp
             }
             if events.len() > 20 {
                 println!("\n... and {} more events (use --json or --csv for full export)", events.len() - 20);
+            }
+        }
+    }
+}
+
+fn format_experiment_status(status: &mdkb::store::stats::ExperimentStatusReport, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(status).unwrap_or_default());
+        }
+        OutputFormat::Csv => {
+            println!("experiment,variant,sample_count,avg_score,avg_latency_ms,p95_latency_ms,zero_result_rate");
+            println!("{},A,{},{:.3},{:.1},{},{}",
+                status.experiment.name,
+                status.variant_a.sample_count,
+                status.variant_a.avg_score,
+                status.variant_a.avg_latency_ms,
+                status.variant_a.p95_latency_ms,
+                status.variant_a.zero_result_rate);
+            println!("{},B,{},{:.3},{:.1},{},{}",
+                status.experiment.name,
+                status.variant_b.sample_count,
+                status.variant_b.avg_score,
+                status.variant_b.avg_latency_ms,
+                status.variant_b.p95_latency_ms,
+                status.variant_b.zero_result_rate);
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            let exp = &status.experiment;
+            let started = chrono::DateTime::from_timestamp(exp.created_at, 0)
+                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+
+            println!("Experiment: {} ({} since {})", exp.name, exp.status, started);
+            if let Some(desc) = &exp.description {
+                println!("Description: {desc}");
+            }
+            println!();
+
+            // Variant A
+            let a = &status.variant_a;
+            println!("Variant A: avg score {:.3}, p95 latency {}ms, n={}",
+                a.avg_score, a.p95_latency_ms, a.sample_count);
+            println!("  Config: {}", exp.config_a);
+
+            // Variant B
+            let b = &status.variant_b;
+            println!("Variant B: avg score {:.3}, p95 latency {}ms, n={}",
+                b.avg_score, b.p95_latency_ms, b.sample_count);
+            println!("  Config: {}", exp.config_b);
+            println!();
+
+            // Significance
+            if !status.has_min_samples {
+                let needed = exp.min_sample_size - a.sample_count.min(b.sample_count);
+                println!("Significance: Need {} more samples before statistical analysis", needed.max(0));
+            } else if let Some(sig) = &status.significance {
+                if sig.significant {
+                    println!("Significance: {:.0}% confidence {} has better quality (p={:.4}, effect size={:.2})",
+                        sig.confidence_level,
+                        sig.winner.as_deref().unwrap_or("?"),
+                        sig.p_value,
+                        sig.effect_size);
+                } else {
+                    println!("Significance: No significant difference detected (p={:.4})", sig.p_value);
+                }
+            }
+        }
+    }
+}
+
+fn format_experiment_list(experiments: &[mdkb::store::stats::Experiment], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(experiments).unwrap_or_default());
+        }
+        OutputFormat::Csv => {
+            println!("name,status,traffic_split,min_samples,created_at,winner");
+            for exp in experiments {
+                println!("{},{},{},{},{},{}",
+                    exp.name,
+                    exp.status,
+                    exp.traffic_split,
+                    exp.min_sample_size,
+                    exp.created_at,
+                    exp.winner.as_deref().unwrap_or(""));
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("| Name | Status | Split | Min Samples | Winner |");
+            println!("|------|--------|-------|-------------|--------|");
+            for exp in experiments {
+                println!("| {} | {} | {:.0}% | {} | {} |",
+                    exp.name,
+                    exp.status,
+                    exp.traffic_split * 100.0,
+                    exp.min_sample_size,
+                    exp.winner.as_deref().unwrap_or("-"));
+            }
+        }
+        OutputFormat::Text => {
+            if experiments.is_empty() {
+                println!("No experiments found.");
+            } else {
+                for exp in experiments {
+                    let started = chrono::DateTime::from_timestamp(exp.created_at, 0)
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    let winner_str = exp.winner.as_ref()
+                        .map(|w| format!(" -> Winner: {w}"))
+                        .unwrap_or_default();
+                    println!("{}: {} (started {}){}", exp.name, exp.status, started, winner_str);
+                }
             }
         }
     }

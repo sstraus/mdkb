@@ -889,3 +889,706 @@ mod tests {
         assert_eq!(bm25.count, 3);
     }
 }
+
+// ==================== A/B Experiments ====================
+
+/// Experiment status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExperimentStatus {
+    Running,
+    Completed,
+    Cancelled,
+}
+
+impl std::fmt::Display for ExperimentStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Running => write!(f, "running"),
+            Self::Completed => write!(f, "completed"),
+            Self::Cancelled => write!(f, "cancelled"),
+        }
+    }
+}
+
+/// A/B experiment definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Experiment {
+    pub id: i64,
+    pub name: String,
+    pub description: Option<String>,
+    pub config_a: String,  // JSON config for variant A
+    pub config_b: String,  // JSON config for variant B
+    pub traffic_split: f64,  // Fraction to variant A (0.0-1.0, default 0.5)
+    pub status: ExperimentStatus,
+    pub min_sample_size: i64,  // Minimum samples before significance calculation
+    pub created_at: i64,
+    pub ended_at: Option<i64>,
+    pub winner: Option<String>,  // "A", "B", or None
+}
+
+/// Experiment result for a single query.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentResult {
+    pub experiment_id: i64,
+    pub variant: String,  // "A" or "B"
+    pub query_hash: String,
+    pub latency_ms: i64,
+    pub score: f64,
+    pub result_count: i64,
+    pub created_at: i64,
+}
+
+/// Initialize the experiments schema.
+pub fn init_experiments_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        -- A/B Experiments
+        CREATE TABLE IF NOT EXISTS experiments (
+            id INTEGER PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            description TEXT,
+            config_a TEXT NOT NULL,       -- JSON config for variant A
+            config_b TEXT NOT NULL,       -- JSON config for variant B
+            traffic_split REAL NOT NULL DEFAULT 0.5,  -- Fraction to A
+            status TEXT NOT NULL DEFAULT 'running',
+            min_sample_size INTEGER NOT NULL DEFAULT 100,
+            created_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            winner TEXT                   -- 'A', 'B', or NULL
+        );
+
+        -- Experiment results per query
+        CREATE TABLE IF NOT EXISTS experiment_results (
+            id INTEGER PRIMARY KEY,
+            experiment_id INTEGER NOT NULL,
+            variant TEXT NOT NULL,        -- 'A' or 'B'
+            query_hash TEXT NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            score REAL NOT NULL,
+            result_count INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY(experiment_id) REFERENCES experiments(id) ON DELETE CASCADE
+        );
+
+        -- Indexes
+        CREATE INDEX IF NOT EXISTS idx_experiment_results_exp ON experiment_results(experiment_id);
+        CREATE INDEX IF NOT EXISTS idx_experiment_results_variant ON experiment_results(experiment_id, variant);
+        "#,
+    )?;
+    Ok(())
+}
+
+/// Create a new experiment.
+pub fn create_experiment(
+    conn: &Connection,
+    name: &str,
+    description: Option<&str>,
+    config_a: &str,
+    config_b: &str,
+    traffic_split: f64,
+    min_sample_size: i64,
+) -> Result<i64> {
+    let now = chrono::Utc::now().timestamp();
+
+    conn.execute(
+        r#"
+        INSERT INTO experiments (name, description, config_a, config_b, traffic_split, min_sample_size, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+        params![name, description, config_a, config_b, traffic_split, min_sample_size, now],
+    )?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Get an experiment by name.
+pub fn get_experiment(conn: &Connection, name: &str) -> Result<Option<Experiment>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, name, description, config_a, config_b, traffic_split, status, min_sample_size, created_at, ended_at, winner
+        FROM experiments
+        WHERE name = ?1
+        "#,
+    )?;
+
+    let result = stmt.query_row(params![name], |row| {
+        let status_str: String = row.get(6)?;
+        let status = match status_str.as_str() {
+            "running" => ExperimentStatus::Running,
+            "completed" => ExperimentStatus::Completed,
+            "cancelled" => ExperimentStatus::Cancelled,
+            _ => ExperimentStatus::Running,
+        };
+
+        Ok(Experiment {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            description: row.get(2)?,
+            config_a: row.get(3)?,
+            config_b: row.get(4)?,
+            traffic_split: row.get(5)?,
+            status,
+            min_sample_size: row.get(7)?,
+            created_at: row.get(8)?,
+            ended_at: row.get(9)?,
+            winner: row.get(10)?,
+        })
+    });
+
+    match result {
+        Ok(exp) => Ok(Some(exp)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get all active (running) experiments.
+pub fn get_active_experiments(conn: &Connection) -> Result<Vec<Experiment>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, name, description, config_a, config_b, traffic_split, status, min_sample_size, created_at, ended_at, winner
+        FROM experiments
+        WHERE status = 'running'
+        ORDER BY created_at DESC
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map([], |row| {
+            Ok(Experiment {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                config_a: row.get(3)?,
+                config_b: row.get(4)?,
+                traffic_split: row.get(5)?,
+                status: ExperimentStatus::Running,
+                min_sample_size: row.get(7)?,
+                created_at: row.get(8)?,
+                ended_at: row.get(9)?,
+                winner: row.get(10)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+/// Determine which variant to use for a query based on consistent hashing.
+pub fn get_experiment_variant(experiment: &Experiment, query_hash: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    // Hash experiment name + query hash for consistent routing
+    let mut hasher = Sha256::new();
+    hasher.update(experiment.name.as_bytes());
+    hasher.update(query_hash.as_bytes());
+    let result = hasher.finalize();
+
+    // Use first 8 bytes as u64, normalize to [0, 1)
+    let bytes: [u8; 8] = result[..8].try_into().unwrap_or([0; 8]);
+    let hash_value = u64::from_le_bytes(bytes);
+    let normalized = (hash_value as f64) / (u64::MAX as f64);
+
+    if normalized < experiment.traffic_split {
+        "A".to_string()
+    } else {
+        "B".to_string()
+    }
+}
+
+/// Record an experiment result.
+pub fn record_experiment_result(conn: &Connection, result: &ExperimentResult) -> Result<i64> {
+    let now = chrono::Utc::now().timestamp();
+
+    conn.execute(
+        r#"
+        INSERT INTO experiment_results (experiment_id, variant, query_hash, latency_ms, score, result_count, created_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+        params![
+            result.experiment_id,
+            result.variant,
+            result.query_hash,
+            result.latency_ms,
+            result.score,
+            result.result_count,
+            now,
+        ],
+    )?;
+
+    Ok(conn.last_insert_rowid())
+}
+
+/// Variant statistics for an experiment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VariantStats {
+    pub variant: String,
+    pub sample_count: i64,
+    pub avg_score: f64,
+    pub avg_latency_ms: f64,
+    pub p95_latency_ms: i64,
+    pub zero_result_rate: f64,
+    pub score_variance: f64,
+}
+
+/// Get statistics for a variant in an experiment.
+pub fn get_variant_stats(conn: &Connection, experiment_id: i64, variant: &str) -> Result<VariantStats> {
+    let sample_count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM experiment_results WHERE experiment_id = ?1 AND variant = ?2",
+        params![experiment_id, variant],
+        |row| row.get(0),
+    )?;
+
+    if sample_count == 0 {
+        return Ok(VariantStats {
+            variant: variant.to_string(),
+            sample_count: 0,
+            avg_score: 0.0,
+            avg_latency_ms: 0.0,
+            p95_latency_ms: 0,
+            zero_result_rate: 0.0,
+            score_variance: 0.0,
+        });
+    }
+
+    let avg_score: f64 = conn.query_row(
+        "SELECT AVG(score) FROM experiment_results WHERE experiment_id = ?1 AND variant = ?2",
+        params![experiment_id, variant],
+        |row| row.get(0),
+    )?;
+
+    let avg_latency: f64 = conn.query_row(
+        "SELECT AVG(latency_ms) FROM experiment_results WHERE experiment_id = ?1 AND variant = ?2",
+        params![experiment_id, variant],
+        |row| row.get(0),
+    )?;
+
+    // P95 latency
+    let p95_idx = ((sample_count as f64 * 0.95).ceil() as i64).max(1) - 1;
+    let p95_latency: i64 = conn.query_row(
+        r#"
+        SELECT latency_ms FROM experiment_results
+        WHERE experiment_id = ?1 AND variant = ?2
+        ORDER BY latency_ms
+        LIMIT 1 OFFSET ?3
+        "#,
+        params![experiment_id, variant, p95_idx],
+        |row| row.get(0),
+    ).unwrap_or(0);
+
+    // Zero result rate
+    let zero_results: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM experiment_results WHERE experiment_id = ?1 AND variant = ?2 AND result_count = 0",
+        params![experiment_id, variant],
+        |row| row.get(0),
+    )?;
+    let zero_result_rate = (zero_results as f64 / sample_count as f64) * 100.0;
+
+    // Score variance for significance testing
+    let score_variance: f64 = conn.query_row(
+        r#"
+        SELECT AVG((score - ?1) * (score - ?1))
+        FROM experiment_results
+        WHERE experiment_id = ?2 AND variant = ?3
+        "#,
+        params![avg_score, experiment_id, variant],
+        |row| row.get::<_, f64>(0),
+    ).unwrap_or(0.0);
+
+    Ok(VariantStats {
+        variant: variant.to_string(),
+        sample_count,
+        avg_score,
+        avg_latency_ms: avg_latency,
+        p95_latency_ms: p95_latency,
+        zero_result_rate,
+        score_variance,
+    })
+}
+
+/// Experiment status with variant statistics.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExperimentStatusReport {
+    pub experiment: Experiment,
+    pub variant_a: VariantStats,
+    pub variant_b: VariantStats,
+    pub has_min_samples: bool,
+    pub significance: Option<SignificanceResult>,
+}
+
+/// Statistical significance result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignificanceResult {
+    pub t_statistic: f64,
+    pub p_value: f64,
+    pub confidence_level: f64,  // e.g., 95.0
+    pub significant: bool,
+    pub winner: Option<String>,  // "A" or "B" if significant
+    pub effect_size: f64,  // Cohen's d
+}
+
+/// Calculate two-sample t-test for experiment significance.
+pub fn calculate_significance(stats_a: &VariantStats, stats_b: &VariantStats) -> Option<SignificanceResult> {
+    if stats_a.sample_count < 2 || stats_b.sample_count < 2 {
+        return None;
+    }
+
+    let n_a = stats_a.sample_count as f64;
+    let n_b = stats_b.sample_count as f64;
+
+    // Pooled variance estimate
+    let var_a = stats_a.score_variance;
+    let var_b = stats_b.score_variance;
+
+    // Standard error of the difference
+    let se = ((var_a / n_a) + (var_b / n_b)).sqrt();
+
+    if se == 0.0 {
+        return None;
+    }
+
+    // t-statistic
+    let t_stat = (stats_a.avg_score - stats_b.avg_score) / se;
+
+    // Degrees of freedom (Welch's approximation)
+    let df_num = ((var_a / n_a) + (var_b / n_b)).powi(2);
+    let df_den = ((var_a / n_a).powi(2) / (n_a - 1.0)) + ((var_b / n_b).powi(2) / (n_b - 1.0));
+    let _df = if df_den > 0.0 { df_num / df_den } else { n_a + n_b - 2.0 };
+
+    // Approximate p-value using normal distribution for large samples
+    // For proper implementation, would use Student's t-distribution
+    let p_value = 2.0 * (1.0 - normal_cdf(t_stat.abs()));
+
+    // Effect size (Cohen's d)
+    let pooled_sd = ((var_a + var_b) / 2.0).sqrt();
+    let effect_size = if pooled_sd > 0.0 {
+        (stats_a.avg_score - stats_b.avg_score).abs() / pooled_sd
+    } else {
+        0.0
+    };
+
+    // Determine winner at 95% confidence
+    let significant = p_value < 0.05;
+    let winner = if significant {
+        if stats_a.avg_score > stats_b.avg_score {
+            Some("A".to_string())
+        } else {
+            Some("B".to_string())
+        }
+    } else {
+        None
+    };
+
+    Some(SignificanceResult {
+        t_statistic: t_stat,
+        p_value,
+        confidence_level: 95.0,
+        significant,
+        winner,
+        effect_size,
+    })
+}
+
+/// Approximate normal CDF for p-value calculation.
+fn normal_cdf(x: f64) -> f64 {
+    // Using the approximation from Abramowitz and Stegun
+    let a1 = 0.254829592;
+    let a2 = -0.284496736;
+    let a3 = 1.421413741;
+    let a4 = -1.453152027;
+    let a5 = 1.061405429;
+    let p = 0.3275911;
+
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    let x = x.abs() / std::f64::consts::SQRT_2;
+
+    let t = 1.0 / (1.0 + p * x);
+    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-x * x).exp();
+
+    0.5 * (1.0 + sign * y)
+}
+
+/// Get full experiment status report.
+pub fn get_experiment_status(conn: &Connection, name: &str) -> Result<Option<ExperimentStatusReport>> {
+    let experiment = match get_experiment(conn, name)? {
+        Some(e) => e,
+        None => return Ok(None),
+    };
+
+    let variant_a = get_variant_stats(conn, experiment.id, "A")?;
+    let variant_b = get_variant_stats(conn, experiment.id, "B")?;
+
+    let has_min_samples = variant_a.sample_count >= experiment.min_sample_size
+        && variant_b.sample_count >= experiment.min_sample_size;
+
+    let significance = if has_min_samples {
+        calculate_significance(&variant_a, &variant_b)
+    } else {
+        None
+    };
+
+    Ok(Some(ExperimentStatusReport {
+        experiment,
+        variant_a,
+        variant_b,
+        has_min_samples,
+        significance,
+    }))
+}
+
+/// End an experiment and record the winner.
+pub fn end_experiment(conn: &Connection, name: &str, winner: Option<&str>) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+
+    conn.execute(
+        "UPDATE experiments SET status = 'completed', ended_at = ?1, winner = ?2 WHERE name = ?3",
+        params![now, winner, name],
+    )?;
+
+    Ok(())
+}
+
+/// Cancel an experiment without a winner.
+pub fn cancel_experiment(conn: &Connection, name: &str) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+
+    conn.execute(
+        "UPDATE experiments SET status = 'cancelled', ended_at = ?1 WHERE name = ?2",
+        params![now, name],
+    )?;
+
+    Ok(())
+}
+
+/// List all experiments.
+pub fn list_experiments(conn: &Connection) -> Result<Vec<Experiment>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT id, name, description, config_a, config_b, traffic_split, status, min_sample_size, created_at, ended_at, winner
+        FROM experiments
+        ORDER BY created_at DESC
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map([], |row| {
+            let status_str: String = row.get(6)?;
+            let status = match status_str.as_str() {
+                "running" => ExperimentStatus::Running,
+                "completed" => ExperimentStatus::Completed,
+                "cancelled" => ExperimentStatus::Cancelled,
+                _ => ExperimentStatus::Running,
+            };
+
+            Ok(Experiment {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                description: row.get(2)?,
+                config_a: row.get(3)?,
+                config_b: row.get(4)?,
+                traffic_split: row.get(5)?,
+                status,
+                min_sample_size: row.get(7)?,
+                created_at: row.get(8)?,
+                ended_at: row.get(9)?,
+                winner: row.get(10)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+#[cfg(test)]
+mod experiment_tests {
+    use super::*;
+
+    fn setup_experiment_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        init_stats_schema(&conn).unwrap();
+        init_experiments_schema(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn test_create_experiment() {
+        let conn = setup_experiment_db();
+
+        let exp_id = create_experiment(
+            &conn,
+            "test-exp",
+            Some("Test experiment"),
+            r#"{"strategy":"fixed"}"#,
+            r#"{"strategy":"markdown"}"#,
+            0.5,
+            100,
+        ).unwrap();
+
+        assert!(exp_id > 0);
+
+        let exp = get_experiment(&conn, "test-exp").unwrap().unwrap();
+        assert_eq!(exp.name, "test-exp");
+        assert_eq!(exp.status, ExperimentStatus::Running);
+        assert_eq!(exp.traffic_split, 0.5);
+    }
+
+    #[test]
+    fn test_consistent_variant_assignment() {
+        let conn = setup_experiment_db();
+
+        create_experiment(
+            &conn,
+            "test-exp",
+            None,
+            "{}",
+            "{}",
+            0.5,
+            10,
+        ).unwrap();
+
+        let exp = get_experiment(&conn, "test-exp").unwrap().unwrap();
+
+        // Same query hash should always get same variant
+        let hash = "abc123";
+        let variant1 = get_experiment_variant(&exp, hash);
+        let variant2 = get_experiment_variant(&exp, hash);
+        let variant3 = get_experiment_variant(&exp, hash);
+
+        assert_eq!(variant1, variant2);
+        assert_eq!(variant2, variant3);
+    }
+
+    #[test]
+    fn test_record_and_stats() {
+        let conn = setup_experiment_db();
+
+        let exp_id = create_experiment(
+            &conn,
+            "test-exp",
+            None,
+            "{}",
+            "{}",
+            0.5,
+            5,
+        ).unwrap();
+
+        // Record some results for variant A
+        for i in 0..10 {
+            let result = ExperimentResult {
+                experiment_id: exp_id,
+                variant: "A".to_string(),
+                query_hash: format!("hash-a-{i}"),
+                latency_ms: 10 + i as i64,
+                score: 0.7 + (i as f64 * 0.01),
+                result_count: 5,
+                created_at: 0,
+            };
+            record_experiment_result(&conn, &result).unwrap();
+        }
+
+        // Record some results for variant B
+        for i in 0..10 {
+            let result = ExperimentResult {
+                experiment_id: exp_id,
+                variant: "B".to_string(),
+                query_hash: format!("hash-b-{i}"),
+                latency_ms: 15 + i as i64,
+                score: 0.8 + (i as f64 * 0.01),
+                result_count: 6,
+                created_at: 0,
+            };
+            record_experiment_result(&conn, &result).unwrap();
+        }
+
+        let stats_a = get_variant_stats(&conn, exp_id, "A").unwrap();
+        assert_eq!(stats_a.sample_count, 10);
+        assert!(stats_a.avg_score > 0.7 && stats_a.avg_score < 0.8);
+
+        let stats_b = get_variant_stats(&conn, exp_id, "B").unwrap();
+        assert_eq!(stats_b.sample_count, 10);
+        assert!(stats_b.avg_score > 0.8 && stats_b.avg_score < 0.9);
+    }
+
+    #[test]
+    fn test_significance_calculation() {
+        let stats_a = VariantStats {
+            variant: "A".to_string(),
+            sample_count: 100,
+            avg_score: 0.7,
+            avg_latency_ms: 20.0,
+            p95_latency_ms: 35,
+            zero_result_rate: 5.0,
+            score_variance: 0.02,
+        };
+
+        let stats_b = VariantStats {
+            variant: "B".to_string(),
+            sample_count: 100,
+            avg_score: 0.85,
+            avg_latency_ms: 22.0,
+            p95_latency_ms: 40,
+            zero_result_rate: 3.0,
+            score_variance: 0.02,
+        };
+
+        let sig = calculate_significance(&stats_a, &stats_b).unwrap();
+
+        // With a significant difference in means, should be significant
+        assert!(sig.significant);
+        assert_eq!(sig.winner.as_deref(), Some("B"));
+        assert!(sig.effect_size > 0.0);
+    }
+
+    #[test]
+    fn test_end_experiment() {
+        let conn = setup_experiment_db();
+
+        create_experiment(&conn, "test-exp", None, "{}", "{}", 0.5, 10).unwrap();
+
+        end_experiment(&conn, "test-exp", Some("B")).unwrap();
+
+        let exp = get_experiment(&conn, "test-exp").unwrap().unwrap();
+        assert_eq!(exp.status, ExperimentStatus::Completed);
+        assert_eq!(exp.winner.as_deref(), Some("B"));
+        assert!(exp.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_experiment_status_report() {
+        let conn = setup_experiment_db();
+
+        let exp_id = create_experiment(&conn, "test-exp", None, "{}", "{}", 0.5, 5).unwrap();
+
+        // Add enough samples for both variants
+        for i in 0..6 {
+            record_experiment_result(&conn, &ExperimentResult {
+                experiment_id: exp_id,
+                variant: "A".to_string(),
+                query_hash: format!("a-{i}"),
+                latency_ms: 10,
+                score: 0.7,
+                result_count: 5,
+                created_at: 0,
+            }).unwrap();
+
+            record_experiment_result(&conn, &ExperimentResult {
+                experiment_id: exp_id,
+                variant: "B".to_string(),
+                query_hash: format!("b-{i}"),
+                latency_ms: 12,
+                score: 0.75,
+                result_count: 5,
+                created_at: 0,
+            }).unwrap();
+        }
+
+        let status = get_experiment_status(&conn, "test-exp").unwrap().unwrap();
+
+        assert!(status.has_min_samples);
+        assert_eq!(status.variant_a.sample_count, 6);
+        assert_eq!(status.variant_b.sample_count, 6);
+    }
+}

@@ -2301,3 +2301,110 @@ mod tests {
         assert_eq!(chain[0].relationship, RelationshipType::Supersedes);
     }
 }
+
+// ==================== Experiment Handlers ====================
+
+/// Result of creating an experiment.
+#[derive(Debug, Clone)]
+pub struct ExperimentCreateResult {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Handle `mdkb experiment create`.
+pub fn handle_experiment_create(
+    ctx: &Context,
+    name: &str,
+    description: Option<&str>,
+    config_a: &str,
+    config_b: &str,
+    split: f64,
+    min_samples: i64,
+) -> Result<ExperimentCreateResult> {
+    // Validate JSON configs
+    let _ = serde_json::from_str::<serde_json::Value>(config_a)
+        .map_err(|e| Error::from(ErrorKind::Config(format!("Invalid config-a JSON: {e}"))))?;
+    let _ = serde_json::from_str::<serde_json::Value>(config_b)
+        .map_err(|e| Error::from(ErrorKind::Config(format!("Invalid config-b JSON: {e}"))))?;
+
+    // Validate split
+    if !(0.0..=1.0).contains(&split) {
+        return Err(Error::from(ErrorKind::Config(
+            "Traffic split must be between 0.0 and 1.0".to_string()
+        )));
+    }
+
+    // Initialize schema if needed
+    stats::init_experiments_schema(&ctx.conn)?;
+
+    let id = stats::create_experiment(
+        &ctx.conn,
+        name,
+        description,
+        config_a,
+        config_b,
+        split,
+        min_samples,
+    )?;
+
+    Ok(ExperimentCreateResult {
+        id,
+        name: name.to_string(),
+    })
+}
+
+/// Handle `mdkb experiment status`.
+pub fn handle_experiment_status(
+    ctx: &Context,
+    name: &str,
+) -> Result<Option<stats::ExperimentStatusReport>> {
+    stats::init_experiments_schema(&ctx.conn)?;
+    stats::get_experiment_status(&ctx.conn, name)
+}
+
+/// Handle `mdkb experiment end`.
+pub fn handle_experiment_end(
+    ctx: &Context,
+    name: &str,
+    winner: Option<&str>,
+) -> Result<Option<String>> {
+    stats::init_experiments_schema(&ctx.conn)?;
+
+    // If winner not specified, try to auto-determine from significance
+    let actual_winner = if winner.is_some() {
+        winner.map(|s| s.to_string())
+    } else {
+        // Get experiment status and check for significant winner
+        match stats::get_experiment_status(&ctx.conn, name)? {
+            Some(status) => {
+                if let Some(sig) = status.significance {
+                    sig.winner
+                } else {
+                    None
+                }
+            }
+            None => return Err(Error::from(ErrorKind::Config(format!("Experiment '{name}' not found")))),
+        }
+    };
+
+    stats::end_experiment(&ctx.conn, name, actual_winner.as_deref())?;
+
+    Ok(actual_winner)
+}
+
+/// Handle `mdkb experiment cancel`.
+pub fn handle_experiment_cancel(ctx: &Context, name: &str) -> Result<()> {
+    stats::init_experiments_schema(&ctx.conn)?;
+    stats::cancel_experiment(&ctx.conn, name)
+}
+
+/// Handle `mdkb experiment list`.
+pub fn handle_experiment_list(ctx: &Context, running_only: bool) -> Result<Vec<stats::Experiment>> {
+    stats::init_experiments_schema(&ctx.conn)?;
+
+    if running_only {
+        stats::get_active_experiments(&ctx.conn)
+    } else {
+        stats::list_experiments(&ctx.conn)
+    }
+}
