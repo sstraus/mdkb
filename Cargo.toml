@@ -94,6 +94,11 @@ trivial_numeric_casts = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_lifetimes = "warn"
 
+# Patch llama-cpp-sys-2 to explicitly disable AVX2/FMA on older CPUs
+# Without this, ggml defaults to AVX2=ON which causes SIGILL on Ivy Bridge
+[patch.crates-io]
+llama-cpp-sys-2 = { path = "patches/llama-cpp-sys-2" }
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
 # Cargo lints disabled - multiple dependency versions are from transitive deps

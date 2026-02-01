@@ -41,6 +41,8 @@ impl Store {
     /// Returns an error if the database file can't be created or opened,
     /// or if SQLite initialization fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        // Ensure sqlite-vec is registered before opening any connection
+        vectors::init_sqlite_vec();
         let conn = rusqlite::Connection::open(path)?;
         let store = Self { conn };
         store.setup_pragmas()?;
@@ -49,6 +51,8 @@ impl Store {
 
     /// Open an in-memory database (for testing).
     pub fn open_in_memory() -> Result<Self> {
+        // Ensure sqlite-vec is registered before opening any connection
+        vectors::init_sqlite_vec();
         let conn = rusqlite::Connection::open_in_memory()?;
         let store = Self { conn };
         store.setup_pragmas()?;

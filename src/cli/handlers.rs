@@ -52,6 +52,9 @@ impl Context {
             .into());
         }
 
+        // Initialize sqlite-vec extension before opening connection
+        vectors::init_sqlite_vec();
+
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 

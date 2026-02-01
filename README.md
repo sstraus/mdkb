@@ -20,6 +20,21 @@ cargo install --path .
 
 Or download a pre-built binary from [Releases](https://github.com/user/mdkb/releases).
 
+### Building for Older CPUs
+
+The LLM feature requires CPU-specific optimizations. If you get `SIGILL` (illegal instruction) errors on older CPUs without AVX2 (e.g., Intel Ivy Bridge, Sandy Bridge), you need to patch `llama-cpp-sys-2`:
+
+```bash
+# Copy the crate locally
+cp -r ~/.cargo/registry/src/*/llama-cpp-sys-2-* patches/llama-cpp-sys-2
+
+# Edit patches/llama-cpp-sys-2/build.rs to explicitly disable AVX2:
+# Change the feature detection loop to explicitly set OFF for missing features
+# See: .cargo/config.toml for target-cpu settings
+```
+
+The patch is not committed to the repo due to size (includes full llama.cpp source). See `.cargo/config.toml` for the target CPU configuration.
+
 ## Quick Start
 
 ```bash

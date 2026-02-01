@@ -2,22 +2,30 @@
 //!
 //! Uses sqlite-vec for vector similarity search.
 
+use std::sync::Once;
+
 use rusqlite::{Connection, ffi::sqlite3_auto_extension, params};
 use sqlite_vec::sqlite3_vec_init;
 use zerocopy::AsBytes;
 
 use crate::error::Result;
 
+/// Ensures sqlite-vec extension is initialized exactly once.
+static INIT_SQLITE_VEC: Once = Once::new();
+
 /// Initialize sqlite-vec extension globally.
-/// Must be called once before opening any connections that use vectors.
+/// Safe to call multiple times - will only initialize once.
+/// Must be called before opening any connections that use vectors.
 pub fn init_sqlite_vec() {
-    // SAFETY: sqlite3_vec_init is an extern "C" function with the signature expected by
-    // sqlite3_auto_extension: `fn(*mut sqlite3, **mut c_char, *const sqlite3_api_routines) -> c_int`.
-    // The transmute converts the function pointer to the type expected by the SQLite C API.
-    // This is the standard pattern for registering SQLite extensions via rusqlite's ffi.
-    unsafe {
-        sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
-    }
+    INIT_SQLITE_VEC.call_once(|| {
+        // SAFETY: sqlite3_vec_init is an extern "C" function with the signature expected by
+        // sqlite3_auto_extension: `fn(*mut sqlite3, **mut c_char, *const sqlite3_api_routines) -> c_int`.
+        // The transmute converts the function pointer to the type expected by the SQLite C API.
+        // This is the standard pattern for registering SQLite extensions via rusqlite's ffi.
+        unsafe {
+            sqlite3_auto_extension(Some(std::mem::transmute(sqlite3_vec_init as *const ())));
+        }
+    });
 }
 
 /// Initialize vector storage tables.
