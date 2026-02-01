@@ -166,7 +166,7 @@ impl McpServer {
 
     /// Search documents using hybrid search (BM25 + semantic with RRF fusion).
     #[tool(description = "Search markdown documents using hybrid search (combines keyword and semantic search)")]
-    async fn mdkb_search(
+    async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -198,7 +198,7 @@ impl McpServer {
 
     /// Retrieve a document by ID or path.
     #[tool(description = "Retrieve a document by ID or path, with optional line range")]
-    async fn mdkb_get(
+    async fn get(
         &self,
         Parameters(params): Parameters<GetParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -249,7 +249,7 @@ impl McpServer {
 
     /// List all collections.
     #[tool(description = "List all indexed collections with their paths and document counts")]
-    async fn mdkb_list_collections(&self) -> Result<CallToolResult, McpError> {
+    async fn list_collections(&self) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
         let ctx_guard = self.ctx.lock().await;
@@ -289,7 +289,7 @@ impl McpServer {
 
     /// Get index status.
     #[tool(description = "Get the current index status (collections, documents, etc.)")]
-    async fn mdkb_status(&self) -> Result<CallToolResult, McpError> {
+    async fn status(&self) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
         let ctx_guard = self.ctx.lock().await;
@@ -315,7 +315,7 @@ impl McpServer {
 
     /// Trigger reindex of all collections.
     #[tool(description = "Trigger a differential reindex of all collections")]
-    async fn mdkb_update(&self) -> Result<CallToolResult, McpError> {
+    async fn update(&self) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
         let mut ctx_guard = self.ctx.lock().await;
@@ -341,7 +341,7 @@ impl McpServer {
 
     /// Retrieve multiple documents by pattern.
     #[tool(description = "Retrieve multiple documents matching a glob pattern")]
-    async fn mdkb_multi_get(
+    async fn multi_get(
         &self,
         Parameters(params): Parameters<MultiGetParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -404,7 +404,7 @@ impl McpServer {
 
     /// Get usage and query performance metrics.
     #[tool(description = "Get search performance metrics for self-evaluation. Includes token usage, query latency, zero-result rate, and quality scores. Use to understand query patterns, identify issues, and track improvements.")]
-    async fn mdkb_metrics(
+    async fn get_metrics(
         &self,
         Parameters(params): Parameters<MetricsParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -552,7 +552,7 @@ impl McpServer {
 
     /// Get memory warmup index (compact list for AI session start).
     #[tool(description = "Get memory index for session warmup (~50 entries, compact format). Call this at session start to load context.")]
-    async fn mdkb_memory_index(
+    async fn memory_index(
         &self,
         Parameters(params): Parameters<MemoryIndexParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -581,7 +581,7 @@ impl McpServer {
 
     /// Retrieve a memory entry by ID.
     #[tool(description = "Retrieve full content of a memory entry by ID")]
-    async fn mdkb_memory_get(
+    async fn memory_get(
         &self,
         Parameters(params): Parameters<MemoryGetParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -620,7 +620,7 @@ impl McpServer {
 
     /// Write or update a memory entry.
     #[tool(description = "Create or update a memory entry. Use after: (1) solving a problem (type=problem, title=symptom), (2) making architectural decisions (type=decision, title=options), (3) learning patterns (type=topic, title=concept). Title max 50 chars, like a headline. ID should be slug format: 'auth-oauth2-pkce'.")]
-    async fn mdkb_memory_write(
+    async fn memory_write(
         &self,
         Parameters(params): Parameters<MemoryWriteParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -682,7 +682,7 @@ impl McpServer {
 
     /// Search memory entries.
     #[tool(description = "Search memory entries by keyword")]
-    async fn mdkb_memory_search(
+    async fn memory_search(
         &self,
         Parameters(params): Parameters<MemorySearchParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -722,7 +722,7 @@ impl McpServer {
 
     /// Query document evolution history.
     #[tool(description = "Trace document evolution - what supersedes it, what it supersedes. Use when checking if a document is current or finding latest version.")]
-    async fn mdkb_evolution(
+    async fn evolution(
         &self,
         Parameters(params): Parameters<EvolutionParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -999,9 +999,9 @@ fn build_warmup_instructions(index: &[String]) -> String {
     let mut instructions = String::from(
         "# mdkb Memory Index\n\n\
          You have access to persistent memory entries. Use these tools:\n\
-         - `mdkb_memory_get(id)`: Get full content of an entry\n\
-         - `mdkb_memory_write(id, title, content, type, tags)`: Save new knowledge\n\
-         - `mdkb_memory_search(query)`: Find entries beyond this index\n\n\
+         - `memory_get(id)`: Get full content of an entry\n\
+         - `memory_write(id, title, content, type, tags)`: Save new knowledge\n\
+         - `memory_search(query)`: Find entries beyond this index\n\n\
          ## When to Write Memories\n\
          - After solving a problem: type=problem, title=symptom\n\
          - After making architectural decisions: type=decision, title=options\n\
@@ -1014,7 +1014,7 @@ fn build_warmup_instructions(index: &[String]) -> String {
         instructions.push('\n');
     }
 
-    instructions.push_str("\nUse `mdkb_memory_get(id)` to retrieve full content.\n");
+    instructions.push_str("\nUse `memory_get(id)` to retrieve full content.\n");
 
     instructions
 }
@@ -1190,9 +1190,9 @@ mod tests {
 
         // Check structure
         assert!(result.contains("# mdkb Memory Index"));
-        assert!(result.contains("mdkb_memory_get"));
-        assert!(result.contains("mdkb_memory_write"));
-        assert!(result.contains("mdkb_memory_search"));
+        assert!(result.contains("memory_get"));
+        assert!(result.contains("memory_write"));
+        assert!(result.contains("memory_search"));
 
         // Check guidance
         assert!(result.contains("When to Write Memories"));
