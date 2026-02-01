@@ -161,10 +161,14 @@ async fn main() -> Result<()> {
                     tags,
                     content,
                 } => {
+                    const MAX_STDIN_SIZE: u64 = 100_000; // 100KB limit
                     let content = content.unwrap_or_else(|| {
                         use std::io::Read;
                         let mut buf = String::new();
-                        std::io::stdin().read_to_string(&mut buf).unwrap_or_default();
+                        std::io::stdin()
+                            .take(MAX_STDIN_SIZE)
+                            .read_to_string(&mut buf)
+                            .unwrap_or_default();
                         buf
                     });
                     handle_memory_add(&ctx, &id, &title, &entry_type, tags.as_deref(), &content)?;

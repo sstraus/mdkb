@@ -952,8 +952,36 @@ pub struct ExperimentResult {
     pub created_at: i64,
 }
 
-/// Initialize the experiments schema.
+/// Current experiments schema version.
+const EXPERIMENTS_SCHEMA_VERSION: i32 = 1;
+
+/// Initialize the experiments schema with version tracking.
 pub fn init_experiments_schema(conn: &Connection) -> Result<()> {
+    // Create version tracking table
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS experiments_schema_version (
+            version INTEGER NOT NULL,
+            migrated_at INTEGER NOT NULL
+        )
+        "#,
+        [],
+    )?;
+
+    // Check current version
+    let current_version: Option<i32> = conn
+        .query_row(
+            "SELECT version FROM experiments_schema_version ORDER BY migrated_at DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+
+    if current_version == Some(EXPERIMENTS_SCHEMA_VERSION) {
+        return Ok(()); // Already at current version
+    }
+
+    // Create or migrate schema
     conn.execute_batch(
         r#"
         -- A/B Experiments
@@ -989,6 +1017,14 @@ pub fn init_experiments_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_experiment_results_variant ON experiment_results(experiment_id, variant);
         "#,
     )?;
+
+    // Record schema version
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO experiments_schema_version (version, migrated_at) VALUES (?1, ?2)",
+        params![EXPERIMENTS_SCHEMA_VERSION, now],
+    )?;
+
     Ok(())
 }
 
@@ -1349,25 +1385,65 @@ pub fn get_experiment_status(conn: &Connection, name: &str) -> Result<Option<Exp
 }
 
 /// End an experiment and record the winner.
+/// Only ends experiments that are currently running.
 pub fn end_experiment(conn: &Connection, name: &str, winner: Option<&str>) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
 
-    conn.execute(
-        "UPDATE experiments SET status = 'completed', ended_at = ?1, winner = ?2 WHERE name = ?3",
+    let rows_affected = conn.execute(
+        "UPDATE experiments SET status = 'completed', ended_at = ?1, winner = ?2 WHERE name = ?3 AND status = 'running'",
         params![now, winner, name],
     )?;
+
+    if rows_affected == 0 {
+        // Check if experiment exists but isn't running
+        let exists: bool = conn.query_row(
+            "SELECT 1 FROM experiments WHERE name = ?1",
+            params![name],
+            |_| Ok(true),
+        ).unwrap_or(false);
+
+        if exists {
+            return Err(crate::Error::config(format!(
+                "Experiment '{}' is not running (may already be completed or cancelled)", name
+            )));
+        } else {
+            return Err(crate::Error::config(format!(
+                "Experiment '{}' not found", name
+            )));
+        }
+    }
 
     Ok(())
 }
 
 /// Cancel an experiment without a winner.
+/// Only cancels experiments that are currently running.
 pub fn cancel_experiment(conn: &Connection, name: &str) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
 
-    conn.execute(
-        "UPDATE experiments SET status = 'cancelled', ended_at = ?1 WHERE name = ?2",
+    let rows_affected = conn.execute(
+        "UPDATE experiments SET status = 'cancelled', ended_at = ?1 WHERE name = ?2 AND status = 'running'",
         params![now, name],
     )?;
+
+    if rows_affected == 0 {
+        // Check if experiment exists but isn't running
+        let exists: bool = conn.query_row(
+            "SELECT 1 FROM experiments WHERE name = ?1",
+            params![name],
+            |_| Ok(true),
+        ).unwrap_or(false);
+
+        if exists {
+            return Err(crate::Error::config(format!(
+                "Experiment '{}' is not running (may already be completed or cancelled)", name
+            )));
+        } else {
+            return Err(crate::Error::config(format!(
+                "Experiment '{}' not found", name
+            )));
+        }
+    }
 
     Ok(())
 }
