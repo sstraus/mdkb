@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -93,7 +93,8 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     updated_at INTEGER NOT NULL,
     superseded_by TEXT,               -- ID of newer entry
     access_count INTEGER DEFAULT 0,   -- Track usage for ranking
-    last_accessed INTEGER
+    last_accessed INTEGER,
+    source_path TEXT                  -- Original file path (for journal imports)
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
@@ -208,6 +209,24 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
         }
 
         // Evolution table is created by SCHEMA_SQL with IF NOT EXISTS
+    }
+
+    // Migration from v2 to v3: add source_path to memory_entries
+    if from_version < 3 {
+        let has_source_path: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'source_path'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !has_source_path {
+            conn.execute(
+                "ALTER TABLE memory_entries ADD COLUMN source_path TEXT",
+                [],
+            )?;
+        }
     }
 
     // Update schema version
@@ -874,11 +893,11 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_version_is_2() {
+    fn test_schema_version_is_current() {
         let conn = setup_db();
         init_schema(&conn).expect("init_schema failed");
 
         let version = get_schema_version(&conn).unwrap().unwrap();
-        assert_eq!(version, 2, "schema version should be 2");
+        assert_eq!(version, SCHEMA_VERSION, "schema version should match SCHEMA_VERSION");
     }
 }

@@ -1,6 +1,7 @@
 //! CLI layer - command parsing and execution with clap.
 
 pub mod handlers;
+pub mod journal;
 
 use clap::{Parser, Subcommand};
 
@@ -135,6 +136,39 @@ pub enum Command {
     /// Manage A/B experiments
     #[command(subcommand)]
     Experiment(ExperimentCommand),
+
+    /// Import Claude Code journal entries to memory
+    #[command(subcommand)]
+    Journal(JournalCommand),
+}
+
+/// Journal import subcommands.
+#[derive(Subcommand, Debug)]
+pub enum JournalCommand {
+    /// Import a journal file to memory entries
+    Import {
+        /// Path to journal markdown file
+        path: String,
+
+        /// Dry run - show what would be imported without saving
+        #[arg(short, long)]
+        dry_run: bool,
+    },
+
+    /// Import all journal entries from a directory
+    ImportAll {
+        /// Path to journal directory (defaults to .claude/journal/)
+        #[arg(long)]
+        dir: Option<String>,
+
+        /// Dry run - show what would be imported without saving
+        #[arg(short = 'n', long)]
+        dry_run: bool,
+
+        /// Skip entries already imported (based on source_path)
+        #[arg(long, default_value = "true")]
+        skip_existing: bool,
+    },
 }
 
 /// A/B Experiment subcommands.

@@ -666,6 +666,7 @@ impl McpServer {
                 superseded_by: None,
                 access_count: 0,
                 last_accessed: None,
+                source_path: None,
             };
             memory::add_entry(&ctx.conn, &entry)
                 .map_err(|e| mcp_error(format!("Failed to create memory entry: {}", e)))?;

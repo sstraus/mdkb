@@ -973,6 +973,7 @@ pub fn handle_memory_add(
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
+        source_path: None,
     };
 
     memory::add_entry(&ctx.conn, &entry)?;
@@ -1277,6 +1278,7 @@ pub fn handle_memory_condense(
                 superseded_by: None,
                 access_count: 0,
                 last_accessed: None,
+                source_path: None,
             };
 
             // Use transaction to ensure atomicity - either all changes succeed or none
@@ -2465,4 +2467,112 @@ pub fn handle_experiment_list(ctx: &Context, running_only: bool) -> Result<Vec<s
     } else {
         stats::list_experiments(&ctx.conn)
     }
+}
+
+// ============================================================================
+// Journal Import Handlers
+// ============================================================================
+
+use crate::cli::journal::{self, JournalImportResult};
+
+/// Handle `mdkb journal import`.
+pub fn handle_journal_import(
+    ctx: &Context,
+    path: &Path,
+    dry_run: bool,
+) -> Result<JournalImportResult> {
+    // Read journal file
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| Error::from(ErrorKind::Io(e)))?;
+
+    // Parse journal
+    let parsed = journal::parse_journal(&content);
+
+    // Generate base ID from filename
+    let base_id = journal::path_to_base_id(path);
+
+    // Convert to memory entries
+    let entries = journal::journal_to_memory_entries(&parsed, path, &base_id);
+
+    let mut result = JournalImportResult {
+        source_path: path.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+
+    if entries.is_empty() {
+        result.skipped.push(("No content".to_string(), "entire file".to_string()));
+        return Ok(result);
+    }
+
+    for entry in entries {
+        if dry_run {
+            result.created.push(entry.id);
+        } else {
+            // Check if entry with this ID already exists
+            if memory::get_entry_without_tracking(&ctx.conn, &entry.id)?.is_some() {
+                result.skipped.push(("Already exists".to_string(), entry.id));
+                continue;
+            }
+
+            memory::add_entry(&ctx.conn, &entry)?;
+            result.created.push(entry.id);
+        }
+    }
+
+    Ok(result)
+}
+
+/// Handle `mdkb journal import-all`.
+pub fn handle_journal_import_all(
+    ctx: &Context,
+    dir: &Path,
+    dry_run: bool,
+    skip_existing: bool,
+) -> Result<Vec<JournalImportResult>> {
+    let mut results = Vec::new();
+
+    // Get list of already imported source paths if skip_existing
+    let existing_sources: HashSet<String> = if skip_existing && !dry_run {
+        memory::list_entries(&ctx.conn, 10000, None)?
+            .into_iter()
+            .filter_map(|e| e.source_path)
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    // Walk journal directory
+    for entry in WalkDir::new(dir)
+        .max_depth(2)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+    {
+        let path = entry.path();
+        let path_str = path.to_string_lossy().to_string();
+
+        // Skip if already imported
+        if skip_existing && existing_sources.contains(&path_str) {
+            results.push(JournalImportResult {
+                source_path: path_str.clone(),
+                skipped: vec![("Already imported".to_string(), path_str)],
+                ..Default::default()
+            });
+            continue;
+        }
+
+        match handle_journal_import(ctx, path, dry_run) {
+            Ok(result) => results.push(result),
+            Err(e) => {
+                results.push(JournalImportResult {
+                    source_path: path_str.clone(),
+                    skipped: vec![(format!("Error: {}", e), path_str)],
+                    ..Default::default()
+                });
+            }
+        }
+    }
+
+    Ok(results)
 }

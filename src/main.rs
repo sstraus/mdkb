@@ -24,7 +24,8 @@ use mdkb::cli::handlers::{
     handle_memory_warmup, handle_metrics_export, handle_metrics_latency, handle_metrics_show,
     handle_mget, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
-use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, MemoryCommand, MetricsCommand, OutputFormat};
+use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat};
+use mdkb::cli::journal::JournalImportResult;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
 use mdkb::mcp::server::run_server;
@@ -303,6 +304,29 @@ async fn main() -> Result<()> {
                 ExperimentCommand::List { running } => {
                     let experiments = handle_experiment_list(&ctx, running)?;
                     format_experiment_list(&experiments, cli.format);
+                }
+            }
+        }
+        Command::Journal(cmd) => {
+            let ctx = Context::open(&cwd)?;
+            match cmd {
+                JournalCommand::Import { path, dry_run } => {
+                    let result = mdkb::cli::handlers::handle_journal_import(
+                        &ctx,
+                        std::path::Path::new(&path),
+                        dry_run,
+                    )?;
+                    format_journal_import_result(&result, dry_run, cli.format);
+                }
+                JournalCommand::ImportAll { dir, dry_run, skip_existing } => {
+                    let journal_dir = dir.unwrap_or_else(|| ".claude/journal".to_string());
+                    let results = mdkb::cli::handlers::handle_journal_import_all(
+                        &ctx,
+                        std::path::Path::new(&journal_dir),
+                        dry_run,
+                        skip_existing,
+                    )?;
+                    format_journal_import_all_results(&results, dry_run, cli.format);
                 }
             }
         }
@@ -1191,6 +1215,78 @@ fn format_experiment_list(experiments: &[mdkb::store::stats::Experiment], format
                         .map(|w| format!(" -> Winner: {w}"))
                         .unwrap_or_default();
                     println!("{}: {} (started {}){}", exp.name, exp.status, started, winner_str);
+                }
+            }
+        }
+    }
+}
+
+fn format_journal_import_result(result: &JournalImportResult, dry_run: bool, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(result).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("source,created,skipped");
+            println!("{},{},{}", result.source_path, result.created.len(), result.skipped.len());
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            let prefix = if dry_run { "[DRY RUN] " } else { "" };
+            println!("{}Imported: {}", prefix, result.source_path);
+            if !result.created.is_empty() {
+                println!("  Created {} memory entries:", result.created.len());
+                for id in &result.created {
+                    println!("    - {}", id);
+                }
+            }
+            if !result.skipped.is_empty() {
+                println!("  Skipped {} entries:", result.skipped.len());
+                for (reason, name) in &result.skipped {
+                    println!("    - {}: {}", name, reason);
+                }
+            }
+        }
+    }
+}
+
+fn format_journal_import_all_results(results: &[JournalImportResult], dry_run: bool, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(results).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("source,created,skipped");
+            for result in results {
+                println!("{},{},{}", result.source_path, result.created.len(), result.skipped.len());
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            let prefix = if dry_run { "[DRY RUN] " } else { "" };
+            let total_created: usize = results.iter().map(|r| r.created.len()).sum();
+            let total_skipped: usize = results.iter().map(|r| r.skipped.len()).sum();
+
+            println!("{}Journal Import Summary", prefix);
+            println!("  Files processed: {}", results.len());
+            println!("  Entries created: {}", total_created);
+            println!("  Entries skipped: {}", total_skipped);
+
+            if total_created > 0 {
+                println!("\nCreated:");
+                for result in results {
+                    for id in &result.created {
+                        println!("  - {}", id);
+                    }
+                }
+            }
+
+            let errors: Vec<_> = results.iter()
+                .flat_map(|r| r.skipped.iter().filter(|(reason, _)| reason.starts_with("Error")))
+                .collect();
+
+            if !errors.is_empty() {
+                println!("\nErrors:");
+                for (reason, path) in errors {
+                    println!("  - {}: {}", path, reason);
                 }
             }
         }

@@ -20,6 +20,8 @@ pub struct MemoryEntry {
     pub superseded_by: Option<String>,
     pub access_count: u64,
     pub last_accessed: Option<i64>,
+    #[serde(default)]
+    pub source_path: Option<String>,
 }
 
 /// Type of memory entry.
@@ -92,8 +94,8 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
     let tags_json = serde_json::to_string(&entry.tags)?;
 
     conn.execute(
-        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, source_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             entry.id,
             entry.title,
@@ -104,6 +106,7 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
             entry.created_at,
             entry.updated_at,
             entry.access_count,
+            entry.source_path,
         ],
     )?;
 
@@ -150,7 +153,7 @@ pub fn get_entry(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
 /// Get a memory entry by ID without incrementing access count.
 pub fn get_entry_without_tracking(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path
          FROM memory_entries WHERE id = ?1"
     )?;
 
@@ -172,6 +175,7 @@ pub fn get_entry_without_tracking(conn: &Connection, id: &str) -> Result<Option<
             superseded_by: row.get(8)?,
             access_count: row.get::<_, i64>(9)? as u64,
             last_accessed: row.get(10)?,
+            source_path: row.get(11)?,
         })
     }).ok();
 
@@ -187,10 +191,10 @@ pub fn delete_entry(conn: &Connection, id: &str) -> Result<bool> {
 /// List memory entries ordered by access count (most used first).
 pub fn list_entries(conn: &Connection, limit: usize, status_filter: Option<EntryStatus>) -> Result<Vec<MemoryEntry>> {
     let sql = if status_filter.is_some() {
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path
          FROM memory_entries WHERE status = ?1 ORDER BY access_count DESC LIMIT ?2"
     } else {
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path
          FROM memory_entries ORDER BY access_count DESC LIMIT ?1"
     };
 
@@ -213,7 +217,7 @@ pub fn list_entries(conn: &Connection, limit: usize, status_filter: Option<Entry
 /// Search memory entries using full-text search.
 pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed
+        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -330,6 +334,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         superseded_by: row.get(8)?,
         access_count: row.get::<_, i64>(9)? as u64,
         last_accessed: row.get(10)?,
+        source_path: row.get(11)?,
     })
 }
 
@@ -362,6 +367,7 @@ mod tests {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
+            source_path: None,
         };
 
         add_entry(&conn, &entry).unwrap();
@@ -391,6 +397,7 @@ mod tests {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
+            source_path: None,
         };
 
         add_entry(&conn, &entry).unwrap();
@@ -421,6 +428,7 @@ mod tests {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
+            source_path: None,
         };
 
         add_entry(&conn, &entry).unwrap();
@@ -450,6 +458,7 @@ mod tests {
                 superseded_by: None,
                 access_count: count,
                 last_accessed: None,
+            source_path: None,
             };
             add_entry(&conn, &entry).unwrap();
         }
@@ -478,6 +487,7 @@ mod tests {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
+            source_path: None,
         };
 
         let entry2 = MemoryEntry {
@@ -492,6 +502,7 @@ mod tests {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
+            source_path: None,
         };
 
         add_entry(&conn, &entry1).unwrap();
@@ -519,6 +530,7 @@ mod tests {
             superseded_by: None,
             access_count: 5,
             last_accessed: None,
+            source_path: None,
         };
 
         add_entry(&conn, &entry).unwrap();
@@ -551,6 +563,7 @@ mod tests {
                 superseded_by: None,
                 access_count: 0,
                 last_accessed: None,
+            source_path: None,
             };
             add_entry(&conn, &entry).unwrap();
         }
@@ -577,6 +590,7 @@ mod tests {
             superseded_by: None,
             access_count: 1,
             last_accessed: Some(now),
+            source_path: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -608,6 +622,7 @@ mod tests {
             superseded_by: None,
             access_count: 5,
             last_accessed: Some(old_time),
+            source_path: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -640,6 +655,7 @@ mod tests {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
+            source_path: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -667,6 +683,7 @@ mod tests {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
+            source_path: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -699,6 +716,7 @@ mod tests {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
+            source_path: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -726,6 +744,7 @@ mod tests {
             superseded_by: None,
             access_count: 10,
             last_accessed: Some(now),
+            source_path: None,
         };
         add_entry(&conn, &recent).unwrap();
 
@@ -742,6 +761,7 @@ mod tests {
             superseded_by: None,
             access_count: 5,
             last_accessed: Some(old_time),
+            source_path: None,
         };
         add_entry(&conn, &stale).unwrap();
 
