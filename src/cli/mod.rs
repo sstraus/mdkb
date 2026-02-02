@@ -2,6 +2,7 @@
 
 pub mod handlers;
 pub mod journal;
+pub mod setup;
 
 use clap::{Parser, Subcommand};
 
@@ -140,6 +141,10 @@ pub enum Command {
     /// Import Claude Code journal entries to memory
     #[command(subcommand)]
     Journal(JournalCommand),
+
+    /// Setup and configure mdkb integrations
+    #[command(subcommand)]
+    Setup(SetupCommand),
 }
 
 /// Journal import subcommands.
@@ -464,6 +469,29 @@ pub enum EvolveCommand {
         /// Reason for extension
         #[arg(short, long)]
         reason: Option<String>,
+    },
+}
+
+/// Setup and configuration subcommands.
+#[derive(Subcommand, Debug)]
+pub enum SetupCommand {
+    /// Register mdkb as an MCP server
+    #[command(subcommand)]
+    Mcp(SetupMcpCommand),
+}
+
+/// MCP setup subcommands.
+#[derive(Subcommand, Debug)]
+pub enum SetupMcpCommand {
+    /// Register mdkb with Claude Code
+    Claude {
+        /// Scope: local (project-specific, default), user (global), or project (deprecated alias for local)
+        #[arg(short, long, default_value = "local")]
+        scope: String,
+
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
     },
 }
 

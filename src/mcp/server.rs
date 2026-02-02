@@ -9,7 +9,7 @@ use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
 use rmcp::handler::server::tool::{Parameters, ToolRouter};
 use rmcp::model::{
-    CallToolResult, Content, ErrorCode, Implementation, ServerCapabilities, ServerInfo,
+    CallToolResult, Content, EmptyObject, ErrorCode, Implementation, ServerCapabilities, ServerInfo,
 };
 use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
@@ -249,7 +249,10 @@ impl McpServer {
 
     /// List all collections.
     #[tool(description = "List all indexed collections with their paths and document counts")]
-    async fn list_collections(&self) -> Result<CallToolResult, McpError> {
+    async fn list_collections(
+        &self,
+        Parameters(_): Parameters<EmptyObject>,
+    ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
         let ctx_guard = self.ctx.lock().await;
@@ -289,7 +292,10 @@ impl McpServer {
 
     /// Get index status.
     #[tool(description = "Get the current index status (collections, documents, etc.)")]
-    async fn status(&self) -> Result<CallToolResult, McpError> {
+    async fn status(
+        &self,
+        Parameters(_): Parameters<EmptyObject>,
+    ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
         let ctx_guard = self.ctx.lock().await;
@@ -315,7 +321,10 @@ impl McpServer {
 
     /// Trigger reindex of all collections.
     #[tool(description = "Trigger a differential reindex of all collections")]
-    async fn update(&self) -> Result<CallToolResult, McpError> {
+    async fn update(
+        &self,
+        Parameters(_): Parameters<EmptyObject>,
+    ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
         let mut ctx_guard = self.ctx.lock().await;

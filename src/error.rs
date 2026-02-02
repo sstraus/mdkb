@@ -134,7 +134,7 @@ pub enum ErrorKind {
 
     // File system errors
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    IoError(#[from] std::io::Error),
 
     #[error("path not found: {path}")]
     PathNotFound { path: PathBuf },
@@ -152,6 +152,14 @@ pub enum ErrorKind {
     // Watcher errors
     #[error("file watcher error: {0}")]
     Watcher(String),
+
+    // Command/process errors
+    #[error("command '{command}' failed: {message}")]
+    Command { command: String, message: String },
+
+    // Io error with context
+    #[error("IO error on {path}: {operation}")]
+    Io { path: PathBuf, operation: String },
 
     // Serialization errors
     #[error("JSON error: {0}")]
@@ -199,7 +207,7 @@ impl From<rusqlite::Error> for Error {
 
 impl From<std::io::Error> for Error {
     fn from(err: std::io::Error) -> Self {
-        Self::new(ErrorKind::Io(err))
+        Self::new(ErrorKind::IoError(err))
     }
 }
 
@@ -272,6 +280,6 @@ mod tests {
     fn test_from_io_error() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err = Error::from(io_err);
-        assert!(matches!(err.kind(), ErrorKind::Io(_)));
+        assert!(matches!(err.kind(), ErrorKind::IoError(_)));
     }
 }

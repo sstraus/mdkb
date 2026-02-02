@@ -24,7 +24,7 @@ use mdkb::cli::handlers::{
     handle_memory_warmup, handle_metrics_export, handle_metrics_latency, handle_metrics_show,
     handle_mget, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
-use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat};
+use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SetupCommand, SetupMcpCommand};
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
@@ -327,6 +327,29 @@ async fn main() -> Result<()> {
                         skip_existing,
                     )?;
                     format_journal_import_all_results(&results, dry_run, cli.format);
+                }
+            }
+        }
+        Command::Setup(cmd) => {
+            match cmd {
+                SetupCommand::Mcp(mcp_cmd) => {
+                    match mcp_cmd {
+                        SetupMcpCommand::Claude { scope, yes } => {
+                            let global = scope == "user";
+                            if scope != "local" && scope != "user" && scope != "project" {
+                                eprintln!("Error: Invalid scope '{}'. Must be 'local', 'user', or 'project'.", scope);
+                                std::process::exit(1);
+                            }
+                            let result = mdkb::cli::setup::handle_setup_mcp_claude(&cwd, global, yes)?;
+                            if result.success {
+                                println!("{}", result.message);
+                                println!();
+                                println!("Restart Claude Code to activate the mdkb MCP server.");
+                            } else {
+                                println!("{}", result.message);
+                            }
+                        }
+                    }
                 }
             }
         }

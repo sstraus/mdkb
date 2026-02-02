@@ -2486,7 +2486,7 @@ pub fn handle_journal_import(
 ) -> Result<JournalImportResult> {
     // Read journal file
     let content = std::fs::read_to_string(path)
-        .map_err(|e| Error::from(ErrorKind::Io(e)))?;
+        .map_err(|e| Error::from(ErrorKind::IoError(e)))?;
 
     // Parse journal
     let parsed = journal::parse_journal(&content);

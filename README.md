@@ -126,10 +126,10 @@ Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectura
 
 ### How AIs Use Memory
 
-1. **Session start**: AI calls `mdkb_memory_index` to get top 50 entries (~1.5K tokens)
-2. **On demand**: AI calls `mdkb_memory_get` for full entry content
-3. **Learning**: AI calls `mdkb_memory_write` to persist new knowledge
-4. **Finding**: AI calls `mdkb_memory_search` to find related entries
+1. **Session start**: AI calls `memory_index` to get top 50 entries (~1.5K tokens)
+2. **On demand**: AI calls `memory_get` for full entry content
+3. **Learning**: AI calls `memory_write` to persist new knowledge
+4. **Finding**: AI calls `memory_search` to find related entries
 
 Access counts track which entries are most useful, ensuring the warmup index prioritizes frequently-used knowledge.
 
@@ -139,33 +139,59 @@ mdkb implements the [Model Context Protocol](https://modelcontextprotocol.io/) t
 
 ### Setup
 
-Add to `~/.claude/mcp_servers.json`:
+**Option 1: Automatic Setup (Recommended)**
+
+Run the setup command from your project directory (where `.mdkb/` exists):
+
+```bash
+# Project-scoped (recommended for project-specific documentation)
+mdkb setup mcp claude --scope local
+
+# User-scoped (global installation)
+mdkb setup mcp claude --scope user
+```
+
+This registers mdkb with Claude Code using `claude mcp add`. Restart Claude Code after setup.
+
+**Option 2: Manual Setup**
+
+If you prefer manual configuration, add to `~/.claude/mcp.json`:
 
 ```json
 {
-  "mdkb": {
-    "command": "mdkb",
-    "args": ["serve"],
-    "cwd": "/path/to/your/project"
+  "mcpServers": {
+    "mdkb": {
+      "type": "stdio",
+      "command": "/path/to/mdkb",
+      "args": ["serve"],
+      "cwd": "/path/to/your/project",
+      "env": {},
+      "alwaysAllow": ["*"]
+    }
   }
 }
 ```
+
+**Important**: The `cwd` field specifies where the MCP server runs. This must be a directory with `.mdkb/` initialized. Without `cwd`, the server runs from wherever Claude Code starts it.
+
+For project-scoped setups (Option 1 with `--scope local`), the server runs from your current project directory. For user-scoped setups (`--scope user`), ensure `.mdkb/` exists in your home directory or launch Claude Code from a directory with `.mdkb/` initialized.
 
 ### Available Tools
 
 | Tool | Description |
 |------|-------------|
-| `mdkb_search` | Hybrid search (keyword + semantic) |
-| `mdkb_get` | Retrieve document by ID (supports line ranges) |
-| `mdkb_multi_get` | Batch retrieve by glob pattern |
-| `mdkb_list_collections` | List available collections |
-| `mdkb_status` | Check index health |
-| `mdkb_update` | Trigger reindex |
-| `mdkb_metrics` | View token usage statistics |
-| `mdkb_memory_index` | Get warmup index for session start |
-| `mdkb_memory_get` | Retrieve full memory entry |
-| `mdkb_memory_write` | Create or update memory entry |
-| `mdkb_memory_search` | Search memory entries |
+| `search` | Hybrid search (keyword + semantic) |
+| `get` | Retrieve document by ID (supports line ranges) |
+| `multi_get` | Batch retrieve by glob pattern |
+| `list_collections` | List available collections |
+| `status` | Check index health |
+| `update` | Trigger reindex |
+| `get_metrics` | View token usage and search quality statistics |
+| `memory_index` | Get warmup index for session start |
+| `memory_get` | Retrieve full memory entry |
+| `memory_write` | Create or update memory entry |
+| `memory_search` | Search memory entries |
+| `evolution` | Trace document evolution history |
 
 ### File Watching
 

@@ -13,7 +13,28 @@
 # To build for maximum compatibility (slower but works everywhere):
 # RUSTFLAGS="-C target-cpu=x86-64" cargo build --release
 
-[build]
-# Target Ivy Bridge CPU (3rd gen Intel) - has AVX but not AVX2
-# This ensures the compiled binary works on older CPUs
+# x86-64: Target Ivy Bridge for compatibility with old CPUs (no AVX2)
+[target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=ivybridge"]
+
+[target.x86_64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=ivybridge"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=ivybridge"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-cpu=ivybridge"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "target-cpu=ivybridge"]
+
+# ARM64: Use native features (required for ring crate on Apple Silicon)
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=native"]
