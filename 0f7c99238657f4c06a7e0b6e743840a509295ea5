@@ -1,0 +1,52 @@
+src/cli/setup.rs
+  3182f7d22e46f994 1-253
+.cargo/config.toml
+  6d657ec9c69f8a91 16-17,19-40
+src/error.rs
+  3182f7d22e46f994 137,156-163,210,283
+src/cli/mod.rs
+  3182f7d22e46f994 5,144-147,475-497
+src/main.rs
+  3182f7d22e46f994 27,333-355
+README.md
+  3182f7d22e46f994 129-132,142,144-158,162,164-165,167-170,175-177,183-194
+.gitignore
+  3182f7d22e46f994 7-8
+src/cli/handlers.rs
+  3182f7d22e46f994 2489
+src/mcp/server.rs
+  6d657ec9c69f8a91 12,253-254,296-297,325-326
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.0.40",
+  "base_commit_sha": "0f7c99238657f4c06a7e0b6e743840a509295ea5",
+  "prompts": {
+    "3182f7d22e46f994": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "55903d5e-b6eb-4e91-b994-b826bce7f2be",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 379,
+      "total_deletions": 39,
+      "accepted_lines": 363,
+      "overriden_lines": 0
+    },
+    "6d657ec9c69f8a91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5383bc03-9e0c-47ea-8bca-45f2e47ac1ae",
+        "model": "claude-sonnet-4-5-20250929"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 40,
+      "total_deletions": 9,
+      "accepted_lines": 34,
+      "overriden_lines": 0
+    }
+  }
+}
