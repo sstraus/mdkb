@@ -4,12 +4,36 @@ use crate::domain::{IndexStatus, SearchQuery, SearchResult};
 use crate::error::Result;
 use rusqlite::{Connection, params};
 
+/// Escape a query string for safe use with FTS5 MATCH.
+///
+/// FTS5 has special syntax for operators (AND, OR, NOT, NEAR) and column
+/// prefixes (column:term). To search for literal text, we quote each term.
+/// This prevents issues with:
+/// - Hyphenated words like "anti-CSRF" being parsed as negation
+/// - ALL CAPS words being interpreted as operators or column names
+/// - Special characters in the query
+fn escape_fts5_query(query: &str) -> String {
+    // Split on whitespace and quote each term
+    query
+        .split_whitespace()
+        .map(|term| {
+            // Double any internal quotes and wrap in quotes
+            let escaped = term.replace('"', "\"\"");
+            format!("\"{}\"", escaped)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Perform BM25 full-text search with optional evolution filtering.
 ///
 /// By default, only returns documents with status 'current' (or NULL for legacy docs).
 /// With `include_superseded`, returns all documents with status markers.
 pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult>> {
     let mut search_results = Vec::new();
+
+    // Escape the query for safe FTS5 usage
+    let fts_query = escape_fts5_query(&query.text);
 
     // Build status filter clause
     let status_filter = if query.include_superseded {
@@ -46,7 +70,7 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(
-            params![&query.text, collection, query.limit as i64],
+            params![&fts_query, collection, query.limit as i64],
             |row| {
                 let snippet: Option<String> = row.get(5)?;
                 let status: Option<String> = row.get(6)?;
@@ -83,7 +107,7 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![&query.text, query.limit as i64], |row| {
+        let rows = stmt.query_map(params![&fts_query, query.limit as i64], |row| {
             let snippet: Option<String> = row.get(5)?;
             let status: Option<String> = row.get(6)?;
             Ok(SearchResult {
@@ -179,6 +203,38 @@ mod tests {
     use crate::store::documents::index_document;
     use crate::store::schema::init_schema;
     use chrono::Utc;
+
+    // ==================== FTS5 Escape Tests ====================
+
+    #[test]
+    fn test_escape_fts5_simple() {
+        assert_eq!(escape_fts5_query("hello world"), "\"hello\" \"world\"");
+    }
+
+    #[test]
+    fn test_escape_fts5_hyphenated() {
+        // Hyphens should be preserved inside quotes
+        assert_eq!(escape_fts5_query("anti-CSRF"), "\"anti-CSRF\"");
+    }
+
+    #[test]
+    fn test_escape_fts5_with_quotes() {
+        // Internal quotes should be doubled
+        assert_eq!(escape_fts5_query("say \"hello\""), "\"say\" \"\"\"hello\"\"\"");
+    }
+
+    #[test]
+    fn test_escape_fts5_operators() {
+        // FTS5 operators should be quoted
+        assert_eq!(escape_fts5_query("cats AND dogs"), "\"cats\" \"AND\" \"dogs\"");
+        assert_eq!(escape_fts5_query("NOT found"), "\"NOT\" \"found\"");
+    }
+
+    #[test]
+    fn test_escape_fts5_column_prefix() {
+        // Column:term syntax should be escaped
+        assert_eq!(escape_fts5_query("CSRF:token"), "\"CSRF:token\"");
+    }
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
