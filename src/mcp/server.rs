@@ -100,25 +100,6 @@ impl McpServer {
         &self.metrics
     }
 
-    /// Apply token limit to output, truncating if necessary.
-    fn apply_token_limit(&self, output: String) -> String {
-        let max = self.config.max_response_tokens;
-        if max == 0 {
-            return output;
-        }
-
-        let tokens = count_tokens(&output);
-        if tokens <= max {
-            return output;
-        }
-
-        if self.config.truncate_with_ellipsis {
-            truncate_with_ellipsis(&output, max)
-        } else {
-            crate::metrics::tokens::truncate_to_tokens(&output, max).0
-        }
-    }
-
     /// Initialize the database connection and stats session.
     async fn ensure_context(&self) -> Result<(), McpError> {
         let mut ctx_guard = self.ctx.lock().await;
@@ -172,23 +153,27 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let (output, tokens, result_count) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        let results = handle_hybrid_search(
-            ctx,
-            &params.query,
-            params.limit,
-            params.collection.as_deref(),
-            params.include_superseded,
-        )
-        .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
+            let results = handle_hybrid_search(
+                ctx,
+                &params.query,
+                params.limit,
+                params.collection.as_deref(),
+                params.include_superseded,
+            )
+            .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-        let output = format_search_results(&results);
-        let tokens = count_tokens(&output);
-        let result_count = results.len();
+            let output = format_search_results(&results);
+            let tokens = count_tokens(&output);
+            let result_count = results.len();
+            (output, tokens, result_count)
+        }; // ctx_guard dropped here before record_persistent_call
+
         self.metrics.record_search(tokens, result_count);
         self.record_persistent_call("search", tokens, result_count, false).await;
         tracing::debug!("mdkb_search: {} tokens, {} results", tokens, result_count);
@@ -204,42 +189,46 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-        // Try to parse as ID
-        let doc = if let Ok(id) = params.id.parse::<i64>() {
-            documents::get_document(&ctx.conn, id)
-                .map_err(|e| mcp_error(format!("Failed to get document: {}", e)))?
-        } else {
-            None
-        };
-
-        let doc = doc.ok_or_else(|| mcp_error(format!("Document not found: {}", params.id)))?;
-
-        let content = documents::get_content(&ctx.conn, &doc.hash)
-            .map_err(|e| mcp_error(format!("Failed to get content: {}", e)))?
-            .ok_or_else(|| mcp_error("Content not found"))?;
-
-        // Apply line range if specified
-        let output = if let Some(range) = &params.lines {
-            apply_line_range(&content, range)?
-        } else {
-            content
-        };
-
-        // Apply token limit with continuation guidance
         let max_tokens = self.config.max_response_tokens;
-        let (output, truncated) = if max_tokens > 0 {
-            let result = truncate_with_continuation(&output, max_tokens, doc.id);
-            (result.content, result.truncated)
-        } else {
-            (output, false)
-        };
+        let (output, tokens, truncated) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        let tokens = count_tokens(&output);
+            // Try to parse as ID
+            let doc = if let Ok(id) = params.id.parse::<i64>() {
+                documents::get_document(&ctx.conn, id)
+                    .map_err(|e| mcp_error(format!("Failed to get document: {}", e)))?
+            } else {
+                None
+            };
+
+            let doc = doc.ok_or_else(|| mcp_error(format!("Document not found: {}", params.id)))?;
+
+            let content = documents::get_content(&ctx.conn, &doc.hash)
+                .map_err(|e| mcp_error(format!("Failed to get content: {}", e)))?
+                .ok_or_else(|| mcp_error("Content not found"))?;
+
+            // Apply line range if specified
+            let output = if let Some(range) = &params.lines {
+                apply_line_range(&content, range)?
+            } else {
+                content
+            };
+
+            // Apply token limit with continuation guidance
+            let (output, truncated) = if max_tokens > 0 {
+                let result = truncate_with_continuation(&output, max_tokens, doc.id);
+                (result.content, result.truncated)
+            } else {
+                (output, false)
+            };
+
+            let tokens = count_tokens(&output);
+            (output, tokens, truncated)
+        }; // ctx_guard dropped here
+
         self.metrics.record_get(tokens);
         self.record_persistent_call("get", tokens, 1, truncated).await;
         tracing::debug!("mdkb_get: {} tokens, truncated={}", tokens, truncated);
@@ -255,37 +244,42 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let (output, tokens, coll_count) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        let coll_list = collections::list_collections(&ctx.conn)
-            .map_err(|e| mcp_error(format!("Failed to list collections: {}", e)))?;
+            let coll_list = collections::list_collections(&ctx.conn)
+                .map_err(|e| mcp_error(format!("Failed to list collections: {}", e)))?;
 
-        if coll_list.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No collections found. Use 'mdkb collection add <name> <path>' to add one.",
-            )]));
-        }
+            if coll_list.is_empty() {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "No collections found. Use 'mdkb collection add <name> <path>' to add one.",
+                )]));
+            }
 
-        let mut output = String::from("Collections:\n");
-        for coll in &coll_list {
-            // Get document count for this collection
-            let doc_count = collections::get_collection_document_count(&ctx.conn, &coll.name)
-                .unwrap_or(0);
-            output.push_str(&format!(
-                "- {} ({}): {} documents\n  Pattern: {}\n",
-                coll.name,
-                coll.path,
-                doc_count,
-                coll.pattern
-            ));
-        }
+            let mut output = String::from("Collections:\n");
+            for coll in &coll_list {
+                // Get document count for this collection
+                let doc_count = collections::get_collection_document_count(&ctx.conn, &coll.name)
+                    .unwrap_or(0);
+                output.push_str(&format!(
+                    "- {} ({}): {} documents\n  Pattern: {}\n",
+                    coll.name,
+                    coll.path,
+                    doc_count,
+                    coll.pattern
+                ));
+            }
 
-        let tokens = count_tokens(&output);
-        self.record_persistent_call("list_collections", tokens, coll_list.len(), false).await;
-        tracing::debug!("mdkb_list_collections: {} tokens, {} collections", tokens, coll_list.len());
+            let tokens = count_tokens(&output);
+            let coll_count = coll_list.len();
+            (output, tokens, coll_count)
+        }; // ctx_guard dropped here
+
+        self.record_persistent_call("list_collections", tokens, coll_count, false).await;
+        tracing::debug!("mdkb_list_collections: {} tokens, {} collections", tokens, coll_count);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -298,20 +292,24 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        let status = search::get_status(&ctx.conn)
-            .map_err(|e| mcp_error(format!("Failed to get status: {}", e)))?;
+            let status = search::get_status(&ctx.conn)
+                .map_err(|e| mcp_error(format!("Failed to get status: {}", e)))?;
 
-        let output = format!(
-            "Collections: {}\nDocuments: {}\nStale: {}\nDB Size: {} bytes",
-            status.collections, status.documents, status.stale_documents, status.db_size_bytes
-        );
+            let output = format!(
+                "Collections: {}\nDocuments: {}\nStale: {}\nDB Size: {} bytes",
+                status.collections, status.documents, status.stale_documents, status.db_size_bytes
+            );
 
-        let tokens = count_tokens(&output);
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        }; // ctx_guard dropped here
+
         self.metrics.record_status(tokens);
         self.record_persistent_call("status", tokens, 1, false).await;
         tracing::debug!("mdkb_status: {} tokens", tokens);
@@ -327,20 +325,24 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let mut ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_mut()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let (output, tokens) = {
+            let mut ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_mut()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        let result = handle_update(ctx, &self.root)
-            .map_err(|e| mcp_error(format!("Update failed: {}", e)))?;
+            let result = handle_update(ctx, &self.root)
+                .map_err(|e| mcp_error(format!("Update failed: {}", e)))?;
 
-        let output = format!(
-            "Added: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
-            result.added, result.updated, result.removed, result.unchanged
-        );
+            let output = format!(
+                "Added: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
+                result.added, result.updated, result.removed, result.unchanged
+            );
 
-        let tokens = count_tokens(&output);
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        }; // ctx_guard dropped here
+
         self.metrics.record_update(tokens);
         self.record_persistent_call("update", tokens, 1, false).await;
         tracing::debug!("mdkb_update: {} tokens", tokens);
@@ -356,54 +358,66 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-        let results = handle_mget(ctx, &params.pattern, params.collection.as_deref())
-            .map_err(|e| mcp_error(format!("Multi-get failed: {}", e)))?;
-
-        if results.is_empty() {
-            return Ok(CallToolResult::success(vec![Content::text(
-                "No documents found.",
-            )]));
-        }
-
-        let mut output = format!("Found {} documents:\n\n", results.len());
         let doc_limit = self.config.max_document_tokens;
+        let truncate_ellipsis = self.config.truncate_with_ellipsis;
+        let max_response_tokens = self.config.max_response_tokens;
 
-        for (doc, content) in &results {
-            let title = doc.title.as_deref().unwrap_or("(untitled)");
+        let (output, result_count) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            // Apply per-document token limit if configured
-            let truncated_content = if doc_limit > 0 {
-                let content_tokens = count_tokens(content);
-                if content_tokens > doc_limit {
-                    if self.config.truncate_with_ellipsis {
-                        truncate_with_ellipsis(content, doc_limit)
+            let results = handle_mget(ctx, &params.pattern, params.collection.as_deref())
+                .map_err(|e| mcp_error(format!("Multi-get failed: {}", e)))?;
+
+            if results.is_empty() {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "No documents found.",
+                )]));
+            }
+
+            let mut output = format!("Found {} documents:\n\n", results.len());
+
+            for (doc, content) in &results {
+                let title = doc.title.as_deref().unwrap_or("(untitled)");
+
+                // Apply per-document token limit if configured
+                let truncated_content = if doc_limit > 0 {
+                    let content_tokens = count_tokens(content);
+                    if content_tokens > doc_limit {
+                        if truncate_ellipsis {
+                            truncate_with_ellipsis(content, doc_limit)
+                        } else {
+                            crate::metrics::tokens::truncate_to_tokens(content, doc_limit).0
+                        }
                     } else {
-                        crate::metrics::tokens::truncate_to_tokens(content, doc_limit).0
+                        content.clone()
                     }
                 } else {
                     content.clone()
-                }
-            } else {
-                content.clone()
-            };
+                };
 
-            output.push_str(&format!(
-                "=== [{}] {} - {} ===\n{}\n\n",
-                doc.id, doc.relative_path, title, truncated_content
-            ));
-        }
+                output.push_str(&format!(
+                    "=== [{}] {} - {} ===\n{}\n\n",
+                    doc.id, doc.relative_path, title, truncated_content
+                ));
+            }
 
-        // Apply overall response limit
+            let result_count = results.len();
+            (output, result_count)
+        }; // ctx_guard dropped here
+
+        // Apply overall response limit (no lock needed for this)
         let original_len = output.len();
-        let output = self.apply_token_limit(output);
+        let output = if max_response_tokens > 0 {
+            crate::metrics::tokens::truncate_to_tokens(&output, max_response_tokens).0
+        } else {
+            output
+        };
         let truncated = output.len() < original_len;
         let tokens = count_tokens(&output);
-        let result_count = results.len();
+
         self.metrics.record_multi_get(tokens, result_count);
         self.record_persistent_call("multi_get", tokens, result_count, truncated).await;
         tracing::debug!("mdkb_multi_get: {} tokens, {} docs, truncated={}", tokens, result_count, truncated);
@@ -419,139 +433,144 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let mut output = String::new();
-        let mut warnings: Vec<String> = Vec::new();
-
-        // Current session token usage
+        // Current session token usage (doesn't need the ctx lock)
         let summary = self.metrics.summary();
-        output.push_str(&format!(
-            "=== Token Usage (Current Session) ===\n\
-             Total calls: {}\n\
-             Total tokens: {}\n\
-             Avg tokens/call: {:.1}\n",
-            summary.total_calls,
-            summary.total_tokens,
-            summary.avg_tokens_per_call,
-        ));
 
-        // Query metrics from database
-        let ctx_guard = self.ctx.lock().await;
-        if let Some(ctx) = ctx_guard.as_ref() {
-            // Get query metrics for the period
-            if let Ok(query_metrics) = stats::get_query_metrics(&ctx.conn, params.period_days) {
-                output.push_str(&format!(
-                    "\n=== Query Metrics (last {} days) ===\n\
-                     Total queries: {}\n\
-                     Zero-result rate: {:.1}%{}\n\
-                     Re-search rate: {:.1}%{}\n",
-                    params.period_days,
-                    query_metrics.total_queries,
-                    query_metrics.zero_result_rate,
-                    if query_metrics.zero_result_rate > 10.0 { " ⚠️" } else { " ✓" },
-                    query_metrics.re_search_rate,
-                    if query_metrics.re_search_rate > 15.0 { " ⚠️" } else { " ✓" },
-                ));
+        let output = {
+            let ctx_guard = self.ctx.lock().await;
 
-                // Check for warnings
-                if query_metrics.zero_result_rate > 10.0 {
-                    warnings.push(format!(
-                        "Zero-result rate {:.1}% > 10% threshold - queries not finding results",
-                        query_metrics.zero_result_rate
-                    ));
-                }
-                if query_metrics.re_search_rate > 15.0 {
-                    warnings.push(format!(
-                        "Re-search rate {:.1}% > 15% threshold - initial results may be poor",
-                        query_metrics.re_search_rate
-                    ));
-                }
+            let mut output = String::new();
+            let mut warnings: Vec<String> = Vec::new();
 
-                // Latency section
-                if params.include_latency {
+            output.push_str(&format!(
+                "=== Token Usage (Current Session) ===\n\
+                 Total calls: {}\n\
+                 Total tokens: {}\n\
+                 Avg tokens/call: {:.1}\n",
+                summary.total_calls,
+                summary.total_tokens,
+                summary.avg_tokens_per_call,
+            ));
+
+            if let Some(ctx) = ctx_guard.as_ref() {
+                // Get query metrics for the period
+                if let Ok(query_metrics) = stats::get_query_metrics(&ctx.conn, params.period_days) {
                     output.push_str(&format!(
-                        "\nLatency:\n\
-                         - p50: {}ms{}\n\
-                         - p95: {}ms{}\n\
-                         - p99: {}ms{}\n",
-                        query_metrics.latency_p50,
-                        if query_metrics.latency_p50 > 100 { " ⚠️" } else { " ✓" },
-                        query_metrics.latency_p95,
-                        if query_metrics.latency_p95 > 300 { " ⚠️" } else { " ✓" },
-                        query_metrics.latency_p99,
-                        if query_metrics.latency_p99 > 500 { " ⚠️" } else { " ✓" },
+                        "\n=== Query Metrics (last {} days) ===\n\
+                         Total queries: {}\n\
+                         Zero-result rate: {:.1}%{}\n\
+                         Re-search rate: {:.1}%{}\n",
+                        params.period_days,
+                        query_metrics.total_queries,
+                        query_metrics.zero_result_rate,
+                        if query_metrics.zero_result_rate > 10.0 { " ⚠️" } else { " ✓" },
+                        query_metrics.re_search_rate,
+                        if query_metrics.re_search_rate > 15.0 { " ⚠️" } else { " ✓" },
                     ));
 
-                    if query_metrics.latency_p99 > 500 {
+                    // Check for warnings
+                    if query_metrics.zero_result_rate > 10.0 {
                         warnings.push(format!(
-                            "p99 latency {}ms > 500ms threshold - performance issue",
-                            query_metrics.latency_p99
+                            "Zero-result rate {:.1}% > 10% threshold - queries not finding results",
+                            query_metrics.zero_result_rate
                         ));
                     }
-                }
-
-                // Quality section
-                if params.include_quality {
-                    output.push_str(&format!(
-                        "\nScore Distribution:\n\
-                         - Excellent (>0.8): {:.1}%\n\
-                         - Good (0.5-0.8): {:.1}%\n\
-                         - Poor (<0.5): {:.1}%\n",
-                        query_metrics.score_above_80,
-                        query_metrics.score_50_to_80,
-                        query_metrics.score_below_50,
-                    ));
-
-                    if query_metrics.score_below_50 > 20.0 {
+                    if query_metrics.re_search_rate > 15.0 {
                         warnings.push(format!(
-                            "Poor-score rate {:.1}% > 20% threshold - content quality or relevance issue",
-                            query_metrics.score_below_50
+                            "Re-search rate {:.1}% > 15% threshold - initial results may be poor",
+                            query_metrics.re_search_rate
                         ));
                     }
-                }
-            }
 
-            // Add latency by search type if requested
-            if params.include_latency {
-                if let Ok(latency_stats) = stats::get_query_latency_stats(&ctx.conn) {
-                    if !latency_stats.is_empty() {
-                        output.push_str("\nLatency by Search Type:");
-                        for stat in &latency_stats {
-                            output.push_str(&format!(
-                                "\n- {}: {:.1}ms avg, {}ms max ({} queries)",
-                                stat.search_type,
-                                stat.avg_latency_ms,
-                                stat.max_latency_ms,
-                                stat.count
+                    // Latency section
+                    if params.include_latency {
+                        output.push_str(&format!(
+                            "\nLatency:\n\
+                             - p50: {}ms{}\n\
+                             - p95: {}ms{}\n\
+                             - p99: {}ms{}\n",
+                            query_metrics.latency_p50,
+                            if query_metrics.latency_p50 > 100 { " ⚠️" } else { " ✓" },
+                            query_metrics.latency_p95,
+                            if query_metrics.latency_p95 > 300 { " ⚠️" } else { " ✓" },
+                            query_metrics.latency_p99,
+                            if query_metrics.latency_p99 > 500 { " ⚠️" } else { " ✓" },
+                        ));
+
+                        if query_metrics.latency_p99 > 500 {
+                            warnings.push(format!(
+                                "p99 latency {}ms > 500ms threshold - performance issue",
+                                query_metrics.latency_p99
                             ));
                         }
-                        output.push('\n');
                     }
+
+                    // Quality section
+                    if params.include_quality {
+                        output.push_str(&format!(
+                            "\nScore Distribution:\n\
+                             - Excellent (>0.8): {:.1}%\n\
+                             - Good (0.5-0.8): {:.1}%\n\
+                             - Poor (<0.5): {:.1}%\n",
+                            query_metrics.score_above_80,
+                            query_metrics.score_50_to_80,
+                            query_metrics.score_below_50,
+                        ));
+
+                        if query_metrics.score_below_50 > 20.0 {
+                            warnings.push(format!(
+                                "Poor-score rate {:.1}% > 20% threshold - content quality or relevance issue",
+                                query_metrics.score_below_50
+                            ));
+                        }
+                    }
+                }
+
+                // Add latency by search type if requested
+                if params.include_latency {
+                    if let Ok(latency_stats) = stats::get_query_latency_stats(&ctx.conn) {
+                        if !latency_stats.is_empty() {
+                            output.push_str("\nLatency by Search Type:");
+                            for stat in &latency_stats {
+                                output.push_str(&format!(
+                                    "\n- {}: {:.1}ms avg, {}ms max ({} queries)",
+                                    stat.search_type,
+                                    stat.avg_latency_ms,
+                                    stat.max_latency_ms,
+                                    stat.count
+                                ));
+                            }
+                            output.push('\n');
+                        }
+                    }
+                }
+
+                // All-time token stats
+                if let Ok(aggregate) = stats::get_aggregate_stats(&ctx.conn) {
+                    output.push_str(&format!(
+                        "\n=== All-Time Token Stats ===\n\
+                         Total sessions: {}\n\
+                         Total calls: {}\n\
+                         Total tokens: {}\n",
+                        aggregate.total_sessions,
+                        aggregate.total_calls,
+                        aggregate.total_tokens,
+                    ));
                 }
             }
 
-            // All-time token stats
-            if let Ok(aggregate) = stats::get_aggregate_stats(&ctx.conn) {
-                output.push_str(&format!(
-                    "\n=== All-Time Token Stats ===\n\
-                     Total sessions: {}\n\
-                     Total calls: {}\n\
-                     Total tokens: {}\n",
-                    aggregate.total_sessions,
-                    aggregate.total_calls,
-                    aggregate.total_tokens,
-                ));
+            // Add warnings section
+            if !warnings.is_empty() {
+                output.push_str("\n⚠️ Warnings:\n");
+                for warning in &warnings {
+                    output.push_str(&format!("  - {}\n", warning));
+                }
+            } else {
+                output.push_str("\n✓ All metrics within acceptable ranges\n");
             }
-        }
 
-        // Add warnings section
-        if !warnings.is_empty() {
-            output.push_str("\n⚠️ Warnings:\n");
-            for warning in &warnings {
-                output.push_str(&format!("  - {}\n", warning));
-            }
-        } else {
-            output.push_str("\n✓ All metrics within acceptable ranges\n");
-        }
+            output
+        }; // ctx_guard dropped here
 
         let tokens = count_tokens(&output);
         self.record_persistent_call("metrics", tokens, 1, false).await;
@@ -567,23 +586,28 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let (output, tokens, entry_count) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        let index = memory::get_warmup_index(&ctx.conn, params.limit)
-            .map_err(|e| mcp_error(format!("Failed to get memory index: {}", e)))?;
+            let index = memory::get_warmup_index(&ctx.conn, params.limit)
+                .map_err(|e| mcp_error(format!("Failed to get memory index: {}", e)))?;
 
-        let output = if index.is_empty() {
-            "No memory entries found.".to_string()
-        } else {
-            format!("Memory index ({} entries):\n{}", index.len(), index.join("\n"))
-        };
+            let output = if index.is_empty() {
+                "No memory entries found.".to_string()
+            } else {
+                format!("Memory index ({} entries):\n{}", index.len(), index.join("\n"))
+            };
 
-        let tokens = count_tokens(&output);
-        self.record_persistent_call("memory_index", tokens, index.len(), false).await;
-        tracing::debug!("mdkb_memory_index: {} tokens, {} entries", tokens, index.len());
+            let tokens = count_tokens(&output);
+            let entry_count = index.len();
+            (output, tokens, entry_count)
+        }; // ctx_guard dropped here
+
+        self.record_persistent_call("memory_index", tokens, entry_count, false).await;
+        tracing::debug!("mdkb_memory_index: {} tokens, {} entries", tokens, entry_count);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -596,31 +620,35 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        let entry = memory::get_entry(&ctx.conn, &params.id)
-            .map_err(|e| mcp_error(format!("Failed to get memory entry: {}", e)))?
-            .ok_or_else(|| mcp_error(format!("Memory entry not found: {}", params.id)))?;
+            let entry = memory::get_entry(&ctx.conn, &params.id)
+                .map_err(|e| mcp_error(format!("Failed to get memory entry: {}", e)))?
+                .ok_or_else(|| mcp_error(format!("Memory entry not found: {}", params.id)))?;
 
-        let output = format!(
-            "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times\n\n{}",
-            entry.title,
-            entry.id,
-            entry.entry_type,
-            entry.status,
-            if entry.tags.is_empty() {
-                "none".to_string()
-            } else {
-                entry.tags.join(", ")
-            },
-            entry.access_count,
-            entry.content
-        );
+            let output = format!(
+                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times\n\n{}",
+                entry.title,
+                entry.id,
+                entry.entry_type,
+                entry.status,
+                if entry.tags.is_empty() {
+                    "none".to_string()
+                } else {
+                    entry.tags.join(", ")
+                },
+                entry.access_count,
+                entry.content
+            );
 
-        let tokens = count_tokens(&output);
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        }; // ctx_guard dropped here
+
         self.record_persistent_call("memory_get", tokens, 1, false).await;
         tracing::debug!("mdkb_memory_get: {} tokens", tokens);
 
@@ -635,54 +663,58 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        // Check if entry exists
-        let existing = memory::get_entry(&ctx.conn, &params.id)
-            .map_err(|e| mcp_error(format!("Failed to check existing entry: {}", e)))?;
+            // Check if entry exists
+            let existing = memory::get_entry(&ctx.conn, &params.id)
+                .map_err(|e| mcp_error(format!("Failed to check existing entry: {}", e)))?;
 
-        // Parse entry type
-        let entry_type: memory::EntryType = params
-            .entry_type
-            .parse()
-            .map_err(|e: String| mcp_error(e))?;
+            // Parse entry type
+            let entry_type: memory::EntryType = params
+                .entry_type
+                .parse()
+                .map_err(|e: String| mcp_error(e))?;
 
-        let now = chrono::Utc::now().timestamp();
+            let now = chrono::Utc::now().timestamp();
 
-        let output = if let Some(mut existing_entry) = existing {
-            // Update existing entry
-            existing_entry.title = params.title.clone();
-            existing_entry.content = params.content.clone();
-            existing_entry.entry_type = entry_type;
-            existing_entry.tags = params.tags.clone();
-            memory::update_entry(&ctx.conn, &existing_entry)
-                .map_err(|e| mcp_error(format!("Failed to update memory entry: {}", e)))?;
-            format!("Updated memory entry: {}", params.id)
-        } else {
-            // Create new entry
-            let entry = memory::MemoryEntry {
-                id: params.id.clone(),
-                title: params.title.clone(),
-                content: params.content.clone(),
-                entry_type,
-                tags: params.tags.clone(),
-                status: memory::EntryStatus::Active,
-                created_at: now,
-                updated_at: now,
-                superseded_by: None,
-                access_count: 0,
-                last_accessed: None,
-                source_path: None,
+            let output = if let Some(mut existing_entry) = existing {
+                // Update existing entry
+                existing_entry.title = params.title.clone();
+                existing_entry.content = params.content.clone();
+                existing_entry.entry_type = entry_type;
+                existing_entry.tags = params.tags.clone();
+                memory::update_entry(&ctx.conn, &existing_entry)
+                    .map_err(|e| mcp_error(format!("Failed to update memory entry: {}", e)))?;
+                format!("Updated memory entry: {}", params.id)
+            } else {
+                // Create new entry
+                let entry = memory::MemoryEntry {
+                    id: params.id.clone(),
+                    title: params.title.clone(),
+                    content: params.content.clone(),
+                    entry_type,
+                    tags: params.tags.clone(),
+                    status: memory::EntryStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                    superseded_by: None,
+                    access_count: 0,
+                    last_accessed: None,
+                    source_path: None,
+                };
+                memory::add_entry(&ctx.conn, &entry)
+                    .map_err(|e| mcp_error(format!("Failed to create memory entry: {}", e)))?;
+                format!("Created memory entry: {}", params.id)
             };
-            memory::add_entry(&ctx.conn, &entry)
-                .map_err(|e| mcp_error(format!("Failed to create memory entry: {}", e)))?;
-            format!("Created memory entry: {}", params.id)
-        };
 
-        let tokens = count_tokens(&output);
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        }; // ctx_guard dropped here
+
         self.record_persistent_call("memory_write", tokens, 1, false).await;
         tracing::debug!("mdkb_memory_write: {}", output);
 
@@ -697,32 +729,36 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let (output, tokens, result_count) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        let entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
-            .map_err(|e| mcp_error(format!("Failed to search memory: {}", e)))?;
+            let entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
+                .map_err(|e| mcp_error(format!("Failed to search memory: {}", e)))?;
 
-        let output = if entries.is_empty() {
-            "No matching memory entries found.".to_string()
-        } else {
-            let mut out = format!("Found {} memory entries:\n\n", entries.len());
-            for entry in &entries {
-                out.push_str(&format!(
-                    "- [{}] {} ({}): {}\n",
-                    entry.id,
-                    entry.title,
-                    entry.entry_type,
-                    truncate_text(&entry.content, 100)
-                ));
-            }
-            out
-        };
+            let output = if entries.is_empty() {
+                "No matching memory entries found.".to_string()
+            } else {
+                let mut out = format!("Found {} memory entries:\n\n", entries.len());
+                for entry in &entries {
+                    out.push_str(&format!(
+                        "- [{}] {} ({}): {}\n",
+                        entry.id,
+                        entry.title,
+                        entry.entry_type,
+                        truncate_text(&entry.content, 100)
+                    ));
+                }
+                out
+            };
 
-        let tokens = count_tokens(&output);
-        let result_count = entries.len();
+            let tokens = count_tokens(&output);
+            let result_count = entries.len();
+            (output, tokens, result_count)
+        }; // ctx_guard dropped here
+
         self.record_persistent_call("memory_search", tokens, result_count, false).await;
         tracing::debug!("mdkb_memory_search: {} tokens, {} results", tokens, result_count);
 
@@ -737,96 +773,100 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let ctx_guard = self.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-        // Resolve document path to ID
-        let doc = resolve_document(&ctx.conn, &params.path)
-            .map_err(|e| mcp_error(format!("Document not found: {}", e)))?;
+            // Resolve document path to ID
+            let doc = resolve_document(&ctx.conn, &params.path)
+                .map_err(|e| mcp_error(format!("Document not found: {}", e)))?;
 
-        let mut output = format!("Evolution for {}:\n\n", params.path);
+            let mut output = format!("Evolution for {}:\n\n", params.path);
 
-        // Get ancestors (what this document supersedes/updates)
-        let show_ancestors = matches!(
-            params.direction,
-            EvolutionDirection::Ancestors | EvolutionDirection::Both
-        );
+            // Get ancestors (what this document supersedes/updates)
+            let show_ancestors = matches!(
+                params.direction,
+                EvolutionDirection::Ancestors | EvolutionDirection::Both
+            );
 
-        // Get descendants (what supersedes/updates this document)
-        let show_descendants = matches!(
-            params.direction,
-            EvolutionDirection::Descendants | EvolutionDirection::Both
-        );
+            // Get descendants (what supersedes/updates this document)
+            let show_descendants = matches!(
+                params.direction,
+                EvolutionDirection::Descendants | EvolutionDirection::Both
+            );
 
-        if show_ancestors {
-            output.push_str("Ancestors (what this supersedes):\n");
-            let ancestors = evolution::get_evolution_chain(&ctx.conn, doc.id)
-                .map_err(|e| mcp_error(format!("Failed to get ancestors: {}", e)))?;
+            if show_ancestors {
+                output.push_str("Ancestors (what this supersedes):\n");
+                let ancestors = evolution::get_evolution_chain(&ctx.conn, doc.id)
+                    .map_err(|e| mcp_error(format!("Failed to get ancestors: {}", e)))?;
 
-            if ancestors.is_empty() {
-                output.push_str("  (none - this may be an original document)\n");
-            } else {
-                for evo in &ancestors {
-                    // Get target document info
-                    if let Ok(Some(target)) = documents::get_document(&ctx.conn, evo.target_doc_id) {
-                        output.push_str(&format!(
-                            "  └── {} ({}, {})\n",
-                            target.relative_path,
-                            evo.relationship,
-                            format_timestamp(evo.created_at)
-                        ));
-                        if let Some(ref scope) = evo.scope {
-                            output.push_str(&format!("      Scope: {}\n", scope));
-                        }
-                        if let Some(ref reason) = evo.reason {
-                            output.push_str(&format!("      Reason: {}\n", reason));
-                        }
-                    }
-                }
-            }
-            output.push('\n');
-        }
-
-        if show_descendants {
-            output.push_str("Descendants (what supersedes this):\n");
-            let descendants = evolution::get_superseded_by(&ctx.conn, doc.id)
-                .map_err(|e| mcp_error(format!("Failed to get descendants: {}", e)))?;
-
-            if descendants.is_empty() {
-                output.push_str("  (none - this is the current version)\n");
-            } else {
-                for evo in &descendants {
-                    // Get source document info (the one that supersedes this)
-                    if let Ok(Some(source)) = documents::get_document(&ctx.conn, evo.source_doc_id) {
-                        output.push_str(&format!(
-                            "  └── {} ({}, {})\n",
-                            source.relative_path,
-                            evo.relationship,
-                            format_timestamp(evo.created_at)
-                        ));
-                        if let Some(ref scope) = evo.scope {
-                            output.push_str(&format!("      Scope: {}\n", scope));
-                        }
-                        if let Some(ref reason) = evo.reason {
-                            output.push_str(&format!("      Reason: {}\n", reason));
+                if ancestors.is_empty() {
+                    output.push_str("  (none - this may be an original document)\n");
+                } else {
+                    for evo in &ancestors {
+                        // Get target document info
+                        if let Ok(Some(target)) = documents::get_document(&ctx.conn, evo.target_doc_id) {
+                            output.push_str(&format!(
+                                "  └── {} ({}, {})\n",
+                                target.relative_path,
+                                evo.relationship,
+                                format_timestamp(evo.created_at)
+                            ));
+                            if let Some(ref scope) = evo.scope {
+                                output.push_str(&format!("      Scope: {}\n", scope));
+                            }
+                            if let Some(ref reason) = evo.reason {
+                                output.push_str(&format!("      Reason: {}\n", reason));
+                            }
                         }
                     }
                 }
+                output.push('\n');
             }
-            output.push('\n');
-        }
 
-        // Get document status
-        if let Ok(Some((status, reason))) = evolution::get_document_status(&ctx.conn, doc.id) {
-            output.push_str(&format!("Status: {:?}\n", status));
-            if let Some(r) = reason {
-                output.push_str(&format!("Status reason: {}\n", r));
+            if show_descendants {
+                output.push_str("Descendants (what supersedes this):\n");
+                let descendants = evolution::get_superseded_by(&ctx.conn, doc.id)
+                    .map_err(|e| mcp_error(format!("Failed to get descendants: {}", e)))?;
+
+                if descendants.is_empty() {
+                    output.push_str("  (none - this is the current version)\n");
+                } else {
+                    for evo in &descendants {
+                        // Get source document info (the one that supersedes this)
+                        if let Ok(Some(source)) = documents::get_document(&ctx.conn, evo.source_doc_id) {
+                            output.push_str(&format!(
+                                "  └── {} ({}, {})\n",
+                                source.relative_path,
+                                evo.relationship,
+                                format_timestamp(evo.created_at)
+                            ));
+                            if let Some(ref scope) = evo.scope {
+                                output.push_str(&format!("      Scope: {}\n", scope));
+                            }
+                            if let Some(ref reason) = evo.reason {
+                                output.push_str(&format!("      Reason: {}\n", reason));
+                            }
+                        }
+                    }
+                }
+                output.push('\n');
             }
-        }
 
-        let tokens = count_tokens(&output);
+            // Get document status
+            if let Ok(Some((status, reason))) = evolution::get_document_status(&ctx.conn, doc.id) {
+                output.push_str(&format!("Status: {:?}\n", status));
+                if let Some(r) = reason {
+                    output.push_str(&format!("Status reason: {}\n", r));
+                }
+            }
+
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        }; // ctx_guard dropped here
+
         self.record_persistent_call("evolution", tokens, 1, false).await;
         tracing::debug!("mdkb_evolution: {} tokens", tokens);
 
