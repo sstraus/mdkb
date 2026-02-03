@@ -1267,4 +1267,101 @@ mod tests {
         // Should be under 2K tokens for 50 entries
         assert!(tokens < 2000, "Warmup exceeds token budget: {} tokens", tokens);
     }
+
+    /// Regression test for deadlock in MCP tool handlers.
+    ///
+    /// The MCP server was previously deadlocking because tool handlers held
+    /// the ctx Mutex lock while calling record_persistent_call(), which also
+    /// tried to acquire the same lock. tokio::Mutex is not reentrant, so this
+    /// caused a deadlock.
+    ///
+    /// This test verifies that calling tools multiple times in succession
+    /// completes within a reasonable timeout (doesn't deadlock).
+    #[tokio::test]
+    async fn test_mcp_tools_no_deadlock() {
+        use std::time::Duration;
+        use rmcp::model::EmptyObject;
+
+        // Create temp directory and initialize mdkb
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+
+        // Create and initialize MCP server
+        let server = McpServer::new(root);
+
+        // Call status multiple times - this would deadlock before the fix
+        // because status() calls ensure_context() and record_persistent_call(),
+        // both of which acquire the ctx lock.
+        let timeout_duration = Duration::from_secs(5);
+
+        for i in 0..3 {
+            let result = tokio::time::timeout(
+                timeout_duration,
+                server.status(Parameters(EmptyObject {})),
+            )
+            .await;
+
+            match result {
+                Ok(Ok(_)) => {} // Success
+                Ok(Err(e)) => panic!("Tool call {} failed with error: {:?}", i, e),
+                Err(_) => panic!(
+                    "Tool call {} timed out after {:?} - likely deadlock!",
+                    i, timeout_duration
+                ),
+            }
+        }
+    }
+
+    /// Test that multiple different tool calls don't deadlock.
+    #[tokio::test]
+    async fn test_mcp_multiple_tools_no_deadlock() {
+        use std::time::Duration;
+        use rmcp::model::EmptyObject;
+
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+
+        let server = McpServer::new(root);
+        let timeout_duration = Duration::from_secs(5);
+
+        // Call different tools in sequence
+        let tools_to_test = vec![
+            "status",
+            "list_collections",
+            "status",
+        ];
+
+        for (i, tool_name) in tools_to_test.iter().enumerate() {
+            let result = match *tool_name {
+                "status" => {
+                    tokio::time::timeout(
+                        timeout_duration,
+                        server.status(Parameters(EmptyObject {})),
+                    )
+                    .await
+                    .map(|r| r.map(|_| ()))
+                }
+                "list_collections" => {
+                    tokio::time::timeout(
+                        timeout_duration,
+                        server.list_collections(Parameters(EmptyObject {})),
+                    )
+                    .await
+                    .map(|r| r.map(|_| ()))
+                }
+                _ => unreachable!(),
+            };
+
+            match result {
+                Ok(Ok(_)) => {} // Success
+                Ok(Err(e)) => panic!("Tool {} ({}) failed: {:?}", tool_name, i, e),
+                Err(_) => panic!(
+                    "Tool {} ({}) timed out - likely deadlock!",
+                    tool_name, i
+                ),
+            }
+        }
+    }
 }
