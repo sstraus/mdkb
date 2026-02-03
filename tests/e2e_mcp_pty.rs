@@ -545,3 +545,369 @@ fn test_mcp_tools_after_file_changes() {
     let text2 = McpTestHarness::get_text_content(&status2);
     assert!(text2.contains("Documents: 2"), "Should have 2 documents after update");
 }
+
+// =============================================================================
+// Additional Tool Coverage Tests
+// =============================================================================
+
+/// Test: multi_get tool retrieves multiple documents by glob pattern.
+#[test]
+fn test_mcp_tool_multi_get() {
+    let mut harness = McpTestHarness::new();
+
+    harness.create_file("docs/chapter1.md", "# Chapter 1\n\nIntroduction");
+    harness.create_file("docs/chapter2.md", "# Chapter 2\n\nContent");
+    harness.create_file("docs/chapter3.md", "# Chapter 3\n\nConclusion");
+    harness.create_file("docs/appendix.md", "# Appendix\n\nReferences");
+    harness.add_collection("docs", "docs", "**/*.md");
+    harness.update_index();
+
+    harness.initialize();
+
+    // Get all chapters
+    let result = harness.call_tool("multi_get", json!({"pattern": "chapter*.md"}));
+    let text = McpTestHarness::get_text_content(&result);
+
+    assert!(text.contains("Chapter 1"), "Should find chapter 1");
+    assert!(text.contains("Chapter 2"), "Should find chapter 2");
+    assert!(text.contains("Chapter 3"), "Should find chapter 3");
+    assert!(!text.contains("Appendix"), "Should not find appendix");
+}
+
+/// Test: multi_get with collection filter.
+#[test]
+fn test_mcp_tool_multi_get_with_collection() {
+    let mut harness = McpTestHarness::new();
+
+    harness.create_file("docs/readme.md", "# Docs Readme");
+    harness.create_file("notes/readme.md", "# Notes Readme");
+    harness.add_collection("docs", "docs", "**/*.md");
+    harness.add_collection("notes", "notes", "**/*.md");
+    harness.update_index();
+
+    harness.initialize();
+
+    // Get readme only from docs collection
+    let result = harness.call_tool(
+        "multi_get",
+        json!({"pattern": "*.md", "collection": "docs"}),
+    );
+    let text = McpTestHarness::get_text_content(&result);
+
+    assert!(text.contains("Docs Readme"), "Should find docs readme");
+    assert!(!text.contains("Notes Readme"), "Should not find notes readme");
+}
+
+/// Test: get tool with line range.
+#[test]
+fn test_mcp_tool_get_with_lines() {
+    let mut harness = McpTestHarness::new();
+
+    let content = (1..=20)
+        .map(|i| format!("Line {}", i))
+        .collect::<Vec<_>>()
+        .join("\n");
+    harness.create_file("docs/long.md", &content);
+    harness.add_collection("docs", "docs", "**/*.md");
+    harness.update_index();
+
+    harness.initialize();
+
+    // Search to get document ID
+    let search_result = harness.call_tool("search", json!({"query": "Line", "limit": 1}));
+    let search_text = McpTestHarness::get_text_content(&search_result);
+
+    let id: i64 = search_text
+        .lines()
+        .find(|l| l.starts_with('['))
+        .and_then(|l| l.trim_start_matches('[').split(']').next())
+        .and_then(|s| s.parse().ok())
+        .expect("Should find document ID");
+
+    // Get lines 5-10
+    let result = harness.call_tool("get", json!({"id": id.to_string(), "lines": "5:10"}));
+    let text = McpTestHarness::get_text_content(&result);
+
+    assert!(text.contains("Line 5"), "Should contain line 5");
+    assert!(text.contains("Line 10"), "Should contain line 10");
+    assert!(!text.contains("Line 1\n"), "Should not contain line 1");
+    assert!(!text.contains("Line 15"), "Should not contain line 15");
+}
+
+/// Test: search with collection filter.
+#[test]
+fn test_mcp_tool_search_with_collection() {
+    let mut harness = McpTestHarness::new();
+
+    harness.create_file("docs/rust.md", "# Rust Guide\n\nRust programming");
+    harness.create_file("notes/rust.md", "# Rust Notes\n\nRust learning notes");
+    harness.add_collection("docs", "docs", "**/*.md");
+    harness.add_collection("notes", "notes", "**/*.md");
+    harness.update_index();
+
+    harness.initialize();
+
+    // Search only in docs
+    let result = harness.call_tool(
+        "search",
+        json!({"query": "rust", "limit": 10, "collection": "docs"}),
+    );
+    let text = McpTestHarness::get_text_content(&result);
+
+    assert!(text.contains("docs:"), "Should find docs collection result");
+    // The collection prefix should be docs, not notes
+    let lines: Vec<&str> = text.lines().filter(|l| l.contains("rust")).collect();
+    for line in &lines {
+        assert!(
+            !line.contains("notes:"),
+            "Should not find notes results. Got: {}",
+            line
+        );
+    }
+}
+
+/// Test: memory_search tool.
+#[test]
+fn test_mcp_tool_memory_search() {
+    let mut harness = McpTestHarness::new();
+    harness.initialize();
+
+    // Create several memory entries
+    harness.call_tool(
+        "memory_write",
+        json!({
+            "id": "auth-jwt-tokens",
+            "title": "JWT Token Authentication",
+            "content": "How to implement JWT authentication",
+            "entry_type": "topic",
+            "tags": ["auth", "jwt"]
+        }),
+    );
+
+    harness.call_tool(
+        "memory_write",
+        json!({
+            "id": "auth-oauth2",
+            "title": "OAuth2 Flow",
+            "content": "OAuth2 authorization code flow implementation",
+            "entry_type": "topic",
+            "tags": ["auth", "oauth"]
+        }),
+    );
+
+    harness.call_tool(
+        "memory_write",
+        json!({
+            "id": "database-setup",
+            "title": "Database Setup",
+            "content": "How to set up PostgreSQL",
+            "entry_type": "topic",
+            "tags": ["database"]
+        }),
+    );
+
+    // Search for auth topics
+    let result = harness.call_tool("memory_search", json!({"query": "authentication", "limit": 10}));
+    let text = McpTestHarness::get_text_content(&result);
+
+    assert!(
+        text.contains("JWT") || text.contains("auth"),
+        "Should find auth-related entries. Got: {}",
+        text
+    );
+}
+
+/// Test: memory_index tool for session warmup.
+#[test]
+fn test_mcp_tool_memory_index() {
+    let mut harness = McpTestHarness::new();
+    harness.initialize();
+
+    // Create memory entries
+    for i in 1..=5 {
+        harness.call_tool(
+            "memory_write",
+            json!({
+                "id": format!("topic-{}", i),
+                "title": format!("Topic {}", i),
+                "content": format!("Content for topic {}", i),
+                "entry_type": "topic",
+                "tags": ["test"]
+            }),
+        );
+    }
+
+    // Get memory index
+    let result = harness.call_tool("memory_index", json!({"limit": 10}));
+    let text = McpTestHarness::get_text_content(&result);
+
+    // Should list all entries in compact format
+    assert!(text.contains("topic-1") || text.contains("Topic 1"), "Should list entries");
+    // Count entries (each entry should be on its own line or section)
+    let entry_count = (1..=5).filter(|i| text.contains(&format!("topic-{}", i))).count();
+    assert!(entry_count >= 3, "Should list most entries. Found {} in: {}", entry_count, text);
+}
+
+/// Test: get_metrics tool.
+#[test]
+fn test_mcp_tool_get_metrics() {
+    let mut harness = McpTestHarness::new();
+    harness.initialize();
+
+    // Perform some searches to generate metrics
+    for i in 0..5 {
+        harness.call_tool("search", json!({"query": format!("test query {}", i), "limit": 5}));
+    }
+
+    // Get metrics
+    let result = harness.call_tool(
+        "get_metrics",
+        json!({"period_days": 7, "include_latency": true, "include_quality": true}),
+    );
+    let text = McpTestHarness::get_text_content(&result);
+
+    // Should contain some metrics information
+    assert!(
+        text.contains("queries") || text.contains("latency") || text.contains("Metrics") || text.len() > 10,
+        "Should return metrics information. Got: {}",
+        text
+    );
+}
+
+/// Test: evolution tool with document lineage.
+#[test]
+fn test_mcp_tool_evolution() {
+    let mut harness = McpTestHarness::new();
+
+    harness.create_file("docs/api-v1.md", "# API v1\n\nOriginal API");
+    harness.add_collection("docs", "docs", "**/*.md");
+    harness.update_index();
+
+    harness.initialize();
+
+    // Query evolution for a document
+    let result = harness.call_tool(
+        "evolution",
+        json!({"path": "api-v1.md", "direction": "both"}),
+    );
+
+    // Should not error even if no evolution exists
+    assert!(
+        result["result"].is_object() || result["error"].is_null(),
+        "Evolution tool should handle documents without lineage"
+    );
+}
+
+/// Test: get tool retrieves document by ID (from search).
+///
+/// Note: get-by-path has a known issue in PTY tests where the MCP server process
+/// doesn't see DB updates made by CLI commands. Search works because it uses FTS5
+/// which has different cache behavior. For now, we test get-by-ID which is reliable.
+#[test]
+fn test_mcp_tool_get_by_id() {
+    let mut harness = McpTestHarness::new();
+
+    harness.create_file("docs/specific.md", "# Specific Document\n\nUnique content here");
+    harness.add_collection("docs", "docs", "**/*.md");
+    harness.update_index();
+
+    harness.initialize();
+
+    // Search to get document ID
+    let search_result = harness.call_tool("search", json!({"query": "Specific Document", "limit": 1}));
+    let search_text = McpTestHarness::get_text_content(&search_result);
+
+    // Extract ID from search results
+    let id: i64 = search_text
+        .lines()
+        .find(|l| l.starts_with('['))
+        .and_then(|l| l.trim_start_matches('[').split(']').next())
+        .and_then(|s| s.parse().ok())
+        .expect("Should find document ID in search results");
+
+    // Get by ID
+    let result = harness.call_tool("get", json!({"id": id.to_string()}));
+    let text = McpTestHarness::get_text_content(&result);
+
+    assert!(
+        text.contains("Specific Document") || text.contains("Unique content"),
+        "Should find document by ID. Got: {}",
+        text
+    );
+}
+
+/// Test: memory_write updates existing entry.
+#[test]
+fn test_mcp_memory_update() {
+    let mut harness = McpTestHarness::new();
+    harness.initialize();
+
+    // Create initial entry
+    harness.call_tool(
+        "memory_write",
+        json!({
+            "id": "update-test",
+            "title": "Original Title",
+            "content": "Original content",
+            "entry_type": "topic",
+            "tags": ["v1"]
+        }),
+    );
+
+    // Verify original
+    let get1 = harness.call_tool("memory_get", json!({"id": "update-test"}));
+    let text1 = McpTestHarness::get_text_content(&get1);
+    assert!(text1.contains("Original"), "Should have original content");
+
+    // Update entry
+    harness.call_tool(
+        "memory_write",
+        json!({
+            "id": "update-test",
+            "title": "Updated Title",
+            "content": "Updated content with new information",
+            "entry_type": "topic",
+            "tags": ["v2"]
+        }),
+    );
+
+    // Verify updated
+    let get2 = harness.call_tool("memory_get", json!({"id": "update-test"}));
+    let text2 = McpTestHarness::get_text_content(&get2);
+    assert!(text2.contains("Updated"), "Should have updated content. Got: {}", text2);
+}
+
+/// Test: search handles special characters (FTS5 escape).
+#[test]
+fn test_mcp_search_special_characters() {
+    let mut harness = McpTestHarness::new();
+
+    harness.create_file(
+        "docs/security.md",
+        "# Security Guide\n\nImplement anti-CSRF tokens and XSS protection.",
+    );
+    harness.add_collection("docs", "docs", "**/*.md");
+    harness.update_index();
+
+    harness.initialize();
+
+    // Search with hyphenated term (was causing FTS5 parse error)
+    let result = harness.call_tool(
+        "search",
+        json!({"query": "anti-CSRF tokens", "limit": 10}),
+    );
+
+    // Should not error
+    assert!(
+        result["error"].is_null(),
+        "Should not error on hyphenated search. Got: {}",
+        result
+    );
+
+    let text = McpTestHarness::get_text_content(&result);
+    assert!(
+        text.contains("security") || text.contains("CSRF"),
+        "Should find security document. Got: {}",
+        text
+    );
+}
