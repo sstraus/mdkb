@@ -101,11 +101,21 @@ impl McpServer {
     }
 
     /// Initialize the database connection and stats session.
+    ///
+    /// Auto-initializes `.mdkb/` if it doesn't exist, so the MCP server
+    /// works out of the box without requiring a manual `mdkb init`.
     async fn ensure_context(&self) -> Result<(), McpError> {
         let mut ctx_guard = self.ctx.lock().await;
         if ctx_guard.is_none() {
-            let ctx = Context::open(&self.root)
-                .map_err(|e| mcp_error(format!("Failed to open database: {}", e)))?;
+            let ctx = match Context::open(&self.root) {
+                Ok(ctx) => ctx,
+                Err(e) if e.is_not_found() => {
+                    tracing::info!("Auto-initializing mdkb at {}", self.root.display());
+                    Context::init(&self.root)
+                        .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {}", e)))?
+                }
+                Err(e) => return Err(mcp_error(format!("Failed to open database: {}", e))),
+            };
 
             // Initialize stats schema
             stats::init_stats_schema(&ctx.conn)
@@ -944,9 +954,9 @@ pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
 
     // Load memory warmup before starting server
     let warmup_limit = 50; // TODO: get from memory config when added
-    let warmup = load_memory_warmup(&root, warmup_limit);
+    let instructions = load_server_instructions(&root, warmup_limit);
 
-    let server = McpServer::with_warmup(root.clone(), mcp_config, warmup);
+    let server = McpServer::with_warmup(root.clone(), mcp_config, Some(instructions));
     let (stdin, stdout) = rmcp::transport::io::stdio();
 
     tracing::info!("Starting mdkb MCP server...");
@@ -1036,79 +1046,86 @@ async fn run_file_watcher(
     Ok(())
 }
 
-/// Build warmup instructions from memory index.
+/// Base instructions explaining what mdkb is and how to use it.
 ///
-/// Creates a compact manifest of available memories for AI context injection.
-/// Format optimized for token efficiency (~30 tokens per entry).
-fn build_warmup_instructions(index: &[String]) -> String {
-    if index.is_empty() {
-        return String::new();
+/// These are always included in server instructions, regardless of whether
+/// memory entries exist. They tell the LLM what mdkb does and how to interact.
+const BASE_INSTRUCTIONS: &str = "\
+# mdkb - Markdown Knowledge Base
+
+mdkb is a local knowledge base that indexes markdown documents and provides \
+hybrid search (keyword + semantic). Use it to find project documentation, \
+solutions to past problems, and architectural decisions.
+
+## Core Tools
+
+- `search(query)`: Find documents using hybrid search. Start here.
+- `get(id)`: Retrieve full document content by ID (from search results).
+- `multi_get(pattern)`: Retrieve multiple documents matching a glob pattern.
+- `list_collections`: See what document collections are indexed.
+- `status`: Check index health (document counts, staleness).
+- `update`: Trigger reindex after adding new documents.
+- `evolution(path)`: Trace document version history.
+
+## Memory Tools (Cross-Session Persistence)
+
+- `memory_write(id, title, content, type, tags)`: Save knowledge for future sessions.
+- `memory_get(id)`: Retrieve a memory entry by ID.
+- `memory_search(query)`: Search memory entries.
+- `memory_index`: Load all memory entries (session warmup).
+
+### When to Write Memories
+- After solving a problem: type=problem, title=symptom
+- After making architectural decisions: type=decision, title=options
+- After learning important patterns: type=topic, title=concept
+
+## Getting Started
+
+If `list_collections` returns empty, the knowledge base needs content. \
+Add collections via the CLI: `mdkb collection add <name> <path> [pattern]`
+";
+
+/// Build server instructions combining base instructions with memory index.
+///
+/// Always includes base instructions explaining what mdkb is.
+/// Appends memory warmup index when memory entries exist.
+fn build_server_instructions(index: &[String]) -> String {
+    let mut instructions = BASE_INSTRUCTIONS.to_string();
+
+    if !index.is_empty() {
+        instructions.push_str("\n## Available Memories\n\n");
+        for entry in index {
+            instructions.push_str(entry);
+            instructions.push('\n');
+        }
+        instructions.push_str("\nUse `memory_get(id)` to retrieve full content.\n");
     }
-
-    let mut instructions = String::from(
-        "# mdkb Memory Index\n\n\
-         You have access to persistent memory entries. Use these tools:\n\
-         - `memory_get(id)`: Get full content of an entry\n\
-         - `memory_write(id, title, content, type, tags)`: Save new knowledge\n\
-         - `memory_search(query)`: Find entries beyond this index\n\n\
-         ## When to Write Memories\n\
-         - After solving a problem: type=problem, title=symptom\n\
-         - After making architectural decisions: type=decision, title=options\n\
-         - After learning important patterns: type=topic, title=concept\n\n\
-         ## Available Memories\n\n",
-    );
-
-    for entry in index {
-        instructions.push_str(entry);
-        instructions.push('\n');
-    }
-
-    instructions.push_str("\nUse `memory_get(id)` to retrieve full content.\n");
 
     instructions
 }
 
-/// Load memory warmup from database.
+/// Load server instructions with optional memory warmup from database.
 ///
-/// Returns formatted instructions for MCP server, or None if no memories exist.
-fn load_memory_warmup(root: &std::path::Path, limit: usize) -> Option<String> {
-    // Try to open context
-    let ctx = match Context::open(root) {
-        Ok(ctx) => ctx,
-        Err(e) => {
-            tracing::debug!("No memory warmup: {}", e);
-            return None;
-        }
-    };
+/// Always returns base instructions explaining what mdkb is.
+/// If the database exists and has memory entries, appends the memory index.
+fn load_server_instructions(root: &std::path::Path, limit: usize) -> String {
+    // Try to load memory entries from existing database
+    let memory_index = Context::open(root)
+        .ok()
+        .and_then(|ctx| {
+            crate::store::schema::init_schema(&ctx.conn).ok()?;
+            memory::get_warmup_index(&ctx.conn, limit).ok()
+        })
+        .unwrap_or_default();
 
-    // Initialize schema if needed (for memory table)
-    if let Err(e) = crate::store::schema::init_schema(&ctx.conn) {
-        tracing::warn!("Failed to init schema for warmup: {}", e);
-        return None;
+    if !memory_index.is_empty() {
+        tracing::info!("Memory warmup: {} entries", memory_index.len());
     }
 
-    // Get warmup index
-    let index = match memory::get_warmup_index(&ctx.conn, limit) {
-        Ok(idx) => idx,
-        Err(e) => {
-            tracing::debug!("No memory index: {}", e);
-            return None;
-        }
-    };
-
-    if index.is_empty() {
-        return None;
-    }
-
-    let instructions = build_warmup_instructions(&index);
+    let instructions = build_server_instructions(&memory_index);
     let tokens = count_tokens(&instructions);
-    tracing::info!(
-        "Memory warmup: {} entries, ~{} tokens",
-        index.len(),
-        tokens
-    );
-
-    Some(instructions)
+    tracing::info!("Server instructions: ~{} tokens", tokens);
+    instructions
 }
 
 /// Truncate text to a maximum length with ellipsis.
@@ -1223,25 +1240,29 @@ mod tests {
     }
 
     #[test]
-    fn test_build_warmup_instructions_empty() {
+    fn test_build_server_instructions_empty_index_has_base() {
         let index: Vec<String> = vec![];
-        let result = build_warmup_instructions(&index);
-        assert!(result.is_empty());
+        let result = build_server_instructions(&index);
+
+        // Base instructions always present
+        assert!(result.contains("mdkb"));
+        assert!(result.contains("knowledge base"));
+        assert!(result.contains("search"));
+        assert!(!result.contains("Available Memories"));
     }
 
     #[test]
-    fn test_build_warmup_instructions_with_entries() {
+    fn test_build_server_instructions_with_entries() {
         let index = vec![
             "auth-oauth2: OAuth2 PKCE implementation #auth #security".to_string(),
             "bug-null-email: Null email panic fix #bug #users".to_string(),
         ];
-        let result = build_warmup_instructions(&index);
+        let result = build_server_instructions(&index);
 
-        // Check structure
-        assert!(result.contains("# mdkb Memory Index"));
-        assert!(result.contains("memory_get"));
+        // Check base instructions present
+        assert!(result.contains("knowledge base"));
         assert!(result.contains("memory_write"));
-        assert!(result.contains("memory_search"));
+        assert!(result.contains("memory_get"));
 
         // Check guidance
         assert!(result.contains("When to Write Memories"));
@@ -1250,18 +1271,19 @@ mod tests {
         assert!(result.contains("type=topic"));
 
         // Check entries included
+        assert!(result.contains("Available Memories"));
         assert!(result.contains("auth-oauth2: OAuth2 PKCE implementation #auth #security"));
         assert!(result.contains("bug-null-email: Null email panic fix #bug #users"));
     }
 
     #[test]
-    fn test_build_warmup_instructions_token_budget() {
+    fn test_build_server_instructions_token_budget() {
         // 50 entries should be around 1.5K tokens
         let mut index = Vec::new();
         for i in 0..50 {
             index.push(format!("entry-{i}: Some title for entry number {i} #tag1 #tag2"));
         }
-        let result = build_warmup_instructions(&index);
+        let result = build_server_instructions(&index);
         let tokens = count_tokens(&result);
 
         // Should be under 2K tokens for 50 entries
@@ -1311,6 +1333,57 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// Test that the MCP server auto-initializes when .mdkb/ doesn't exist.
+    #[tokio::test]
+    async fn test_mcp_auto_init_on_first_tool_call() {
+        use rmcp::model::EmptyObject;
+
+        // Create temp directory WITHOUT running mdkb init
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+
+        // Verify .mdkb/ does not exist
+        assert!(!root.join(".mdkb").exists());
+
+        // Create server pointing at uninitialized directory
+        let server = McpServer::new(root.clone());
+
+        // First tool call should auto-initialize and succeed
+        let result = server.status(Parameters(EmptyObject {})).await;
+        assert!(result.is_ok(), "status() should auto-init and succeed, got: {:?}", result.err());
+
+        // Verify .mdkb/ was created
+        assert!(root.join(".mdkb").exists(), ".mdkb/ should have been created");
+        assert!(root.join(".mdkb/index.sqlite").exists(), "database should exist");
+        assert!(root.join(".mdkb/config.toml").exists(), "config should exist");
+    }
+
+    #[test]
+    fn test_build_server_instructions_contains_base_instructions() {
+        // Even with no memories, instructions should explain what mdkb is
+        let index: Vec<String> = vec![];
+        let result = build_server_instructions(&index);
+
+        // Must contain base instructions explaining mdkb purpose
+        assert!(result.contains("mdkb"), "Should mention mdkb");
+        assert!(result.contains("knowledge base"), "Should explain what mdkb is");
+        assert!(result.contains("search"), "Should mention search tool");
+        assert!(result.contains("memory_write"), "Should mention memory tools");
+        assert!(result.contains("collection"), "Should mention collections");
+    }
+
+    #[test]
+    fn test_build_server_instructions_includes_memory_when_present() {
+        let index = vec![
+            "auth-flow: OAuth2 implementation #auth".to_string(),
+        ];
+        let result = build_server_instructions(&index);
+
+        // Should contain both base instructions and memory
+        assert!(result.contains("knowledge base"), "Should have base instructions");
+        assert!(result.contains("auth-flow"), "Should include memory entries");
     }
 
     /// Test that multiple different tool calls don't deadlock.
