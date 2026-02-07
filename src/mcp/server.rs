@@ -176,15 +176,15 @@ impl McpServer {
     ) -> Result<crate::code::symbol::Symbol, McpError> {
         if let Some(id) = symbol_id {
             let sid = SymbolId::new(id)
-                .ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved"))?;
+                .ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved. Use `find_symbol(name)` to get valid IDs."))?;
             return facade
                 .get_symbol(sid)
-                .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}")));
+                .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}. Use `find_symbol(name)` to get current IDs.")));
         }
 
         let matches = facade.find_symbols_by_name(name);
         match matches.len() {
-            0 => Err(mcp_error(format!("No symbol found with name '{name}'"))),
+            0 => Err(mcp_error(format!("No symbol found with name '{name}'. Try `search_symbols(query)` for fuzzy matching."))),
             1 => Ok(matches.into_iter().next().unwrap()),
             _ => {
                 let mut msg = format!(
@@ -286,11 +286,14 @@ impl McpServer {
                 None
             };
 
-            let doc = doc.ok_or_else(|| mcp_error(format!("Document not found: {}", params.id)))?;
+            let doc = doc.ok_or_else(|| mcp_error(format!(
+                "Document not found: {}. Use `search(query)` to find documents by content, or `list_collections` to see indexed collections.",
+                params.id
+            )))?;
 
             let content = documents::get_content(&ctx.conn, &doc.hash)
                 .map_err(|e| mcp_error(format!("Failed to get content: {}", e)))?
-                .ok_or_else(|| mcp_error("Content not found"))?;
+                .ok_or_else(|| mcp_error("Content missing for document. Try `update` to reindex, or `search(query)` to find an alternative."))?;
 
             // Apply line range if specified
             let output = if let Some(range) = &params.lines {
@@ -455,7 +458,7 @@ impl McpServer {
 
             if results.is_empty() {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "No documents found.",
+                    "No documents matched pattern. Use `list_collections` to see indexed collections, or `search(query)` to find by content.",
                 )]));
             }
 
@@ -710,7 +713,10 @@ impl McpServer {
 
             let entry = memory::get_entry(&ctx.conn, &params.id)
                 .map_err(|e| mcp_error(format!("Failed to get memory entry: {}", e)))?
-                .ok_or_else(|| mcp_error(format!("Memory entry not found: {}", params.id)))?;
+                .ok_or_else(|| mcp_error(format!(
+                    "Memory entry not found: {}. Use `memory_search(query)` to find entries, or `memory_index` to list all.",
+                    params.id
+                )))?;
 
             let output = format!(
                 "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times\n\n{}",
@@ -759,7 +765,7 @@ impl McpServer {
             let entry_type: memory::EntryType = params
                 .entry_type
                 .parse()
-                .map_err(|e: String| mcp_error(e))?;
+                .map_err(|e: String| mcp_error(format!("{e}. Valid types: topic, problem, decision")))?;
 
             let now = chrono::Utc::now().timestamp();
 
@@ -821,7 +827,7 @@ impl McpServer {
                 .map_err(|e| mcp_error(format!("Failed to search memory: {}", e)))?;
 
             let output = if entries.is_empty() {
-                "No matching memory entries found.".to_string()
+                "No matching memory entries found. Use `memory_index` to list all entries, or `memory_write` to create one.".to_string()
             } else {
                 let mut out = format!("Found {} memory entries:\n\n", entries.len());
                 for entry in &entries {
@@ -863,7 +869,10 @@ impl McpServer {
 
             // Resolve document path to ID
             let doc = resolve_document(&ctx.conn, &params.path)
-                .map_err(|e| mcp_error(format!("Document not found: {}", e)))?;
+                .map_err(|_| mcp_error(format!(
+                    "Document not found: {}. Use `search(query)` to find documents, then pass the document ID.",
+                    params.path
+                )))?;
 
             let mut output = format!("Evolution for {}:\n\n", params.path);
 
@@ -1006,7 +1015,7 @@ impl McpServer {
             let output = if removed {
                 format!("Removed collection '{}'.", params.name)
             } else {
-                format!("Collection '{}' not found.", params.name)
+                format!("Collection '{}' not found. Use `list_collections` to see available collections.", params.name)
             };
             let tokens = count_tokens(&output);
             (output, tokens)
@@ -1038,7 +1047,7 @@ impl McpServer {
             let output = if deleted {
                 format!("Deleted memory entry '{}'.", params.id)
             } else {
-                format!("Memory entry '{}' not found.", params.id)
+                format!("Memory entry '{}' not found. Use `memory_search(query)` to find entries, or `memory_index` to list all.", params.id)
             };
             let tokens = count_tokens(&output);
             (output, tokens)
@@ -1080,7 +1089,7 @@ impl McpServer {
                     if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
                         symbols.retain(|s| s.kind == kind);
                     } else {
-                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'")));
+                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro")));
                     }
                 }
 
@@ -1090,7 +1099,7 @@ impl McpServer {
                 }
 
                 if symbols.is_empty() {
-                    "No symbols found.".to_string()
+                    "No symbols found. Try `search_symbols(query)` for fuzzy matching, or `get_index_info` to check if the index has content.".to_string()
                 } else {
                     let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
                     for sym in &symbols {
@@ -1134,12 +1143,12 @@ impl McpServer {
                     if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
                         symbols.retain(|s| s.kind == kind);
                     } else {
-                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'")));
+                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro")));
                     }
                 }
 
                 if symbols.is_empty() {
-                    "No symbols found.".to_string()
+                    "No symbols found. Try different search terms, or `get_index_info` to check if the index has content.".to_string()
                 } else {
                     let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
                     for sym in &symbols {
@@ -1625,7 +1634,7 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 /// Format search results for output.
 fn format_search_results(results: &[SearchResult]) -> String {
     if results.is_empty() {
-        return "No results found.".to_string();
+        return "No results found. Try broader terms, check `list_collections` for indexed content, or `update` to reindex.".to_string();
     }
 
     let mut output = String::new();
@@ -1682,7 +1691,8 @@ mod tests {
     fn test_format_search_results_empty() {
         let results: Vec<SearchResult> = vec![];
         let output = format_search_results(&results);
-        assert_eq!(output, "No results found.");
+        assert!(output.starts_with("No results found."), "Should start with 'No results found.', got: {}", output);
+        assert!(output.contains("list_collections"), "Should suggest list_collections, got: {}", output);
     }
 
     #[test]
@@ -2121,6 +2131,169 @@ mod tests {
 
         tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
             .await.expect("timeout").expect("status failed");
+    }
+
+    /// Extract the error message from a failed MCP tool result.
+    fn extract_error_msg(result: Result<CallToolResult, McpError>) -> String {
+        match result {
+            Err(e) => e.message.into_owned(),
+            Ok(r) => panic!("Expected error, got success: {}", extract_text(&r)),
+        }
+    }
+
+    // --- Error message hint tests ---
+    //
+    // Every MCP tool error should include a usage hint suggesting how to
+    // fix the problem. These tests verify that error messages contain
+    // actionable guidance for LLMs.
+
+    #[tokio::test]
+    async fn test_get_not_found_error_has_hint() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.get(Parameters(GetParams {
+            id: "nonexistent".to_string(),
+            lines: None,
+        })).await;
+
+        let msg = extract_error_msg(result);
+        assert!(msg.contains("search"), "Error should suggest search tool, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_get_numeric_id_not_found_error_has_hint() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.get(Parameters(GetParams {
+            id: "999999".to_string(),
+            lines: None,
+        })).await;
+
+        let msg = extract_error_msg(result);
+        assert!(msg.contains("search"), "Error should suggest search tool, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_memory_get_not_found_error_has_hint() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.memory_get(Parameters(MemoryGetParams {
+            id: "nonexistent-entry".to_string(),
+        })).await;
+
+        let msg = extract_error_msg(result);
+        assert!(msg.contains("memory_search") || msg.contains("memory_index"),
+            "Error should suggest memory_search or memory_index, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_evolution_not_found_error_has_hint() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.evolution(Parameters(EvolutionParams {
+            path: "nonexistent.md".to_string(),
+            direction: EvolutionDirection::Both,
+        })).await;
+
+        let msg = extract_error_msg(result);
+        assert!(msg.contains("search"), "Error should suggest search tool, got: {}", msg);
+    }
+
+    #[tokio::test]
+    async fn test_search_no_results_has_hint() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.search(Parameters(SearchParams {
+            query: "zzzznonexistentquery99999".to_string(),
+            limit: 10,
+            collection: None,
+            include_superseded: false,
+        })).await.expect("search should not error");
+
+        let text = extract_text(&result);
+        assert!(text.contains("list_collections") || text.contains("broader") || text.contains("collection"),
+            "No results should suggest broadening query or checking collections, got: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_no_results_has_hint() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.multi_get(Parameters(MultiGetParams {
+            pattern: "nonexistent/**/*.md".to_string(),
+            collection: None,
+        })).await.expect("multi_get should not error");
+
+        let text = extract_text(&result);
+        assert!(text.contains("list_collections") || text.contains("search"),
+            "No results should suggest list_collections or search, got: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_memory_search_no_results_has_hint() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.memory_search(Parameters(MemorySearchParams {
+            query: "zzzznonexistentquery99999".to_string(),
+            limit: 10,
+        })).await.expect("memory_search should not error");
+
+        let text = extract_text(&result);
+        assert!(text.contains("memory_write") || text.contains("memory_index"),
+            "No results should suggest memory_write or memory_index, got: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_collection_remove_not_found_has_hint() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.collection_remove(Parameters(CollectionRemoveParams {
+            name: "nonexistent".to_string(),
+        })).await.expect("collection_remove should not error");
+
+        let text = extract_text(&result);
+        assert!(text.contains("list_collections"),
+            "Not found should suggest list_collections, got: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_memory_delete_not_found_has_hint() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.memory_delete(Parameters(MemoryDeleteParams {
+            id: "nonexistent-entry".to_string(),
+        })).await.expect("memory_delete should not error");
+
+        let text = extract_text(&result);
+        assert!(text.contains("memory_search") || text.contains("memory_index"),
+            "Not found should suggest memory_search or memory_index, got: {}", text);
     }
 
     // --- Code intelligence tool tests ---
