@@ -266,7 +266,10 @@ fn test_mcp_tools_list() {
         "memory_get",
         "memory_write",
         "memory_search",
+        "memory_delete",
         "evolution",
+        "collection_add",
+        "collection_remove",
     ];
 
     let tool_names: Vec<&str> = tools
