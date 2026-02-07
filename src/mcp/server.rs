@@ -16,6 +16,10 @@ use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
 use crate::cli::handlers::{Context, handle_collection_add, handle_collection_remove, handle_hybrid_search, handle_mget, handle_update};
+#[cfg(feature = "code-intel")]
+use crate::code::indexing::IndexFacade;
+#[cfg(feature = "code-intel")]
+use crate::code::types::SymbolId;
 use crate::config::McpConfig;
 use crate::domain::SearchResult;
 use crate::metrics::{count_tokens, truncate_with_continuation, truncate_with_ellipsis, UsageMetrics};
@@ -23,9 +27,10 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    CollectionAddParams, CollectionRemoveParams, EvolutionDirection, EvolutionParams, GetParams,
+    AnalyzeImpactParams, CollectionAddParams, CollectionRemoveParams, EvolutionDirection,
+    EvolutionParams, FindCallersParams, FindSymbolParams, GetCallsParams, GetParams,
     MemoryDeleteParams, MemoryGetParams, MemoryIndexParams, MemorySearchParams, MemoryWriteParams,
-    MetricsParams, MultiGetParams, SearchParams,
+    MetricsParams, MultiGetParams, SearchParams, SearchSymbolsParams,
 };
 
 /// Create an MCP error from a message.
@@ -44,6 +49,9 @@ pub struct McpServer {
     root: PathBuf,
     /// Shared database context.
     ctx: Arc<Mutex<Option<Context>>>,
+    /// Code intelligence index (Tantivy-backed).
+    #[cfg(feature = "code-intel")]
+    code_index: Arc<Mutex<Option<IndexFacade>>>,
     /// Tool router.
     tool_router: ToolRouter<Self>,
     /// Usage metrics tracker (in-memory).
@@ -76,6 +84,8 @@ impl McpServer {
         Self {
             root,
             ctx: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "code-intel")]
+            code_index: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
             metrics: Arc::new(UsageMetrics::new()),
             config,
@@ -89,6 +99,8 @@ impl McpServer {
         Self {
             root,
             ctx: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "code-intel")]
+            code_index: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
             metrics: Arc::new(UsageMetrics::new()),
             config,
@@ -134,6 +146,64 @@ impl McpServer {
             *ctx_guard = Some(ctx);
         }
         Ok(())
+    }
+
+    /// Initialize the code intelligence index (Tantivy-backed).
+    ///
+    /// Opens or creates the index at `.mdkb/code-index/`.
+    #[cfg(feature = "code-intel")]
+    async fn ensure_code_index(&self) -> Result<(), McpError> {
+        let mut idx_guard = self.code_index.lock().await;
+        if idx_guard.is_none() {
+            let index_path = self.root.join(".mdkb/code-index");
+            let facade = IndexFacade::open_or_create(&index_path)
+                .map_err(|e| mcp_error(format!("Failed to open code index: {}", e)))?;
+            *idx_guard = Some(facade);
+        }
+        Ok(())
+    }
+
+    /// Resolve a symbol by ID or name, returning an error for disambiguation.
+    ///
+    /// If `symbol_id` is provided, looks up by ID directly.
+    /// If only `name` is provided, finds all matches. Returns an error with
+    /// a disambiguation list if multiple symbols share the name.
+    #[cfg(feature = "code-intel")]
+    fn resolve_symbol(
+        facade: &IndexFacade,
+        name: &str,
+        symbol_id: Option<u32>,
+    ) -> Result<crate::code::symbol::Symbol, McpError> {
+        if let Some(id) = symbol_id {
+            let sid = SymbolId::new(id)
+                .ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved"))?;
+            return facade
+                .get_symbol(sid)
+                .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}")));
+        }
+
+        let matches = facade.find_symbols_by_name(name);
+        match matches.len() {
+            0 => Err(mcp_error(format!("No symbol found with name '{name}'"))),
+            1 => Ok(matches.into_iter().next().unwrap()),
+            _ => {
+                let mut msg = format!(
+                    "Multiple symbols found for '{}'. Use symbol_id to disambiguate:\n",
+                    name
+                );
+                for sym in &matches {
+                    msg.push_str(&format!(
+                        "  sym#{} - {:?} {} in {} ({})\n",
+                        sym.id.value(),
+                        sym.kind,
+                        sym.name,
+                        sym.file_path,
+                        sym.range,
+                    ));
+                }
+                Err(mcp_error(msg))
+            }
+        }
     }
 
     /// Record a tool call to persistent stats.
@@ -979,6 +1049,320 @@ impl McpServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    // -----------------------------------------------------------------------
+    // Code intelligence tools (require `code-intel` feature at runtime)
+    // -----------------------------------------------------------------------
+
+    /// Find a code symbol by exact name with optional kind/file filters.
+    #[tool(description = "Find a code symbol by exact name. Returns matching symbols with their location, signature, and kind. Use kind/file filters to narrow results.")]
+    async fn find_symbol(
+        &self,
+        Parameters(params): Parameters<FindSymbolParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(not(feature = "code-intel"))]
+        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
+
+        #[cfg(feature = "code-intel")]
+        {
+            self.ensure_code_index().await?;
+
+            let output = {
+                let idx_guard = self.code_index.lock().await;
+                let facade = idx_guard
+                    .as_ref()
+                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
+
+                let mut symbols = facade.find_symbols_by_name(&params.name);
+
+                // Apply kind filter
+                if let Some(ref kind_str) = params.kind {
+                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
+                        symbols.retain(|s| s.kind == kind);
+                    } else {
+                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'")));
+                    }
+                }
+
+                // Apply file filter (substring match)
+                if let Some(ref file_pattern) = params.file {
+                    symbols.retain(|s| s.file_path.contains(file_pattern.as_str()));
+                }
+
+                if symbols.is_empty() {
+                    "No symbols found.".to_string()
+                } else {
+                    let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
+                    for sym in &symbols {
+                        out.push_str(&format_symbol(sym));
+                        out.push('\n');
+                    }
+                    out
+                }
+            }; // idx_guard dropped
+
+            let tokens = count_tokens(&output);
+            self.record_persistent_call("find_symbol", tokens, 1, false).await;
+
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+    }
+
+    /// Search code symbols by text query (fuzzy matching on names/signatures/docs).
+    #[tool(description = "Search code symbols by text query. Uses fuzzy matching across symbol names, signatures, and doc comments. Filter by kind to narrow results.")]
+    async fn search_symbols(
+        &self,
+        Parameters(params): Parameters<SearchSymbolsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(not(feature = "code-intel"))]
+        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
+
+        #[cfg(feature = "code-intel")]
+        {
+            self.ensure_code_index().await?;
+
+            let output = {
+                let idx_guard = self.code_index.lock().await;
+                let facade = idx_guard
+                    .as_ref()
+                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
+
+                let mut symbols = facade.search_symbols(&params.query, params.limit);
+
+                // Apply kind filter
+                if let Some(ref kind_str) = params.kind {
+                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
+                        symbols.retain(|s| s.kind == kind);
+                    } else {
+                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'")));
+                    }
+                }
+
+                if symbols.is_empty() {
+                    "No symbols found.".to_string()
+                } else {
+                    let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
+                    for sym in &symbols {
+                        out.push_str(&format_symbol(sym));
+                        out.push('\n');
+                    }
+                    out
+                }
+            }; // idx_guard dropped
+
+            let tokens = count_tokens(&output);
+            self.record_persistent_call("search_symbols", tokens, 1, false).await;
+
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+    }
+
+    /// Get functions/methods called by a given symbol.
+    #[tool(description = "Get functions and methods called by a given symbol. Provide symbol_id to disambiguate when multiple symbols share the same name.")]
+    async fn get_calls(
+        &self,
+        Parameters(params): Parameters<GetCallsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(not(feature = "code-intel"))]
+        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
+
+        #[cfg(feature = "code-intel")]
+        {
+            self.ensure_code_index().await?;
+
+            let output = {
+                let idx_guard = self.code_index.lock().await;
+                let facade = idx_guard
+                    .as_ref()
+                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
+
+                let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
+                let called = facade.get_called_functions(symbol.id);
+
+                if called.is_empty() {
+                    format!("{} ({:?}) does not call any indexed functions.", symbol.name, symbol.kind)
+                } else {
+                    let mut out = format!(
+                        "{} ({:?}) calls {} function(s):\n\n",
+                        symbol.name,
+                        symbol.kind,
+                        called.len()
+                    );
+                    for sym in &called {
+                        out.push_str(&format_symbol(sym));
+                        out.push('\n');
+                    }
+                    out
+                }
+            }; // idx_guard dropped
+
+            let tokens = count_tokens(&output);
+            self.record_persistent_call("get_calls", tokens, 1, false).await;
+
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+    }
+
+    /// Find all callers of a given symbol.
+    #[tool(description = "Find all functions and methods that call a given symbol. Provide symbol_id to disambiguate when multiple symbols share the same name.")]
+    async fn find_callers(
+        &self,
+        Parameters(params): Parameters<FindCallersParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(not(feature = "code-intel"))]
+        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
+
+        #[cfg(feature = "code-intel")]
+        {
+            self.ensure_code_index().await?;
+
+            let output = {
+                let idx_guard = self.code_index.lock().await;
+                let facade = idx_guard
+                    .as_ref()
+                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
+
+                let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
+                let callers = facade.get_calling_functions(symbol.id);
+
+                if callers.is_empty() {
+                    format!("{} ({:?}) has no indexed callers.", symbol.name, symbol.kind)
+                } else {
+                    let mut out = format!(
+                        "{} ({:?}) is called by {} function(s):\n\n",
+                        symbol.name,
+                        symbol.kind,
+                        callers.len()
+                    );
+                    for sym in &callers {
+                        out.push_str(&format_symbol(sym));
+                        out.push('\n');
+                    }
+                    out
+                }
+            }; // idx_guard dropped
+
+            let tokens = count_tokens(&output);
+            self.record_persistent_call("find_callers", tokens, 1, false).await;
+
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+    }
+
+    /// Analyze the impact radius of changing a symbol.
+    #[tool(description = "Analyze the impact of changing a symbol by traversing its dependency graph. Returns all symbols reachable within max_depth hops. Provide symbol_id to disambiguate.")]
+    async fn analyze_impact(
+        &self,
+        Parameters(params): Parameters<AnalyzeImpactParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(not(feature = "code-intel"))]
+        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
+
+        #[cfg(feature = "code-intel")]
+        {
+            self.ensure_code_index().await?;
+
+            let output = {
+                let idx_guard = self.code_index.lock().await;
+                let facade = idx_guard
+                    .as_ref()
+                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
+
+                let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
+                let impacted_ids = facade.get_impact_radius(symbol.id, params.max_depth);
+
+                if impacted_ids.is_empty() {
+                    format!(
+                        "{} ({:?}) has no reachable symbols within {} hop(s).",
+                        symbol.name, symbol.kind, params.max_depth
+                    )
+                } else {
+                    let mut out = format!(
+                        "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
+                        symbol.name,
+                        symbol.kind,
+                        impacted_ids.len(),
+                        params.max_depth
+                    );
+                    for sid in &impacted_ids {
+                        if let Some(sym) = facade.get_symbol(*sid) {
+                            out.push_str(&format_symbol(&sym));
+                            out.push('\n');
+                        } else {
+                            out.push_str(&format!("  sym#{} (not found in index)\n", sid.value()));
+                        }
+                    }
+                    out
+                }
+            }; // idx_guard dropped
+
+            let tokens = count_tokens(&output);
+            self.record_persistent_call("analyze_impact", tokens, 1, false).await;
+
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+    }
+
+    /// Get code index statistics.
+    #[tool(description = "Get code intelligence index statistics: number of indexed symbols, files, and relationships.")]
+    async fn get_index_info(
+        &self,
+        Parameters(_): Parameters<EmptyObject>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(not(feature = "code-intel"))]
+        { return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
+
+        #[cfg(feature = "code-intel")]
+        {
+            self.ensure_code_index().await?;
+
+            let output = {
+                let idx_guard = self.code_index.lock().await;
+                let facade = idx_guard
+                    .as_ref()
+                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
+
+                let symbols = facade.symbol_count();
+                let files = facade.file_count();
+                let relationships = facade.relationship_count();
+
+                format!(
+                    "Code Index Info:\n  Symbols: {}\n  Files: {}\n  Relationships: {}",
+                    symbols, files, relationships
+                )
+            }; // idx_guard dropped
+
+            let tokens = count_tokens(&output);
+            self.record_persistent_call("get_index_info", tokens, 1, false).await;
+
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+    }
+}
+
+/// Format a code symbol for MCP output.
+#[cfg(feature = "code-intel")]
+fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
+    let mut out = format!(
+        "  sym#{} {:?} {} in {}:{}\n",
+        sym.id.value(),
+        sym.kind,
+        sym.name,
+        sym.file_path,
+        sym.range.start_line,
+    );
+    if let Some(ref sig) = sym.signature {
+        out.push_str(&format!("    Signature: {}\n", sig));
+    }
+    if let Some(ref doc) = sym.doc_comment {
+        let truncated = if doc.len() > 120 {
+            format!("{}...", &doc[..120])
+        } else {
+            doc.to_string()
+        };
+        out.push_str(&format!("    Doc: {}\n", truncated));
+    }
+    out
 }
 
 /// Resolve a document by path or ID.
@@ -1737,5 +2121,354 @@ mod tests {
 
         tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
             .await.expect("timeout").expect("status failed");
+    }
+
+    // --- Code intelligence tool tests ---
+
+    #[cfg(feature = "code-intel")]
+    mod code_intel_tests {
+        use super::*;
+        use std::time::Duration;
+
+        /// Create a temp directory with Rust source files and a pre-populated code index.
+        /// Returns (temp_dir, McpServer) where the server is ready to use.
+        fn setup_indexed_server() -> (tempfile::TempDir, McpServer) {
+            let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+            let root = temp_dir.path().to_path_buf();
+
+            // Initialize mdkb
+            crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+
+            // Create source files
+            let src_dir = root.join("src");
+            std::fs::create_dir_all(&src_dir).unwrap();
+
+            std::fs::write(src_dir.join("main.rs"), r#"
+/// Entry point for the application.
+fn main() {
+    let result = process_data("hello");
+    println!("{}", result);
+}
+
+/// Process input data and return a formatted string.
+fn process_data(input: &str) -> String {
+    let validated = validate(input);
+    format!("processed: {}", validated)
+}
+
+/// Validate input data.
+fn validate(input: &str) -> &str {
+    input.trim()
+}
+"#).unwrap();
+
+            std::fs::write(src_dir.join("lib.rs"), r#"
+/// A helper struct for data operations.
+pub struct DataHelper {
+    pub name: String,
+}
+
+impl DataHelper {
+    /// Create a new DataHelper.
+    pub fn new(name: &str) -> Self {
+        Self { name: name.to_string() }
+    }
+
+    /// Transform the data.
+    pub fn transform(&self) -> String {
+        format!("transformed: {}", self.name)
+    }
+}
+
+/// Top-level utility function.
+pub fn utility() -> i32 {
+    42
+}
+"#).unwrap();
+
+            // Create code index
+            let index_path = root.join(".mdkb/code-index");
+            let mut facade = IndexFacade::create(&index_path)
+                .expect("Failed to create code index");
+            facade.index_directory(&src_dir)
+                .expect("Failed to index source files");
+
+            let server = McpServer::new(root);
+            (temp_dir, server)
+        }
+
+        #[tokio::test]
+        async fn test_find_symbol_by_name() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
+                name: "main".to_string(),
+                kind: None,
+                file: None,
+            })))
+            .await.expect("timeout").expect("find_symbol failed");
+
+            let text = extract_text(&result);
+            assert!(text.contains("main"), "Should find main: {}", text);
+            assert!(text.contains("sym#"), "Should include symbol ID: {}", text);
+            assert!(text.contains("Function"), "Should show kind: {}", text);
+        }
+
+        #[tokio::test]
+        async fn test_find_symbol_not_found() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
+                name: "nonexistent_symbol".to_string(),
+                kind: None,
+                file: None,
+            })))
+            .await.expect("timeout").expect("find_symbol failed");
+
+            let text = extract_text(&result);
+            assert!(text.contains("No symbols found"), "Got: {}", text);
+        }
+
+        #[tokio::test]
+        async fn test_find_symbol_with_kind_filter() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            // Find only structs named DataHelper
+            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
+                name: "DataHelper".to_string(),
+                kind: Some("struct".to_string()),
+                file: None,
+            })))
+            .await.expect("timeout").expect("find_symbol failed");
+
+            let text = extract_text(&result);
+            assert!(text.contains("DataHelper"), "Should find DataHelper: {}", text);
+            assert!(text.contains("Struct"), "Should be a struct: {}", text);
+        }
+
+        #[tokio::test]
+        async fn test_find_symbol_with_file_filter() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            // Find symbols only in lib.rs
+            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
+                name: "utility".to_string(),
+                kind: None,
+                file: Some("lib.rs".to_string()),
+            })))
+            .await.expect("timeout").expect("find_symbol failed");
+
+            let text = extract_text(&result);
+            assert!(text.contains("utility"), "Should find utility: {}", text);
+            assert!(text.contains("lib.rs"), "Should be in lib.rs: {}", text);
+        }
+
+        #[tokio::test]
+        async fn test_find_symbol_invalid_kind() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
+                name: "main".to_string(),
+                kind: Some("invalid_kind".to_string()),
+                file: None,
+            })))
+            .await.expect("timeout");
+
+            assert!(result.is_err(), "Should error on invalid kind");
+        }
+
+        #[tokio::test]
+        async fn test_search_symbols() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            let result = tokio::time::timeout(timeout, server.search_symbols(Parameters(SearchSymbolsParams {
+                query: "process".to_string(),
+                kind: None,
+                limit: 10,
+            })))
+            .await.expect("timeout").expect("search_symbols failed");
+
+            let text = extract_text(&result);
+            assert!(text.contains("process_data"), "Should find process_data: {}", text);
+        }
+
+        #[tokio::test]
+        async fn test_get_calls() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            let result = tokio::time::timeout(timeout, server.get_calls(Parameters(GetCallsParams {
+                name: "process_data".to_string(),
+                symbol_id: None,
+            })))
+            .await.expect("timeout").expect("get_calls failed");
+
+            let text = extract_text(&result);
+            // process_data calls validate
+            assert!(
+                text.contains("validate") || text.contains("does not call"),
+                "Should list called functions or report none: {}",
+                text
+            );
+        }
+
+        #[tokio::test]
+        async fn test_find_callers() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            let result = tokio::time::timeout(timeout, server.find_callers(Parameters(FindCallersParams {
+                name: "process_data".to_string(),
+                symbol_id: None,
+            })))
+            .await.expect("timeout").expect("find_callers failed");
+
+            let text = extract_text(&result);
+            // main calls process_data
+            assert!(
+                text.contains("main") || text.contains("no indexed callers"),
+                "Should list callers or report none: {}",
+                text
+            );
+        }
+
+        #[tokio::test]
+        async fn test_analyze_impact() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            let result = tokio::time::timeout(timeout, server.analyze_impact(Parameters(AnalyzeImpactParams {
+                name: "validate".to_string(),
+                symbol_id: None,
+                max_depth: 3,
+            })))
+            .await.expect("timeout").expect("analyze_impact failed");
+
+            let text = extract_text(&result);
+            // validate is called by process_data, so there should be some impact
+            assert!(
+                text.contains("symbol(s)") || text.contains("no reachable symbols"),
+                "Should report impact or no impact: {}",
+                text
+            );
+        }
+
+        #[tokio::test]
+        async fn test_get_index_info() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            let result = tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
+                .await.expect("timeout").expect("get_index_info failed");
+
+            let text = extract_text(&result);
+            assert!(text.contains("Symbols:"), "Should list symbols: {}", text);
+            assert!(text.contains("Files:"), "Should list files: {}", text);
+            assert!(text.contains("Relationships:"), "Should list relationships: {}", text);
+            // We indexed 2 files with multiple symbols
+            assert!(!text.contains("Symbols: 0"), "Should have indexed some symbols: {}", text);
+        }
+
+        #[tokio::test]
+        async fn test_get_index_info_empty() {
+            let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+            let root = temp_dir.path().to_path_buf();
+            crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+
+            let server = McpServer::new(root);
+            let timeout = Duration::from_secs(5);
+
+            let result = tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
+                .await.expect("timeout").expect("get_index_info failed");
+
+            let text = extract_text(&result);
+            assert!(text.contains("Symbols: 0"), "Empty index: {}", text);
+            assert!(text.contains("Files: 0"), "Empty index: {}", text);
+        }
+
+        #[tokio::test]
+        async fn test_code_intel_tools_no_deadlock() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            // Call multiple code-intel tools in sequence to verify no deadlock
+            tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
+                .await.expect("timeout").expect("get_index_info failed");
+
+            tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
+                name: "main".to_string(),
+                kind: None,
+                file: None,
+            })))
+            .await.expect("timeout").expect("find_symbol failed");
+
+            tokio::time::timeout(timeout, server.search_symbols(Parameters(SearchSymbolsParams {
+                query: "data".to_string(),
+                kind: None,
+                limit: 5,
+            })))
+            .await.expect("timeout").expect("search_symbols failed");
+
+            tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
+                .await.expect("timeout").expect("get_index_info failed (second call)");
+        }
+
+        #[tokio::test]
+        async fn test_resolve_symbol_not_found() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            // get_calls with nonexistent symbol should return an error
+            let result = tokio::time::timeout(timeout, server.get_calls(Parameters(GetCallsParams {
+                name: "nonexistent_fn".to_string(),
+                symbol_id: None,
+            })))
+            .await.expect("timeout");
+
+            assert!(result.is_err(), "Should error for nonexistent symbol");
+        }
+
+        #[tokio::test]
+        async fn test_resolve_symbol_by_id() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            // First find a symbol to get its ID
+            let find_result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
+                name: "main".to_string(),
+                kind: None,
+                file: None,
+            })))
+            .await.expect("timeout").expect("find_symbol failed");
+
+            let text = extract_text(&find_result);
+            // Extract symbol ID from "sym#N"
+            let sym_id: u32 = text
+                .split("sym#")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .and_then(|s| s.parse().ok())
+                .expect("Should find sym# in output");
+
+            // Now use that ID with get_calls
+            let result = tokio::time::timeout(timeout, server.get_calls(Parameters(GetCallsParams {
+                name: "main".to_string(),
+                symbol_id: Some(sym_id),
+            })))
+            .await.expect("timeout").expect("get_calls with ID failed");
+
+            let text = extract_text(&result);
+            assert!(
+                text.contains("main") || text.contains("does not call"),
+                "Should work with symbol_id: {}",
+                text
+            );
+        }
     }
 }

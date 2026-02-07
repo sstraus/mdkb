@@ -183,6 +183,81 @@ pub struct EvolutionParams {
     pub direction: EvolutionDirection,
 }
 
+// ---------------------------------------------------------------------------
+// Code intelligence tool parameters (requires `code-intel` feature)
+// ---------------------------------------------------------------------------
+
+/// Parameters for find_symbol: exact name lookup with optional filters.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct FindSymbolParams {
+    /// Exact symbol name to find.
+    pub name: String,
+
+    /// Filter by symbol kind (e.g., "function", "struct", "method").
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    /// Filter by file path (substring match).
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+/// Parameters for search_symbols: fuzzy text search across symbol names/signatures.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SearchSymbolsParams {
+    /// Search query text (matched against names, signatures, doc comments).
+    pub query: String,
+
+    /// Filter by symbol kind (e.g., "function", "struct").
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    /// Maximum results (default: 10).
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+}
+
+/// Parameters for get_calls: what functions does a symbol call?
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct GetCallsParams {
+    /// Symbol name to look up.
+    pub name: String,
+
+    /// Exact symbol ID (use to disambiguate when multiple symbols share a name).
+    #[serde(default)]
+    pub symbol_id: Option<u32>,
+}
+
+/// Parameters for find_callers: what calls a given symbol?
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct FindCallersParams {
+    /// Symbol name to look up.
+    pub name: String,
+
+    /// Exact symbol ID (use to disambiguate when multiple symbols share a name).
+    #[serde(default)]
+    pub symbol_id: Option<u32>,
+}
+
+/// Parameters for analyze_impact: dependency graph from a symbol.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct AnalyzeImpactParams {
+    /// Symbol name to start from.
+    pub name: String,
+
+    /// Exact symbol ID (use to disambiguate when multiple symbols share a name).
+    #[serde(default)]
+    pub symbol_id: Option<u32>,
+
+    /// Maximum traversal depth (default: 3).
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+}
+
+fn default_max_depth() -> usize {
+    3
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -286,5 +361,85 @@ mod tests {
         let json = r#"{"id": "auth-oauth2-pkce"}"#;
         let params: MemoryDeleteParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.id, "auth-oauth2-pkce");
+    }
+
+    // --- Code intelligence param tests ---
+
+    #[test]
+    fn test_find_symbol_params_minimal() {
+        let json = r#"{"name": "process_data"}"#;
+        let params: FindSymbolParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "process_data");
+        assert!(params.kind.is_none());
+        assert!(params.file.is_none());
+    }
+
+    #[test]
+    fn test_find_symbol_params_with_filters() {
+        let json = r#"{"name": "process_data", "kind": "function", "file": "src/main.rs"}"#;
+        let params: FindSymbolParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "process_data");
+        assert_eq!(params.kind.as_deref(), Some("function"));
+        assert_eq!(params.file.as_deref(), Some("src/main.rs"));
+    }
+
+    #[test]
+    fn test_search_symbols_params_defaults() {
+        let json = r#"{"query": "handler"}"#;
+        let params: SearchSymbolsParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "handler");
+        assert!(params.kind.is_none());
+        assert_eq!(params.limit, 10);
+    }
+
+    #[test]
+    fn test_search_symbols_params_custom() {
+        let json = r#"{"query": "handler", "kind": "method", "limit": 25}"#;
+        let params: SearchSymbolsParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "handler");
+        assert_eq!(params.kind.as_deref(), Some("method"));
+        assert_eq!(params.limit, 25);
+    }
+
+    #[test]
+    fn test_get_calls_params_name_only() {
+        let json = r#"{"name": "main"}"#;
+        let params: GetCallsParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "main");
+        assert!(params.symbol_id.is_none());
+    }
+
+    #[test]
+    fn test_get_calls_params_with_id() {
+        let json = r#"{"name": "main", "symbol_id": 42}"#;
+        let params: GetCallsParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "main");
+        assert_eq!(params.symbol_id, Some(42));
+    }
+
+    #[test]
+    fn test_find_callers_params() {
+        let json = r#"{"name": "process", "symbol_id": 7}"#;
+        let params: FindCallersParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "process");
+        assert_eq!(params.symbol_id, Some(7));
+    }
+
+    #[test]
+    fn test_analyze_impact_params_defaults() {
+        let json = r#"{"name": "Database.connect"}"#;
+        let params: AnalyzeImpactParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "Database.connect");
+        assert!(params.symbol_id.is_none());
+        assert_eq!(params.max_depth, 3);
+    }
+
+    #[test]
+    fn test_analyze_impact_params_custom() {
+        let json = r#"{"name": "init", "symbol_id": 1, "max_depth": 5}"#;
+        let params: AnalyzeImpactParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "init");
+        assert_eq!(params.symbol_id, Some(1));
+        assert_eq!(params.max_depth, 5);
     }
 }
