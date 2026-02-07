@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
-use rmcp::handler::server::tool::{Parameters, ToolRouter};
+use rmcp::handler::server::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, EmptyObject, ErrorCode, Implementation, ServerCapabilities, ServerInfo,
 };

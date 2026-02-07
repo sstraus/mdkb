@@ -35,7 +35,7 @@ gray_matter = "0.2"
 tokio = { version = "1", features = ["full"] }
 
 # MCP protocol
-rmcp = { version = "0.3", features = ["server", "transport-io"] }
+rmcp = { version = "0.14", features = ["server", "transport-io"] }
 
 # File watching
 notify = "6"
