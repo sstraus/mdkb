@@ -72,9 +72,13 @@ indicatif = "0.17"
 # Token counting for usage metrics
 tiktoken-rs = "0.6"
 
+# Code intelligence - search backend
+tantivy = { version = "0.25.0", optional = true }
+
 [features]
 default = []
 llm = []  # Enable LLM-powered features like memory condense
+code-intel = ["dep:tantivy"]  # Enable code intelligence (tree-sitter, tantivy, fastembed)
 
 [dev-dependencies]
 tempfile = "3"

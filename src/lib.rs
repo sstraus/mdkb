@@ -15,6 +15,8 @@
 //! - `llm`: Enable local LLM inference for semantic search (Phase 3+)
 
 pub mod cli;
+#[cfg(feature = "code-intel")]
+pub mod code;
 pub mod config;
 pub mod domain;
 pub mod error;
