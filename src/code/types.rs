@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::num::NonZeroU32;
 use std::str::FromStr;
 
 /// Unique identifier for a symbol in the code index.
@@ -210,6 +211,54 @@ impl fmt::Display for SymbolKind {
     }
 }
 
+// --- SymbolCounter ---
+
+/// Sequential generator for unique [`SymbolId`] values.
+///
+/// Starts at 1 and increments monotonically. Single-threaded; each
+/// parser gets its own counter per file.
+#[derive(Debug, Clone)]
+pub struct SymbolCounter {
+    next: NonZeroU32,
+}
+
+impl SymbolCounter {
+    pub fn new() -> Self {
+        Self {
+            next: NonZeroU32::new(1).expect("1 is non-zero"),
+        }
+    }
+
+    /// Generate the next ID and advance the counter.
+    pub fn next_id(&mut self) -> SymbolId {
+        let current = self.next;
+        self.next = NonZeroU32::new(
+            current
+                .get()
+                .checked_add(1)
+                .expect("symbol counter overflow"),
+        )
+        .expect("incremented value is non-zero");
+        SymbolId(current.get())
+    }
+
+    /// Number of IDs generated so far.
+    pub fn current_count(&self) -> u32 {
+        self.next.get() - 1
+    }
+
+    /// Reset back to 1.
+    pub fn reset(&mut self) {
+        self.next = NonZeroU32::new(1).expect("1 is non-zero");
+    }
+}
+
+impl Default for SymbolCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,5 +392,33 @@ mod tests {
         let json = serde_json::to_string(&range).unwrap();
         let back: Range = serde_json::from_str(&json).unwrap();
         assert_eq!(range, back);
+    }
+
+    #[test]
+    fn test_symbol_counter_starts_at_one() {
+        let mut counter = SymbolCounter::new();
+        let id = counter.next_id();
+        assert_eq!(id.value(), 1);
+    }
+
+    #[test]
+    fn test_symbol_counter_increments() {
+        let mut counter = SymbolCounter::new();
+        assert_eq!(counter.next_id().value(), 1);
+        assert_eq!(counter.next_id().value(), 2);
+        assert_eq!(counter.next_id().value(), 3);
+        assert_eq!(counter.current_count(), 3);
+    }
+
+    #[test]
+    fn test_symbol_counter_reset() {
+        let mut counter = SymbolCounter::new();
+        counter.next_id();
+        counter.next_id();
+        assert_eq!(counter.current_count(), 2);
+
+        counter.reset();
+        assert_eq!(counter.current_count(), 0);
+        assert_eq!(counter.next_id().value(), 1);
     }
 }
