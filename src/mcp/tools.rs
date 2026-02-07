@@ -127,6 +127,38 @@ fn default_true() -> bool {
     true
 }
 
+/// Parameters for the collection_add tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct CollectionAddParams {
+    /// Collection name.
+    pub name: String,
+
+    /// Path to directory containing documents.
+    pub path: String,
+
+    /// Glob pattern for files (default: **/*.md).
+    #[serde(default = "default_collection_pattern")]
+    pub pattern: String,
+}
+
+fn default_collection_pattern() -> String {
+    "**/*.md".to_string()
+}
+
+/// Parameters for the collection_remove tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct CollectionRemoveParams {
+    /// Name of the collection to remove.
+    pub name: String,
+}
+
+/// Parameters for the memory_delete tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryDeleteParams {
+    /// Memory entry ID.
+    pub id: String,
+}
+
 /// Direction for evolution queries.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
 #[serde(rename_all = "lowercase")]
@@ -222,5 +254,37 @@ mod tests {
         assert_eq!(params.period_days, 30);
         assert!(!params.include_latency);
         assert!(params.include_quality);
+    }
+
+    #[test]
+    fn test_collection_add_params_deserialize() {
+        let json = r#"{"name": "docs", "path": "docs/", "pattern": "**/*.txt"}"#;
+        let params: CollectionAddParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "docs");
+        assert_eq!(params.path, "docs/");
+        assert_eq!(params.pattern, "**/*.txt");
+    }
+
+    #[test]
+    fn test_collection_add_params_default_pattern() {
+        let json = r#"{"name": "notes", "path": "notes/"}"#;
+        let params: CollectionAddParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "notes");
+        assert_eq!(params.path, "notes/");
+        assert_eq!(params.pattern, "**/*.md");
+    }
+
+    #[test]
+    fn test_collection_remove_params_deserialize() {
+        let json = r#"{"name": "docs"}"#;
+        let params: CollectionRemoveParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "docs");
+    }
+
+    #[test]
+    fn test_memory_delete_params_deserialize() {
+        let json = r#"{"id": "auth-oauth2-pkce"}"#;
+        let params: MemoryDeleteParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.id, "auth-oauth2-pkce");
     }
 }

@@ -14,7 +14,7 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
-use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_update};
+use crate::cli::handlers::{Context, handle_collection_add, handle_collection_remove, handle_hybrid_search, handle_mget, handle_update};
 use crate::config::McpConfig;
 use crate::domain::SearchResult;
 use crate::metrics::{count_tokens, truncate_with_continuation, truncate_with_ellipsis, UsageMetrics};
@@ -22,8 +22,9 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    EvolutionDirection, EvolutionParams, GetParams, MemoryGetParams, MemoryIndexParams,
-    MemorySearchParams, MemoryWriteParams, MetricsParams, MultiGetParams, SearchParams,
+    CollectionAddParams, CollectionRemoveParams, EvolutionDirection, EvolutionParams, GetParams,
+    MemoryDeleteParams, MemoryGetParams, MemoryIndexParams, MemorySearchParams, MemoryWriteParams,
+    MetricsParams, MultiGetParams, SearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -882,6 +883,101 @@ impl McpServer {
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
+
+    /// Add a document collection to the knowledge base.
+    #[tool(description = "Add a document collection to index. Provide a name, path (relative to project root), and optional glob pattern (default: **/*.md). Call `update` after adding to index the documents.")]
+    async fn collection_add(
+        &self,
+        Parameters(params): Parameters<CollectionAddParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            handle_collection_add(ctx, &params.name, &params.path, &params.pattern)
+                .map_err(|e| mcp_error(format!("Failed to add collection: {}", e)))?;
+
+            let output = format!(
+                "Added collection '{}' at path '{}' with pattern '{}'.\nCall `update` to index the documents.",
+                params.name, params.path, params.pattern
+            );
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        }; // ctx_guard dropped here
+
+        self.record_persistent_call("collection_add", tokens, 1, false).await;
+        tracing::debug!("mdkb_collection_add: {}", output);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Remove a document collection from the knowledge base.
+    #[tool(description = "Remove a document collection and all its indexed documents. Use `list_collections` to see available collections.")]
+    async fn collection_remove(
+        &self,
+        Parameters(params): Parameters<CollectionRemoveParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let removed = handle_collection_remove(ctx, &params.name)
+                .map_err(|e| mcp_error(format!("Failed to remove collection: {}", e)))?;
+
+            let output = if removed {
+                format!("Removed collection '{}'.", params.name)
+            } else {
+                format!("Collection '{}' not found.", params.name)
+            };
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        }; // ctx_guard dropped here
+
+        self.record_persistent_call("collection_remove", tokens, 1, false).await;
+        tracing::debug!("mdkb_collection_remove: {}", output);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Delete a memory entry by ID.
+    #[tool(description = "Delete a memory entry permanently. Use `memory_search` or `memory_index` to find entry IDs.")]
+    async fn memory_delete(
+        &self,
+        Parameters(params): Parameters<MemoryDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let deleted = memory::delete_entry(&ctx.conn, &params.id)
+                .map_err(|e| mcp_error(format!("Failed to delete memory entry: {}", e)))?;
+
+            let output = if deleted {
+                format!("Deleted memory entry '{}'.", params.id)
+            } else {
+                format!("Memory entry '{}' not found.", params.id)
+            };
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        }; // ctx_guard dropped here
+
+        self.record_persistent_call("memory_delete", tokens, 1, false).await;
+        tracing::debug!("mdkb_memory_delete: {}", output);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
 }
 
 /// Resolve a document by path or ID.
@@ -1063,6 +1159,8 @@ solutions to past problems, and architectural decisions.
 - `get(id)`: Retrieve full document content by ID (from search results).
 - `multi_get(pattern)`: Retrieve multiple documents matching a glob pattern.
 - `list_collections`: See what document collections are indexed.
+- `collection_add(name, path, pattern)`: Add a document collection to index.
+- `collection_remove(name)`: Remove a collection and its indexed documents.
 - `status`: Check index health (document counts, staleness).
 - `update`: Trigger reindex after adding new documents.
 - `evolution(path)`: Trace document version history.
@@ -1071,6 +1169,7 @@ solutions to past problems, and architectural decisions.
 
 - `memory_write(id, title, content, type, tags)`: Save knowledge for future sessions.
 - `memory_get(id)`: Retrieve a memory entry by ID.
+- `memory_delete(id)`: Delete a memory entry permanently.
 - `memory_search(query)`: Search memory entries.
 - `memory_index`: Load all memory entries (session warmup).
 
@@ -1082,7 +1181,7 @@ solutions to past problems, and architectural decisions.
 ## Getting Started
 
 If `list_collections` returns empty, the knowledge base needs content. \
-Add collections via the CLI: `mdkb collection add <name> <path> [pattern]`
+Add collections with `collection_add(name, path)` then call `update` to index.
 ";
 
 /// Build server instructions combining base instructions with memory index.
@@ -1436,5 +1535,206 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// Extract text from the first Content item in a CallToolResult.
+    fn extract_text(result: &CallToolResult) -> &str {
+        result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.as_str())
+            .expect("Expected text content")
+    }
+
+    /// Test collection_add tool adds a collection successfully.
+    #[tokio::test]
+    async fn test_mcp_collection_add() {
+        use std::time::Duration;
+
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+
+        // Create a docs directory with a file
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs/test.md"), "# Test\n\nContent").unwrap();
+
+        let server = McpServer::new(root);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.collection_add(Parameters(CollectionAddParams {
+                name: "docs".to_string(),
+                path: "docs".to_string(),
+                pattern: "**/*.md".to_string(),
+            })),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(r)) => {
+                let text = extract_text(&r);
+                assert!(text.contains("Added collection 'docs'"), "Got: {}", text);
+                assert!(text.contains("Call `update`"), "Should suggest calling update");
+            }
+            Ok(Err(e)) => panic!("collection_add failed: {:?}", e),
+            Err(_) => panic!("collection_add timed out - likely deadlock!"),
+        }
+    }
+
+    /// Test collection_remove tool removes a collection.
+    #[tokio::test]
+    async fn test_mcp_collection_remove() {
+        use std::time::Duration;
+
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+
+        let server = McpServer::new(root);
+
+        // First add a collection
+        server.collection_add(Parameters(CollectionAddParams {
+            name: "test-coll".to_string(),
+            path: "docs".to_string(),
+            pattern: "**/*.md".to_string(),
+        }))
+        .await
+        .expect("Failed to add collection");
+
+        // Now remove it
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.collection_remove(Parameters(CollectionRemoveParams {
+                name: "test-coll".to_string(),
+            })),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(r)) => {
+                let text = extract_text(&r);
+                assert!(text.contains("Removed collection 'test-coll'"), "Got: {}", text);
+            }
+            Ok(Err(e)) => panic!("collection_remove failed: {:?}", e),
+            Err(_) => panic!("collection_remove timed out - likely deadlock!"),
+        }
+
+        // Removing nonexistent collection should report not found
+        let result = server
+            .collection_remove(Parameters(CollectionRemoveParams {
+                name: "nonexistent".to_string(),
+            }))
+            .await
+            .expect("Should not error");
+        let text = extract_text(&result);
+        assert!(text.contains("not found"), "Got: {}", text);
+    }
+
+    /// Test memory_delete tool deletes a memory entry.
+    #[tokio::test]
+    async fn test_mcp_memory_delete() {
+        use std::time::Duration;
+
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+
+        let server = McpServer::new(root);
+
+        // First write a memory entry
+        server.memory_write(Parameters(MemoryWriteParams {
+            id: "test-delete-me".to_string(),
+            title: "Deletable entry".to_string(),
+            content: "This will be deleted.".to_string(),
+            entry_type: "topic".to_string(),
+            tags: vec![],
+        }))
+        .await
+        .expect("Failed to write memory entry");
+
+        // Delete it
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.memory_delete(Parameters(MemoryDeleteParams {
+                id: "test-delete-me".to_string(),
+            })),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(r)) => {
+                let text = extract_text(&r);
+                assert!(text.contains("Deleted memory entry 'test-delete-me'"), "Got: {}", text);
+            }
+            Ok(Err(e)) => panic!("memory_delete failed: {:?}", e),
+            Err(_) => panic!("memory_delete timed out - likely deadlock!"),
+        }
+
+        // Verify it's gone - get should return not found
+        let get_result = server
+            .memory_get(Parameters(MemoryGetParams {
+                id: "test-delete-me".to_string(),
+            }))
+            .await;
+        assert!(get_result.is_err(), "memory_get should fail for deleted entry");
+
+        // Deleting nonexistent entry should report not found
+        let result = server
+            .memory_delete(Parameters(MemoryDeleteParams {
+                id: "nonexistent".to_string(),
+            }))
+            .await
+            .expect("Should not error");
+        let text = extract_text(&result);
+        assert!(text.contains("not found"), "Got: {}", text);
+    }
+
+    /// Regression test: new tools don't deadlock when called sequentially.
+    #[tokio::test]
+    async fn test_mcp_new_tools_no_deadlock() {
+        use std::time::Duration;
+        use rmcp::model::EmptyObject;
+
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+
+        let server = McpServer::new(root);
+        let timeout = Duration::from_secs(5);
+
+        // Sequence: status -> collection_add -> collection_remove -> memory_write -> memory_delete -> status
+        tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
+            .await.expect("timeout").expect("status failed");
+
+        tokio::time::timeout(timeout, server.collection_add(Parameters(CollectionAddParams {
+            name: "deadlock-test".to_string(),
+            path: "docs".to_string(),
+            pattern: "**/*.md".to_string(),
+        })))
+        .await.expect("timeout").expect("collection_add failed");
+
+        tokio::time::timeout(timeout, server.collection_remove(Parameters(CollectionRemoveParams {
+            name: "deadlock-test".to_string(),
+        })))
+        .await.expect("timeout").expect("collection_remove failed");
+
+        tokio::time::timeout(timeout, server.memory_write(Parameters(MemoryWriteParams {
+            id: "deadlock-test".to_string(),
+            title: "Test".to_string(),
+            content: "Content".to_string(),
+            entry_type: "topic".to_string(),
+            tags: vec![],
+        })))
+        .await.expect("timeout").expect("memory_write failed");
+
+        tokio::time::timeout(timeout, server.memory_delete(Parameters(MemoryDeleteParams {
+            id: "deadlock-test".to_string(),
+        })))
+        .await.expect("timeout").expect("memory_delete failed");
+
+        tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
+            .await.expect("timeout").expect("status failed");
     }
 }
