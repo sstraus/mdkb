@@ -82,6 +82,11 @@ tree-sitter-go = { version = "0.25.0", optional = true }
 tree-sitter-typescript = { version = "0.23.2", optional = true }
 tree-sitter-python = { version = "0.25.0", optional = true }
 
+# Code intelligence - indexing pipeline
+crossbeam-channel = { version = "0.5", optional = true }
+ignore = { version = "0.4", optional = true }
+rayon = { version = "1.10", optional = true }
+
 [features]
 default = []
 llm = []  # Enable LLM-powered features like memory condense
@@ -92,6 +97,9 @@ code-intel = [
     "dep:tree-sitter-go",
     "dep:tree-sitter-typescript",
     "dep:tree-sitter-python",
+    "dep:crossbeam-channel",
+    "dep:ignore",
+    "dep:rayon",
 ]
 
 [dev-dependencies]
