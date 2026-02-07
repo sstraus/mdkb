@@ -9,4 +9,6 @@ pub mod language;
 pub mod method_call;
 pub mod parser;
 pub mod go;
+pub mod python;
 pub mod rust;
+pub mod typescript;
