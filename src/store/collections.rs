@@ -7,11 +7,12 @@ use rusqlite::{Connection, OptionalExtension, params};
 /// Add a new collection.
 pub fn add_collection(conn: &Connection, collection: &Collection) -> Result<()> {
     conn.execute(
-        "INSERT INTO collections (name, path, pattern, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO collections (name, path, pattern, source, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             collection.name,
             collection.path,
             collection.pattern,
+            collection.source,
             collection.created_at,
             collection.updated_at,
         ],
@@ -23,15 +24,16 @@ pub fn add_collection(conn: &Connection, collection: &Collection) -> Result<()> 
 pub fn get_collection(conn: &Connection, name: &str) -> Result<Option<Collection>> {
     let result = conn
         .query_row(
-            "SELECT name, path, pattern, created_at, updated_at FROM collections WHERE name = ?1",
+            "SELECT name, path, pattern, source, created_at, updated_at FROM collections WHERE name = ?1",
             params![name],
             |row| {
                 Ok(Collection {
                     name: row.get(0)?,
                     path: row.get(1)?,
                     pattern: row.get(2)?,
-                    created_at: row.get(3)?,
-                    updated_at: row.get(4)?,
+                    source: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "manual".to_string()),
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
                 })
             },
         )
@@ -42,14 +44,15 @@ pub fn get_collection(conn: &Connection, name: &str) -> Result<Option<Collection
 /// List all collections.
 pub fn list_collections(conn: &Connection) -> Result<Vec<Collection>> {
     let mut stmt =
-        conn.prepare("SELECT name, path, pattern, created_at, updated_at FROM collections")?;
+        conn.prepare("SELECT name, path, pattern, source, created_at, updated_at FROM collections")?;
     let rows = stmt.query_map([], |row| {
         Ok(Collection {
             name: row.get(0)?,
             path: row.get(1)?,
             pattern: row.get(2)?,
-            created_at: row.get(3)?,
-            updated_at: row.get(4)?,
+            source: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "manual".to_string()),
+            created_at: row.get(4)?,
+            updated_at: row.get(5)?,
         })
     })?;
 
@@ -111,6 +114,7 @@ mod tests {
             name: name.to_string(),
             path: path.to_string(),
             pattern: "**/*.md".to_string(),
+            source: "manual".to_string(),
             created_at: now,
             updated_at: now,
         }

@@ -121,7 +121,8 @@ pub fn handle_init(root: impl AsRef<Path>) -> Result<()> {
         )));
     }
 
-    Context::init(root)?;
+    let ctx = Context::init(root)?;
+    apply_conventions(&ctx, root)?;
     Ok(())
 }
 
@@ -143,6 +144,7 @@ pub fn handle_collection_add(ctx: &Context, name: &str, path: &str, pattern: &st
         name: name.to_string(),
         path: path.to_string(),
         pattern: pattern.to_string(),
+        source: crate::domain::COLLECTION_SOURCE_MANUAL.to_string(),
         created_at: now,
         updated_at: now,
     };
@@ -424,6 +426,10 @@ pub fn handle_mget(
 /// If any operation fails, the entire update is rolled back.
 pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResult> {
     let root = root.as_ref();
+
+    // Detect and register convention-based collections before processing
+    apply_conventions(ctx, root)?;
+
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult::default();
 
@@ -441,6 +447,25 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
             Err(e)
         }
     }
+}
+
+/// Detect and register convention-based collections.
+fn apply_conventions(ctx: &Context, root: &Path) -> Result<()> {
+    let config = crate::config::Config::load_or_default(&ctx.config_path);
+    if !config.conventions.enabled {
+        return Ok(());
+    }
+
+    let existing = collections::list_collections(&ctx.conn)?;
+    let proposals = crate::domain::conventions::detect_conventions(root, &existing);
+
+    for proposal in &proposals {
+        let coll = crate::domain::conventions::proposal_to_collection(proposal);
+        collections::add_collection(&ctx.conn, &coll)?;
+        tracing::info!("Auto-detected collection: {} ({})", coll.name, coll.path);
+    }
+
+    Ok(())
 }
 
 /// Update all collections within a transaction.

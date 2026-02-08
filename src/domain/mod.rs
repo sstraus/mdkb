@@ -3,11 +3,17 @@
 //! This layer contains pure business logic independent of storage or UI.
 //! All domain types are storage-agnostic and can be tested with mocks.
 
+pub mod conventions;
 pub mod frontmatter;
 pub mod links;
 pub mod traits;
 
 use serde::{Deserialize, Serialize};
+
+/// How a collection was created.
+pub const COLLECTION_SOURCE_MANUAL: &str = "manual";
+/// Collection was auto-detected via directory conventions.
+pub const COLLECTION_SOURCE_CONVENTION: &str = "convention";
 
 /// A collection of documents from a directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,11 +27,19 @@ pub struct Collection {
     /// Glob pattern for matching files.
     pub pattern: String,
 
+    /// How this collection was created: "manual" or "convention".
+    #[serde(default = "default_source")]
+    pub source: String,
+
     /// Creation timestamp (Unix seconds).
     pub created_at: i64,
 
     /// Last update timestamp (Unix seconds).
     pub updated_at: i64,
+}
+
+fn default_source() -> String {
+    COLLECTION_SOURCE_MANUAL.to_string()
 }
 
 /// A document in the knowledge base.

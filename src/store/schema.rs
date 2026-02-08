@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 3;
+pub const SCHEMA_VERSION: i32 = 4;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS collections (
     name TEXT PRIMARY KEY,
     path TEXT NOT NULL,
     pattern TEXT DEFAULT '**/*.md',
+    source TEXT DEFAULT 'manual',
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL
 );
@@ -224,6 +225,24 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
         if !has_source_path {
             conn.execute(
                 "ALTER TABLE memory_entries ADD COLUMN source_path TEXT",
+                [],
+            )?;
+        }
+    }
+
+    // Migration from v3 to v4: add source column to collections
+    if from_version < 4 {
+        let has_source: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('collections') WHERE name = 'source'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !has_source {
+            conn.execute(
+                "ALTER TABLE collections ADD COLUMN source TEXT DEFAULT 'manual'",
                 [],
             )?;
         }

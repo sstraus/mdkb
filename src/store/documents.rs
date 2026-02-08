@@ -331,6 +331,7 @@ mod tests {
             name: name.to_string(),
             path: format!("./{name}"),
             pattern: "**/*.md".to_string(),
+            source: "manual".to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -516,6 +517,7 @@ mod tests {
                 name: "notes".to_string(),
                 path: "./notes".to_string(),
                 pattern: "**/*.md".to_string(),
+                source: "manual".to_string(),
                 created_at: now,
                 updated_at: now,
             },

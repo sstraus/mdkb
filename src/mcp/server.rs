@@ -135,6 +135,10 @@ impl McpServer {
             stats::init_stats_schema(&ctx.conn)
                 .map_err(|e| mcp_error(format!("Failed to init stats schema: {}", e)))?;
 
+            // Apply convention-based collection detection
+            self.apply_conventions(&ctx)
+                .map_err(|e| mcp_error(format!("Failed to apply conventions: {}", e)))?;
+
             // Create a new session if we don't have one
             if self.session_id.load(Ordering::Relaxed) == 0 {
                 let session_id = stats::create_session(&ctx.conn)
@@ -145,6 +149,25 @@ impl McpServer {
 
             *ctx_guard = Some(ctx);
         }
+        Ok(())
+    }
+
+    /// Detect and register convention-based collections if enabled.
+    fn apply_conventions(&self, ctx: &Context) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let config = crate::config::Config::load_or_default(&ctx.config_path);
+        if !config.conventions.enabled {
+            return Ok(());
+        }
+
+        let existing = crate::store::collections::list_collections(&ctx.conn)?;
+        let proposals = crate::domain::conventions::detect_conventions(&self.root, &existing);
+
+        for proposal in &proposals {
+            let coll = crate::domain::conventions::proposal_to_collection(proposal);
+            crate::store::collections::add_collection(&ctx.conn, &coll)?;
+            tracing::info!("Auto-detected collection: {} ({})", coll.name, coll.path);
+        }
+
         Ok(())
     }
 
@@ -1951,17 +1974,17 @@ mod tests {
         let root = temp_dir.path().to_path_buf();
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
 
-        // Create a docs directory with a file
-        std::fs::create_dir_all(root.join("docs")).unwrap();
-        std::fs::write(root.join("docs/test.md"), "# Test\n\nContent").unwrap();
+        // Create a notes directory with a file (not docs/ which is auto-detected by convention)
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/test.md"), "# Test\n\nContent").unwrap();
 
         let server = McpServer::new(root);
 
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             server.collection_add(Parameters(CollectionAddParams {
-                name: "docs".to_string(),
-                path: "docs".to_string(),
+                name: "notes".to_string(),
+                path: "notes".to_string(),
                 pattern: "**/*.md".to_string(),
             })),
         )
@@ -1970,7 +1993,7 @@ mod tests {
         match result {
             Ok(Ok(r)) => {
                 let text = extract_text(&r);
-                assert!(text.contains("Added collection 'docs'"), "Got: {}", text);
+                assert!(text.contains("Added collection 'notes'"), "Got: {}", text);
                 assert!(text.contains("Call `update`"), "Should suggest calling update");
             }
             Ok(Err(e)) => panic!("collection_add failed: {:?}", e),

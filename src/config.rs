@@ -27,6 +27,9 @@ pub struct Config {
 
     /// MCP server configuration.
     pub mcp: McpConfig,
+
+    /// Convention-based auto-collection detection.
+    pub conventions: ConventionsConfig,
 }
 
 /// Indexing settings.
@@ -138,6 +141,14 @@ pub struct ModelsConfig {
     pub inactivity_timeout_secs: u64,
 }
 
+/// Convention-based auto-collection detection settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConventionsConfig {
+    /// Enable auto-detection of convention-based collections.
+    pub enabled: bool,
+}
+
 /// MCP server settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -164,7 +175,14 @@ impl Default for Config {
             memory: MemoryConfig::default(),
             models: ModelsConfig::default(),
             mcp: McpConfig::default(),
+            conventions: ConventionsConfig::default(),
         }
+    }
+}
+
+impl Default for ConventionsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
