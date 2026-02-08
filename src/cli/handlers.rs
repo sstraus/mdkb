@@ -2673,3 +2673,239 @@ pub fn handle_journal_import_all(
 
     Ok(results)
 }
+
+// ---------------------------------------------------------------------------
+// Code intelligence handlers (require `code-intel` feature)
+// ---------------------------------------------------------------------------
+
+/// Result of `code info` command.
+#[cfg(feature = "code-intel")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CodeInfoResult {
+    pub symbols: u64,
+    pub files: u64,
+    pub relationships: usize,
+}
+
+/// Handle `mdkb code init` - initialize code index directory.
+#[cfg(feature = "code-intel")]
+pub fn handle_code_init(root: &Path) -> Result<()> {
+    let index_path = root.join(".mdkb/code-index");
+    if index_path.exists() {
+        return Err(Error::other(format!(
+            "Code index already exists at {}",
+            index_path.display()
+        )));
+    }
+    crate::code::indexing::IndexFacade::create(&index_path)
+        .map_err(|e| Error::other(format!("Failed to create code index: {}", e)))?;
+    Ok(())
+}
+
+/// Handle `mdkb code index` - build code index from source files.
+#[cfg(feature = "code-intel")]
+pub fn handle_code_index(
+    root: &Path,
+    paths: &[String],
+) -> Result<crate::code::indexing::types::IndexStats> {
+    let index_path = root.join(".mdkb/code-index");
+    let mut facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
+        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+
+    if paths.is_empty() {
+        facade
+            .index_directory(root)
+            .map_err(|e| Error::other(format!("Indexing failed: {}", e)))
+    } else {
+        let mut total = crate::code::indexing::types::IndexStats::default();
+        for p in paths {
+            let target = root.join(p);
+            let stats = facade
+                .index_directory(&target)
+                .map_err(|e| Error::other(format!("Indexing '{}' failed: {}", p, e)))?;
+            total.files_discovered += stats.files_discovered;
+            total.files_indexed += stats.files_indexed;
+            total.symbols_indexed += stats.symbols_indexed;
+            total.relationships_collected += stats.relationships_collected;
+            total.errors += stats.errors;
+        }
+        Ok(total)
+    }
+}
+
+/// Handle `mdkb code search` - fuzzy symbol search.
+#[cfg(feature = "code-intel")]
+pub fn handle_code_search(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    kind_filter: Option<&str>,
+) -> Result<Vec<crate::code::symbol::Symbol>> {
+    let index_path = root.join(".mdkb/code-index");
+    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
+        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+
+    let mut results = facade.search_symbols(query, limit * 2);
+
+    if let Some(kind_str) = kind_filter {
+        let kind: crate::code::types::SymbolKind = kind_str
+            .parse()
+            .map_err(|_| Error::other(format!("Unknown symbol kind: {}", kind_str)))?;
+        results.retain(|s| s.kind == kind);
+    }
+
+    results.truncate(limit);
+    Ok(results)
+}
+
+/// Handle `mdkb code find` - exact symbol lookup.
+#[cfg(feature = "code-intel")]
+pub fn handle_code_find(
+    root: &Path,
+    name: &str,
+    kind_filter: Option<&str>,
+    file_filter: Option<&str>,
+) -> Result<Vec<crate::code::symbol::Symbol>> {
+    let index_path = root.join(".mdkb/code-index");
+    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
+        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+
+    let mut results = facade.find_symbols_by_name(name);
+
+    if let Some(kind_str) = kind_filter {
+        let kind: crate::code::types::SymbolKind = kind_str
+            .parse()
+            .map_err(|_| Error::other(format!("Unknown symbol kind: {}", kind_str)))?;
+        results.retain(|s| s.kind == kind);
+    }
+
+    if let Some(file_substr) = file_filter {
+        results.retain(|s| s.file_path.contains(file_substr));
+    }
+
+    Ok(results)
+}
+
+/// Handle `mdkb code calls` - show what a symbol calls.
+#[cfg(feature = "code-intel")]
+pub fn handle_code_calls(
+    root: &Path,
+    name: &str,
+) -> Result<(crate::code::symbol::Symbol, Vec<crate::code::symbol::Symbol>)> {
+    let index_path = root.join(".mdkb/code-index");
+    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
+        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+
+    let symbol = facade
+        .get_symbol_by_name(name)
+        .ok_or_else(|| Error::other(format!("Symbol '{}' not found", name)))?;
+
+    let callees = facade.get_called_functions(symbol.id);
+    Ok((symbol, callees))
+}
+
+/// Handle `mdkb code callers` - show what calls a symbol.
+#[cfg(feature = "code-intel")]
+pub fn handle_code_callers(
+    root: &Path,
+    name: &str,
+) -> Result<(crate::code::symbol::Symbol, Vec<crate::code::symbol::Symbol>)> {
+    let index_path = root.join(".mdkb/code-index");
+    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
+        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+
+    let symbol = facade
+        .get_symbol_by_name(name)
+        .ok_or_else(|| Error::other(format!("Symbol '{}' not found", name)))?;
+
+    let callers = facade.get_calling_functions(symbol.id);
+    Ok((symbol, callers))
+}
+
+/// Handle `mdkb code impact` - impact analysis from a symbol.
+#[cfg(feature = "code-intel")]
+pub fn handle_code_impact(
+    root: &Path,
+    name: &str,
+    depth: usize,
+) -> Result<(crate::code::symbol::Symbol, Vec<crate::code::symbol::Symbol>)> {
+    let index_path = root.join(".mdkb/code-index");
+    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
+        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+
+    let symbol = facade
+        .get_symbol_by_name(name)
+        .ok_or_else(|| Error::other(format!("Symbol '{}' not found", name)))?;
+
+    let impacted_ids = facade.get_impact_radius(symbol.id, depth);
+    let impacted: Vec<_> = impacted_ids
+        .iter()
+        .filter_map(|&id| facade.get_symbol(id))
+        .collect();
+
+    Ok((symbol, impacted))
+}
+
+/// Handle `mdkb code info` - show index statistics.
+#[cfg(feature = "code-intel")]
+pub fn handle_code_info(root: &Path) -> Result<CodeInfoResult> {
+    let index_path = root.join(".mdkb/code-index");
+    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
+        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+
+    Ok(CodeInfoResult {
+        symbols: facade.symbol_count(),
+        files: facade.file_count(),
+        relationships: facade.relationship_count(),
+    })
+}
+
+/// Handle `mdkb code parse` - parse a single file and return symbols.
+#[cfg(feature = "code-intel")]
+pub fn handle_code_parse(file: &Path) -> Result<Vec<crate::code::symbol::Symbol>> {
+    use crate::code::parsing::language::Language;
+    use crate::code::parsing::parser::LanguageParser;
+    use crate::code::types::{FileId, SymbolCounter};
+
+    let language = Language::from_path(file)
+        .ok_or_else(|| Error::other(format!("Unsupported language for file: {}", file.display())))?;
+
+    let code = std::fs::read_to_string(file)
+        .map_err(|e| Error::other(format!("Failed to read '{}': {}", file.display(), e)))?;
+
+    let file_id = FileId::new(1).expect("1 is valid");
+    let mut counter = SymbolCounter::new();
+
+    let mut parser: Box<dyn LanguageParser> = match language {
+        Language::Rust => Box::new(crate::code::parsing::rust::RustParser::new()
+            .map_err(|e| Error::other(format!("Failed to create Rust parser: {}", e)))?),
+        Language::Go => Box::new(crate::code::parsing::go::GoParser::new()
+            .map_err(|e| Error::other(format!("Failed to create Go parser: {}", e)))?),
+        Language::TypeScript | Language::JavaScript => {
+            Box::new(crate::code::parsing::typescript::TypeScriptParser::new()
+                .map_err(|e| Error::other(format!("Failed to create TypeScript parser: {}", e)))?)
+        }
+        Language::Python => Box::new(crate::code::parsing::python::PythonParser::new()
+            .map_err(|e| Error::other(format!("Failed to create Python parser: {}", e)))?),
+        Language::Java => Box::new(crate::code::parsing::java::JavaParser::new()
+            .map_err(|e| Error::other(format!("Failed to create Java parser: {}", e)))?),
+        Language::C => Box::new(crate::code::parsing::c_lang::CParser::new()
+            .map_err(|e| Error::other(format!("Failed to create C parser: {}", e)))?),
+        Language::Cpp => Box::new(crate::code::parsing::cpp::CppParser::new()
+            .map_err(|e| Error::other(format!("Failed to create C++ parser: {}", e)))?),
+        Language::CSharp => Box::new(crate::code::parsing::csharp::CSharpParser::new()
+            .map_err(|e| Error::other(format!("Failed to create C# parser: {}", e)))?),
+        Language::Php => Box::new(crate::code::parsing::php::PhpParser::new()
+            .map_err(|e| Error::other(format!("Failed to create PHP parser: {}", e)))?),
+        Language::Swift => Box::new(crate::code::parsing::swift::SwiftParser::new()
+            .map_err(|e| Error::other(format!("Failed to create Swift parser: {}", e)))?),
+        Language::Lua => Box::new(crate::code::parsing::lua::LuaParser::new()
+            .map_err(|e| Error::other(format!("Failed to create Lua parser: {}", e)))?),
+        Language::Gdscript => Box::new(crate::code::parsing::gdscript::GdscriptParser::new()
+            .map_err(|e| Error::other(format!("Failed to create GDScript parser: {}", e)))?),
+        _ => return Err(Error::other(format!("No parser available for {:?}", language))),
+    };
+
+    let symbols = parser.parse(&code, file_id, &mut counter);
+    Ok(symbols)
+}

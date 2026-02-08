@@ -25,6 +25,8 @@ use mdkb::cli::handlers::{
     handle_mget, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
 use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SetupCommand, SetupMcpCommand};
+#[cfg(feature = "code-intel")]
+use mdkb::cli::CodeCommand;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
@@ -358,6 +360,70 @@ async fn main() -> Result<()> {
                         skip_existing,
                     )?;
                     format_journal_import_all_results(&results, dry_run, cli.format);
+                }
+            }
+        }
+        Command::Code(cmd) => {
+            #[cfg(not(feature = "code-intel"))]
+            {
+                let _ = cmd;
+                eprintln!("Code intelligence not enabled. Build with --features code-intel");
+                std::process::exit(1);
+            }
+            #[cfg(feature = "code-intel")]
+            {
+                match cmd {
+                    CodeCommand::Init => {
+                        mdkb::cli::handlers::handle_code_init(&cwd)?;
+                        println!("Initialized code index at .mdkb/code-index/");
+                    }
+                    CodeCommand::Index { paths } => {
+                        let stats = mdkb::cli::handlers::handle_code_index(&cwd, &paths)?;
+                        format_code_index_stats(&stats, cli.format);
+                    }
+                    CodeCommand::Search { query, limit, kind } => {
+                        let symbols = mdkb::cli::handlers::handle_code_search(
+                            &cwd,
+                            &query,
+                            limit,
+                            kind.as_deref(),
+                        )?;
+                        format_code_symbols(&symbols, cli.format);
+                    }
+                    CodeCommand::Find { name, kind, file } => {
+                        let symbols = mdkb::cli::handlers::handle_code_find(
+                            &cwd,
+                            &name,
+                            kind.as_deref(),
+                            file.as_deref(),
+                        )?;
+                        format_code_symbols(&symbols, cli.format);
+                    }
+                    CodeCommand::Calls { name } => {
+                        let (source, callees) =
+                            mdkb::cli::handlers::handle_code_calls(&cwd, &name)?;
+                        format_code_graph("Calls", &source, &callees, cli.format);
+                    }
+                    CodeCommand::Callers { name } => {
+                        let (target, callers) =
+                            mdkb::cli::handlers::handle_code_callers(&cwd, &name)?;
+                        format_code_graph("Called by", &target, &callers, cli.format);
+                    }
+                    CodeCommand::Impact { name, depth } => {
+                        let (source, impacted) =
+                            mdkb::cli::handlers::handle_code_impact(&cwd, &name, depth)?;
+                        format_code_graph("Impact radius", &source, &impacted, cli.format);
+                    }
+                    CodeCommand::Info => {
+                        let info = mdkb::cli::handlers::handle_code_info(&cwd)?;
+                        format_code_info(&info, cli.format);
+                    }
+                    CodeCommand::Parse { file } => {
+                        let symbols = mdkb::cli::handlers::handle_code_parse(
+                            std::path::Path::new(&file),
+                        )?;
+                        format_code_parse(&symbols, &file, cli.format);
+                    }
                 }
             }
         }
@@ -1328,6 +1394,236 @@ fn format_journal_import_all_results(results: &[JournalImportResult], dry_run: b
                 for (reason, path) in errors {
                     println!("  - {}: {}", path, reason);
                 }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Code intelligence format functions
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "code-intel")]
+fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "files_discovered": stats.files_discovered,
+                "files_indexed": stats.files_indexed,
+                "symbols_indexed": stats.symbols_indexed,
+                "relationships_collected": stats.relationships_collected,
+                "files_skipped": stats.files_skipped,
+                "errors": stats.errors,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("files_discovered,files_indexed,symbols_indexed,relationships,skipped,errors");
+            println!(
+                "{},{},{},{},{},{}",
+                stats.files_discovered,
+                stats.files_indexed,
+                stats.symbols_indexed,
+                stats.relationships_collected,
+                stats.files_skipped,
+                stats.errors,
+            );
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("Files discovered: {}", stats.files_discovered);
+            println!("Files indexed:    {}", stats.files_indexed);
+            println!("Symbols indexed:  {}", stats.symbols_indexed);
+            println!("Relationships:    {}", stats.relationships_collected);
+            if stats.files_skipped > 0 {
+                println!("Files skipped:    {}", stats.files_skipped);
+            }
+            if stats.errors > 0 {
+                println!("Errors:           {}", stats.errors);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "code-intel")]
+fn format_code_symbols(symbols: &[mdkb::code::symbol::Symbol], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(symbols).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id,name,kind,file,line");
+            for s in symbols {
+                println!(
+                    "{},{},{},{},{}",
+                    s.id.value(),
+                    s.name,
+                    s.kind,
+                    s.file_path,
+                    s.range.start_line,
+                );
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("| ID | Name | Kind | File | Line |");
+            println!("|----|------|------|------|------|");
+            for s in symbols {
+                let sig = s.signature.as_deref().unwrap_or("");
+                println!(
+                    "| {} | `{}` | {} | {} | {} |",
+                    s.id.value(),
+                    if sig.is_empty() { s.name.as_ref() } else { sig },
+                    s.kind,
+                    s.file_path,
+                    s.range.start_line,
+                );
+            }
+        }
+        OutputFormat::Text => {
+            if symbols.is_empty() {
+                println!("No symbols found.");
+            } else {
+                for s in symbols {
+                    print!(
+                        "  sym#{} {} {} in {}:{}",
+                        s.id.value(),
+                        s.kind,
+                        s.name,
+                        s.file_path,
+                        s.range.start_line,
+                    );
+                    if let Some(ref sig) = s.signature {
+                        print!("  sig: {}", sig);
+                    }
+                    println!();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "code-intel")]
+fn format_code_graph(
+    label: &str,
+    source: &mdkb::code::symbol::Symbol,
+    related: &[mdkb::code::symbol::Symbol],
+    format: OutputFormat,
+) {
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "source": source,
+                "relationship": label,
+                "targets": related,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("source,relationship,target,target_kind,file,line");
+            for t in related {
+                println!(
+                    "{},{},{},{},{},{}",
+                    source.name,
+                    label,
+                    t.name,
+                    t.kind,
+                    t.file_path,
+                    t.range.start_line,
+                );
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!(
+                "{} for {} {} ({}:{})",
+                label,
+                source.kind,
+                source.name,
+                source.file_path,
+                source.range.start_line,
+            );
+            if related.is_empty() {
+                println!("  (none)");
+            } else {
+                for t in related {
+                    println!(
+                        "  - {} {} ({}:{})",
+                        t.kind, t.name, t.file_path, t.range.start_line,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "code-intel")]
+fn format_code_info(info: &mdkb::cli::handlers::CodeInfoResult, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(info).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("symbols,files,relationships");
+            println!("{},{},{}", info.symbols, info.files, info.relationships);
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("Code Index:");
+            println!("  Symbols:       {}", info.symbols);
+            println!("  Files:         {}", info.files);
+            println!("  Relationships: {}", info.relationships);
+        }
+    }
+}
+
+#[cfg(feature = "code-intel")]
+fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let output: Vec<_> = symbols
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "name": s.name.as_ref(),
+                        "kind": s.kind.to_string(),
+                        "line": s.range.start_line,
+                        "end_line": s.range.end_line,
+                        "signature": s.signature.as_deref(),
+                        "doc_comment": s.doc_comment.as_deref(),
+                        "visibility": format!("{:?}", s.visibility),
+                    })
+                })
+                .collect();
+            // JSONL output for parse command
+            for item in &output {
+                println!("{}", item);
+            }
+        }
+        OutputFormat::Csv => {
+            println!("name,kind,line,end_line,visibility");
+            for s in symbols {
+                println!(
+                    "{},{},{},{},{:?}",
+                    s.name,
+                    s.kind,
+                    s.range.start_line,
+                    s.range.end_line,
+                    s.visibility,
+                );
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            println!("Parsed {} ({} symbols):\n", file, symbols.len());
+            for s in symbols {
+                print!(
+                    "  L{}-{} {} {} {}",
+                    s.range.start_line,
+                    s.range.end_line,
+                    s.kind,
+                    s.name,
+                    format!("{:?}", s.visibility).to_lowercase(),
+                );
+                if let Some(ref sig) = s.signature {
+                    print!("  sig: {}", sig);
+                }
+                println!();
             }
         }
     }

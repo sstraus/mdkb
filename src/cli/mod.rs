@@ -149,6 +149,10 @@ pub enum Command {
     /// Setup and configure mdkb integrations
     #[command(subcommand)]
     Setup(SetupCommand),
+
+    /// Code intelligence commands
+    #[command(subcommand)]
+    Code(CodeCommand),
 }
 
 /// Journal import subcommands.
@@ -493,6 +497,78 @@ pub enum SetupMcpCommand {
         /// Skip confirmation prompt
         #[arg(short, long)]
         yes: bool,
+    },
+}
+
+/// Code intelligence subcommands.
+#[derive(Subcommand, Debug)]
+pub enum CodeCommand {
+    /// Initialize code index in .mdkb/code/
+    Init,
+
+    /// Build code index from source files
+    Index {
+        /// Paths to index (defaults to current directory)
+        paths: Vec<String>,
+    },
+
+    /// Fuzzy symbol search
+    Search {
+        /// Search query
+        query: String,
+
+        /// Maximum results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+
+        /// Filter by symbol kind (function, struct, method, etc.)
+        #[arg(short, long)]
+        kind: Option<String>,
+    },
+
+    /// Exact symbol lookup by name
+    Find {
+        /// Symbol name
+        name: String,
+
+        /// Filter by symbol kind
+        #[arg(short, long)]
+        kind: Option<String>,
+
+        /// Filter by file path (substring match)
+        #[arg(short, long)]
+        file: Option<String>,
+    },
+
+    /// Show what functions a symbol calls
+    Calls {
+        /// Symbol name
+        name: String,
+    },
+
+    /// Show what calls a given symbol
+    Callers {
+        /// Symbol name
+        name: String,
+    },
+
+    /// Impact analysis: dependency graph from a symbol
+    Impact {
+        /// Symbol name
+        name: String,
+
+        /// Maximum traversal depth
+        #[arg(short, long, default_value = "3")]
+        depth: usize,
+    },
+
+    /// Show code index statistics
+    Info,
+
+    /// Parse a file and output symbols as JSONL
+    Parse {
+        /// File path to parse
+        file: String,
     },
 }
 
