@@ -22,12 +22,20 @@ use crate::code::indexing::types::{
     RawSymbol, UnresolvedRelationship,
 };
 use crate::code::indexing::walker;
+use crate::code::parsing::c_lang::CParser;
+use crate::code::parsing::cpp::CppParser;
+use crate::code::parsing::csharp::CSharpParser;
+use crate::code::parsing::gdscript::GdscriptParser;
 use crate::code::parsing::go::GoParser;
 use crate::code::parsing::import::Import;
+use crate::code::parsing::java::JavaParser;
 use crate::code::parsing::language::Language;
+use crate::code::parsing::lua::LuaParser;
 use crate::code::parsing::parser::LanguageParser;
+use crate::code::parsing::php::PhpParser;
 use crate::code::parsing::python::PythonParser;
 use crate::code::parsing::rust::RustParser;
+use crate::code::parsing::swift::SwiftParser;
 use crate::code::parsing::typescript::TypeScriptParser;
 use crate::code::relationship::RelationKind;
 use crate::code::storage::CodeIndex;
@@ -181,8 +189,24 @@ fn create_parser(language: Language) -> Option<Box<dyn LanguageParser>> {
         Language::TypeScript | Language::JavaScript => {
             TypeScriptParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
         }
-        Language::Python => PythonParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        _ => None, // unsupported languages
+        Language::Python => {
+            PythonParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
+        }
+        Language::Java => JavaParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::C => CParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Cpp => CppParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::CSharp => {
+            CSharpParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
+        }
+        Language::Php => PhpParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Swift => {
+            SwiftParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
+        }
+        Language::Lua => LuaParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Gdscript => {
+            GdscriptParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
+        }
+        _ => None, // Kotlin blocked by tree-sitter version incompatibility
     }
 }
 
@@ -722,12 +746,18 @@ fn callee() {}
         assert!(create_parser(Language::TypeScript).is_some());
         assert!(create_parser(Language::JavaScript).is_some());
         assert!(create_parser(Language::Python).is_some());
+        assert!(create_parser(Language::Java).is_some());
+        assert!(create_parser(Language::C).is_some());
+        assert!(create_parser(Language::Cpp).is_some());
+        assert!(create_parser(Language::CSharp).is_some());
+        assert!(create_parser(Language::Php).is_some());
+        assert!(create_parser(Language::Swift).is_some());
+        assert!(create_parser(Language::Lua).is_some());
+        assert!(create_parser(Language::Gdscript).is_some());
     }
 
     #[test]
     fn test_create_parser_unsupported_languages() {
-        assert!(create_parser(Language::Java).is_none());
-        assert!(create_parser(Language::CSharp).is_none());
         assert!(create_parser(Language::Kotlin).is_none());
     }
 }
