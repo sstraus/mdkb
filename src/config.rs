@@ -30,6 +30,9 @@ pub struct Config {
 
     /// Convention-based auto-collection detection.
     pub conventions: ConventionsConfig,
+
+    /// Code intelligence configuration.
+    pub code: CodeConfig,
 }
 
 /// Indexing settings.
@@ -166,6 +169,150 @@ pub struct McpConfig {
     pub include_token_count: bool,
 }
 
+/// Code intelligence configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeConfig {
+    /// Enable code intelligence features.
+    pub enabled: bool,
+
+    /// Index path relative to .mdkb/.
+    pub index_path: String,
+
+    /// Code indexing pipeline settings.
+    pub indexing: CodeIndexingConfig,
+
+    /// Per-language configuration.
+    pub languages: CodeLanguagesConfig,
+
+    /// Semantic code search settings.
+    pub semantic_search: CodeSemanticSearchConfig,
+}
+
+/// Code indexing pipeline settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeIndexingConfig {
+    /// Worker threads for parsing (0 = auto-detect from CPU count).
+    pub parallelism: usize,
+
+    /// Glob patterns to ignore during indexing.
+    pub ignore_patterns: Vec<String>,
+
+    /// Batch size for Tantivy commits.
+    pub batch_size: usize,
+}
+
+/// Per-language enable/disable and extension overrides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeLanguagesConfig {
+    pub rust: LanguageEntry,
+    pub python: LanguageEntry,
+    pub typescript: LanguageEntry,
+    pub javascript: LanguageEntry,
+    pub go: LanguageEntry,
+    pub java: LanguageEntry,
+    pub c: LanguageEntry,
+    pub cpp: LanguageEntry,
+    pub csharp: LanguageEntry,
+    pub php: LanguageEntry,
+    pub swift: LanguageEntry,
+    pub lua: LanguageEntry,
+    pub gdscript: LanguageEntry,
+    pub kotlin: LanguageEntry,
+}
+
+/// Configuration entry for a single language.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LanguageEntry {
+    /// Enable indexing for this language.
+    pub enabled: bool,
+
+    /// Override file extensions (empty = use language defaults).
+    pub extensions: Vec<String>,
+}
+
+/// Semantic code search settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodeSemanticSearchConfig {
+    /// Enable semantic (embedding-based) code search.
+    pub enabled: bool,
+
+    /// Embedding model identifier (e.g., "AllMiniLML6V2").
+    pub model: String,
+
+    /// Minimum cosine similarity threshold for results.
+    pub threshold: f64,
+}
+
+impl Default for LanguageEntry {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            extensions: Vec::new(),
+        }
+    }
+}
+
+impl Default for CodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            index_path: "code-index".to_string(),
+            indexing: CodeIndexingConfig::default(),
+            languages: CodeLanguagesConfig::default(),
+            semantic_search: CodeSemanticSearchConfig::default(),
+        }
+    }
+}
+
+impl Default for CodeIndexingConfig {
+    fn default() -> Self {
+        Self {
+            parallelism: DEFAULT_CODE_PARALLELISM,
+            ignore_patterns: DEFAULT_CODE_IGNORE_PATTERNS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            batch_size: DEFAULT_CODE_BATCH_SIZE,
+        }
+    }
+}
+
+impl Default for CodeLanguagesConfig {
+    fn default() -> Self {
+        Self {
+            rust: LanguageEntry::default(),
+            python: LanguageEntry::default(),
+            typescript: LanguageEntry::default(),
+            javascript: LanguageEntry::default(),
+            go: LanguageEntry::default(),
+            java: LanguageEntry::default(),
+            c: LanguageEntry::default(),
+            cpp: LanguageEntry::default(),
+            csharp: LanguageEntry::default(),
+            php: LanguageEntry::default(),
+            swift: LanguageEntry::default(),
+            lua: LanguageEntry::default(),
+            gdscript: LanguageEntry::default(),
+            kotlin: LanguageEntry { enabled: false, extensions: Vec::new() },
+        }
+    }
+}
+
+impl Default for CodeSemanticSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            model: DEFAULT_CODE_SEMANTIC_MODEL.to_string(),
+            threshold: DEFAULT_CODE_SEMANTIC_THRESHOLD,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -176,6 +323,7 @@ impl Default for Config {
             models: ModelsConfig::default(),
             mcp: McpConfig::default(),
             conventions: ConventionsConfig::default(),
+            code: CodeConfig::default(),
         }
     }
 }
@@ -329,6 +477,35 @@ const DEFAULT_WARMUP_LIMIT: usize = 50;
 /// when the user has moved on to other tasks.
 const DEFAULT_INACTIVITY_TIMEOUT_SECS: u64 = 120;
 
+/// Code indexing worker threads. 0 = auto-detect from CPU count.
+/// Auto-detect uses crossbeam's built-in thread pool sizing.
+const DEFAULT_CODE_PARALLELISM: usize = 0;
+
+/// Glob patterns to ignore during code indexing.
+/// Covers common build output, dependencies, and generated files.
+const DEFAULT_CODE_IGNORE_PATTERNS: &[&str] = &[
+    "**/target/**",
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/vendor/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/__pycache__/**",
+    "**/.venv/**",
+];
+
+/// Batch size for Tantivy commits during code indexing.
+/// 500 balances memory usage with commit overhead.
+const DEFAULT_CODE_BATCH_SIZE: usize = 500;
+
+/// Default embedding model for semantic code search.
+/// AllMiniLML6V2 is a fast, lightweight model (384 dimensions).
+const DEFAULT_CODE_SEMANTIC_MODEL: &str = "AllMiniLML6V2";
+
+/// Default cosine similarity threshold for semantic code search.
+/// 0.3 is a permissive default; higher values improve precision at cost of recall.
+const DEFAULT_CODE_SEMANTIC_THRESHOLD: f64 = 0.3;
+
 impl Config {
     /// Load configuration from a TOML file.
     ///
@@ -410,6 +587,23 @@ impl Config {
             return Err(ErrorKind::ConfigInvalid {
                 field: "chunking.overlap_tokens".to_string(),
                 message: "must be less than max_tokens".to_string(),
+            }
+            .into());
+        }
+
+        // Code indexing validation
+        if self.code.indexing.batch_size == 0 {
+            return Err(ErrorKind::ConfigInvalid {
+                field: "code.indexing.batch_size".to_string(),
+                message: "must be greater than 0".to_string(),
+            }
+            .into());
+        }
+
+        if self.code.semantic_search.threshold < 0.0 || self.code.semantic_search.threshold > 1.0 {
+            return Err(ErrorKind::ConfigInvalid {
+                field: "code.semantic_search.threshold".to_string(),
+                message: "must be between 0.0 and 1.0".to_string(),
             }
             .into());
         }
@@ -679,5 +873,120 @@ default_limit = 20
         assert!(toml_str.contains("[search]"));
         assert!(toml_str.contains("[memory]"));
         assert!(toml_str.contains("[models]"));
+        assert!(toml_str.contains("[code]"));
+    }
+
+    // ==================== Code Config Tests ====================
+
+    #[test]
+    fn test_code_config_defaults() {
+        let config = Config::default();
+        assert!(config.code.enabled);
+        assert_eq!(config.code.index_path, "code-index");
+        assert_eq!(config.code.indexing.parallelism, 0);
+        assert_eq!(config.code.indexing.batch_size, 500);
+        assert!(!config.code.indexing.ignore_patterns.is_empty());
+        assert!(config.code.indexing.ignore_patterns.contains(&"**/target/**".to_string()));
+        assert!(config.code.languages.rust.enabled);
+        assert!(!config.code.languages.kotlin.enabled);
+        assert!(!config.code.semantic_search.enabled);
+        assert_eq!(config.code.semantic_search.model, "AllMiniLML6V2");
+    }
+
+    #[test]
+    fn test_code_config_serialization_roundtrip() {
+        let config = Config::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        assert!(toml_str.contains("[code]"));
+        assert!(toml_str.contains("[code.indexing]"));
+        assert!(toml_str.contains("[code.languages.rust]"));
+        assert!(toml_str.contains("[code.semantic_search]"));
+
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.code.enabled, config.code.enabled);
+        assert_eq!(parsed.code.index_path, config.code.index_path);
+        assert_eq!(parsed.code.indexing.batch_size, config.code.indexing.batch_size);
+        assert_eq!(parsed.code.languages.kotlin.enabled, false);
+        assert_eq!(parsed.code.semantic_search.threshold, config.code.semantic_search.threshold);
+    }
+
+    #[test]
+    fn test_code_config_partial_override() {
+        let toml_content = r#"
+[code]
+enabled = false
+index_path = "my-code-idx"
+
+[code.indexing]
+batch_size = 1000
+
+[code.languages.kotlin]
+enabled = true
+extensions = ["kt", "kts"]
+
+[code.semantic_search]
+enabled = true
+threshold = 0.5
+"#;
+        let config: Config = toml::from_str(toml_content).unwrap();
+        assert!(!config.code.enabled);
+        assert_eq!(config.code.index_path, "my-code-idx");
+        assert_eq!(config.code.indexing.batch_size, 1000);
+        // Non-overridden fields keep defaults
+        assert_eq!(config.code.indexing.parallelism, 0);
+        assert!(config.code.languages.rust.enabled); // not overridden
+        assert!(config.code.languages.kotlin.enabled); // overridden
+        assert_eq!(config.code.languages.kotlin.extensions, vec!["kt", "kts"]);
+        assert!(config.code.semantic_search.enabled);
+        assert_eq!(config.code.semantic_search.threshold, 0.5);
+    }
+
+    #[test]
+    fn test_validate_code_batch_size_zero() {
+        let mut config = Config::default();
+        config.code.indexing.batch_size = 0;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("batch_size"));
+    }
+
+    #[test]
+    fn test_validate_code_threshold_out_of_range() {
+        let mut config = Config::default();
+        config.code.semantic_search.threshold = 1.5;
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("threshold"));
+
+        config.code.semantic_search.threshold = -0.1;
+        let result = config.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_code_language_entry_defaults_all_enabled_except_kotlin() {
+        let langs = CodeLanguagesConfig::default();
+        assert!(langs.rust.enabled);
+        assert!(langs.python.enabled);
+        assert!(langs.typescript.enabled);
+        assert!(langs.javascript.enabled);
+        assert!(langs.go.enabled);
+        assert!(langs.java.enabled);
+        assert!(langs.c.enabled);
+        assert!(langs.cpp.enabled);
+        assert!(langs.csharp.enabled);
+        assert!(langs.php.enabled);
+        assert!(langs.swift.enabled);
+        assert!(langs.lua.enabled);
+        assert!(langs.gdscript.enabled);
+        assert!(!langs.kotlin.enabled);
+    }
+
+    #[test]
+    fn test_code_config_ignore_patterns_default() {
+        let config = CodeIndexingConfig::default();
+        assert!(config.ignore_patterns.contains(&"**/node_modules/**".to_string()));
+        assert!(config.ignore_patterns.contains(&"**/.git/**".to_string()));
+        assert!(config.ignore_patterns.contains(&"**/vendor/**".to_string()));
     }
 }
