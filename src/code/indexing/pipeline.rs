@@ -29,6 +29,7 @@ use crate::code::parsing::gdscript::GdscriptParser;
 use crate::code::parsing::go::GoParser;
 use crate::code::parsing::import::Import;
 use crate::code::parsing::java::JavaParser;
+use crate::code::parsing::kotlin::KotlinParser;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::lua::LuaParser;
 use crate::code::parsing::parser::LanguageParser;
@@ -206,7 +207,9 @@ fn create_parser(language: Language) -> Option<Box<dyn LanguageParser>> {
         Language::Gdscript => {
             GdscriptParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
         }
-        _ => None, // Kotlin blocked by tree-sitter version incompatibility
+        Language::Kotlin => {
+            KotlinParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
+        }
     }
 }
 
@@ -757,7 +760,7 @@ fn callee() {}
     }
 
     #[test]
-    fn test_create_parser_unsupported_languages() {
-        assert!(create_parser(Language::Kotlin).is_none());
+    fn test_create_parser_kotlin() {
+        assert!(create_parser(Language::Kotlin).is_some());
     }
 }

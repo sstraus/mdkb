@@ -14,6 +14,7 @@ pub mod csharp;
 pub mod gdscript;
 pub mod go;
 pub mod java;
+pub mod kotlin;
 pub mod lua;
 pub mod php;
 pub mod python;

@@ -298,7 +298,7 @@ impl Default for CodeLanguagesConfig {
             swift: LanguageEntry::default(),
             lua: LanguageEntry::default(),
             gdscript: LanguageEntry::default(),
-            kotlin: LanguageEntry { enabled: false, extensions: Vec::new() },
+            kotlin: LanguageEntry::default(),
         }
     }
 }
@@ -888,7 +888,7 @@ default_limit = 20
         assert!(!config.code.indexing.ignore_patterns.is_empty());
         assert!(config.code.indexing.ignore_patterns.contains(&"**/target/**".to_string()));
         assert!(config.code.languages.rust.enabled);
-        assert!(!config.code.languages.kotlin.enabled);
+        assert!(config.code.languages.kotlin.enabled);
         assert!(!config.code.semantic_search.enabled);
         assert_eq!(config.code.semantic_search.model, "AllMiniLML6V2");
     }
@@ -906,7 +906,7 @@ default_limit = 20
         assert_eq!(parsed.code.enabled, config.code.enabled);
         assert_eq!(parsed.code.index_path, config.code.index_path);
         assert_eq!(parsed.code.indexing.batch_size, config.code.indexing.batch_size);
-        assert_eq!(parsed.code.languages.kotlin.enabled, false);
+        assert_eq!(parsed.code.languages.kotlin.enabled, true);
         assert_eq!(parsed.code.semantic_search.threshold, config.code.semantic_search.threshold);
     }
 
@@ -964,7 +964,7 @@ threshold = 0.5
     }
 
     #[test]
-    fn test_code_language_entry_defaults_all_enabled_except_kotlin() {
+    fn test_code_language_entry_defaults_all_enabled() {
         let langs = CodeLanguagesConfig::default();
         assert!(langs.rust.enabled);
         assert!(langs.python.enabled);
@@ -979,7 +979,7 @@ threshold = 0.5
         assert!(langs.swift.enabled);
         assert!(langs.lua.enabled);
         assert!(langs.gdscript.enabled);
-        assert!(!langs.kotlin.enabled);
+        assert!(langs.kotlin.enabled);
     }
 
     #[test]

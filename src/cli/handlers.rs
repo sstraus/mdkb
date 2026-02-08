@@ -2903,7 +2903,8 @@ pub fn handle_code_parse(file: &Path) -> Result<Vec<crate::code::symbol::Symbol>
             .map_err(|e| Error::other(format!("Failed to create Lua parser: {}", e)))?),
         Language::Gdscript => Box::new(crate::code::parsing::gdscript::GdscriptParser::new()
             .map_err(|e| Error::other(format!("Failed to create GDScript parser: {}", e)))?),
-        _ => return Err(Error::other(format!("No parser available for {:?}", language))),
+        Language::Kotlin => Box::new(crate::code::parsing::kotlin::KotlinParser::new()
+            .map_err(|e| Error::other(format!("Failed to create Kotlin parser: {}", e)))?),
     };
 
     let symbols = parser.parse(&code, file_id, &mut counter);
