@@ -29,7 +29,7 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 use super::tools::{
     AnalyzeImpactParams, CollectionAddParams, CollectionRemoveParams, EvolutionDirection,
     EvolutionParams, FindCallersParams, FindSymbolParams, GetCallsParams, GetParams,
-    MemoryDeleteParams, MemoryIndexParams, MemorySearchParams, MemoryWriteParams,
+    MemoryDeleteParams, MemoryIndexParams, MemoryWriteParams,
     MetricsParams, MultiGetParams, SearchParams, SearchSymbolsParams,
 };
 
@@ -318,25 +318,93 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
+        let scope = params.scope.as_deref().unwrap_or("docs");
+
         let (output, tokens, result_count) = {
             let ctx_guard = self.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            let results = handle_hybrid_search(
-                ctx,
-                &params.query,
-                params.limit,
-                params.collection.as_deref(),
-                params.include_superseded,
-            )
-            .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
+            match scope {
+                "docs" => {
+                    let results = handle_hybrid_search(
+                        ctx,
+                        &params.query,
+                        params.limit,
+                        params.collection.as_deref(),
+                        params.include_superseded,
+                    )
+                    .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-            let output = format_search_results(&results);
-            let tokens = count_tokens(&output);
-            let result_count = results.len();
-            (output, tokens, result_count)
+                    let output = format_search_results(&results);
+                    let tokens = count_tokens(&output);
+                    (output, tokens, results.len())
+                }
+                "memory" => {
+                    let entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
+                        .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
+
+                    let output = format_memory_search_results(&entries);
+                    let tokens = count_tokens(&output);
+                    (output, tokens, entries.len())
+                }
+                "all" => {
+                    let doc_results = handle_hybrid_search(
+                        ctx,
+                        &params.query,
+                        params.limit,
+                        params.collection.as_deref(),
+                        params.include_superseded,
+                    )
+                    .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
+
+                    let mem_entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
+                        .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
+
+                    let total = doc_results.len() + mem_entries.len();
+                    let mut output = format!("Found {} results:\n\n", total);
+
+                    if !doc_results.is_empty() {
+                        output.push_str("## Documents\n\n");
+                        for r in &doc_results {
+                            output.push_str(&format!(
+                                "- [DOC] {} (score: {:.2})\n",
+                                r.path, r.score
+                            ));
+                            if let Some(ref title) = r.title {
+                                output.push_str(&format!("  Title: {}\n", title));
+                            }
+                        }
+                        output.push('\n');
+                    }
+
+                    if !mem_entries.is_empty() {
+                        output.push_str("## Memory Entries\n\n");
+                        for entry in &mem_entries {
+                            output.push_str(&format!(
+                                "- [MEM] {} ({}): {}\n",
+                                entry.title,
+                                entry.id,
+                                truncate_text(&entry.content, 100)
+                            ));
+                        }
+                    }
+
+                    if total == 0 {
+                        output = "No results found in documents or memory. Try a different query.".to_string();
+                    }
+
+                    let tokens = count_tokens(&output);
+                    (output, tokens, total)
+                }
+                _ => {
+                    return Err(mcp_error(format!(
+                        "Invalid scope: '{}'. Valid values: 'docs' (default), 'memory', 'all'.",
+                        scope
+                    )));
+                }
+            }
         }; // ctx_guard dropped here before record_persistent_call
 
         self.metrics.record_search(tokens, result_count);
@@ -861,49 +929,6 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Search memory entries.
-    #[tool(description = "Search memory entries by keyword")]
-    async fn memory_search(
-        &self,
-        Parameters(params): Parameters<MemorySearchParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let (output, tokens, result_count) = {
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
-                .map_err(|e| mcp_error(format!("Failed to search memory: {}", e)))?;
-
-            let output = if entries.is_empty() {
-                "No matching memory entries found. Use `memory_index` to list all entries, or `memory_write` to create one.".to_string()
-            } else {
-                let mut out = format!("Found {} memory entries:\n\n", entries.len());
-                for entry in &entries {
-                    out.push_str(&format!(
-                        "- [{}] {} ({}): {}\n",
-                        entry.id,
-                        entry.title,
-                        entry.entry_type,
-                        truncate_text(&entry.content, 100)
-                    ));
-                }
-                out
-            };
-
-            let tokens = count_tokens(&output);
-            let result_count = entries.len();
-            (output, tokens, result_count)
-        }; // ctx_guard dropped here
-
-        self.record_persistent_call("memory_search", tokens, result_count, false).await;
-        tracing::debug!("mdkb_memory_search: {} tokens, {} results", tokens, result_count);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
 
     /// Query document evolution history.
     #[tool(description = "Trace document evolution - what supersedes it, what it supersedes. Use when checking if a document is current or finding latest version.")]
@@ -1080,7 +1105,7 @@ impl McpServer {
     }
 
     /// Delete a memory entry by ID.
-    #[tool(description = "Delete a memory entry permanently. Use `memory_search` or `memory_index` to find entry IDs.")]
+    #[tool(description = "Delete a memory entry permanently. Use `search(query, scope=\"memory\")` or `memory_index` to find entry IDs.")]
     async fn memory_delete(
         &self,
         Parameters(params): Parameters<MemoryDeleteParams>,
@@ -1099,7 +1124,7 @@ impl McpServer {
             let output = if deleted {
                 format!("Deleted memory entry '{}'.", params.id)
             } else {
-                format!("Memory entry '{}' not found. Use `memory_search(query)` to find entries, or `memory_index` to list all.", params.id)
+                format!("Memory entry '{}' not found. Use `search(query, scope=\"memory\")` to find entries, or `memory_index` to list all.", params.id)
             };
             let tokens = count_tokens(&output);
             (output, tokens)
@@ -1601,7 +1626,7 @@ solutions to past problems, and architectural decisions.
 
 ## Core Tools
 
-- `search(query)`: Find documents using hybrid search. Start here.
+- `search(query)`: Find documents using hybrid search. Start here. Use `scope` to search `\"docs\"` (default), `\"memory\"`, or `\"all\"`.
 - `get(id)`: Retrieve by numeric ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2'). Includes evolution metadata for documents.
 - `multi_get(pattern)`: Retrieve multiple documents matching a glob pattern.
 - `list_collections`: See what document collections are indexed.
@@ -1615,7 +1640,6 @@ solutions to past problems, and architectural decisions.
 
 - `memory_write(id, title, content, type, tags)`: Save knowledge for future sessions.
 - `memory_delete(id)`: Delete a memory entry permanently.
-- `memory_search(query)`: Search memory entries.
 - `memory_index`: Load all memory entries (session warmup).
 
 ### When to Write Memories
@@ -1700,6 +1724,25 @@ fn format_search_results(results: &[SearchResult]) -> String {
         }
     }
     output
+}
+
+/// Format memory search results for output.
+fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
+    if entries.is_empty() {
+        return "No matching memory entries found. Use `memory_index` to list all entries, or `memory_write` to create one.".to_string();
+    }
+
+    let mut out = format!("Found {} memory entries:\n\n", entries.len());
+    for entry in entries {
+        out.push_str(&format!(
+            "- [{}] {} ({}): {}\n",
+            entry.id,
+            entry.title,
+            entry.entry_type,
+            truncate_text(&entry.content, 100)
+        ));
+    }
+    out
 }
 
 /// Apply line range to content.
@@ -2276,6 +2319,7 @@ mod tests {
             limit: 10,
             collection: None,
             include_superseded: false,
+            scope: None,
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
@@ -2301,16 +2345,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memory_search_no_results_has_hint() {
+    async fn test_search_memory_scope_no_results_has_hint() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.memory_search(Parameters(MemorySearchParams {
+        let result = server.search(Parameters(SearchParams {
             query: "zzzznonexistentquery99999".to_string(),
             limit: 10,
-        })).await.expect("memory_search should not error");
+            collection: None,
+            include_superseded: false,
+            scope: Some("memory".to_string()),
+        })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
         assert!(text.contains("memory_write") || text.contains("memory_index"),
@@ -2345,8 +2392,8 @@ mod tests {
         })).await.expect("memory_delete should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("memory_search") || text.contains("memory_index"),
-            "Not found should suggest memory_search or memory_index, got: {}", text);
+        assert!(text.contains("search") || text.contains("memory_index"),
+            "Not found should suggest search or memory_index, got: {}", text);
     }
 
     // --- Code intelligence tool tests ---

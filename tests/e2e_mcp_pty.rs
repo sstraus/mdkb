@@ -264,7 +264,6 @@ fn test_mcp_tools_list() {
         "get_metrics",
         "memory_index",
         "memory_write",
-        "memory_search",
         "memory_delete",
         "evolution",
         "collection_add",
@@ -668,9 +667,9 @@ fn test_mcp_tool_search_with_collection() {
     }
 }
 
-/// Test: memory_search tool.
+/// Test: search tool with memory scope.
 #[test]
-fn test_mcp_tool_memory_search() {
+fn test_mcp_tool_search_memory_scope() {
     let mut harness = McpTestHarness::new();
     harness.initialize();
 
@@ -708,8 +707,8 @@ fn test_mcp_tool_memory_search() {
         }),
     );
 
-    // Search for auth topics
-    let result = harness.call_tool("memory_search", json!({"query": "authentication", "limit": 10}));
+    // Search for auth topics using scope="memory"
+    let result = harness.call_tool("search", json!({"query": "authentication", "limit": 10, "scope": "memory"}));
     let text = McpTestHarness::get_text_content(&result);
 
     assert!(

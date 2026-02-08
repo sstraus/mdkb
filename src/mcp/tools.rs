@@ -20,6 +20,10 @@ pub struct SearchParams {
     /// Include superseded/retracted documents (default: false).
     #[serde(default)]
     pub include_superseded: bool,
+
+    /// Search scope: "docs" (default), "memory", or "all".
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -83,17 +87,6 @@ pub struct MemoryWriteParams {
 
 fn default_entry_type() -> String {
     "topic".to_string()
-}
-
-/// Parameters for the memory search tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct MemorySearchParams {
-    /// Search query.
-    pub query: String,
-
-    /// Maximum results (default: 10).
-    #[serde(default = "default_limit")]
-    pub limit: usize,
 }
 
 /// Parameters for the metrics tool.
@@ -269,6 +262,15 @@ mod tests {
         let json = r#"{"query": "test"}"#;
         let params: SearchParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.limit, 10);
+        assert!(params.scope.is_none());
+    }
+
+    #[test]
+    fn test_search_params_with_scope() {
+        let json = r#"{"query": "auth", "scope": "memory"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "auth");
+        assert_eq!(params.scope.as_deref(), Some("memory"));
     }
 
     #[test]
