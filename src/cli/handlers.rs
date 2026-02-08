@@ -325,46 +325,114 @@ pub fn handle_hybrid_search(
     Ok(results)
 }
 
+/// Status result including index status and collection listing.
+#[derive(Debug)]
+pub struct StatusResult {
+    /// Index status (documents, stale, db size).
+    pub index: crate::domain::IndexStatus,
+    /// Collection details (name, path, pattern, source, doc_count).
+    pub collections: Vec<CollectionInfo>,
+}
+
+/// Info about a single collection for status display.
+#[derive(Debug)]
+pub struct CollectionInfo {
+    pub name: String,
+    pub path: String,
+    pub pattern: String,
+    pub source: String,
+    pub doc_count: i64,
+}
+
 /// Handle `mdkb status` command.
-pub fn handle_status(ctx: &Context) -> Result<crate::domain::IndexStatus> {
-    search::get_status(&ctx.conn)
+pub fn handle_status(ctx: &Context) -> Result<StatusResult> {
+    let index = search::get_status(&ctx.conn)?;
+    let coll_list = collections::list_collections(&ctx.conn)?;
+    let collections = coll_list
+        .iter()
+        .map(|c| {
+            let doc_count = collections::get_collection_document_count(&ctx.conn, &c.name)
+                .unwrap_or(0);
+            CollectionInfo {
+                name: c.name.clone(),
+                path: c.path.clone(),
+                pattern: c.pattern.clone(),
+                source: c.source.clone(),
+                doc_count,
+            }
+        })
+        .collect();
+    Ok(StatusResult { index, collections })
+}
+
+/// Result of a `get` command: document or memory entry.
+#[derive(Debug)]
+pub enum GetResult {
+    /// A document with its content.
+    Document(crate::domain::Document, String),
+    /// A memory entry.
+    Memory(crate::store::memory::MemoryEntry),
 }
 
 /// Handle `mdkb get` command.
+///
+/// Resolution order: numeric ID → file path → memory slug → fallback.
 pub fn handle_get(
     ctx: &Context,
     id_or_path: &str,
     lines: Option<&str>,
-) -> Result<(crate::domain::Document, String)> {
-    // Try to parse as ID first
-    let doc = if let Ok(id) = id_or_path.parse::<i64>() {
-        documents::get_document(&ctx.conn, id)?
-    } else {
-        // Try as path - search for it
-        None
-    };
+) -> Result<GetResult> {
+    // Try numeric ID first
+    if let Ok(id) = id_or_path.parse::<i64>() {
+        if let Some(doc) = documents::get_document(&ctx.conn, id)? {
+            let content = get_document_content(ctx, &doc, lines)?;
+            return Ok(GetResult::Document(doc, content));
+        }
+    }
 
-    let doc = doc.ok_or_else(|| {
-        Error::from(ErrorKind::DocumentNotFound {
-            id: id_or_path.to_string(),
-        })
-    })?;
+    // Try path resolution across collections
+    if id_or_path.contains('/') || id_or_path.contains('.') {
+        let all_colls = collections::list_collections(&ctx.conn)?;
+        for coll in &all_colls {
+            if let Some(doc) = documents::get_document_by_path(&ctx.conn, &coll.name, id_or_path)? {
+                let content = get_document_content(ctx, &doc, lines)?;
+                return Ok(GetResult::Document(doc, content));
+            }
+        }
+    }
 
-    // Get content
+    // Try memory slug
+    if let Some(entry) = crate::store::memory::get_entry(&ctx.conn, id_or_path)? {
+        return Ok(GetResult::Memory(entry));
+    }
+
+    // Fallback: try all collections without path hint
+    let all_colls = collections::list_collections(&ctx.conn)?;
+    for coll in &all_colls {
+        if let Some(doc) = documents::get_document_by_path(&ctx.conn, &coll.name, id_or_path)? {
+            let content = get_document_content(ctx, &doc, lines)?;
+            return Ok(GetResult::Document(doc, content));
+        }
+    }
+
+    Err(Error::from(ErrorKind::DocumentNotFound {
+        id: id_or_path.to_string(),
+    }))
+}
+
+/// Get document content, applying optional line range.
+fn get_document_content(ctx: &Context, doc: &crate::domain::Document, lines: Option<&str>) -> Result<String> {
     let content = documents::get_content(&ctx.conn, &doc.hash)?.ok_or_else(|| {
         Error::from(ErrorKind::DocumentNotFound {
-            id: id_or_path.to_string(),
+            id: doc.id.to_string(),
         })
     })?;
 
-    // Apply line range if specified
-    let content = if let Some(range) = lines {
-        apply_line_range(&content, range)?
+    if let Some(range) = lines {
+        apply_line_range(&content, range)
     } else {
-        content
-    };
-
-    Ok((doc, content))
+        Ok(content)
+    }
 }
 
 /// Handle `mdkb mget` command - batch retrieval by pattern.
@@ -1914,8 +1982,9 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
 
         let status = handle_status(&ctx).expect("status should succeed");
-        assert_eq!(status.collections, 0);
-        assert_eq!(status.documents, 0);
+        assert_eq!(status.index.collections, 0);
+        assert_eq!(status.index.documents, 0);
+        assert!(status.collections.is_empty());
     }
 
     // ==================== Line Range Tests ====================

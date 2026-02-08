@@ -59,11 +59,15 @@ pub enum Command {
         /// Include superseded/retracted documents
         #[arg(long)]
         include_superseded: bool,
+
+        /// Search scope: docs (default), memory, or all
+        #[arg(long, default_value = "docs")]
+        scope: String,
     },
 
-    /// Retrieve a document by ID or path
+    /// Retrieve a document by ID, path, or memory slug
     Get {
-        /// Document ID or relative path
+        /// Document ID, relative path, or memory slug
         id: String,
 
         /// Line range (e.g., 10:50)
@@ -256,9 +260,6 @@ pub enum CollectionCommand {
         /// Collection name
         name: String,
     },
-
-    /// List all collections
-    List,
 
     /// Rename a collection
     Rename {

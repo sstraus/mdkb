@@ -15,7 +15,7 @@ use tracing_subscriber::EnvFilter;
 
 use mdkb::Result;
 use mdkb::cli::handlers::{
-    Context, EmbedResult, EvolutionHistoryEntry, StatsResult, handle_collection_add, handle_collection_list,
+    Context, EmbedResult, EvolutionHistoryEntry, StatsResult, handle_collection_add,
     handle_collection_remove, handle_collection_rename, handle_current, handle_embed, handle_evolve_corrects,
     handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end, handle_experiment_list,
@@ -75,10 +75,6 @@ async fn main() -> Result<()> {
                         println!("Collection '{name}' not found");
                     }
                 }
-                CollectionCommand::List => {
-                    let collections = handle_collection_list(&ctx)?;
-                    format_collections(&collections, cli.format);
-                }
                 CollectionCommand::Rename { old_name, new_name } => {
                     handle_collection_rename(&ctx, &old_name, &new_name)?;
                     println!("Renamed collection '{old_name}' to '{new_name}'");
@@ -90,15 +86,50 @@ async fn main() -> Result<()> {
             limit,
             collection,
             include_superseded,
+            scope,
         } => {
             let ctx = Context::open(&cwd)?;
-            let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref(), include_superseded)?;
-            format_search_results(&results, cli.format);
+            match scope.as_str() {
+                "docs" => {
+                    let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref(), include_superseded)?;
+                    format_search_results(&results, cli.format);
+                }
+                "memory" => {
+                    let entries = handle_memory_search(&ctx, &query, limit)?;
+                    format_memory_list(&entries, cli.format);
+                }
+                "all" => {
+                    let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref(), include_superseded)?;
+                    let entries = handle_memory_search(&ctx, &query, limit)?;
+                    if !results.is_empty() {
+                        println!("## Documents\n");
+                        format_search_results(&results, cli.format);
+                    }
+                    if !entries.is_empty() {
+                        println!("## Memory Entries\n");
+                        format_memory_list(&entries, cli.format);
+                    }
+                    if results.is_empty() && entries.is_empty() {
+                        println!("No results found.");
+                    }
+                }
+                _ => {
+                    eprintln!("Invalid scope: '{}'. Valid values: docs, memory, all", scope);
+                    std::process::exit(1);
+                }
+            }
         }
         Command::Get { id, lines } => {
+            use mdkb::cli::handlers::GetResult;
             let ctx = Context::open(&cwd)?;
-            let (doc, content) = handle_get(&ctx, &id, lines.as_deref())?;
-            format_document(&doc, &content, cli.format);
+            match handle_get(&ctx, &id, lines.as_deref())? {
+                GetResult::Document(doc, content) => {
+                    format_document(&doc, &content, cli.format);
+                }
+                GetResult::Memory(entry) => {
+                    format_memory_entry(&entry, cli.format);
+                }
+            }
         }
         Command::Mget {
             pattern,
@@ -110,8 +141,8 @@ async fn main() -> Result<()> {
         }
         Command::Status => {
             let ctx = Context::open(&cwd)?;
-            let status = handle_status(&ctx)?;
-            format_status(&status, cli.format);
+            let result = handle_status(&ctx)?;
+            format_status(&result, cli.format);
         }
         Command::Update => {
             let ctx = Context::open(&cwd)?;
@@ -358,39 +389,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn format_collections(collections: &[mdkb::domain::Collection], format: OutputFormat) {
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(collections).unwrap());
-        }
-        OutputFormat::Csv => {
-            println!("name,path,pattern,created_at,updated_at");
-            for c in collections {
-                println!(
-                    "{},{},{},{},{}",
-                    c.name, c.path, c.pattern, c.created_at, c.updated_at
-                );
-            }
-        }
-        OutputFormat::Markdown => {
-            println!("| Name | Path | Pattern |");
-            println!("|------|------|---------|");
-            for c in collections {
-                println!("| {} | {} | {} |", c.name, c.path, c.pattern);
-            }
-        }
-        OutputFormat::Text => {
-            if collections.is_empty() {
-                println!("No collections found.");
-            } else {
-                for c in collections {
-                    println!("{}: {} ({})", c.name, c.path, c.pattern);
-                }
-            }
-        }
-    }
-}
-
 fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -451,10 +449,21 @@ fn format_document(doc: &mdkb::domain::Document, content: &str, format: OutputFo
     }
 }
 
-fn format_status(status: &mdkb::domain::IndexStatus, format: OutputFormat) {
+fn format_status(result: &mdkb::cli::handlers::StatusResult, format: OutputFormat) {
+    let status = &result.index;
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(status).unwrap());
+            let output = serde_json::json!({
+                "index": status,
+                "collections": result.collections.iter().map(|c| serde_json::json!({
+                    "name": c.name,
+                    "path": c.path,
+                    "pattern": c.pattern,
+                    "source": c.source,
+                    "doc_count": c.doc_count,
+                })).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
         }
         OutputFormat::Csv => {
             println!("collections,documents,stale,db_size_bytes");
@@ -464,12 +473,20 @@ fn format_status(status: &mdkb::domain::IndexStatus, format: OutputFormat) {
             );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
-            println!("Collections: {}", status.collections);
             println!("Documents:   {}", status.documents);
             println!("Stale:       {}", status.stale_documents);
             println!("DB Size:     {} bytes", status.db_size_bytes);
             if let Some(ts) = status.last_updated {
                 println!("Last Update: {}", ts);
+            }
+            println!("\nCollections ({}):", result.collections.len());
+            if result.collections.is_empty() {
+                println!("  (none)");
+            } else {
+                for c in &result.collections {
+                    let tag = if c.source == "convention" { "[convention]" } else { "[manual]" };
+                    println!("  - {} {} ({}): {} docs, pattern: {}", c.name, tag, c.path, c.doc_count, c.pattern);
+                }
             }
         }
     }
