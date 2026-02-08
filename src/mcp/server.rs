@@ -1349,8 +1349,17 @@ pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
     // Start file watcher in background
     let watcher_root = root.clone();
     let watcher_ctx = server.ctx.clone();
+    #[cfg(feature = "code-intel")]
+    let watcher_code_index = server.code_index.clone();
     tokio::spawn(async move {
-        if let Err(e) = run_file_watcher(watcher_root, watcher_ctx).await {
+        if let Err(e) = run_file_watcher(
+            watcher_root,
+            watcher_ctx,
+            #[cfg(feature = "code-intel")]
+            watcher_code_index,
+        )
+        .await
+        {
             tracing::error!("File watcher error: {}", e);
         }
     });
@@ -1372,6 +1381,7 @@ pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
 async fn run_file_watcher(
     root: PathBuf,
     ctx: Arc<Mutex<Option<Context>>>,
+    #[cfg(feature = "code-intel")] code_index: Arc<Mutex<Option<IndexFacade>>>,
 ) -> crate::error::Result<()> {
     let config = WatcherConfig::default();
     let mut watcher = FileWatcher::new(config)?;
@@ -1390,7 +1400,7 @@ async fn run_file_watcher(
     };
     drop(ctx_guard);
 
-    // Watch all collection paths
+    // Watch all collection paths (for document reindex)
     for coll in &collection_list {
         let path = root.join(&coll.path);
         if path.exists() {
@@ -1402,14 +1412,55 @@ async fn run_file_watcher(
         }
     }
 
+    // Watch root for source code changes (code intelligence)
+    #[cfg(feature = "code-intel")]
+    {
+        let code_config = {
+            let config_path = root.join(".mdkb/config.toml");
+            crate::Config::load_or_default(&config_path).code
+        };
+        if code_config.enabled {
+            if let Err(e) = watcher.watch(&root.to_path_buf()) {
+                tracing::warn!("Failed to watch root for code changes: {}", e);
+            } else {
+                tracing::info!("Watching root for source code changes");
+            }
+        }
+    }
+
     // Process file changes
     while let Some(change) = watcher.recv().await {
         tracing::debug!("File change detected: {:?}", change.path);
 
-        // Re-acquire context and trigger update
+        // Check if this is a source code file change
+        #[cfg(feature = "code-intel")]
+        {
+            use crate::code::parsing::language::Language;
+            if Language::from_path(&change.path).is_some() {
+                let mut idx_guard = code_index.lock().await;
+                if let Some(facade) = idx_guard.as_mut() {
+                    match facade.reindex(&root) {
+                        Ok(stats) => {
+                            if stats.symbols_indexed > 0 {
+                                tracing::info!(
+                                    "Code reindexed: {} files, {} symbols",
+                                    stats.files_indexed,
+                                    stats.symbols_indexed,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("Code reindex failed: {}", e);
+                        }
+                    }
+                }
+                // Also trigger document reindex in case it's in a collection
+            }
+        }
+
+        // Re-acquire context and trigger document update
         let mut ctx_guard = ctx.lock().await;
         if let Some(ctx_ref) = ctx_guard.as_mut() {
-            // Check if the changed file matches any collection pattern
             match handle_update(ctx_ref, &root) {
                 Ok(result) => {
                     if result.added > 0 || result.updated > 0 || result.removed > 0 {
