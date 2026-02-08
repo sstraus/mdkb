@@ -257,15 +257,12 @@ fn test_mcp_tools_list() {
     let expected_tools = vec![
         "search",
         "get",
-        "list_collections",
         "status",
         "update",
         "multi_get",
         "get_metrics",
-        "memory_index",
         "memory_write",
         "memory_delete",
-        "evolution",
         "collection_add",
         "collection_remove",
     ];
@@ -298,8 +295,9 @@ fn test_mcp_tool_status() {
     let result = harness.call_tool("status", json!({}));
     let text = McpTestHarness::get_text_content(&result);
 
-    assert!(text.contains("Collections:"), "Should contain Collections count");
+    assert!(text.contains("## Index Status"), "Should contain Index Status section");
     assert!(text.contains("Documents:"), "Should contain Documents count");
+    assert!(text.contains("## Collections"), "Should contain Collections section");
 }
 
 /// Test: search tool with documents.
@@ -409,24 +407,23 @@ fn test_mcp_memory_tools() {
     );
 }
 
-/// Test: list_collections tool.
+/// Test: status tool includes collection listing with source tags.
 #[test]
-fn test_mcp_tool_list_collections() {
+fn test_mcp_tool_status_includes_collections() {
     let mut harness = McpTestHarness::new();
 
-    harness.create_file("docs/readme.md", "# Docs");
-    harness.create_file("notes/todo.md", "# Notes");
-    harness.add_collection("docs", "docs", "**/*.md");
+    harness.create_file("notes/readme.md", "# Notes");
     harness.add_collection("notes", "notes", "**/*.md");
     harness.update_index();
 
     harness.initialize();
 
-    let result = harness.call_tool("list_collections", json!({}));
+    let result = harness.call_tool("status", json!({}));
     let text = McpTestHarness::get_text_content(&result);
 
-    assert!(text.contains("docs"), "Should list docs collection");
-    assert!(text.contains("notes"), "Should list notes collection");
+    assert!(text.contains("notes"), "Should list notes collection in status");
+    assert!(text.contains("[manual]") || text.contains("[convention]"),
+        "Should show source tags. Got: {}", text);
 }
 
 /// Test: update tool triggers reindex.
@@ -718,37 +715,6 @@ fn test_mcp_tool_search_memory_scope() {
     );
 }
 
-/// Test: memory_index tool for session warmup.
-#[test]
-fn test_mcp_tool_memory_index() {
-    let mut harness = McpTestHarness::new();
-    harness.initialize();
-
-    // Create memory entries
-    for i in 1..=5 {
-        harness.call_tool(
-            "memory_write",
-            json!({
-                "id": format!("topic-{}", i),
-                "title": format!("Topic {}", i),
-                "content": format!("Content for topic {}", i),
-                "entry_type": "topic",
-                "tags": ["test"]
-            }),
-        );
-    }
-
-    // Get memory index
-    let result = harness.call_tool("memory_index", json!({"limit": 10}));
-    let text = McpTestHarness::get_text_content(&result);
-
-    // Should list all entries in compact format
-    assert!(text.contains("topic-1") || text.contains("Topic 1"), "Should list entries");
-    // Count entries (each entry should be on its own line or section)
-    let entry_count = (1..=5).filter(|i| text.contains(&format!("topic-{}", i))).count();
-    assert!(entry_count >= 3, "Should list most entries. Found {} in: {}", entry_count, text);
-}
-
 /// Test: get_metrics tool.
 #[test]
 fn test_mcp_tool_get_metrics() {
@@ -772,30 +738,6 @@ fn test_mcp_tool_get_metrics() {
         text.contains("queries") || text.contains("latency") || text.contains("Metrics") || text.len() > 10,
         "Should return metrics information. Got: {}",
         text
-    );
-}
-
-/// Test: evolution tool with document lineage.
-#[test]
-fn test_mcp_tool_evolution() {
-    let mut harness = McpTestHarness::new();
-
-    harness.create_file("docs/api-v1.md", "# API v1\n\nOriginal API");
-    harness.add_collection("docs", "docs", "**/*.md");
-    harness.update_index();
-
-    harness.initialize();
-
-    // Query evolution for a document
-    let result = harness.call_tool(
-        "evolution",
-        json!({"path": "api-v1.md", "direction": "both"}),
-    );
-
-    // Should not error even if no evolution exists
-    assert!(
-        result["result"].is_object() || result["error"].is_null(),
-        "Evolution tool should handle documents without lineage"
     );
 }
 

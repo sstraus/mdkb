@@ -27,9 +27,9 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    AnalyzeImpactParams, CollectionAddParams, CollectionRemoveParams, EvolutionDirection,
-    EvolutionParams, FindCallersParams, FindSymbolParams, GetCallsParams, GetParams,
-    MemoryDeleteParams, MemoryIndexParams, MemoryWriteParams,
+    AnalyzeImpactParams, CollectionAddParams, CollectionRemoveParams,
+    FindCallersParams, FindSymbolParams, GetCallsParams, GetParams,
+    MemoryDeleteParams, MemoryWriteParams,
     MetricsParams, MultiGetParams, SearchParams, SearchSymbolsParams,
 };
 
@@ -487,56 +487,8 @@ impl McpServer {
         )))
     }
 
-    /// List all collections.
-    #[tool(description = "List all indexed collections with their paths and document counts")]
-    async fn list_collections(
-        &self,
-        Parameters(_): Parameters<EmptyObject>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let (output, tokens, coll_count) = {
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let coll_list = collections::list_collections(&ctx.conn)
-                .map_err(|e| mcp_error(format!("Failed to list collections: {}", e)))?;
-
-            if coll_list.is_empty() {
-                return Ok(CallToolResult::success(vec![Content::text(
-                    "No collections found. Use 'mdkb collection add <name> <path>' to add one.",
-                )]));
-            }
-
-            let mut output = String::from("Collections:\n");
-            for coll in &coll_list {
-                // Get document count for this collection
-                let doc_count = collections::get_collection_document_count(&ctx.conn, &coll.name)
-                    .unwrap_or(0);
-                output.push_str(&format!(
-                    "- {} ({}): {} documents\n  Pattern: {}\n",
-                    coll.name,
-                    coll.path,
-                    doc_count,
-                    coll.pattern
-                ));
-            }
-
-            let tokens = count_tokens(&output);
-            let coll_count = coll_list.len();
-            (output, tokens, coll_count)
-        }; // ctx_guard dropped here
-
-        self.record_persistent_call("list_collections", tokens, coll_count, false).await;
-        tracing::debug!("mdkb_list_collections: {} tokens, {} collections", tokens, coll_count);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Get index status.
-    #[tool(description = "Get the current index status (collections, documents, etc.)")]
+    /// Get index status with collection listing.
+    #[tool(description = "Get the current index status (collections, documents, etc.) including collection listing with source tags")]
     async fn status(
         &self,
         Parameters(_): Parameters<EmptyObject>,
@@ -549,13 +501,32 @@ impl McpServer {
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            let status = search::get_status(&ctx.conn)
+            let index_status = search::get_status(&ctx.conn)
                 .map_err(|e| mcp_error(format!("Failed to get status: {}", e)))?;
 
-            let output = format!(
-                "Collections: {}\nDocuments: {}\nStale: {}\nDB Size: {} bytes",
-                status.collections, status.documents, status.stale_documents, status.db_size_bytes
+            let mut output = format!(
+                "## Index Status\n\nDocuments: {}\nStale: {}\nDB Size: {} bytes\n",
+                index_status.documents, index_status.stale_documents, index_status.db_size_bytes
             );
+
+            // Collection listing with source tags
+            let coll_list = collections::list_collections(&ctx.conn)
+                .map_err(|e| mcp_error(format!("Failed to list collections: {}", e)))?;
+
+            output.push_str(&format!("\n## Collections ({})\n\n", coll_list.len()));
+            if coll_list.is_empty() {
+                output.push_str("No collections. Use `collection_add(name, path)` then `update` to index.\n");
+            } else {
+                for coll in &coll_list {
+                    let doc_count = collections::get_collection_document_count(&ctx.conn, &coll.name)
+                        .unwrap_or(0);
+                    let source_tag = if coll.source == "convention" { "[convention]" } else { "[manual]" };
+                    output.push_str(&format!(
+                        "- {} {} ({}): {} docs, pattern: {}\n",
+                        coll.name, source_tag, coll.path, doc_count, coll.pattern
+                    ));
+                }
+            }
 
             let tokens = count_tokens(&output);
             (output, tokens)
@@ -624,7 +595,7 @@ impl McpServer {
 
             if results.is_empty() {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "No documents matched pattern. Use `list_collections` to see indexed collections, or `search(query)` to find by content.",
+                    "No documents matched pattern. Use `status` to see indexed collections, or `search(query)` to find by content.",
                 )]));
             }
 
@@ -829,40 +800,6 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Get memory warmup index (compact list for AI session start).
-    #[tool(description = "Get memory index for session warmup (~50 entries, compact format). Call this at session start to load context.")]
-    async fn memory_index(
-        &self,
-        Parameters(params): Parameters<MemoryIndexParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let (output, tokens, entry_count) = {
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let index = memory::get_warmup_index(&ctx.conn, params.limit)
-                .map_err(|e| mcp_error(format!("Failed to get memory index: {}", e)))?;
-
-            let output = if index.is_empty() {
-                "No memory entries found.".to_string()
-            } else {
-                format!("Memory index ({} entries):\n{}", index.len(), index.join("\n"))
-            };
-
-            let tokens = count_tokens(&output);
-            let entry_count = index.len();
-            (output, tokens, entry_count)
-        }; // ctx_guard dropped here
-
-        self.record_persistent_call("memory_index", tokens, entry_count, false).await;
-        tracing::debug!("mdkb_memory_index: {} tokens, {} entries", tokens, entry_count);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
     /// Write or update a memory entry.
     #[tool(description = "Create or update a memory entry. Use after: (1) solving a problem (type=problem, title=symptom), (2) making architectural decisions (type=decision, title=options), (3) learning patterns (type=topic, title=concept). Title max 50 chars, like a headline. ID should be slug format: 'auth-oauth2-pkce'.")]
     async fn memory_write(
@@ -930,117 +867,6 @@ impl McpServer {
     }
 
 
-    /// Query document evolution history.
-    #[tool(description = "Trace document evolution - what supersedes it, what it supersedes. Use when checking if a document is current or finding latest version.")]
-    async fn evolution(
-        &self,
-        Parameters(params): Parameters<EvolutionParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            // Resolve document path to ID
-            let doc = resolve_document(&ctx.conn, &params.path)
-                .map_err(|_| mcp_error(format!(
-                    "Document not found: {}. Use `search(query)` to find documents, then pass the document ID.",
-                    params.path
-                )))?;
-
-            let mut output = format!("Evolution for {}:\n\n", params.path);
-
-            // Get ancestors (what this document supersedes/updates)
-            let show_ancestors = matches!(
-                params.direction,
-                EvolutionDirection::Ancestors | EvolutionDirection::Both
-            );
-
-            // Get descendants (what supersedes/updates this document)
-            let show_descendants = matches!(
-                params.direction,
-                EvolutionDirection::Descendants | EvolutionDirection::Both
-            );
-
-            if show_ancestors {
-                output.push_str("Ancestors (what this supersedes):\n");
-                let ancestors = evolution::get_evolution_chain(&ctx.conn, doc.id)
-                    .map_err(|e| mcp_error(format!("Failed to get ancestors: {}", e)))?;
-
-                if ancestors.is_empty() {
-                    output.push_str("  (none - this may be an original document)\n");
-                } else {
-                    for evo in &ancestors {
-                        // Get target document info
-                        if let Ok(Some(target)) = documents::get_document(&ctx.conn, evo.target_doc_id) {
-                            output.push_str(&format!(
-                                "  └── {} ({}, {})\n",
-                                target.relative_path,
-                                evo.relationship,
-                                format_timestamp(evo.created_at)
-                            ));
-                            if let Some(ref scope) = evo.scope {
-                                output.push_str(&format!("      Scope: {}\n", scope));
-                            }
-                            if let Some(ref reason) = evo.reason {
-                                output.push_str(&format!("      Reason: {}\n", reason));
-                            }
-                        }
-                    }
-                }
-                output.push('\n');
-            }
-
-            if show_descendants {
-                output.push_str("Descendants (what supersedes this):\n");
-                let descendants = evolution::get_superseded_by(&ctx.conn, doc.id)
-                    .map_err(|e| mcp_error(format!("Failed to get descendants: {}", e)))?;
-
-                if descendants.is_empty() {
-                    output.push_str("  (none - this is the current version)\n");
-                } else {
-                    for evo in &descendants {
-                        // Get source document info (the one that supersedes this)
-                        if let Ok(Some(source)) = documents::get_document(&ctx.conn, evo.source_doc_id) {
-                            output.push_str(&format!(
-                                "  └── {} ({}, {})\n",
-                                source.relative_path,
-                                evo.relationship,
-                                format_timestamp(evo.created_at)
-                            ));
-                            if let Some(ref scope) = evo.scope {
-                                output.push_str(&format!("      Scope: {}\n", scope));
-                            }
-                            if let Some(ref reason) = evo.reason {
-                                output.push_str(&format!("      Reason: {}\n", reason));
-                            }
-                        }
-                    }
-                }
-                output.push('\n');
-            }
-
-            // Get document status
-            if let Ok(Some((status, reason))) = evolution::get_document_status(&ctx.conn, doc.id) {
-                output.push_str(&format!("Status: {:?}\n", status));
-                if let Some(r) = reason {
-                    output.push_str(&format!("Status reason: {}\n", r));
-                }
-            }
-
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        }; // ctx_guard dropped here
-
-        self.record_persistent_call("evolution", tokens, 1, false).await;
-        tracing::debug!("mdkb_evolution: {} tokens", tokens);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
     /// Add a document collection to the knowledge base.
     #[tool(description = "Add a document collection to index. Provide a name, path (relative to project root), and optional glob pattern (default: **/*.md). Call `update` after adding to index the documents.")]
     async fn collection_add(
@@ -1073,7 +899,7 @@ impl McpServer {
     }
 
     /// Remove a document collection from the knowledge base.
-    #[tool(description = "Remove a document collection and all its indexed documents. Use `list_collections` to see available collections.")]
+    #[tool(description = "Remove a document collection and all its indexed documents. Use `status` to see available collections.")]
     async fn collection_remove(
         &self,
         Parameters(params): Parameters<CollectionRemoveParams>,
@@ -1092,7 +918,7 @@ impl McpServer {
             let output = if removed {
                 format!("Removed collection '{}'.", params.name)
             } else {
-                format!("Collection '{}' not found. Use `list_collections` to see available collections.", params.name)
+                format!("Collection '{}' not found. Use `status` to see available collections.", params.name)
             };
             let tokens = count_tokens(&output);
             (output, tokens)
@@ -1105,7 +931,7 @@ impl McpServer {
     }
 
     /// Delete a memory entry by ID.
-    #[tool(description = "Delete a memory entry permanently. Use `search(query, scope=\"memory\")` or `memory_index` to find entry IDs.")]
+    #[tool(description = "Delete a memory entry permanently. Use `search(query, scope=\"memory\")` to find entry IDs.")]
     async fn memory_delete(
         &self,
         Parameters(params): Parameters<MemoryDeleteParams>,
@@ -1124,7 +950,7 @@ impl McpServer {
             let output = if deleted {
                 format!("Deleted memory entry '{}'.", params.id)
             } else {
-                format!("Memory entry '{}' not found. Use `search(query, scope=\"memory\")` to find entries, or `memory_index` to list all.", params.id)
+                format!("Memory entry '{}' not found. Use `search(query, scope=\"memory\")` to find entries.", params.id)
             };
             let tokens = count_tokens(&output);
             (output, tokens)
@@ -1473,14 +1299,6 @@ fn resolve_document(conn: &rusqlite::Connection, path_or_id: &str) -> crate::err
     }))
 }
 
-/// Format a Unix timestamp as an ISO date string.
-fn format_timestamp(timestamp: i64) -> String {
-    use chrono::{DateTime, Utc};
-    DateTime::<Utc>::from_timestamp(timestamp, 0)
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
 #[tool_handler]
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
@@ -1629,18 +1447,15 @@ solutions to past problems, and architectural decisions.
 - `search(query)`: Find documents using hybrid search. Start here. Use `scope` to search `\"docs\"` (default), `\"memory\"`, or `\"all\"`.
 - `get(id)`: Retrieve by numeric ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2'). Includes evolution metadata for documents.
 - `multi_get(pattern)`: Retrieve multiple documents matching a glob pattern.
-- `list_collections`: See what document collections are indexed.
+- `status`: Check index health, collections with [convention]/[manual] tags, and document counts.
+- `update`: Trigger reindex after adding new documents.
 - `collection_add(name, path, pattern)`: Add a document collection to index.
 - `collection_remove(name)`: Remove a collection and its indexed documents.
-- `status`: Check index health (document counts, staleness).
-- `update`: Trigger reindex after adding new documents.
-- `evolution(path)`: Trace document version history.
 
 ## Memory Tools (Cross-Session Persistence)
 
 - `memory_write(id, title, content, type, tags)`: Save knowledge for future sessions.
 - `memory_delete(id)`: Delete a memory entry permanently.
-- `memory_index`: Load all memory entries (session warmup).
 
 ### When to Write Memories
 - After solving a problem: type=problem, title=symptom
@@ -1649,8 +1464,7 @@ solutions to past problems, and architectural decisions.
 
 ## Getting Started
 
-If `list_collections` returns empty, the knowledge base needs content. \
-Add collections with `collection_add(name, path)` then call `update` to index.
+If `status` shows no collections, add with `collection_add(name, path)` then `update` to index.
 ";
 
 /// Build server instructions combining base instructions with memory index.
@@ -1709,7 +1523,7 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 /// Format search results for output.
 fn format_search_results(results: &[SearchResult]) -> String {
     if results.is_empty() {
-        return "No results found. Try broader terms, check `list_collections` for indexed content, or `update` to reindex.".to_string();
+        return "No results found. Try broader terms, check `status` for indexed content, or `update` to reindex.".to_string();
     }
 
     let mut output = String::new();
@@ -1729,7 +1543,7 @@ fn format_search_results(results: &[SearchResult]) -> String {
 /// Format memory search results for output.
 fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
     if entries.is_empty() {
-        return "No matching memory entries found. Use `memory_index` to list all entries, or `memory_write` to create one.".to_string();
+        return "No matching memory entries found. Use `memory_write` to create one.".to_string();
     }
 
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
@@ -1786,7 +1600,7 @@ mod tests {
         let results: Vec<SearchResult> = vec![];
         let output = format_search_results(&results);
         assert!(output.starts_with("No results found."), "Should start with 'No results found.', got: {}", output);
-        assert!(output.contains("list_collections"), "Should suggest list_collections, got: {}", output);
+        assert!(output.contains("status"), "Should suggest status, got: {}", output);
     }
 
     #[test]
@@ -1987,10 +1801,10 @@ mod tests {
         let server = McpServer::new(root);
         let timeout_duration = Duration::from_secs(5);
 
-        // Call different tools in sequence
+        // Call status tool multiple times to verify no deadlock
         let tools_to_test = vec![
             "status",
-            "list_collections",
+            "status",
             "status",
         ];
 
@@ -2000,14 +1814,6 @@ mod tests {
                     tokio::time::timeout(
                         timeout_duration,
                         server.status(Parameters(EmptyObject {})),
-                    )
-                    .await
-                    .map(|r| r.map(|_| ()))
-                }
-                "list_collections" => {
-                    tokio::time::timeout(
-                        timeout_duration,
-                        server.list_collections(Parameters(EmptyObject {})),
                     )
                     .await
                     .map(|r| r.map(|_| ()))
@@ -2292,22 +2098,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_evolution_not_found_error_has_hint() {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let root = temp_dir.path().to_path_buf();
-        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
-        let server = McpServer::new(root);
-
-        let result = server.evolution(Parameters(EvolutionParams {
-            path: "nonexistent.md".to_string(),
-            direction: EvolutionDirection::Both,
-        })).await;
-
-        let msg = extract_error_msg(result);
-        assert!(msg.contains("search"), "Error should suggest search tool, got: {}", msg);
-    }
-
-    #[tokio::test]
     async fn test_search_no_results_has_hint() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
@@ -2323,8 +2113,8 @@ mod tests {
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("list_collections") || text.contains("broader") || text.contains("collection"),
-            "No results should suggest broadening query or checking collections, got: {}", text);
+        assert!(text.contains("status") || text.contains("broader") || text.contains("collection"),
+            "No results should suggest broadening query or checking status, got: {}", text);
     }
 
     #[tokio::test]
@@ -2340,8 +2130,8 @@ mod tests {
         })).await.expect("multi_get should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("list_collections") || text.contains("search"),
-            "No results should suggest list_collections or search, got: {}", text);
+        assert!(text.contains("status") || text.contains("search"),
+            "No results should suggest status or search, got: {}", text);
     }
 
     #[tokio::test]
@@ -2360,8 +2150,8 @@ mod tests {
         })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("memory_write") || text.contains("memory_index"),
-            "No results should suggest memory_write or memory_index, got: {}", text);
+        assert!(text.contains("memory_write"),
+            "No results should suggest memory_write, got: {}", text);
     }
 
     #[tokio::test]
@@ -2376,8 +2166,8 @@ mod tests {
         })).await.expect("collection_remove should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("list_collections"),
-            "Not found should suggest list_collections, got: {}", text);
+        assert!(text.contains("status"),
+            "Not found should suggest status, got: {}", text);
     }
 
     #[tokio::test]
@@ -2392,8 +2182,8 @@ mod tests {
         })).await.expect("memory_delete should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("search") || text.contains("memory_index"),
-            "Not found should suggest search or memory_index, got: {}", text);
+        assert!(text.contains("search"),
+            "Not found should suggest search, got: {}", text);
     }
 
     // --- Code intelligence tool tests ---
