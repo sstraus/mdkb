@@ -29,7 +29,7 @@ fn default_limit() -> usize {
 /// Parameters for the get tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct GetParams {
-    /// Document ID or path.
+    /// Document ID, path, or memory slug.
     pub id: String,
 
     /// Optional line range (e.g., "10:50").
@@ -58,13 +58,6 @@ pub struct MemoryIndexParams {
 
 fn default_memory_limit() -> usize {
     50
-}
-
-/// Parameters for the memory get tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct MemoryGetParams {
-    /// Memory entry ID.
-    pub id: String,
 }
 
 /// Parameters for the memory write tool.

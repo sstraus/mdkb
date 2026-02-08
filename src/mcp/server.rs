@@ -29,7 +29,7 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 use super::tools::{
     AnalyzeImpactParams, CollectionAddParams, CollectionRemoveParams, EvolutionDirection,
     EvolutionParams, FindCallersParams, FindSymbolParams, GetCallsParams, GetParams,
-    MemoryDeleteParams, MemoryGetParams, MemoryIndexParams, MemorySearchParams, MemoryWriteParams,
+    MemoryDeleteParams, MemoryIndexParams, MemorySearchParams, MemoryWriteParams,
     MetricsParams, MultiGetParams, SearchParams, SearchSymbolsParams,
 };
 
@@ -171,6 +171,66 @@ impl McpServer {
         Ok(())
     }
 
+    /// Helper: retrieve document content with optional line range and evolution metadata.
+    fn get_document_content(
+        &self,
+        ctx: &Context,
+        doc: &crate::domain::Document,
+        lines: &Option<String>,
+    ) -> Result<String, McpError> {
+        let content = documents::get_content(&ctx.conn, &doc.hash)
+            .map_err(|e| mcp_error(format!("Failed to get content: {}", e)))?
+            .ok_or_else(|| mcp_error("Content missing for document. Try `update` to reindex."))?;
+
+        // Apply line range if specified
+        let mut output = if let Some(range) = lines {
+            apply_line_range(&content, range)?
+        } else {
+            content
+        };
+
+        // Append evolution metadata
+        if let Ok(Some((status, reason))) = evolution::get_document_status(&ctx.conn, doc.id) {
+            let status_str = format!("{:?}", status);
+            if status_str != "Current" {
+                output.push_str(&format!("\n\n---\n**Status:** {}", status_str));
+                if let Some(r) = reason {
+                    output.push_str(&format!(" ({})", r));
+                }
+
+                // Show what supersedes this document
+                if let Ok(descendants) = evolution::get_superseded_by(&ctx.conn, doc.id) {
+                    for evo in &descendants {
+                        if let Ok(Some(source)) = documents::get_document(&ctx.conn, evo.source_doc_id) {
+                            output.push_str(&format!(
+                                "\n**Superseded by:** {} ({})",
+                                source.relative_path, evo.relationship
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Apply token limit with continuation guidance
+        let max_tokens = self.config.max_response_tokens;
+        let output = if max_tokens > 0 {
+            truncate_with_continuation(&output, max_tokens, doc.id).content
+        } else {
+            output
+        };
+
+        Ok(output)
+    }
+
+    /// Helper: finish a document get by recording metrics.
+    async fn finish_get(&self, output: String, tokens: usize) -> Result<CallToolResult, McpError> {
+        self.metrics.record_get(tokens);
+        self.record_persistent_call("get", tokens, 1, false).await;
+        tracing::debug!("mdkb_get: {} tokens", tokens);
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
     /// Initialize the code intelligence index (Tantivy-backed).
     ///
     /// Opens or creates the index at `.mdkb/code-index/`.
@@ -286,62 +346,77 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Retrieve a document by ID or path.
-    #[tool(description = "Retrieve a document by ID or path, with optional line range")]
+    /// Retrieve a document by ID or path, with optional line range
+    #[tool(description = "Retrieve a document by ID or path, with optional line range. Also accepts memory slugs (e.g., 'auth-oauth2-pkce') to retrieve memory entries.")]
     async fn get(
         &self,
         Parameters(params): Parameters<GetParams>,
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let max_tokens = self.config.max_response_tokens;
-        let (output, tokens, truncated) = {
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            // Try to parse as ID
-            let doc = if let Ok(id) = params.id.parse::<i64>() {
-                documents::get_document(&ctx.conn, id)
-                    .map_err(|e| mcp_error(format!("Failed to get document: {}", e)))?
-            } else {
-                None
-            };
+        // Resolution strategy:
+        // 1. Numeric ID → document lookup
+        // 2. Contains / or . → path resolution across collections
+        // 3. Slug (hyphens, no slashes/dots) → memory entry lookup
+        // 4. Fallback: try full resolve_document for edge cases
+        let id = &params.id;
 
-            let doc = doc.ok_or_else(|| mcp_error(format!(
-                "Document not found: {}. Use `search(query)` to find documents by content, or `list_collections` to see indexed collections.",
-                params.id
-            )))?;
+        // Try numeric ID first
+        if let Ok(numeric_id) = id.parse::<i64>() {
+            if let Some(doc) = documents::get_document(&ctx.conn, numeric_id)
+                .map_err(|e| mcp_error(format!("Failed to get document: {}", e)))? {
+                let output = self.get_document_content(ctx, &doc, &params.lines)?;
+                let tokens = count_tokens(&output);
+                drop(ctx_guard);
+                return self.finish_get(output, tokens).await;
+            }
+        }
 
-            let content = documents::get_content(&ctx.conn, &doc.hash)
-                .map_err(|e| mcp_error(format!("Failed to get content: {}", e)))?
-                .ok_or_else(|| mcp_error("Content missing for document. Try `update` to reindex, or `search(query)` to find an alternative."))?;
+        // Try path resolution (contains / or .)
+        if id.contains('/') || id.contains('.') {
+            if let Ok(doc) = resolve_document(&ctx.conn, id) {
+                let output = self.get_document_content(ctx, &doc, &params.lines)?;
+                let tokens = count_tokens(&output);
+                drop(ctx_guard);
+                return self.finish_get(output, tokens).await;
+            }
+        }
 
-            // Apply line range if specified
-            let output = if let Some(range) = &params.lines {
-                apply_line_range(&content, range)?
-            } else {
-                content
-            };
-
-            // Apply token limit with continuation guidance
-            let (output, truncated) = if max_tokens > 0 {
-                let result = truncate_with_continuation(&output, max_tokens, doc.id);
-                (result.content, result.truncated)
-            } else {
-                (output, false)
-            };
-
+        // Try memory slug
+        if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+            let output = format!(
+                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times\n\n{}",
+                entry.title,
+                entry.id,
+                entry.entry_type,
+                entry.status,
+                if entry.tags.is_empty() { "none".to_string() } else { entry.tags.join(", ") },
+                entry.access_count,
+                entry.content
+            );
             let tokens = count_tokens(&output);
-            (output, tokens, truncated)
-        }; // ctx_guard dropped here
+            drop(ctx_guard);
+            self.record_persistent_call("get", tokens, 1, false).await;
+            return Ok(CallToolResult::success(vec![Content::text(output)]));
+        }
 
-        self.metrics.record_get(tokens);
-        self.record_persistent_call("get", tokens, 1, truncated).await;
-        tracing::debug!("mdkb_get: {} tokens, truncated={}", tokens, truncated);
+        // Fallback: try full resolve_document for edge cases
+        if let Ok(doc) = resolve_document(&ctx.conn, id) {
+            let output = self.get_document_content(ctx, &doc, &params.lines)?;
+            let tokens = count_tokens(&output);
+            drop(ctx_guard);
+            return self.finish_get(output, tokens).await;
+        }
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
+        Err(mcp_error(format!(
+            "Not found: '{}'. Accepts: numeric document ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2'). Use `search(query)` to find content.",
+            params.id
+        )))
     }
 
     /// List all collections.
@@ -716,52 +791,6 @@ impl McpServer {
 
         self.record_persistent_call("memory_index", tokens, entry_count, false).await;
         tracing::debug!("mdkb_memory_index: {} tokens, {} entries", tokens, entry_count);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Retrieve a memory entry by ID.
-    #[tool(description = "Retrieve full content of a memory entry by ID")]
-    async fn memory_get(
-        &self,
-        Parameters(params): Parameters<MemoryGetParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let entry = memory::get_entry(&ctx.conn, &params.id)
-                .map_err(|e| mcp_error(format!("Failed to get memory entry: {}", e)))?
-                .ok_or_else(|| mcp_error(format!(
-                    "Memory entry not found: {}. Use `memory_search(query)` to find entries, or `memory_index` to list all.",
-                    params.id
-                )))?;
-
-            let output = format!(
-                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times\n\n{}",
-                entry.title,
-                entry.id,
-                entry.entry_type,
-                entry.status,
-                if entry.tags.is_empty() {
-                    "none".to_string()
-                } else {
-                    entry.tags.join(", ")
-                },
-                entry.access_count,
-                entry.content
-            );
-
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        }; // ctx_guard dropped here
-
-        self.record_persistent_call("memory_get", tokens, 1, false).await;
-        tracing::debug!("mdkb_memory_get: {} tokens", tokens);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -1573,7 +1602,7 @@ solutions to past problems, and architectural decisions.
 ## Core Tools
 
 - `search(query)`: Find documents using hybrid search. Start here.
-- `get(id)`: Retrieve full document content by ID (from search results).
+- `get(id)`: Retrieve by numeric ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2'). Includes evolution metadata for documents.
 - `multi_get(pattern)`: Retrieve multiple documents matching a glob pattern.
 - `list_collections`: See what document collections are indexed.
 - `collection_add(name, path, pattern)`: Add a document collection to index.
@@ -1585,7 +1614,6 @@ solutions to past problems, and architectural decisions.
 ## Memory Tools (Cross-Session Persistence)
 
 - `memory_write(id, title, content, type, tags)`: Save knowledge for future sessions.
-- `memory_get(id)`: Retrieve a memory entry by ID.
 - `memory_delete(id)`: Delete a memory entry permanently.
 - `memory_search(query)`: Search memory entries.
 - `memory_index`: Load all memory entries (session warmup).
@@ -2092,11 +2120,12 @@ mod tests {
 
         // Verify it's gone - get should return not found
         let get_result = server
-            .memory_get(Parameters(MemoryGetParams {
+            .get(Parameters(GetParams {
                 id: "test-delete-me".to_string(),
+                lines: None,
             }))
             .await;
-        assert!(get_result.is_err(), "memory_get should fail for deleted entry");
+        assert!(get_result.is_err(), "get should fail for deleted memory entry");
 
         // Deleting nonexistent entry should report not found
         let result = server
@@ -2203,19 +2232,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_memory_get_not_found_error_has_hint() {
+    async fn test_get_slug_not_found_error_has_hint() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.memory_get(Parameters(MemoryGetParams {
-            id: "nonexistent-entry".to_string(),
+        let result = server.get(Parameters(GetParams {
+            id: "nonexistent-memory-slug".to_string(),
+            lines: None,
         })).await;
 
         let msg = extract_error_msg(result);
-        assert!(msg.contains("memory_search") || msg.contains("memory_index"),
-            "Error should suggest memory_search or memory_index, got: {}", msg);
+        assert!(msg.contains("search"),
+            "Error should suggest search tool, got: {}", msg);
     }
 
     #[tokio::test]

@@ -263,7 +263,6 @@ fn test_mcp_tools_list() {
         "multi_get",
         "get_metrics",
         "memory_index",
-        "memory_get",
         "memory_write",
         "memory_search",
         "memory_delete",
@@ -376,7 +375,7 @@ fn test_mcp_tool_get() {
     );
 }
 
-/// Test: memory_write and memory_get tools.
+/// Test: memory_write and unified get for memory entries.
 #[test]
 fn test_mcp_memory_tools() {
     let mut harness = McpTestHarness::new();
@@ -400,13 +399,13 @@ fn test_mcp_memory_tools() {
         "memory_write should succeed"
     );
 
-    // Get the memory entry back
-    let get_result = harness.call_tool("memory_get", json!({"id": "test-memory-entry"}));
+    // Get the memory entry back via unified get (slug resolution)
+    let get_result = harness.call_tool("get", json!({"id": "test-memory-entry"}));
     let get_text = McpTestHarness::get_text_content(&get_result);
 
     assert!(
         get_text.contains("Test Memory Entry"),
-        "Should retrieve memory entry. Got: {}",
+        "Should retrieve memory entry via unified get. Got: {}",
         get_text
     );
 }
@@ -857,8 +856,8 @@ fn test_mcp_memory_update() {
         }),
     );
 
-    // Verify original
-    let get1 = harness.call_tool("memory_get", json!({"id": "update-test"}));
+    // Verify original via unified get
+    let get1 = harness.call_tool("get", json!({"id": "update-test"}));
     let text1 = McpTestHarness::get_text_content(&get1);
     assert!(text1.contains("Original"), "Should have original content");
 
@@ -874,8 +873,8 @@ fn test_mcp_memory_update() {
         }),
     );
 
-    // Verify updated
-    let get2 = harness.call_tool("memory_get", json!({"id": "update-test"}));
+    // Verify updated via unified get
+    let get2 = harness.call_tool("get", json!({"id": "update-test"}));
     let text2 = McpTestHarness::get_text_content(&get2);
     assert!(text2.contains("Updated"), "Should have updated content. Got: {}", text2);
 }
