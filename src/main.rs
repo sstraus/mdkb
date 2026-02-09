@@ -156,8 +156,24 @@ async fn main() -> Result<()> {
             let result = handle_embed(&ctx)?;
             format_embed_result(&result, cli.format);
         }
-        Command::Serve => {
-            run_server(cwd).await?;
+        Command::Serve { http, https, bind, token } => {
+            let transport = if https {
+                mdkb::mcp::server::TransportMode::Https {
+                    bind: bind.unwrap_or_else(|| "127.0.0.1:8443".to_string()),
+                    token,
+                }
+            } else if http {
+                mdkb::mcp::server::TransportMode::Http {
+                    bind: bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
+                    token,
+                }
+            } else {
+                if bind.is_some() || token.is_some() {
+                    eprintln!("Warning: --bind and --token are only used with --http or --https");
+                }
+                mdkb::mcp::server::TransportMode::Stdio
+            };
+            run_server(cwd, transport).await?;
         }
         Command::Stats { sessions, aggregate } => {
             let ctx = Context::open(&cwd)?;

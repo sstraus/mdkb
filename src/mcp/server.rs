@@ -1315,8 +1315,25 @@ impl ServerHandler for McpServer {
     }
 }
 
-/// Run the MCP server on stdio with file watching.
-pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
+/// Transport mode for the MCP server.
+#[derive(Debug, Clone)]
+pub enum TransportMode {
+    /// Standard IO (stdin/stdout) - default for CLI tools.
+    Stdio,
+    /// HTTP server with optional bearer token auth.
+    Http {
+        bind: String,
+        token: Option<String>,
+    },
+    /// HTTPS server with self-signed cert and optional bearer token auth.
+    Https {
+        bind: String,
+        token: Option<String>,
+    },
+}
+
+/// Run the MCP server with file watching.
+pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error::Result<()> {
     // Load config if available
     let config_path = root.join(".mdkb/config.toml");
     let mcp_config = if config_path.exists() {
@@ -1342,9 +1359,6 @@ pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
     let instructions = load_server_instructions(&root, warmup_limit);
 
     let server = McpServer::with_warmup(root.clone(), mcp_config, Some(instructions));
-    let (stdin, stdout) = rmcp::transport::io::stdio();
-
-    tracing::info!("Starting mdkb MCP server...");
 
     // Start file watcher in background
     let watcher_root = root.clone();
@@ -1364,15 +1378,46 @@ pub async fn run_server(root: PathBuf) -> crate::error::Result<()> {
         }
     });
 
-    let service = server
-        .serve((stdin, stdout))
-        .await
-        .map_err(|e| crate::error::Error::mcp(format!("Failed to start server: {e}")))?;
-
-    service
-        .waiting()
-        .await
-        .map_err(|e| crate::error::Error::mcp(format!("Server error: {e}")))?;
+    match transport {
+        TransportMode::Stdio => {
+            tracing::info!("Starting mdkb MCP server on stdio...");
+            let (stdin, stdout) = rmcp::transport::io::stdio();
+            let service = server
+                .serve((stdin, stdout))
+                .await
+                .map_err(|e| crate::error::Error::mcp(format!("Failed to start server: {e}")))?;
+            service
+                .waiting()
+                .await
+                .map_err(|e| crate::error::Error::mcp(format!("Server error: {e}")))?;
+        }
+        #[cfg(feature = "http-server")]
+        TransportMode::Http { bind, token } => {
+            super::http_server::run_http_server(server, &bind, token.as_deref()).await?;
+        }
+        #[cfg(not(feature = "http-server"))]
+        TransportMode::Http { .. } => {
+            return Err(crate::error::Error::mcp(
+                "HTTP server not enabled. Build with --features http-server".to_string(),
+            ));
+        }
+        #[cfg(feature = "https-server")]
+        TransportMode::Https { bind, token } => {
+            super::https_server::run_https_server(server, &bind, token.as_deref()).await?;
+        }
+        #[cfg(all(feature = "http-server", not(feature = "https-server")))]
+        TransportMode::Https { .. } => {
+            return Err(crate::error::Error::mcp(
+                "HTTPS server not enabled. Build with --features https-server".to_string(),
+            ));
+        }
+        #[cfg(not(feature = "http-server"))]
+        TransportMode::Https { .. } => {
+            return Err(crate::error::Error::mcp(
+                "HTTPS server not enabled. Build with --features https-server".to_string(),
+            ));
+        }
+    }
 
     Ok(())
 }

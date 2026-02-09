@@ -94,8 +94,24 @@ pub enum Command {
     /// Generate embeddings for documents
     Embed,
 
-    /// Start MCP server
-    Serve,
+    /// Start MCP server (stdio by default, --http or --https for network transport)
+    Serve {
+        /// Run as HTTP server instead of stdio
+        #[arg(long)]
+        http: bool,
+
+        /// Run as HTTPS server with self-signed certificate
+        #[arg(long)]
+        https: bool,
+
+        /// Bind address (default: 127.0.0.1:8080 for HTTP, 127.0.0.1:8443 for HTTPS)
+        #[arg(long)]
+        bind: Option<String>,
+
+        /// Bearer token for authentication (required for HTTP/HTTPS)
+        #[arg(long, env = "MDKB_TOKEN")]
+        token: Option<String>,
+    },
 
     /// Show usage statistics
     Stats {

@@ -9,5 +9,11 @@
 pub mod server;
 pub mod tools;
 
+#[cfg(feature = "http-server")]
+pub mod http_server;
+
+#[cfg(feature = "https-server")]
+pub mod https_server;
+
 #[doc(inline)]
 pub use server::McpServer;
