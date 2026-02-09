@@ -1,0 +1,35 @@
+src/code/indexing/mod.rs
+  1f8a62f6bffaba38 23,40,47,52,59,64,82,96-100,262-299,323-372,387-403
+src/mcp/tools.rs
+  1f8a62f6bffaba38 211-233,408-427
+.gitignore
+  1f8a62f6bffaba38 9
+src/code/mod.rs
+  1f8a62f6bffaba38 10
+src/mcp/server.rs
+  1f8a62f6bffaba38 34,1073-1124
+src/code/semantic.rs
+  1f8a62f6bffaba38 1-586
+Cargo.toml
+  1f8a62f6bffaba38 104-106,136
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.1",
+  "base_commit_sha": "268db8602aeb70624d7431e879bb382faa1d31fb",
+  "prompts": {
+    "1f8a62f6bffaba38": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2561c806-890e-497f-bb49-15d2792e2b1c",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 809,
+      "total_deletions": 2,
+      "accepted_lines": 807,
+      "overriden_lines": 0
+    }
+  }
+}
