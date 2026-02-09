@@ -7,6 +7,7 @@ pub mod indexing;
 pub mod parsing;
 pub mod project_resolver;
 pub mod relationship;
+pub mod semantic;
 pub mod storage;
 pub mod symbol;
 pub mod types;

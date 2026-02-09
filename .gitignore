@@ -6,3 +6,4 @@ plans/
 patches/
 .mdkb/
 .mcp.json
+.fastembed_cache/

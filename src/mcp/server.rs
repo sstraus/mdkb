@@ -31,6 +31,7 @@ use super::tools::{
     FindCallersParams, FindSymbolParams, GetCallsParams, GetParams,
     MemoryDeleteParams, MemoryWriteParams,
     MetricsParams, MultiGetParams, SearchParams, SearchSymbolsParams,
+    SemanticSearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -1064,6 +1065,58 @@ impl McpServer {
 
             let tokens = count_tokens(&output);
             self.record_persistent_call("search_symbols", tokens, 1, false).await;
+
+            Ok(CallToolResult::success(vec![Content::text(output)]))
+        }
+    }
+
+    /// Semantic search over code symbols using natural language.
+    #[tool(description = "Search code symbols by meaning using natural language (e.g., 'authentication handler', 'database connection pool'). Uses embedding-based semantic similarity. Complements search_symbols which does keyword matching.")]
+    async fn semantic_search(
+        &self,
+        Parameters(params): Parameters<SemanticSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        #[cfg(not(feature = "code-intel"))]
+        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
+
+        #[cfg(feature = "code-intel")]
+        {
+            self.ensure_code_index().await?;
+
+            let output = {
+                let idx_guard = self.code_index.lock().await;
+                let facade = idx_guard
+                    .as_ref()
+                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
+
+                let mut results = facade
+                    .semantic_search(&params.query, params.limit, params.threshold)
+                    .map_err(|e| mcp_error(format!("Semantic search failed: {e}")))?;
+
+                // Apply kind filter
+                if let Some(ref kind_str) = params.kind {
+                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
+                        results.retain(|(s, _)| s.kind == kind);
+                    } else {
+                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro")));
+                    }
+                }
+
+                if results.is_empty() {
+                    "No semantic matches found. Try broadening your query, lowering the threshold, or using `search_symbols` for keyword search.".to_string()
+                } else {
+                    let mut out = format!("Found {} semantic match(es):\n\n", results.len());
+                    for (sym, score) in &results {
+                        out.push_str(&format_symbol(sym));
+                        out.push_str(&format!("    Similarity: {:.3}\n", score));
+                        out.push('\n');
+                    }
+                    out
+                }
+            }; // idx_guard dropped
+
+            let tokens = count_tokens(&output);
+            self.record_persistent_call("semantic_search", tokens, 1, false).await;
 
             Ok(CallToolResult::success(vec![Content::text(output)]))
         }

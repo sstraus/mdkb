@@ -20,6 +20,7 @@ use tantivy::schema::IndexRecordOption;
 use tantivy::Term;
 
 use crate::code::relationship::RelationKind;
+use crate::code::semantic::{SemanticSearch, format_symbol_text};
 use crate::code::storage::CodeIndex;
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
@@ -36,26 +37,31 @@ pub struct IndexFacade {
     index: CodeIndex,
     config: PipelineConfig,
     unresolved: Vec<UnresolvedRelationship>,
+    semantic: Option<SemanticSearch>,
 }
 
 impl IndexFacade {
     /// Create a new facade with an index at the given path.
     pub fn create(index_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let index = CodeIndex::create(index_path)?;
+        let semantic = init_semantic(index.path());
         Ok(Self {
             index,
             config: PipelineConfig::default(),
             unresolved: Vec::new(),
+            semantic,
         })
     }
 
     /// Open an existing index, or create one if it doesn't exist.
     pub fn open_or_create(index_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let index = CodeIndex::open_or_create(index_path)?;
+        let semantic = init_semantic(index.path());
         Ok(Self {
             index,
             config: PipelineConfig::default(),
             unresolved: Vec::new(),
+            semantic,
         })
     }
 
@@ -73,6 +79,7 @@ impl IndexFacade {
     pub fn index_directory(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
         let (stats, unresolved) = pipeline::index_directory(root, &self.index, &self.config)?;
         self.unresolved.extend(unresolved);
+        self.generate_symbol_embeddings();
         Ok(stats)
     }
 
@@ -86,6 +93,11 @@ impl IndexFacade {
             writer.commit()?;
         }
         self.unresolved.clear();
+        if let Some(ref semantic) = self.semantic {
+            if let Err(e) = semantic.clear() {
+                tracing::warn!("Failed to clear semantic index: {e}");
+            }
+        }
         self.index.reload()?;
 
         self.index_directory(root)
@@ -247,6 +259,45 @@ impl IndexFacade {
     }
 
     // -----------------------------------------------------------------------
+    // Semantic search
+    // -----------------------------------------------------------------------
+
+    /// Search symbols by semantic similarity to a natural language query.
+    ///
+    /// Returns `(Symbol, score)` pairs sorted by descending similarity.
+    pub fn semantic_search(
+        &self,
+        query: &str,
+        limit: usize,
+        threshold: f32,
+    ) -> anyhow::Result<Vec<(Symbol, f32)>> {
+        let Some(ref semantic) = self.semantic else {
+            return Ok(Vec::new());
+        };
+
+        let matches = semantic.search(query, limit, threshold)?;
+
+        let results: Vec<(Symbol, f32)> = matches
+            .into_iter()
+            .filter_map(|m| {
+                let id = SymbolId::new(m.symbol_id)?;
+                let symbol = self.get_symbol(id)?;
+                Some((symbol, m.score))
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Number of stored semantic embeddings.
+    pub fn semantic_count(&self) -> usize {
+        self.semantic
+            .as_ref()
+            .and_then(|s| s.count().ok())
+            .unwrap_or(0)
+    }
+
+    // -----------------------------------------------------------------------
     // Statistics
     // -----------------------------------------------------------------------
 
@@ -269,6 +320,56 @@ impl IndexFacade {
     // Private helpers
     // -----------------------------------------------------------------------
 
+    /// Generate embeddings for all indexed symbols and write to the vector store.
+    fn generate_symbol_embeddings(&self) {
+        let Some(ref semantic) = self.semantic else {
+            return;
+        };
+
+        let symbols = self.all_symbols(100_000);
+        if symbols.is_empty() {
+            return;
+        }
+
+        let embed_inputs: Vec<(u32, String)> = symbols
+            .iter()
+            .map(|sym| {
+                let text = format_symbol_text(
+                    sym.kind,
+                    sym.as_name(),
+                    sym.as_signature(),
+                    sym.as_doc_comment(),
+                );
+                (sym.id.value(), text)
+            })
+            .collect();
+
+        tracing::info!("Generating semantic embeddings for {} symbols...", embed_inputs.len());
+        if let Err(e) = semantic.generate_embeddings(&embed_inputs) {
+            tracing::warn!("Failed to generate semantic embeddings: {e}");
+        }
+    }
+
+    /// Query all symbol documents from the Tantivy index.
+    fn all_symbols(&self, limit: usize) -> Vec<Symbol> {
+        let searcher = self.index.reader().searcher();
+        let schema = self.index.schema();
+
+        let type_term = Term::from_field_text(schema.doc_type, "symbol");
+        let query = TermQuery::new(type_term, IndexRecordOption::Basic);
+
+        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(limit)) else {
+            return Vec::new();
+        };
+
+        top.into_iter()
+            .filter_map(|(_score, addr)| {
+                let doc = searcher.doc::<tantivy::TantivyDocument>(addr).ok()?;
+                doc_to_symbol(&doc, schema)
+            })
+            .collect()
+    }
+
     /// Resolve relationship targets for a given source symbol and relation kind.
     fn resolve_relationship_targets(&self, source: SymbolId, kind: RelationKind) -> Vec<Symbol> {
         self.unresolved
@@ -279,6 +380,24 @@ impl IndexFacade {
                 targets.into_iter().next()
             })
             .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Semantic search initialization
+// ---------------------------------------------------------------------------
+
+/// Try to initialize `SemanticSearch` at `{index_path}/vectors.bin`.
+///
+/// Returns `None` if initialization fails (logged as warning).
+fn init_semantic(index_path: &Path) -> Option<SemanticSearch> {
+    let vectors_path = index_path.join("vectors.bin");
+    match SemanticSearch::new(&vectors_path) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("Failed to initialize semantic search at {}: {e}", vectors_path.display());
+            None
+        }
     }
 }
 

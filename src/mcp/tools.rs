@@ -208,6 +208,29 @@ fn default_max_depth() -> usize {
     3
 }
 
+/// Parameters for semantic_search: natural language search over code symbols.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SemanticSearchParams {
+    /// Natural language query (e.g., "function that handles authentication").
+    pub query: String,
+
+    /// Filter by symbol kind (e.g., "function", "struct", "method").
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    /// Maximum results (default: 10).
+    #[serde(default = "default_limit")]
+    pub limit: usize,
+
+    /// Minimum similarity score 0.0-1.0 (default: 0.3).
+    #[serde(default = "default_threshold")]
+    pub threshold: f32,
+}
+
+fn default_threshold() -> f32 {
+    0.3
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,5 +404,25 @@ mod tests {
         assert_eq!(params.name, "init");
         assert_eq!(params.symbol_id, Some(1));
         assert_eq!(params.max_depth, 5);
+    }
+
+    #[test]
+    fn test_semantic_search_params_defaults() {
+        let json = r#"{"query": "authentication handler"}"#;
+        let params: SemanticSearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "authentication handler");
+        assert!(params.kind.is_none());
+        assert_eq!(params.limit, 10);
+        assert!((params.threshold - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_semantic_search_params_custom() {
+        let json = r#"{"query": "database pool", "kind": "struct", "limit": 5, "threshold": 0.5}"#;
+        let params: SemanticSearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "database pool");
+        assert_eq!(params.kind.as_deref(), Some("struct"));
+        assert_eq!(params.limit, 5);
+        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
     }
 }
