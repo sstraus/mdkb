@@ -275,7 +275,42 @@ impl SemanticSearch {
         })
     }
 
+    /// Initialize the embedding model on a blocking thread.
+    ///
+    /// Call this from async context before using `generate_embeddings` or `search`.
+    /// Uses `spawn_blocking` so model download/init won't block the tokio executor.
+    /// No-op if the model is already loaded.
+    pub async fn init_model_async(&self) -> anyhow::Result<()> {
+        // Fast path: already loaded
+        {
+            let guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+
+        // Slow path: init on blocking thread
+        tracing::info!("Initializing fastembed model (AllMiniLML6V2)...");
+        let model = tokio::task::spawn_blocking(|| {
+            TextEmbedding::try_new(
+                InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
+            )
+            .context("Failed to initialize fastembed model")
+        })
+        .await
+        .context("Model init task panicked")??;
+
+        tracing::info!("fastembed model ready");
+        let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
+        *guard = Some(model);
+        Ok(())
+    }
+
     /// Ensure the embedding model is loaded, initializing it if needed.
+    ///
+    /// Prefer `init_model_async` from async context. This sync version blocks
+    /// the current thread during model download and should only be used from
+    /// non-async callers (e.g. the indexing pipeline).
     fn ensure_model(&self) -> anyhow::Result<()> {
         let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
         if guard.is_none() {

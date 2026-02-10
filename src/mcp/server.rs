@@ -242,6 +242,10 @@ impl McpServer {
             let index_path = self.root.join(".mdkb/code-index");
             let facade = IndexFacade::open_or_create(&index_path)
                 .map_err(|e| mcp_error(format!("Failed to open code index: {}", e)))?;
+            // Pre-init model on blocking thread to avoid executor starvation
+            if let Err(e) = facade.init_semantic_model().await {
+                tracing::warn!("Semantic model init failed (search will init on demand): {e}");
+            }
             *idx_guard = Some(facade);
         }
         Ok(())

@@ -289,6 +289,18 @@ impl IndexFacade {
         Ok(results)
     }
 
+    /// Pre-initialize the semantic search model on a blocking thread.
+    ///
+    /// Call from async context to avoid blocking the tokio executor during
+    /// model download. No-op if semantic search is not configured or model
+    /// is already loaded.
+    pub async fn init_semantic_model(&self) -> anyhow::Result<()> {
+        if let Some(ref semantic) = self.semantic {
+            semantic.init_model_async().await?;
+        }
+        Ok(())
+    }
+
     /// Number of stored semantic embeddings.
     pub fn semantic_count(&self) -> usize {
         self.semantic
