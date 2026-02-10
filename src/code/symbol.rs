@@ -6,7 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use super::types::{CompactString, FileId, Range, SymbolId, SymbolKind, compact_string};
+use super::types::{CompactString, FileId, Range, SymbolId, SymbolKind};
+#[cfg(test)]
+use super::types::compact_string;
 
 /// Visibility of a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,22 +128,6 @@ impl Symbol {
         self.module_path.as_deref()
     }
 
-    /// Convert to compact 32-byte representation for dense storage.
-    pub fn to_compact(&self, string_table: &mut StringTable) -> CompactSymbol {
-        let name_offset = string_table.intern(&self.name);
-        CompactSymbol {
-            name_offset,
-            kind: self.kind.as_u8(),
-            flags: 0,
-            file_id: self.file_id.value() as u16,
-            start_line: self.range.start_line,
-            start_col: self.range.start_column,
-            end_line: self.range.end_line,
-            end_col: self.range.end_column,
-            symbol_id: self.id.value(),
-            _padding: [0; 2],
-        }
-    }
 }
 
 impl fmt::Display for Symbol {
@@ -168,106 +154,9 @@ impl fmt::Display for Symbol {
     }
 }
 
-// --- CompactSymbol ---
-
-/// Compact 32-byte symbol representation for dense storage.
-///
-/// Uses a string table for name lookup instead of heap-allocated strings.
-#[repr(C, align(32))]
-#[derive(Debug, Clone, Copy)]
-pub struct CompactSymbol {
-    pub name_offset: u32,
-    pub kind: u8,
-    pub flags: u8,
-    pub file_id: u16,
-    pub start_line: u32,
-    pub start_col: u16,
-    pub end_line: u32,
-    pub end_col: u16,
-    pub symbol_id: u32,
-    _padding: [u8; 2],
-}
-
-impl CompactSymbol {
-    /// Convert back to a full Symbol using a string table for name lookup.
-    pub fn to_symbol(&self, string_table: &StringTable) -> Option<Symbol> {
-        let name = string_table.get(self.name_offset)?;
-        let kind = SymbolKind::from_u8(self.kind)?;
-        let file_id = FileId::new(u32::from(self.file_id))?;
-        let id = SymbolId::new(self.symbol_id)?;
-
-        Some(Symbol {
-            id,
-            name: compact_string(name),
-            kind,
-            file_id,
-            range: Range::new(self.start_line, self.start_col, self.end_line, self.end_col),
-            file_path: "<unknown>".into(),
-            signature: None,
-            doc_comment: None,
-            module_path: None,
-            visibility: Visibility::Private,
-            scope_context: None,
-        })
-    }
-}
-
-// --- StringTable ---
-
-/// Interned string storage for compact symbol representations.
-///
-/// Stores strings as null-terminated byte sequences in a contiguous buffer.
-/// Returns offsets that can be used to retrieve strings later.
-#[derive(Debug)]
-pub struct StringTable {
-    data: Vec<u8>,
-    offsets: std::collections::HashMap<String, u32>,
-}
-
-impl Default for StringTable {
-    fn default() -> Self {
-        Self {
-            data: vec![0], // null terminator at offset 0
-            offsets: std::collections::HashMap::new(),
-        }
-    }
-}
-
-impl StringTable {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Intern a string, returning its offset. Reuses existing entries.
-    pub fn intern(&mut self, s: &str) -> u32 {
-        if let Some(&offset) = self.offsets.get(s) {
-            return offset;
-        }
-        let offset = self.data.len() as u32;
-        self.data.extend_from_slice(s.as_bytes());
-        self.data.push(0);
-        self.offsets.insert(s.to_string(), offset);
-        offset
-    }
-
-    /// Look up a string by offset.
-    pub fn get(&self, offset: u32) -> Option<&str> {
-        let start = offset as usize;
-        if start >= self.data.len() {
-            return None;
-        }
-        let end = self.data[start..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|pos| start + pos)?;
-        std::str::from_utf8(&self.data[start..end]).ok()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::mem;
 
     #[test]
     fn test_symbol_creation() {
@@ -308,71 +197,6 @@ mod tests {
         assert_eq!(sym.visibility, Visibility::Public);
         assert_eq!(sym.scope_context, Some(ScopeContext::Module));
         assert_eq!(&*sym.file_path, "src/math.rs");
-    }
-
-    #[test]
-    fn test_compact_symbol_size_and_alignment() {
-        assert_eq!(mem::size_of::<CompactSymbol>(), 32);
-        assert_eq!(mem::align_of::<CompactSymbol>(), 32);
-    }
-
-    #[test]
-    fn test_string_table_intern_and_get() {
-        let mut table = StringTable::new();
-
-        let o1 = table.intern("hello");
-        let o2 = table.intern("world");
-        let o3 = table.intern("hello"); // reuse
-
-        assert_eq!(o1, 1); // offset 0 is the initial null
-        assert_ne!(o1, o2);
-        assert_eq!(o1, o3);
-
-        assert_eq!(table.get(o1), Some("hello"));
-        assert_eq!(table.get(o2), Some("world"));
-        assert_eq!(table.get(999), None);
-    }
-
-    #[test]
-    fn test_compact_symbol_roundtrip() {
-        let mut string_table = StringTable::new();
-
-        let original = Symbol::new(
-            SymbolId::new(42).unwrap(),
-            "test_method",
-            SymbolKind::Method,
-            FileId::new(7).unwrap(),
-            Range::new(10, 5, 15, 20),
-        );
-
-        let compact = original.to_compact(&mut string_table);
-        let restored = compact.to_symbol(&string_table).unwrap();
-
-        assert_eq!(original.id, restored.id);
-        assert_eq!(original.name, restored.name);
-        assert_eq!(original.kind, restored.kind);
-        assert_eq!(original.file_id, restored.file_id);
-        assert_eq!(original.range, restored.range);
-    }
-
-    #[test]
-    fn test_all_symbol_kinds_compact_roundtrip() {
-        let mut string_table = StringTable::new();
-
-        for i in 0..SymbolKind::COUNT as u8 {
-            let kind = SymbolKind::from_u8(i).unwrap();
-            let sym = Symbol::new(
-                SymbolId::new(u32::from(i) + 1).unwrap(),
-                format!("test_{i}"),
-                kind,
-                FileId::new(1).unwrap(),
-                Range::new(1, 0, 1, 10),
-            );
-
-            let compact = sym.to_compact(&mut string_table);
-            let restored = compact.to_symbol(&string_table).unwrap();
-            assert_eq!(sym.kind, restored.kind);
-        }
     }
 
     #[test]

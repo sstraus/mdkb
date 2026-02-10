@@ -182,9 +182,6 @@ pub struct CodeConfig {
     /// Code indexing pipeline settings.
     pub indexing: CodeIndexingConfig,
 
-    /// Per-language configuration.
-    pub languages: CodeLanguagesConfig,
-
     /// Semantic code search settings.
     pub semantic_search: CodeSemanticSearchConfig,
 }
@@ -203,37 +200,6 @@ pub struct CodeIndexingConfig {
     pub batch_size: usize,
 }
 
-/// Per-language enable/disable and extension overrides.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct CodeLanguagesConfig {
-    pub rust: LanguageEntry,
-    pub python: LanguageEntry,
-    pub typescript: LanguageEntry,
-    pub javascript: LanguageEntry,
-    pub go: LanguageEntry,
-    pub java: LanguageEntry,
-    pub c: LanguageEntry,
-    pub cpp: LanguageEntry,
-    pub csharp: LanguageEntry,
-    pub php: LanguageEntry,
-    pub swift: LanguageEntry,
-    pub lua: LanguageEntry,
-    pub gdscript: LanguageEntry,
-    pub kotlin: LanguageEntry,
-}
-
-/// Configuration entry for a single language.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LanguageEntry {
-    /// Enable indexing for this language.
-    pub enabled: bool,
-
-    /// Override file extensions (empty = use language defaults).
-    pub extensions: Vec<String>,
-}
-
 /// Semantic code search settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -248,22 +214,12 @@ pub struct CodeSemanticSearchConfig {
     pub threshold: f64,
 }
 
-impl Default for LanguageEntry {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            extensions: Vec::new(),
-        }
-    }
-}
-
 impl Default for CodeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             index_path: "code-index".to_string(),
             indexing: CodeIndexingConfig::default(),
-            languages: CodeLanguagesConfig::default(),
             semantic_search: CodeSemanticSearchConfig::default(),
         }
     }
@@ -278,27 +234,6 @@ impl Default for CodeIndexingConfig {
                 .map(|s| (*s).to_string())
                 .collect(),
             batch_size: DEFAULT_CODE_BATCH_SIZE,
-        }
-    }
-}
-
-impl Default for CodeLanguagesConfig {
-    fn default() -> Self {
-        Self {
-            rust: LanguageEntry::default(),
-            python: LanguageEntry::default(),
-            typescript: LanguageEntry::default(),
-            javascript: LanguageEntry::default(),
-            go: LanguageEntry::default(),
-            java: LanguageEntry::default(),
-            c: LanguageEntry::default(),
-            cpp: LanguageEntry::default(),
-            csharp: LanguageEntry::default(),
-            php: LanguageEntry::default(),
-            swift: LanguageEntry::default(),
-            lua: LanguageEntry::default(),
-            gdscript: LanguageEntry::default(),
-            kotlin: LanguageEntry::default(),
         }
     }
 }
@@ -887,8 +822,6 @@ default_limit = 20
         assert_eq!(config.code.indexing.batch_size, 500);
         assert!(!config.code.indexing.ignore_patterns.is_empty());
         assert!(config.code.indexing.ignore_patterns.contains(&"**/target/**".to_string()));
-        assert!(config.code.languages.rust.enabled);
-        assert!(config.code.languages.kotlin.enabled);
         assert!(!config.code.semantic_search.enabled);
         assert_eq!(config.code.semantic_search.model, "AllMiniLML6V2");
     }
@@ -899,14 +832,12 @@ default_limit = 20
         let toml_str = toml::to_string_pretty(&config).unwrap();
         assert!(toml_str.contains("[code]"));
         assert!(toml_str.contains("[code.indexing]"));
-        assert!(toml_str.contains("[code.languages.rust]"));
         assert!(toml_str.contains("[code.semantic_search]"));
 
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.code.enabled, config.code.enabled);
         assert_eq!(parsed.code.index_path, config.code.index_path);
         assert_eq!(parsed.code.indexing.batch_size, config.code.indexing.batch_size);
-        assert_eq!(parsed.code.languages.kotlin.enabled, true);
         assert_eq!(parsed.code.semantic_search.threshold, config.code.semantic_search.threshold);
     }
 
@@ -920,10 +851,6 @@ index_path = "my-code-idx"
 [code.indexing]
 batch_size = 1000
 
-[code.languages.kotlin]
-enabled = true
-extensions = ["kt", "kts"]
-
 [code.semantic_search]
 enabled = true
 threshold = 0.5
@@ -932,11 +859,7 @@ threshold = 0.5
         assert!(!config.code.enabled);
         assert_eq!(config.code.index_path, "my-code-idx");
         assert_eq!(config.code.indexing.batch_size, 1000);
-        // Non-overridden fields keep defaults
         assert_eq!(config.code.indexing.parallelism, 0);
-        assert!(config.code.languages.rust.enabled); // not overridden
-        assert!(config.code.languages.kotlin.enabled); // overridden
-        assert_eq!(config.code.languages.kotlin.extensions, vec!["kt", "kts"]);
         assert!(config.code.semantic_search.enabled);
         assert_eq!(config.code.semantic_search.threshold, 0.5);
     }
@@ -963,24 +886,6 @@ threshold = 0.5
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_code_language_entry_defaults_all_enabled() {
-        let langs = CodeLanguagesConfig::default();
-        assert!(langs.rust.enabled);
-        assert!(langs.python.enabled);
-        assert!(langs.typescript.enabled);
-        assert!(langs.javascript.enabled);
-        assert!(langs.go.enabled);
-        assert!(langs.java.enabled);
-        assert!(langs.c.enabled);
-        assert!(langs.cpp.enabled);
-        assert!(langs.csharp.enabled);
-        assert!(langs.php.enabled);
-        assert!(langs.swift.enabled);
-        assert!(langs.lua.enabled);
-        assert!(langs.gdscript.enabled);
-        assert!(langs.kotlin.enabled);
-    }
 
     #[test]
     fn test_code_config_ignore_patterns_default() {
