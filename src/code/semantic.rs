@@ -70,6 +70,8 @@ impl VectorStore {
     }
 
     /// Write all entries to the store (overwrites existing data).
+    ///
+    /// Uses write-to-temp + rename for atomic writes (crash-safe on Unix).
     pub fn write_all(&self, entries: &[(u32, Vec<f32>)]) -> anyhow::Result<()> {
         let count = entries.len() as u32;
         let dim = EMBEDDING_DIM as u32;
@@ -92,8 +94,7 @@ impl VectorStore {
             }
         }
 
-        std::fs::write(&self.path, &buf)
-            .with_context(|| format!("Failed to write vector store: {}", self.path.display()))?;
+        atomic_write(&self.path, &buf)?;
         Ok(())
     }
 
@@ -110,10 +111,17 @@ impl VectorStore {
         let count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
         let entry_sz = entry_size();
 
+        let expected_data_size = count
+            .checked_mul(entry_sz)
+            .and_then(|s| s.checked_add(HEADER_SIZE))
+            .ok_or_else(|| anyhow::anyhow!(
+                "Vector store count overflow: {count} entries * {entry_sz} bytes"
+            ))?;
+
         ensure!(
-            data.len() == HEADER_SIZE + count * entry_sz,
+            data.len() == expected_data_size,
             "Vector store size mismatch: expected {} bytes, got {}",
-            HEADER_SIZE + count * entry_sz,
+            expected_data_size,
             data.len()
         );
 
@@ -127,6 +135,7 @@ impl VectorStore {
             let mut embedding = Vec::with_capacity(EMBEDDING_DIM);
             for _ in 0..EMBEDDING_DIM {
                 let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+                ensure!(val.is_finite(), "Non-finite float in vector store at offset {offset}");
                 embedding.push(val);
                 offset += 4;
             }
@@ -169,8 +178,35 @@ fn write_empty_file(path: &Path) -> anyhow::Result<()> {
     buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // count = 0
-    std::fs::write(path, &buf)
-        .with_context(|| format!("Failed to write empty vector store: {}", path.display()))?;
+    atomic_write(path, &buf)?;
+    Ok(())
+}
+
+/// Write data to a file atomically via write-to-temp + rename.
+///
+/// On Unix, rename is atomic so a crash during write won't corrupt the target.
+fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let tmp_path = parent.join(format!(
+        ".{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("vectorstore")
+    ));
+
+    std::fs::write(&tmp_path, data)
+        .with_context(|| format!("Failed to write temp file: {}", tmp_path.display()))?;
+
+    std::fs::rename(&tmp_path, path).with_context(|| {
+        // Clean up temp file on rename failure
+        let _ = std::fs::remove_file(&tmp_path);
+        format!(
+            "Failed to rename {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+
     Ok(())
 }
 
@@ -497,6 +533,116 @@ mod tests {
         let loaded = store2.load().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, 42);
+    }
+
+    #[test]
+    fn test_vector_store_overflow_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overflow.bin");
+
+        // Craft a header with a huge count that would overflow when multiplied by entry_size
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
+        buf.extend_from_slice(&u32::MAX.to_le_bytes()); // count = 0xFFFFFFFF
+        std::fs::write(&path, &buf).unwrap();
+
+        let store = VectorStore::open(&path).unwrap();
+        let result = store.load();
+        assert!(result.is_err(), "Should fail on overflow count");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("overflow") || err.contains("mismatch"),
+            "Expected overflow or mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_vector_store_nan_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nan.bin");
+
+        // Write a valid header + one entry with NaN
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // count = 1
+        buf.extend_from_slice(&1u32.to_le_bytes()); // symbol_id = 1
+        // First float is NaN, rest are 0.0
+        buf.extend_from_slice(&f32::NAN.to_le_bytes());
+        for _ in 1..EMBEDDING_DIM {
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let store = VectorStore::open(&path).unwrap();
+        let result = store.load();
+        assert!(result.is_err(), "Should reject NaN values");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Non-finite"), "Expected non-finite error, got: {err}");
+    }
+
+    #[test]
+    fn test_vector_store_inf_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inf.bin");
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&f32::INFINITY.to_le_bytes());
+        for _ in 1..EMBEDDING_DIM {
+            buf.extend_from_slice(&0.0f32.to_le_bytes());
+        }
+        std::fs::write(&path, &buf).unwrap();
+
+        let store = VectorStore::open(&path).unwrap();
+        let result = store.load();
+        assert!(result.is_err(), "Should reject Inf values");
+    }
+
+    #[test]
+    fn test_vector_store_atomic_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(dir.path().join("atomic.bin")).unwrap();
+
+        let entries = vec![(1, vec![0.5; EMBEDDING_DIM])];
+        store.write_all(&entries).unwrap();
+
+        // Verify no temp file left behind
+        let tmp_path = dir.path().join(".atomic.bin.tmp");
+        assert!(!tmp_path.exists(), "Temp file should be cleaned up after rename");
+
+        // Verify data is correct
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, 1);
+    }
+
+    #[test]
+    fn test_vector_store_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.bin");
+
+        // Write a header claiming 1 entry but only provide partial data
+        let mut buf = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
+        buf.extend_from_slice(&1u32.to_le_bytes()); // claims 1 entry
+        buf.extend_from_slice(&1u32.to_le_bytes()); // partial: just symbol_id, no embedding
+        std::fs::write(&path, &buf).unwrap();
+
+        let store = VectorStore::open(&path).unwrap();
+        let result = store.load();
+        assert!(result.is_err(), "Should fail on size mismatch");
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("mismatch"), "Expected size mismatch error, got: {err}");
     }
 
     // --- Cosine similarity tests ---
