@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Json, Response};
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
+use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
 use super::McpServer;
@@ -103,8 +104,9 @@ async fn auth_middleware(
 
     match auth_header {
         Some(auth) if auth.starts_with("Bearer ") => {
-            let provided = &auth["Bearer ".len()..];
-            if provided == expected_token {
+            let provided = auth["Bearer ".len()..].as_bytes();
+            let expected = expected_token.as_bytes();
+            if provided.ct_eq(expected).into() {
                 next.run(request).await
             } else {
                 (StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response()

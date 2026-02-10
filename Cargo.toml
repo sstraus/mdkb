@@ -104,6 +104,9 @@ rayon = { version = "1.10", optional = true }
 # Code intelligence - semantic search with local embeddings
 fastembed = { version = "4", optional = true }
 
+# HTTP server auth (constant-time token comparison)
+subtle = { version = "2", optional = true }
+
 # HTTPS server (self-signed certs)
 rcgen = { version = "0.13", optional = true }
 axum-server = { version = "0.7", features = ["tls-rustls-no-provider"], optional = true }
@@ -112,7 +115,7 @@ rustls = { version = "0.23", features = ["ring"], default-features = false, opti
 [features]
 default = []
 llm = []  # Enable LLM-powered features like memory condense
-http-server = ["dep:axum", "dep:tower", "dep:tokio-util", "rmcp/transport-streamable-http-server"]
+http-server = ["dep:axum", "dep:tower", "dep:tokio-util", "dep:subtle", "rmcp/transport-streamable-http-server"]
 https-server = ["http-server", "dep:rcgen", "dep:axum-server", "dep:rustls"]
 code-intel = [
     "dep:tantivy",
