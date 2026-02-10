@@ -151,15 +151,19 @@ impl VectorStore {
         write_empty_file(&self.path)
     }
 
-    /// Entry count from the header (without loading all data).
+    /// Entry count from the header (reads only 16 bytes, not the full file).
     pub fn count(&self) -> anyhow::Result<usize> {
-        let data = std::fs::read(&self.path)
-            .with_context(|| format!("Failed to read vector store: {}", self.path.display()))?;
-        if data.len() < HEADER_SIZE {
-            return Ok(0);
+        let mut file = std::fs::File::open(&self.path)
+            .with_context(|| format!("Failed to open vector store: {}", self.path.display()))?;
+        let mut header = [0u8; HEADER_SIZE];
+        match file.read_exact(&mut header) {
+            Ok(()) => {
+                let count = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+                Ok(count)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(0),
+            Err(e) => Err(e).context("Failed to read vector store header"),
         }
-        let count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
-        Ok(count)
     }
 }
 
@@ -284,17 +288,24 @@ pub struct SemanticMatch {
     pub score: f32,
 }
 
+/// Batch size for embedding generation to avoid loading all symbols at once.
+const EMBED_BATCH_SIZE: usize = 5000;
+
 /// Orchestrates embedding generation and brute-force search over code symbols.
 pub struct SemanticSearch {
     model: Mutex<Option<TextEmbedding>>,
     store: VectorStore,
+    /// Cached embeddings loaded from disk. Invalidated on write.
+    cache: Mutex<Option<Vec<(u32, Vec<f32>)>>>,
 }
 
 impl std::fmt::Debug for SemanticSearch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cached = self.cache.lock().map(|g| g.as_ref().map(|c| c.len())).unwrap_or(None);
         f.debug_struct("SemanticSearch")
             .field("store", &self.store)
             .field("model_loaded", &self.model.lock().map(|g| g.is_some()).unwrap_or(false))
+            .field("cached_entries", &cached)
             .finish()
     }
 }
@@ -308,6 +319,7 @@ impl SemanticSearch {
         Ok(Self {
             model: Mutex::new(None),
             store,
+            cache: Mutex::new(None),
         })
     }
 
@@ -361,37 +373,52 @@ impl SemanticSearch {
         Ok(())
     }
 
-    /// Generate embeddings for a batch of symbols and write them to the vector store.
+    /// Generate embeddings for symbols and write them to the vector store.
     ///
+    /// Processes in batches of [`EMBED_BATCH_SIZE`] to bound memory usage.
     /// Each entry is `(symbol_id, text_to_embed)`.
     pub fn generate_embeddings(&self, symbols: &[(u32, String)]) -> anyhow::Result<()> {
+        // Invalidate cache since we're rewriting the store
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
+        }
+
         if symbols.is_empty() {
             return self.store.clear();
         }
 
         self.ensure_model()?;
 
-        let texts: Vec<&str> = symbols.iter().map(|(_, text)| text.as_str()).collect();
-        let embeddings = {
-            let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
-            let model = guard.as_mut().expect("model initialized by ensure_model");
-            model.embed(texts, None).context("Failed to generate embeddings")?
-        };
+        let mut all_entries: Vec<(u32, Vec<f32>)> = Vec::with_capacity(symbols.len());
 
-        let entries: Vec<(u32, Vec<f32>)> = symbols
-            .iter()
-            .zip(embeddings)
-            .map(|((id, _), emb)| (*id, emb))
-            .collect();
+        for chunk in symbols.chunks(EMBED_BATCH_SIZE) {
+            let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+            let embeddings = {
+                let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
+                let model = guard.as_mut().expect("model initialized by ensure_model");
+                model.embed(texts, None).context("Failed to generate embeddings")?
+            };
 
-        self.store.write_all(&entries)?;
-        tracing::info!("Generated {} embeddings", entries.len());
+            for ((id, _), emb) in chunk.iter().zip(embeddings) {
+                all_entries.push((*id, emb));
+            }
+
+            tracing::info!(
+                "Generated embeddings batch: {}/{} symbols",
+                all_entries.len(),
+                symbols.len()
+            );
+        }
+
+        self.store.write_all(&all_entries)?;
+        tracing::info!("Wrote {} embeddings to store", all_entries.len());
         Ok(())
     }
 
     /// Search for symbols similar to the given query text.
     ///
     /// Returns up to `limit` results with similarity >= `threshold`, sorted by score descending.
+    /// Embeddings are cached in memory after first load.
     pub fn search(
         &self,
         query: &str,
@@ -410,8 +437,10 @@ impl SemanticSearch {
             embeddings.remove(0)
         };
 
-        // Load stored embeddings
-        let entries = self.store.load()?;
+        // Load stored embeddings (cached after first read)
+        self.ensure_cache()?;
+        let cache_guard = self.cache.lock().map_err(|e| anyhow::anyhow!("Cache lock poisoned: {e}"))?;
+        let entries = cache_guard.as_ref().expect("cache populated by ensure_cache");
 
         // Brute-force cosine similarity
         let mut scored: Vec<SemanticMatch> = entries
@@ -429,8 +458,22 @@ impl SemanticSearch {
         Ok(scored)
     }
 
-    /// Clear the vector store.
+    /// Ensure the embedding cache is populated from disk.
+    fn ensure_cache(&self) -> anyhow::Result<()> {
+        let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("Cache lock poisoned: {e}"))?;
+        if cache.is_none() {
+            let entries = self.store.load()?;
+            tracing::debug!("Cached {} embeddings from disk", entries.len());
+            *cache = Some(entries);
+        }
+        Ok(())
+    }
+
+    /// Clear the vector store and invalidate the cache.
     pub fn clear(&self) -> anyhow::Result<()> {
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
+        }
         self.store.clear()
     }
 
