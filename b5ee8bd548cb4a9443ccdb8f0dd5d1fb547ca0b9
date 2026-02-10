@@ -1,0 +1,23 @@
+src/code/semantic.rs
+  412db19a9e85dbe7 154,156-165,291-293,298-299,304,308,322,378,381-385,392,394-395,401-411,413-414,421,440-443,461-469,472,474-476
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.1",
+  "base_commit_sha": "b5ee8bd548cb4a9443ccdb8f0dd5d1fb547ca0b9",
+  "prompts": {
+    "412db19a9e85dbe7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e528956f-7436-49c5-ab81-ff473c5795b0",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 69,
+      "total_deletions": 26,
+      "accepted_lines": 63,
+      "overriden_lines": 0
+    }
+  }
+}
