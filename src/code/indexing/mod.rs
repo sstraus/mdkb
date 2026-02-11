@@ -231,6 +231,9 @@ impl IndexFacade {
     /// Compute the impact radius: all symbols reachable from the given one
     /// within `max_depth` hops via any relationship.
     pub fn get_impact_radius(&self, start: SymbolId, max_depth: usize) -> Vec<SymbolId> {
+        // Build adjacency list once to avoid N+1 Tantivy queries during graph walk
+        let adjacency = self.build_adjacency_list();
+
         let mut visited = HashSet::new();
         let mut queue = VecDeque::new();
         visited.insert(start);
@@ -241,21 +244,51 @@ impl IndexFacade {
                 continue;
             }
 
-            // Find all outgoing relationships from current
-            for rel in &self.unresolved {
-                if rel.from_id == Some(current) {
-                    // Try to resolve the target by name
-                    let targets = self.find_symbols_by_name(&rel.to_name);
-                    for target in targets {
-                        if visited.insert(target.id) {
-                            queue.push_back((target.id, depth + 1));
-                        }
+            // Use hash lookup instead of querying Tantivy for each edge
+            if let Some(targets) = adjacency.get(&current) {
+                for &target in targets {
+                    if visited.insert(target) {
+                        queue.push_back((target, depth + 1));
                     }
                 }
             }
         }
 
         visited.into_iter().filter(|&id| id != start).collect()
+    }
+
+    /// Build an adjacency list from unresolved relationships for efficient graph traversal.
+    ///
+    /// Returns a HashMap<SymbolId, Vec<SymbolId>> mapping source symbols to target symbols.
+    /// Resolves target names to IDs via batch Tantivy queries.
+    fn build_adjacency_list(&self) -> std::collections::HashMap<SymbolId, Vec<SymbolId>> {
+        let mut adjacency: std::collections::HashMap<SymbolId, Vec<SymbolId>> =
+            std::collections::HashMap::new();
+
+        // Build a cache of name -> Vec<SymbolId> to minimize Tantivy queries
+        let mut name_cache: std::collections::HashMap<&str, Vec<SymbolId>> =
+            std::collections::HashMap::new();
+
+        for rel in &self.unresolved {
+            let Some(from_id) = rel.from_id else {
+                continue;
+            };
+
+            // Look up target IDs, caching results
+            let target_ids = name_cache.entry(&rel.to_name).or_insert_with(|| {
+                self.find_symbols_by_name(&rel.to_name)
+                    .into_iter()
+                    .map(|s| s.id)
+                    .collect()
+            });
+
+            adjacency
+                .entry(from_id)
+                .or_default()
+                .extend(target_ids.iter().copied());
+        }
+
+        adjacency
     }
 
     // -----------------------------------------------------------------------
