@@ -4,25 +4,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::{Request, StatusCode, header};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Json, Response};
+use axum::middleware;
 use axum_server::tls_rustls::RustlsConfig;
+use chrono::Datelike;
 use rmcp::transport::streamable_http_server::StreamableHttpService;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::tower::StreamableHttpServerConfig;
-use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
 use super::McpServer;
-
-/// Shared state for middleware.
-#[derive(Clone)]
-struct AppState {
-    token: Option<String>,
-}
+use super::common::{AppState, auth_middleware, health_handler};
 
 /// Run the HTTPS MCP server with self-signed certificates.
 pub async fn run_https_server(
@@ -51,7 +42,7 @@ pub async fn run_https_server(
     };
 
     let router = Router::new()
-        .route("/health", axum::routing::get(health_handler))
+        .route("/health", axum::routing::get(|| health_handler(true)))
         .nest_service("/mcp", mcp_service)
         .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
         .with_state(state);
@@ -93,48 +84,6 @@ pub async fn run_https_server(
     Ok(())
 }
 
-/// Health check endpoint.
-async fn health_handler() -> impl IntoResponse {
-    Json(serde_json::json!({
-        "status": "ok",
-        "version": env!("CARGO_PKG_VERSION"),
-        "tls": true,
-    }))
-}
-
-/// Bearer token authentication middleware.
-async fn auth_middleware(
-    State(state): State<AppState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    if request.uri().path() == "/health" {
-        return next.run(request).await;
-    }
-
-    let Some(expected_token) = &state.token else {
-        return next.run(request).await;
-    };
-
-    let auth_header = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-
-    match auth_header {
-        Some(auth) if auth.starts_with("Bearer ") => {
-            let provided = auth["Bearer ".len()..].as_bytes();
-            let expected = expected_token.as_bytes();
-            if provided.ct_eq(expected).into() {
-                next.run(request).await
-            } else {
-                (StatusCode::UNAUTHORIZED, "Invalid bearer token").into_response()
-            }
-        }
-        _ => (StatusCode::UNAUTHORIZED, "Bearer token required").into_response(),
-    }
-}
-
 /// Ensure a self-signed certificate exists, generating one if needed.
 ///
 /// Certificates are cached in `~/.config/mdkb/certs/`.
@@ -172,8 +121,14 @@ fn ensure_self_signed_cert() -> crate::error::Result<(PathBuf, PathBuf)> {
             std::net::Ipv6Addr::LOCALHOST,
         )));
 
-    // Valid for 365 days
-    params.not_after = rcgen::date_time_ymd(2027, 1, 1);
+    // Valid for 365 days from now
+    let now = chrono::Utc::now();
+    let expiry = now + chrono::Duration::days(365);
+    params.not_after = rcgen::date_time_ymd(
+        expiry.year(),
+        expiry.month() as u8,
+        expiry.day() as u8,
+    );
 
     let key_pair = rcgen::KeyPair::generate()
         .map_err(|e| crate::error::Error::mcp(format!("Failed to generate key pair: {e}")))?;
@@ -184,8 +139,21 @@ fn ensure_self_signed_cert() -> crate::error::Result<(PathBuf, PathBuf)> {
 
     std::fs::write(&cert_path, cert.pem())
         .map_err(|e| crate::error::Error::mcp(format!("Failed to write certificate: {e}")))?;
+
+    // Write private key with restricted permissions (owner read/write only)
     std::fs::write(&key_path, key_pair.serialize_pem())
         .map_err(|e| crate::error::Error::mcp(format!("Failed to write private key: {e}")))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&key_path)
+            .map_err(|e| crate::error::Error::mcp(format!("Failed to read key metadata: {e}")))?
+            .permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(&key_path, perms)
+            .map_err(|e| crate::error::Error::mcp(format!("Failed to set key permissions: {e}")))?;
+    }
 
     tracing::info!("Self-signed certificate generated at {}", cert_dir.display());
 

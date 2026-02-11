@@ -9,6 +9,9 @@
 pub mod server;
 pub mod tools;
 
+#[cfg(any(feature = "http-server", feature = "https-server"))]
+pub mod common;
+
 #[cfg(feature = "http-server")]
 pub mod http_server;
 
