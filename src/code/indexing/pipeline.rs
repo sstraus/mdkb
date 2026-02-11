@@ -138,6 +138,14 @@ pub fn index_directory(
         errors: stats.errors,
     };
 
+    if parse_errors > 0 {
+        tracing::error!(
+            "Pipeline completed with {} parse errors. Impact: {} files not indexed (unsupported language or parse failure).",
+            parse_errors,
+            parse_errors
+        );
+    }
+
     Ok((final_stats, unresolved))
 }
 
@@ -167,7 +175,10 @@ fn stage_read(rx: &Receiver<PathBuf>, tx: &Sender<FileContent>) {
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("skipping {}: {e}", path.display());
+                tracing::error!(
+                    "Failed to read file {}: {e}. Impact: file will not be indexed.",
+                    path.display()
+                );
                 continue;
             }
         };
@@ -222,6 +233,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
 
     while let Ok(fc) = rx.recv() {
         let Some(language) = Language::from_path(&fc.path) else {
+            tracing::warn!("Unsupported or unknown language for file: {}", fc.path.display());
             errors += 1;
             continue;
         };

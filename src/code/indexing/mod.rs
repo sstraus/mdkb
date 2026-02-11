@@ -95,7 +95,7 @@ impl IndexFacade {
         self.unresolved.clear();
         if let Some(ref semantic) = self.semantic {
             if let Err(e) = semantic.clear() {
-                tracing::warn!("Failed to clear semantic index: {e}");
+                tracing::error!("Failed to clear semantic index: {e}. Impact: old embeddings may persist.");
             }
         }
         self.index.reload()?;
@@ -358,7 +358,10 @@ impl IndexFacade {
 
         tracing::info!("Generating semantic embeddings for {} symbols...", embed_inputs.len());
         if let Err(e) = semantic.generate_embeddings(&embed_inputs) {
-            tracing::warn!("Failed to generate semantic embeddings: {e}");
+            tracing::error!(
+                "Failed to generate semantic embeddings: {e}. Impact: {} symbols will not be searchable via semantic_search().",
+                embed_inputs.len()
+            );
         }
     }
 
@@ -401,13 +404,16 @@ impl IndexFacade {
 
 /// Try to initialize `SemanticSearch` at `{index_path}/vectors.bin`.
 ///
-/// Returns `None` if initialization fails (logged as warning).
+/// Returns `None` if initialization fails (logged as error with impact).
 fn init_semantic(index_path: &Path) -> Option<SemanticSearch> {
     let vectors_path = index_path.join("vectors.bin");
     match SemanticSearch::new(&vectors_path) {
         Ok(s) => Some(s),
         Err(e) => {
-            tracing::warn!("Failed to initialize semantic search at {}: {e}", vectors_path.display());
+            tracing::error!(
+                "Failed to initialize semantic search at {}: {e}. Impact: semantic_search() will return empty results.",
+                vectors_path.display()
+            );
             None
         }
     }
