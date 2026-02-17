@@ -27,9 +27,8 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    AnalyzeImpactParams, CollectionAddParams, CollectionRemoveParams,
-    FindCallersParams, GetCallsParams, GetParams,
-    MemoryDeleteParams, MemoryWriteParams,
+    CodeGraphParams, CollectionAddParams, CollectionRemoveParams,
+    GetParams, MemoryDeleteParams, MemoryWriteParams,
     MetricsParams, MultiGetParams, SearchParams,
 };
 
@@ -1057,60 +1056,20 @@ impl McpServer {
     // Code intelligence tools (require `code-intel` feature at runtime)
     // -----------------------------------------------------------------------
 
-    /// Get functions/methods called by a given symbol.
-    #[tool(description = "Get functions and methods called by a given symbol. Provide symbol_id to disambiguate when multiple symbols share the same name.")]
-    async fn get_calls(
+    /// Query the code call graph: outgoing calls, incoming callers, or impact radius.
+    #[tool(description = "Query code call graph. Use direction='calls' (default) for outgoing calls, 'callers' for incoming calls, or 'impact' for transitive dependency graph (with max_depth). Provide symbol_id to disambiguate when multiple symbols share the same name.")]
+    async fn code_graph(
         &self,
-        Parameters(params): Parameters<GetCallsParams>,
+        Parameters(params): Parameters<CodeGraphParams>,
     ) -> Result<CallToolResult, McpError> {
         #[cfg(not(feature = "code-intel"))]
-        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
-
-        #[cfg(feature = "code-intel")]
         {
-            self.ensure_code_index().await?;
-
-            let output = {
-                let idx_guard = self.code_index.lock().await;
-                let facade = idx_guard
-                    .as_ref()
-                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
-
-                let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
-                let called = facade.get_called_functions(symbol.id);
-
-                if called.is_empty() {
-                    format!("{} ({:?}) does not call any indexed functions.", symbol.name, symbol.kind)
-                } else {
-                    let mut out = format!(
-                        "{} ({:?}) calls {} function(s):\n\n",
-                        symbol.name,
-                        symbol.kind,
-                        called.len()
-                    );
-                    for sym in &called {
-                        out.push_str(&format_symbol(sym));
-                        out.push('\n');
-                    }
-                    out
-                }
-            }; // idx_guard dropped
-
-            let tokens = count_tokens(&output);
-            self.record_persistent_call("get_calls", tokens, 1, false).await;
-
-            Ok(CallToolResult::success(vec![Content::text(output)]))
+            let _ = params;
+            return Err(mcp_error(
+                "Code graph is not available. This build was compiled without code-intel support. \
+                 Rebuild with `--features code-intel` to enable code intelligence."
+            ));
         }
-    }
-
-    /// Find all callers of a given symbol.
-    #[tool(description = "Find all functions and methods that call a given symbol. Provide symbol_id to disambiguate when multiple symbols share the same name.")]
-    async fn find_callers(
-        &self,
-        Parameters(params): Parameters<FindCallersParams>,
-    ) -> Result<CallToolResult, McpError> {
-        #[cfg(not(feature = "code-intel"))]
-        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
 
         #[cfg(feature = "code-intel")]
         {
@@ -1123,81 +1082,74 @@ impl McpServer {
                     .ok_or_else(|| mcp_error("Code index not initialized"))?;
 
                 let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
-                let callers = facade.get_calling_functions(symbol.id);
 
-                if callers.is_empty() {
-                    format!("{} ({:?}) has no indexed callers.", symbol.name, symbol.kind)
-                } else {
-                    let mut out = format!(
-                        "{} ({:?}) is called by {} function(s):\n\n",
-                        symbol.name,
-                        symbol.kind,
-                        callers.len()
-                    );
-                    for sym in &callers {
-                        out.push_str(&format_symbol(sym));
-                        out.push('\n');
-                    }
-                    out
-                }
-            }; // idx_guard dropped
-
-            let tokens = count_tokens(&output);
-            self.record_persistent_call("find_callers", tokens, 1, false).await;
-
-            Ok(CallToolResult::success(vec![Content::text(output)]))
-        }
-    }
-
-    /// Analyze the impact radius of changing a symbol.
-    #[tool(description = "Analyze the impact of changing a symbol by traversing its dependency graph. Returns all symbols reachable within max_depth hops. Provide symbol_id to disambiguate.")]
-    async fn analyze_impact(
-        &self,
-        Parameters(params): Parameters<AnalyzeImpactParams>,
-    ) -> Result<CallToolResult, McpError> {
-        #[cfg(not(feature = "code-intel"))]
-        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
-
-        #[cfg(feature = "code-intel")]
-        {
-            self.ensure_code_index().await?;
-
-            let output = {
-                let idx_guard = self.code_index.lock().await;
-                let facade = idx_guard
-                    .as_ref()
-                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
-
-                let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
-                let impacted_ids = facade.get_impact_radius(symbol.id, params.max_depth);
-
-                if impacted_ids.is_empty() {
-                    format!(
-                        "{} ({:?}) has no reachable symbols within {} hop(s).",
-                        symbol.name, symbol.kind, params.max_depth
-                    )
-                } else {
-                    let mut out = format!(
-                        "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
-                        symbol.name,
-                        symbol.kind,
-                        impacted_ids.len(),
-                        params.max_depth
-                    );
-                    for sid in &impacted_ids {
-                        if let Some(sym) = facade.get_symbol(*sid) {
-                            out.push_str(&format_symbol(&sym));
-                            out.push('\n');
+                match params.direction.as_str() {
+                    "calls" => {
+                        let called = facade.get_called_functions(symbol.id);
+                        if called.is_empty() {
+                            format!("{} ({:?}) does not call any indexed functions.", symbol.name, symbol.kind)
                         } else {
-                            out.push_str(&format!("  sym#{} (not found in index)\n", sid.value()));
+                            let mut out = format!(
+                                "{} ({:?}) calls {} function(s):\n\n",
+                                symbol.name, symbol.kind, called.len()
+                            );
+                            for sym in &called {
+                                out.push_str(&format_symbol(sym));
+                                out.push('\n');
+                            }
+                            out
                         }
                     }
-                    out
+                    "callers" => {
+                        let callers = facade.get_calling_functions(symbol.id);
+                        if callers.is_empty() {
+                            format!("{} ({:?}) has no indexed callers.", symbol.name, symbol.kind)
+                        } else {
+                            let mut out = format!(
+                                "{} ({:?}) is called by {} function(s):\n\n",
+                                symbol.name, symbol.kind, callers.len()
+                            );
+                            for sym in &callers {
+                                out.push_str(&format_symbol(sym));
+                                out.push('\n');
+                            }
+                            out
+                        }
+                    }
+                    "impact" => {
+                        let impacted_ids = facade.get_impact_radius(symbol.id, params.max_depth);
+                        if impacted_ids.is_empty() {
+                            format!(
+                                "{} ({:?}) has no reachable symbols within {} hop(s).",
+                                symbol.name, symbol.kind, params.max_depth
+                            )
+                        } else {
+                            let mut out = format!(
+                                "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
+                                symbol.name, symbol.kind, impacted_ids.len(), params.max_depth
+                            );
+                            for sid in &impacted_ids {
+                                if let Some(sym) = facade.get_symbol(*sid) {
+                                    out.push_str(&format_symbol(&sym));
+                                    out.push('\n');
+                                } else {
+                                    out.push_str(&format!("  sym#{} (not found in index)\n", sid.value()));
+                                }
+                            }
+                            out
+                        }
+                    }
+                    _ => {
+                        return Err(mcp_error(format!(
+                            "Invalid direction: '{}'. Valid values: 'calls' (default), 'callers', 'impact'.",
+                            params.direction
+                        )));
+                    }
                 }
             }; // idx_guard dropped
 
             let tokens = count_tokens(&output);
-            self.record_persistent_call("analyze_impact", tokens, 1, false).await;
+            self.record_persistent_call("code_graph", tokens, 1, false).await;
 
             Ok(CallToolResult::success(vec![Content::text(output)]))
         }
@@ -2479,18 +2431,19 @@ pub fn utility() -> i32 {
         }
 
         #[tokio::test]
-        async fn test_get_calls() {
+        async fn test_code_graph_calls() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.get_calls(Parameters(GetCallsParams {
+            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
                 name: "process_data".to_string(),
+                direction: "calls".to_string(),
                 symbol_id: None,
+                max_depth: 3,
             })))
-            .await.expect("timeout").expect("get_calls failed");
+            .await.expect("timeout").expect("code_graph direction=calls failed");
 
             let text = extract_text(&result);
-            // process_data calls validate
             assert!(
                 text.contains("validate") || text.contains("does not call"),
                 "Should list called functions or report none: {}",
@@ -2499,18 +2452,19 @@ pub fn utility() -> i32 {
         }
 
         #[tokio::test]
-        async fn test_find_callers() {
+        async fn test_code_graph_callers() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.find_callers(Parameters(FindCallersParams {
+            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
                 name: "process_data".to_string(),
+                direction: "callers".to_string(),
                 symbol_id: None,
+                max_depth: 3,
             })))
-            .await.expect("timeout").expect("find_callers failed");
+            .await.expect("timeout").expect("code_graph direction=callers failed");
 
             let text = extract_text(&result);
-            // main calls process_data
             assert!(
                 text.contains("main") || text.contains("no indexed callers"),
                 "Should list callers or report none: {}",
@@ -2519,19 +2473,19 @@ pub fn utility() -> i32 {
         }
 
         #[tokio::test]
-        async fn test_analyze_impact() {
+        async fn test_code_graph_impact() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.analyze_impact(Parameters(AnalyzeImpactParams {
+            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
                 name: "validate".to_string(),
+                direction: "impact".to_string(),
                 symbol_id: None,
                 max_depth: 3,
             })))
-            .await.expect("timeout").expect("analyze_impact failed");
+            .await.expect("timeout").expect("code_graph direction=impact failed");
 
             let text = extract_text(&result);
-            // validate is called by process_data, so there should be some impact
             assert!(
                 text.contains("symbol(s)") || text.contains("no reachable symbols"),
                 "Should report impact or no impact: {}",
@@ -2614,10 +2568,12 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            // get_calls with nonexistent symbol should return an error
-            let result = tokio::time::timeout(timeout, server.get_calls(Parameters(GetCallsParams {
+            // code_graph with nonexistent symbol should return an error
+            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
                 name: "nonexistent_fn".to_string(),
+                direction: "calls".to_string(),
                 symbol_id: None,
+                max_depth: 3,
             })))
             .await.expect("timeout");
 
@@ -2651,12 +2607,14 @@ pub fn utility() -> i32 {
                 .and_then(|s| s.parse().ok())
                 .expect("Should find sym# in output");
 
-            // Now use that ID with get_calls
-            let result = tokio::time::timeout(timeout, server.get_calls(Parameters(GetCallsParams {
+            // Now use that ID with code_graph
+            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
                 name: "main".to_string(),
+                direction: "calls".to_string(),
                 symbol_id: Some(sym_id),
+                max_depth: 3,
             })))
-            .await.expect("timeout").expect("get_calls with ID failed");
+            .await.expect("timeout").expect("code_graph with ID failed");
 
             let text = extract_text(&result);
             assert!(

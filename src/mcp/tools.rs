@@ -149,41 +149,27 @@ pub struct MemoryDeleteParams {
 // Code intelligence tool parameters (requires `code-intel` feature)
 // ---------------------------------------------------------------------------
 
-/// Parameters for get_calls: what functions does a symbol call?
+/// Parameters for code_graph: call graph queries with direction.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct GetCallsParams {
+pub struct CodeGraphParams {
     /// Symbol name to look up.
     pub name: String,
 
-    /// Exact symbol ID (use to disambiguate when multiple symbols share a name).
-    #[serde(default)]
-    pub symbol_id: Option<u32>,
-}
-
-/// Parameters for find_callers: what calls a given symbol?
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct FindCallersParams {
-    /// Symbol name to look up.
-    pub name: String,
-
-    /// Exact symbol ID (use to disambiguate when multiple symbols share a name).
-    #[serde(default)]
-    pub symbol_id: Option<u32>,
-}
-
-/// Parameters for analyze_impact: dependency graph from a symbol.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct AnalyzeImpactParams {
-    /// Symbol name to start from.
-    pub name: String,
+    /// Graph direction: "calls" (default, outgoing), "callers" (incoming), or "impact" (transitive).
+    #[serde(default = "default_direction")]
+    pub direction: String,
 
     /// Exact symbol ID (use to disambiguate when multiple symbols share a name).
     #[serde(default)]
     pub symbol_id: Option<u32>,
 
-    /// Maximum traversal depth (default: 3).
+    /// Maximum traversal depth when direction is "impact" (default: 3).
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
+}
+
+fn default_direction() -> String {
+    "calls".to_string()
 }
 
 fn default_max_depth() -> usize {
@@ -323,43 +309,30 @@ mod tests {
     }
 
     #[test]
-    fn test_get_calls_params_name_only() {
+    fn test_code_graph_params_defaults() {
         let json = r#"{"name": "main"}"#;
-        let params: GetCallsParams = serde_json::from_str(json).unwrap();
+        let params: CodeGraphParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.name, "main");
-        assert!(params.symbol_id.is_none());
-    }
-
-    #[test]
-    fn test_get_calls_params_with_id() {
-        let json = r#"{"name": "main", "symbol_id": 42}"#;
-        let params: GetCallsParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "main");
-        assert_eq!(params.symbol_id, Some(42));
-    }
-
-    #[test]
-    fn test_find_callers_params() {
-        let json = r#"{"name": "process", "symbol_id": 7}"#;
-        let params: FindCallersParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "process");
-        assert_eq!(params.symbol_id, Some(7));
-    }
-
-    #[test]
-    fn test_analyze_impact_params_defaults() {
-        let json = r#"{"name": "Database.connect"}"#;
-        let params: AnalyzeImpactParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "Database.connect");
+        assert_eq!(params.direction, "calls");
         assert!(params.symbol_id.is_none());
         assert_eq!(params.max_depth, 3);
     }
 
     #[test]
-    fn test_analyze_impact_params_custom() {
-        let json = r#"{"name": "init", "symbol_id": 1, "max_depth": 5}"#;
-        let params: AnalyzeImpactParams = serde_json::from_str(json).unwrap();
+    fn test_code_graph_params_callers() {
+        let json = r#"{"name": "process", "direction": "callers", "symbol_id": 7}"#;
+        let params: CodeGraphParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "process");
+        assert_eq!(params.direction, "callers");
+        assert_eq!(params.symbol_id, Some(7));
+    }
+
+    #[test]
+    fn test_code_graph_params_impact() {
+        let json = r#"{"name": "init", "direction": "impact", "symbol_id": 1, "max_depth": 5}"#;
+        let params: CodeGraphParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.name, "init");
+        assert_eq!(params.direction, "impact");
         assert_eq!(params.symbol_id, Some(1));
         assert_eq!(params.max_depth, 5);
     }
