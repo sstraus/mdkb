@@ -5,12 +5,12 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, bail, ensure};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use crate::code::types::SymbolKind;
+use crate::llm::EmbeddingService;
 
 /// Embedding dimensionality for AllMiniLML6V2.
 const EMBEDDING_DIM: usize = 384;
@@ -292,8 +292,11 @@ pub struct SemanticMatch {
 const EMBED_BATCH_SIZE: usize = 5000;
 
 /// Orchestrates embedding generation and brute-force search over code symbols.
+///
+/// Uses a shared `EmbeddingService` (same model instance as document search)
+/// to avoid loading the model twice.
 pub struct SemanticSearch {
-    model: Mutex<Option<TextEmbedding>>,
+    service: Arc<EmbeddingService>,
     store: VectorStore,
     /// Cached embeddings loaded from disk. Invalidated on write.
     cache: Mutex<Option<Vec<(u32, Vec<f32>)>>>,
@@ -304,73 +307,20 @@ impl std::fmt::Debug for SemanticSearch {
         let cached = self.cache.lock().map(|g| g.as_ref().map(|c| c.len())).unwrap_or(None);
         f.debug_struct("SemanticSearch")
             .field("store", &self.store)
-            .field("model_loaded", &self.model.lock().map(|g| g.is_some()).unwrap_or(false))
             .field("cached_entries", &cached)
             .finish()
     }
 }
 
 impl SemanticSearch {
-    /// Create a new semantic search instance with a vector store at the given path.
-    ///
-    /// The embedding model is initialized lazily on first use.
-    pub fn new(store_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+    /// Create a new semantic search instance with a shared embedding service.
+    pub fn new(store_path: impl AsRef<Path>, service: Arc<EmbeddingService>) -> anyhow::Result<Self> {
         let store = VectorStore::open(store_path)?;
         Ok(Self {
-            model: Mutex::new(None),
+            service,
             store,
             cache: Mutex::new(None),
         })
-    }
-
-    /// Initialize the embedding model on a blocking thread.
-    ///
-    /// Call this from async context before using `generate_embeddings` or `search`.
-    /// Uses `spawn_blocking` so model download/init won't block the tokio executor.
-    /// No-op if the model is already loaded.
-    pub async fn init_model_async(&self) -> anyhow::Result<()> {
-        // Fast path: already loaded
-        {
-            let guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
-            if guard.is_some() {
-                return Ok(());
-            }
-        }
-
-        // Slow path: init on blocking thread
-        tracing::info!("Initializing fastembed model (AllMiniLML6V2)...");
-        let model = tokio::task::spawn_blocking(|| {
-            TextEmbedding::try_new(
-                InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
-            )
-            .context("Failed to initialize fastembed model")
-        })
-        .await
-        .context("Model init task panicked")??;
-
-        tracing::info!("fastembed model ready");
-        let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
-        *guard = Some(model);
-        Ok(())
-    }
-
-    /// Ensure the embedding model is loaded, initializing it if needed.
-    ///
-    /// Prefer `init_model_async` from async context. This sync version blocks
-    /// the current thread during model download and should only be used from
-    /// non-async callers (e.g. the indexing pipeline).
-    fn ensure_model(&self) -> anyhow::Result<()> {
-        let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
-        if guard.is_none() {
-            tracing::info!("Initializing fastembed model (AllMiniLML6V2)...");
-            let model = TextEmbedding::try_new(
-                InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
-            )
-            .context("Failed to initialize fastembed model")?;
-            tracing::info!("fastembed model ready");
-            *guard = Some(model);
-        }
-        Ok(())
     }
 
     /// Generate embeddings for symbols and write them to the vector store.
@@ -387,17 +337,14 @@ impl SemanticSearch {
             return self.store.clear();
         }
 
-        self.ensure_model()?;
-
         let mut all_entries: Vec<(u32, Vec<f32>)> = Vec::with_capacity(symbols.len());
 
         for chunk in symbols.chunks(EMBED_BATCH_SIZE) {
             let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
-            let embeddings = {
-                let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
-                let model = guard.as_mut().expect("model initialized by ensure_model");
-                model.embed(texts, None).context("Failed to generate embeddings")?
-            };
+            let embeddings = self
+                .service
+                .embed_documents(&texts)
+                .map_err(|e| anyhow::anyhow!("Failed to generate embeddings: {e}"))?;
 
             for ((id, _), emb) in chunk.iter().zip(embeddings) {
                 all_entries.push((*id, emb));
@@ -425,17 +372,11 @@ impl SemanticSearch {
         limit: usize,
         threshold: f32,
     ) -> anyhow::Result<Vec<SemanticMatch>> {
-        self.ensure_model()?;
-
         // Embed the query
-        let query_embedding = {
-            let mut guard = self.model.lock().map_err(|e| anyhow::anyhow!("Model lock poisoned: {e}"))?;
-            let model = guard.as_mut().expect("model initialized by ensure_model");
-            let mut embeddings = model
-                .embed(vec![query], None)
-                .context("Failed to embed query")?;
-            embeddings.remove(0)
-        };
+        let query_embedding = self
+            .service
+            .embed_query(query)
+            .map_err(|e| anyhow::anyhow!("Failed to embed query: {e}"))?;
 
         // Load stored embeddings (cached after first read)
         self.ensure_cache()?;
@@ -767,7 +708,8 @@ mod tests {
     #[ignore]
     fn test_semantic_search_basic() {
         let dir = tempfile::tempdir().unwrap();
-        let search = SemanticSearch::new(dir.path().join("vectors.bin")).unwrap();
+        let service = Arc::new(EmbeddingService::new().unwrap());
+        let search = SemanticSearch::new(dir.path().join("vectors.bin"), service).unwrap();
 
         let symbols = vec![
             (1, "Function authenticate_user\nfn authenticate_user(username: &str, password: &str) -> bool\nVerifies user credentials against the database.".to_string()),
@@ -792,7 +734,8 @@ mod tests {
     #[ignore]
     fn test_semantic_search_threshold() {
         let dir = tempfile::tempdir().unwrap();
-        let search = SemanticSearch::new(dir.path().join("vectors.bin")).unwrap();
+        let service = Arc::new(EmbeddingService::new().unwrap());
+        let search = SemanticSearch::new(dir.path().join("vectors.bin"), service).unwrap();
 
         let symbols = vec![
             (1, "Function hello\nfn hello()\nPrints a greeting.".to_string()),
