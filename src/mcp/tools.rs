@@ -21,9 +21,21 @@ pub struct SearchParams {
     #[serde(default)]
     pub include_superseded: bool,
 
-    /// Search scope: "docs" (default), "memory", or "all".
+    /// Search scope: "docs" (default), "memory", "all", "code", or "symbols".
     #[serde(default)]
     pub scope: Option<String>,
+
+    /// Filter by symbol kind when scope is "code" or "symbols" (e.g., "function", "struct").
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    /// Minimum similarity score 0.0-1.0 when scope is "code" (default: 0.3).
+    #[serde(default = "default_threshold")]
+    pub threshold: f32,
+
+    /// Filter by file path (substring match) when scope is "symbols".
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -137,36 +149,6 @@ pub struct MemoryDeleteParams {
 // Code intelligence tool parameters (requires `code-intel` feature)
 // ---------------------------------------------------------------------------
 
-/// Parameters for find_symbol: exact name lookup with optional filters.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct FindSymbolParams {
-    /// Exact symbol name to find.
-    pub name: String,
-
-    /// Filter by symbol kind (e.g., "function", "struct", "method").
-    #[serde(default)]
-    pub kind: Option<String>,
-
-    /// Filter by file path (substring match).
-    #[serde(default)]
-    pub file: Option<String>,
-}
-
-/// Parameters for search_symbols: fuzzy text search across symbol names/signatures.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct SearchSymbolsParams {
-    /// Search query text (matched against names, signatures, doc comments).
-    pub query: String,
-
-    /// Filter by symbol kind (e.g., "function", "struct").
-    #[serde(default)]
-    pub kind: Option<String>,
-
-    /// Maximum results (default: 10).
-    #[serde(default = "default_limit")]
-    pub limit: usize,
-}
-
 /// Parameters for get_calls: what functions does a symbol call?
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct GetCallsParams {
@@ -206,25 +188,6 @@ pub struct AnalyzeImpactParams {
 
 fn default_max_depth() -> usize {
     3
-}
-
-/// Parameters for semantic_search: natural language search over code symbols.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct SemanticSearchParams {
-    /// Natural language query (e.g., "function that handles authentication").
-    pub query: String,
-
-    /// Filter by symbol kind (e.g., "function", "struct", "method").
-    #[serde(default)]
-    pub kind: Option<String>,
-
-    /// Maximum results (default: 10).
-    #[serde(default = "default_limit")]
-    pub limit: usize,
-
-    /// Minimum similarity score 0.0-1.0 (default: 0.3).
-    #[serde(default = "default_threshold")]
-    pub threshold: f32,
 }
 
 fn default_threshold() -> f32 {
@@ -326,42 +289,37 @@ mod tests {
         assert_eq!(params.id, "auth-oauth2-pkce");
     }
 
-    // --- Code intelligence param tests ---
+    // --- Code intelligence param tests (via SearchParams scopes) ---
 
     #[test]
-    fn test_find_symbol_params_minimal() {
-        let json = r#"{"name": "process_data"}"#;
-        let params: FindSymbolParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "process_data");
+    fn test_search_params_code_scope_defaults() {
+        let json = r#"{"query": "auth handler", "scope": "code"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "auth handler");
+        assert_eq!(params.scope.as_deref(), Some("code"));
         assert!(params.kind.is_none());
+        assert!((params.threshold - 0.3).abs() < f32::EPSILON);
         assert!(params.file.is_none());
     }
 
     #[test]
-    fn test_find_symbol_params_with_filters() {
-        let json = r#"{"name": "process_data", "kind": "function", "file": "src/main.rs"}"#;
-        let params: FindSymbolParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "process_data");
+    fn test_search_params_code_scope_custom() {
+        let json = r#"{"query": "pool", "scope": "code", "kind": "struct", "threshold": 0.5}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "pool");
+        assert_eq!(params.scope.as_deref(), Some("code"));
+        assert_eq!(params.kind.as_deref(), Some("struct"));
+        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_search_params_symbols_scope_with_file() {
+        let json = r#"{"query": "handler", "scope": "symbols", "kind": "function", "file": "src/main.rs"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "handler");
+        assert_eq!(params.scope.as_deref(), Some("symbols"));
         assert_eq!(params.kind.as_deref(), Some("function"));
         assert_eq!(params.file.as_deref(), Some("src/main.rs"));
-    }
-
-    #[test]
-    fn test_search_symbols_params_defaults() {
-        let json = r#"{"query": "handler"}"#;
-        let params: SearchSymbolsParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.query, "handler");
-        assert!(params.kind.is_none());
-        assert_eq!(params.limit, 10);
-    }
-
-    #[test]
-    fn test_search_symbols_params_custom() {
-        let json = r#"{"query": "handler", "kind": "method", "limit": 25}"#;
-        let params: SearchSymbolsParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.query, "handler");
-        assert_eq!(params.kind.as_deref(), Some("method"));
-        assert_eq!(params.limit, 25);
     }
 
     #[test]
@@ -406,23 +364,4 @@ mod tests {
         assert_eq!(params.max_depth, 5);
     }
 
-    #[test]
-    fn test_semantic_search_params_defaults() {
-        let json = r#"{"query": "authentication handler"}"#;
-        let params: SemanticSearchParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.query, "authentication handler");
-        assert!(params.kind.is_none());
-        assert_eq!(params.limit, 10);
-        assert!((params.threshold - 0.3).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_semantic_search_params_custom() {
-        let json = r#"{"query": "database pool", "kind": "struct", "limit": 5, "threshold": 0.5}"#;
-        let params: SemanticSearchParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.query, "database pool");
-        assert_eq!(params.kind.as_deref(), Some("struct"));
-        assert_eq!(params.limit, 5);
-        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
-    }
 }

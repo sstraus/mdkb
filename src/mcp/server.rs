@@ -28,10 +28,9 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
     AnalyzeImpactParams, CollectionAddParams, CollectionRemoveParams,
-    FindCallersParams, FindSymbolParams, GetCallsParams, GetParams,
+    FindCallersParams, GetCallsParams, GetParams,
     MemoryDeleteParams, MemoryWriteParams,
-    MetricsParams, MultiGetParams, SearchParams, SearchSymbolsParams,
-    SemanticSearchParams,
+    MetricsParams, MultiGetParams, SearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -260,15 +259,15 @@ impl McpServer {
     ) -> Result<crate::code::symbol::Symbol, McpError> {
         if let Some(id) = symbol_id {
             let sid = SymbolId::new(id)
-                .ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved. Use `find_symbol(name)` to get valid IDs."))?;
+                .ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved. Use `search(query, scope=\"symbols\")` to get valid IDs."))?;
             return facade
                 .get_symbol(sid)
-                .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}. Use `find_symbol(name)` to get current IDs.")));
+                .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}. Use `search(query, scope=\"symbols\")` to get current IDs.")));
         }
 
         let matches = facade.find_symbols_by_name(name);
         match matches.len() {
-            0 => Err(mcp_error(format!("No symbol found with name '{name}'. Try `search_symbols(query)` for fuzzy matching."))),
+            0 => Err(mcp_error(format!("No symbol found with name '{name}'. Try `search(query, scope=\"symbols\")` for fuzzy matching."))),
             1 => Ok(matches.into_iter().next().unwrap()),
             _ => {
                 let mut msg = format!(
@@ -399,9 +398,100 @@ impl McpServer {
                     let tokens = count_tokens(&output);
                     (output, tokens, total)
                 }
+                "code" | "symbols" => {
+                    // Drop ctx_guard before acquiring code_index lock
+                    drop(ctx_guard);
+
+                    #[cfg(not(feature = "code-intel"))]
+                    {
+                        return Err(mcp_error(
+                            "Code search is not available. This build was compiled without code-intel support. \
+                             Rebuild with `--features code-intel` to enable code search. \
+                             For document search, use scope='docs' (default)."
+                        ));
+                    }
+
+                    #[cfg(feature = "code-intel")]
+                    {
+                        self.ensure_code_index().await?;
+
+                        let idx_guard = self.code_index.lock().await;
+                        let facade = idx_guard
+                            .as_ref()
+                            .ok_or_else(|| mcp_error("Code index not initialized"))?;
+
+                        if scope == "code" {
+                            // Semantic search (embedding similarity)
+                            let mut results = facade
+                                .semantic_search(&params.query, params.limit, params.threshold)
+                                .map_err(|e| mcp_error(format!("Semantic code search failed: {e}")))?;
+
+                            // Apply kind filter
+                            if let Some(ref kind_str) = params.kind {
+                                if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
+                                    results.retain(|(s, _)| s.kind == kind);
+                                } else {
+                                    return Err(mcp_error(format!(
+                                        "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro"
+                                    )));
+                                }
+                            }
+
+                            if results.is_empty() {
+                                let output = "No semantic matches found. Try broader terms, lower the threshold, or use scope='symbols' for keyword search.".to_string();
+                                let tokens = count_tokens(&output);
+                                (output, tokens, 0)
+                            } else {
+                                let mut out = format!("Found {} semantic match(es):\n\n", results.len());
+                                for (sym, score) in &results {
+                                    out.push_str(&format_symbol(sym));
+                                    out.push_str(&format!("    Similarity: {:.3}\n", score));
+                                    out.push('\n');
+                                }
+                                let result_count = results.len();
+                                let tokens = count_tokens(&out);
+                                (out, tokens, result_count)
+                            }
+                        } else {
+                            // symbols scope: fuzzy text match
+                            let mut symbols = facade.search_symbols(&params.query, params.limit);
+
+                            // Apply kind filter
+                            if let Some(ref kind_str) = params.kind {
+                                if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
+                                    symbols.retain(|s| s.kind == kind);
+                                } else {
+                                    return Err(mcp_error(format!(
+                                        "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro"
+                                    )));
+                                }
+                            }
+
+                            // Apply file filter (substring match)
+                            if let Some(ref file_pattern) = params.file {
+                                symbols.retain(|s| s.file_path.contains(file_pattern.as_str()));
+                            }
+
+                            if symbols.is_empty() {
+                                let output = "No symbols found. Try different search terms, scope='code' for semantic matching, or check `status` to verify the code index has content.".to_string();
+                                let tokens = count_tokens(&output);
+                                (output, tokens, 0)
+                            } else {
+                                let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
+                                for sym in &symbols {
+                                    out.push_str(&format_symbol(sym));
+                                    out.push('\n');
+                                }
+                                let result_count = symbols.len();
+                                let tokens = count_tokens(&out);
+                                (out, tokens, result_count)
+                            }
+                        }
+                    }
+                }
                 _ => {
                     return Err(mcp_error(format!(
-                        "Invalid scope: '{}'. Valid values: 'docs' (default), 'memory', 'all'.",
+                        "Invalid scope: '{}'. Valid values: 'docs' (default), 'memory', 'all', 'code', 'symbols'.",
                         scope
                     )));
                 }
@@ -966,161 +1056,6 @@ impl McpServer {
     // -----------------------------------------------------------------------
     // Code intelligence tools (require `code-intel` feature at runtime)
     // -----------------------------------------------------------------------
-
-    /// Find a code symbol by exact name with optional kind/file filters.
-    #[tool(description = "Find a code symbol by exact name. Returns matching symbols with their location, signature, and kind. Use kind/file filters to narrow results.")]
-    async fn find_symbol(
-        &self,
-        Parameters(params): Parameters<FindSymbolParams>,
-    ) -> Result<CallToolResult, McpError> {
-        #[cfg(not(feature = "code-intel"))]
-        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
-
-        #[cfg(feature = "code-intel")]
-        {
-            self.ensure_code_index().await?;
-
-            let output = {
-                let idx_guard = self.code_index.lock().await;
-                let facade = idx_guard
-                    .as_ref()
-                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
-
-                let mut symbols = facade.find_symbols_by_name(&params.name);
-
-                // Apply kind filter
-                if let Some(ref kind_str) = params.kind {
-                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
-                        symbols.retain(|s| s.kind == kind);
-                    } else {
-                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro")));
-                    }
-                }
-
-                // Apply file filter (substring match)
-                if let Some(ref file_pattern) = params.file {
-                    symbols.retain(|s| s.file_path.contains(file_pattern.as_str()));
-                }
-
-                if symbols.is_empty() {
-                    "No symbols found. Try `search_symbols(query)` for fuzzy matching, or `get_index_info` to check if the index has content.".to_string()
-                } else {
-                    let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
-                    for sym in &symbols {
-                        out.push_str(&format_symbol(sym));
-                        out.push('\n');
-                    }
-                    out
-                }
-            }; // idx_guard dropped
-
-            let tokens = count_tokens(&output);
-            self.record_persistent_call("find_symbol", tokens, 1, false).await;
-
-            Ok(CallToolResult::success(vec![Content::text(output)]))
-        }
-    }
-
-    /// Search code symbols by text query (fuzzy matching on names/signatures/docs).
-    #[tool(description = "Search code symbols by text query. Uses fuzzy matching across symbol names, signatures, and doc comments. Filter by kind to narrow results.")]
-    async fn search_symbols(
-        &self,
-        Parameters(params): Parameters<SearchSymbolsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        #[cfg(not(feature = "code-intel"))]
-        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
-
-        #[cfg(feature = "code-intel")]
-        {
-            self.ensure_code_index().await?;
-
-            let output = {
-                let idx_guard = self.code_index.lock().await;
-                let facade = idx_guard
-                    .as_ref()
-                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
-
-                let mut symbols = facade.search_symbols(&params.query, params.limit);
-
-                // Apply kind filter
-                if let Some(ref kind_str) = params.kind {
-                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
-                        symbols.retain(|s| s.kind == kind);
-                    } else {
-                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro")));
-                    }
-                }
-
-                if symbols.is_empty() {
-                    "No symbols found. Try different search terms, or `get_index_info` to check if the index has content.".to_string()
-                } else {
-                    let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
-                    for sym in &symbols {
-                        out.push_str(&format_symbol(sym));
-                        out.push('\n');
-                    }
-                    out
-                }
-            }; // idx_guard dropped
-
-            let tokens = count_tokens(&output);
-            self.record_persistent_call("search_symbols", tokens, 1, false).await;
-
-            Ok(CallToolResult::success(vec![Content::text(output)]))
-        }
-    }
-
-    /// Semantic search over code symbols using natural language.
-    #[tool(description = "Search code symbols by meaning using natural language (e.g., 'authentication handler', 'database connection pool'). Uses embedding-based semantic similarity. Complements search_symbols which does keyword matching.")]
-    async fn semantic_search(
-        &self,
-        Parameters(params): Parameters<SemanticSearchParams>,
-    ) -> Result<CallToolResult, McpError> {
-        #[cfg(not(feature = "code-intel"))]
-        { let _ = params; return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
-
-        #[cfg(feature = "code-intel")]
-        {
-            self.ensure_code_index().await?;
-
-            let output = {
-                let idx_guard = self.code_index.lock().await;
-                let facade = idx_guard
-                    .as_ref()
-                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
-
-                let mut results = facade
-                    .semantic_search(&params.query, params.limit, params.threshold)
-                    .map_err(|e| mcp_error(format!("Semantic search failed: {e}")))?;
-
-                // Apply kind filter
-                if let Some(ref kind_str) = params.kind {
-                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
-                        results.retain(|(s, _)| s.kind == kind);
-                    } else {
-                        return Err(mcp_error(format!("Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro")));
-                    }
-                }
-
-                if results.is_empty() {
-                    "No semantic matches found. Try broadening your query, lowering the threshold, or using `search_symbols` for keyword search.".to_string()
-                } else {
-                    let mut out = format!("Found {} semantic match(es):\n\n", results.len());
-                    for (sym, score) in &results {
-                        out.push_str(&format_symbol(sym));
-                        out.push_str(&format!("    Similarity: {:.3}\n", score));
-                        out.push('\n');
-                    }
-                    out
-                }
-            }; // idx_guard dropped
-
-            let tokens = count_tokens(&output);
-            self.record_persistent_call("semantic_search", tokens, 1, false).await;
-
-            Ok(CallToolResult::success(vec![Content::text(output)]))
-        }
-    }
 
     /// Get functions/methods called by a given symbol.
     #[tool(description = "Get functions and methods called by a given symbol. Provide symbol_id to disambiguate when multiple symbols share the same name.")]
@@ -2259,6 +2194,9 @@ mod tests {
             collection: None,
             include_superseded: false,
             scope: None,
+            kind: None,
+            threshold: 0.3,
+            file: None,
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
@@ -2296,6 +2234,9 @@ mod tests {
             collection: None,
             include_superseded: false,
             scope: Some("memory".to_string()),
+            kind: None,
+            threshold: 0.3,
+            file: None,
         })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
@@ -2410,51 +2351,64 @@ pub fn utility() -> i32 {
         }
 
         #[tokio::test]
-        async fn test_find_symbol_by_name() {
+        async fn test_search_symbols_scope() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
-                name: "main".to_string(),
+            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
+                query: "main".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
                 kind: None,
+                threshold: 0.3,
                 file: None,
             })))
-            .await.expect("timeout").expect("find_symbol failed");
+            .await.expect("timeout").expect("search scope=symbols failed");
 
             let text = extract_text(&result);
             assert!(text.contains("main"), "Should find main: {}", text);
             assert!(text.contains("sym#"), "Should include symbol ID: {}", text);
-            assert!(text.contains("Function"), "Should show kind: {}", text);
         }
 
         #[tokio::test]
-        async fn test_find_symbol_not_found() {
+        async fn test_search_symbols_not_found() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
-                name: "nonexistent_symbol".to_string(),
+            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
+                query: "nonexistent_symbol_xyz".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
                 kind: None,
+                threshold: 0.3,
                 file: None,
             })))
-            .await.expect("timeout").expect("find_symbol failed");
+            .await.expect("timeout").expect("search scope=symbols failed");
 
             let text = extract_text(&result);
             assert!(text.contains("No symbols found"), "Got: {}", text);
         }
 
         #[tokio::test]
-        async fn test_find_symbol_with_kind_filter() {
+        async fn test_search_symbols_with_kind_filter() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            // Find only structs named DataHelper
-            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
-                name: "DataHelper".to_string(),
+            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
+                query: "DataHelper".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
                 kind: Some("struct".to_string()),
+                threshold: 0.3,
                 file: None,
             })))
-            .await.expect("timeout").expect("find_symbol failed");
+            .await.expect("timeout").expect("search scope=symbols kind=struct failed");
 
             let text = extract_text(&result);
             assert!(text.contains("DataHelper"), "Should find DataHelper: {}", text);
@@ -2462,17 +2416,21 @@ pub fn utility() -> i32 {
         }
 
         #[tokio::test]
-        async fn test_find_symbol_with_file_filter() {
+        async fn test_search_symbols_with_file_filter() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            // Find symbols only in lib.rs
-            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
-                name: "utility".to_string(),
+            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
+                query: "utility".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
                 kind: None,
+                threshold: 0.3,
                 file: Some("lib.rs".to_string()),
             })))
-            .await.expect("timeout").expect("find_symbol failed");
+            .await.expect("timeout").expect("search scope=symbols file=lib.rs failed");
 
             let text = extract_text(&result);
             assert!(text.contains("utility"), "Should find utility: {}", text);
@@ -2480,13 +2438,18 @@ pub fn utility() -> i32 {
         }
 
         #[tokio::test]
-        async fn test_find_symbol_invalid_kind() {
+        async fn test_search_symbols_invalid_kind() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
-                name: "main".to_string(),
+            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
+                query: "main".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
                 kind: Some("invalid_kind".to_string()),
+                threshold: 0.3,
                 file: None,
             })))
             .await.expect("timeout");
@@ -2495,16 +2458,21 @@ pub fn utility() -> i32 {
         }
 
         #[tokio::test]
-        async fn test_search_symbols() {
+        async fn test_search_symbols_fuzzy() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.search_symbols(Parameters(SearchSymbolsParams {
+            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
                 query: "process".to_string(),
-                kind: None,
                 limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
+                kind: None,
+                threshold: 0.3,
+                file: None,
             })))
-            .await.expect("timeout").expect("search_symbols failed");
+            .await.expect("timeout").expect("search scope=symbols failed");
 
             let text = extract_text(&result);
             assert!(text.contains("process_data"), "Should find process_data: {}", text);
@@ -2613,19 +2581,29 @@ pub fn utility() -> i32 {
             tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
                 .await.expect("timeout").expect("get_index_info failed");
 
-            tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
-                name: "main".to_string(),
+            tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
+                query: "main".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
                 kind: None,
+                threshold: 0.3,
                 file: None,
             })))
-            .await.expect("timeout").expect("find_symbol failed");
+            .await.expect("timeout").expect("search scope=symbols failed");
 
-            tokio::time::timeout(timeout, server.search_symbols(Parameters(SearchSymbolsParams {
+            tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
                 query: "data".to_string(),
-                kind: None,
                 limit: 5,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
+                kind: None,
+                threshold: 0.3,
+                file: None,
             })))
-            .await.expect("timeout").expect("search_symbols failed");
+            .await.expect("timeout").expect("search scope=symbols failed (second call)");
 
             tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
                 .await.expect("timeout").expect("get_index_info failed (second call)");
@@ -2651,13 +2629,18 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            // First find a symbol to get its ID
-            let find_result = tokio::time::timeout(timeout, server.find_symbol(Parameters(FindSymbolParams {
-                name: "main".to_string(),
+            // First find a symbol to get its ID via search scope=symbols
+            let find_result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
+                query: "main".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
                 kind: None,
+                threshold: 0.3,
                 file: None,
             })))
-            .await.expect("timeout").expect("find_symbol failed");
+            .await.expect("timeout").expect("search scope=symbols failed");
 
             let text = extract_text(&find_result);
             // Extract symbol ID from "sym#N"

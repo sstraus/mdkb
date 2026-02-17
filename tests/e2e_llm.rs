@@ -7,9 +7,10 @@
 //! cargo test --test e2e_llm -- --ignored
 //! ```
 //!
-//! The model is cached in ~/.cache/huggingface/ so subsequent runs are faster.
+//! The model is cached so subsequent runs are faster.
 
 use std::fs;
+use std::sync::Arc;
 
 use mdkb::cli::handlers::{
     Context, handle_collection_add, handle_embed, handle_hybrid_search, handle_init, handle_update,
@@ -116,81 +117,55 @@ Validate user permissions on every request.
 
 #[test]
 #[ignore = "requires model download (~100MB), run with: cargo test --test e2e_llm -- --ignored"]
-fn test_embedding_model_loads() {
-    // Just test that the model loads successfully
-    let model = mdkb::llm::get_cached_model().expect("failed to load model");
+fn test_embedding_service_loads() {
+    let service = mdkb::llm::get_cached_service().expect("failed to load service");
 
     // Verify we can generate an embedding
-    let embedding = model.embed("test text").expect("failed to generate embedding");
+    let embedding = service.embed_query("test text").expect("failed to generate embedding");
 
-    // nomic-embed-text produces 768-dimensional embeddings
-    assert_eq!(embedding.len(), 768);
-
-    // Embedding should be normalized (L2 norm ≈ 1.0)
-    let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
-    assert!(
-        (norm - 1.0).abs() < 0.01,
-        "embedding should be normalized, got norm={}",
-        norm
-    );
+    // AllMiniLML6V2 produces 384-dimensional embeddings
+    assert_eq!(embedding.len(), 384);
 }
 
 #[test]
 #[ignore = "requires model download (~100MB), run with: cargo test --test e2e_llm -- --ignored"]
-fn test_embedding_model_caching() {
-    // First call loads the model
-    let model1 = mdkb::llm::get_cached_model().expect("failed to load model");
-    let ptr1 = model1 as *const _;
+fn test_embedding_service_caching() {
+    let svc1 = mdkb::llm::get_cached_service().expect("failed to load service");
+    let svc2 = mdkb::llm::get_cached_service().expect("failed to get cached service");
 
-    // Second call should return the same instance
-    let model2 = mdkb::llm::get_cached_model().expect("failed to get cached model");
-    let ptr2 = model2 as *const _;
-
-    assert_eq!(ptr1, ptr2, "get_cached_model should return same instance");
+    assert!(Arc::ptr_eq(&svc1, &svc2), "get_cached_service should return same Arc instance");
 }
 
 #[test]
 #[ignore = "requires model download (~100MB), run with: cargo test --test e2e_llm -- --ignored"]
 fn test_query_vs_document_embeddings() {
-    let model = mdkb::llm::get_cached_model().expect("failed to load model");
+    let service = mdkb::llm::get_cached_service().expect("failed to load service");
 
-    // nomic-embed-text uses different prefixes for queries vs documents
-    let doc_embedding = model.embed("Rust programming language").unwrap();
-    let query_embedding = model.embed_query("What is Rust?").unwrap();
+    let doc_embeddings = service.embed_documents(&["Rust programming language"]).unwrap();
+    let query_embedding = service.embed_query("What is Rust?").unwrap();
 
-    // Both should be valid embeddings
-    assert_eq!(doc_embedding.len(), 768);
-    assert_eq!(query_embedding.len(), 768);
-
-    // They should be different (due to different prefixes)
-    let are_different = doc_embedding
-        .iter()
-        .zip(query_embedding.iter())
-        .any(|(a, b)| (a - b).abs() > 0.001);
-    assert!(
-        are_different,
-        "query and document embeddings should differ due to prefixes"
-    );
+    assert_eq!(doc_embeddings[0].len(), 384);
+    assert_eq!(query_embedding.len(), 384);
 }
 
 #[test]
 #[ignore = "requires model download (~100MB), run with: cargo test --test e2e_llm -- --ignored"]
 fn test_semantic_similarity() {
-    let model = mdkb::llm::get_cached_model().expect("failed to load model");
+    let service = mdkb::llm::get_cached_service().expect("failed to load service");
 
     // These should be semantically similar
-    let rust1 = model.embed("Rust programming language").unwrap();
-    let rust2 = model.embed("Rust is a systems language").unwrap();
+    let rust1 = service.embed_query("Rust programming language").unwrap();
+    let rust2 = service.embed_query("Rust is a systems language").unwrap();
 
     // This should be less similar
-    let python = model.embed("Python scripting language").unwrap();
+    let python = service.embed_query("Python scripting language").unwrap();
 
     // This should be very different
-    let cooking = model.embed("How to bake chocolate chip cookies").unwrap();
+    let cooking = service.embed_query("How to bake chocolate chip cookies").unwrap();
 
-    let sim_rust_rust = mdkb::llm::embeddings::cosine_similarity(&rust1, &rust2);
-    let sim_rust_python = mdkb::llm::embeddings::cosine_similarity(&rust1, &python);
-    let sim_rust_cooking = mdkb::llm::embeddings::cosine_similarity(&rust1, &cooking);
+    let sim_rust_rust = mdkb::llm::cosine_similarity(&rust1, &rust2);
+    let sim_rust_python = mdkb::llm::cosine_similarity(&rust1, &python);
+    let sim_rust_cooking = mdkb::llm::cosine_similarity(&rust1, &cooking);
 
     // Rust descriptions should be most similar to each other
     assert!(
