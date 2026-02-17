@@ -260,7 +260,6 @@ fn test_mcp_tools_list() {
         "status",
         "update",
         "multi_get",
-        "get_metrics",
         "memory_write",
         "memory_delete",
         "collection_add",
@@ -711,32 +710,6 @@ fn test_mcp_tool_search_memory_scope() {
     assert!(
         text.contains("JWT") || text.contains("auth"),
         "Should find auth-related entries. Got: {}",
-        text
-    );
-}
-
-/// Test: get_metrics tool.
-#[test]
-fn test_mcp_tool_get_metrics() {
-    let mut harness = McpTestHarness::new();
-    harness.initialize();
-
-    // Perform some searches to generate metrics
-    for i in 0..5 {
-        harness.call_tool("search", json!({"query": format!("test query {}", i), "limit": 5}));
-    }
-
-    // Get metrics
-    let result = harness.call_tool(
-        "get_metrics",
-        json!({"period_days": 7, "include_latency": true, "include_quality": true}),
-    );
-    let text = McpTestHarness::get_text_content(&result);
-
-    // Should contain some metrics information
-    assert!(
-        text.contains("queries") || text.contains("latency") || text.contains("Metrics") || text.len() > 10,
-        "Should return metrics information. Got: {}",
         text
     );
 }

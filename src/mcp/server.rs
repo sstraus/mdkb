@@ -29,7 +29,7 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 use super::tools::{
     CodeGraphParams, CollectionAddParams, CollectionRemoveParams,
     GetParams, MemoryDeleteParams, MemoryWriteParams,
-    MetricsParams, MultiGetParams, SearchParams,
+    MultiGetParams, SearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -577,15 +577,15 @@ impl McpServer {
         )))
     }
 
-    /// Get index status with collection listing.
-    #[tool(description = "Get the current index status (collections, documents, etc.) including collection listing with source tags")]
+    /// Get index status with collection listing and optional code index stats.
+    #[tool(description = "Get the current index status (collections, documents, etc.) including code index stats when available")]
     async fn status(
         &self,
         Parameters(_): Parameters<EmptyObject>,
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let (output, tokens) = {
+        let mut output = {
             let ctx_guard = self.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
@@ -618,10 +618,25 @@ impl McpServer {
                 }
             }
 
-            let tokens = count_tokens(&output);
-            (output, tokens)
+            output
         }; // ctx_guard dropped here
 
+        // Append code index stats if code-intel is compiled and index is initialized
+        #[cfg(feature = "code-intel")]
+        {
+            let idx_guard = self.code_index.lock().await;
+            if let Some(facade) = idx_guard.as_ref() {
+                let symbols = facade.symbol_count();
+                let files = facade.file_count();
+                let relationships = facade.relationship_count();
+                output.push_str(&format!(
+                    "\n## Code Index\n\nSymbols: {}\nFiles: {}\nRelationships: {}\n",
+                    symbols, files, relationships
+                ));
+            }
+        }
+
+        let tokens = count_tokens(&output);
         self.metrics.record_status(tokens);
         self.record_persistent_call("status", tokens, 1, false).await;
         tracing::debug!("mdkb_status: {} tokens", tokens);
@@ -733,159 +748,6 @@ impl McpServer {
         self.metrics.record_multi_get(tokens, result_count);
         self.record_persistent_call("multi_get", tokens, result_count, truncated).await;
         tracing::debug!("mdkb_multi_get: {} tokens, {} docs, truncated={}", tokens, result_count, truncated);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Get usage and query performance metrics.
-    #[tool(description = "Get search performance metrics for self-evaluation. Includes token usage, query latency, zero-result rate, and quality scores. Use to understand query patterns, identify issues, and track improvements.")]
-    async fn get_metrics(
-        &self,
-        Parameters(params): Parameters<MetricsParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        // Current session token usage (doesn't need the ctx lock)
-        let summary = self.metrics.summary();
-
-        let output = {
-            let ctx_guard = self.ctx.lock().await;
-
-            let mut output = String::new();
-            let mut warnings: Vec<String> = Vec::new();
-
-            output.push_str(&format!(
-                "=== Token Usage (Current Session) ===\n\
-                 Total calls: {}\n\
-                 Total tokens: {}\n\
-                 Avg tokens/call: {:.1}\n",
-                summary.total_calls,
-                summary.total_tokens,
-                summary.avg_tokens_per_call,
-            ));
-
-            if let Some(ctx) = ctx_guard.as_ref() {
-                // Get query metrics for the period
-                if let Ok(query_metrics) = stats::get_query_metrics(&ctx.conn, params.period_days) {
-                    output.push_str(&format!(
-                        "\n=== Query Metrics (last {} days) ===\n\
-                         Total queries: {}\n\
-                         Zero-result rate: {:.1}%{}\n\
-                         Re-search rate: {:.1}%{}\n",
-                        params.period_days,
-                        query_metrics.total_queries,
-                        query_metrics.zero_result_rate,
-                        if query_metrics.zero_result_rate > 10.0 { " ⚠️" } else { " ✓" },
-                        query_metrics.re_search_rate,
-                        if query_metrics.re_search_rate > 15.0 { " ⚠️" } else { " ✓" },
-                    ));
-
-                    // Check for warnings
-                    if query_metrics.zero_result_rate > 10.0 {
-                        warnings.push(format!(
-                            "Zero-result rate {:.1}% > 10% threshold - queries not finding results",
-                            query_metrics.zero_result_rate
-                        ));
-                    }
-                    if query_metrics.re_search_rate > 15.0 {
-                        warnings.push(format!(
-                            "Re-search rate {:.1}% > 15% threshold - initial results may be poor",
-                            query_metrics.re_search_rate
-                        ));
-                    }
-
-                    // Latency section
-                    if params.include_latency {
-                        output.push_str(&format!(
-                            "\nLatency:\n\
-                             - p50: {}ms{}\n\
-                             - p95: {}ms{}\n\
-                             - p99: {}ms{}\n",
-                            query_metrics.latency_p50,
-                            if query_metrics.latency_p50 > 100 { " ⚠️" } else { " ✓" },
-                            query_metrics.latency_p95,
-                            if query_metrics.latency_p95 > 300 { " ⚠️" } else { " ✓" },
-                            query_metrics.latency_p99,
-                            if query_metrics.latency_p99 > 500 { " ⚠️" } else { " ✓" },
-                        ));
-
-                        if query_metrics.latency_p99 > 500 {
-                            warnings.push(format!(
-                                "p99 latency {}ms > 500ms threshold - performance issue",
-                                query_metrics.latency_p99
-                            ));
-                        }
-                    }
-
-                    // Quality section
-                    if params.include_quality {
-                        output.push_str(&format!(
-                            "\nScore Distribution:\n\
-                             - Excellent (>0.8): {:.1}%\n\
-                             - Good (0.5-0.8): {:.1}%\n\
-                             - Poor (<0.5): {:.1}%\n",
-                            query_metrics.score_above_80,
-                            query_metrics.score_50_to_80,
-                            query_metrics.score_below_50,
-                        ));
-
-                        if query_metrics.score_below_50 > 20.0 {
-                            warnings.push(format!(
-                                "Poor-score rate {:.1}% > 20% threshold - content quality or relevance issue",
-                                query_metrics.score_below_50
-                            ));
-                        }
-                    }
-                }
-
-                // Add latency by search type if requested
-                if params.include_latency {
-                    if let Ok(latency_stats) = stats::get_query_latency_stats(&ctx.conn) {
-                        if !latency_stats.is_empty() {
-                            output.push_str("\nLatency by Search Type:");
-                            for stat in &latency_stats {
-                                output.push_str(&format!(
-                                    "\n- {}: {:.1}ms avg, {}ms max ({} queries)",
-                                    stat.search_type,
-                                    stat.avg_latency_ms,
-                                    stat.max_latency_ms,
-                                    stat.count
-                                ));
-                            }
-                            output.push('\n');
-                        }
-                    }
-                }
-
-                // All-time token stats
-                if let Ok(aggregate) = stats::get_aggregate_stats(&ctx.conn) {
-                    output.push_str(&format!(
-                        "\n=== All-Time Token Stats ===\n\
-                         Total sessions: {}\n\
-                         Total calls: {}\n\
-                         Total tokens: {}\n",
-                        aggregate.total_sessions,
-                        aggregate.total_calls,
-                        aggregate.total_tokens,
-                    ));
-                }
-            }
-
-            // Add warnings section
-            if !warnings.is_empty() {
-                output.push_str("\n⚠️ Warnings:\n");
-                for warning in &warnings {
-                    output.push_str(&format!("  - {}\n", warning));
-                }
-            } else {
-                output.push_str("\n✓ All metrics within acceptable ranges\n");
-            }
-
-            output
-        }; // ctx_guard dropped here
-
-        let tokens = count_tokens(&output);
-        self.record_persistent_call("metrics", tokens, 1, false).await;
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -1155,41 +1017,6 @@ impl McpServer {
         }
     }
 
-    /// Get code index statistics.
-    #[tool(description = "Get code intelligence index statistics: number of indexed symbols, files, and relationships.")]
-    async fn get_index_info(
-        &self,
-        Parameters(_): Parameters<EmptyObject>,
-    ) -> Result<CallToolResult, McpError> {
-        #[cfg(not(feature = "code-intel"))]
-        { return Err(mcp_error("Code intelligence not enabled. Build with --features code-intel")); }
-
-        #[cfg(feature = "code-intel")]
-        {
-            self.ensure_code_index().await?;
-
-            let output = {
-                let idx_guard = self.code_index.lock().await;
-                let facade = idx_guard
-                    .as_ref()
-                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
-
-                let symbols = facade.symbol_count();
-                let files = facade.file_count();
-                let relationships = facade.relationship_count();
-
-                format!(
-                    "Code Index Info:\n  Symbols: {}\n  Files: {}\n  Relationships: {}",
-                    symbols, files, relationships
-                )
-            }; // idx_guard dropped
-
-            let tokens = count_tokens(&output);
-            self.record_persistent_call("get_index_info", tokens, 1, false).await;
-
-            Ok(CallToolResult::success(vec![Content::text(output)]))
-        }
-    }
 }
 
 /// Format a code symbol for MCP output.
@@ -2494,36 +2321,31 @@ pub fn utility() -> i32 {
         }
 
         #[tokio::test]
-        async fn test_get_index_info() {
+        async fn test_status_includes_code_index() {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
-                .await.expect("timeout").expect("get_index_info failed");
+            // Ensure code index is populated by doing a symbols search first
+            tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
+                query: "main".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("symbols".to_string()),
+                kind: None,
+                threshold: 0.3,
+                file: None,
+            })))
+            .await.expect("timeout").expect("search scope=symbols failed");
+
+            let result = tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
+                .await.expect("timeout").expect("status failed");
 
             let text = extract_text(&result);
+            assert!(text.contains("Code Index"), "Should include code index section: {}", text);
             assert!(text.contains("Symbols:"), "Should list symbols: {}", text);
             assert!(text.contains("Files:"), "Should list files: {}", text);
             assert!(text.contains("Relationships:"), "Should list relationships: {}", text);
-            // We indexed 2 files with multiple symbols
-            assert!(!text.contains("Symbols: 0"), "Should have indexed some symbols: {}", text);
-        }
-
-        #[tokio::test]
-        async fn test_get_index_info_empty() {
-            let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-            let root = temp_dir.path().to_path_buf();
-            crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
-
-            let server = McpServer::new(root);
-            let timeout = Duration::from_secs(5);
-
-            let result = tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
-                .await.expect("timeout").expect("get_index_info failed");
-
-            let text = extract_text(&result);
-            assert!(text.contains("Symbols: 0"), "Empty index: {}", text);
-            assert!(text.contains("Files: 0"), "Empty index: {}", text);
         }
 
         #[tokio::test]
@@ -2532,8 +2354,8 @@ pub fn utility() -> i32 {
             let timeout = Duration::from_secs(5);
 
             // Call multiple code-intel tools in sequence to verify no deadlock
-            tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
-                .await.expect("timeout").expect("get_index_info failed");
+            tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
+                .await.expect("timeout").expect("status failed");
 
             tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
                 query: "main".to_string(),
@@ -2559,8 +2381,8 @@ pub fn utility() -> i32 {
             })))
             .await.expect("timeout").expect("search scope=symbols failed (second call)");
 
-            tokio::time::timeout(timeout, server.get_index_info(Parameters(EmptyObject {})))
-                .await.expect("timeout").expect("get_index_info failed (second call)");
+            tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
+                .await.expect("timeout").expect("status failed (second call)");
         }
 
         #[tokio::test]
