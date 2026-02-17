@@ -20,21 +20,6 @@ cargo install --path .
 
 Or download a pre-built binary from [Releases](https://github.com/user/mdkb/releases).
 
-### Building for Older CPUs
-
-The LLM feature requires CPU-specific optimizations. If you get `SIGILL` (illegal instruction) errors on older CPUs without AVX2 (e.g., Intel Ivy Bridge, Sandy Bridge), you need to patch `llama-cpp-sys-2`:
-
-```bash
-# Copy the crate locally
-cp -r ~/.cargo/registry/src/*/llama-cpp-sys-2-* patches/llama-cpp-sys-2
-
-# Edit patches/llama-cpp-sys-2/build.rs to explicitly disable AVX2:
-# Change the feature detection loop to explicitly set OFF for missing features
-# See: .cargo/config.toml for target-cpu settings
-```
-
-The patch is not committed to the repo due to size (includes full llama.cpp source). See `.cargo/config.toml` for the target CPU configuration.
-
 ## Quick Start
 
 ```bash
@@ -62,7 +47,7 @@ mdkb search "how to handle errors" -c docs
 mdkb uses hybrid search combining two strategies:
 
 - **BM25 keyword search** - Traditional full-text search. "OAuth2 callback" finds documents with those exact words.
-- **Semantic vector search** - Understands meaning. "how to authenticate users" finds docs about "login", "OAuth", "JWT".
+- **Semantic vector search** - Understands meaning using fastembed (AllMiniLML6V2, 384-dim). "how to authenticate users" finds docs about "login", "OAuth", "JWT".
 
 Results are merged using Reciprocal Rank Fusion (RRF), so documents matching both keyword and meaning rank highest.
 
@@ -126,10 +111,10 @@ Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectura
 
 ### How AIs Use Memory
 
-1. **Session start**: AI calls `memory_index` to get top 50 entries (~1.5K tokens)
-2. **On demand**: AI calls `memory_get` for full entry content
+1. **Session start**: Server instructions include top 50 memory entries (~1.5K tokens)
+2. **On demand**: AI calls `get(slug)` for full entry content
 3. **Learning**: AI calls `memory_write` to persist new knowledge
-4. **Finding**: AI calls `memory_search` to find related entries
+4. **Finding**: AI calls `search(query, scope="memory")` to find related entries
 
 Access counts track which entries are most useful, ensuring the warmup index prioritizes frequently-used knowledge.
 
@@ -176,22 +161,20 @@ If you prefer manual configuration, add to `~/.claude/mcp.json`:
 
 For project-scoped setups (Option 1 with `--scope local`), the server runs from your current project directory. For user-scoped setups (`--scope user`), ensure `.mdkb/` exists in your home directory or launch Claude Code from a directory with `.mdkb/` initialized.
 
-### Available Tools
+### Available Tools (10)
 
 | Tool | Description |
 |------|-------------|
-| `search` | Hybrid search (keyword + semantic) |
-| `get` | Retrieve document by ID (supports line ranges) |
+| `search` | Unified search with scope: `docs` (default), `memory`, `all`, `code`, `symbols` |
+| `get` | Retrieve by ID, path, or memory slug (supports line ranges) |
 | `multi_get` | Batch retrieve by glob pattern |
-| `list_collections` | List available collections |
-| `status` | Check index health |
+| `code_graph` | Call graph queries: `calls`, `callers`, or `impact` (requires `code-intel` feature) |
+| `status` | Index health, collections, and code index stats |
 | `update` | Trigger reindex |
-| `get_metrics` | View token usage and search quality statistics |
-| `memory_index` | Get warmup index for session start |
-| `memory_get` | Retrieve full memory entry |
 | `memory_write` | Create or update memory entry |
-| `memory_search` | Search memory entries |
-| `evolution` | Trace document evolution history |
+| `memory_delete` | Delete a memory entry |
+| `collection_add` | Add a document collection |
+| `collection_remove` | Remove a collection |
 
 ### File Watching
 
@@ -222,10 +205,10 @@ All data stays local in `.mdkb/`:
 ```
 .mdkb/
 ├── config.toml
-├── index.sqlite
-└── models/
-    └── bge-small-en-v1.5-q8_0.gguf
+└── index.sqlite
 ```
+
+The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded automatically on first use and cached locally.
 
 Add `.mdkb/` to `.gitignore` - it can be regenerated with `mdkb update && mdkb embed`.
 
