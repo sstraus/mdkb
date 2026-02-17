@@ -1307,16 +1307,17 @@ solutions to past problems, and architectural decisions.
 
 ## Core Tools
 
-- `search(query)`: Find documents using hybrid search. Start here. Use `scope` to search `\"docs\"` (default), `\"memory\"`, or `\"all\"`.
-- `get(id)`: Retrieve by numeric ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2'). Includes evolution metadata for documents.
+- `search(query)`: Find documents using hybrid search. Start here.
+  - `scope`: `\"docs\"` (default), `\"memory\"`, `\"all\"`, `\"code\"`, or `\"symbols\"`.
+  - `scope=\"code\"`: Semantic similarity over code symbols. Optional: `kind` (e.g., \"function\", \"struct\"), `threshold` (0.0-1.0).
+  - `scope=\"symbols\"`: Fuzzy text match over symbol names/signatures. Optional: `kind`, `file` (path substring filter).
+- `get(id)`: Retrieve full content by numeric ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2').
 - `multi_get(pattern)`: Retrieve multiple documents matching a glob pattern.
-- `status`: Check index health, collections with [convention]/[manual] tags, and document counts.
+- `code_graph(name)`: Query code call graph. `direction`: `\"calls\"` (default), `\"callers\"`, or `\"impact\"` (transitive, with `max_depth`).
+- `status`: Check index health (collections, documents, code index stats).
 - `update`: Trigger reindex after adding new documents.
 - `collection_add(name, path, pattern)`: Add a document collection to index.
 - `collection_remove(name)`: Remove a collection and its indexed documents.
-
-## Memory Tools (Cross-Session Persistence)
-
 - `memory_write(id, title, content, type, tags)`: Save knowledge for future sessions.
 - `memory_delete(id)`: Delete a memory entry permanently.
 
@@ -1343,7 +1344,7 @@ fn build_server_instructions(index: &[String]) -> String {
             instructions.push_str(entry);
             instructions.push('\n');
         }
-        instructions.push_str("\nUse `memory_get(id)` to retrieve full content.\n");
+        instructions.push_str("\nUse `get(id)` to retrieve full content.\n");
     }
 
     instructions
@@ -1527,7 +1528,7 @@ mod tests {
         // Check base instructions present
         assert!(result.contains("knowledge base"));
         assert!(result.contains("memory_write"));
-        assert!(result.contains("memory_get"));
+        assert!(result.contains("get(id)"));
 
         // Check guidance
         assert!(result.contains("When to Write Memories"));
