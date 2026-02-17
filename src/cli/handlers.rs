@@ -196,11 +196,11 @@ pub fn handle_vsearch(
     limit: usize,
     collection: Option<&str>,
 ) -> Result<Vec<SearchResult>> {
-    // Use cached model to avoid reloading (fixes P1-PERF-003)
-    let model = crate::llm::get_cached_model()?;
+    // Use cached service to avoid reloading
+    let service = crate::llm::get_cached_service()?;
 
     // Generate query embedding
-    let query_embedding = model.embed_query(query_text)?;
+    let query_embedding = service.embed_query(query_text)?;
 
     // Perform vector search - get more results to account for collection filtering
     let fetch_limit = if collection.is_some() { limit * 2 } else { limit };
@@ -270,9 +270,9 @@ pub fn handle_hybrid_search(
     };
     let bm25_results = search::search(&ctx.conn, &bm25_query)?;
 
-    // Use cached model to avoid reloading (fixes P1-PERF-003)
-    let model = crate::llm::get_cached_model()?;
-    let query_embedding = model.embed_query(query_text)?;
+    // Use cached service to avoid reloading
+    let service = crate::llm::get_cached_service()?;
+    let query_embedding = service.embed_query(query_text)?;
     let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, limit * 2)?;
 
     // Fuse results using RRF
@@ -737,8 +737,8 @@ fn update_collection(
 pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
     let mut result = EmbedResult::default();
 
-    // Use cached model to avoid reloading (fixes P1-PERF-003)
-    let model = crate::llm::get_cached_model()?;
+    // Use cached service to avoid reloading
+    let service = crate::llm::get_cached_service()?;
 
     // Get all documents
     let all_collections = collections::list_collections(&ctx.conn)?;
@@ -772,13 +772,13 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
             };
 
             // Generate embedding
-            match model.embed(content) {
+            match service.embed_query(content) {
                 Ok(embedding) => {
                     vectors::store_embedding(
                         &ctx.conn,
                         doc.id,
                         &embedding,
-                        crate::llm::embeddings::DEFAULT_EMBEDDING_REPO,
+                        crate::llm::embeddings::MODEL_NAME,
                     )?;
                     result.generated += 1;
                 }

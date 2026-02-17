@@ -69,10 +69,8 @@ directories = "5"
 pulldown-cmark = "0.12"
 regex = "1"
 
-# LLM - semantic search with local embeddings
-llama-cpp-2 = "0.1"
-hf-hub = "0.3"
-indicatif = "0.17"
+# Embedding - semantic search with local ONNX models
+fastembed = "4"
 
 # Token counting for usage metrics
 tiktoken-rs = "0.6"
@@ -101,8 +99,6 @@ crossbeam-channel = { version = "0.5", optional = true }
 ignore = { version = "0.4", optional = true }
 rayon = { version = "1.10", optional = true }
 
-# Code intelligence - semantic search with local embeddings
-fastembed = { version = "4", optional = true }
 
 # HTTP server auth (constant-time token comparison)
 subtle = { version = "2", optional = true }
@@ -136,7 +132,6 @@ code-intel = [
     "dep:crossbeam-channel",
     "dep:ignore",
     "dep:rayon",
-    "dep:fastembed",
 ]
 
 [dev-dependencies]
@@ -156,11 +151,6 @@ redundant_imports = "warn"
 trivial_numeric_casts = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_lifetimes = "warn"
-
-# Patch llama-cpp-sys-2 to explicitly disable AVX2/FMA on older CPUs
-# Without this, ggml defaults to AVX2=ON which causes SIGILL on Ivy Bridge
-[patch.crates-io]
-llama-cpp-sys-2 = { path = "patches/llama-cpp-sys-2" }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
