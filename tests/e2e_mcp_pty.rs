@@ -253,7 +253,7 @@ fn test_mcp_tools_list() {
 
     let tools = harness.list_tools();
 
-    // Expected tools based on server implementation
+    // Expected tools based on server implementation (10 tools)
     let expected_tools = vec![
         "search",
         "get",
@@ -264,6 +264,7 @@ fn test_mcp_tools_list() {
         "memory_delete",
         "collection_add",
         "collection_remove",
+        "code_graph",
     ];
 
     let tool_names: Vec<&str> = tools

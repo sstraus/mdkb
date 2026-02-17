@@ -16,9 +16,7 @@ use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
 use crate::cli::handlers::{Context, handle_collection_add, handle_collection_remove, handle_hybrid_search, handle_mget, handle_update};
-#[cfg(feature = "code-intel")]
 use crate::code::indexing::IndexFacade;
-#[cfg(feature = "code-intel")]
 use crate::code::types::SymbolId;
 use crate::config::McpConfig;
 use crate::domain::SearchResult;
@@ -49,7 +47,6 @@ pub struct McpServer {
     /// Shared database context.
     ctx: Arc<Mutex<Option<Context>>>,
     /// Code intelligence index (Tantivy-backed).
-    #[cfg(feature = "code-intel")]
     code_index: Arc<Mutex<Option<IndexFacade>>>,
     /// Tool router.
     tool_router: ToolRouter<Self>,
@@ -83,7 +80,6 @@ impl McpServer {
         Self {
             root,
             ctx: Arc::new(Mutex::new(None)),
-            #[cfg(feature = "code-intel")]
             code_index: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
             metrics: Arc::new(UsageMetrics::new()),
@@ -98,7 +94,6 @@ impl McpServer {
         Self {
             root,
             ctx: Arc::new(Mutex::new(None)),
-            #[cfg(feature = "code-intel")]
             code_index: Arc::new(Mutex::new(None)),
             tool_router: Self::tool_router(),
             metrics: Arc::new(UsageMetrics::new()),
@@ -233,7 +228,6 @@ impl McpServer {
     /// Initialize the code intelligence index (Tantivy-backed).
     ///
     /// Opens or creates the index at `.mdkb/code-index/`.
-    #[cfg(feature = "code-intel")]
     async fn ensure_code_index(&self) -> Result<(), McpError> {
         let mut idx_guard = self.code_index.lock().await;
         if idx_guard.is_none() {
@@ -250,7 +244,6 @@ impl McpServer {
     /// If `symbol_id` is provided, looks up by ID directly.
     /// If only `name` is provided, finds all matches. Returns an error with
     /// a disambiguation list if multiple symbols share the name.
-    #[cfg(feature = "code-intel")]
     fn resolve_symbol(
         facade: &IndexFacade,
         name: &str,
@@ -401,16 +394,6 @@ impl McpServer {
                     // Drop ctx_guard before acquiring code_index lock
                     drop(ctx_guard);
 
-                    #[cfg(not(feature = "code-intel"))]
-                    {
-                        return Err(mcp_error(
-                            "Code search is not available. This build was compiled without code-intel support. \
-                             Rebuild with `--features code-intel` to enable code search. \
-                             For document search, use scope='docs' (default)."
-                        ));
-                    }
-
-                    #[cfg(feature = "code-intel")]
                     {
                         self.ensure_code_index().await?;
 
@@ -621,8 +604,7 @@ impl McpServer {
             output
         }; // ctx_guard dropped here
 
-        // Append code index stats if code-intel is compiled and index is initialized
-        #[cfg(feature = "code-intel")]
+        // Append code index stats if index is initialized
         {
             let idx_guard = self.code_index.lock().await;
             if let Some(facade) = idx_guard.as_ref() {
@@ -915,7 +897,7 @@ impl McpServer {
     }
 
     // -----------------------------------------------------------------------
-    // Code intelligence tools (require `code-intel` feature at runtime)
+    // Code intelligence tools
     // -----------------------------------------------------------------------
 
     /// Query the code call graph: outgoing calls, incoming callers, or impact radius.
@@ -924,26 +906,15 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<CodeGraphParams>,
     ) -> Result<CallToolResult, McpError> {
-        #[cfg(not(feature = "code-intel"))]
-        {
-            let _ = params;
-            return Err(mcp_error(
-                "Code graph is not available. This build was compiled without code-intel support. \
-                 Rebuild with `--features code-intel` to enable code intelligence."
-            ));
-        }
+        self.ensure_code_index().await?;
 
-        #[cfg(feature = "code-intel")]
-        {
-            self.ensure_code_index().await?;
+        let output = {
+            let idx_guard = self.code_index.lock().await;
+            let facade = idx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Code index not initialized"))?;
 
-            let output = {
-                let idx_guard = self.code_index.lock().await;
-                let facade = idx_guard
-                    .as_ref()
-                    .ok_or_else(|| mcp_error("Code index not initialized"))?;
-
-                let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
+            let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
 
                 match params.direction.as_str() {
                     "calls" => {
@@ -1010,17 +981,15 @@ impl McpServer {
                 }
             }; // idx_guard dropped
 
-            let tokens = count_tokens(&output);
-            self.record_persistent_call("code_graph", tokens, 1, false).await;
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("code_graph", tokens, 1, false).await;
 
-            Ok(CallToolResult::success(vec![Content::text(output)]))
-        }
+        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
 }
 
 /// Format a code symbol for MCP output.
-#[cfg(feature = "code-intel")]
 fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
     let mut out = format!(
         "  sym#{} {:?} {} in {}:{}\n",
@@ -1130,13 +1099,11 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
     // Start file watcher in background
     let watcher_root = root.clone();
     let watcher_ctx = server.ctx.clone();
-    #[cfg(feature = "code-intel")]
     let watcher_code_index = server.code_index.clone();
     tokio::spawn(async move {
         if let Err(e) = run_file_watcher(
             watcher_root,
             watcher_ctx,
-            #[cfg(feature = "code-intel")]
             watcher_code_index,
         )
         .await
@@ -1193,7 +1160,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
 async fn run_file_watcher(
     root: PathBuf,
     ctx: Arc<Mutex<Option<Context>>>,
-    #[cfg(feature = "code-intel")] code_index: Arc<Mutex<Option<IndexFacade>>>,
+    code_index: Arc<Mutex<Option<IndexFacade>>>,
 ) -> crate::error::Result<()> {
     let config = WatcherConfig::default();
     let mut watcher = FileWatcher::new(config)?;
@@ -1225,7 +1192,6 @@ async fn run_file_watcher(
     }
 
     // Watch root for source code changes (code intelligence)
-    #[cfg(feature = "code-intel")]
     {
         let code_config = {
             let config_path = root.join(".mdkb/config.toml");
@@ -1245,7 +1211,6 @@ async fn run_file_watcher(
         tracing::debug!("File change detected: {:?}", change.path);
 
         // Check if this is a source code file change
-        #[cfg(feature = "code-intel")]
         {
             use crate::code::parsing::language::Language;
             if Language::from_path(&change.path).is_some() {
@@ -2058,7 +2023,6 @@ mod tests {
 
     // --- Code intelligence tool tests ---
 
-    #[cfg(feature = "code-intel")]
     mod code_intel_tests {
         use super::*;
         use std::time::Duration;

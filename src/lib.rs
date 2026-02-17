@@ -10,12 +10,7 @@
 //! - **Store**: SQLite storage layer (rusqlite + FTS5)
 //! - **CLI/MCP**: User interfaces (clap CLI, rmcp MCP server)
 //!
-//! # Features
-//!
-//! - `llm`: Enable local LLM inference for semantic search (Phase 3+)
-
 pub mod cli;
-#[cfg(feature = "code-intel")]
 pub mod code;
 pub mod config;
 pub mod domain;

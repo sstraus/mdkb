@@ -122,7 +122,7 @@ pub struct MemoryDeleteParams {
 }
 
 // ---------------------------------------------------------------------------
-// Code intelligence tool parameters (requires `code-intel` feature)
+// Code intelligence tool parameters
 // ---------------------------------------------------------------------------
 
 /// Parameters for code_graph: call graph queries with direction.
