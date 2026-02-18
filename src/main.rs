@@ -92,16 +92,17 @@ async fn main() -> Result<()> {
             file,
         } => {
             let ctx = Context::open(&cwd)?;
-            match scope.as_str() {
-                "docs" => {
+            match scope.as_deref() {
+                Some("docs") => {
                     let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref(), include_superseded)?;
                     format_search_results(&results, cli.format);
                 }
-                "memory" => {
+                Some("memory") => {
                     let entries = handle_memory_search(&ctx, &query, limit)?;
                     format_memory_list(&entries, cli.format);
                 }
-                "all" => {
+                None => {
+                    // Default: search docs + memory
                     let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref(), include_superseded)?;
                     let entries = handle_memory_search(&ctx, &query, limit)?;
                     if !results.is_empty() {
@@ -116,7 +117,7 @@ async fn main() -> Result<()> {
                         println!("No results found.");
                     }
                 }
-                "code" => {
+                Some("code") => {
                     let symbols = mdkb::cli::handlers::handle_code_search(
                         &cwd,
                         &query,
@@ -125,7 +126,7 @@ async fn main() -> Result<()> {
                     )?;
                     format_code_symbols(&symbols, cli.format);
                 }
-                "symbols" => {
+                Some("symbols") => {
                     let symbols = mdkb::cli::handlers::handle_code_find(
                         &cwd,
                         &query,
@@ -134,8 +135,8 @@ async fn main() -> Result<()> {
                     )?;
                     format_code_symbols(&symbols, cli.format);
                 }
-                _ => {
-                    eprintln!("Invalid scope: '{}'. Valid values: docs, memory, all, code, symbols", scope);
+                Some(invalid) => {
+                    eprintln!("Invalid scope: '{}'. Valid values: docs, memory, code, symbols. Omit for docs+memory.", invalid);
                     std::process::exit(1);
                 }
             }

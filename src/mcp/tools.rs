@@ -21,7 +21,7 @@ pub struct SearchParams {
     #[serde(default)]
     pub include_superseded: bool,
 
-    /// Search scope: "docs" (default), "memory", "all", "code", or "symbols".
+    /// Search scope: "docs", "memory", "code", or "symbols". Omit to search docs+memory.
     #[serde(default)]
     pub scope: Option<String>,
 

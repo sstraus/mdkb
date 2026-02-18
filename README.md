@@ -49,9 +49,9 @@ mdkb provides unified search across documents, memory, and code with the `--scop
 
 | Scope | Description |
 |-------|-------------|
-| `docs` (default) | Hybrid BM25 + semantic search over markdown documents |
+| _(omit)_ | Searches docs + memory (default) |
+| `docs` | Hybrid BM25 + semantic search over markdown documents |
 | `memory` | Full-text search over memory entries |
-| `all` | Combined docs + memory results |
 | `code` | Fuzzy symbol search over indexed source code |
 | `symbols` | Exact symbol lookup by name |
 
@@ -210,7 +210,7 @@ For project-scoped setups (Option 1 with `--scope local`), the server runs from 
 
 | Tool | Description |
 |------|-------------|
-| `search` | Unified search with scope: `docs` (default), `memory`, `all`, `code`, `symbols` |
+| `search` | Search docs+memory (default), or scope to `docs`, `memory`, `code`, `symbols` |
 | `get` | Retrieve by ID, path, memory slug, glob pattern, or comma-separated list |
 | `code_graph` | Call graph queries: `calls`, `callers`, or `impact` |
 | `status` | Index health, collections, and code index stats |

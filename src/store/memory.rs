@@ -216,6 +216,7 @@ pub fn list_entries(conn: &Connection, limit: usize, status_filter: Option<Entry
 
 /// Search memory entries using full-text search.
 pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+    let fts_query = crate::store::search::escape_fts5_query(query);
     let mut stmt = conn.prepare(
         "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path
          FROM memory_entries m
@@ -225,7 +226,7 @@ pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Ve
          LIMIT ?2"
     )?;
 
-    let rows = stmt.query_map(params![query, limit as i64], row_to_entry)?;
+    let rows = stmt.query_map(params![fts_query, limit as i64], row_to_entry)?;
 
     let mut entries = Vec::new();
     for row in rows {

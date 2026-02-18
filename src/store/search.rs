@@ -12,7 +12,7 @@ use rusqlite::{Connection, params};
 /// - Hyphenated words like "anti-CSRF" being parsed as negation
 /// - ALL CAPS words being interpreted as operators or column names
 /// - Special characters in the query
-fn escape_fts5_query(query: &str) -> String {
+pub fn escape_fts5_query(query: &str) -> String {
     // Split on whitespace and quote each term
     query
         .split_whitespace()

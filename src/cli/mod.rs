@@ -60,9 +60,9 @@ pub enum Command {
         #[arg(long)]
         include_superseded: bool,
 
-        /// Search scope: docs (default), memory, all, code, or symbols
-        #[arg(long, default_value = "docs")]
-        scope: String,
+        /// Search scope: docs, memory, code, or symbols. Omit to search docs+memory
+        #[arg(long)]
+        scope: Option<String>,
 
         /// Filter by symbol kind (function, struct, method, etc.) - used with code/symbols scopes
         #[arg(short, long)]

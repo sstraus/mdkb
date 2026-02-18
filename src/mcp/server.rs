@@ -437,7 +437,7 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let scope = params.scope.as_deref().unwrap_or("docs");
+        let scope = params.scope.as_deref();
 
         let (output, tokens, result_count) = {
             let ctx_guard = self.ctx.lock().await;
@@ -446,7 +446,7 @@ impl McpServer {
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
             match scope {
-                "docs" => {
+                Some("docs") => {
                     let results = handle_hybrid_search(
                         ctx,
                         &params.query,
@@ -460,7 +460,7 @@ impl McpServer {
                     let tokens = count_tokens(&output);
                     (output, tokens, results.len())
                 }
-                "memory" => {
+                Some("memory") => {
                     let entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
                         .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
@@ -468,7 +468,7 @@ impl McpServer {
                     let tokens = count_tokens(&output);
                     (output, tokens, entries.len())
                 }
-                "all" => {
+                None => {
                     let doc_results = handle_hybrid_search(
                         ctx,
                         &params.query,
@@ -482,42 +482,30 @@ impl McpServer {
                         .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
                     let total = doc_results.len() + mem_entries.len();
-                    let mut output = format!("Found {} results:\n\n", total);
-
-                    if !doc_results.is_empty() {
-                        output.push_str("## Documents\n\n");
-                        for r in &doc_results {
-                            output.push_str(&format!(
-                                "- [DOC] {} (score: {:.2})\n",
-                                r.path, r.score
-                            ));
-                            if let Some(ref title) = r.title {
-                                output.push_str(&format!("  Title: {}\n", title));
-                            }
-                        }
-                        output.push('\n');
-                    }
-
-                    if !mem_entries.is_empty() {
-                        output.push_str("## Memory Entries\n\n");
-                        for entry in &mem_entries {
-                            output.push_str(&format!(
-                                "- [MEM] {} ({}): {}\n",
-                                entry.title,
-                                entry.id,
-                                truncate_text(&entry.content, 100)
-                            ));
-                        }
-                    }
 
                     if total == 0 {
-                        output = "No results found in documents or memory. Try a different query.".to_string();
-                    }
+                        let output = "No results found. Try broader terms, use scope='code' for code symbols, or check `status` to verify collections are indexed.".to_string();
+                        let tokens = count_tokens(&output);
+                        (output, tokens, 0)
+                    } else {
+                        let mut output = String::new();
 
-                    let tokens = count_tokens(&output);
-                    (output, tokens, total)
+                        if !doc_results.is_empty() {
+                            output.push_str(&format_search_results(&doc_results));
+                        }
+
+                        if !mem_entries.is_empty() {
+                            if !doc_results.is_empty() {
+                                output.push_str("\n## Memory\n\n");
+                            }
+                            output.push_str(&format_memory_search_results(&mem_entries));
+                        }
+
+                        let tokens = count_tokens(&output);
+                        (output, tokens, total)
+                    }
                 }
-                "code" | "symbols" => {
+                Some("code") | Some("symbols") => {
                     // Drop ctx_guard before acquiring code_index lock
                     drop(ctx_guard);
 
@@ -529,7 +517,7 @@ impl McpServer {
                             .as_ref()
                             .ok_or_else(|| mcp_error("Code index not initialized"))?;
 
-                        if scope == "code" {
+                        if scope == Some("code") {
                             // Semantic search (embedding similarity)
                             let mut results = facade
                                 .semantic_search(&params.query, params.limit, params.threshold)
@@ -598,10 +586,10 @@ impl McpServer {
                         }
                     }
                 }
-                _ => {
+                Some(invalid) => {
                     return Err(mcp_error(format!(
-                        "Invalid scope: '{}'. Valid values: 'docs' (default), 'memory', 'all', 'code', 'symbols'.",
-                        scope
+                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols. Omit scope to search docs+memory.",
+                        invalid
                     )));
                 }
             }
@@ -1354,7 +1342,7 @@ code symbols, solutions to past problems, and architectural decisions.
 ## Core Tools
 
 - `search(query)`: Find documents using hybrid search. Start here.
-  - `scope`: `\"docs\"` (default), `\"memory\"`, `\"all\"`, `\"code\"`, or `\"symbols\"`.
+  - `scope`: `\"docs\"`, `\"memory\"`, `\"code\"`, or `\"symbols\"`. Omit to search docs+memory.
   - `scope=\"code\"`: Semantic similarity over code symbols. Optional: `kind` (e.g., \"function\", \"struct\"), `threshold` (0.0-1.0).
   - `scope=\"symbols\"`: Fuzzy text match over symbol names/signatures. Optional: `kind`, `file` (path substring filter).
 - `get(id)`: Retrieve full content by numeric ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2').
