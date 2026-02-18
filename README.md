@@ -168,7 +168,7 @@ For project-scoped setups (Option 1 with `--scope local`), the server runs from 
 | `search` | Unified search with scope: `docs` (default), `memory`, `all`, `code`, `symbols` |
 | `get` | Retrieve by ID, path, or memory slug (supports line ranges) |
 | `multi_get` | Batch retrieve by glob pattern |
-| `code_graph` | Call graph queries: `calls`, `callers`, or `impact` (requires `code-intel` feature) |
+| `code_graph` | Call graph queries: `calls`, `callers`, or `impact` |
 | `status` | Index health, collections, and code index stats |
 | `update` | Trigger reindex |
 | `memory_write` | Create or update memory entry |

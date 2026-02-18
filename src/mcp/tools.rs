@@ -53,17 +53,6 @@ pub struct GetParams {
     pub lines: Option<String>,
 }
 
-/// Parameters for the multi_get tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct MultiGetParams {
-    /// Pattern to match (glob).
-    pub pattern: String,
-
-    /// Optional collection filter.
-    #[serde(default)]
-    pub collection: Option<String>,
-}
-
 /// Parameters for the memory write tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct MemoryWriteParams {
@@ -87,31 +76,6 @@ pub struct MemoryWriteParams {
 
 fn default_entry_type() -> String {
     "topic".to_string()
-}
-
-/// Parameters for the collection_add tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct CollectionAddParams {
-    /// Collection name.
-    pub name: String,
-
-    /// Path to directory containing documents.
-    pub path: String,
-
-    /// Glob pattern for files (default: **/*.md).
-    #[serde(default = "default_collection_pattern")]
-    pub pattern: String,
-}
-
-fn default_collection_pattern() -> String {
-    "**/*.md".to_string()
-}
-
-/// Parameters for the collection_remove tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct CollectionRemoveParams {
-    /// Name of the collection to remove.
-    pub name: String,
 }
 
 /// Parameters for the memory_delete tool.
@@ -199,31 +163,6 @@ mod tests {
         let params: GetParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.id, "123");
         assert!(params.lines.is_none());
-    }
-
-    #[test]
-    fn test_collection_add_params_deserialize() {
-        let json = r#"{"name": "docs", "path": "docs/", "pattern": "**/*.txt"}"#;
-        let params: CollectionAddParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "docs");
-        assert_eq!(params.path, "docs/");
-        assert_eq!(params.pattern, "**/*.txt");
-    }
-
-    #[test]
-    fn test_collection_add_params_default_pattern() {
-        let json = r#"{"name": "notes", "path": "notes/"}"#;
-        let params: CollectionAddParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "notes");
-        assert_eq!(params.path, "notes/");
-        assert_eq!(params.pattern, "**/*.md");
-    }
-
-    #[test]
-    fn test_collection_remove_params_deserialize() {
-        let json = r#"{"name": "docs"}"#;
-        let params: CollectionRemoveParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "docs");
     }
 
     #[test]

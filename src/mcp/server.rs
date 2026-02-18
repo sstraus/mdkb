@@ -15,7 +15,7 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
-use crate::cli::handlers::{Context, handle_collection_add, handle_collection_remove, handle_hybrid_search, handle_mget, handle_update};
+use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_update};
 use crate::code::indexing::IndexFacade;
 use crate::code::types::SymbolId;
 use crate::config::McpConfig;
@@ -25,9 +25,9 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    CodeGraphParams, CollectionAddParams, CollectionRemoveParams,
+    CodeGraphParams,
     GetParams, MemoryDeleteParams, MemoryWriteParams,
-    MultiGetParams, SearchParams,
+    SearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -222,6 +222,133 @@ impl McpServer {
         self.metrics.record_get(tokens);
         self.record_persistent_call("get", tokens, 1, false).await;
         tracing::debug!("mdkb_get: {} tokens", tokens);
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Retrieve multiple documents by comma-separated IDs/paths/slugs.
+    async fn get_batch(&self, ids: &str, lines: &Option<String>) -> Result<CallToolResult, McpError> {
+        let ctx_guard = self.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        let mut output = String::new();
+        let mut found = 0;
+
+        for raw_id in ids.split(',') {
+            let id = raw_id.trim();
+            if id.is_empty() {
+                continue;
+            }
+
+            // Try numeric ID
+            if let Ok(numeric_id) = id.parse::<i64>() {
+                if let Ok(Some(doc)) = documents::get_document(&ctx.conn, numeric_id) {
+                    if let Ok(content) = self.get_document_content(ctx, &doc, lines) {
+                        let title = doc.title.as_deref().unwrap_or("(untitled)");
+                        output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
+                        found += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Try path resolution
+            if let Ok(doc) = resolve_document(&ctx.conn, id) {
+                if let Ok(content) = self.get_document_content(ctx, &doc, lines) {
+                    let title = doc.title.as_deref().unwrap_or("(untitled)");
+                    output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
+                    found += 1;
+                    continue;
+                }
+            }
+
+            // Try memory slug
+            if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+                output.push_str(&format!(
+                    "=== [MEM] {} - {} ===\n{}\n\n",
+                    entry.id, entry.title, entry.content
+                ));
+                found += 1;
+                continue;
+            }
+
+            output.push_str(&format!("=== {} ===\nNot found\n\n", id));
+        }
+
+        if found == 0 {
+            return Err(mcp_error("None of the requested items were found. Use `search(query)` to find content."));
+        }
+
+        let tokens = count_tokens(&output);
+        drop(ctx_guard);
+        self.finish_get(output, tokens).await
+    }
+
+    /// Retrieve multiple documents matching a glob pattern.
+    async fn get_glob(&self, pattern: &str) -> Result<CallToolResult, McpError> {
+        let doc_limit = self.config.max_document_tokens;
+        let truncate_ellipsis = self.config.truncate_with_ellipsis;
+        let max_response_tokens = self.config.max_response_tokens;
+
+        let (output, result_count) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let results = handle_mget(ctx, pattern, None)
+                .map_err(|e| mcp_error(format!("Glob retrieval failed: {}", e)))?;
+
+            if results.is_empty() {
+                return Ok(CallToolResult::success(vec![Content::text(
+                    "No documents matched pattern. Use `status` to see what's indexed, or `search(query)` to find by content.",
+                )]));
+            }
+
+            let mut output = format!("Found {} documents:\n\n", results.len());
+
+            for (doc, content) in &results {
+                let title = doc.title.as_deref().unwrap_or("(untitled)");
+
+                let truncated_content = if doc_limit > 0 {
+                    let content_tokens = count_tokens(content);
+                    if content_tokens > doc_limit {
+                        if truncate_ellipsis {
+                            truncate_with_ellipsis(content, doc_limit)
+                        } else {
+                            crate::metrics::tokens::truncate_to_tokens(content, doc_limit).0
+                        }
+                    } else {
+                        content.clone()
+                    }
+                } else {
+                    content.clone()
+                };
+
+                output.push_str(&format!(
+                    "=== [{}] {} - {} ===\n{}\n\n",
+                    doc.id, doc.relative_path, title, truncated_content
+                ));
+            }
+
+            let result_count = results.len();
+            (output, result_count)
+        }; // ctx_guard dropped here
+
+        let original_len = output.len();
+        let output = if max_response_tokens > 0 {
+            crate::metrics::tokens::truncate_to_tokens(&output, max_response_tokens).0
+        } else {
+            output
+        };
+        let truncated = output.len() < original_len;
+        let tokens = count_tokens(&output);
+
+        self.metrics.record_get(tokens);
+        self.record_persistent_call("get", tokens, result_count, truncated).await;
+        tracing::debug!("mdkb_get_glob: {} tokens, {} docs, truncated={}", tokens, result_count, truncated);
+
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -487,13 +614,26 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Retrieve a document by ID or path, with optional line range
+    /// Retrieve a document by ID or path, with optional line range.
+    /// Also accepts memory slugs, glob patterns, and comma-separated lists.
     #[tool(description = "Retrieve a document by ID or path, with optional line range. Also accepts memory slugs (e.g., 'auth-oauth2-pkce') to retrieve memory entries.")]
     async fn get(
         &self,
         Parameters(params): Parameters<GetParams>,
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
+
+        let id = &params.id;
+
+        // Comma-separated list → batch retrieve
+        if id.contains(',') {
+            return self.get_batch(id, &params.lines).await;
+        }
+
+        // Glob pattern → batch retrieve by pattern
+        if id.contains('*') || id.contains('?') {
+            return self.get_glob(id).await;
+        }
 
         let ctx_guard = self.ctx.lock().await;
         let ctx = ctx_guard
@@ -505,7 +645,6 @@ impl McpServer {
         // 2. Contains / or . → path resolution across collections
         // 3. Slug (hyphens, no slashes/dots) → memory entry lookup
         // 4. Fallback: try full resolve_document for edge cases
-        let id = &params.id;
 
         // Try numeric ID first
         if let Ok(numeric_id) = id.parse::<i64>() {
@@ -560,7 +699,7 @@ impl McpServer {
         )))
     }
 
-    /// Get index status with collection listing and optional code index stats.
+    /// Get index status including documents, collections, and code index.
     #[tool(description = "Get the current index status (collections, documents, etc.) including code index stats when available")]
     async fn status(
         &self,
@@ -588,7 +727,7 @@ impl McpServer {
 
             output.push_str(&format!("\n## Collections ({})\n\n", coll_list.len()));
             if coll_list.is_empty() {
-                output.push_str("No collections. Use `collection_add(name, path)` then `update` to index.\n");
+                output.push_str("No collections configured. Markdown files are indexed via collections (use CLI: `mdkb collection add <name> <path>`).\n");
             } else {
                 for coll in &coll_list {
                     let doc_count = collections::get_collection_document_count(&ctx.conn, &coll.name)
@@ -604,8 +743,10 @@ impl McpServer {
             output
         }; // ctx_guard dropped here
 
-        // Append code index stats if index is initialized
+        // Always show code index stats (initialize if needed)
         {
+            // Try to open the code index for stats
+            let _ = self.ensure_code_index().await;
             let idx_guard = self.code_index.lock().await;
             if let Some(facade) = idx_guard.as_ref() {
                 let symbols = facade.symbol_count();
@@ -615,6 +756,9 @@ impl McpServer {
                     "\n## Code Index\n\nSymbols: {}\nFiles: {}\nRelationships: {}\n",
                     symbols, files, relationships
                 ));
+                if symbols == 0 {
+                    output.push_str("\nNo symbols indexed yet. Run `update` to index source code.\n");
+                }
             }
         }
 
@@ -626,7 +770,7 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Trigger reindex of all collections.
+    /// Reindex everything: documents (from collections) and source code (from project root).
     #[tool(description = "Trigger a differential reindex of all collections")]
     async fn update(
         &self,
@@ -634,102 +778,49 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         self.ensure_context().await?;
 
-        let (output, tokens) = {
+        // Phase 1: Reindex documents (markdown collections)
+        let doc_output = {
             let mut ctx_guard = self.ctx.lock().await;
             let ctx = ctx_guard
                 .as_mut()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
             let result = handle_update(ctx, &self.root)
-                .map_err(|e| mcp_error(format!("Update failed: {}", e)))?;
+                .map_err(|e| mcp_error(format!("Document update failed: {}", e)))?;
 
-            let output = format!(
-                "Added: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
+            format!(
+                "## Documents\n\nAdded: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
                 result.added, result.updated, result.removed, result.unchanged
-            );
-
-            let tokens = count_tokens(&output);
-            (output, tokens)
+            )
         }; // ctx_guard dropped here
 
+        // Phase 2: Reindex source code (tree-sitter + Tantivy)
+        let code_output = {
+            self.ensure_code_index().await?;
+            let mut idx_guard = self.code_index.lock().await;
+            if let Some(facade) = idx_guard.as_mut() {
+                match facade.reindex(&self.root) {
+                    Ok(stats) => {
+                        format!(
+                            "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
+                            stats.files_indexed, stats.symbols_indexed, stats.relationships_collected
+                        )
+                    }
+                    Err(e) => {
+                        tracing::error!("Code reindex failed: {}", e);
+                        format!("\n\n## Code\n\nReindex failed: {}", e)
+                    }
+                }
+            } else {
+                String::new()
+            }
+        }; // idx_guard dropped here
+
+        let output = format!("{}{}", doc_output, code_output);
+        let tokens = count_tokens(&output);
         self.metrics.record_update(tokens);
         self.record_persistent_call("update", tokens, 1, false).await;
         tracing::debug!("mdkb_update: {} tokens", tokens);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Retrieve multiple documents by pattern.
-    #[tool(description = "Retrieve multiple documents matching a glob pattern")]
-    async fn multi_get(
-        &self,
-        Parameters(params): Parameters<MultiGetParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let doc_limit = self.config.max_document_tokens;
-        let truncate_ellipsis = self.config.truncate_with_ellipsis;
-        let max_response_tokens = self.config.max_response_tokens;
-
-        let (output, result_count) = {
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let results = handle_mget(ctx, &params.pattern, params.collection.as_deref())
-                .map_err(|e| mcp_error(format!("Multi-get failed: {}", e)))?;
-
-            if results.is_empty() {
-                return Ok(CallToolResult::success(vec![Content::text(
-                    "No documents matched pattern. Use `status` to see indexed collections, or `search(query)` to find by content.",
-                )]));
-            }
-
-            let mut output = format!("Found {} documents:\n\n", results.len());
-
-            for (doc, content) in &results {
-                let title = doc.title.as_deref().unwrap_or("(untitled)");
-
-                // Apply per-document token limit if configured
-                let truncated_content = if doc_limit > 0 {
-                    let content_tokens = count_tokens(content);
-                    if content_tokens > doc_limit {
-                        if truncate_ellipsis {
-                            truncate_with_ellipsis(content, doc_limit)
-                        } else {
-                            crate::metrics::tokens::truncate_to_tokens(content, doc_limit).0
-                        }
-                    } else {
-                        content.clone()
-                    }
-                } else {
-                    content.clone()
-                };
-
-                output.push_str(&format!(
-                    "=== [{}] {} - {} ===\n{}\n\n",
-                    doc.id, doc.relative_path, title, truncated_content
-                ));
-            }
-
-            let result_count = results.len();
-            (output, result_count)
-        }; // ctx_guard dropped here
-
-        // Apply overall response limit (no lock needed for this)
-        let original_len = output.len();
-        let output = if max_response_tokens > 0 {
-            crate::metrics::tokens::truncate_to_tokens(&output, max_response_tokens).0
-        } else {
-            output
-        };
-        let truncated = output.len() < original_len;
-        let tokens = count_tokens(&output);
-
-        self.metrics.record_multi_get(tokens, result_count);
-        self.record_persistent_call("multi_get", tokens, result_count, truncated).await;
-        tracing::debug!("mdkb_multi_get: {} tokens, {} docs, truncated={}", tokens, result_count, truncated);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -800,69 +891,6 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-
-    /// Add a document collection to the knowledge base.
-    #[tool(description = "Add a document collection to index. Provide a name, path (relative to project root), and optional glob pattern (default: **/*.md). Call `update` after adding to index the documents.")]
-    async fn collection_add(
-        &self,
-        Parameters(params): Parameters<CollectionAddParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            handle_collection_add(ctx, &params.name, &params.path, &params.pattern)
-                .map_err(|e| mcp_error(format!("Failed to add collection: {}", e)))?;
-
-            let output = format!(
-                "Added collection '{}' at path '{}' with pattern '{}'.\nCall `update` to index the documents.",
-                params.name, params.path, params.pattern
-            );
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        }; // ctx_guard dropped here
-
-        self.record_persistent_call("collection_add", tokens, 1, false).await;
-        tracing::debug!("mdkb_collection_add: {}", output);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Remove a document collection from the knowledge base.
-    #[tool(description = "Remove a document collection and all its indexed documents. Use `status` to see available collections.")]
-    async fn collection_remove(
-        &self,
-        Parameters(params): Parameters<CollectionRemoveParams>,
-    ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
-
-        let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let removed = handle_collection_remove(ctx, &params.name)
-                .map_err(|e| mcp_error(format!("Failed to remove collection: {}", e)))?;
-
-            let output = if removed {
-                format!("Removed collection '{}'.", params.name)
-            } else {
-                format!("Collection '{}' not found. Use `status` to see available collections.", params.name)
-            };
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        }; // ctx_guard dropped here
-
-        self.record_persistent_call("collection_remove", tokens, 1, false).await;
-        tracing::debug!("mdkb_collection_remove: {}", output);
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
 
     /// Delete a memory entry by ID.
     #[tool(description = "Delete a memory entry permanently. Use `search(query, scope=\"memory\")` to find entry IDs.")]
@@ -1266,9 +1294,9 @@ async fn run_file_watcher(
 const BASE_INSTRUCTIONS: &str = "\
 # mdkb - Markdown Knowledge Base
 
-mdkb is a local knowledge base that indexes markdown documents and provides \
-hybrid search (keyword + semantic). Use it to find project documentation, \
-solutions to past problems, and architectural decisions.
+mdkb is a local knowledge base that indexes your project's documentation and source code. \
+It provides hybrid search (keyword + semantic) across everything. Use it to find project docs, \
+code symbols, solutions to past problems, and architectural decisions.
 
 ## Core Tools
 
@@ -1277,12 +1305,10 @@ solutions to past problems, and architectural decisions.
   - `scope=\"code\"`: Semantic similarity over code symbols. Optional: `kind` (e.g., \"function\", \"struct\"), `threshold` (0.0-1.0).
   - `scope=\"symbols\"`: Fuzzy text match over symbol names/signatures. Optional: `kind`, `file` (path substring filter).
 - `get(id)`: Retrieve full content by numeric ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2').
-- `multi_get(pattern)`: Retrieve multiple documents matching a glob pattern.
+  - Also accepts glob patterns (e.g., 'docs/*.md') and comma-separated lists (e.g., '42,43,44').
 - `code_graph(name)`: Query code call graph. `direction`: `\"calls\"` (default), `\"callers\"`, or `\"impact\"` (transitive, with `max_depth`).
 - `status`: Check index health (collections, documents, code index stats).
-- `update`: Trigger reindex after adding new documents.
-- `collection_add(name, path, pattern)`: Add a document collection to index.
-- `collection_remove(name)`: Remove a collection and its indexed documents.
+- `update`: Trigger reindex of everything (documents and source code).
 - `memory_write(id, title, content, type, tags)`: Save knowledge for future sessions.
 - `memory_delete(id)`: Delete a memory entry permanently.
 
@@ -1293,7 +1319,7 @@ solutions to past problems, and architectural decisions.
 
 ## Getting Started
 
-If `status` shows no collections, add with `collection_add(name, path)` then `update` to index.
+If `status` shows 0 symbols or stale documents, run `update` to reindex everything.
 ";
 
 /// Build server instructions combining base instructions with memory index.
@@ -1671,91 +1697,6 @@ mod tests {
             .expect("Expected text content")
     }
 
-    /// Test collection_add tool adds a collection successfully.
-    #[tokio::test]
-    async fn test_mcp_collection_add() {
-        use std::time::Duration;
-
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let root = temp_dir.path().to_path_buf();
-        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
-
-        // Create a notes directory with a file (not docs/ which is auto-detected by convention)
-        std::fs::create_dir_all(root.join("notes")).unwrap();
-        std::fs::write(root.join("notes/test.md"), "# Test\n\nContent").unwrap();
-
-        let server = McpServer::new(root);
-
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            server.collection_add(Parameters(CollectionAddParams {
-                name: "notes".to_string(),
-                path: "notes".to_string(),
-                pattern: "**/*.md".to_string(),
-            })),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(r)) => {
-                let text = extract_text(&r);
-                assert!(text.contains("Added collection 'notes'"), "Got: {}", text);
-                assert!(text.contains("Call `update`"), "Should suggest calling update");
-            }
-            Ok(Err(e)) => panic!("collection_add failed: {:?}", e),
-            Err(_) => panic!("collection_add timed out - likely deadlock!"),
-        }
-    }
-
-    /// Test collection_remove tool removes a collection.
-    #[tokio::test]
-    async fn test_mcp_collection_remove() {
-        use std::time::Duration;
-
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let root = temp_dir.path().to_path_buf();
-        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
-
-        let server = McpServer::new(root);
-
-        // First add a collection
-        server.collection_add(Parameters(CollectionAddParams {
-            name: "test-coll".to_string(),
-            path: "docs".to_string(),
-            pattern: "**/*.md".to_string(),
-        }))
-        .await
-        .expect("Failed to add collection");
-
-        // Now remove it
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            server.collection_remove(Parameters(CollectionRemoveParams {
-                name: "test-coll".to_string(),
-            })),
-        )
-        .await;
-
-        match result {
-            Ok(Ok(r)) => {
-                let text = extract_text(&r);
-                assert!(text.contains("Removed collection 'test-coll'"), "Got: {}", text);
-            }
-            Ok(Err(e)) => panic!("collection_remove failed: {:?}", e),
-            Err(_) => panic!("collection_remove timed out - likely deadlock!"),
-        }
-
-        // Removing nonexistent collection should report not found
-        let result = server
-            .collection_remove(Parameters(CollectionRemoveParams {
-                name: "nonexistent".to_string(),
-            }))
-            .await
-            .expect("Should not error");
-        let text = extract_text(&result);
-        assert!(text.contains("not found"), "Got: {}", text);
-    }
-
     /// Test memory_delete tool deletes a memory entry.
     #[tokio::test]
     async fn test_mcp_memory_delete() {
@@ -1829,21 +1770,9 @@ mod tests {
         let server = McpServer::new(root);
         let timeout = Duration::from_secs(5);
 
-        // Sequence: status -> collection_add -> collection_remove -> memory_write -> memory_delete -> status
+        // Sequence: status -> memory_write -> memory_delete -> status
         tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
             .await.expect("timeout").expect("status failed");
-
-        tokio::time::timeout(timeout, server.collection_add(Parameters(CollectionAddParams {
-            name: "deadlock-test".to_string(),
-            path: "docs".to_string(),
-            pattern: "**/*.md".to_string(),
-        })))
-        .await.expect("timeout").expect("collection_add failed");
-
-        tokio::time::timeout(timeout, server.collection_remove(Parameters(CollectionRemoveParams {
-            name: "deadlock-test".to_string(),
-        })))
-        .await.expect("timeout").expect("collection_remove failed");
 
         tokio::time::timeout(timeout, server.memory_write(Parameters(MemoryWriteParams {
             id: "deadlock-test".to_string(),
@@ -1950,16 +1879,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_multi_get_no_results_has_hint() {
+    async fn test_get_glob_no_results_has_hint() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.multi_get(Parameters(MultiGetParams {
-            pattern: "nonexistent/**/*.md".to_string(),
-            collection: None,
-        })).await.expect("multi_get should not error");
+        let result = server.get(Parameters(GetParams {
+            id: "nonexistent/**/*.md".to_string(),
+            lines: None,
+        })).await.expect("get with glob should not error");
 
         let text = extract_text(&result);
         assert!(text.contains("status") || text.contains("search"),
@@ -1987,22 +1916,6 @@ mod tests {
         let text = extract_text(&result);
         assert!(text.contains("memory_write"),
             "No results should suggest memory_write, got: {}", text);
-    }
-
-    #[tokio::test]
-    async fn test_collection_remove_not_found_has_hint() {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let root = temp_dir.path().to_path_buf();
-        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
-        let server = McpServer::new(root);
-
-        let result = server.collection_remove(Parameters(CollectionRemoveParams {
-            name: "nonexistent".to_string(),
-        })).await.expect("collection_remove should not error");
-
-        let text = extract_text(&result);
-        assert!(text.contains("status"),
-            "Not found should suggest status, got: {}", text);
     }
 
     #[tokio::test]
