@@ -88,6 +88,8 @@ async fn main() -> Result<()> {
             collection,
             include_superseded,
             scope,
+            kind,
+            file,
         } => {
             let ctx = Context::open(&cwd)?;
             match scope.as_str() {
@@ -114,8 +116,26 @@ async fn main() -> Result<()> {
                         println!("No results found.");
                     }
                 }
+                "code" => {
+                    let symbols = mdkb::cli::handlers::handle_code_search(
+                        &cwd,
+                        &query,
+                        limit,
+                        kind.as_deref(),
+                    )?;
+                    format_code_symbols(&symbols, cli.format);
+                }
+                "symbols" => {
+                    let symbols = mdkb::cli::handlers::handle_code_find(
+                        &cwd,
+                        &query,
+                        kind.as_deref(),
+                        file.as_deref(),
+                    )?;
+                    format_code_symbols(&symbols, cli.format);
+                }
                 _ => {
-                    eprintln!("Invalid scope: '{}'. Valid values: docs, memory, all", scope);
+                    eprintln!("Invalid scope: '{}'. Valid values: docs, memory, all, code, symbols", scope);
                     std::process::exit(1);
                 }
             }
@@ -123,12 +143,38 @@ async fn main() -> Result<()> {
         Command::Get { id, lines } => {
             use mdkb::cli::handlers::GetResult;
             let ctx = Context::open(&cwd)?;
-            match handle_get(&ctx, &id, lines.as_deref())? {
-                GetResult::Document(doc, content) => {
-                    format_document(&doc, &content, cli.format);
+
+            // Detect glob pattern (contains * or ?)
+            if id.contains('*') || id.contains('?') {
+                let results = handle_mget(&ctx, &id, None)?;
+                format_mget_results(&results, cli.format);
+            }
+            // Detect comma-separated list (e.g., "42,43,44")
+            else if id.contains(',') {
+                let ids: Vec<&str> = id.split(',').map(|s| s.trim()).collect();
+                for single_id in ids {
+                    match handle_get(&ctx, single_id, lines.as_deref()) {
+                        Ok(GetResult::Document(doc, content)) => {
+                            format_document(&doc, &content, cli.format);
+                        }
+                        Ok(GetResult::Memory(entry)) => {
+                            format_memory_entry(&entry, cli.format);
+                        }
+                        Err(e) => {
+                            eprintln!("Error getting '{}': {}", single_id, e);
+                        }
+                    }
                 }
-                GetResult::Memory(entry) => {
-                    format_memory_entry(&entry, cli.format);
+            }
+            // Single ID/path/slug
+            else {
+                match handle_get(&ctx, &id, lines.as_deref())? {
+                    GetResult::Document(doc, content) => {
+                        format_document(&doc, &content, cli.format);
+                    }
+                    GetResult::Memory(entry) => {
+                        format_memory_entry(&entry, cli.format);
+                    }
                 }
             }
         }
@@ -149,6 +195,18 @@ async fn main() -> Result<()> {
             let ctx = Context::open(&cwd)?;
             let result = handle_update(&ctx, &cwd)?;
             format_update_result(&result, cli.format);
+
+            // Also reindex code (matching MCP update behavior)
+            match mdkb::cli::handlers::handle_code_index(&cwd, &[]) {
+                Ok(stats) => {
+                    println!("\nCode index:");
+                    format_code_index_stats(&stats, cli.format);
+                }
+                Err(e) => {
+                    tracing::warn!("Code reindexing failed: {:?}", e);
+                    eprintln!("Warning: code reindexing failed: {}", e);
+                }
+            }
         }
         Command::Embed => {
             let ctx = Context::open(&cwd)?;

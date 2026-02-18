@@ -1,16 +1,16 @@
 # mdkb
 
-Local markdown knowledge base with hybrid search for AI assistants.
+Local knowledge base with hybrid search for AI assistants.
 
-**mdkb** indexes your markdown files and exposes them to Claude Code (or any MCP-compatible AI) through a local search API. It combines keyword matching with semantic understanding to find the most relevant documents.
+**mdkb** indexes your project's markdown documentation and source code, exposing everything to Claude Code (or any MCP-compatible AI) through a local search API. It combines keyword matching with semantic understanding to find the most relevant results.
 
 ## Why mdkb?
 
-AI assistants are limited by context windows. When your codebase has extensive documentation, the AI can't read it all. mdkb solves this by:
+AI assistants are limited by context windows. When your codebase has extensive documentation and thousands of source files, the AI can't read it all. mdkb solves this by:
 
-1. **Indexing** your markdown files locally (no cloud, no API keys)
-2. **Searching** with hybrid retrieval (keyword + semantic)
-3. **Exposing** results through MCP so Claude can query your docs on demand
+1. **Indexing** your markdown files and source code locally (no cloud, no API keys)
+2. **Searching** with hybrid retrieval (keyword + semantic) across docs and code
+3. **Exposing** results through MCP so Claude can query your knowledge base on demand
 
 ## Installation
 
@@ -31,35 +31,58 @@ mdkb init
 mdkb collection add docs ./docs
 mdkb collection add wiki ./wiki --pattern "**/*.md"
 
-# Index files
+# Index everything (documents + source code)
 mdkb update
 
-# Generate semantic embeddings (downloads ~100MB model on first run)
+# Generate semantic embeddings (downloads ~30MB model on first run)
 mdkb embed
 
 # Search
 mdkb search "authentication flow"
 mdkb search "how to handle errors" -c docs
+mdkb search "handler" --scope symbols --kind function
 ```
 
 ## Search
 
-mdkb uses hybrid search combining two strategies:
+mdkb provides unified search across documents, memory, and code with the `--scope` parameter:
 
-- **BM25 keyword search** - Traditional full-text search. "OAuth2 callback" finds documents with those exact words.
-- **Semantic vector search** - Understands meaning using fastembed (AllMiniLML6V2, 384-dim). "how to authenticate users" finds docs about "login", "OAuth", "JWT".
+| Scope | Description |
+|-------|-------------|
+| `docs` (default) | Hybrid BM25 + semantic search over markdown documents |
+| `memory` | Full-text search over memory entries |
+| `all` | Combined docs + memory results |
+| `code` | Fuzzy symbol search over indexed source code |
+| `symbols` | Exact symbol lookup by name |
 
-Results are merged using Reciprocal Rank Fusion (RRF), so documents matching both keyword and meaning rank highest.
+### Document Search (scope: docs)
+
+Combines two strategies merged with Reciprocal Rank Fusion (RRF):
+
+- **BM25 keyword search** - "OAuth2 callback" finds documents with those exact words.
+- **Semantic vector search** - Uses fastembed (AllMiniLML6V2, 384-dim). "how to authenticate users" finds docs about "login", "OAuth", "JWT".
 
 ```bash
-mdkb search <query> [-l LIMIT] [-c COLLECTION]
+mdkb search <query> [-l LIMIT] [-c COLLECTION] [--scope docs]
 ```
 
-Output format: `[id] collection:path - title (score)`
+Output: `[id] collection:path - title (score)`
 
 ```
 [42] docs:api/auth.md - Authentication Guide (score: 0.85)
 [17] notes:security.md - Security Notes (score: 0.72)
+```
+
+### Code Search (scope: code, symbols)
+
+Search indexed source code symbols (functions, structs, methods, etc.):
+
+```bash
+# Fuzzy search across all symbol names
+mdkb search "auth handler" --scope code
+
+# Exact symbol lookup, filtered by kind and file
+mdkb search "handle_get" --scope symbols --kind function --file handlers.rs
 ```
 
 Use `mdkb get 42` to retrieve full document content.
@@ -70,19 +93,41 @@ Collections group documents by source directory:
 
 ```bash
 mdkb collection add <name> <path> [--pattern <glob>]
-mdkb collection list
 mdkb collection remove <name>
 mdkb collection rename <old> <new>
 ```
 
-The pattern defaults to `**/*.md`. Use `-c <name>` on search/get commands to filter by collection.
+The pattern defaults to `**/*.md`. Use `-c <name>` on search commands to filter by collection.
 
 ## Document Retrieval
 
 ```bash
-mdkb get <id|path>              # Get document by ID or path
-mdkb get 42 --lines 10:50       # Get specific line range
-mdkb mget "*.md" [-c NAME]      # Batch retrieve by glob pattern
+mdkb get <id|path|slug>          # Get by ID, path, or memory slug
+mdkb get 42 --lines 10:50        # Get specific line range
+mdkb get "docs/*.md"             # Get by glob pattern
+mdkb get 42,43,44                # Get multiple by comma-separated IDs
+mdkb mget "*.md" [-c NAME]       # Batch retrieve (alias for glob get)
+```
+
+## Code Intelligence
+
+mdkb indexes source code using tree-sitter parsers (Rust, Go, TypeScript/JavaScript, Python) and builds a call graph for navigation:
+
+```bash
+# Build code index (also done by mdkb update)
+mdkb code index
+
+# Search symbols
+mdkb code search "handler" --kind function
+mdkb code find "Config" --kind struct
+
+# Call graph
+mdkb code calls main              # What does main() call?
+mdkb code callers handle_get      # What calls handle_get()?
+mdkb code impact init --depth 5   # Transitive dependency graph
+
+# Index info
+mdkb code info
 ```
 
 ## Memory
@@ -202,7 +247,8 @@ All data stays local in `.mdkb/`:
 ```
 .mdkb/
 ├── config.toml
-└── index.sqlite
+├── index.sqlite
+└── code-index/
 ```
 
 The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded automatically on first use and cached locally.
