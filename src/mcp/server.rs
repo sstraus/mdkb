@@ -1124,6 +1124,59 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
 
     let server = McpServer::with_warmup(root.clone(), mcp_config, Some(instructions));
 
+    // Auto-index on startup: initialize context and run initial indexing in background
+    {
+        let startup_server = server.clone();
+        let startup_root = root.clone();
+        tokio::spawn(async move {
+            // Initialize context (auto-creates .mdkb/ if needed, detects conventions)
+            if let Err(e) = startup_server.ensure_context().await {
+                tracing::error!("Startup auto-init failed: {:?}", e);
+                return;
+            }
+
+            // Run document reindex
+            {
+                let mut ctx_guard = startup_server.ctx.lock().await;
+                if let Some(ctx) = ctx_guard.as_mut() {
+                    match handle_update(ctx, &startup_root) {
+                        Ok(result) => {
+                            if result.added > 0 || result.updated > 0 || result.removed > 0 {
+                                tracing::info!(
+                                    "Startup index: {} added, {} updated, {} removed docs",
+                                    result.added, result.updated, result.removed
+                                );
+                            }
+                        }
+                        Err(e) => tracing::error!("Startup doc reindex failed: {}", e),
+                    }
+                }
+            } // ctx_guard dropped
+
+            // Run code reindex
+            if let Err(e) = startup_server.ensure_code_index().await {
+                tracing::error!("Startup code index init failed: {:?}", e);
+                return;
+            }
+            {
+                let mut idx_guard = startup_server.code_index.lock().await;
+                if let Some(facade) = idx_guard.as_mut() {
+                    match facade.reindex(&startup_root) {
+                        Ok(stats) => {
+                            if stats.symbols_indexed > 0 {
+                                tracing::info!(
+                                    "Startup index: {} files, {} symbols",
+                                    stats.files_indexed, stats.symbols_indexed
+                                );
+                            }
+                        }
+                        Err(e) => tracing::error!("Startup code reindex failed: {}", e),
+                    }
+                }
+            }
+        });
+    }
+
     // Start file watcher in background
     let watcher_root = root.clone();
     let watcher_ctx = server.ctx.clone();

@@ -161,24 +161,21 @@ If you prefer manual configuration, add to `~/.claude/mcp.json`:
 
 For project-scoped setups (Option 1 with `--scope local`), the server runs from your current project directory. For user-scoped setups (`--scope user`), ensure `.mdkb/` exists in your home directory or launch Claude Code from a directory with `.mdkb/` initialized.
 
-### Available Tools (10)
+### Available Tools (7)
 
 | Tool | Description |
 |------|-------------|
 | `search` | Unified search with scope: `docs` (default), `memory`, `all`, `code`, `symbols` |
-| `get` | Retrieve by ID, path, or memory slug (supports line ranges) |
-| `multi_get` | Batch retrieve by glob pattern |
+| `get` | Retrieve by ID, path, memory slug, glob pattern, or comma-separated list |
 | `code_graph` | Call graph queries: `calls`, `callers`, or `impact` |
 | `status` | Index health, collections, and code index stats |
-| `update` | Trigger reindex |
+| `update` | Reindex everything (documents and source code) |
 | `memory_write` | Create or update memory entry |
 | `memory_delete` | Delete a memory entry |
-| `collection_add` | Add a document collection |
-| `collection_remove` | Remove a collection |
 
-### File Watching
+### Auto-Indexing
 
-In MCP mode, mdkb watches collection paths and automatically reindexes when files change.
+When the MCP server starts, it automatically indexes all configured collections and source code. The file watcher then keeps the index up to date as files change. No manual `update` call is needed for initial setup.
 
 ## Configuration
 
