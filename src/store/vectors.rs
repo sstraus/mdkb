@@ -28,7 +28,7 @@ pub fn init_sqlite_vec() {
     });
 }
 
-/// Initialize vector storage tables.
+/// Initialize vector storage tables, migrating from old dimensions if needed.
 pub fn init_vector_schema(conn: &Connection) -> Result<()> {
     // Create embeddings table
     conn.execute(
@@ -44,19 +44,80 @@ pub fn init_vector_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Create virtual table for vector search
-    // Using vec0 for approximate nearest neighbor search
+    // Check if vec_documents exists with wrong dimensions and migrate if needed
+    migrate_vector_table_if_needed(conn)?;
+
+    // Create virtual table for vector search (no-op if already exists)
     conn.execute(
         r#"
         CREATE VIRTUAL TABLE IF NOT EXISTS vec_documents USING vec0(
             document_id INTEGER PRIMARY KEY,
-            embedding FLOAT[768]
+            embedding FLOAT[384]
         )
         "#,
         [],
     )?;
 
     Ok(())
+}
+
+/// Detect dimension mismatch in existing vec_documents table and recreate if needed.
+///
+/// sqlite-vec doesn't support ALTER, so we must drop and recreate.
+/// Old embeddings in the `embeddings` table are also cleared since they
+/// have the wrong dimension and must be regenerated.
+fn migrate_vector_table_if_needed(conn: &Connection) -> Result<()> {
+    // Check if the table exists by querying sqlite_master
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='vec_documents'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap_or(false);
+
+    if !table_exists {
+        return Ok(());
+    }
+
+    // Try to detect dimension mismatch by checking if an existing embedding
+    // has the wrong size. We probe the embeddings table since that stores raw blobs.
+    let old_dim = detect_embedding_dimension(conn);
+
+    if let Some(dim) = old_dim {
+        if dim != EMBEDDING_DIM {
+            tracing::info!(
+                "Embedding dimension changed ({} -> {}), migrating vector tables",
+                dim,
+                EMBEDDING_DIM
+            );
+
+            // Drop old vector table (sqlite-vec doesn't support ALTER)
+            conn.execute("DROP TABLE IF EXISTS vec_documents", [])?;
+
+            // Clear old embeddings since they have wrong dimensions
+            conn.execute("DELETE FROM embeddings", [])?;
+
+            tracing::info!("Migration complete. Documents will be re-embedded on next update.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Detect the dimension of existing embeddings by checking blob size.
+/// Returns None if no embeddings exist.
+fn detect_embedding_dimension(conn: &Connection) -> Option<usize> {
+    conn.query_row(
+        "SELECT LENGTH(embedding) FROM embeddings LIMIT 1",
+        [],
+        |row| {
+            let byte_len: usize = row.get(0)?;
+            // Each f32 is 4 bytes
+            Ok(byte_len / 4)
+        },
+    )
+    .ok()
 }
 
 /// Store embedding for a document.
@@ -176,8 +237,8 @@ pub fn count_embeddings(conn: &Connection) -> Result<usize> {
     Ok(count as usize)
 }
 
-/// Embedding dimension (768 for nomic-embed-text).
-pub const EMBEDDING_DIM: usize = 768;
+/// Embedding dimension (384 for AllMiniLML6V2).
+pub const EMBEDDING_DIM: usize = 384;
 
 #[cfg(test)]
 mod tests {

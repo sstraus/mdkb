@@ -196,11 +196,11 @@ pub fn handle_vsearch(
     limit: usize,
     collection: Option<&str>,
 ) -> Result<Vec<SearchResult>> {
-    // Use cached model to avoid reloading (fixes P1-PERF-003)
-    let model = crate::llm::get_cached_model()?;
+    // Use cached service to avoid reloading
+    let service = crate::llm::get_cached_service()?;
 
     // Generate query embedding
-    let query_embedding = model.embed_query(query_text)?;
+    let query_embedding = service.embed_query(query_text)?;
 
     // Perform vector search - get more results to account for collection filtering
     let fetch_limit = if collection.is_some() { limit * 2 } else { limit };
@@ -270,9 +270,9 @@ pub fn handle_hybrid_search(
     };
     let bm25_results = search::search(&ctx.conn, &bm25_query)?;
 
-    // Use cached model to avoid reloading (fixes P1-PERF-003)
-    let model = crate::llm::get_cached_model()?;
-    let query_embedding = model.embed_query(query_text)?;
+    // Use cached service to avoid reloading
+    let service = crate::llm::get_cached_service()?;
+    let query_embedding = service.embed_query(query_text)?;
     let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, limit * 2)?;
 
     // Fuse results using RRF
@@ -737,8 +737,8 @@ fn update_collection(
 pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
     let mut result = EmbedResult::default();
 
-    // Use cached model to avoid reloading (fixes P1-PERF-003)
-    let model = crate::llm::get_cached_model()?;
+    // Use cached service to avoid reloading
+    let service = crate::llm::get_cached_service()?;
 
     // Get all documents
     let all_collections = collections::list_collections(&ctx.conn)?;
@@ -772,13 +772,13 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
             };
 
             // Generate embedding
-            match model.embed(content) {
+            match service.embed_query(content) {
                 Ok(embedding) => {
                     vectors::store_embedding(
                         &ctx.conn,
                         doc.id,
                         &embedding,
-                        crate::llm::embeddings::DEFAULT_EMBEDDING_REPO,
+                        crate::llm::embeddings::MODEL_NAME,
                     )?;
                     result.generated += 1;
                 }
@@ -2675,11 +2675,10 @@ pub fn handle_journal_import_all(
 }
 
 // ---------------------------------------------------------------------------
-// Code intelligence handlers (require `code-intel` feature)
+// Code intelligence handlers
 // ---------------------------------------------------------------------------
 
 /// Result of `code info` command.
-#[cfg(feature = "code-intel")]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CodeInfoResult {
     pub symbols: u64,
@@ -2688,7 +2687,6 @@ pub struct CodeInfoResult {
 }
 
 /// Handle `mdkb code init` - initialize code index directory.
-#[cfg(feature = "code-intel")]
 pub fn handle_code_init(root: &Path) -> Result<()> {
     let index_path = root.join(".mdkb/code-index");
     if index_path.exists() {
@@ -2703,7 +2701,6 @@ pub fn handle_code_init(root: &Path) -> Result<()> {
 }
 
 /// Handle `mdkb code index` - build code index from source files.
-#[cfg(feature = "code-intel")]
 pub fn handle_code_index(
     root: &Path,
     paths: &[String],
@@ -2734,7 +2731,6 @@ pub fn handle_code_index(
 }
 
 /// Handle `mdkb code search` - fuzzy symbol search.
-#[cfg(feature = "code-intel")]
 pub fn handle_code_search(
     root: &Path,
     query: &str,
@@ -2759,7 +2755,6 @@ pub fn handle_code_search(
 }
 
 /// Handle `mdkb code find` - exact symbol lookup.
-#[cfg(feature = "code-intel")]
 pub fn handle_code_find(
     root: &Path,
     name: &str,
@@ -2787,7 +2782,6 @@ pub fn handle_code_find(
 }
 
 /// Handle `mdkb code calls` - show what a symbol calls.
-#[cfg(feature = "code-intel")]
 pub fn handle_code_calls(
     root: &Path,
     name: &str,
@@ -2805,7 +2799,6 @@ pub fn handle_code_calls(
 }
 
 /// Handle `mdkb code callers` - show what calls a symbol.
-#[cfg(feature = "code-intel")]
 pub fn handle_code_callers(
     root: &Path,
     name: &str,
@@ -2823,7 +2816,6 @@ pub fn handle_code_callers(
 }
 
 /// Handle `mdkb code impact` - impact analysis from a symbol.
-#[cfg(feature = "code-intel")]
 pub fn handle_code_impact(
     root: &Path,
     name: &str,
@@ -2847,7 +2839,6 @@ pub fn handle_code_impact(
 }
 
 /// Handle `mdkb code info` - show index statistics.
-#[cfg(feature = "code-intel")]
 pub fn handle_code_info(root: &Path) -> Result<CodeInfoResult> {
     let index_path = root.join(".mdkb/code-index");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
@@ -2861,7 +2852,6 @@ pub fn handle_code_info(root: &Path) -> Result<CodeInfoResult> {
 }
 
 /// Handle `mdkb code parse` - parse a single file and return symbols.
-#[cfg(feature = "code-intel")]
 pub fn handle_code_parse(file: &Path) -> Result<Vec<crate::code::symbol::Symbol>> {
     use crate::code::parsing::language::Language;
     use crate::code::parsing::parser::LanguageParser;

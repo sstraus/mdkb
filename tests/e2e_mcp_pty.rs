@@ -253,18 +253,15 @@ fn test_mcp_tools_list() {
 
     let tools = harness.list_tools();
 
-    // Expected tools based on server implementation
+    // Expected tools based on server implementation (7 tools)
     let expected_tools = vec![
         "search",
         "get",
         "status",
         "update",
-        "multi_get",
-        "get_metrics",
         "memory_write",
         "memory_delete",
-        "collection_add",
-        "collection_remove",
+        "code_graph",
     ];
 
     let tool_names: Vec<&str> = tools
@@ -548,9 +545,9 @@ fn test_mcp_tools_after_file_changes() {
 // Additional Tool Coverage Tests
 // =============================================================================
 
-/// Test: multi_get tool retrieves multiple documents by glob pattern.
+/// Test: get tool with glob pattern retrieves multiple documents.
 #[test]
-fn test_mcp_tool_multi_get() {
+fn test_mcp_tool_get_glob() {
     let mut harness = McpTestHarness::new();
 
     harness.create_file("docs/chapter1.md", "# Chapter 1\n\nIntroduction");
@@ -562,38 +559,14 @@ fn test_mcp_tool_multi_get() {
 
     harness.initialize();
 
-    // Get all chapters
-    let result = harness.call_tool("multi_get", json!({"pattern": "chapter*.md"}));
+    // Get all chapters via glob
+    let result = harness.call_tool("get", json!({"id": "chapter*.md"}));
     let text = McpTestHarness::get_text_content(&result);
 
     assert!(text.contains("Chapter 1"), "Should find chapter 1");
     assert!(text.contains("Chapter 2"), "Should find chapter 2");
     assert!(text.contains("Chapter 3"), "Should find chapter 3");
     assert!(!text.contains("Appendix"), "Should not find appendix");
-}
-
-/// Test: multi_get with collection filter.
-#[test]
-fn test_mcp_tool_multi_get_with_collection() {
-    let mut harness = McpTestHarness::new();
-
-    harness.create_file("docs/readme.md", "# Docs Readme");
-    harness.create_file("notes/readme.md", "# Notes Readme");
-    harness.add_collection("docs", "docs", "**/*.md");
-    harness.add_collection("notes", "notes", "**/*.md");
-    harness.update_index();
-
-    harness.initialize();
-
-    // Get readme only from docs collection
-    let result = harness.call_tool(
-        "multi_get",
-        json!({"pattern": "*.md", "collection": "docs"}),
-    );
-    let text = McpTestHarness::get_text_content(&result);
-
-    assert!(text.contains("Docs Readme"), "Should find docs readme");
-    assert!(!text.contains("Notes Readme"), "Should not find notes readme");
 }
 
 /// Test: get tool with line range.
@@ -711,32 +684,6 @@ fn test_mcp_tool_search_memory_scope() {
     assert!(
         text.contains("JWT") || text.contains("auth"),
         "Should find auth-related entries. Got: {}",
-        text
-    );
-}
-
-/// Test: get_metrics tool.
-#[test]
-fn test_mcp_tool_get_metrics() {
-    let mut harness = McpTestHarness::new();
-    harness.initialize();
-
-    // Perform some searches to generate metrics
-    for i in 0..5 {
-        harness.call_tool("search", json!({"query": format!("test query {}", i), "limit": 5}));
-    }
-
-    // Get metrics
-    let result = harness.call_tool(
-        "get_metrics",
-        json!({"period_days": 7, "include_latency": true, "include_quality": true}),
-    );
-    let text = McpTestHarness::get_text_content(&result);
-
-    // Should contain some metrics information
-    assert!(
-        text.contains("queries") || text.contains("latency") || text.contains("Metrics") || text.len() > 10,
-        "Should return metrics information. Got: {}",
         text
     );
 }

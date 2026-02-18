@@ -43,7 +43,7 @@ pub enum Command {
     #[command(subcommand)]
     Collection(CollectionCommand),
 
-    /// Search documents (hybrid: combines BM25 + semantic with RRF fusion)
+    /// Search documents, memory, or code symbols
     Search {
         /// Search query
         query: String,
@@ -60,14 +60,22 @@ pub enum Command {
         #[arg(long)]
         include_superseded: bool,
 
-        /// Search scope: docs (default), memory, or all
+        /// Search scope: docs (default), memory, all, code, or symbols
         #[arg(long, default_value = "docs")]
         scope: String,
+
+        /// Filter by symbol kind (function, struct, method, etc.) - used with code/symbols scopes
+        #[arg(short, long)]
+        kind: Option<String>,
+
+        /// Filter by file path (substring match) - used with symbols scope
+        #[arg(short, long)]
+        file: Option<String>,
     },
 
-    /// Retrieve a document by ID, path, or memory slug
+    /// Retrieve a document by ID, path, memory slug, glob pattern, or comma-separated list
     Get {
-        /// Document ID, relative path, or memory slug
+        /// Document ID, relative path, memory slug, glob pattern (e.g., "docs/*.md"), or comma-separated list (e.g., "42,43,44")
         id: String,
 
         /// Line range (e.g., 10:50)
@@ -88,7 +96,7 @@ pub enum Command {
     /// Show index status
     Status,
 
-    /// Trigger differential reindex
+    /// Reindex everything (documents and source code)
     Update,
 
     /// Generate embeddings for documents

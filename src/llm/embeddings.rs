@@ -1,188 +1,77 @@
-//! Document embeddings using local LLM inference.
+//! Document embeddings using local ONNX inference.
 //!
-//! Uses nomic-embed-text for high-quality embeddings.
+//! Uses fastembed with AllMiniLML6V2 (384-dim) for embedding generation.
+//! This is the shared embedding backend for both document search and code
+//! intelligence semantic search.
 
-use std::path::PathBuf;
-
-use hf_hub::api::sync::Api;
-use indicatif::{ProgressBar, ProgressStyle};
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use crate::error::{Error, Result};
 
-/// Default embedding model from HuggingFace.
-pub const DEFAULT_EMBEDDING_REPO: &str = "nomic-ai/nomic-embed-text-v1.5-GGUF";
-pub const DEFAULT_EMBEDDING_FILE: &str = "nomic-embed-text-v1.5.Q4_K_M.gguf";
+/// Embedding dimension for AllMiniLML6V2.
+pub const EMBEDDING_DIM: usize = 384;
 
-/// Embedding dimension for nomic-embed-text.
-pub const EMBEDDING_DIM: usize = 768;
+/// Model identifier stored alongside embeddings for migration detection.
+pub const MODEL_NAME: &str = "AllMiniLML6V2";
 
-/// Embedding model for generating document vectors.
-pub struct EmbeddingModel {
-    backend: LlamaBackend,
-    model: LlamaModel,
+/// Shared embedding service for generating document and query vectors.
+///
+/// Wraps fastembed's `TextEmbedding` model. Thread-safe for concurrent use
+/// via shared reference (fastembed handles internal synchronization).
+pub struct EmbeddingService {
+    model: TextEmbedding,
 }
 
-impl std::fmt::Debug for EmbeddingModel {
+impl std::fmt::Debug for EmbeddingService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EmbeddingModel")
-            .field("repo", &DEFAULT_EMBEDDING_REPO)
-            .finish_non_exhaustive()
+        f.debug_struct("EmbeddingService")
+            .field("model", &MODEL_NAME)
+            .field("dimension", &EMBEDDING_DIM)
+            .finish()
     }
 }
 
-impl EmbeddingModel {
-    /// Load the embedding model, downloading if necessary.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// use mdkb::llm::EmbeddingModel;
-    ///
-    /// // Load default model (nomic-embed-text)
-    /// let model = EmbeddingModel::load(None, None)?;
-    ///
-    /// // Load custom model
-    /// let model = EmbeddingModel::load(
-    ///     Some("my-org/my-embedding-model"),
-    ///     Some("model.Q4_K_M.gguf"),
-    /// )?;
-    /// ```
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - Model download from HuggingFace fails
-    /// - LLM backend initialization fails
-    /// - Model file loading fails
-    pub fn load(repo: Option<&str>, file: Option<&str>) -> Result<Self> {
-        let repo = repo.unwrap_or(DEFAULT_EMBEDDING_REPO);
-        let file = file.unwrap_or(DEFAULT_EMBEDDING_FILE);
+impl EmbeddingService {
+    /// Create a new embedding service, downloading the model if needed.
+    pub fn new() -> Result<Self> {
+        let model = TextEmbedding::try_new(
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
+        )
+        .map_err(|e| Error::other(format!("Failed to initialize embedding model: {e}")))?;
 
-        // Download model from HuggingFace
-        let model_path = download_model(repo, file)?;
-
-        // Initialize llama backend
-        let backend = LlamaBackend::init()
-            .map_err(|e| Error::other(format!("Failed to init llama backend: {}", e)))?;
-
-        // Load model
-        let model_params = LlamaModelParams::default();
-        let model = LlamaModel::load_from_file(&backend, &model_path, &model_params)
-            .map_err(|e| Error::other(format!("Failed to load embedding model: {}", e)))?;
-
-        Ok(Self { backend, model })
+        Ok(Self { model })
     }
 
-    /// Generate embedding for text.
-    pub fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        // Prepend search prefix for nomic-embed
-        let prefixed = format!("search_document: {}", text);
-        self.generate_embedding(&prefixed)
-    }
-
-    /// Generate embeddings for multiple texts in batch.
-    pub fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        texts.iter().map(|t| self.embed(t)).collect()
-    }
-
-    /// Generate query embedding (different prefix for queries).
-    pub fn embed_query(&self, query: &str) -> Result<Vec<f32>> {
-        let prefixed = format!("search_query: {}", query);
-        self.generate_embedding(&prefixed)
-    }
-
-    /// Internal method to generate embedding from text.
-    fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
-        // Create context with embeddings enabled
-        let n_threads = std::thread::available_parallelism()
-            .map(|p| p.get() as i32)
-            .unwrap_or(4);
-
-        let ctx_params = LlamaContextParams::default()
-            .with_n_threads_batch(n_threads)
-            .with_embeddings(true);
-
-        let mut ctx = self
-            .model
-            .new_context(&self.backend, ctx_params)
-            .map_err(|e| Error::other(format!("Failed to create context: {}", e)))?;
-
-        // Tokenize the text
-        let tokens = self
-            .model
-            .str_to_token(text, AddBos::Always)
-            .map_err(|e| Error::other(format!("Failed to tokenize: {}", e)))?;
-
-        let n_ctx = ctx.n_ctx() as usize;
-        if tokens.len() > n_ctx {
-            return Err(Error::other(format!(
-                "Text too long: {} tokens exceeds context size {}",
-                tokens.len(),
-                n_ctx
-            )));
+    /// Generate embeddings for multiple document texts in batch.
+    pub fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
         }
-
-        // Create batch and add tokens
-        let mut batch = LlamaBatch::new(n_ctx, 1);
-        batch
-            .add_sequence(&tokens, 0, false)
-            .map_err(|e| Error::other(format!("Failed to add sequence to batch: {}", e)))?;
-
-        // Clear KV cache and decode
-        ctx.clear_kv_cache();
-        ctx.decode(&mut batch)
-            .map_err(|e| Error::other(format!("Failed to decode: {}", e)))?;
-
-        // Get embeddings for sequence 0
-        let embedding = ctx
-            .embeddings_seq_ith(0)
-            .map_err(|e| Error::other(format!("Failed to get embeddings: {}", e)))?;
-
-        // Normalize the embedding
-        Ok(normalize(embedding))
-    }
-}
-
-/// Download model from HuggingFace Hub.
-fn download_model(repo: &str, filename: &str) -> Result<PathBuf> {
-    let api = Api::new().map_err(|e| Error::other(format!("HuggingFace API error: {}", e)))?;
-
-    // Show progress bar
-    let pb = ProgressBar::new_spinner();
-    pb.set_style(
-        ProgressStyle::default_spinner()
-            .template("{spinner:.green} {msg}")
-            .unwrap(),
-    );
-    pb.set_message(format!("Downloading {} from {}...", filename, repo));
-
-    let model_path = api
-        .model(repo.to_string())
-        .get(filename)
-        .map_err(|e| Error::other(format!("Failed to download model: {}", e)))?;
-
-    pb.finish_with_message(format!("Model ready: {}", model_path.display()));
-
-    Ok(model_path)
-}
-
-/// Normalize a vector using L2 normalization.
-fn normalize(input: &[f32]) -> Vec<f32> {
-    let magnitude = input
-        .iter()
-        .fold(0.0, |acc, &val| val.mul_add(val, acc))
-        .sqrt();
-
-    if magnitude == 0.0 {
-        return input.to_vec();
+        self.model
+            .embed(texts.to_vec(), None)
+            .map_err(|e| Error::other(format!("Failed to embed documents: {e}")))
     }
 
-    input.iter().map(|&val| val / magnitude).collect()
+    /// Generate embedding for a single query text.
+    pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        let mut results = self
+            .model
+            .embed(vec![text], None)
+            .map_err(|e| Error::other(format!("Failed to embed query: {e}")))?;
+        results
+            .pop()
+            .ok_or_else(|| Error::other("Embedding model returned no results"))
+    }
+
+    /// Embedding dimension (384 for AllMiniLML6V2).
+    pub const fn dimension() -> usize {
+        EMBEDDING_DIM
+    }
+
+    /// Model name for storage and migration detection.
+    pub const fn model_name() -> &'static str {
+        MODEL_NAME
+    }
 }
 
 /// Compute cosine similarity between two vectors.
@@ -207,22 +96,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_normalize() {
-        let v = vec![3.0, 4.0];
-        let normalized = normalize(&v);
-        // 3/5 = 0.6, 4/5 = 0.8
-        assert!((normalized[0] - 0.6).abs() < 0.001);
-        assert!((normalized[1] - 0.8).abs() < 0.001);
-    }
-
-    #[test]
-    fn test_normalize_zero_vector() {
-        let v = vec![0.0, 0.0, 0.0];
-        let normalized = normalize(&v);
-        assert_eq!(normalized, vec![0.0, 0.0, 0.0]);
-    }
-
-    #[test]
     fn test_cosine_similarity_identical() {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![1.0, 0.0, 0.0];
@@ -244,5 +117,62 @@ mod tests {
         let b = vec![-1.0, 0.0, 0.0];
         let sim = cosine_similarity(&a, &b);
         assert!((sim + 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_embedding_dim_constant() {
+        assert_eq!(EmbeddingService::dimension(), 384);
+    }
+
+    #[test]
+    fn test_model_name_constant() {
+        assert_eq!(EmbeddingService::model_name(), "AllMiniLML6V2");
+    }
+
+    // Integration tests that require model download
+    #[test]
+    #[ignore]
+    fn test_embed_query_returns_correct_dimension() {
+        let service = EmbeddingService::new().unwrap();
+        let embedding = service.embed_query("test query").unwrap();
+        assert_eq!(embedding.len(), EMBEDDING_DIM);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_embed_documents_batch() {
+        let service = EmbeddingService::new().unwrap();
+        let texts = vec!["first document", "second document", "third document"];
+        let embeddings = service.embed_documents(&texts).unwrap();
+        assert_eq!(embeddings.len(), 3);
+        for emb in &embeddings {
+            assert_eq!(emb.len(), EMBEDDING_DIM);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_embed_documents_empty() {
+        let service = EmbeddingService::new().unwrap();
+        let embeddings = service.embed_documents(&[]).unwrap();
+        assert!(embeddings.is_empty());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_similar_texts_have_higher_similarity() {
+        let service = EmbeddingService::new().unwrap();
+        let cat = service.embed_query("cat").unwrap();
+        let kitten = service.embed_query("kitten").unwrap();
+        let airplane = service.embed_query("airplane").unwrap();
+
+        let sim_related = cosine_similarity(&cat, &kitten);
+        let sim_unrelated = cosine_similarity(&cat, &airplane);
+        assert!(
+            sim_related > sim_unrelated,
+            "cat-kitten ({:.3}) should be more similar than cat-airplane ({:.3})",
+            sim_related,
+            sim_unrelated
+        );
     }
 }

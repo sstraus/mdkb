@@ -1,7 +1,7 @@
 //! Code intelligence for multi-language source analysis.
 //!
 //! Provides symbol extraction, relationship graphing, and semantic code search
-//! via tree-sitter parsing and Tantivy indexing. Gated behind the `code-intel` feature.
+//! via tree-sitter parsing and Tantivy indexing.
 
 pub mod indexing;
 pub mod parsing;

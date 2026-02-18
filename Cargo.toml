@@ -69,40 +69,36 @@ directories = "5"
 pulldown-cmark = "0.12"
 regex = "1"
 
-# LLM - semantic search with local embeddings
-llama-cpp-2 = "0.1"
-hf-hub = "0.3"
-indicatif = "0.17"
+# Embedding - semantic search with local ONNX models
+fastembed = "4"
 
 # Token counting for usage metrics
 tiktoken-rs = "0.6"
 
 # Code intelligence - search backend
-tantivy = { version = "0.25.0", optional = true }
+tantivy = "0.25.0"
 
 # Code intelligence - tree-sitter parsing
-tree-sitter = { version = "0.26.5", optional = true }
-tree-sitter-rust = { version = "0.24.0", optional = true }
-tree-sitter-go = { version = "0.25.0", optional = true }
-tree-sitter-typescript = { version = "0.23.2", optional = true }
-tree-sitter-python = { version = "0.25.0", optional = true }
-tree-sitter-java = { version = "0.23.5", optional = true }
-tree-sitter-c = { version = "0.24.1", optional = true }
-tree-sitter-cpp = { version = "0.23.4", optional = true }
-tree-sitter-c-sharp = { version = "0.23.1", optional = true }
-tree-sitter-kotlin-codanna = { version = "0.3.9", optional = true }
-tree-sitter-php = { version = "0.24.2", optional = true }
-tree-sitter-swift = { version = "0.7.1", optional = true }
-tree-sitter-lua = { version = "0.4.1", optional = true }
-tree-sitter-gdscript = { version = "6.1.0", optional = true }
+tree-sitter = "0.26.5"
+tree-sitter-rust = "0.24.0"
+tree-sitter-go = "0.25.0"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-python = "0.25.0"
+tree-sitter-java = "0.23.5"
+tree-sitter-c = "0.24.1"
+tree-sitter-cpp = "0.23.4"
+tree-sitter-c-sharp = "0.23.1"
+tree-sitter-kotlin-codanna = "0.3.9"
+tree-sitter-php = "0.24.2"
+tree-sitter-swift = "0.7.1"
+tree-sitter-lua = "0.4.1"
+tree-sitter-gdscript = "6.1.0"
 
 # Code intelligence - indexing pipeline
-crossbeam-channel = { version = "0.5", optional = true }
-ignore = { version = "0.4", optional = true }
-rayon = { version = "1.10", optional = true }
+crossbeam-channel = "0.5"
+ignore = "0.4"
+rayon = "1.10"
 
-# Code intelligence - semantic search with local embeddings
-fastembed = { version = "4", optional = true }
 
 # HTTP server auth (constant-time token comparison)
 subtle = { version = "2", optional = true }
@@ -117,27 +113,6 @@ default = []
 llm = []  # Enable LLM-powered features like memory condense
 http-server = ["dep:axum", "dep:tower", "dep:tokio-util", "dep:subtle", "rmcp/transport-streamable-http-server"]
 https-server = ["http-server", "dep:rcgen", "dep:axum-server", "dep:rustls"]
-code-intel = [
-    "dep:tantivy",
-    "dep:tree-sitter",
-    "dep:tree-sitter-rust",
-    "dep:tree-sitter-go",
-    "dep:tree-sitter-typescript",
-    "dep:tree-sitter-python",
-    "dep:tree-sitter-java",
-    "dep:tree-sitter-c",
-    "dep:tree-sitter-cpp",
-    "dep:tree-sitter-c-sharp",
-    "dep:tree-sitter-kotlin-codanna",
-    "dep:tree-sitter-php",
-    "dep:tree-sitter-swift",
-    "dep:tree-sitter-lua",
-    "dep:tree-sitter-gdscript",
-    "dep:crossbeam-channel",
-    "dep:ignore",
-    "dep:rayon",
-    "dep:fastembed",
-]
 
 [dev-dependencies]
 tempfile = "3"
@@ -156,11 +131,6 @@ redundant_imports = "warn"
 trivial_numeric_casts = "warn"
 unsafe_op_in_unsafe_fn = "warn"
 unused_lifetimes = "warn"
-
-# Patch llama-cpp-sys-2 to explicitly disable AVX2/FMA on older CPUs
-# Without this, ggml defaults to AVX2=ON which causes SIGILL on Ivy Bridge
-[patch.crates-io]
-llama-cpp-sys-2 = { path = "patches/llama-cpp-sys-2" }
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

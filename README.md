@@ -1,16 +1,16 @@
 # mdkb
 
-Local markdown knowledge base with hybrid search for AI assistants.
+Local knowledge base with hybrid search for AI assistants.
 
-**mdkb** indexes your markdown files and exposes them to Claude Code (or any MCP-compatible AI) through a local search API. It combines keyword matching with semantic understanding to find the most relevant documents.
+**mdkb** indexes your project's markdown documentation and source code, exposing everything to Claude Code (or any MCP-compatible AI) through a local search API. It combines keyword matching with semantic understanding to find the most relevant results.
 
 ## Why mdkb?
 
-AI assistants are limited by context windows. When your codebase has extensive documentation, the AI can't read it all. mdkb solves this by:
+AI assistants are limited by context windows. When your codebase has extensive documentation and thousands of source files, the AI can't read it all. mdkb solves this by:
 
-1. **Indexing** your markdown files locally (no cloud, no API keys)
-2. **Searching** with hybrid retrieval (keyword + semantic)
-3. **Exposing** results through MCP so Claude can query your docs on demand
+1. **Indexing** your markdown files and source code locally (no cloud, no API keys)
+2. **Searching** with hybrid retrieval (keyword + semantic) across docs and code
+3. **Exposing** results through MCP so Claude can query your knowledge base on demand
 
 ## Installation
 
@@ -19,21 +19,6 @@ cargo install --path .
 ```
 
 Or download a pre-built binary from [Releases](https://github.com/user/mdkb/releases).
-
-### Building for Older CPUs
-
-The LLM feature requires CPU-specific optimizations. If you get `SIGILL` (illegal instruction) errors on older CPUs without AVX2 (e.g., Intel Ivy Bridge, Sandy Bridge), you need to patch `llama-cpp-sys-2`:
-
-```bash
-# Copy the crate locally
-cp -r ~/.cargo/registry/src/*/llama-cpp-sys-2-* patches/llama-cpp-sys-2
-
-# Edit patches/llama-cpp-sys-2/build.rs to explicitly disable AVX2:
-# Change the feature detection loop to explicitly set OFF for missing features
-# See: .cargo/config.toml for target-cpu settings
-```
-
-The patch is not committed to the repo due to size (includes full llama.cpp source). See `.cargo/config.toml` for the target CPU configuration.
 
 ## Quick Start
 
@@ -46,35 +31,58 @@ mdkb init
 mdkb collection add docs ./docs
 mdkb collection add wiki ./wiki --pattern "**/*.md"
 
-# Index files
+# Index everything (documents + source code)
 mdkb update
 
-# Generate semantic embeddings (downloads ~100MB model on first run)
+# Generate semantic embeddings (downloads ~30MB model on first run)
 mdkb embed
 
 # Search
 mdkb search "authentication flow"
 mdkb search "how to handle errors" -c docs
+mdkb search "handler" --scope symbols --kind function
 ```
 
 ## Search
 
-mdkb uses hybrid search combining two strategies:
+mdkb provides unified search across documents, memory, and code with the `--scope` parameter:
 
-- **BM25 keyword search** - Traditional full-text search. "OAuth2 callback" finds documents with those exact words.
-- **Semantic vector search** - Understands meaning. "how to authenticate users" finds docs about "login", "OAuth", "JWT".
+| Scope | Description |
+|-------|-------------|
+| `docs` (default) | Hybrid BM25 + semantic search over markdown documents |
+| `memory` | Full-text search over memory entries |
+| `all` | Combined docs + memory results |
+| `code` | Fuzzy symbol search over indexed source code |
+| `symbols` | Exact symbol lookup by name |
 
-Results are merged using Reciprocal Rank Fusion (RRF), so documents matching both keyword and meaning rank highest.
+### Document Search (scope: docs)
+
+Combines two strategies merged with Reciprocal Rank Fusion (RRF):
+
+- **BM25 keyword search** - "OAuth2 callback" finds documents with those exact words.
+- **Semantic vector search** - Uses fastembed (AllMiniLML6V2, 384-dim). "how to authenticate users" finds docs about "login", "OAuth", "JWT".
 
 ```bash
-mdkb search <query> [-l LIMIT] [-c COLLECTION]
+mdkb search <query> [-l LIMIT] [-c COLLECTION] [--scope docs]
 ```
 
-Output format: `[id] collection:path - title (score)`
+Output: `[id] collection:path - title (score)`
 
 ```
 [42] docs:api/auth.md - Authentication Guide (score: 0.85)
 [17] notes:security.md - Security Notes (score: 0.72)
+```
+
+### Code Search (scope: code, symbols)
+
+Search indexed source code symbols (functions, structs, methods, etc.):
+
+```bash
+# Fuzzy search across all symbol names
+mdkb search "auth handler" --scope code
+
+# Exact symbol lookup, filtered by kind and file
+mdkb search "handle_get" --scope symbols --kind function --file handlers.rs
 ```
 
 Use `mdkb get 42` to retrieve full document content.
@@ -85,19 +93,41 @@ Collections group documents by source directory:
 
 ```bash
 mdkb collection add <name> <path> [--pattern <glob>]
-mdkb collection list
 mdkb collection remove <name>
 mdkb collection rename <old> <new>
 ```
 
-The pattern defaults to `**/*.md`. Use `-c <name>` on search/get commands to filter by collection.
+The pattern defaults to `**/*.md`. Use `-c <name>` on search commands to filter by collection.
 
 ## Document Retrieval
 
 ```bash
-mdkb get <id|path>              # Get document by ID or path
-mdkb get 42 --lines 10:50       # Get specific line range
-mdkb mget "*.md" [-c NAME]      # Batch retrieve by glob pattern
+mdkb get <id|path|slug>          # Get by ID, path, or memory slug
+mdkb get 42 --lines 10:50        # Get specific line range
+mdkb get "docs/*.md"             # Get by glob pattern
+mdkb get 42,43,44                # Get multiple by comma-separated IDs
+mdkb mget "*.md" [-c NAME]       # Batch retrieve (alias for glob get)
+```
+
+## Code Intelligence
+
+mdkb indexes source code using tree-sitter parsers (Rust, Go, TypeScript/JavaScript, Python) and builds a call graph for navigation:
+
+```bash
+# Build code index (also done by mdkb update)
+mdkb code index
+
+# Search symbols
+mdkb code search "handler" --kind function
+mdkb code find "Config" --kind struct
+
+# Call graph
+mdkb code calls main              # What does main() call?
+mdkb code callers handle_get      # What calls handle_get()?
+mdkb code impact init --depth 5   # Transitive dependency graph
+
+# Index info
+mdkb code info
 ```
 
 ## Memory
@@ -126,10 +156,10 @@ Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectura
 
 ### How AIs Use Memory
 
-1. **Session start**: AI calls `memory_index` to get top 50 entries (~1.5K tokens)
-2. **On demand**: AI calls `memory_get` for full entry content
+1. **Session start**: Server instructions include top 50 memory entries (~1.5K tokens)
+2. **On demand**: AI calls `get(slug)` for full entry content
 3. **Learning**: AI calls `memory_write` to persist new knowledge
-4. **Finding**: AI calls `memory_search` to find related entries
+4. **Finding**: AI calls `search(query, scope="memory")` to find related entries
 
 Access counts track which entries are most useful, ensuring the warmup index prioritizes frequently-used knowledge.
 
@@ -176,26 +206,21 @@ If you prefer manual configuration, add to `~/.claude/mcp.json`:
 
 For project-scoped setups (Option 1 with `--scope local`), the server runs from your current project directory. For user-scoped setups (`--scope user`), ensure `.mdkb/` exists in your home directory or launch Claude Code from a directory with `.mdkb/` initialized.
 
-### Available Tools
+### Available Tools (7)
 
 | Tool | Description |
 |------|-------------|
-| `search` | Hybrid search (keyword + semantic) |
-| `get` | Retrieve document by ID (supports line ranges) |
-| `multi_get` | Batch retrieve by glob pattern |
-| `list_collections` | List available collections |
-| `status` | Check index health |
-| `update` | Trigger reindex |
-| `get_metrics` | View token usage and search quality statistics |
-| `memory_index` | Get warmup index for session start |
-| `memory_get` | Retrieve full memory entry |
+| `search` | Unified search with scope: `docs` (default), `memory`, `all`, `code`, `symbols` |
+| `get` | Retrieve by ID, path, memory slug, glob pattern, or comma-separated list |
+| `code_graph` | Call graph queries: `calls`, `callers`, or `impact` |
+| `status` | Index health, collections, and code index stats |
+| `update` | Reindex everything (documents and source code) |
 | `memory_write` | Create or update memory entry |
-| `memory_search` | Search memory entries |
-| `evolution` | Trace document evolution history |
+| `memory_delete` | Delete a memory entry |
 
-### File Watching
+### Auto-Indexing
 
-In MCP mode, mdkb watches collection paths and automatically reindexes when files change.
+When the MCP server starts, it automatically indexes all configured collections and source code. The file watcher then keeps the index up to date as files change. No manual `update` call is needed for initial setup.
 
 ## Configuration
 
@@ -223,9 +248,10 @@ All data stays local in `.mdkb/`:
 .mdkb/
 ├── config.toml
 ├── index.sqlite
-└── models/
-    └── bge-small-en-v1.5-q8_0.gguf
+└── code-index/
 ```
+
+The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded automatically on first use and cached locally.
 
 Add `.mdkb/` to `.gitignore` - it can be regenerated with `mdkb update && mdkb embed`.
 

@@ -21,9 +21,21 @@ pub struct SearchParams {
     #[serde(default)]
     pub include_superseded: bool,
 
-    /// Search scope: "docs" (default), "memory", or "all".
+    /// Search scope: "docs" (default), "memory", "all", "code", or "symbols".
     #[serde(default)]
     pub scope: Option<String>,
+
+    /// Filter by symbol kind when scope is "code" or "symbols" (e.g., "function", "struct").
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    /// Minimum similarity score 0.0-1.0 when scope is "code" (default: 0.3).
+    #[serde(default = "default_threshold")]
+    pub threshold: f32,
+
+    /// Filter by file path (substring match) when scope is "symbols".
+    #[serde(default)]
+    pub file: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -39,17 +51,6 @@ pub struct GetParams {
     /// Optional line range (e.g., "10:50").
     #[serde(default)]
     pub lines: Option<String>,
-}
-
-/// Parameters for the multi_get tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct MultiGetParams {
-    /// Pattern to match (glob).
-    pub pattern: String,
-
-    /// Optional collection filter.
-    #[serde(default)]
-    pub collection: Option<String>,
 }
 
 /// Parameters for the memory write tool.
@@ -77,55 +78,6 @@ fn default_entry_type() -> String {
     "topic".to_string()
 }
 
-/// Parameters for the metrics tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct MetricsParams {
-    /// Number of days to analyze (default: 7).
-    #[serde(default = "default_period")]
-    pub period_days: u32,
-
-    /// Include latency percentiles (default: true).
-    #[serde(default = "default_true")]
-    pub include_latency: bool,
-
-    /// Include quality metrics (default: true).
-    #[serde(default = "default_true")]
-    pub include_quality: bool,
-}
-
-fn default_period() -> u32 {
-    7
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// Parameters for the collection_add tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct CollectionAddParams {
-    /// Collection name.
-    pub name: String,
-
-    /// Path to directory containing documents.
-    pub path: String,
-
-    /// Glob pattern for files (default: **/*.md).
-    #[serde(default = "default_collection_pattern")]
-    pub pattern: String,
-}
-
-fn default_collection_pattern() -> String {
-    "**/*.md".to_string()
-}
-
-/// Parameters for the collection_remove tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct CollectionRemoveParams {
-    /// Name of the collection to remove.
-    pub name: String,
-}
-
 /// Parameters for the memory_delete tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct MemoryDeleteParams {
@@ -134,97 +86,34 @@ pub struct MemoryDeleteParams {
 }
 
 // ---------------------------------------------------------------------------
-// Code intelligence tool parameters (requires `code-intel` feature)
+// Code intelligence tool parameters
 // ---------------------------------------------------------------------------
 
-/// Parameters for find_symbol: exact name lookup with optional filters.
+/// Parameters for code_graph: call graph queries with direction.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct FindSymbolParams {
-    /// Exact symbol name to find.
-    pub name: String,
-
-    /// Filter by symbol kind (e.g., "function", "struct", "method").
-    #[serde(default)]
-    pub kind: Option<String>,
-
-    /// Filter by file path (substring match).
-    #[serde(default)]
-    pub file: Option<String>,
-}
-
-/// Parameters for search_symbols: fuzzy text search across symbol names/signatures.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct SearchSymbolsParams {
-    /// Search query text (matched against names, signatures, doc comments).
-    pub query: String,
-
-    /// Filter by symbol kind (e.g., "function", "struct").
-    #[serde(default)]
-    pub kind: Option<String>,
-
-    /// Maximum results (default: 10).
-    #[serde(default = "default_limit")]
-    pub limit: usize,
-}
-
-/// Parameters for get_calls: what functions does a symbol call?
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct GetCallsParams {
+pub struct CodeGraphParams {
     /// Symbol name to look up.
     pub name: String,
 
-    /// Exact symbol ID (use to disambiguate when multiple symbols share a name).
-    #[serde(default)]
-    pub symbol_id: Option<u32>,
-}
-
-/// Parameters for find_callers: what calls a given symbol?
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct FindCallersParams {
-    /// Symbol name to look up.
-    pub name: String,
-
-    /// Exact symbol ID (use to disambiguate when multiple symbols share a name).
-    #[serde(default)]
-    pub symbol_id: Option<u32>,
-}
-
-/// Parameters for analyze_impact: dependency graph from a symbol.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct AnalyzeImpactParams {
-    /// Symbol name to start from.
-    pub name: String,
+    /// Graph direction: "calls" (default, outgoing), "callers" (incoming), or "impact" (transitive).
+    #[serde(default = "default_direction")]
+    pub direction: String,
 
     /// Exact symbol ID (use to disambiguate when multiple symbols share a name).
     #[serde(default)]
     pub symbol_id: Option<u32>,
 
-    /// Maximum traversal depth (default: 3).
+    /// Maximum traversal depth when direction is "impact" (default: 3).
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
 }
 
-fn default_max_depth() -> usize {
-    3
+fn default_direction() -> String {
+    "calls".to_string()
 }
 
-/// Parameters for semantic_search: natural language search over code symbols.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct SemanticSearchParams {
-    /// Natural language query (e.g., "function that handles authentication").
-    pub query: String,
-
-    /// Filter by symbol kind (e.g., "function", "struct", "method").
-    #[serde(default)]
-    pub kind: Option<String>,
-
-    /// Maximum results (default: 10).
-    #[serde(default = "default_limit")]
-    pub limit: usize,
-
-    /// Minimum similarity score 0.0-1.0 (default: 0.3).
-    #[serde(default = "default_threshold")]
-    pub threshold: f32,
+fn default_max_depth() -> usize {
+    3
 }
 
 fn default_threshold() -> f32 {
@@ -277,152 +166,72 @@ mod tests {
     }
 
     #[test]
-    fn test_metrics_params_defaults() {
-        let json = r#"{}"#;
-        let params: MetricsParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.period_days, 7);
-        assert!(params.include_latency);
-        assert!(params.include_quality);
-    }
-
-    #[test]
-    fn test_metrics_params_custom() {
-        let json = r#"{"period_days": 30, "include_latency": false, "include_quality": true}"#;
-        let params: MetricsParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.period_days, 30);
-        assert!(!params.include_latency);
-        assert!(params.include_quality);
-    }
-
-    #[test]
-    fn test_collection_add_params_deserialize() {
-        let json = r#"{"name": "docs", "path": "docs/", "pattern": "**/*.txt"}"#;
-        let params: CollectionAddParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "docs");
-        assert_eq!(params.path, "docs/");
-        assert_eq!(params.pattern, "**/*.txt");
-    }
-
-    #[test]
-    fn test_collection_add_params_default_pattern() {
-        let json = r#"{"name": "notes", "path": "notes/"}"#;
-        let params: CollectionAddParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "notes");
-        assert_eq!(params.path, "notes/");
-        assert_eq!(params.pattern, "**/*.md");
-    }
-
-    #[test]
-    fn test_collection_remove_params_deserialize() {
-        let json = r#"{"name": "docs"}"#;
-        let params: CollectionRemoveParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "docs");
-    }
-
-    #[test]
     fn test_memory_delete_params_deserialize() {
         let json = r#"{"id": "auth-oauth2-pkce"}"#;
         let params: MemoryDeleteParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.id, "auth-oauth2-pkce");
     }
 
-    // --- Code intelligence param tests ---
+    // --- Code intelligence param tests (via SearchParams scopes) ---
 
     #[test]
-    fn test_find_symbol_params_minimal() {
-        let json = r#"{"name": "process_data"}"#;
-        let params: FindSymbolParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "process_data");
+    fn test_search_params_code_scope_defaults() {
+        let json = r#"{"query": "auth handler", "scope": "code"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "auth handler");
+        assert_eq!(params.scope.as_deref(), Some("code"));
         assert!(params.kind.is_none());
+        assert!((params.threshold - 0.3).abs() < f32::EPSILON);
         assert!(params.file.is_none());
     }
 
     #[test]
-    fn test_find_symbol_params_with_filters() {
-        let json = r#"{"name": "process_data", "kind": "function", "file": "src/main.rs"}"#;
-        let params: FindSymbolParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "process_data");
+    fn test_search_params_code_scope_custom() {
+        let json = r#"{"query": "pool", "scope": "code", "kind": "struct", "threshold": 0.5}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "pool");
+        assert_eq!(params.scope.as_deref(), Some("code"));
+        assert_eq!(params.kind.as_deref(), Some("struct"));
+        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_search_params_symbols_scope_with_file() {
+        let json = r#"{"query": "handler", "scope": "symbols", "kind": "function", "file": "src/main.rs"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.query, "handler");
+        assert_eq!(params.scope.as_deref(), Some("symbols"));
         assert_eq!(params.kind.as_deref(), Some("function"));
         assert_eq!(params.file.as_deref(), Some("src/main.rs"));
     }
 
     #[test]
-    fn test_search_symbols_params_defaults() {
-        let json = r#"{"query": "handler"}"#;
-        let params: SearchSymbolsParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.query, "handler");
-        assert!(params.kind.is_none());
-        assert_eq!(params.limit, 10);
-    }
-
-    #[test]
-    fn test_search_symbols_params_custom() {
-        let json = r#"{"query": "handler", "kind": "method", "limit": 25}"#;
-        let params: SearchSymbolsParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.query, "handler");
-        assert_eq!(params.kind.as_deref(), Some("method"));
-        assert_eq!(params.limit, 25);
-    }
-
-    #[test]
-    fn test_get_calls_params_name_only() {
+    fn test_code_graph_params_defaults() {
         let json = r#"{"name": "main"}"#;
-        let params: GetCallsParams = serde_json::from_str(json).unwrap();
+        let params: CodeGraphParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.name, "main");
-        assert!(params.symbol_id.is_none());
-    }
-
-    #[test]
-    fn test_get_calls_params_with_id() {
-        let json = r#"{"name": "main", "symbol_id": 42}"#;
-        let params: GetCallsParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "main");
-        assert_eq!(params.symbol_id, Some(42));
-    }
-
-    #[test]
-    fn test_find_callers_params() {
-        let json = r#"{"name": "process", "symbol_id": 7}"#;
-        let params: FindCallersParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "process");
-        assert_eq!(params.symbol_id, Some(7));
-    }
-
-    #[test]
-    fn test_analyze_impact_params_defaults() {
-        let json = r#"{"name": "Database.connect"}"#;
-        let params: AnalyzeImpactParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.name, "Database.connect");
+        assert_eq!(params.direction, "calls");
         assert!(params.symbol_id.is_none());
         assert_eq!(params.max_depth, 3);
     }
 
     #[test]
-    fn test_analyze_impact_params_custom() {
-        let json = r#"{"name": "init", "symbol_id": 1, "max_depth": 5}"#;
-        let params: AnalyzeImpactParams = serde_json::from_str(json).unwrap();
+    fn test_code_graph_params_callers() {
+        let json = r#"{"name": "process", "direction": "callers", "symbol_id": 7}"#;
+        let params: CodeGraphParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.name, "process");
+        assert_eq!(params.direction, "callers");
+        assert_eq!(params.symbol_id, Some(7));
+    }
+
+    #[test]
+    fn test_code_graph_params_impact() {
+        let json = r#"{"name": "init", "direction": "impact", "symbol_id": 1, "max_depth": 5}"#;
+        let params: CodeGraphParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.name, "init");
+        assert_eq!(params.direction, "impact");
         assert_eq!(params.symbol_id, Some(1));
         assert_eq!(params.max_depth, 5);
     }
 
-    #[test]
-    fn test_semantic_search_params_defaults() {
-        let json = r#"{"query": "authentication handler"}"#;
-        let params: SemanticSearchParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.query, "authentication handler");
-        assert!(params.kind.is_none());
-        assert_eq!(params.limit, 10);
-        assert!((params.threshold - 0.3).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_semantic_search_params_custom() {
-        let json = r#"{"query": "database pool", "kind": "struct", "limit": 5, "threshold": 0.5}"#;
-        let params: SemanticSearchParams = serde_json::from_str(json).unwrap();
-        assert_eq!(params.query, "database pool");
-        assert_eq!(params.kind.as_deref(), Some("struct"));
-        assert_eq!(params.limit, 5);
-        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
-    }
 }

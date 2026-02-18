@@ -25,7 +25,6 @@ use mdkb::cli::handlers::{
     handle_mget, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
 use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SetupCommand, SetupMcpCommand};
-#[cfg(feature = "code-intel")]
 use mdkb::cli::CodeCommand;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::store::evolution::Evolution;
@@ -89,6 +88,8 @@ async fn main() -> Result<()> {
             collection,
             include_superseded,
             scope,
+            kind,
+            file,
         } => {
             let ctx = Context::open(&cwd)?;
             match scope.as_str() {
@@ -115,8 +116,26 @@ async fn main() -> Result<()> {
                         println!("No results found.");
                     }
                 }
+                "code" => {
+                    let symbols = mdkb::cli::handlers::handle_code_search(
+                        &cwd,
+                        &query,
+                        limit,
+                        kind.as_deref(),
+                    )?;
+                    format_code_symbols(&symbols, cli.format);
+                }
+                "symbols" => {
+                    let symbols = mdkb::cli::handlers::handle_code_find(
+                        &cwd,
+                        &query,
+                        kind.as_deref(),
+                        file.as_deref(),
+                    )?;
+                    format_code_symbols(&symbols, cli.format);
+                }
                 _ => {
-                    eprintln!("Invalid scope: '{}'. Valid values: docs, memory, all", scope);
+                    eprintln!("Invalid scope: '{}'. Valid values: docs, memory, all, code, symbols", scope);
                     std::process::exit(1);
                 }
             }
@@ -124,12 +143,38 @@ async fn main() -> Result<()> {
         Command::Get { id, lines } => {
             use mdkb::cli::handlers::GetResult;
             let ctx = Context::open(&cwd)?;
-            match handle_get(&ctx, &id, lines.as_deref())? {
-                GetResult::Document(doc, content) => {
-                    format_document(&doc, &content, cli.format);
+
+            // Detect glob pattern (contains * or ?)
+            if id.contains('*') || id.contains('?') {
+                let results = handle_mget(&ctx, &id, None)?;
+                format_mget_results(&results, cli.format);
+            }
+            // Detect comma-separated list (e.g., "42,43,44")
+            else if id.contains(',') {
+                let ids: Vec<&str> = id.split(',').map(|s| s.trim()).collect();
+                for single_id in ids {
+                    match handle_get(&ctx, single_id, lines.as_deref()) {
+                        Ok(GetResult::Document(doc, content)) => {
+                            format_document(&doc, &content, cli.format);
+                        }
+                        Ok(GetResult::Memory(entry)) => {
+                            format_memory_entry(&entry, cli.format);
+                        }
+                        Err(e) => {
+                            eprintln!("Error getting '{}': {}", single_id, e);
+                        }
+                    }
                 }
-                GetResult::Memory(entry) => {
-                    format_memory_entry(&entry, cli.format);
+            }
+            // Single ID/path/slug
+            else {
+                match handle_get(&ctx, &id, lines.as_deref())? {
+                    GetResult::Document(doc, content) => {
+                        format_document(&doc, &content, cli.format);
+                    }
+                    GetResult::Memory(entry) => {
+                        format_memory_entry(&entry, cli.format);
+                    }
                 }
             }
         }
@@ -150,6 +195,18 @@ async fn main() -> Result<()> {
             let ctx = Context::open(&cwd)?;
             let result = handle_update(&ctx, &cwd)?;
             format_update_result(&result, cli.format);
+
+            // Also reindex code (matching MCP update behavior)
+            match mdkb::cli::handlers::handle_code_index(&cwd, &[]) {
+                Ok(stats) => {
+                    println!("\nCode index:");
+                    format_code_index_stats(&stats, cli.format);
+                }
+                Err(e) => {
+                    tracing::warn!("Code reindexing failed: {:?}", e);
+                    eprintln!("Warning: code reindexing failed: {}", e);
+                }
+            }
         }
         Command::Embed => {
             let ctx = Context::open(&cwd)?;
@@ -380,66 +437,57 @@ async fn main() -> Result<()> {
             }
         }
         Command::Code(cmd) => {
-            #[cfg(not(feature = "code-intel"))]
-            {
-                let _ = cmd;
-                eprintln!("Code intelligence not enabled. Build with --features code-intel");
-                std::process::exit(1);
-            }
-            #[cfg(feature = "code-intel")]
-            {
-                match cmd {
-                    CodeCommand::Init => {
-                        mdkb::cli::handlers::handle_code_init(&cwd)?;
-                        println!("Initialized code index at .mdkb/code-index/");
-                    }
-                    CodeCommand::Index { paths } => {
-                        let stats = mdkb::cli::handlers::handle_code_index(&cwd, &paths)?;
-                        format_code_index_stats(&stats, cli.format);
-                    }
-                    CodeCommand::Search { query, limit, kind } => {
-                        let symbols = mdkb::cli::handlers::handle_code_search(
-                            &cwd,
-                            &query,
-                            limit,
-                            kind.as_deref(),
-                        )?;
-                        format_code_symbols(&symbols, cli.format);
-                    }
-                    CodeCommand::Find { name, kind, file } => {
-                        let symbols = mdkb::cli::handlers::handle_code_find(
-                            &cwd,
-                            &name,
-                            kind.as_deref(),
-                            file.as_deref(),
-                        )?;
-                        format_code_symbols(&symbols, cli.format);
-                    }
-                    CodeCommand::Calls { name } => {
-                        let (source, callees) =
-                            mdkb::cli::handlers::handle_code_calls(&cwd, &name)?;
-                        format_code_graph("Calls", &source, &callees, cli.format);
-                    }
-                    CodeCommand::Callers { name } => {
-                        let (target, callers) =
-                            mdkb::cli::handlers::handle_code_callers(&cwd, &name)?;
-                        format_code_graph("Called by", &target, &callers, cli.format);
-                    }
-                    CodeCommand::Impact { name, depth } => {
-                        let (source, impacted) =
-                            mdkb::cli::handlers::handle_code_impact(&cwd, &name, depth)?;
-                        format_code_graph("Impact radius", &source, &impacted, cli.format);
-                    }
-                    CodeCommand::Info => {
-                        let info = mdkb::cli::handlers::handle_code_info(&cwd)?;
-                        format_code_info(&info, cli.format);
-                    }
-                    CodeCommand::Parse { file } => {
-                        let symbols = mdkb::cli::handlers::handle_code_parse(
-                            std::path::Path::new(&file),
-                        )?;
-                        format_code_parse(&symbols, &file, cli.format);
-                    }
+            match cmd {
+                CodeCommand::Init => {
+                    mdkb::cli::handlers::handle_code_init(&cwd)?;
+                    println!("Initialized code index at .mdkb/code-index/");
+                }
+                CodeCommand::Index { paths } => {
+                    let stats = mdkb::cli::handlers::handle_code_index(&cwd, &paths)?;
+                    format_code_index_stats(&stats, cli.format);
+                }
+                CodeCommand::Search { query, limit, kind } => {
+                    let symbols = mdkb::cli::handlers::handle_code_search(
+                        &cwd,
+                        &query,
+                        limit,
+                        kind.as_deref(),
+                    )?;
+                    format_code_symbols(&symbols, cli.format);
+                }
+                CodeCommand::Find { name, kind, file } => {
+                    let symbols = mdkb::cli::handlers::handle_code_find(
+                        &cwd,
+                        &name,
+                        kind.as_deref(),
+                        file.as_deref(),
+                    )?;
+                    format_code_symbols(&symbols, cli.format);
+                }
+                CodeCommand::Calls { name } => {
+                    let (source, callees) =
+                        mdkb::cli::handlers::handle_code_calls(&cwd, &name)?;
+                    format_code_graph("Calls", &source, &callees, cli.format);
+                }
+                CodeCommand::Callers { name } => {
+                    let (target, callers) =
+                        mdkb::cli::handlers::handle_code_callers(&cwd, &name)?;
+                    format_code_graph("Called by", &target, &callers, cli.format);
+                }
+                CodeCommand::Impact { name, depth } => {
+                    let (source, impacted) =
+                        mdkb::cli::handlers::handle_code_impact(&cwd, &name, depth)?;
+                    format_code_graph("Impact radius", &source, &impacted, cli.format);
+                }
+                CodeCommand::Info => {
+                    let info = mdkb::cli::handlers::handle_code_info(&cwd)?;
+                    format_code_info(&info, cli.format);
+                }
+                CodeCommand::Parse { file } => {
+                    let symbols = mdkb::cli::handlers::handle_code_parse(
+                        std::path::Path::new(&file),
+                    )?;
+                    format_code_parse(&symbols, &file, cli.format);
                 }
             }
         }
@@ -1419,7 +1467,6 @@ fn format_journal_import_all_results(results: &[JournalImportResult], dry_run: b
 // Code intelligence format functions
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "code-intel")]
 fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -1460,7 +1507,6 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
     }
 }
 
-#[cfg(feature = "code-intel")]
 fn format_code_symbols(symbols: &[mdkb::code::symbol::Symbol], format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -1517,7 +1563,6 @@ fn format_code_symbols(symbols: &[mdkb::code::symbol::Symbol], format: OutputFor
     }
 }
 
-#[cfg(feature = "code-intel")]
 fn format_code_graph(
     label: &str,
     source: &mdkb::code::symbol::Symbol,
@@ -1570,7 +1615,6 @@ fn format_code_graph(
     }
 }
 
-#[cfg(feature = "code-intel")]
 fn format_code_info(info: &mdkb::cli::handlers::CodeInfoResult, format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -1589,7 +1633,6 @@ fn format_code_info(info: &mdkb::cli::handlers::CodeInfoResult, format: OutputFo
     }
 }
 
-#[cfg(feature = "code-intel")]
 fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format: OutputFormat) {
     match format {
         OutputFormat::Json => {

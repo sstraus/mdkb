@@ -322,16 +322,12 @@ impl IndexFacade {
         Ok(results)
     }
 
-    /// Pre-initialize the semantic search model on a blocking thread.
+    /// Check if semantic search is available.
     ///
-    /// Call from async context to avoid blocking the tokio executor during
-    /// model download. No-op if semantic search is not configured or model
-    /// is already loaded.
-    pub async fn init_semantic_model(&self) -> anyhow::Result<()> {
-        if let Some(ref semantic) = self.semantic {
-            semantic.init_model_async().await?;
-        }
-        Ok(())
+    /// Returns true if the embedding service was initialized successfully
+    /// and the vector store is accessible.
+    pub fn has_semantic_search(&self) -> bool {
+        self.semantic.is_some()
     }
 
     /// Number of stored semantic embeddings.
@@ -440,7 +436,16 @@ impl IndexFacade {
 /// Returns `None` if initialization fails (logged as error with impact).
 fn init_semantic(index_path: &Path) -> Option<SemanticSearch> {
     let vectors_path = index_path.join("vectors.bin");
-    match SemanticSearch::new(&vectors_path) {
+    let service = match crate::llm::get_cached_service() {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(
+                "Failed to initialize embedding service: {e}. Impact: semantic_search() will return empty results."
+            );
+            return None;
+        }
+    };
+    match SemanticSearch::new(&vectors_path, service) {
         Ok(s) => Some(s),
         Err(e) => {
             tracing::error!(
