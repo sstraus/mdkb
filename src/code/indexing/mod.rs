@@ -38,30 +38,37 @@ pub struct IndexFacade {
     config: PipelineConfig,
     unresolved: Vec<UnresolvedRelationship>,
     semantic: Option<SemanticSearch>,
+    /// false = not yet attempted to initialize semantic search.
+    semantic_initialized: bool,
 }
 
 impl IndexFacade {
     /// Create a new facade with an index at the given path.
+    ///
+    /// The ONNX embedding model is NOT loaded until first use
+    /// (lazy initialization to save ~300-800 MB per idle instance).
     pub fn create(index_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let index = CodeIndex::create(index_path)?;
-        let semantic = init_semantic(index.path());
         Ok(Self {
             index,
             config: PipelineConfig::default(),
             unresolved: Vec::new(),
-            semantic,
+            semantic: None,
+            semantic_initialized: false,
         })
     }
 
     /// Open an existing index, or create one if it doesn't exist.
+    ///
+    /// The ONNX embedding model is NOT loaded until first use.
     pub fn open_or_create(index_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let index = CodeIndex::open_or_create(index_path)?;
-        let semantic = init_semantic(index.path());
         Ok(Self {
             index,
             config: PipelineConfig::default(),
             unresolved: Vec::new(),
-            semantic,
+            semantic: None,
+            semantic_initialized: false,
         })
     }
 
@@ -69,6 +76,17 @@ impl IndexFacade {
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Lazily initialize semantic search on first use.
+    ///
+    /// Loads the ONNX model (~300-800 MB RSS) only when actually needed.
+    fn ensure_semantic(&mut self) -> Option<&SemanticSearch> {
+        if !self.semantic_initialized {
+            self.semantic_initialized = true;
+            self.semantic = init_semantic(self.index.path());
+        }
+        self.semantic.as_ref()
     }
 
     // -----------------------------------------------------------------------
@@ -93,6 +111,7 @@ impl IndexFacade {
             writer.commit()?;
         }
         self.unresolved.clear();
+        // Only clear semantic if already initialized (don't trigger lazy load for a clear)
         if let Some(ref semantic) = self.semantic {
             if let Err(e) = semantic.clear() {
                 tracing::error!("Failed to clear semantic index: {e}. Impact: old embeddings may persist.");
@@ -426,15 +445,17 @@ impl IndexFacade {
     /// Search symbols by semantic similarity to a natural language query.
     ///
     /// Returns `(Symbol, score)` pairs sorted by descending similarity.
+    /// Triggers lazy initialization of the ONNX model on first call.
     pub fn semantic_search(
-        &self,
+        &mut self,
         query: &str,
         limit: usize,
         threshold: f32,
     ) -> anyhow::Result<Vec<(Symbol, f32)>> {
-        let Some(ref semantic) = self.semantic else {
+        if self.ensure_semantic().is_none() {
             return Ok(Vec::new());
-        };
+        }
+        let semantic = self.semantic.as_ref().unwrap();
 
         let matches = semantic.search(query, limit, threshold)?;
 
@@ -453,9 +474,9 @@ impl IndexFacade {
     /// Check if semantic search is available.
     ///
     /// Returns true if the embedding service was initialized successfully
-    /// and the vector store is accessible.
-    pub fn has_semantic_search(&self) -> bool {
-        self.semantic.is_some()
+    /// and the vector store is accessible. Triggers lazy initialization.
+    pub fn has_semantic_search(&mut self) -> bool {
+        self.ensure_semantic().is_some()
     }
 
     /// Number of stored semantic embeddings.
@@ -490,10 +511,11 @@ impl IndexFacade {
     // -----------------------------------------------------------------------
 
     /// Generate embeddings only for symbols in the given files.
-    fn generate_symbol_embeddings_for_files(&self, paths: &[PathBuf], root: &Path) {
-        let Some(ref semantic) = self.semantic else {
+    fn generate_symbol_embeddings_for_files(&mut self, paths: &[PathBuf], root: &Path) {
+        if self.ensure_semantic().is_none() {
             return;
-        };
+        }
+        let semantic = self.semantic.as_ref().unwrap();
 
         let rel_paths: HashSet<String> = paths
             .iter()
@@ -548,10 +570,11 @@ impl IndexFacade {
     }
 
     /// Generate embeddings for all indexed symbols and write to the vector store.
-    fn generate_symbol_embeddings(&self) {
-        let Some(ref semantic) = self.semantic else {
+    fn generate_symbol_embeddings(&mut self) {
+        if self.ensure_semantic().is_none() {
             return;
-        };
+        }
+        let semantic = self.semantic.as_ref().unwrap();
 
         let symbols = self.all_symbols(100_000);
         if symbols.is_empty() {
@@ -748,6 +771,25 @@ fn count_by_type(index: &CodeIndex, doc_type: &str) -> u64 {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_facade_create_does_not_load_model() {
+        let idx_dir = tempfile::tempdir().unwrap();
+        let facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+
+        // Semantic should NOT be initialized on construction (lazy)
+        assert!(!facade.semantic_initialized, "semantic should not be initialized on create");
+        assert!(facade.semantic.is_none(), "semantic should be None on create");
+    }
+
+    #[test]
+    fn test_facade_open_or_create_does_not_load_model() {
+        let idx_dir = tempfile::tempdir().unwrap();
+        let facade = IndexFacade::open_or_create(idx_dir.path().join("idx")).unwrap();
+
+        assert!(!facade.semantic_initialized, "semantic should not be initialized on open_or_create");
+        assert!(facade.semantic.is_none(), "semantic should be None on open_or_create");
+    }
 
     #[test]
     fn test_facade_create_and_index() {

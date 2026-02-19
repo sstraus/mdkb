@@ -107,6 +107,14 @@ impl CodeIndex {
         self.index.writer(clamped)
     }
 
+    /// Create a small index writer for incremental updates (15 MB, single thread).
+    ///
+    /// Uses less memory than the default 50 MB writer, appropriate for
+    /// reindexing a handful of files rather than a full project.
+    pub fn writer_incremental(&self) -> tantivy::Result<tantivy::IndexWriter> {
+        self.index.writer_with_num_threads(1, 15_000_000)
+    }
+
     /// Reload the reader to pick up newly committed segments.
     pub fn reload(&self) -> tantivy::Result<()> {
         self.reader.reload()
@@ -221,5 +229,13 @@ mod tests {
         idx.reload().unwrap();
         let searcher = idx.reader().searcher();
         assert_eq!(searcher.num_docs(), 1);
+    }
+
+    #[test]
+    fn test_writer_incremental() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = CodeIndex::create(dir.path().join("incr_test")).unwrap();
+        let writer = idx.writer_incremental();
+        assert!(writer.is_ok(), "incremental writer should be created successfully: {:?}", writer.err());
     }
 }

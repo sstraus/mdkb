@@ -512,9 +512,9 @@ impl McpServer {
                     {
                         self.ensure_code_index().await?;
 
-                        let idx_guard = self.code_index.lock().await;
+                        let mut idx_guard = self.code_index.lock().await;
                         let facade = idx_guard
-                            .as_ref()
+                            .as_mut()
                             .ok_or_else(|| mcp_error("Code index not initialized"))?;
 
                         if scope == Some("code") {
