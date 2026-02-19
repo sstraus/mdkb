@@ -1,7 +1,7 @@
 //! MCP server implementation.
 
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
@@ -1141,7 +1141,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 }
             } // ctx_guard dropped
 
-            // Run code reindex
+            // Run code reindex (incremental if index already exists)
             if let Err(e) = startup_server.ensure_code_index().await {
                 tracing::error!("Startup code index init failed: {:?}", e);
                 return;
@@ -1149,9 +1149,17 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
             {
                 let mut idx_guard = startup_server.code_index.lock().await;
                 if let Some(facade) = idx_guard.as_mut() {
-                    match facade.reindex(&startup_root) {
+                    let result = if facade.file_count() == 0 {
+                        // First run: full reindex
+                        facade.reindex(&startup_root)
+                    } else {
+                        // Subsequent startup: incremental — compare hashes
+                        let all_files = crate::code::indexing::walker::discover_files(&startup_root);
+                        facade.reindex_files(&startup_root, &all_files)
+                    };
+                    match result {
                         Ok(stats) => {
-                            if stats.symbols_indexed > 0 {
+                            if stats.symbols_indexed > 0 || stats.files_indexed > 0 {
                                 tracing::info!(
                                     "Startup index: {} files, {} symbols",
                                     stats.files_indexed, stats.symbols_indexed
@@ -1225,6 +1233,20 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
     Ok(())
 }
 
+/// Classify a file change into code and/or document categories.
+///
+/// Returns `(is_code, is_doc)` — a file can be both (e.g., a `.rs` file
+/// inside a collection path).
+fn classify_change(path: &Path, collection_paths: &[PathBuf]) -> (bool, bool) {
+    use crate::code::parsing::language::Language;
+    let is_code = Language::from_path(path).is_some();
+    let is_doc = collection_paths.iter().any(|cp| path.starts_with(cp));
+    (is_code, is_doc)
+}
+
+/// Batch window for collecting rapid-fire code changes before reindexing.
+const CODE_BATCH_IDLE_MS: u64 = 200;
+
 /// Run the file watcher and trigger reindex on changes.
 async fn run_file_watcher(
     root: PathBuf,
@@ -1237,7 +1259,6 @@ async fn run_file_watcher(
     // Open context to get collection paths
     let ctx_guard = ctx.lock().await;
     if ctx_guard.is_none() {
-        // Context not yet initialized, will be initialized on first tool call
         drop(ctx_guard);
         return Ok(());
     }
@@ -1248,84 +1269,141 @@ async fn run_file_watcher(
     };
     drop(ctx_guard);
 
-    // Watch all collection paths (for document reindex)
-    for coll in &collection_list {
-        let path = root.join(&coll.path);
-        if path.exists() {
-            if let Err(e) = watcher.watch(&path) {
-                tracing::warn!("Failed to watch {}: {}", path.display(), e);
+    // Resolve absolute collection paths for routing
+    let collection_paths: Vec<PathBuf> = collection_list
+        .iter()
+        .map(|coll| root.join(&coll.path))
+        .filter(|p| p.exists())
+        .collect();
+
+    // Check if code indexing is enabled
+    let code_enabled = {
+        let config_path = root.join(".mdkb/config.toml");
+        crate::Config::load_or_default(&config_path).code.enabled
+    };
+
+    // Watch root recursively (covers both code and collections inside root)
+    if code_enabled {
+        if let Err(e) = watcher.watch(&root.to_path_buf()) {
+            tracing::warn!("Failed to watch root: {}", e);
+        } else {
+            tracing::info!("Watching root for changes");
+        }
+    }
+
+    // Only watch collection paths that are OUTSIDE the root (rare edge case)
+    for (coll, abs_path) in collection_list.iter().zip(collection_paths.iter()) {
+        if !abs_path.starts_with(&root) {
+            if let Err(e) = watcher.watch(&abs_path.to_path_buf()) {
+                tracing::warn!("Failed to watch {}: {}", abs_path.display(), e);
             } else {
-                tracing::info!("Watching collection '{}' at {}", coll.name, path.display());
+                tracing::info!("Watching external collection '{}' at {}", coll.name, abs_path.display());
             }
         }
     }
 
-    // Watch root for source code changes (code intelligence)
-    {
-        let code_config = {
-            let config_path = root.join(".mdkb/config.toml");
-            crate::Config::load_or_default(&config_path).code
+    // Process file changes with batching for code reindex
+    let mut code_batch: Vec<PathBuf> = Vec::new();
+    let mut needs_doc_update = false;
+
+    loop {
+        let change = if code_batch.is_empty() && !needs_doc_update {
+            // No pending work — block until next event
+            match watcher.recv().await {
+                Some(c) => c,
+                None => break,
+            }
+        } else {
+            // Pending batch — wait for more events or flush after idle timeout
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(CODE_BATCH_IDLE_MS),
+                watcher.recv(),
+            )
+            .await
+            {
+                Ok(Some(c)) => c,
+                Ok(None) => break, // channel closed
+                Err(_) => {
+                    // Timeout: flush pending batch
+                    flush_code_batch(&code_index, &root, &mut code_batch).await;
+                    flush_doc_update(&ctx, &root, &mut needs_doc_update).await;
+                    continue;
+                }
+            }
         };
-        if code_config.enabled {
-            if let Err(e) = watcher.watch(&root.to_path_buf()) {
-                tracing::warn!("Failed to watch root for code changes: {}", e);
-            } else {
-                tracing::info!("Watching root for source code changes");
-            }
-        }
-    }
 
-    // Process file changes
-    while let Some(change) = watcher.recv().await {
         tracing::debug!("File change detected: {:?}", change.path);
 
-        // Check if this is a source code file change
-        {
-            use crate::code::parsing::language::Language;
-            if Language::from_path(&change.path).is_some() {
-                let mut idx_guard = code_index.lock().await;
-                if let Some(facade) = idx_guard.as_mut() {
-                    match facade.reindex(&root) {
-                        Ok(stats) => {
-                            if stats.symbols_indexed > 0 {
-                                tracing::info!(
-                                    "Code reindexed: {} files, {} symbols",
-                                    stats.files_indexed,
-                                    stats.symbols_indexed,
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("Code reindex failed: {}", e);
-                        }
-                    }
-                }
-                // Also trigger document reindex in case it's in a collection
-            }
-        }
+        let (is_code, is_doc) = classify_change(&change.path, &collection_paths);
 
-        // Re-acquire context and trigger document update
-        let mut ctx_guard = ctx.lock().await;
-        if let Some(ctx_ref) = ctx_guard.as_mut() {
-            match handle_update(ctx_ref, &root) {
-                Ok(result) => {
-                    if result.added > 0 || result.updated > 0 || result.removed > 0 {
-                        tracing::info!(
-                            "Reindexed: {} added, {} updated, {} removed",
-                            result.added,
-                            result.updated,
-                            result.removed
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("Reindex failed: {}", e);
-                }
-            }
+        if is_code {
+            code_batch.push(change.path.clone());
+        }
+        if is_doc {
+            needs_doc_update = true;
+        }
+        if !is_code && !is_doc {
+            tracing::debug!("Ignoring non-code, non-doc change: {:?}", change.path);
         }
     }
 
     Ok(())
+}
+
+/// Flush accumulated code changes as a single incremental reindex.
+async fn flush_code_batch(
+    code_index: &Arc<Mutex<Option<IndexFacade>>>,
+    root: &Path,
+    batch: &mut Vec<PathBuf>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let paths = std::mem::take(batch);
+    let mut idx_guard = code_index.lock().await;
+    if let Some(facade) = idx_guard.as_mut() {
+        match facade.reindex_files(root, &paths) {
+            Ok(stats) => {
+                if stats.symbols_indexed > 0 || stats.files_indexed > 0 {
+                    tracing::info!(
+                        "Code reindexed: {} files, {} symbols (from {} changes)",
+                        stats.files_indexed,
+                        stats.symbols_indexed,
+                        paths.len(),
+                    );
+                }
+            }
+            Err(e) => tracing::error!("Code reindex failed: {}", e),
+        }
+    }
+}
+
+/// Flush pending document update.
+async fn flush_doc_update(
+    ctx: &Arc<Mutex<Option<Context>>>,
+    root: &Path,
+    needs_update: &mut bool,
+) {
+    if !*needs_update {
+        return;
+    }
+    *needs_update = false;
+    let mut ctx_guard = ctx.lock().await;
+    if let Some(ctx_ref) = ctx_guard.as_mut() {
+        match handle_update(ctx_ref, root) {
+            Ok(result) => {
+                if result.added > 0 || result.updated > 0 || result.removed > 0 {
+                    tracing::info!(
+                        "Reindexed: {} added, {} updated, {} removed",
+                        result.added,
+                        result.updated,
+                        result.removed
+                    );
+                }
+            }
+            Err(e) => tracing::error!("Doc reindex failed: {}", e),
+        }
+    }
 }
 
 /// Base instructions explaining what mdkb is and how to use it.
@@ -2393,5 +2471,33 @@ pub fn utility() -> i32 {
                 text
             );
         }
+    }
+
+    #[test]
+    fn test_classify_change_rs_outside_collection() {
+        let path = Path::new("/project/src/main.rs");
+        let collections = vec![PathBuf::from("/project/docs")];
+        assert_eq!(classify_change(path, &collections), (true, false));
+    }
+
+    #[test]
+    fn test_classify_change_md_in_collection() {
+        let path = Path::new("/project/docs/readme.md");
+        let collections = vec![PathBuf::from("/project/docs")];
+        assert_eq!(classify_change(path, &collections), (false, true));
+    }
+
+    #[test]
+    fn test_classify_change_rs_in_collection() {
+        let path = Path::new("/project/docs/example.rs");
+        let collections = vec![PathBuf::from("/project/docs")];
+        assert_eq!(classify_change(path, &collections), (true, true));
+    }
+
+    #[test]
+    fn test_classify_change_irrelevant_file() {
+        let path = Path::new("/project/data.json");
+        let collections = vec![PathBuf::from("/project/docs")];
+        assert_eq!(classify_change(path, &collections), (false, false));
     }
 }
