@@ -1335,28 +1335,57 @@ async fn run_file_watcher(
 const BASE_INSTRUCTIONS: &str = "\
 # mdkb - Markdown Knowledge Base
 
-mdkb is a local knowledge base that indexes your project's documentation and source code. \
-It provides hybrid search (keyword + semantic) across everything. Use it to find project docs, \
-code symbols, solutions to past problems, and architectural decisions.
+mdkb indexes your project's documentation and source code with hybrid search \
+(keyword + semantic embeddings). It provides capabilities that your built-in \
+tools (Grep, Glob, Read) cannot:
+
+- **Semantic search**: \"how to authenticate\" finds docs about \"login\", \"OAuth\", \
+\"JWT\" — not just exact keyword matches. Use `search(query)` instead of Grep \
+when intent matters more than exact text.
+- **Cross-session memory**: Persist and retrieve knowledge across conversations. \
+Always check memory first when starting a task — past solutions may already exist.
+- **Code graph**: Trace call chains, find callers, and assess impact radius of \
+changes. Use `code_graph(name)` before refactoring to understand dependencies.
+- **Token-efficient code search**: `search(query, scope=\"code\")` returns only \
+matching symbol signatures with similarity scores — not entire files. Use it \
+to locate code before reading full files with your built-in Read tool.
+
+## When to Use mdkb vs Built-in Tools
+
+| Task | Use mdkb | Use built-in |
+|------|----------|-------------|
+| Find docs by meaning/concept | `search(query)` | - |
+| Find exact text pattern | - | Grep |
+| Find code symbols semantically | `search(query, scope=\"code\")` | - |
+| Find exact symbol by name | `search(name, scope=\"symbols\")` | Grep |
+| Understand what calls what | `code_graph(name)` | - |
+| Read a known file | - | Read |
+| Recall past decisions/solutions | `search(query, scope=\"memory\")` | - |
+| List files by pattern | - | Glob |
 
 ## Core Tools
 
-- `search(query)`: Find documents using hybrid search. Start here.
+- `search(query)`: Hybrid search. Start here.
   - `scope`: `\"docs\"`, `\"memory\"`, `\"code\"`, or `\"symbols\"`. Omit to search docs+memory.
-  - `scope=\"code\"`: Semantic similarity over code symbols. Optional: `kind` (e.g., \"function\", \"struct\"), `threshold` (0.0-1.0).
-  - `scope=\"symbols\"`: Fuzzy text match over symbol names/signatures. Optional: `kind`, `file` (path substring filter).
-- `get(id)`: Retrieve full content by numeric ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2').
-  - Also accepts glob patterns (e.g., 'docs/*.md') and comma-separated lists (e.g., '42,43,44').
-- `code_graph(name)`: Query code call graph. `direction`: `\"calls\"` (default), `\"callers\"`, or `\"impact\"` (transitive, with `max_depth`).
+  - `scope=\"code\"`: Semantic similarity over symbols. Optional: `kind`, `threshold`.
+  - `scope=\"symbols\"`: Fuzzy text match over symbol names. Optional: `kind`, `file`.
+- `get(id)`: Retrieve by numeric ID, file path, memory slug, glob, or comma list.
+- `code_graph(name)`: Call graph: `\"calls\"`, `\"callers\"`, or `\"impact\"` (with `max_depth`).
 - `status`: Check index health (collections, documents, code index stats).
-- `update`: Trigger reindex of everything (documents and source code).
-- `memory_write(id, title, content, type, tags)`: Save knowledge for future sessions.
+- `update`: Reindex everything (documents and source code).
+- `memory_write(id, title, content, type, tags)`: Persist knowledge for future sessions.
 - `memory_delete(id)`: Delete a memory entry permanently.
 
 ### When to Write Memories
 - After solving a problem: type=problem, title=symptom
 - After making architectural decisions: type=decision, title=options
 - After learning important patterns: type=topic, title=concept
+
+### Token Efficiency
+
+mdkb responses are token-budgeted. Search returns compact result summaries \
+(~50 tokens each), not full documents. Use `get(id)` only when you need the \
+full content. Large documents are auto-truncated with continuation instructions.
 
 ## Getting Started
 
@@ -1544,7 +1573,7 @@ mod tests {
 
         // Base instructions always present
         assert!(result.contains("mdkb"));
-        assert!(result.contains("knowledge base"));
+        assert!(result.contains("Knowledge Base"));
         assert!(result.contains("search"));
         assert!(!result.contains("Available Memories"));
     }
@@ -1558,7 +1587,7 @@ mod tests {
         let result = build_server_instructions(&index);
 
         // Check base instructions present
-        assert!(result.contains("knowledge base"));
+        assert!(result.contains("Knowledge Base"));
         assert!(result.contains("memory_write"));
         assert!(result.contains("get(id)"));
 
@@ -1666,7 +1695,7 @@ mod tests {
 
         // Must contain base instructions explaining mdkb purpose
         assert!(result.contains("mdkb"), "Should mention mdkb");
-        assert!(result.contains("knowledge base"), "Should explain what mdkb is");
+        assert!(result.contains("Knowledge Base"), "Should explain what mdkb is");
         assert!(result.contains("search"), "Should mention search tool");
         assert!(result.contains("memory_write"), "Should mention memory tools");
         assert!(result.contains("collection"), "Should mention collections");
@@ -1680,7 +1709,7 @@ mod tests {
         let result = build_server_instructions(&index);
 
         // Should contain both base instructions and memory
-        assert!(result.contains("knowledge base"), "Should have base instructions");
+        assert!(result.contains("Knowledge Base"), "Should have base instructions");
         assert!(result.contains("auth-flow"), "Should include memory entries");
     }
 
