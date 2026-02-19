@@ -362,6 +362,63 @@ impl SemanticSearch {
         Ok(())
     }
 
+    /// Load existing embeddings, filtering out entries matching a predicate.
+    ///
+    /// Returns entries where `keep(symbol_id)` returns true.
+    pub fn store_load_filtered(&self, keep: impl Fn(u32) -> bool) -> Vec<(u32, Vec<f32>)> {
+        match self.store.load() {
+            Ok(entries) => entries.into_iter().filter(|(id, _)| keep(*id)).collect(),
+            Err(e) => {
+                tracing::warn!("Failed to load existing embeddings: {e}");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Generate embeddings for new symbols and merge with existing kept entries.
+    ///
+    /// `existing` — embeddings to preserve (already filtered).
+    /// `new_symbols` — `(symbol_id, text)` pairs to embed and add.
+    pub fn generate_embeddings_incremental(
+        &self,
+        existing: &[(u32, Vec<f32>)],
+        new_symbols: &[(u32, String)],
+    ) -> anyhow::Result<()> {
+        // Invalidate cache
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
+        }
+
+        if new_symbols.is_empty() && existing.is_empty() {
+            return self.store.clear();
+        }
+
+        let mut all_entries: Vec<(u32, Vec<f32>)> = existing.to_vec();
+
+        if !new_symbols.is_empty() {
+            for chunk in new_symbols.chunks(EMBED_BATCH_SIZE) {
+                let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
+                let embeddings = self
+                    .service
+                    .embed_documents(&texts)
+                    .map_err(|e| anyhow::anyhow!("Failed to generate embeddings: {e}"))?;
+
+                for ((id, _), emb) in chunk.iter().zip(embeddings) {
+                    all_entries.push((*id, emb));
+                }
+            }
+        }
+
+        self.store.write_all(&all_entries)?;
+        tracing::info!(
+            "Wrote {} embeddings to store ({} existing + {} new)",
+            all_entries.len(),
+            existing.len(),
+            new_symbols.len()
+        );
+        Ok(())
+    }
+
     /// Search for symbols similar to the given query text.
     ///
     /// Returns up to `limit` results with similarity >= `threshold`, sorted by score descending.

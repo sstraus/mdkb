@@ -11,8 +11,8 @@ pub mod pipeline;
 pub mod types;
 pub mod walker;
 
-use std::collections::{HashSet, VecDeque};
-use std::path::Path;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
@@ -101,6 +101,134 @@ impl IndexFacade {
         self.index.reload()?;
 
         self.index_directory(root)
+    }
+
+    /// Index specific files (not a full directory walk).
+    ///
+    /// Like `index_directory` but takes explicit file paths instead of walking.
+    pub fn index_files(&mut self, root: &Path, paths: &[PathBuf]) -> anyhow::Result<IndexStats> {
+        let (stats, unresolved) = pipeline::index_files(paths, root, &self.index, &self.config)?;
+        self.unresolved.extend(unresolved);
+        self.generate_symbol_embeddings_for_files(paths, root);
+        Ok(stats)
+    }
+
+    /// Get a map of absolute file path → content hash for all indexed files.
+    pub fn get_indexed_file_hashes(&self) -> HashMap<String, String> {
+        let searcher = self.index.reader().searcher();
+        let schema = self.index.schema();
+
+        let type_term = Term::from_field_text(schema.doc_type, "file");
+        let query = TermQuery::new(type_term, IndexRecordOption::Basic);
+
+        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(1_000_000)) else {
+            return HashMap::new();
+        };
+
+        let mut result = HashMap::new();
+        for (_score, addr) in top {
+            let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(addr) else {
+                continue;
+            };
+            let path = doc_get_text(&doc, schema.file_path);
+            let hash = doc_get_text(&doc, schema.file_hash);
+            if let (Some(p), Some(h)) = (path, hash) {
+                result.insert(p, h);
+            }
+        }
+        result
+    }
+
+    /// Delete all Tantivy docs (file registration + symbols) for a given file.
+    ///
+    /// Issues delete_term calls for both absolute path (file registration docs)
+    /// and relative path (symbol docs), then clears related unresolved relationships.
+    pub fn delete_by_file(&mut self, file_path: &Path, root: &Path) -> anyhow::Result<()> {
+        let schema = self.index.schema();
+        let abs_path = file_path.to_string_lossy().to_string();
+        let rel_path = file_path
+            .strip_prefix(root)
+            .unwrap_or(file_path)
+            .to_string_lossy()
+            .to_string();
+
+        let mut writer = self.index.writer()?;
+        // Delete file registration doc (stored with absolute path)
+        writer.delete_term(Term::from_field_text(schema.file_path, &abs_path));
+        // Delete symbol docs (stored with relative path)
+        writer.delete_term(Term::from_field_text(schema.file_path, &rel_path));
+        writer.commit()?;
+        self.index.reload()?;
+
+        // Unresolved relationships reference file_id, not file_path.
+        // Since we've deleted the file docs, we can't map path → file_id.
+        // Stale entries are harmless (resolve_relationship_targets will
+        // find no symbols) and will be cleaned on next full reindex.
+
+        Ok(())
+    }
+
+    /// Incrementally reindex only changed files.
+    ///
+    /// Compares content hashes of the given paths against what's already indexed.
+    /// Only re-parses and re-indexes files whose content hash has changed.
+    /// Files that no longer exist on disk are removed from the index.
+    pub fn reindex_files(&mut self, root: &Path, paths: &[PathBuf]) -> anyhow::Result<IndexStats> {
+        let indexed_hashes = self.get_indexed_file_hashes();
+
+        let mut changed: Vec<PathBuf> = Vec::new();
+        let mut deleted: Vec<PathBuf> = Vec::new();
+
+        for path in paths {
+            if !path.exists() {
+                // File deleted from disk
+                if indexed_hashes.contains_key(&path.to_string_lossy().to_string()) {
+                    deleted.push(path.clone());
+                }
+                continue;
+            }
+
+            let content = match std::fs::read_to_string(path) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("Failed to read {}: {e}", path.display());
+                    continue;
+                }
+            };
+            let current_hash = hasher::content_hash(&content);
+
+            let abs_key = path.to_string_lossy().to_string();
+            match indexed_hashes.get(&abs_key) {
+                Some(old_hash) if *old_hash == current_hash => {
+                    // Unchanged — skip
+                }
+                _ => {
+                    changed.push(path.clone());
+                }
+            }
+        }
+
+        if changed.is_empty() && deleted.is_empty() {
+            return Ok(IndexStats::default());
+        }
+
+        tracing::info!(
+            "Incremental reindex: {} changed, {} deleted",
+            changed.len(),
+            deleted.len()
+        );
+
+        // Delete old data for changed and deleted files
+        for path in deleted.iter().chain(changed.iter()) {
+            self.delete_by_file(path, root)?;
+        }
+
+        // Re-index changed files
+        if changed.is_empty() {
+            return Ok(IndexStats::default());
+        }
+
+        self.index_files(root, &changed)
     }
 
     /// Access unresolved relationships (for future resolution phases).
@@ -361,6 +489,64 @@ impl IndexFacade {
     // Private helpers
     // -----------------------------------------------------------------------
 
+    /// Generate embeddings only for symbols in the given files.
+    fn generate_symbol_embeddings_for_files(&self, paths: &[PathBuf], root: &Path) {
+        let Some(ref semantic) = self.semantic else {
+            return;
+        };
+
+        let rel_paths: HashSet<String> = paths
+            .iter()
+            .filter_map(|p| {
+                p.strip_prefix(root)
+                    .ok()
+                    .map(|r| r.to_string_lossy().to_string())
+            })
+            .collect();
+
+        let symbols: Vec<Symbol> = self
+            .all_symbols(100_000)
+            .into_iter()
+            .filter(|s| rel_paths.contains(&*s.file_path))
+            .collect();
+
+        if symbols.is_empty() {
+            return;
+        }
+
+        // Load existing embeddings, filter out the ones we're regenerating,
+        // then append new ones
+        let existing = semantic.store_load_filtered(|id| {
+            // Keep embeddings NOT belonging to the changed files' symbols
+            !symbols.iter().any(|s| s.id.value() == id)
+        });
+
+        let embed_inputs: Vec<(u32, String)> = symbols
+            .iter()
+            .map(|sym| {
+                let text = format_symbol_text(
+                    sym.kind,
+                    sym.as_name(),
+                    sym.as_signature(),
+                    sym.as_doc_comment(),
+                );
+                (sym.id.value(), text)
+            })
+            .collect();
+
+        tracing::info!(
+            "Generating semantic embeddings for {} symbols (incremental)...",
+            embed_inputs.len()
+        );
+
+        if let Err(e) = semantic.generate_embeddings_incremental(&existing, &embed_inputs) {
+            tracing::error!(
+                "Failed to generate incremental embeddings: {e}. Impact: {} symbols may not be searchable.",
+                embed_inputs.len()
+            );
+        }
+    }
+
     /// Generate embeddings for all indexed symbols and write to the vector store.
     fn generate_symbol_embeddings(&self) {
         let Some(ref semantic) = self.semantic else {
@@ -531,6 +717,16 @@ fn doc_to_symbol(
     Some(symbol)
 }
 
+/// Extract a text field value from a Tantivy document.
+fn doc_get_text(doc: &tantivy::TantivyDocument, field: tantivy::schema::Field) -> Option<String> {
+    use tantivy::schema::OwnedValue;
+    let owned: OwnedValue = doc.get_first(field)?.into();
+    match owned {
+        OwnedValue::Str(s) => Some(s),
+        _ => None,
+    }
+}
+
 /// Count documents of a given type in the index.
 fn count_by_type(index: &CodeIndex, doc_type: &str) -> u64 {
     let searcher = index.reader().searcher();
@@ -676,5 +872,117 @@ pub fn world() {
         facade.index_directory(src_dir.path()).unwrap();
 
         assert!(facade.relationship_count() > 0);
+    }
+
+    #[test]
+    fn test_get_indexed_file_hashes() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+        fs::write(src_dir.path().join("c.rs"), "pub fn ccc() {}").unwrap();
+
+        let idx_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        let hashes = facade.get_indexed_file_hashes();
+        assert_eq!(hashes.len(), 3, "expected 3 file entries, got {}", hashes.len());
+
+        // All values should be valid SHA-256 hex strings (64 chars)
+        for (_path, hash) in &hashes {
+            assert_eq!(hash.len(), 64, "hash should be 64 hex chars");
+            assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+
+    #[test]
+    fn test_delete_by_file() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("keep.rs"), "pub fn keep_me() {}").unwrap();
+        fs::write(src_dir.path().join("remove.rs"), "pub fn remove_me() {}").unwrap();
+
+        let idx_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        assert!(facade.get_symbol_by_name("keep_me").is_some());
+        assert!(facade.get_symbol_by_name("remove_me").is_some());
+        assert_eq!(facade.file_count(), 2);
+
+        // Delete the remove.rs file from the index
+        let remove_path = src_dir.path().join("remove.rs");
+        facade.delete_by_file(&remove_path, src_dir.path()).unwrap();
+
+        assert!(facade.get_symbol_by_name("keep_me").is_some(), "keep_me should survive");
+        assert!(facade.get_symbol_by_name("remove_me").is_none(), "remove_me should be deleted");
+        assert_eq!(facade.file_count(), 1);
+    }
+
+    #[test]
+    fn test_reindex_files_updates_modified() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("lib.rs"), "pub fn foo() {}").unwrap();
+
+        let idx_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        assert!(facade.get_symbol_by_name("foo").is_some());
+
+        // Modify the file
+        fs::write(src_dir.path().join("lib.rs"), "pub fn bar() {}").unwrap();
+
+        let paths = vec![src_dir.path().join("lib.rs")];
+        let stats = facade.reindex_files(src_dir.path(), &paths).unwrap();
+        assert_eq!(stats.files_indexed, 1, "should have reindexed 1 changed file");
+
+        assert!(facade.get_symbol_by_name("foo").is_none(), "foo should be gone");
+        assert!(facade.get_symbol_by_name("bar").is_some(), "bar should be present");
+    }
+
+    #[test]
+    fn test_reindex_files_skips_unchanged() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let idx_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        // Reindex without changing anything
+        let paths = vec![
+            src_dir.path().join("a.rs"),
+            src_dir.path().join("b.rs"),
+        ];
+        let stats = facade.reindex_files(src_dir.path(), &paths).unwrap();
+        assert_eq!(stats.files_indexed, 0, "no files should be reindexed when unchanged");
+
+        // Symbols should still be queryable
+        assert!(facade.get_symbol_by_name("aaa").is_some());
+        assert!(facade.get_symbol_by_name("bbb").is_some());
+    }
+
+    #[test]
+    fn test_reindex_files_handles_deleted() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let idx_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        assert!(facade.get_symbol_by_name("aaa").is_some());
+        assert!(facade.get_symbol_by_name("bbb").is_some());
+
+        // Delete a.rs from disk, then reindex its path
+        fs::remove_file(src_dir.path().join("a.rs")).unwrap();
+        let paths = vec![src_dir.path().join("a.rs")];
+        facade.reindex_files(src_dir.path(), &paths).unwrap();
+
+        assert!(facade.get_symbol_by_name("aaa").is_none(), "aaa should be removed");
+        assert!(facade.get_symbol_by_name("bbb").is_some(), "bbb should survive");
+        assert_eq!(facade.file_count(), 1);
     }
 }

@@ -149,6 +149,88 @@ pub fn index_directory(
     Ok((final_stats, unresolved))
 }
 
+/// Run the indexing pipeline on specific files (not a full directory walk).
+///
+/// Identical to `index_directory` but replaces the DISCOVER stage with
+/// the given file list. Reuses all other stages.
+pub fn index_files(
+    paths: &[PathBuf],
+    root: &Path,
+    index: &CodeIndex,
+    config: &PipelineConfig,
+) -> anyhow::Result<(IndexStats, Vec<UnresolvedRelationship>)> {
+    if paths.is_empty() {
+        return Ok((IndexStats::default(), Vec::new()));
+    }
+
+    let (path_tx, path_rx) = bounded::<PathBuf>(config.channel_size);
+    let (content_tx, content_rx) = bounded::<FileContent>(config.channel_size);
+    let (parsed_tx, parsed_rx) = bounded::<ParsedFile>(config.channel_size);
+    let (batch_tx, batch_rx) = bounded::<IndexBatch>(config.channel_size / 4 + 1);
+
+    let root = root.to_path_buf();
+
+    // Send explicit paths instead of walking the filesystem
+    let files_discovered = paths.len() as u32;
+    let paths_owned: Vec<PathBuf> = paths.to_vec();
+    let discover = thread::spawn(move || {
+        for path in paths_owned {
+            if path_tx.send(path).is_err() {
+                break;
+            }
+        }
+        files_discovered
+    });
+
+    // READ stage (multiple I/O threads)
+    let mut readers = Vec::with_capacity(config.read_threads);
+    for _ in 0..config.read_threads {
+        let rx = path_rx.clone();
+        let tx = content_tx.clone();
+        readers.push(thread::spawn(move || stage_read(&rx, &tx)));
+    }
+    drop(path_rx);
+    drop(content_tx);
+
+    // PARSE stage
+    let parse_handle = thread::spawn(move || stage_parse(&content_rx, &parsed_tx));
+
+    // COLLECT stage
+    let collect_root = root.clone();
+    let batch_size = config.batch_size;
+    let collect_handle = thread::spawn(move || {
+        stage_collect(&collect_root, &parsed_rx, &batch_tx, batch_size)
+    });
+
+    // INDEX stage runs on this thread
+    let (stats, unresolved) = stage_index(index, &batch_rx)?;
+
+    // Wait for all stages
+    let _files_discovered = discover
+        .join()
+        .map_err(|_| anyhow::anyhow!("discover thread panicked"))?;
+    for reader in readers {
+        reader.join().map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
+    }
+    let parse_errors = parse_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("parse thread panicked"))?;
+    let collect_stats = collect_handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("collect thread panicked"))?;
+
+    let final_stats = IndexStats {
+        files_discovered,
+        files_indexed: collect_stats.files_indexed,
+        symbols_indexed: stats.symbols_indexed,
+        relationships_collected: collect_stats.relationships_collected,
+        files_skipped: parse_errors,
+        errors: stats.errors,
+    };
+
+    Ok((final_stats, unresolved))
+}
+
 // ---------------------------------------------------------------------------
 // Stage 1: DISCOVER
 // ---------------------------------------------------------------------------
@@ -774,5 +856,39 @@ fn callee() {}
     #[test]
     fn test_create_parser_kotlin() {
         assert!(create_parser(Language::Kotlin).is_some());
+    }
+
+    #[test]
+    fn test_index_files_specific_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+        fs::write(dir.path().join("c.rs"), "pub fn ccc() {}").unwrap();
+
+        let idx_dir = tempfile::tempdir().unwrap();
+        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
+
+        // Only index 2 of the 3 files
+        let paths = vec![
+            dir.path().join("a.rs"),
+            dir.path().join("b.rs"),
+        ];
+        let (stats, _) = index_files(&paths, dir.path(), &index, &test_config()).unwrap();
+
+        assert_eq!(stats.files_discovered, 2);
+        assert_eq!(stats.files_indexed, 2);
+        assert!(stats.symbols_indexed >= 2);
+    }
+
+    #[test]
+    fn test_index_files_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx_dir = tempfile::tempdir().unwrap();
+        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
+
+        let (stats, unresolved) = index_files(&[], dir.path(), &index, &test_config()).unwrap();
+        assert_eq!(stats.files_discovered, 0);
+        assert_eq!(stats.files_indexed, 0);
+        assert!(unresolved.is_empty());
     }
 }
