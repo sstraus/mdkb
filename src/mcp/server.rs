@@ -1245,7 +1245,13 @@ fn classify_change(path: &Path, collection_paths: &[PathBuf]) -> (bool, bool) {
 }
 
 /// Batch window for collecting rapid-fire code changes before reindexing.
-const CODE_BATCH_IDLE_MS: u64 = 200;
+/// Idle timeout before flushing accumulated code changes as a batch reindex.
+///
+/// During active development, files change in rapid succession. A short timeout
+/// triggers frequent reindexes — each loading the ONNX model, generating
+/// embeddings, and allocating memory arenas. 30 seconds lets file saves
+/// accumulate into a single efficient batch while still feeling responsive.
+const CODE_BATCH_IDLE_MS: u64 = 30_000;
 
 /// Run the file watcher and trigger reindex on changes.
 async fn run_file_watcher(

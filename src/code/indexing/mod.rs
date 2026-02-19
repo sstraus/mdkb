@@ -98,6 +98,8 @@ impl IndexFacade {
         let (stats, unresolved) = pipeline::index_directory(root, &self.index, &self.config)?;
         self.unresolved.extend(unresolved);
         self.generate_symbol_embeddings();
+        // Release the ONNX model to free memory arenas (re-acquired on next search)
+        crate::llm::release_cached_service();
         Ok(stats)
     }
 
@@ -129,6 +131,8 @@ impl IndexFacade {
         let (stats, unresolved) = pipeline::index_files(paths, root, &self.index, &self.config)?;
         self.unresolved.extend(unresolved);
         self.generate_symbol_embeddings_for_files(paths, root);
+        // Release the ONNX model to free memory arenas (re-acquired on next search)
+        crate::llm::release_cached_service();
         Ok(stats)
     }
 
@@ -643,18 +647,10 @@ impl IndexFacade {
 /// Try to initialize `SemanticSearch` at `{index_path}/vectors.bin`.
 ///
 /// Returns `None` if initialization fails (logged as error with impact).
+/// Does NOT load the ONNX model — that happens lazily on first use.
 fn init_semantic(index_path: &Path) -> Option<SemanticSearch> {
     let vectors_path = index_path.join("vectors.bin");
-    let service = match crate::llm::get_cached_service() {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(
-                "Failed to initialize embedding service: {e}. Impact: semantic_search() will return empty results."
-            );
-            return None;
-        }
-    };
-    match SemanticSearch::new(&vectors_path, service) {
+    match SemanticSearch::new(&vectors_path) {
         Ok(s) => Some(s),
         Err(e) => {
             tracing::error!(

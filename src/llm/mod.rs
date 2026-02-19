@@ -41,3 +41,22 @@ pub fn get_cached_service() -> crate::error::Result<Arc<EmbeddingService>> {
     *guard = Some(Arc::clone(&service));
     Ok(service)
 }
+
+/// Release the cached embedding service to free ONNX Runtime memory.
+///
+/// The ONNX Runtime arena allocator never returns memory to the OS while the
+/// session is alive. Calling this after bulk embedding generation frees
+/// gigabytes of arena memory. The service will be re-initialized on next use.
+///
+/// Also calls `mi_collect(true)` to force mimalloc to return freed pages
+/// to the OS (mimalloc retains freed memory by default for reuse).
+pub fn release_cached_service() {
+    if let Ok(mut guard) = CACHED_SERVICE.lock() {
+        *guard = None;
+    }
+    // Force mimalloc to return freed pages to the OS.
+    // Without this, the ~1GB+ of ONNX Runtime arena memory stays mapped.
+    unsafe {
+        libmimalloc_sys::mi_collect(true);
+    }
+}

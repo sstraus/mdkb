@@ -293,10 +293,10 @@ const EMBED_BATCH_SIZE: usize = 5000;
 
 /// Orchestrates embedding generation and brute-force search over code symbols.
 ///
-/// Uses a shared `EmbeddingService` (same model instance as document search)
-/// to avoid loading the model twice.
+/// Acquires the embedding service on-demand from the global cache. The global
+/// cache handles idle release to free ONNX Runtime memory arenas (multiple GB)
+/// when the model hasn't been used for a while.
 pub struct SemanticSearch {
-    service: Arc<EmbeddingService>,
     store: VectorStore,
     /// Cached embeddings loaded from disk. Invalidated on write.
     cache: Mutex<Option<Vec<(u32, Vec<f32>)>>>,
@@ -313,14 +313,21 @@ impl std::fmt::Debug for SemanticSearch {
 }
 
 impl SemanticSearch {
-    /// Create a new semantic search instance with a shared embedding service.
-    pub fn new(store_path: impl AsRef<Path>, service: Arc<EmbeddingService>) -> anyhow::Result<Self> {
+    /// Create a new semantic search instance.
+    ///
+    /// The embedding service is acquired on-demand, not at construction time.
+    pub fn new(store_path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let store = VectorStore::open(store_path)?;
         Ok(Self {
-            service,
             store,
             cache: Mutex::new(None),
         })
+    }
+
+    /// Get the embedding service, initializing it if needed.
+    fn service(&self) -> anyhow::Result<Arc<EmbeddingService>> {
+        crate::llm::get_cached_service()
+            .map_err(|e| anyhow::anyhow!("Failed to get embedding service: {e}"))
     }
 
     /// Generate embeddings for symbols and write them to the vector store.
@@ -337,12 +344,12 @@ impl SemanticSearch {
             return self.store.clear();
         }
 
+        let service = self.service()?;
         let mut all_entries: Vec<(u32, Vec<f32>)> = Vec::with_capacity(symbols.len());
 
         for chunk in symbols.chunks(EMBED_BATCH_SIZE) {
             let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
-            let embeddings = self
-                .service
+            let embeddings = service
                 .embed_documents(&texts)
                 .map_err(|e| anyhow::anyhow!("Failed to generate embeddings: {e}"))?;
 
@@ -396,10 +403,10 @@ impl SemanticSearch {
         let mut all_entries: Vec<(u32, Vec<f32>)> = existing.to_vec();
 
         if !new_symbols.is_empty() {
+            let service = self.service()?;
             for chunk in new_symbols.chunks(EMBED_BATCH_SIZE) {
                 let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
-                let embeddings = self
-                    .service
+                let embeddings = service
                     .embed_documents(&texts)
                     .map_err(|e| anyhow::anyhow!("Failed to generate embeddings: {e}"))?;
 
@@ -430,8 +437,8 @@ impl SemanticSearch {
         threshold: f32,
     ) -> anyhow::Result<Vec<SemanticMatch>> {
         // Embed the query
-        let query_embedding = self
-            .service
+        let service = self.service()?;
+        let query_embedding = service
             .embed_query(query)
             .map_err(|e| anyhow::anyhow!("Failed to embed query: {e}"))?;
 
@@ -765,8 +772,7 @@ mod tests {
     #[ignore]
     fn test_semantic_search_basic() {
         let dir = tempfile::tempdir().unwrap();
-        let service = Arc::new(EmbeddingService::new().unwrap());
-        let search = SemanticSearch::new(dir.path().join("vectors.bin"), service).unwrap();
+        let search = SemanticSearch::new(dir.path().join("vectors.bin")).unwrap();
 
         let symbols = vec![
             (1, "Function authenticate_user\nfn authenticate_user(username: &str, password: &str) -> bool\nVerifies user credentials against the database.".to_string()),
@@ -791,8 +797,7 @@ mod tests {
     #[ignore]
     fn test_semantic_search_threshold() {
         let dir = tempfile::tempdir().unwrap();
-        let service = Arc::new(EmbeddingService::new().unwrap());
-        let search = SemanticSearch::new(dir.path().join("vectors.bin"), service).unwrap();
+        let search = SemanticSearch::new(dir.path().join("vectors.bin")).unwrap();
 
         let symbols = vec![
             (1, "Function hello\nfn hello()\nPrints a greeting.".to_string()),

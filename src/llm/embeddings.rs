@@ -13,6 +13,13 @@ use crate::error::{Error, Result};
 /// Embedding dimension for AllMiniLML6V2.
 pub const EMBEDDING_DIM: usize = 384;
 
+/// Batch size for fastembed inference.
+///
+/// Controls how many texts ONNX Runtime processes per inference call.
+/// Smaller = less peak memory (each batch gets its own arena that's never freed).
+/// 32 is a good balance: fast enough, but doesn't balloon memory via rayon parallelism.
+const EMBED_BATCH_SIZE: usize = 32;
+
 /// Model identifier stored alongside embeddings for migration detection.
 pub const MODEL_NAME: &str = "AllMiniLML6V2";
 
@@ -51,12 +58,16 @@ impl EmbeddingService {
     }
 
     /// Generate embeddings for multiple document texts in batch.
+    ///
+    /// Uses a small batch size (32) to limit ONNX Runtime memory arena allocation.
+    /// Larger batches cause rayon to run multiple ONNX inferences in parallel,
+    /// each allocating its own memory arena that is never freed.
     pub fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
         self.model
-            .embed(texts.to_vec(), None)
+            .embed(texts.to_vec(), Some(EMBED_BATCH_SIZE))
             .map_err(|e| Error::other(format!("Failed to embed documents: {e}")))
     }
 
