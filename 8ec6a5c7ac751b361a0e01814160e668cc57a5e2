@@ -1,0 +1,23 @@
+src/llm/embeddings.rs
+  cd68c1c15b98bfc4 7-8,38-40,42,45-46,102-117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.4",
+  "base_commit_sha": "8ec6a5c7ac751b361a0e01814160e668cc57a5e2",
+  "prompts": {
+    "cd68c1c15b98bfc4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91ab5a89-e538-459b-b486-dda7140398f1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 28,
+      "total_deletions": 4,
+      "accepted_lines": 24,
+      "overriden_lines": 0
+    }
+  }
+}
