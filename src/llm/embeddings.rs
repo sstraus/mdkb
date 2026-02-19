@@ -4,6 +4,8 @@
 //! This is the shared embedding backend for both document search and code
 //! intelligence semantic search.
 
+use std::path::PathBuf;
+
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use crate::error::{Error, Result};
@@ -33,9 +35,15 @@ impl std::fmt::Debug for EmbeddingService {
 
 impl EmbeddingService {
     /// Create a new embedding service, downloading the model if needed.
+    ///
+    /// Models are cached in `~/.cache/fastembed/` (shared across all projects)
+    /// instead of per-project `.fastembed_cache/` directories.
     pub fn new() -> Result<Self> {
+        let cache_dir = shared_cache_dir();
         let model = TextEmbedding::try_new(
-            InitOptions::new(EmbeddingModel::AllMiniLML6V2).with_show_download_progress(true),
+            InitOptions::new(EmbeddingModel::AllMiniLML6V2)
+                .with_cache_dir(cache_dir)
+                .with_show_download_progress(true),
         )
         .map_err(|e| Error::other(format!("Failed to initialize embedding model: {e}")))?;
 
@@ -89,6 +97,22 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 
     dot / (norm_a * norm_b)
+}
+
+/// Shared cache directory for fastembed models.
+///
+/// Uses `~/.cache/fastembed/` so all mdkb instances (and other projects)
+/// share a single model copy instead of downloading one per project.
+/// Respects `FASTEMBED_CACHE_DIR` env var if set.
+fn shared_cache_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("FASTEMBED_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".cache/fastembed");
+    }
+    // Fallback: use CWD-relative (original fastembed behavior)
+    PathBuf::from(".fastembed_cache")
 }
 
 #[cfg(test)]
