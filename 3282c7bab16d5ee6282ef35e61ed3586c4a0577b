@@ -1,0 +1,27 @@
+src/code/indexing/mod.rs
+  cd68c1c15b98bfc4 41-42,47-49,56-57,62-63,70-71,81-91,114,448,450,455-458,480-482,517-518,521,576-577,580,779-796
+src/mcp/server.rs
+  cd68c1c15b98bfc4 515,517
+src/code/storage/mod.rs
+  cd68c1c15b98bfc4 110-117,233-240
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.4",
+  "base_commit_sha": "3282c7bab16d5ee6282ef35e61ed3586c4a0577b",
+  "prompts": {
+    "cd68c1c15b98bfc4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91ab5a89-e538-459b-b486-dda7140398f1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 80,
+      "total_deletions": 19,
+      "accepted_lines": 75,
+      "overriden_lines": 0
+    }
+  }
+}
