@@ -1,0 +1,154 @@
+src/error.rs
+  3182f7d22e46f994 137,156-163,210,283
+src/mcp/server.rs
+  cd68c1c15b98bfc4 4,1144,1152-1160,1162,1236-1247,1255,1278-1294,1296,1300-1304,1306,1311-1313,1315-1326,1328,1330-1336,1339-1349,1351-1352,1354,1356-1373,1375-1378,1382,1385,1387-1412,2481-2508
+  6d657ec9c69f8a91 13,693-694,764-765
+  d6a97fef07a57144 1422-1424,1426-1448,1452,1454-1457,1459-1460,1468-1472,1660,1674,1782,1796
+  779b1b31f9cc2336 442-443,596-597,657,670,699,711,732,771,783,804,806,824-825,866,873-875,1703-1748,1800-1812,1814-1815,1817-1842
+src/mcp/common.rs
+  412db19a9e85dbe7 1-152
+README.md
+  3182f7d22e46f994 154,163,165-176
+.cargo/config.toml
+  6d657ec9c69f8a91 16-17,19-39
+src/cli/handlers.rs
+  3182f7d22e46f994 2583
+.gitignore
+  3182f7d22e46f994 7-8
+tests/e2e_mcp_pty.rs
+  779b1b31f9cc2336 1-255,257-262,265-294,296,298-371,373-395,398-401,403-406,408,410-411,413-417,419-420,424-542
+src/code/indexing/mod.rs
+  cd68c1c15b98bfc4 14-15,41-42,47-49,56-57,62-63,70-71,81-91,116,127-133,136-256,452,454,459,461-462,481-483,517-520,522-575,577-578,581,739-748,772-789,914-1025
+  412db19a9e85dbe7 119,385-387,398-402,411-442,479,484-485,603-605,649,656-657
+  1f8a62f6bffaba38 23,40,100,117-118,120-121,446-451,453,455-458,460,463-477,486-493,576,579,582-602,607-629,644-648,651-652,654-655,660-664
+Cargo.toml
+  1f8a62f6bffaba38 103
+  412db19a9e85dbe7 104-106,115
+src/code/symbol.rs
+  412db19a9e85dbe7 9-11
+src/code/indexing/pipeline.rs
+  412db19a9e85dbe7 141-148,260-261,318
+  cd68c1c15b98bfc4 152-233,860-893
+src/code/semantic.rs
+  cd68c1c15b98bfc4 372-405,407-408,410-428
+  1f8a62f6bffaba38 1-7,9-12,14-72,75-96,98-113,121,123,125-137,139-153,155,166-184,214-290,294,299-300,303-306,308-309,311-315,320-322,324-326,334,336-337,343-346,349,366,369-371,429-431,433-439,444,449-465,478,482-585,696-774,776-799,801-815
+  412db19a9e85dbe7 73-74,97,114-120,122,124,138,154,156-165,185-213,291-293,301-302,307,310,323,335,338-342,348,350-351,355-365,367-368,432,445-448,466-474,477,479-481,586-695
+src/mcp/https_server.rs
+  412db19a9e85dbe7 9,16,45,124-130,142-143,147-156
+src/mcp/tools.rs
+  1f8a62f6bffaba38 119-122,236
+src/main.rs
+  3182f7d22e46f994 27,495-517
+src/mcp/mod.rs
+  412db19a9e85dbe7 12-14
+src/cli/mod.rs
+  3182f7d22e46f994 5,172-175,504-526
+src/llm/embeddings.rs
+  cd68c1c15b98bfc4 7-8,45-47,49,52-53,113-128
+src/mcp/http_server.rs
+  412db19a9e85dbe7 13,42,73
+src/cli/setup.rs
+  3182f7d22e46f994 1-253
+src/store/search.rs
+  779b1b31f9cc2336 7-14,16-27,35-37,73,110,207-238
+src/code/mod.rs
+  1f8a62f6bffaba38 9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.4",
+  "base_commit_sha": "7709f3219cf1d8ea4221782f84aabcedc1bf896c",
+  "prompts": {
+    "1f8a62f6bffaba38": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "2561c806-890e-497f-bb49-15d2792e2b1c",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 628,
+      "overriden_lines": 0
+    },
+    "3182f7d22e46f994": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "55903d5e-b6eb-4e91-b994-b826bce7f2be",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 338,
+      "overriden_lines": 0
+    },
+    "412db19a9e85dbe7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e528956f-7436-49c5-ab81-ff473c5795b0",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 459,
+      "overriden_lines": 0
+    },
+    "6d657ec9c69f8a91": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5383bc03-9e0c-47ea-8bca-45f2e47ac1ae",
+        "model": "claude-sonnet-4-5-20250929"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 29,
+      "overriden_lines": 0
+    },
+    "779b1b31f9cc2336": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6d91d65c-104c-4709-a007-0c5411a7b108",
+        "model": "claude-opus-4-5-20251101"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 689,
+      "overriden_lines": 0
+    },
+    "cd68c1c15b98bfc4": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "91ab5a89-e538-459b-b486-dda7140398f1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 721,
+      "overriden_lines": 0
+    },
+    "d6a97fef07a57144": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ddebc44c-b6bc-40ed-b7bb-f9d1ebb85399",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 42,
+      "overriden_lines": 0
+    }
+  }
+}
