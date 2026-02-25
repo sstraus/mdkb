@@ -1,0 +1,39 @@
+src/cli/handlers.rs
+  b9327a1bec190363 218,1891-1893
+  81135c2dfe129256 602-615,2695-2722
+Cargo.toml
+  81135c2dfe129256 62
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.5",
+  "base_commit_sha": "868e73073569a82b2155c6d6521785c1ac443fb8",
+  "prompts": {
+    "81135c2dfe129256": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c5ec07a-5d84-409e-bf58-be52bb508a06",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 43,
+      "total_deletions": 2,
+      "accepted_lines": 43,
+      "overriden_lines": 0
+    },
+    "b9327a1bec190363": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "229e9d2b-eb49-4afe-b44f-b0a0f21ab1a6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    }
+  }
+}
