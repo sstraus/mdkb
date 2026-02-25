@@ -1,0 +1,23 @@
+src/api.rs
+  81135c2dfe129256 331,334,855-893
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.5",
+  "base_commit_sha": "522b83bd490eae537d1561811a9397cc9f5070a4",
+  "prompts": {
+    "81135c2dfe129256": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c5ec07a-5d84-409e-bf58-be52bb508a06",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 41,
+      "total_deletions": 1,
+      "accepted_lines": 41,
+      "overriden_lines": 0
+    }
+  }
+}
