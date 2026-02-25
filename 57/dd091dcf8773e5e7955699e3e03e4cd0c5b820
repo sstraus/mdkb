@@ -1,0 +1,23 @@
+src/store/memory.rs
+  b9327a1bec190363 41-44,53-56,69-72,438-467
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.5",
+  "base_commit_sha": "57dd091dcf8773e5e7955699e3e03e4cd0c5b820",
+  "prompts": {
+    "b9327a1bec190363": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "229e9d2b-eb49-4afe-b44f-b0a0f21ab1a6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 42,
+      "total_deletions": 0,
+      "accepted_lines": 42,
+      "overriden_lines": 0
+    }
+  }
+}
