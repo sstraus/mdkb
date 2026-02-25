@@ -1,0 +1,27 @@
+src/cli/handlers.rs
+  b9327a1bec190363 1346
+src/mcp/server.rs
+  b9327a1bec190363 479-490,507,572
+src/store/memory.rs
+  b9327a1bec190363 236,240-241,245,250-256,258-260,267-270,613-662,685,728
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.5",
+  "base_commit_sha": "a7212a195ff447d972317aedc7fbf6df3fa599e9",
+  "prompts": {
+    "b9327a1bec190363": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "229e9d2b-eb49-4afe-b44f-b0a0f21ab1a6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 101,
+      "total_deletions": 22,
+      "accepted_lines": 86,
+      "overriden_lines": 0
+    }
+  }
+}
