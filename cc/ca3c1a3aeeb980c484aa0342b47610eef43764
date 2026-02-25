@@ -1,0 +1,38 @@
+src/store/schema.rs
+  81135c2dfe129256 345
+src/store/memory.rs
+  81135c2dfe129256 4,199,258,269,305,367,401
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.5",
+  "base_commit_sha": "ccca3c1a3aeeb980c484aa0342b47610eef43764",
+  "prompts": {
+    "81135c2dfe129256": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6c5ec07a-5d84-409e-bf58-be52bb508a06",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 8,
+      "total_deletions": 11,
+      "accepted_lines": 8,
+      "overriden_lines": 0
+    },
+    "b9327a1bec190363": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "229e9d2b-eb49-4afe-b44f-b0a0f21ab1a6",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 4,
+      "overriden_lines": 0
+    }
+  }
+}
