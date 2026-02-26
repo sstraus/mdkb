@@ -484,7 +484,7 @@ impl McpServer {
                     let total = doc_results.len() + mem_entries.len();
 
                     if total == 0 {
-                        let output = "No results found. Try broader terms, use scope='code' for code symbols, or check `status` to verify collections are indexed.".to_string();
+                        let output = "No results found. Try broader terms, omit scope to search docs + memory, or use scope='code' for source symbols.".to_string();
                         let tokens = count_tokens(&output);
                         (output, tokens, 0)
                     } else {
@@ -535,7 +535,7 @@ impl McpServer {
                             }
 
                             if results.is_empty() {
-                                let output = "No semantic matches found. Try broader terms, lower the threshold, or use scope='symbols' for keyword search.".to_string();
+                                let output = "No semantic matches found. Try broader terms, lower the threshold (default 0.3), or use scope='symbols' for name-based search.".to_string();
                                 let tokens = count_tokens(&output);
                                 (output, tokens, 0)
                             } else {
@@ -570,7 +570,7 @@ impl McpServer {
                             }
 
                             if symbols.is_empty() {
-                                let output = "No symbols found. Try different search terms, scope='code' for semantic matching, or check `status` to verify the code index has content.".to_string();
+                                let output = "No symbols found. Try different search terms, or use scope='code' for semantic matching.".to_string();
                                 let tokens = count_tokens(&output);
                                 (output, tokens, 0)
                             } else {
@@ -1532,7 +1532,7 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 /// Format search results for output.
 fn format_search_results(results: &[SearchResult]) -> String {
     if results.is_empty() {
-        return "No results found. Try broader terms, check `status` for indexed content, or `update` to reindex.".to_string();
+        return "No results found. Try broader terms, omit scope to include memory, or use scope='code' for source symbols.".to_string();
     }
 
     let mut output = String::new();
@@ -1552,7 +1552,7 @@ fn format_search_results(results: &[SearchResult]) -> String {
 /// Format memory search results for output.
 fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
     if entries.is_empty() {
-        return "No matching memory entries found. Use `memory_write` to create one.".to_string();
+        return "No matching memory entries found. Try different terms, or omit scope to search docs + memory together.".to_string();
     }
 
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
@@ -1609,7 +1609,7 @@ mod tests {
         let results: Vec<SearchResult> = vec![];
         let output = format_search_results(&results);
         assert!(output.starts_with("No results found."), "Should start with 'No results found.', got: {}", output);
-        assert!(output.contains("status"), "Should suggest status, got: {}", output);
+        assert!(output.contains("scope") || output.contains("broader"), "Should suggest alternative scope or broader terms, got: {}", output);
     }
 
     #[test]
@@ -2028,8 +2028,8 @@ mod tests {
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("status") || text.contains("broader") || text.contains("collection"),
-            "No results should suggest broadening query or checking status, got: {}", text);
+        assert!(text.contains("broader") || text.contains("scope"),
+            "No results should suggest broadening query or alternative scope, got: {}", text);
     }
 
     #[tokio::test]
@@ -2068,8 +2068,8 @@ mod tests {
         })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("memory_write"),
-            "No results should suggest memory_write, got: {}", text);
+        assert!(text.contains("different terms") || text.contains("omit scope"),
+            "No results should suggest alternative search strategies, got: {}", text);
     }
 
     #[tokio::test]
