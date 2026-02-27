@@ -25,7 +25,7 @@ pub struct SearchParams {
     #[serde(default)]
     pub scope: Option<String>,
 
-    /// Filter by symbol kind when scope is "code" or "symbols" (e.g., "function", "struct").
+    /// Filter by symbol kind (scope="code"/"symbols", e.g., "function", "struct") or entry type (scope="memory", e.g., "problem", "decision").
     #[serde(default)]
     pub kind: Option<String>,
 

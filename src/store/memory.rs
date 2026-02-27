@@ -244,7 +244,7 @@ pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> 
         .iter()
         .map(|e| {
             let tags = e.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
-            format!("{}: {} {}", e.id, e.title, tags)
+            format!("[{}] {}: {} {}", e.entry_type, e.id, e.title, tags)
         })
         .collect();
 
@@ -538,6 +538,7 @@ mod tests {
 
         let index = get_warmup_index(&conn, 50).unwrap();
         assert_eq!(index.len(), 1);
+        assert!(index[0].starts_with("[problem]"), "Should start with type prefix, got: {}", index[0]);
         assert!(index[0].contains("test-entry"));
         assert!(index[0].contains("Test entry title"));
         assert!(index[0].contains("#bug"));
