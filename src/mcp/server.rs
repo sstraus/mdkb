@@ -1417,63 +1417,66 @@ async fn flush_doc_update(
 /// These are always included in server instructions, regardless of whether
 /// memory entries exist. They tell the LLM what mdkb does and how to interact.
 const BASE_INSTRUCTIONS: &str = "\
-# mdkb - Markdown Knowledge Base
+# mdkb - Project Knowledge Base
 
-mdkb indexes your project's documentation and source code with hybrid search \
-(keyword + semantic embeddings). It provides capabilities that your built-in \
-tools (Grep, Glob, Read) cannot:
+## REQUIRED: Search mdkb Before Starting Work
+
+Before using Grep, Glob, Read, or Explore subagents to investigate code, \
+you MUST first search mdkb for existing knowledge:
+
+1. `search(query, scope=\"memory\")` — check if this problem/topic was solved before
+2. `search(query)` — search docs + memory for relevant context
+
+Only after checking mdkb should you fall back to built-in tools. \
+If mdkb returns no useful results, proceed with Grep/Glob/Read normally.
+
+This applies to ALL tasks: bug investigation, feature exploration, \
+refactoring, code understanding, and architecture questions.
+
+## What mdkb Provides (that Grep/Glob Cannot)
 
 - **Semantic search**: \"how to authenticate\" finds docs about \"login\", \"OAuth\", \
-\"JWT\" — not just exact keyword matches. Use `search(query)` instead of Grep \
-when intent matters more than exact text.
-- **Cross-session memory**: Persist and retrieve knowledge across conversations. \
-Always check memory first when starting a task — past solutions may already exist.
-- **Code graph**: Trace call chains, find callers, and assess impact radius of \
-changes. Use `code_graph(name)` before refactoring to understand dependencies.
-- **Token-efficient code search**: `search(query, scope=\"code\")` returns only \
-matching symbol signatures with similarity scores — not entire files. Use it \
-to locate code before reading full files with your built-in Read tool.
+\"JWT\" — not just exact keyword matches.
+- **Cross-session memory**: Past solutions, decisions, and patterns persist \
+across conversations. Check memory first — the answer may already exist.
+- **Code graph**: `code_graph(name)` traces call chains and impact radius. \
+Use before refactoring.
+- **Token-efficient code search**: `search(query, scope=\"code\")` returns \
+matching symbol signatures, not entire files.
 
 ## When to Use mdkb vs Built-in Tools
 
-| Task | Use mdkb | Use built-in |
-|------|----------|-------------|
-| Find docs by meaning/concept | `search(query)` | - |
-| Find exact text pattern | - | Grep |
-| Find code symbols semantically | `search(query, scope=\"code\")` | - |
-| Find exact symbol by name | `search(name, scope=\"symbols\")` | Grep |
-| Understand what calls what | `code_graph(name)` | - |
-| Read a known file | - | Read |
-| Recall past decisions/solutions | `search(query, scope=\"memory\")` | - |
-| List files by pattern | - | Glob |
+- Semantic/conceptual search → `search(query)` (NOT Grep)
+- Exact text pattern → Grep (NOT mdkb)
+- Find code symbols by meaning → `search(query, scope=\"code\")`
+- Find exact symbol by name → `search(name, scope=\"symbols\")` or Grep
+- Call graph / impact analysis → `code_graph(name)`
+- Read a known file → Read
+- Recall past decisions/bugs → `search(query, scope=\"memory\")`
+- List files by pattern → Glob
 
-## Core Tools
+## Tools
 
-- `search(query)`: Hybrid search. Start here.
-  - `scope`: `\"docs\"`, `\"memory\"`, `\"code\"`, or `\"symbols\"`. Omit to search docs+memory.
-  - `scope=\"code\"`: Semantic similarity over symbols. Optional: `kind`, `threshold`.
-  - `scope=\"symbols\"`: Fuzzy text match over symbol names. Optional: `kind`, `file`.
-- `get(id)`: Retrieve by numeric ID, file path, memory slug, glob, or comma list.
-- `code_graph(name)`: Call graph: `\"calls\"`, `\"callers\"`, or `\"impact\"` (with `max_depth`).
-- `status`: Check index health (collections, documents, code index stats).
-- `update`: Reindex everything (documents and source code).
-- `memory_write(id, title, content, type, tags)`: Persist knowledge for future sessions.
-- `memory_delete(id)`: Delete a memory entry permanently.
+- `search(query, scope?)`: Hybrid search. Scopes: `\"docs\"`, `\"memory\"`, \
+`\"code\"`, `\"symbols\"`. Omit scope to search docs+memory.
+- `get(id)`: Retrieve by ID, path, memory slug, glob, or comma list.
+- `code_graph(name, direction?)`: `\"calls\"`, `\"callers\"`, or `\"impact\"`.
+- `memory_write(id, title, content, type, tags)`: Persist knowledge. \
+Types: problem (title=symptom), decision (title=options), topic (title=concept).
+- `memory_delete(id)`: Remove a memory entry.
+- `status`: Index health. `update`: Reindex everything.
 
-### When to Write Memories
-- After solving a problem: type=problem, title=symptom
-- After making architectural decisions: type=decision, title=options
-- After learning important patterns: type=topic, title=concept
+## REQUIRED: Write Memories After Solving Problems
 
-### Token Efficiency
+After solving a bug, making an architectural decision, or learning an \
+important pattern, persist it with `memory_write`. Title by the symptom \
+or concept, not the solution. Use slug IDs (e.g., `auth-pkce-flow`).
 
-mdkb responses are token-budgeted. Search returns compact result summaries \
-(~50 tokens each), not full documents. Use `get(id)` only when you need the \
-full content. Large documents are auto-truncated with continuation instructions.
+## Empty Results
 
-## Getting Started
-
-If `status` shows 0 symbols or stale documents, run `update` to reindex everything.
+If `search` returns no results, try: (1) broader/different query terms, \
+(2) different scope, (3) then fall back to Grep/Glob. Do NOT conclude \
+the index is broken or incomplete — try alternative queries first.
 ";
 
 /// Build server instructions combining base instructions with memory index.
@@ -1676,10 +1679,10 @@ mod tests {
         assert!(result.contains("get(id)"));
 
         // Check guidance
-        assert!(result.contains("When to Write Memories"));
-        assert!(result.contains("type=problem"));
-        assert!(result.contains("type=decision"));
-        assert!(result.contains("type=topic"));
+        assert!(result.contains("Write Memories After Solving Problems"));
+        assert!(result.contains("problem"));
+        assert!(result.contains("decision"));
+        assert!(result.contains("topic"));
 
         // Check entries included
         assert!(result.contains("Available Memories"));
@@ -1782,7 +1785,7 @@ mod tests {
         assert!(result.contains("Knowledge Base"), "Should explain what mdkb is");
         assert!(result.contains("search"), "Should mention search tool");
         assert!(result.contains("memory_write"), "Should mention memory tools");
-        assert!(result.contains("collection"), "Should mention collections");
+        assert!(result.contains("REQUIRED"), "Should contain required workflow");
     }
 
     #[test]
