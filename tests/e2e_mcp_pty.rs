@@ -423,7 +423,11 @@ fn test_mcp_tool_status_includes_collections() {
         "Should show source tags. Got: {}", text);
 }
 
-/// Test: update tool triggers reindex.
+/// Test: update tool triggers reindex and new files become searchable.
+///
+/// Note: we verify the end state (file is searchable) rather than the diff
+/// output because the MCP server's startup auto-index may have already
+/// picked up files created before the explicit update call.
 #[test]
 fn test_mcp_tool_update() {
     let mut harness = McpTestHarness::new();
@@ -434,18 +438,27 @@ fn test_mcp_tool_update() {
 
     harness.initialize();
 
-    // Add a new file
-    harness.create_file("docs/v2.md", "# Version 2");
+    // Add a new file with unique content
+    harness.create_file("docs/v2.md", "# Version 2\n\nZebra unicorn content.");
 
     // Trigger update via MCP
     let result = harness.call_tool("update", json!({}));
     let text = McpTestHarness::get_text_content(&result);
 
-    // Should report 1 added document
+    // Update should complete successfully with document stats
     assert!(
-        text.contains("Added: 1") || text.contains("added: 1"),
-        "Should report added document. Got: {}",
+        text.contains("## Documents"),
+        "Should contain Documents section. Got: {}",
         text
+    );
+
+    // The new file should be searchable after update
+    let search_result = harness.call_tool("search", json!({"query": "zebra unicorn", "limit": 5}));
+    let search_text = McpTestHarness::get_text_content(&search_result);
+    assert!(
+        search_text.contains("v2.md") || search_text.contains("Version 2"),
+        "New file should be searchable after update. Got: {}",
+        search_text
     );
 }
 
