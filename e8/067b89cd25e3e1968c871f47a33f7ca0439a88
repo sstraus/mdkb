@@ -1,0 +1,27 @@
+src/code/indexing/pipeline.rs
+  74815550ad2333e5 65,74,100-101,242-243,717
+src/code/indexing/walker.rs
+  74815550ad2333e5 7,15-17,27-39,81,103,117,131,138,143-199,210
+src/mcp/server.rs
+  74815550ad2333e5 61-62,91,99-100,111,371,373-379,1161,1166,1170,1172-1173,1185,1229
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.7",
+  "base_commit_sha": "e8067b89cd25e3e1968c871f47a33f7ca0439a88",
+  "prompts": {
+    "74815550ad2333e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "832f49f3-451b-4112-b062-166396229cd1",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 115,
+      "total_deletions": 19,
+      "accepted_lines": 110,
+      "overriden_lines": 0
+    }
+  }
+}
