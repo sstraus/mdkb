@@ -1,0 +1,23 @@
+src/mcp/server.rs
+  b3fcf566062548b3 1478-1481,1487,1490-1492
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.7",
+  "base_commit_sha": "bc52b902ba17b2634752960238875c6d9ce040c5",
+  "prompts": {
+    "b3fcf566062548b3": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "630a13b5-6a62-4130-aead-7d068a6f77fc",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 8,
+      "total_deletions": 8,
+      "accepted_lines": 8,
+      "overriden_lines": 0
+    }
+  }
+}
