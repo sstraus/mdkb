@@ -29,7 +29,7 @@ pub struct SearchParams {
     #[serde(default)]
     pub kind: Option<String>,
 
-    /// Minimum similarity score 0.0-1.0 when scope is "code" (default: 0.3).
+    /// Minimum similarity score 0.0-1.0 when scope is "code" (default: 0.5).
     #[serde(default = "default_threshold")]
     pub threshold: f32,
 
@@ -85,6 +85,26 @@ pub struct MemoryDeleteParams {
     pub id: String,
 }
 
+/// Parameters for the memory_list tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryListParams {
+    /// Maximum entries to return (default: 20).
+    #[serde(default = "default_memory_list_limit")]
+    pub limit: usize,
+
+    /// Sort order: "recent" (last accessed), "popular" (access count), "newest" (created). Default: "recent".
+    #[serde(default = "default_memory_list_sort")]
+    pub sort: String,
+}
+
+fn default_memory_list_limit() -> usize {
+    20
+}
+
+fn default_memory_list_sort() -> String {
+    "recent".to_string()
+}
+
 // ---------------------------------------------------------------------------
 // Code intelligence tool parameters
 // ---------------------------------------------------------------------------
@@ -117,7 +137,7 @@ fn default_max_depth() -> usize {
 }
 
 fn default_threshold() -> f32 {
-    0.3
+    0.5
 }
 
 #[cfg(test)]
@@ -172,6 +192,22 @@ mod tests {
         assert_eq!(params.id, "auth-oauth2-pkce");
     }
 
+    #[test]
+    fn test_memory_list_params_defaults() {
+        let json = r#"{}"#;
+        let params: MemoryListParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.limit, 20);
+        assert_eq!(params.sort, "recent");
+    }
+
+    #[test]
+    fn test_memory_list_params_custom() {
+        let json = r#"{"limit": 5, "sort": "popular"}"#;
+        let params: MemoryListParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.limit, 5);
+        assert_eq!(params.sort, "popular");
+    }
+
     // --- Code intelligence param tests (via SearchParams scopes) ---
 
     #[test]
@@ -181,7 +217,7 @@ mod tests {
         assert_eq!(params.query, "auth handler");
         assert_eq!(params.scope.as_deref(), Some("code"));
         assert!(params.kind.is_none());
-        assert!((params.threshold - 0.3).abs() < f32::EPSILON);
+        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
         assert!(params.file.is_none());
     }
 

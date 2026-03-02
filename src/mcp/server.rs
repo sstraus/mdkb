@@ -26,7 +26,7 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
     CodeGraphParams,
-    GetParams, MemoryDeleteParams, MemoryWriteParams,
+    GetParams, MemoryDeleteParams, MemoryListParams, MemoryWriteParams,
     SearchParams,
 };
 
@@ -277,7 +277,7 @@ impl McpServer {
         }
 
         if found == 0 {
-            return Err(mcp_error("None of the requested items were found. Use `search(query)` to find content."));
+            return Err(mcp_error("None of the requested items were found."));
         }
 
         let tokens = count_tokens(&output);
@@ -302,7 +302,7 @@ impl McpServer {
 
             if results.is_empty() {
                 return Ok(CallToolResult::success(vec![Content::text(
-                    "No documents matched pattern. Use `status` to see what's indexed, or `search(query)` to find by content.",
+                    "No documents matched pattern.",
                 )]));
             }
 
@@ -378,10 +378,10 @@ impl McpServer {
     ) -> Result<crate::code::symbol::Symbol, McpError> {
         if let Some(id) = symbol_id {
             let sid = SymbolId::new(id)
-                .ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved. Use `search(query, scope=\"symbols\")` to get valid IDs."))?;
+                .ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved."))?;
             return facade
                 .get_symbol(sid)
-                .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}. Use `search(query, scope=\"symbols\")` to get current IDs.")));
+                .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}.")));
         }
 
         let matches = facade.find_symbols_by_name(name);
@@ -484,7 +484,7 @@ impl McpServer {
                     let total = doc_results.len() + mem_entries.len();
 
                     if total == 0 {
-                        let output = "No results found. Try broader terms, omit scope to search docs + memory, or use scope='code' for source symbols.".to_string();
+                        let output = "No results. Try broader terms.".to_string();
                         let tokens = count_tokens(&output);
                         (output, tokens, 0)
                     } else {
@@ -519,8 +519,10 @@ impl McpServer {
 
                         if scope == Some("code") {
                             // Semantic search (embedding similarity)
+                            // Cap at 5 to avoid flooding context with low-quality matches
+                            let code_limit = params.limit.min(5);
                             let mut results = facade
-                                .semantic_search(&params.query, params.limit, params.threshold)
+                                .semantic_search(&params.query, code_limit, params.threshold)
                                 .map_err(|e| mcp_error(format!("Semantic code search failed: {e}")))?;
 
                             // Apply kind filter
@@ -535,7 +537,7 @@ impl McpServer {
                             }
 
                             if results.is_empty() {
-                                let output = "No semantic matches found. Try broader terms, lower the threshold (default 0.3), or use scope='symbols' for name-based search.".to_string();
+                                let output = "No semantic matches found.".to_string();
                                 let tokens = count_tokens(&output);
                                 (output, tokens, 0)
                             } else {
@@ -570,7 +572,7 @@ impl McpServer {
                             }
 
                             if symbols.is_empty() {
-                                let output = "No symbols found. Try different search terms, or use scope='code' for semantic matching.".to_string();
+                                let output = "No symbols found.".to_string();
                                 let tokens = count_tokens(&output);
                                 (output, tokens, 0)
                             } else {
@@ -588,7 +590,7 @@ impl McpServer {
                 }
                 Some(invalid) => {
                     return Err(mcp_error(format!(
-                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols. Omit scope to search docs+memory.",
+                        "Invalid scope: '{}'. Valid: docs, memory, code, symbols.",
                         invalid
                     )));
                 }
@@ -604,7 +606,7 @@ impl McpServer {
 
     /// Retrieve a document by ID or path, with optional line range.
     /// Also accepts memory slugs, glob patterns, and comma-separated lists.
-    #[tool(description = "Retrieve a document by ID or path, with optional line range. Also accepts memory slugs (e.g., 'auth-oauth2-pkce') to retrieve memory entries.")]
+    #[tool(description = "Retrieve a document by ID, path, or memory slug, with optional line range.")]
     async fn get(
         &self,
         Parameters(params): Parameters<GetParams>,
@@ -682,13 +684,13 @@ impl McpServer {
         }
 
         Err(mcp_error(format!(
-            "Not found: '{}'. Accepts: numeric document ID, file path (e.g., 'docs/api.md'), or memory slug (e.g., 'auth-oauth2'). Use `search(query)` to find content.",
+            "Not found: '{}'.",
             params.id
         )))
     }
 
     /// Get index status including documents, collections, and code index.
-    #[tool(description = "Get the current index status (collections, documents, etc.) including code index stats when available")]
+    #[tool(description = "Get index status: collections, documents, code index stats.")]
     async fn status(
         &self,
         Parameters(_): Parameters<EmptyObject>,
@@ -759,7 +761,7 @@ impl McpServer {
     }
 
     /// Reindex everything: documents (from collections) and source code (from project root).
-    #[tool(description = "Trigger a differential reindex of all collections")]
+    #[tool(description = "Differential reindex of all collections.")]
     async fn update(
         &self,
         Parameters(_): Parameters<EmptyObject>,
@@ -814,7 +816,7 @@ impl McpServer {
     }
 
     /// Write or update a memory entry.
-    #[tool(description = "Create or update a memory entry. Use after: (1) solving a problem (type=problem, title=symptom), (2) making architectural decisions (type=decision, title=options), (3) learning patterns (type=topic, title=concept). Title max 50 chars, like a headline. ID should be slug format: 'auth-oauth2-pkce'.")]
+    #[tool(description = "Create or update a memory entry. Types: problem, decision, topic. Slug ID, title max 50 chars.")]
     async fn memory_write(
         &self,
         Parameters(params): Parameters<MemoryWriteParams>,
@@ -881,7 +883,7 @@ impl McpServer {
 
 
     /// Delete a memory entry by ID.
-    #[tool(description = "Delete a memory entry permanently. Use `search(query, scope=\"memory\")` to find entry IDs.")]
+    #[tool(description = "Delete a memory entry by ID.")]
     async fn memory_delete(
         &self,
         Parameters(params): Parameters<MemoryDeleteParams>,
@@ -900,7 +902,7 @@ impl McpServer {
             let output = if deleted {
                 format!("Deleted memory entry '{}'.", params.id)
             } else {
-                format!("Memory entry '{}' not found. Use `search(query, scope=\"memory\")` to find entries.", params.id)
+                format!("Memory entry '{}' not found.", params.id)
             };
             let tokens = count_tokens(&output);
             (output, tokens)
@@ -912,12 +914,64 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
+    /// List memory entries with configurable sort order.
+    #[tool(description = "List memory entries sorted by recency, popularity, or creation date.")]
+    async fn memory_list(
+        &self,
+        Parameters(params): Parameters<MemoryListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let sort: memory::MemorySortOrder = params.sort.parse()
+            .map_err(|e: String| mcp_error(e))?;
+
+        let (output, tokens, count) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let entries = memory::list_entries_sorted(
+                &ctx.conn,
+                params.limit,
+                sort,
+                Some(memory::EntryStatus::Active),
+            )
+            .map_err(|e| mcp_error(format!("Failed to list memory entries: {}", e)))?;
+
+            if entries.is_empty() {
+                let output = "No memory entries.".to_string();
+                let tokens = count_tokens(&output);
+                (output, tokens, 0)
+            } else {
+                let mut out = format!("Found {} memory entries:\n\n", entries.len());
+                for e in &entries {
+                    let tags = e.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
+                    out.push_str(&format!(
+                        "- [{}] {} ({}): {} {}\n",
+                        e.entry_type, e.id, e.title,
+                        truncate_text(&e.content, 80),
+                        tags,
+                    ));
+                }
+                let count = entries.len();
+                let tokens = count_tokens(&out);
+                (out, tokens, count)
+            }
+        }; // ctx_guard dropped here
+
+        self.metrics.record_search(tokens, count);
+        self.record_persistent_call("memory_list", tokens, count, false).await;
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
     // -----------------------------------------------------------------------
     // Code intelligence tools
     // -----------------------------------------------------------------------
 
     /// Query the code call graph: outgoing calls, incoming callers, or impact radius.
-    #[tool(description = "Query code call graph. Use direction='calls' (default) for outgoing calls, 'callers' for incoming calls, or 'impact' for transitive dependency graph (with max_depth). Provide symbol_id to disambiguate when multiple symbols share the same name.")]
+    #[tool(description = "Query code call graph. Directions: calls (default), callers, impact.")]
     async fn code_graph(
         &self,
         Parameters(params): Parameters<CodeGraphParams>,
@@ -990,7 +1044,7 @@ impl McpServer {
                     }
                     _ => {
                         return Err(mcp_error(format!(
-                            "Invalid direction: '{}'. Valid values: 'calls' (default), 'callers', 'impact'.",
+                            "Invalid direction: '{}'. Valid: calls, callers, impact.",
                             params.direction
                         )));
                     }
@@ -1417,66 +1471,25 @@ async fn flush_doc_update(
 /// These are always included in server instructions, regardless of whether
 /// memory entries exist. They tell the LLM what mdkb does and how to interact.
 const BASE_INSTRUCTIONS: &str = "\
-# mdkb - Project Knowledge Base
+# mdkb — Project Knowledge Base
 
-## REQUIRED: Search mdkb Before Starting Work
+## Workflow
 
-Before using Grep, Glob, Read, or Explore subagents to investigate code, \
-you MUST first search mdkb for existing knowledge:
-
-1. `search(query, scope=\"memory\")` — check if this problem/topic was solved before
-2. `search(query)` — search docs + memory for relevant context
-
-Only after checking mdkb should you fall back to built-in tools. \
-If mdkb returns no useful results, proceed with Grep/Glob/Read normally.
-
-This applies to ALL tasks: bug investigation, feature exploration, \
-refactoring, code understanding, and architecture questions.
-
-## What mdkb Provides (that Grep/Glob Cannot)
-
-- **Semantic search**: \"how to authenticate\" finds docs about \"login\", \"OAuth\", \
-\"JWT\" — not just exact keyword matches.
-- **Cross-session memory**: Past solutions, decisions, and patterns persist \
-across conversations. Check memory first — the answer may already exist.
-- **Code graph**: `code_graph(name)` traces call chains and impact radius. \
-Use before refactoring.
-- **Token-efficient code search**: `search(query, scope=\"code\")` returns \
-matching symbol signatures, not entire files.
-
-## When to Use mdkb vs Built-in Tools
-
-- Semantic/conceptual search → `search(query)` (NOT Grep)
-- Exact text pattern → Grep (NOT mdkb)
-- Find code symbols by meaning → `search(query, scope=\"code\")`
-- Find exact symbol by name → `search(name, scope=\"symbols\")` or Grep
-- Call graph / impact analysis → `code_graph(name)`
-- Read a known file → Read
-- Recall past decisions/bugs → `search(query, scope=\"memory\")`
-- List files by pattern → Glob
+1. `search(query)` — always start here (searches docs+memory together)
+2. Narrow with scope only if default returns too many results: `code`, `symbols`, `docs`
+3. No results? Broaden query terms, then fall back to Grep/Glob
+4. After solving a problem/decision: `memory_write`
 
 ## Tools
 
-- `search(query, scope?)`: Hybrid search. Scopes: `\"docs\"`, `\"memory\"`, \
-`\"code\"`, `\"symbols\"`. Omit scope to search docs+memory.
-- `get(id)`: Retrieve by ID, path, memory slug, glob, or comma list.
-- `code_graph(name, direction?)`: `\"calls\"`, `\"callers\"`, or `\"impact\"`.
-- `memory_write(id, title, content, type, tags)`: Persist knowledge. \
-Types: problem (title=symptom), decision (title=options), topic (title=concept).
-- `memory_delete(id)`: Remove a memory entry.
-- `status`: Index health. `update`: Reindex everything.
-
-## REQUIRED: Write Memories After Solving Problems
-
-After solving a bug, making an architectural decision, or learning an \
-important pattern, persist it with `memory_write`. Title by the symptom \
-or concept, not the solution. Use slug IDs (e.g., `auth-pkce-flow`).
-
-## Empty Results
-
-If `search` returns no results, try: (1) broader/different query terms, \
-(2) different scope, (3) then fall back to Grep/Glob. Do NOT conclude \
-the index is broken or incomplete — try alternative queries first.
+| Need | Tool |
+|---|---|
+| Any knowledge search | `search(query)` |
+| Code symbols by meaning | `search(query, scope=\"code\")` |
+| Exact symbol by name | `search(query, scope=\"symbols\")` or Grep |
+| Call graph / impact | `code_graph(name)` |
+| Exact text pattern | Grep |
+| Browse all memories | `memory_list()` |
 ";
 
 /// Build server instructions combining base instructions with memory index.
@@ -1535,7 +1548,7 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 /// Format search results for output.
 fn format_search_results(results: &[SearchResult]) -> String {
     if results.is_empty() {
-        return "No results found. Try broader terms, omit scope to include memory, or use scope='code' for source symbols.".to_string();
+        return "No matching documents found.".to_string();
     }
 
     let mut output = String::new();
@@ -1555,7 +1568,7 @@ fn format_search_results(results: &[SearchResult]) -> String {
 /// Format memory search results for output.
 fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
     if entries.is_empty() {
-        return "No matching memory entries found. Try different terms, or omit scope to search docs + memory together.".to_string();
+        return "No matching memory entries found.".to_string();
     }
 
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
@@ -1611,8 +1624,7 @@ mod tests {
     fn test_format_search_results_empty() {
         let results: Vec<SearchResult> = vec![];
         let output = format_search_results(&results);
-        assert!(output.starts_with("No results found."), "Should start with 'No results found.', got: {}", output);
-        assert!(output.contains("scope") || output.contains("broader"), "Should suggest alternative scope or broader terms, got: {}", output);
+        assert!(output.starts_with("No matching documents"), "Should start with 'No matching documents', got: {}", output);
     }
 
     #[test]
@@ -1676,13 +1688,7 @@ mod tests {
         // Check base instructions present
         assert!(result.contains("Knowledge Base"));
         assert!(result.contains("memory_write"));
-        assert!(result.contains("get(id)"));
-
-        // Check guidance
-        assert!(result.contains("Write Memories After Solving Problems"));
-        assert!(result.contains("problem"));
-        assert!(result.contains("decision"));
-        assert!(result.contains("topic"));
+        assert!(result.contains("search(query)"));
 
         // Check entries included
         assert!(result.contains("Available Memories"));
@@ -1783,9 +1789,9 @@ mod tests {
         // Must contain base instructions explaining mdkb purpose
         assert!(result.contains("mdkb"), "Should mention mdkb");
         assert!(result.contains("Knowledge Base"), "Should explain what mdkb is");
-        assert!(result.contains("search"), "Should mention search tool");
+        assert!(result.contains("search(query)"), "Should mention search tool");
         assert!(result.contains("memory_write"), "Should mention memory tools");
-        assert!(result.contains("REQUIRED"), "Should contain required workflow");
+        assert!(result.contains("memory_list"), "Should mention memory_list tool");
     }
 
     #[test]
@@ -1957,14 +1963,12 @@ mod tests {
         }
     }
 
-    // --- Error message hint tests ---
+    // --- Error message tests ---
     //
-    // Every MCP tool error should include a usage hint suggesting how to
-    // fix the problem. These tests verify that error messages contain
-    // actionable guidance for LLMs.
+    // Verify that error messages are concise and contain the relevant ID.
 
     #[tokio::test]
-    async fn test_get_not_found_error_has_hint() {
+    async fn test_get_not_found_error() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
@@ -1976,11 +1980,11 @@ mod tests {
         })).await;
 
         let msg = extract_error_msg(result);
-        assert!(msg.contains("search"), "Error should suggest search tool, got: {}", msg);
+        assert!(msg.contains("Not found"), "Error should indicate not found, got: {}", msg);
     }
 
     #[tokio::test]
-    async fn test_get_numeric_id_not_found_error_has_hint() {
+    async fn test_get_numeric_id_not_found_error() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
@@ -1992,28 +1996,11 @@ mod tests {
         })).await;
 
         let msg = extract_error_msg(result);
-        assert!(msg.contains("search"), "Error should suggest search tool, got: {}", msg);
+        assert!(msg.contains("Not found"), "Error should indicate not found, got: {}", msg);
     }
 
     #[tokio::test]
-    async fn test_get_slug_not_found_error_has_hint() {
-        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-        let root = temp_dir.path().to_path_buf();
-        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
-        let server = McpServer::new(root);
-
-        let result = server.get(Parameters(GetParams {
-            id: "nonexistent-memory-slug".to_string(),
-            lines: None,
-        })).await;
-
-        let msg = extract_error_msg(result);
-        assert!(msg.contains("search"),
-            "Error should suggest search tool, got: {}", msg);
-    }
-
-    #[tokio::test]
-    async fn test_search_no_results_has_hint() {
+    async fn test_search_no_results() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
@@ -2031,12 +2018,11 @@ mod tests {
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("broader") || text.contains("scope"),
-            "No results should suggest broadening query or alternative scope, got: {}", text);
+        assert!(text.contains("No results"), "Should indicate no results, got: {}", text);
     }
 
     #[tokio::test]
-    async fn test_get_glob_no_results_has_hint() {
+    async fn test_get_glob_no_results() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
@@ -2048,12 +2034,11 @@ mod tests {
         })).await.expect("get with glob should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("status") || text.contains("search"),
-            "No results should suggest status or search, got: {}", text);
+        assert!(text.contains("No documents"), "Should indicate no documents, got: {}", text);
     }
 
     #[tokio::test]
-    async fn test_search_memory_scope_no_results_has_hint() {
+    async fn test_search_memory_scope_no_results() {
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
@@ -2071,8 +2056,7 @@ mod tests {
         })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("different terms") || text.contains("omit scope"),
-            "No results should suggest alternative search strategies, got: {}", text);
+        assert!(text.contains("No matching memory entries"), "Should indicate no memory entries, got: {}", text);
     }
 
     #[tokio::test]
@@ -2087,8 +2071,74 @@ mod tests {
         })).await.expect("memory_delete should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("search"),
-            "Not found should suggest search, got: {}", text);
+        assert!(text.contains("not found"),
+            "Should indicate entry not found, got: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_memory_list_empty() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.memory_list(Parameters(MemoryListParams {
+            limit: 20,
+            sort: "recent".to_string(),
+        })).await.expect("memory_list should not error");
+
+        let text = extract_text(&result);
+        assert!(text.contains("No memory entries"), "Should indicate no entries, got: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_memory_list_with_entries() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        // Write two entries
+        server.memory_write(Parameters(MemoryWriteParams {
+            id: "test-a".to_string(),
+            title: "Test A".to_string(),
+            content: "Content A".to_string(),
+            entry_type: "topic".to_string(),
+            tags: vec!["tag1".to_string()],
+        })).await.expect("write A");
+
+        server.memory_write(Parameters(MemoryWriteParams {
+            id: "test-b".to_string(),
+            title: "Test B".to_string(),
+            content: "Content B".to_string(),
+            entry_type: "problem".to_string(),
+            tags: vec![],
+        })).await.expect("write B");
+
+        let result = server.memory_list(Parameters(MemoryListParams {
+            limit: 20,
+            sort: "newest".to_string(),
+        })).await.expect("memory_list should not error");
+
+        let text = extract_text(&result);
+        assert!(text.contains("test-a"), "Should contain test-a, got: {}", text);
+        assert!(text.contains("test-b"), "Should contain test-b, got: {}", text);
+        assert!(text.contains("Found 2"), "Should indicate 2 entries, got: {}", text);
+    }
+
+    #[tokio::test]
+    async fn test_memory_list_invalid_sort() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server.memory_list(Parameters(MemoryListParams {
+            limit: 20,
+            sort: "invalid".to_string(),
+        })).await;
+
+        assert!(result.is_err(), "Should error on invalid sort");
     }
 
     // --- Code intelligence tool tests ---

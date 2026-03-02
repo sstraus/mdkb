@@ -89,13 +89,78 @@ impl std::str::FromStr for EntryStatus {
     }
 }
 
+/// Sort order for listing memory entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySortOrder {
+    /// Most accessed first (access_count DESC).
+    Popular,
+    /// Most recently accessed first (last_accessed DESC NULLS LAST).
+    Recent,
+    /// Most recently created first (created_at DESC).
+    Newest,
+}
+
+impl std::str::FromStr for MemorySortOrder {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "popular" => Ok(Self::Popular),
+            "recent" => Ok(Self::Recent),
+            "newest" => Ok(Self::Newest),
+            _ => Err(format!("Invalid sort order: '{s}'. Valid: popular, recent, newest.")),
+        }
+    }
+}
+
+/// List memory entries with configurable sort order.
+pub fn list_entries_sorted(
+    conn: &Connection,
+    limit: usize,
+    sort: MemorySortOrder,
+    status_filter: Option<EntryStatus>,
+) -> Result<Vec<MemoryEntry>> {
+    let order_clause = match sort {
+        MemorySortOrder::Popular => "ORDER BY access_count DESC",
+        MemorySortOrder::Recent => "ORDER BY COALESCE(last_accessed, 0) DESC",
+        MemorySortOrder::Newest => "ORDER BY created_at DESC",
+    };
+
+    let sql = if status_filter.is_some() {
+        format!(
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path
+             FROM memory_entries WHERE status = ?1 {order_clause} LIMIT ?2"
+        )
+    } else {
+        format!(
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path
+             FROM memory_entries {order_clause} LIMIT ?1"
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+
+    let rows = if let Some(status) = status_filter {
+        stmt.query_map(params![status.to_string(), limit as i64], row_to_entry)?
+    } else {
+        stmt.query_map(params![limit as i64], row_to_entry)?
+    };
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+
+    Ok(entries)
+}
+
 /// Add a new memory entry.
 pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
     let tags_json = serde_json::to_string(&entry.tags)?;
 
     conn.execute(
-        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, source_path)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, last_accessed, source_path)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             entry.id,
             entry.title,
@@ -106,6 +171,7 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
             entry.created_at,
             entry.updated_at,
             entry.access_count,
+            entry.last_accessed,
             entry.source_path,
         ],
     )?;
@@ -778,5 +844,131 @@ mod tests {
         let warmup = get_warmup_index(&conn, 50).unwrap();
         assert_eq!(warmup.len(), 1);
         assert!(warmup[0].contains("recent"));
+    }
+
+    #[test]
+    fn test_list_entries_sorted_popular() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+
+        let high = MemoryEntry {
+            id: "high".to_string(),
+            title: "High".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now - 100,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 50,
+            last_accessed: Some(now - 200),
+            source_path: None,
+        };
+        let low = MemoryEntry {
+            id: "low".to_string(),
+            title: "Low".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 1,
+            last_accessed: Some(now),
+            source_path: None,
+        };
+        add_entry(&conn, &low).unwrap();
+        add_entry(&conn, &high).unwrap();
+
+        let entries = list_entries_sorted(&conn, 10, MemorySortOrder::Popular, Some(EntryStatus::Active)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "high", "Popular sort: highest access_count first");
+        assert_eq!(entries[1].id, "low");
+    }
+
+    #[test]
+    fn test_list_entries_sorted_recent() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+
+        let old_accessed = MemoryEntry {
+            id: "old".to_string(),
+            title: "Old".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 100,
+            last_accessed: Some(now - 1000),
+            source_path: None,
+        };
+        let recent = MemoryEntry {
+            id: "recent".to_string(),
+            title: "Recent".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now - 500,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 1,
+            last_accessed: Some(now),
+            source_path: None,
+        };
+        add_entry(&conn, &old_accessed).unwrap();
+        add_entry(&conn, &recent).unwrap();
+
+        let entries = list_entries_sorted(&conn, 10, MemorySortOrder::Recent, Some(EntryStatus::Active)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "recent", "Recent sort: most recently accessed first");
+        assert_eq!(entries[1].id, "old");
+    }
+
+    #[test]
+    fn test_list_entries_sorted_newest() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+
+        let older = MemoryEntry {
+            id: "older".to_string(),
+            title: "Older".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now - 1000,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 100,
+            last_accessed: Some(now),
+            source_path: None,
+        };
+        let newer = MemoryEntry {
+            id: "newer".to_string(),
+            title: "Newer".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 1,
+            last_accessed: Some(now - 500),
+            source_path: None,
+        };
+        add_entry(&conn, &older).unwrap();
+        add_entry(&conn, &newer).unwrap();
+
+        let entries = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, Some(EntryStatus::Active)).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "newer", "Newest sort: most recently created first");
+        assert_eq!(entries[1].id, "older");
     }
 }
