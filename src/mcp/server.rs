@@ -1475,21 +1475,21 @@ const BASE_INSTRUCTIONS: &str = "\
 
 ## Workflow
 
-1. `search(query)` — always start here (searches docs+memory together)
-2. Narrow with scope only if default returns too many results: `code`, `symbols`, `docs`
-3. No results? Broaden query terms, then fall back to Grep/Glob
-4. After solving a problem/decision: `memory_write`
+1. `search(query)` — ALWAYS start here. Searches docs AND memory together.
+2. Only add a scope param if step 1 returned too many irrelevant results.
+3. No results? Broaden query, then Grep/Glob.
+4. After solving problems: `memory_write`
 
 ## Tools
 
 | Need | Tool |
 |---|---|
-| Any knowledge search | `search(query)` |
-| Code symbols by meaning | `search(query, scope=\"code\")` |
-| Exact symbol by name | `search(query, scope=\"symbols\")` or Grep |
+| Any search (docs, memory, bugs, decisions) | `search(query)` |
 | Call graph / impact | `code_graph(name)` |
 | Exact text pattern | Grep |
-| Browse all memories | `memory_list()` |
+| Browse memories | `memory_list()` |
+
+Scopes (`code`, `symbols`, `docs`) are filters, not starting points.
 ";
 
 /// Build server instructions combining base instructions with memory index.
