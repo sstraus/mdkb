@@ -919,4 +919,283 @@ mod tests {
         let version = get_schema_version(&conn).unwrap().unwrap();
         assert_eq!(version, SCHEMA_VERSION, "schema version should match SCHEMA_VERSION");
     }
+
+    // ==================== Migration Tests ====================
+    //
+    // These tests create a genuine old schema from scratch (no init_schema),
+    // then call migrate_schema to verify migrations work correctly.
+
+    /// Create a v1 schema: no status/version columns on documents, no evolution table,
+    /// no source_path on memory_entries, no source on collections.
+    fn create_v1_schema(conn: &Connection) {
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+            INSERT INTO schema_version (version) VALUES (1);
+
+            CREATE TABLE collections (
+                name TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                pattern TEXT DEFAULT '**/*.md',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE content (
+                hash TEXT PRIMARY KEY,
+                body TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
+            CREATE TABLE documents (
+                id INTEGER PRIMARY KEY,
+                collection TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                hash TEXT NOT NULL,
+                title TEXT,
+                metadata TEXT,
+                file_modified_at INTEGER NOT NULL,
+                indexed_at INTEGER NOT NULL,
+                FOREIGN KEY(collection) REFERENCES collections(name) ON DELETE CASCADE,
+                FOREIGN KEY(hash) REFERENCES content(hash),
+                UNIQUE(collection, relative_path)
+            );
+
+            CREATE INDEX idx_documents_collection ON documents(collection);
+            CREATE INDEX idx_documents_hash ON documents(hash);
+            CREATE INDEX idx_documents_path ON documents(relative_path);
+
+            CREATE VIRTUAL TABLE documents_fts USING fts5(
+                title, body,
+                tokenize = 'porter unicode61',
+                content='', content_rowid='id'
+            );
+
+            CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
+                INSERT INTO documents_fts(rowid, title, body)
+                SELECT NEW.id, NEW.title, c.body FROM content c WHERE c.hash = NEW.hash;
+            END;
+            CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
+                INSERT INTO documents_fts(documents_fts, rowid, title, body)
+                VALUES('delete', OLD.id, OLD.title, (SELECT body FROM content WHERE hash = OLD.hash));
+            END;
+            CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
+                INSERT INTO documents_fts(documents_fts, rowid, title, body)
+                VALUES('delete', OLD.id, OLD.title, (SELECT body FROM content WHERE hash = OLD.hash));
+                INSERT INTO documents_fts(rowid, title, body)
+                SELECT NEW.id, NEW.title, c.body FROM content c WHERE c.hash = NEW.hash;
+            END;
+
+            CREATE TABLE memory_entries (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                entry_type TEXT NOT NULL,
+                tags TEXT NOT NULL DEFAULT '[]',
+                status TEXT DEFAULT 'active',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                superseded_by TEXT,
+                access_count INTEGER DEFAULT 0,
+                last_accessed INTEGER
+            );
+
+            CREATE INDEX idx_memory_type ON memory_entries(entry_type);
+            CREATE INDEX idx_memory_status ON memory_entries(status);
+            CREATE INDEX idx_memory_access ON memory_entries(access_count DESC);
+
+            CREATE VIRTUAL TABLE memory_fts USING fts5(
+                id, title, content,
+                tokenize = 'porter unicode61',
+                content='', content_rowid='rowid'
+            );
+
+            CREATE TRIGGER memory_ai AFTER INSERT ON memory_entries BEGIN
+                INSERT INTO memory_fts(rowid, id, title, content)
+                VALUES ((SELECT rowid FROM memory_entries WHERE id = NEW.id), NEW.id, NEW.title, NEW.content);
+            END;
+            CREATE TRIGGER memory_ad AFTER DELETE ON memory_entries BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, id, title, content)
+                VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content);
+            END;
+            CREATE TRIGGER memory_au AFTER UPDATE ON memory_entries BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, id, title, content)
+                VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content);
+                INSERT INTO memory_fts(rowid, id, title, content)
+                VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
+            END;
+
+            INSERT OR REPLACE INTO documents_fts(documents_fts, rank) VALUES('rank', 'bm25(10.0, 1.0)');
+            "#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_migrate_v1_to_current() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_v1_schema(&conn);
+
+        // Verify starting at v1
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(1));
+
+        // v1 should NOT have status column on documents
+        let has_status: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('documents') WHERE name = 'status'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(!has_status, "v1 should not have status column");
+
+        // Run migration
+        migrate_schema(&conn, 1).unwrap();
+
+        // Should be at current version
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        // v2 migration: documents should now have status, status_reason, version
+        let has_status: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('documents') WHERE name = 'status'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_status, "should have status column after migration");
+
+        // v3 migration: memory_entries should have source_path
+        let has_source_path: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'source_path'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_source_path, "should have source_path column after migration");
+
+        // v4 migration: collections should have source
+        let has_source: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('collections') WHERE name = 'source'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_source, "should have source column after migration");
+    }
+
+    #[test]
+    fn test_migrate_v1_preserves_existing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_v1_schema(&conn);
+
+        // Insert data at v1
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ["docs", "./docs", "**/*.md", "1000", "1000"],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
+            ["h1", "body text", "1000"],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, title, file_modified_at, indexed_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+            ["docs", "readme.md", "h1", "Readme", "1000", "1000"],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ["test-entry", "Test", "Content", "topic", "[\"tag1\"]", "1000", "1000"],
+        ).unwrap();
+
+        // Migrate
+        migrate_schema(&conn, 1).unwrap();
+
+        // Data should survive
+        let title: String = conn
+            .query_row("SELECT title FROM documents WHERE relative_path = 'readme.md'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "Readme");
+
+        let mem_title: String = conn
+            .query_row("SELECT title FROM memory_entries WHERE id = 'test-entry'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mem_title, "Test");
+
+        // New columns should have defaults
+        let status: String = conn
+            .query_row("SELECT status FROM documents WHERE relative_path = 'readme.md'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(status, "current");
+
+        let source: String = conn
+            .query_row("SELECT source FROM collections WHERE name = 'docs'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(source, "manual");
+    }
+
+    #[test]
+    fn test_migrate_v3_to_current() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_v1_schema(&conn);
+        // Manually apply v2 and v3 migrations to get to v3
+        conn.execute_batch(
+            r#"
+            ALTER TABLE documents ADD COLUMN status TEXT DEFAULT 'current';
+            ALTER TABLE documents ADD COLUMN status_reason TEXT;
+            ALTER TABLE documents ADD COLUMN version TEXT;
+            ALTER TABLE memory_entries ADD COLUMN source_path TEXT;
+            UPDATE schema_version SET version = 3;
+            "#,
+        ).unwrap();
+
+        // v3 should NOT have source on collections
+        let has_source: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('collections') WHERE name = 'source'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(!has_source, "v3 should not have source column");
+
+        // Migrate from v3
+        migrate_schema(&conn, 3).unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        let has_source: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('collections') WHERE name = 'source'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_source, "should have source column after v3→v4 migration");
+    }
+
+    #[test]
+    fn test_malformed_tags_json_returns_empty_vec() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_v1_schema(&conn);
+        migrate_schema(&conn, 1).unwrap();
+
+        // Insert a memory entry with malformed JSON in tags
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ["bad-tags", "Bad Tags", "Content", "topic", "not valid json{{{", "1000", "1000"],
+        ).unwrap();
+
+        // Read it back via the memory module
+        let entry = crate::store::memory::get_entry(&conn, "bad-tags")
+            .expect("get_entry should not error")
+            .expect("entry should exist");
+
+        assert!(entry.tags.is_empty(), "malformed tags_json should result in empty tags vec, got: {:?}", entry.tags);
+    }
 }
