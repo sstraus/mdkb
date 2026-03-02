@@ -4,6 +4,7 @@
 //! that respects `.gitignore` rules and custom ignore patterns.
 
 use crate::code::parsing::language::Language;
+use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use std::path::{Path, PathBuf};
 
@@ -11,8 +12,9 @@ use std::path::{Path, PathBuf};
 ///
 /// Respects `.gitignore`, `.git/info/exclude`, and global gitignore. Skips
 /// hidden files (starting with `.`) and files whose extension doesn't map
-/// to a [`Language`].
-pub fn discover_files(root: &Path) -> Vec<PathBuf> {
+/// to a [`Language`]. Applies `ignore_patterns` as additional exclusion rules
+/// (glob syntax, e.g. `**/node_modules/**`).
+pub fn discover_files(root: &Path, ignore_patterns: &[String]) -> Vec<PathBuf> {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(false) // enter hidden dirs (let gitignore handle filtering)
@@ -21,6 +23,20 @@ pub fn discover_files(root: &Path) -> Vec<PathBuf> {
         .git_exclude(true)
         .follow_links(false)
         .require_git(false); // respect .gitignore even outside git repos
+
+    // Apply custom ignore patterns via overrides (negated globs = exclusions)
+    if !ignore_patterns.is_empty() {
+        let mut overrides = OverrideBuilder::new(root);
+        for pattern in ignore_patterns {
+            // Negate the pattern: "!pattern" tells the override to exclude matches
+            if let Err(e) = overrides.add(&format!("!{pattern}")) {
+                tracing::warn!("Invalid ignore pattern '{pattern}': {e}");
+            }
+        }
+        if let Ok(built) = overrides.build() {
+            builder.overrides(built);
+        }
+    }
 
     builder
         .build()
@@ -62,7 +78,7 @@ mod tests {
         fs::write(root.join("README.md"), "# hello").unwrap();
         fs::write(root.join("data.json"), "{}").unwrap();
 
-        let files = discover_files(root);
+        let files = discover_files(root, &[]);
 
         // md and json are not supported languages
         assert_eq!(files.len(), 4);
@@ -84,7 +100,7 @@ mod tests {
         fs::write(root.join(".hidden.rs"), "fn hidden() {}").unwrap();
         fs::write(root.join("visible.rs"), "fn visible() {}").unwrap();
 
-        let files = discover_files(root);
+        let files = discover_files(root, &[]);
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("visible.rs"));
     }
@@ -98,7 +114,7 @@ mod tests {
         fs::write(root.join("ignored.rs"), "fn ignored() {}").unwrap();
         fs::write(root.join("included.rs"), "fn included() {}").unwrap();
 
-        let files = discover_files(root);
+        let files = discover_files(root, &[]);
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("included.rs"));
     }
@@ -112,15 +128,73 @@ mod tests {
         fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
         fs::write(root.join("src/util/helpers.go"), "package util").unwrap();
 
-        let files = discover_files(root);
+        let files = discover_files(root, &[]);
         assert_eq!(files.len(), 2);
     }
 
     #[test]
     fn test_empty_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let files = discover_files(dir.path());
+        let files = discover_files(dir.path(), &[]);
         assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_ignore_patterns_exclude_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Create node_modules with a .js file (no .gitignore to cover it)
+        fs::create_dir_all(root.join("node_modules/lodash")).unwrap();
+        fs::write(
+            root.join("node_modules/lodash/index.js"),
+            "function foo() {}",
+        )
+        .unwrap();
+        // And a normal source file
+        fs::write(root.join("app.js"), "function main() {}").unwrap();
+
+        let patterns = vec!["**/node_modules/**".to_string()];
+        let files = discover_files(root, &patterns);
+
+        let names: Vec<&str> = files
+            .iter()
+            .filter_map(|p| p.file_name()?.to_str())
+            .collect();
+        assert_eq!(files.len(), 1, "expected only app.js, got: {names:?}");
+        assert!(files[0].ends_with("app.js"));
+    }
+
+    #[test]
+    fn test_multiple_ignore_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::create_dir_all(root.join("vendor/lib")).unwrap();
+        fs::write(root.join("vendor/lib/dep.go"), "package lib").unwrap();
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::write(root.join("dist/bundle.js"), "function bundle() {}").unwrap();
+        fs::write(root.join("main.go"), "package main").unwrap();
+
+        let patterns = vec![
+            "**/vendor/**".to_string(),
+            "**/dist/**".to_string(),
+        ];
+        let files = discover_files(root, &patterns);
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("main.go"));
+    }
+
+    #[test]
+    fn test_empty_ignore_patterns() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+        let files = discover_files(root, &[]);
+        assert_eq!(files.len(), 1);
     }
 
     #[test]
@@ -133,7 +207,7 @@ mod tests {
         fs::write(root.join("target/build.rs"), "fn build() {}").unwrap();
         fs::write(root.join("src.rs"), "fn src() {}").unwrap();
 
-        let files = discover_files(root);
+        let files = discover_files(root, &[]);
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("src.rs"));
     }

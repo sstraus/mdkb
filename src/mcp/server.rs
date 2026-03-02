@@ -58,6 +58,8 @@ pub struct McpServer {
     session_id: Arc<AtomicI64>,
     /// Warmup instructions (loaded at startup, used in get_info).
     warmup_instructions: Option<String>,
+    /// Glob patterns to exclude from code indexing (e.g. `**/node_modules/**`).
+    code_ignore_patterns: Vec<String>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -86,11 +88,17 @@ impl McpServer {
             config,
             session_id: Arc::new(AtomicI64::new(0)),
             warmup_instructions: None,
+            code_ignore_patterns: Vec::new(),
         }
     }
 
     /// Create a new MCP server with warmup instructions pre-loaded.
-    pub fn with_warmup(root: PathBuf, config: McpConfig, warmup: Option<String>) -> Self {
+    pub fn with_warmup(
+        root: PathBuf,
+        config: McpConfig,
+        warmup: Option<String>,
+        code_ignore_patterns: Vec<String>,
+    ) -> Self {
         Self {
             root,
             ctx: Arc::new(Mutex::new(None)),
@@ -100,6 +108,7 @@ impl McpServer {
             config,
             session_id: Arc::new(AtomicI64::new(0)),
             warmup_instructions: warmup,
+            code_ignore_patterns,
         }
     }
 
@@ -359,8 +368,15 @@ impl McpServer {
         let mut idx_guard = self.code_index.lock().await;
         if idx_guard.is_none() {
             let index_path = self.root.join(".mdkb/code-index");
-            let facade = IndexFacade::open_or_create(&index_path)
+            let mut facade = IndexFacade::open_or_create(&index_path)
                 .map_err(|e| mcp_error(format!("Failed to open code index: {}", e)))?;
+            if !self.code_ignore_patterns.is_empty() {
+                let config = crate::code::indexing::pipeline::PipelineConfig {
+                    ignore_patterns: self.code_ignore_patterns.clone(),
+                    ..Default::default()
+                };
+                facade = facade.with_config(config);
+            }
             *idx_guard = Some(facade);
         }
         Ok(())
@@ -1142,17 +1158,19 @@ pub enum TransportMode {
 pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error::Result<()> {
     // Load config if available
     let config_path = root.join(".mdkb/config.toml");
-    let mcp_config = if config_path.exists() {
+    let full_config = if config_path.exists() {
         match crate::Config::load(&config_path) {
-            Ok(config) => config.mcp,
+            Ok(config) => config,
             Err(e) => {
                 tracing::warn!("Failed to load config, using defaults: {}", e);
-                McpConfig::default()
+                crate::Config::default()
             }
         }
     } else {
-        McpConfig::default()
+        crate::Config::default()
     };
+    let mcp_config = full_config.mcp;
+    let code_ignore_patterns = full_config.code.indexing.ignore_patterns;
 
     tracing::info!(
         "MCP config: max_response_tokens={}, max_document_tokens={}",
@@ -1164,7 +1182,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
     let warmup_limit = 50; // TODO: get from memory config when added
     let instructions = load_server_instructions(&root, warmup_limit);
 
-    let server = McpServer::with_warmup(root.clone(), mcp_config, Some(instructions));
+    let server = McpServer::with_warmup(root.clone(), mcp_config, Some(instructions), code_ignore_patterns);
 
     // Auto-index on startup: initialize context and run initial indexing in background
     {
@@ -1208,7 +1226,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                         facade.reindex(&startup_root)
                     } else {
                         // Subsequent startup: incremental — compare hashes
-                        let all_files = crate::code::indexing::walker::discover_files(&startup_root);
+                        let all_files = crate::code::indexing::walker::discover_files(&startup_root, &startup_server.code_ignore_patterns);
                         facade.reindex_files(&startup_root, &all_files)
                     };
                     match result {

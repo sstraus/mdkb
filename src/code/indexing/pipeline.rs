@@ -62,6 +62,7 @@ pub struct PipelineConfig {
     pub channel_size: usize,
     pub batch_size: usize,
     pub read_threads: usize,
+    pub ignore_patterns: Vec<String>,
 }
 
 impl Default for PipelineConfig {
@@ -70,6 +71,7 @@ impl Default for PipelineConfig {
             channel_size: CHANNEL_SIZE,
             batch_size: BATCH_SIZE,
             read_threads: READ_THREADS,
+            ignore_patterns: Vec::new(),
         }
     }
 }
@@ -95,7 +97,8 @@ pub fn index_directory(
 
     // DISCOVER stage (single thread)
     let discover_root = root.clone();
-    let discover = thread::spawn(move || stage_discover(&discover_root, &path_tx));
+    let discover_patterns = config.ignore_patterns.clone();
+    let discover = thread::spawn(move || stage_discover(&discover_root, &discover_patterns, &path_tx));
 
     // READ stage (multiple I/O threads)
     let mut readers = Vec::with_capacity(config.read_threads);
@@ -236,8 +239,8 @@ pub fn index_files(
 // ---------------------------------------------------------------------------
 
 /// Walk the filesystem and send discovered file paths to the channel.
-fn stage_discover(root: &Path, tx: &Sender<PathBuf>) -> u32 {
-    let paths = walker::discover_files(root);
+fn stage_discover(root: &Path, ignore_patterns: &[String], tx: &Sender<PathBuf>) -> u32 {
+    let paths = walker::discover_files(root, ignore_patterns);
     let count = paths.len() as u32;
     for path in paths {
         if tx.send(path).is_err() {
@@ -711,6 +714,7 @@ mod tests {
             channel_size: 16,
             batch_size: 100,
             read_threads: 2,
+            ignore_patterns: Vec::new(),
         }
     }
 
