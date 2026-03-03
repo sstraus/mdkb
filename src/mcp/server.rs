@@ -887,8 +887,8 @@ impl McpServer {
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            // Check if entry exists
-            let existing = memory::get_entry(&ctx.conn, &params.id)
+            // Check if entry exists (without tracking — must not corrupt access_count)
+            let existing = memory::get_entry_without_tracking(&ctx.conn, &params.id)
                 .map_err(|e| mcp_error(format!("Failed to check existing entry: {}", e)))?;
 
             // Parse entry type
@@ -2648,5 +2648,50 @@ pub fn utility() -> i32 {
         let path = Path::new("/project/data.json");
         let collections = vec![PathBuf::from("/project/docs")];
         assert_eq!(classify_change(path, &collections), (false, false));
+    }
+
+    #[tokio::test]
+    async fn test_memory_write_does_not_increment_access_count() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        // Create an entry
+        server.memory_write(Parameters(MemoryWriteParams {
+            id: "test-entry".to_string(),
+            title: "Test Entry".to_string(),
+            content: "Initial content".to_string(),
+            entry_type: "topic".to_string(),
+            tags: vec![],
+        })).await.expect("write should succeed");
+
+        // Get access_count after creation
+        let ctx_guard = server.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let entry_after_create = crate::store::memory::get_entry_without_tracking(&ctx.conn, "test-entry")
+            .unwrap().unwrap();
+        let count_after_create = entry_after_create.access_count;
+        drop(ctx_guard);
+
+        // Update the entry (this should NOT increment access_count)
+        server.memory_write(Parameters(MemoryWriteParams {
+            id: "test-entry".to_string(),
+            title: "Test Entry".to_string(),
+            content: "Updated content".to_string(),
+            entry_type: "topic".to_string(),
+            tags: vec![],
+        })).await.expect("update should succeed");
+
+        // access_count must not have changed
+        let ctx_guard = server.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let entry_after_update = crate::store::memory::get_entry_without_tracking(&ctx.conn, "test-entry")
+            .unwrap().unwrap();
+        assert_eq!(
+            entry_after_update.access_count, count_after_create,
+            "memory_write must not increment access_count (was {}, now {})",
+            count_after_create, entry_after_update.access_count
+        );
     }
 }
