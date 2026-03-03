@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 
 use rmcp::ServiceExt;
@@ -60,6 +60,8 @@ pub struct McpServer {
     warmup_instructions: Option<String>,
     /// Glob patterns to exclude from code indexing (e.g. `**/node_modules/**`).
     code_ignore_patterns: Vec<String>,
+    /// True while startup code reindex is in progress (prevents concurrent facade creation).
+    code_reindex_active: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -89,6 +91,7 @@ impl McpServer {
             session_id: Arc::new(AtomicI64::new(0)),
             warmup_instructions: None,
             code_ignore_patterns: Vec::new(),
+            code_reindex_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -109,6 +112,7 @@ impl McpServer {
             session_id: Arc::new(AtomicI64::new(0)),
             warmup_instructions: warmup,
             code_ignore_patterns,
+            code_reindex_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -365,6 +369,11 @@ impl McpServer {
     ///
     /// Opens or creates the index at `.mdkb/code-index/`.
     async fn ensure_code_index(&self) -> Result<(), McpError> {
+        // If startup reindex took the facade, don't recreate it — the startup
+        // task will put it back when done.
+        if self.code_reindex_active.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let mut idx_guard = self.code_index.lock().await;
         if idx_guard.is_none() {
             let index_path = self.root.join(".mdkb/code-index");
@@ -529,9 +538,14 @@ impl McpServer {
                         self.ensure_code_index().await?;
 
                         let mut idx_guard = self.code_index.lock().await;
-                        let facade = idx_guard
-                            .as_mut()
-                            .ok_or_else(|| mcp_error("Code index not initialized"))?;
+                        let facade = match idx_guard.as_mut() {
+                            Some(f) => f,
+                            None => {
+                                return Ok(CallToolResult::success(vec![Content::text(
+                                    "Code index is being rebuilt, retry shortly.",
+                                )]));
+                            }
+                        };
 
                         if scope == Some("code") {
                             // Semantic search (embedding similarity)
@@ -996,9 +1010,14 @@ impl McpServer {
 
         let output = {
             let idx_guard = self.code_index.lock().await;
-            let facade = idx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Code index not initialized"))?;
+            let facade = match idx_guard.as_ref() {
+                Some(f) => f,
+                None => {
+                    return Ok(CallToolResult::success(vec![Content::text(
+                        "Code index is being rebuilt, retry shortly.",
+                    )]));
+                }
+            };
 
             let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
 
@@ -1195,7 +1214,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 return;
             }
 
-            // Run document reindex
+            // Run document reindex (holds ctx lock — fast for markdown files)
             {
                 let mut ctx_guard = startup_server.ctx.lock().await;
                 if let Some(ctx) = ctx_guard.as_mut() {
@@ -1213,35 +1232,43 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 }
             } // ctx_guard dropped
 
-            // Run code reindex (incremental if index already exists)
+            // Run code reindex (incremental if index already exists).
+            // Take the facade out of the lock to avoid blocking tool calls
+            // during the (potentially slow) reindex + embedding generation.
             if let Err(e) = startup_server.ensure_code_index().await {
                 tracing::error!("Startup code index init failed: {:?}", e);
                 return;
             }
-            {
+            startup_server.code_reindex_active.store(true, Ordering::Relaxed);
+            let taken_facade = {
                 let mut idx_guard = startup_server.code_index.lock().await;
-                if let Some(facade) = idx_guard.as_mut() {
-                    let result = if facade.file_count() == 0 {
-                        // First run: full reindex
-                        facade.reindex(&startup_root)
-                    } else {
-                        // Subsequent startup: incremental — compare hashes
-                        let all_files = crate::code::indexing::walker::discover_files(&startup_root, &startup_server.code_ignore_patterns);
-                        facade.reindex_files(&startup_root, &all_files)
-                    };
-                    match result {
-                        Ok(stats) => {
-                            if stats.symbols_indexed > 0 || stats.files_indexed > 0 {
-                                tracing::info!(
-                                    "Startup index: {} files, {} symbols",
-                                    stats.files_indexed, stats.symbols_indexed
-                                );
-                            }
+                idx_guard.take()
+            }; // lock released immediately
+
+            if let Some(mut facade) = taken_facade {
+                let result = if facade.file_count() == 0 {
+                    facade.reindex(&startup_root)
+                } else {
+                    let all_files = crate::code::indexing::walker::discover_files(&startup_root, &startup_server.code_ignore_patterns);
+                    facade.reindex_files(&startup_root, &all_files)
+                };
+                match result {
+                    Ok(stats) => {
+                        if stats.symbols_indexed > 0 || stats.files_indexed > 0 {
+                            tracing::info!(
+                                "Startup index: {} files, {} symbols",
+                                stats.files_indexed, stats.symbols_indexed
+                            );
                         }
-                        Err(e) => tracing::error!("Startup code reindex failed: {}", e),
                     }
+                    Err(e) => tracing::error!("Startup code reindex failed: {}", e),
                 }
+
+                // Put the facade back and clear the flag
+                let mut idx_guard = startup_server.code_index.lock().await;
+                *idx_guard = Some(facade);
             }
+            startup_server.code_reindex_active.store(false, Ordering::Relaxed);
         });
     }
 
