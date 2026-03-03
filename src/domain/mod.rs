@@ -17,6 +17,8 @@ pub const COLLECTION_SOURCE_MANUAL: &str = "manual";
 pub const COLLECTION_SOURCE_CONVENTION: &str = "convention";
 /// Collection was created for Claude Code session indexing.
 pub const COLLECTION_SOURCE_SESSIONS: &str = "sessions";
+/// Collection name for Claude Code sessions (excluded from default search).
+pub const COLLECTION_CLAUDE_SESSIONS: &str = "claude_sessions";
 
 /// A collection of documents from a directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]

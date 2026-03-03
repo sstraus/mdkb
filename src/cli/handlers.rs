@@ -221,11 +221,13 @@ pub fn handle_vsearch(
     let mut results = Vec::new();
     for (doc_id, distance) in vector_results {
         if let Some(doc) = doc_map.get(&doc_id) {
-            // Filter by collection if specified
+            // Filter by collection if specified; exclude claude_sessions from default search
             if let Some(coll) = collection {
                 if doc.collection != coll {
                     continue;
                 }
+            } else if doc.collection == crate::domain::COLLECTION_CLAUDE_SESSIONS {
+                continue;
             }
 
             results.push(SearchResult {
@@ -297,11 +299,13 @@ pub fn handle_hybrid_search(
     let mut results = Vec::new();
     for (doc_id, score) in fused {
         if let Some(doc) = doc_map.get(&doc_id) {
-            // Filter by collection if specified
+            // Filter by collection if specified; exclude claude_sessions from default search
             if let Some(coll) = collection {
                 if doc.collection != coll {
                     continue;
                 }
+            } else if doc.collection == crate::domain::COLLECTION_CLAUDE_SESSIONS {
+                continue;
             }
 
             results.push(SearchResult {
@@ -2471,11 +2475,11 @@ mod tests {
         assert_eq!(result.errors.len(), 0);
 
         // Collection should exist
-        let coll = collections::get_collection(&ctx.conn, "_sessions").unwrap();
+        let coll = collections::get_collection(&ctx.conn, crate::domain::COLLECTION_CLAUDE_SESSIONS).unwrap();
         assert!(coll.is_some());
 
         // Document should be searchable
-        let docs = documents::list_documents(&ctx.conn, "_sessions").unwrap();
+        let docs = documents::list_documents(&ctx.conn, crate::domain::COLLECTION_CLAUDE_SESSIONS).unwrap();
         assert!(!docs.is_empty());
     }
 
@@ -2827,7 +2831,7 @@ pub fn handle_journal_import_all(
 // Session indexing handlers
 // ---------------------------------------------------------------------------
 
-/// Index Claude Code session files into a `_sessions` collection.
+/// Index Claude Code session files into the `claude_sessions` collection.
 ///
 /// Walks `*.jsonl` files in the session directory (non-recursive),
 /// parses them into documents with chunking, and indexes the results.
@@ -2848,8 +2852,8 @@ pub fn handle_session_index(
         }
     };
 
-    // Ensure _sessions collection exists
-    let collection_name = "_sessions";
+    // Ensure claude_sessions collection exists
+    let collection_name = crate::domain::COLLECTION_CLAUDE_SESSIONS;
     if collections::get_collection(&ctx.conn, collection_name)?.is_none() {
         let now = chrono::Utc::now().timestamp();
         let coll = Collection {
@@ -2861,7 +2865,7 @@ pub fn handle_session_index(
             updated_at: now,
         };
         collections::add_collection(&ctx.conn, &coll)?;
-        tracing::info!("Created _sessions collection at {}", session_dir.display());
+        tracing::info!("Created claude_sessions collection at {}", session_dir.display());
     }
 
     let config = SessionParseConfig::default();
