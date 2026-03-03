@@ -22,9 +22,9 @@ use mdkb::cli::handlers::{
     handle_experiment_status, handle_get, handle_history, handle_hybrid_search, handle_init, handle_memory_add,
     handle_memory_list, handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show,
     handle_memory_warmup, handle_metrics_export, handle_metrics_latency, handle_metrics_show,
-    handle_mget, handle_stats, handle_status, handle_superseded_by, handle_update,
+    handle_mget, handle_session_index, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
-use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SetupCommand, SetupMcpCommand};
+use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SessionCommand, SetupCommand, SetupMcpCommand};
 use mdkb::cli::CodeCommand;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::store::evolution::Evolution;
@@ -206,6 +206,25 @@ async fn main() -> Result<()> {
                 Err(e) => {
                     tracing::warn!("Code reindexing failed: {:?}", e);
                     eprintln!("Warning: code reindexing failed: {}", e);
+                }
+            }
+
+            // Also reindex Claude Code sessions
+            let sessions_base = std::path::PathBuf::from(
+                std::env::var("HOME").unwrap_or_default(),
+            )
+            .join(".claude/projects");
+            let project_root = cwd.to_string_lossy().to_string();
+            match handle_session_index(&ctx, &sessions_base, &project_root) {
+                Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+                    println!(
+                        "\nSessions: {} added, {} updated, {} unchanged",
+                        sr.added, sr.updated, sr.unchanged
+                    );
+                }
+                Ok(_) => {} // no sessions or nothing changed — silent
+                Err(e) => {
+                    tracing::warn!("Session indexing failed: {:?}", e);
                 }
             }
         }
@@ -512,6 +531,24 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
+                }
+            }
+        }
+        Command::Session(cmd) => {
+            match cmd {
+                SessionCommand::Index { sessions_path, project_root } => {
+                    let ctx = Context::open(&cwd)?;
+                    let sessions_base = sessions_path
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| {
+                            std::path::PathBuf::from(
+                                std::env::var("HOME").unwrap_or_default(),
+                            )
+                            .join(".claude/projects")
+                        });
+                    let root = project_root.unwrap_or_else(|| cwd.to_string_lossy().to_string());
+                    let result = handle_session_index(&ctx, &sessions_base, &root)?;
+                    format_update_result(&result, cli.format);
                 }
             }
         }

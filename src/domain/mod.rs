@@ -6,6 +6,7 @@
 pub mod conventions;
 pub mod frontmatter;
 pub mod links;
+pub mod sessions;
 pub mod traits;
 
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,8 @@ use serde::{Deserialize, Serialize};
 pub const COLLECTION_SOURCE_MANUAL: &str = "manual";
 /// Collection was auto-detected via directory conventions.
 pub const COLLECTION_SOURCE_CONVENTION: &str = "convention";
+/// Collection was created for Claude Code session indexing.
+pub const COLLECTION_SOURCE_SESSIONS: &str = "sessions";
 
 /// A collection of documents from a directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]

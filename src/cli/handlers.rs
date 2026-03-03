@@ -2420,6 +2420,155 @@ mod tests {
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].relationship, RelationshipType::Supersedes);
     }
+
+    // ==================== Session Indexing Tests ====================
+
+    /// Build a minimal valid JSONL session file with the given number of user turns.
+    fn make_session_jsonl(session_id: &str, user_turns: usize) -> String {
+        let mut lines = Vec::new();
+        for i in 0..user_turns {
+            lines.push(format!(
+                r#"{{"type":"user","sessionId":"{}","message":{{"content":"User message {}"}}}}"#,
+                session_id, i
+            ));
+            lines.push(format!(
+                r#"{{"type":"assistant","sessionId":"{}","message":{{"content":"Assistant reply {}"}}}}"#,
+                session_id, i
+            ));
+        }
+        lines.join("\n")
+    }
+
+    #[test]
+    fn test_handle_session_index_creates_collection_and_indexes() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Build fake session directory matching encode_project_path for temp path
+        let sessions_base = temp.path().join("sessions");
+        let encoded = crate::domain::sessions::encode_project_path(
+            &temp.path().to_string_lossy(),
+        );
+        let session_dir = sessions_base.join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Write a session file with enough turns
+        std::fs::write(
+            session_dir.join("abc-123.jsonl"),
+            make_session_jsonl("abc-123", 4),
+        )
+        .unwrap();
+
+        let result = handle_session_index(
+            &ctx,
+            &sessions_base,
+            &temp.path().to_string_lossy(),
+        )
+        .unwrap();
+
+        assert!(result.added > 0);
+        assert_eq!(result.errors.len(), 0);
+
+        // Collection should exist
+        let coll = collections::get_collection(&ctx.conn, "_sessions").unwrap();
+        assert!(coll.is_some());
+
+        // Document should be searchable
+        let docs = documents::list_documents(&ctx.conn, "_sessions").unwrap();
+        assert!(!docs.is_empty());
+    }
+
+    #[test]
+    fn test_handle_session_index_skips_short_sessions() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let sessions_base = temp.path().join("sessions");
+        let encoded = crate::domain::sessions::encode_project_path(
+            &temp.path().to_string_lossy(),
+        );
+        let session_dir = sessions_base.join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        // Only 2 user turns — below min_turns=3
+        std::fs::write(
+            session_dir.join("short-session.jsonl"),
+            make_session_jsonl("short-session", 2),
+        )
+        .unwrap();
+
+        let result = handle_session_index(
+            &ctx,
+            &sessions_base,
+            &temp.path().to_string_lossy(),
+        )
+        .unwrap();
+
+        assert_eq!(result.added, 0);
+        assert_eq!(result.updated, 0);
+    }
+
+    #[test]
+    fn test_handle_session_index_dedup_by_mtime() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let sessions_base = temp.path().join("sessions");
+        let encoded = crate::domain::sessions::encode_project_path(
+            &temp.path().to_string_lossy(),
+        );
+        let session_dir = sessions_base.join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+
+        std::fs::write(
+            session_dir.join("dedup-test.jsonl"),
+            make_session_jsonl("dedup-test", 4),
+        )
+        .unwrap();
+
+        // First index
+        let r1 = handle_session_index(
+            &ctx,
+            &sessions_base,
+            &temp.path().to_string_lossy(),
+        )
+        .unwrap();
+        assert!(r1.added > 0);
+
+        // Second index without modification — should skip via mtime
+        let r2 = handle_session_index(
+            &ctx,
+            &sessions_base,
+            &temp.path().to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(r2.added, 0);
+        assert!(r2.unchanged > 0);
+    }
+
+    #[test]
+    fn test_handle_session_index_no_session_dir() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let sessions_base = temp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_base).unwrap();
+
+        let result = handle_session_index(
+            &ctx,
+            &sessions_base,
+            "/nonexistent/project/path",
+        )
+        .unwrap();
+
+        assert_eq!(result.added, 0);
+        assert_eq!(result.updated, 0);
+        assert_eq!(result.unchanged, 0);
+    }
 }
 
 // ==================== Experiment Handlers ====================
@@ -2672,6 +2821,130 @@ pub fn handle_journal_import_all(
     }
 
     Ok(results)
+}
+
+// ---------------------------------------------------------------------------
+// Session indexing handlers
+// ---------------------------------------------------------------------------
+
+/// Index Claude Code session files into a `_sessions` collection.
+///
+/// Walks `*.jsonl` files in the session directory (non-recursive),
+/// parses them into documents with chunking, and indexes the results.
+/// Uses mtime-based dedup to skip unchanged files.
+pub fn handle_session_index(
+    ctx: &Context,
+    sessions_path: &Path,
+    project_root: &str,
+) -> Result<UpdateResult> {
+    use crate::domain::sessions::{find_session_dir, parse_session_file, SessionParseConfig};
+    use std::collections::HashMap;
+
+    let session_dir = match find_session_dir(sessions_path, project_root) {
+        Some(dir) => dir,
+        None => {
+            tracing::debug!("No session directory found for {}", project_root);
+            return Ok(UpdateResult::default());
+        }
+    };
+
+    // Ensure _sessions collection exists
+    let collection_name = "_sessions";
+    if collections::get_collection(&ctx.conn, collection_name)?.is_none() {
+        let now = chrono::Utc::now().timestamp();
+        let coll = Collection {
+            name: collection_name.to_string(),
+            path: session_dir.to_string_lossy().to_string(),
+            pattern: "*.jsonl".to_string(),
+            source: crate::domain::COLLECTION_SOURCE_SESSIONS.to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        collections::add_collection(&ctx.conn, &coll)?;
+        tracing::info!("Created _sessions collection at {}", session_dir.display());
+    }
+
+    let config = SessionParseConfig::default();
+    let mut result = UpdateResult::default();
+
+    // Pre-load existing documents for mtime-based dedup
+    let existing_docs: HashMap<String, Document> =
+        documents::list_documents(&ctx.conn, collection_name)?
+            .into_iter()
+            .map(|d| (d.relative_path.clone(), d))
+            .collect();
+
+    // Walk .jsonl files (non-recursive)
+    let entries: Vec<_> = std::fs::read_dir(&session_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let path = e.path();
+            path.is_file() && path.extension().map(|ext| ext == "jsonl").unwrap_or(false)
+        })
+        .collect();
+
+    documents::begin_transaction(&ctx.conn)?;
+
+    for entry in &entries {
+        let path = entry.path();
+        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(name) => name.to_string(),
+            None => continue,
+        };
+
+        let file_mtime = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+
+        let session_docs = match parse_session_file(&path, &config) {
+            Ok(docs) => docs,
+            Err(e) => {
+                result
+                    .errors
+                    .push(format!("Failed to parse {}: {}", file_name, e));
+                continue;
+            }
+        };
+
+        for sdoc in &session_docs {
+            let existing = existing_docs.get(&sdoc.relative_path);
+
+            // Skip if mtime hasn't changed
+            if let Some(existing_doc) = existing {
+                if existing_doc.file_modified_at == file_mtime {
+                    result.unchanged += 1;
+                    continue;
+                }
+            }
+
+            let now = chrono::Utc::now().timestamp();
+            let doc = Document {
+                id: 0,
+                collection: collection_name.to_string(),
+                relative_path: sdoc.relative_path.clone(),
+                hash: String::new(), // computed by index_document_in_tx
+                title: Some(sdoc.metadata.session_id.clone()),
+                metadata: None,
+                file_modified_at: file_mtime,
+                indexed_at: now,
+            };
+
+            documents::index_document_in_tx(&ctx.conn, &doc, &sdoc.content)?;
+
+            if existing.is_some() {
+                result.updated += 1;
+            } else {
+                result.added += 1;
+            }
+        }
+    }
+
+    documents::commit_transaction(&ctx.conn)?;
+
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

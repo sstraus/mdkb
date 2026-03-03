@@ -15,7 +15,7 @@ use rmcp::model::{
 use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
-use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_update};
+use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update};
 use crate::code::indexing::IndexFacade;
 use crate::code::types::SymbolId;
 use crate::config::McpConfig;
@@ -836,7 +836,35 @@ impl McpServer {
             }
         }; // idx_guard dropped here
 
-        let output = format!("{}{}", doc_output, code_output);
+        // Phase 3: Reindex Claude Code sessions
+        let session_output = {
+            let sessions_base = std::path::PathBuf::from(
+                std::env::var("HOME").unwrap_or_default(),
+            )
+            .join(".claude/projects");
+            let project_root = self.root.to_string_lossy().to_string();
+
+            let mut ctx_guard = self.ctx.lock().await;
+            if let Some(ctx) = ctx_guard.as_mut() {
+                match handle_session_index(ctx, &sessions_base, &project_root) {
+                    Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+                        format!(
+                            "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}",
+                            sr.added, sr.updated, sr.unchanged
+                        )
+                    }
+                    Ok(_) => String::new(),
+                    Err(e) => {
+                        tracing::warn!("Session indexing failed: {}", e);
+                        String::new()
+                    }
+                }
+            } else {
+                String::new()
+            }
+        };
+
+        let output = format!("{}{}{}", doc_output, code_output, session_output);
         let tokens = count_tokens(&output);
         self.metrics.record_update(tokens);
         self.record_persistent_call("update", tokens, 1, false).await;
@@ -1228,6 +1256,23 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                             }
                         }
                         Err(e) => tracing::error!("Startup doc reindex failed: {}", e),
+                    }
+
+                    // Also index Claude Code sessions
+                    let sessions_base = std::path::PathBuf::from(
+                        std::env::var("HOME").unwrap_or_default(),
+                    )
+                    .join(".claude/projects");
+                    let project_root = startup_root.to_string_lossy().to_string();
+                    match handle_session_index(ctx, &sessions_base, &project_root) {
+                        Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+                            tracing::info!(
+                                "Startup session index: {} added, {} updated",
+                                sr.added, sr.updated
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!("Session indexing failed: {}", e),
                     }
                 }
             } // ctx_guard dropped

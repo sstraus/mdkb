@@ -177,6 +177,25 @@ pub enum Command {
     /// Code intelligence commands
     #[command(subcommand)]
     Code(CodeCommand),
+
+    /// Claude Code session indexing
+    #[command(subcommand)]
+    Session(SessionCommand),
+}
+
+/// Session indexing subcommands.
+#[derive(Subcommand, Debug)]
+pub enum SessionCommand {
+    /// Index Claude Code session JSONL files
+    Index {
+        /// Path to sessions base directory (default: ~/.claude/projects)
+        #[arg(long)]
+        sessions_path: Option<String>,
+
+        /// Project root to match (default: current directory)
+        #[arg(long)]
+        project_root: Option<String>,
+    },
 }
 
 /// Journal import subcommands.
