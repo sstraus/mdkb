@@ -1,6 +1,6 @@
 //! CLI command handlers.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -600,12 +600,13 @@ fn update_collection(
         })?
         .compile_matcher();
 
-    // Get existing documents for this collection
+    // Get existing documents for this collection — prefetch to avoid N+1 queries
     let existing_docs = documents::list_documents(&ctx.conn, &collection.name)?;
-    let mut existing_paths: HashSet<String> = existing_docs
-        .iter()
-        .map(|d| d.relative_path.clone())
+    let mut existing_by_path: HashMap<String, Document> = existing_docs
+        .into_iter()
+        .map(|d| (d.relative_path.clone(), d))
         .collect();
+    let mut existing_paths: HashSet<String> = existing_by_path.keys().cloned().collect();
 
     // Walk directory and process files
     for entry in WalkDir::new(&base_path)
@@ -647,8 +648,8 @@ fn update_collection(
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
 
-        // Check if document exists and compare mtime
-        let existing_doc = documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
+        // Check if document exists and compare mtime (from prefetched map)
+        let existing_doc = existing_by_path.remove(&relative);
 
         let needs_index = match &existing_doc {
             Some(doc) => file_mtime > doc.indexed_at,
@@ -713,11 +714,9 @@ fn update_collection(
         }
     }
 
-    // Remove documents for deleted files
+    // Remove documents for deleted files (remaining in prefetched map)
     for deleted_path in existing_paths {
-        if let Some(doc) =
-            documents::get_document_by_path(&ctx.conn, &collection.name, &deleted_path)?
-        {
+        if let Some(doc) = existing_by_path.get(&deleted_path) {
             match documents::delete_document(&ctx.conn, doc.id) {
                 Ok(true) => result.removed += 1,
                 Ok(false) => {}
