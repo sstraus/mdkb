@@ -58,6 +58,8 @@ pub struct McpServer {
     session_id: Arc<AtomicI64>,
     /// Warmup instructions (loaded at startup, used in get_info).
     warmup_instructions: Option<String>,
+    /// Full project config (cached at startup to avoid hot-path I/O).
+    full_config: crate::Config,
     /// Glob patterns to exclude from code indexing (e.g. `**/node_modules/**`).
     code_ignore_patterns: Vec<String>,
     /// True while startup code reindex is in progress (prevents concurrent facade creation).
@@ -90,18 +92,20 @@ impl McpServer {
             config,
             session_id: Arc::new(AtomicI64::new(0)),
             warmup_instructions: None,
+            full_config: crate::Config::default(),
             code_ignore_patterns: Vec::new(),
             code_reindex_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Create a new MCP server with warmup instructions pre-loaded.
+    /// Create a new MCP server with warmup instructions and full config pre-loaded.
     pub fn with_warmup(
         root: PathBuf,
-        config: McpConfig,
+        full_config: crate::Config,
         warmup: Option<String>,
         code_ignore_patterns: Vec<String>,
     ) -> Self {
+        let config = full_config.mcp.clone();
         Self {
             root,
             ctx: Arc::new(Mutex::new(None)),
@@ -111,6 +115,7 @@ impl McpServer {
             config,
             session_id: Arc::new(AtomicI64::new(0)),
             warmup_instructions: warmup,
+            full_config,
             code_ignore_patterns,
             code_reindex_active: Arc::new(AtomicBool::new(false)),
         }
@@ -161,8 +166,7 @@ impl McpServer {
 
     /// Detect and register convention-based collections if enabled.
     fn apply_conventions(&self, ctx: &Context) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let config = crate::config::Config::load_or_default(&ctx.config_path);
-        if !config.conventions.enabled {
+        if !self.full_config.conventions.enabled {
             return Ok(());
         }
 
@@ -1220,20 +1224,19 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
     } else {
         crate::Config::default()
     };
-    let mcp_config = full_config.mcp;
-    let code_ignore_patterns = full_config.code.indexing.ignore_patterns;
+    let code_ignore_patterns = full_config.code.indexing.ignore_patterns.clone();
 
     tracing::info!(
         "MCP config: max_response_tokens={}, max_document_tokens={}",
-        mcp_config.max_response_tokens,
-        mcp_config.max_document_tokens
+        full_config.mcp.max_response_tokens,
+        full_config.mcp.max_document_tokens
     );
 
     // Load memory warmup before starting server
     let warmup_limit = 50; // TODO: get from memory config when added
     let instructions = load_server_instructions(&root, warmup_limit);
 
-    let server = McpServer::with_warmup(root.clone(), mcp_config, Some(instructions), code_ignore_patterns);
+    let server = McpServer::with_warmup(root.clone(), full_config, Some(instructions), code_ignore_patterns);
 
     // Auto-index on startup: initialize context and run initial indexing in background
     {
@@ -1325,11 +1328,13 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
     let watcher_root = root.clone();
     let watcher_ctx = server.ctx.clone();
     let watcher_code_index = server.code_index.clone();
+    let watcher_code_enabled = server.full_config.code.enabled;
     tokio::spawn(async move {
         if let Err(e) = run_file_watcher(
             watcher_root,
             watcher_ctx,
             watcher_code_index,
+            watcher_code_enabled,
         )
         .await
         {
@@ -1406,6 +1411,7 @@ async fn run_file_watcher(
     root: PathBuf,
     ctx: Arc<Mutex<Option<Context>>>,
     code_index: Arc<Mutex<Option<IndexFacade>>>,
+    code_enabled: bool,
 ) -> crate::error::Result<()> {
     let config = WatcherConfig::default();
     let mut watcher = FileWatcher::new(config)?;
@@ -1429,12 +1435,6 @@ async fn run_file_watcher(
         .map(|coll| root.join(&coll.path))
         .filter(|p| p.exists())
         .collect();
-
-    // Check if code indexing is enabled
-    let code_enabled = {
-        let config_path = root.join(".mdkb/config.toml");
-        crate::Config::load_or_default(&config_path).code.enabled
-    };
 
     // Watch root recursively (covers both code and collections inside root)
     if code_enabled {
