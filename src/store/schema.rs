@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 4;
+pub const SCHEMA_VERSION: i32 = 5;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -115,7 +115,7 @@ CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
 -- Triggers to keep memory FTS in sync
 CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory_entries BEGIN
     INSERT INTO memory_fts(rowid, id, title, content)
-    VALUES ((SELECT rowid FROM memory_entries WHERE id = NEW.id), NEW.id, NEW.title, NEW.content);
+    VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
 END;
 
 CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory_entries BEGIN
@@ -246,6 +246,19 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
                 [],
             )?;
         }
+    }
+
+    // Migration from v4 to v5: fix FTS INSERT trigger to use NEW.rowid directly
+    if from_version < 5 {
+        conn.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS memory_ai;
+            CREATE TRIGGER memory_ai AFTER INSERT ON memory_entries BEGIN
+                INSERT INTO memory_fts(rowid, id, title, content)
+                VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
+            END;
+            "#,
+        )?;
     }
 
     // Update schema version
@@ -1013,7 +1026,7 @@ mod tests {
 
             CREATE TRIGGER memory_ai AFTER INSERT ON memory_entries BEGIN
                 INSERT INTO memory_fts(rowid, id, title, content)
-                VALUES ((SELECT rowid FROM memory_entries WHERE id = NEW.id), NEW.id, NEW.title, NEW.content);
+                VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
             END;
             CREATE TRIGGER memory_ad AFTER DELETE ON memory_entries BEGIN
                 INSERT INTO memory_fts(memory_fts, rowid, id, title, content)
