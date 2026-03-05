@@ -2832,7 +2832,6 @@ pub fn handle_session_index(
     project_root: &str,
 ) -> Result<UpdateResult> {
     use crate::domain::sessions::{find_session_dir, parse_session_file, SessionParseConfig};
-    use std::collections::HashMap;
 
     let session_dir = match find_session_dir(sessions_path, project_root) {
         Some(dir) => dir,

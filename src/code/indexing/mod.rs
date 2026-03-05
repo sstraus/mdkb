@@ -94,11 +94,52 @@ impl IndexFacade {
     // -----------------------------------------------------------------------
 
     /// Index all source files under the given directory.
+    ///
+    /// Uses content hashes to skip unchanged files and deletes stale docs
+    /// for changed files before re-indexing, preventing duplicates.
     pub fn index_directory(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
-        let (stats, unresolved) = pipeline::index_directory(root, &self.index, &self.config)?;
+        // Get hashes of already-indexed files to detect changes
+        let indexed_hashes = self.get_indexed_file_hashes();
+
+        let (stats, unresolved) = if indexed_hashes.is_empty() {
+            // Fresh index — no dedup needed
+            pipeline::index_directory(root, &self.index, &self.config)?
+        } else {
+            // Incremental — discover files, filter changed, delete stale, re-index
+            let discovered = walker::discover_files(root, &self.config.ignore_patterns);
+            let mut changed = Vec::new();
+
+            for path in &discovered {
+                let content = match std::fs::read_to_string(path) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let hash = hasher::content_hash(&content);
+                let key = path.to_string_lossy().to_string();
+
+                match indexed_hashes.get(&key) {
+                    Some(old) if *old == hash => {} // unchanged
+                    _ => changed.push(path.clone()),
+                }
+            }
+
+            if changed.is_empty() {
+                return Ok(IndexStats {
+                    files_discovered: discovered.len() as u32,
+                    ..IndexStats::default()
+                });
+            }
+
+            // Delete stale docs for changed files
+            for path in &changed {
+                self.delete_by_file(path, root)?;
+            }
+
+            pipeline::index_files(&changed, root, &self.index, &self.config)?
+        };
+
         self.unresolved.extend(unresolved);
         self.generate_symbol_embeddings();
-        // Release the ONNX model to free memory arenas (re-acquired on next search)
         crate::llm::release_cached_service();
         Ok(stats)
     }
@@ -1022,5 +1063,23 @@ pub fn world() {
         assert!(facade.get_symbol_by_name("aaa").is_none(), "aaa should be removed");
         assert!(facade.get_symbol_by_name("bbb").is_some(), "bbb should survive");
         assert_eq!(facade.file_count(), 1);
+    }
+
+    #[test]
+    fn test_index_directory_twice_no_duplicates() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("lib.rs"), "pub fn foo() {}\npub fn bar() {}").unwrap();
+
+        let idx_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+
+        let stats1 = facade.index_directory(src_dir.path()).unwrap();
+        assert_eq!(stats1.symbols_indexed, 2);
+
+        // Index again without clearing — should not duplicate
+        let _stats2 = facade.index_directory(src_dir.path()).unwrap();
+
+        // Count total symbols
+        assert_eq!(facade.symbol_count(), 2, "Should have exactly 2 symbols after double index");
     }
 }
