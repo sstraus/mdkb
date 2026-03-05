@@ -655,6 +655,33 @@ mod tests {
     }
 
     #[test]
+    fn test_search_entries_by_tag() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+
+        let entry = MemoryEntry {
+            id: "tagged-entry".to_string(),
+            title: "Some title".to_string(),
+            content: "Unrelated content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec!["kubernetes".to_string(), "deployment".to_string()],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        // Search by tag name — should find via FTS tags column
+        let results = search_entries(&conn, "kubernetes", 10).unwrap();
+        assert_eq!(results.len(), 1, "Should find entry by tag");
+        assert_eq!(results[0].id, "tagged-entry");
+    }
+
+    #[test]
     fn test_warmup_index() {
         let conn = setup_db();
         let now = Utc::now().timestamp();

@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -102,32 +102,38 @@ CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
 CREATE INDEX IF NOT EXISTS idx_memory_status ON memory_entries(status);
 CREATE INDEX IF NOT EXISTS idx_memory_access ON memory_entries(access_count DESC);
 
--- FTS for memory content search
+-- FTS for memory content search (includes tags as space-separated text)
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     id,
     title,
     content,
+    tags,
     tokenize = 'porter unicode61',
     content='',
     content_rowid='rowid'
 );
 
 -- Triggers to keep memory FTS in sync
+-- Tags stored as JSON array, stripped to space-separated text for FTS
 CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memory_entries BEGIN
-    INSERT INTO memory_fts(rowid, id, title, content)
-    VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
+    INSERT INTO memory_fts(rowid, id, title, content, tags)
+    VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content,
+            REPLACE(REPLACE(REPLACE(NEW.tags, '"', ''), '[', ''), ']', ''));
 END;
 
 CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory_entries BEGIN
-    INSERT INTO memory_fts(memory_fts, rowid, id, title, content)
-    VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content);
+    INSERT INTO memory_fts(memory_fts, rowid, id, title, content, tags)
+    VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content,
+            REPLACE(REPLACE(REPLACE(OLD.tags, '"', ''), '[', ''), ']', ''));
 END;
 
 CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory_entries BEGIN
-    INSERT INTO memory_fts(memory_fts, rowid, id, title, content)
-    VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content);
-    INSERT INTO memory_fts(rowid, id, title, content)
-    VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
+    INSERT INTO memory_fts(memory_fts, rowid, id, title, content, tags)
+    VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content,
+            REPLACE(REPLACE(REPLACE(OLD.tags, '"', ''), '[', ''), ']', ''));
+    INSERT INTO memory_fts(rowid, id, title, content, tags)
+    VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content,
+            REPLACE(REPLACE(REPLACE(NEW.tags, '"', ''), '[', ''), ']', ''));
 END;
 
 -- Evolution tracking for document relationships (RFC-style)
@@ -257,6 +263,49 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
                 INSERT INTO memory_fts(rowid, id, title, content)
                 VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content);
             END;
+            "#,
+        )?;
+    }
+
+    // Migration from v5 to v6: add tags column to memory FTS
+    if from_version < 6 {
+        conn.execute_batch(
+            r#"
+            DROP TABLE IF EXISTS memory_fts;
+            CREATE VIRTUAL TABLE memory_fts USING fts5(
+                id, title, content, tags,
+                tokenize = 'porter unicode61',
+                content='', content_rowid='rowid'
+            );
+
+            DROP TRIGGER IF EXISTS memory_ai;
+            DROP TRIGGER IF EXISTS memory_ad;
+            DROP TRIGGER IF EXISTS memory_au;
+
+            CREATE TRIGGER memory_ai AFTER INSERT ON memory_entries BEGIN
+                INSERT INTO memory_fts(rowid, id, title, content, tags)
+                VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content,
+                        REPLACE(REPLACE(REPLACE(NEW.tags, '"', ''), '[', ''), ']', ''));
+            END;
+            CREATE TRIGGER memory_ad AFTER DELETE ON memory_entries BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, id, title, content, tags)
+                VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content,
+                        REPLACE(REPLACE(REPLACE(OLD.tags, '"', ''), '[', ''), ']', ''));
+            END;
+            CREATE TRIGGER memory_au AFTER UPDATE ON memory_entries BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, id, title, content, tags)
+                VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content,
+                        REPLACE(REPLACE(REPLACE(OLD.tags, '"', ''), '[', ''), ']', ''));
+                INSERT INTO memory_fts(rowid, id, title, content, tags)
+                VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content,
+                        REPLACE(REPLACE(REPLACE(NEW.tags, '"', ''), '[', ''), ']', ''));
+            END;
+
+            -- Repopulate FTS from existing entries
+            INSERT INTO memory_fts(rowid, id, title, content, tags)
+            SELECT rowid, id, title, content,
+                   REPLACE(REPLACE(REPLACE(tags, '"', ''), '[', ''), ']', '')
+            FROM memory_entries;
             "#,
         )?;
     }
