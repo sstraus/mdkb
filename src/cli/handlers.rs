@@ -1048,8 +1048,12 @@ pub fn handle_memory_add(
     memory::add_entry(&ctx.conn, &entry)?;
 
     // Save to disk and regenerate index
-    let _ = save_entry_to_disk(ctx, &entry);
-    let _ = generate_memory_index(ctx);
+    if let Err(e) = save_entry_to_disk(ctx, &entry) {
+        tracing::warn!("Failed to save entry to disk: {e}");
+    }
+    if let Err(e) = generate_memory_index(ctx) {
+        tracing::warn!("Failed to regenerate memory index: {e}");
+    }
 
     Ok(())
 }
@@ -1090,8 +1094,12 @@ pub fn handle_memory_rm(ctx: &Context, id: &str) -> Result<bool> {
     let deleted = memory::delete_entry(&ctx.conn, id)?;
     if deleted {
         // Archive from disk and regenerate index
-        let _ = archive_entry_on_disk(ctx, id);
-        let _ = generate_memory_index(ctx);
+        if let Err(e) = archive_entry_on_disk(ctx, id) {
+            tracing::warn!("Failed to archive entry on disk: {e}");
+        }
+        if let Err(e) = generate_memory_index(ctx) {
+            tracing::warn!("Failed to regenerate memory index: {e}");
+        }
     }
     Ok(deleted)
 }
@@ -1103,9 +1111,13 @@ pub fn handle_memory_prune(ctx: &Context, days: u32, dry_run: bool) -> Result<Ve
     if !dry_run && !pruned.is_empty() {
         // Archive entries from disk and regenerate index
         for id in &pruned {
-            let _ = archive_entry_on_disk(ctx, id);
+            if let Err(e) = archive_entry_on_disk(ctx, id) {
+                tracing::warn!("Failed to archive entry {id} on disk: {e}");
+            }
         }
-        let _ = generate_memory_index(ctx);
+        if let Err(e) = generate_memory_index(ctx) {
+            tracing::warn!("Failed to regenerate memory index: {e}");
+        }
     }
     Ok(pruned)
 }
@@ -1381,7 +1393,9 @@ pub fn handle_memory_condense(
 
     // Regenerate index if changes were made
     if !dry_run && result.merged_count > 0 {
-        let _ = generate_memory_index(ctx);
+        if let Err(e) = generate_memory_index(ctx) {
+            tracing::warn!("Failed to regenerate memory index: {e}");
+        }
     }
 
     Ok(result)
@@ -1420,14 +1434,16 @@ fn process_frontmatter_evolution(
     // Process supersedes
     for evo_ref in &parsed.supersedes {
         if let Some(target_id) = resolve_path(&evo_ref.path) {
-            let _ = evolution::add_evolution(
+            if let Err(e) = evolution::add_evolution(
                 conn,
                 source_doc_id,
                 target_id,
                 RelationshipType::Supersedes,
                 None,
                 evo_ref.reason.as_deref(),
-            );
+            ) {
+                tracing::warn!("Failed to add supersedes evolution: {e}");
+            }
         } else {
             tracing::warn!(
                 "Evolution: supersedes reference '{}' not found, skipping",
@@ -1439,14 +1455,16 @@ fn process_frontmatter_evolution(
     // Process updates
     for evo_ref in &parsed.updates {
         if let Some(target_id) = resolve_path(&evo_ref.path) {
-            let _ = evolution::add_evolution(
+            if let Err(e) = evolution::add_evolution(
                 conn,
                 source_doc_id,
                 target_id,
                 RelationshipType::Updates,
                 evo_ref.scope.as_deref(),
                 evo_ref.reason.as_deref(),
-            );
+            ) {
+                tracing::warn!("Failed to add updates evolution: {e}");
+            }
         } else {
             tracing::warn!(
                 "Evolution: updates reference '{}' not found, skipping",
@@ -1458,14 +1476,16 @@ fn process_frontmatter_evolution(
     // Process corrects
     for evo_ref in &parsed.corrects {
         if let Some(target_id) = resolve_path(&evo_ref.path) {
-            let _ = evolution::add_evolution(
+            if let Err(e) = evolution::add_evolution(
                 conn,
                 source_doc_id,
                 target_id,
                 RelationshipType::Corrects,
                 None,
                 evo_ref.reason.as_deref(),
-            );
+            ) {
+                tracing::warn!("Failed to add corrects evolution: {e}");
+            }
         } else {
             tracing::warn!(
                 "Evolution: corrects reference '{}' not found, skipping",
@@ -1477,14 +1497,16 @@ fn process_frontmatter_evolution(
     // Process extends
     for evo_ref in &parsed.extends {
         if let Some(target_id) = resolve_path(&evo_ref.path) {
-            let _ = evolution::add_evolution(
+            if let Err(e) = evolution::add_evolution(
                 conn,
                 source_doc_id,
                 target_id,
                 RelationshipType::Extends,
                 None,
                 evo_ref.reason.as_deref(),
-            );
+            ) {
+                tracing::warn!("Failed to add extends evolution: {e}");
+            }
         } else {
             tracing::warn!(
                 "Evolution: extends reference '{}' not found, skipping",
