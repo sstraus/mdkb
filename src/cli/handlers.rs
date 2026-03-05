@@ -1009,15 +1009,6 @@ fn archive_entry_on_disk(ctx: &Context, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Maximum number of tags per memory entry.
-const MAX_TAGS: usize = 20;
-
-/// Maximum length of a single tag.
-const MAX_TAG_LENGTH: usize = 50;
-
-/// Maximum content size for memory entries (100KB).
-const MAX_CONTENT_SIZE: usize = 100_000;
-
 /// Handle `mdkb memory add` command.
 pub fn handle_memory_add(
     ctx: &Context,
@@ -1027,13 +1018,6 @@ pub fn handle_memory_add(
     tags: Option<&str>,
     content: &str,
 ) -> Result<()> {
-    // Validate content size
-    if content.len() > MAX_CONTENT_SIZE {
-        return Err(Error::from(ErrorKind::Config(
-            format!("Content exceeds maximum size of {} bytes", MAX_CONTENT_SIZE)
-        )));
-    }
-
     let entry_type: EntryType = entry_type
         .parse()
         .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
@@ -1042,22 +1026,7 @@ pub fn handle_memory_add(
         .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
         .unwrap_or_default();
 
-    // Validate tag count
-    if tags.len() > MAX_TAGS {
-        return Err(Error::from(ErrorKind::Config(
-            format!("Too many tags (max {})", MAX_TAGS)
-        )));
-    }
-
-    // Validate individual tag lengths
-    for tag in &tags {
-        if tag.len() > MAX_TAG_LENGTH {
-            return Err(Error::from(ErrorKind::Config(
-                format!("Tag '{}' exceeds maximum length of {} characters",
-                    tag.chars().take(20).collect::<String>(), MAX_TAG_LENGTH)
-            )));
-        }
-    }
+    memory::validate_entry_input(id, title, &tags, content)?;
 
     let now = chrono::Utc::now().timestamp();
 

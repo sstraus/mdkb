@@ -887,6 +887,10 @@ impl McpServer {
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
+            // Validate input
+            memory::validate_entry_input(&params.id, &params.title, &params.tags, &params.content)
+                .map_err(|e| mcp_error(e.to_string()))?;
+
             // Check if entry exists (without tracking — must not corrupt access_count)
             let existing = memory::get_entry_without_tracking(&ctx.conn, &params.id)
                 .map_err(|e| mcp_error(format!("Failed to check existing entry: {}", e)))?;

@@ -4,7 +4,57 @@ use chrono::Utc;
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
-use crate::error::Result;
+use crate::error::{ErrorKind, Result};
+
+/// Maximum ID length (slug format).
+pub const MAX_ID_LEN: usize = 100;
+/// Maximum title length.
+pub const MAX_TITLE_LEN: usize = 200;
+/// Maximum number of tags per entry.
+pub const MAX_TAGS: usize = 20;
+/// Maximum length of a single tag.
+pub const MAX_TAG_LEN: usize = 50;
+/// Maximum content size (100KB).
+pub const MAX_CONTENT_SIZE: usize = 100_000;
+
+/// Validate memory entry input fields.
+///
+/// Checks ID format, title length, tag count/length, and content size.
+pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &str) -> Result<()> {
+    if id.is_empty() || id.len() > MAX_ID_LEN {
+        return Err(ErrorKind::InvalidQuery(
+            format!("ID must be 1-{MAX_ID_LEN} chars"),
+        ).into());
+    }
+    if !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+        return Err(ErrorKind::InvalidQuery(
+            "ID must be lowercase alphanumeric with hyphens".to_string(),
+        ).into());
+    }
+    if title.is_empty() || title.len() > MAX_TITLE_LEN {
+        return Err(ErrorKind::InvalidQuery(
+            format!("Title must be 1-{MAX_TITLE_LEN} chars"),
+        ).into());
+    }
+    if tags.len() > MAX_TAGS {
+        return Err(ErrorKind::InvalidQuery(
+            format!("Too many tags (max {MAX_TAGS})"),
+        ).into());
+    }
+    for tag in tags {
+        if tag.len() > MAX_TAG_LEN {
+            return Err(ErrorKind::InvalidQuery(
+                format!("Tag '{}' exceeds {MAX_TAG_LEN} chars", &tag[..20.min(tag.len())]),
+            ).into());
+        }
+    }
+    if content.len() > MAX_CONTENT_SIZE {
+        return Err(ErrorKind::InvalidQuery(
+            format!("Content exceeds {MAX_CONTENT_SIZE} bytes"),
+        ).into());
+    }
+    Ok(())
+}
 
 /// A memory entry for AI knowledge persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -970,5 +1020,63 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].id, "newer", "Newest sort: most recently created first");
         assert_eq!(entries[1].id, "older");
+    }
+
+    #[test]
+    fn test_validate_entry_valid() {
+        validate_entry_input("auth-jwt", "JWT Auth", &["auth".into()], "content").unwrap();
+    }
+
+    #[test]
+    fn test_validate_entry_empty_id() {
+        let err = validate_entry_input("", "Title", &[], "content").unwrap_err();
+        assert!(err.to_string().contains("ID must be"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_entry_id_too_long() {
+        let long_id = "a".repeat(MAX_ID_LEN + 1);
+        let err = validate_entry_input(&long_id, "Title", &[], "content").unwrap_err();
+        assert!(err.to_string().contains("ID must be"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_entry_id_invalid_chars() {
+        let err = validate_entry_input("Auth_JWT", "Title", &[], "content").unwrap_err();
+        assert!(err.to_string().contains("lowercase"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_entry_empty_title() {
+        let err = validate_entry_input("ok-id", "", &[], "content").unwrap_err();
+        assert!(err.to_string().contains("Title must be"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_entry_title_too_long() {
+        let long_title = "x".repeat(MAX_TITLE_LEN + 1);
+        let err = validate_entry_input("ok-id", &long_title, &[], "content").unwrap_err();
+        assert!(err.to_string().contains("Title must be"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_entry_too_many_tags() {
+        let tags: Vec<String> = (0..MAX_TAGS + 1).map(|i| format!("tag-{i}")).collect();
+        let err = validate_entry_input("ok-id", "Title", &tags, "content").unwrap_err();
+        assert!(err.to_string().contains("Too many tags"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_entry_tag_too_long() {
+        let tags = vec!["x".repeat(MAX_TAG_LEN + 1)];
+        let err = validate_entry_input("ok-id", "Title", &tags, "content").unwrap_err();
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_entry_content_too_large() {
+        let big = "x".repeat(MAX_CONTENT_SIZE + 1);
+        let err = validate_entry_input("ok-id", "Title", &[], &big).unwrap_err();
+        assert!(err.to_string().contains("Content exceeds"), "{err}");
     }
 }
