@@ -62,6 +62,8 @@ pub struct McpServer {
     full_config: crate::Config,
     /// Glob patterns to exclude from code indexing (e.g. `**/node_modules/**`).
     code_ignore_patterns: Vec<String>,
+    /// True while the startup task holds ctx for doc/session reindex.
+    doc_reindex_active: Arc<AtomicBool>,
     /// True while startup code reindex is in progress (prevents concurrent facade creation).
     code_reindex_active: Arc<AtomicBool>,
 }
@@ -95,6 +97,7 @@ impl McpServer {
             full_config: crate::Config::default(),
             code_ignore_patterns: Vec::new(),
             code_reindex_active: Arc::new(AtomicBool::new(false)),
+            doc_reindex_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -118,6 +121,7 @@ impl McpServer {
             full_config,
             code_ignore_patterns,
             code_reindex_active: Arc::new(AtomicBool::new(false)),
+            doc_reindex_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -133,6 +137,10 @@ impl McpServer {
     async fn ensure_context(&self) -> Result<(), McpError> {
         let mut ctx_guard = self.ctx.lock().await;
         if ctx_guard.is_none() {
+            // Startup task has taken ctx out for reindex — don't create a new one
+            if self.doc_reindex_active.load(Ordering::Relaxed) {
+                return Err(mcp_error("Server initializing, retry shortly"));
+            }
             let ctx = match Context::open(&self.root) {
                 Ok(ctx) => ctx,
                 Err(e) if e.is_not_found() => {
@@ -1249,40 +1257,50 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 return;
             }
 
-            // Run document reindex (holds ctx lock — fast for markdown files)
-            {
+            // Take ctx out of the lock for doc/session reindex so tool calls
+            // get "initializing, retry shortly" instead of blocking for minutes.
+            startup_server.doc_reindex_active.store(true, Ordering::Relaxed);
+            let taken_ctx = {
                 let mut ctx_guard = startup_server.ctx.lock().await;
-                if let Some(ctx) = ctx_guard.as_mut() {
-                    match handle_update(ctx, &startup_root) {
-                        Ok(result) => {
-                            if result.added > 0 || result.updated > 0 || result.removed > 0 {
-                                tracing::info!(
-                                    "Startup index: {} added, {} updated, {} removed docs",
-                                    result.added, result.updated, result.removed
-                                );
-                            }
-                        }
-                        Err(e) => tracing::error!("Startup doc reindex failed: {}", e),
-                    }
+                ctx_guard.take()
+            }; // lock released immediately
 
-                    // Also index Claude Code sessions
-                    let sessions_base = std::path::PathBuf::from(
-                        std::env::var("HOME").unwrap_or_default(),
-                    )
-                    .join(".claude/projects");
-                    let project_root = startup_root.to_string_lossy().to_string();
-                    match handle_session_index(ctx, &sessions_base, &project_root) {
-                        Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+            if let Some(mut ctx) = taken_ctx {
+                match handle_update(&mut ctx, &startup_root) {
+                    Ok(result) => {
+                        if result.added > 0 || result.updated > 0 || result.removed > 0 {
                             tracing::info!(
-                                "Startup session index: {} added, {} updated",
-                                sr.added, sr.updated
+                                "Startup index: {} added, {} updated, {} removed docs",
+                                result.added, result.updated, result.removed
                             );
                         }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!("Session indexing failed: {}", e),
                     }
+                    Err(e) => tracing::error!("Startup doc reindex failed: {}", e),
                 }
-            } // ctx_guard dropped
+
+                let sessions_base = std::path::PathBuf::from(
+                    std::env::var("HOME").unwrap_or_default(),
+                )
+                .join(".claude/projects");
+                let project_root = startup_root.to_string_lossy().to_string();
+                match handle_session_index(&ctx, &sessions_base, &project_root) {
+                    Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+                        tracing::info!(
+                            "Startup session index: {} added, {} updated",
+                            sr.added, sr.updated
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("Session indexing failed: {}", e),
+                }
+
+                // Put ctx back so tool calls can proceed
+                {
+                    let mut ctx_guard = startup_server.ctx.lock().await;
+                    *ctx_guard = Some(ctx);
+                }
+            }
+            startup_server.doc_reindex_active.store(false, Ordering::Relaxed);
 
             // Run code reindex (incremental if index already exists).
             // Take the facade out of the lock to avoid blocking tool calls
@@ -2790,5 +2808,38 @@ pub fn utility() -> i32 {
             "memory_write must not increment access_count (was {}, now {})",
             count_after_create, entry_after_update.access_count
         );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_context_returns_error_during_doc_reindex() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+
+        let server = McpServer::new(root);
+
+        // Initialize context normally first
+        server.ensure_context().await.expect("initial ensure_context should succeed");
+
+        // Simulate startup taking ctx for reindex
+        server.doc_reindex_active.store(true, Ordering::Relaxed);
+        {
+            let mut ctx_guard = server.ctx.lock().await;
+            let _taken = ctx_guard.take(); // take ctx out
+        }
+
+        // ensure_context should return an error, not hang or create a new ctx
+        let result = server.ensure_context().await;
+        assert!(result.is_err(), "ensure_context should fail during doc reindex");
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("initializing"),
+            "error should mention initializing, got: {}",
+            err_msg
+        );
+
+        // ctx should still be None (no new ctx created)
+        let ctx_guard = server.ctx.lock().await;
+        assert!(ctx_guard.is_none(), "ctx should remain None while reindex is active");
     }
 }

@@ -145,7 +145,7 @@ impl McpTestHarness {
         stdin.flush().expect("Failed to flush");
     }
 
-    /// Perform MCP initialization handshake.
+    /// Perform MCP initialization handshake and wait for server readiness.
     pub fn initialize(&mut self) -> Value {
         let response = self.send_request(
             "initialize",
@@ -156,6 +156,21 @@ impl McpTestHarness {
             }),
         );
         self.send_notification("notifications/initialized", json!({}));
+
+        // Poll until the server's startup reindex finishes and ctx is available.
+        // The status tool needs ctx, so a successful call means the server is ready.
+        let start = std::time::Instant::now();
+        loop {
+            let status = self.call_tool("status", json!({}));
+            if status.get("error").is_none() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("Server did not become ready within 10s");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
         response
     }
 
