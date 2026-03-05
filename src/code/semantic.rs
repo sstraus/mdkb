@@ -272,7 +272,11 @@ pub fn format_symbol_text(kind: SymbolKind, name: &str, signature: Option<&str>,
         text.push_str(doc);
     }
     if text.len() > MAX_EMBED_TEXT_LEN {
-        text.truncate(MAX_EMBED_TEXT_LEN);
+        let mut end = MAX_EMBED_TEXT_LEN;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
     }
     text
 }
@@ -764,6 +768,15 @@ mod tests {
         let long_doc = "x".repeat(600);
         let text = format_symbol_text(SymbolKind::Function, "f", None, Some(&long_doc));
         assert!(text.len() <= MAX_EMBED_TEXT_LEN);
+    }
+
+    #[test]
+    fn test_format_symbol_text_truncation_multibyte() {
+        // 'é' is 2 bytes in UTF-8. Fill with enough to exceed MAX_EMBED_TEXT_LEN.
+        let long_doc = "é".repeat(300); // 600 bytes, 300 chars
+        let text = format_symbol_text(SymbolKind::Function, "f", None, Some(&long_doc));
+        assert!(text.len() <= MAX_EMBED_TEXT_LEN);
+        assert!(text.is_char_boundary(text.len()), "Must truncate at a char boundary");
     }
 
     // --- Integration tests (require model download) ---
