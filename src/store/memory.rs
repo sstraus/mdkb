@@ -353,14 +353,32 @@ pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Ve
 }
 
 /// Get warmup index - compact list of top entries by access count.
+///
+/// Uses a targeted query selecting only needed columns (no content).
 pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> {
-    let entries = list_entries(conn, limit, Some(EntryStatus::Active))?;
+    let mut stmt = conn.prepare(
+        "SELECT id, title, entry_type, tags FROM memory_entries
+         WHERE status = 'active'
+         ORDER BY access_count DESC
+         LIMIT ?1"
+    )?;
 
-    let index: Vec<String> = entries
-        .iter()
-        .map(|e| {
-            let tags = e.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
-            format!("[{}] {}: {} {}", e.entry_type, e.id, e.title, tags)
+    let index: Vec<String> = stmt
+        .query_map(params![limit as i64], |row| {
+            let id: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            let entry_type: String = row.get(2)?;
+            let tags_json: String = row.get(3)?;
+            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+            let tags_str = tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
+            Ok(format!("[{entry_type}] {id}: {title} {tags_str}"))
+        })?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("Failed to read warmup entry: {e}");
+                None
+            }
         })
         .collect();
 
