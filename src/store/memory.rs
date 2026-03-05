@@ -239,7 +239,7 @@ pub fn get_entry_without_tracking(conn: &Connection, id: &str) -> Result<Option<
             created_at: row.get(6)?,
             updated_at: row.get(7)?,
             superseded_by: row.get(8)?,
-            access_count: row.get::<_, i64>(9)? as u64,
+            access_count: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
             last_accessed: row.get(10)?,
             source_path: row.get(11)?,
         })
@@ -399,7 +399,7 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
         superseded_by: row.get(8)?,
-        access_count: row.get::<_, i64>(9)? as u64,
+        access_count: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
         last_accessed: row.get(10)?,
         source_path: row.get(11)?,
     })
