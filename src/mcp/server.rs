@@ -1586,12 +1586,26 @@ const BASE_INSTRUCTIONS: &str = "\
 Scopes (`code`, `symbols`, `docs`) are filters, not starting points.
 ";
 
+/// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
+///
+/// Currently only `default` exists. Unknown variants fall back to default with a warning.
+/// Add new variants here for A/B testing, then validate with `e2e_search_behaviour` tests.
+fn select_base_instructions() -> &'static str {
+    match std::env::var("MDKB_INSTRUCTIONS_VARIANT").as_deref() {
+        Ok("default") | Err(_) => BASE_INSTRUCTIONS,
+        Ok(variant) => {
+            tracing::warn!("Unknown MDKB_INSTRUCTIONS_VARIANT={variant:?}, falling back to default");
+            BASE_INSTRUCTIONS
+        }
+    }
+}
+
 /// Build server instructions combining base instructions with memory index.
 ///
 /// Always includes base instructions explaining what mdkb is.
 /// Appends memory warmup index when memory entries exist.
 fn build_server_instructions(index: &[String]) -> String {
-    let mut instructions = BASE_INSTRUCTIONS.to_string();
+    let mut instructions = select_base_instructions().to_string();
 
     if !index.is_empty() {
         instructions.push_str("\n## Available Memories\n\n");
