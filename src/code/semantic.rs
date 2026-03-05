@@ -3,6 +3,7 @@
 //! Uses fastembed (ONNX Runtime) with AllMiniLML6V2 (384-dim) for local
 //! embedding generation and brute-force cosine similarity for search.
 
+use std::collections::HashSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -144,6 +145,21 @@ impl VectorStore {
         }
 
         Ok(entries)
+    }
+
+    /// Remove entries by symbol ID set.
+    pub fn remove_by_ids(&self, ids: &HashSet<u32>) -> anyhow::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let entries = self.load()?;
+        let before = entries.len();
+        let filtered: Vec<_> = entries.into_iter().filter(|(id, _)| !ids.contains(id)).collect();
+        let removed = before - filtered.len();
+        if removed > 0 {
+            self.write_all(&filtered)?;
+        }
+        Ok(removed)
     }
 
     /// Clear the store (reset to empty header).
@@ -478,6 +494,20 @@ impl SemanticSearch {
         Ok(())
     }
 
+    /// Remove embeddings for the given symbol IDs.
+    ///
+    /// Invalidates the in-memory cache so subsequent searches reflect the removal.
+    pub fn remove_embeddings(&self, ids: &HashSet<u32>) -> anyhow::Result<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        // Invalidate cache before modifying the store
+        if let Ok(mut cache) = self.cache.lock() {
+            *cache = None;
+        }
+        self.store.remove_by_ids(ids)
+    }
+
     /// Clear the vector store and invalidate the cache.
     pub fn clear(&self) -> anyhow::Result<()> {
         if let Ok(mut cache) = self.cache.lock() {
@@ -695,6 +725,58 @@ mod tests {
         assert!(result.is_err(), "Should fail on size mismatch");
         let err = result.unwrap_err().to_string();
         assert!(err.contains("mismatch"), "Expected size mismatch error, got: {err}");
+    }
+
+    #[test]
+    fn test_vector_store_remove_by_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(dir.path().join("test.bin")).unwrap();
+
+        let entries: Vec<(u32, Vec<f32>)> = vec![
+            (1, vec![0.1; EMBEDDING_DIM]),
+            (2, vec![0.2; EMBEDDING_DIM]),
+            (3, vec![0.3; EMBEDDING_DIM]),
+            (4, vec![0.4; EMBEDDING_DIM]),
+        ];
+        store.write_all(&entries).unwrap();
+        assert_eq!(store.count().unwrap(), 4);
+
+        let to_remove: HashSet<u32> = [2, 4].into_iter().collect();
+        let removed = store.remove_by_ids(&to_remove).unwrap();
+        assert_eq!(removed, 2);
+        assert_eq!(store.count().unwrap(), 2);
+
+        let remaining = store.load().unwrap();
+        let ids: Vec<u32> = remaining.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    #[test]
+    fn test_vector_store_remove_by_ids_empty_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(dir.path().join("test.bin")).unwrap();
+
+        let entries = vec![(1, vec![0.1; EMBEDDING_DIM])];
+        store.write_all(&entries).unwrap();
+
+        let empty: HashSet<u32> = HashSet::new();
+        let removed = store.remove_by_ids(&empty).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_vector_store_remove_by_ids_nonexistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(dir.path().join("test.bin")).unwrap();
+
+        let entries = vec![(1, vec![0.1; EMBEDDING_DIM])];
+        store.write_all(&entries).unwrap();
+
+        let to_remove: HashSet<u32> = [99].into_iter().collect();
+        let removed = store.remove_by_ids(&to_remove).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(store.count().unwrap(), 1);
     }
 
     // --- Cosine similarity tests ---

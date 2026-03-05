@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
-use tantivy::schema::IndexRecordOption;
+use tantivy::schema::{IndexRecordOption, Value};
 use tantivy::Term;
 
 use crate::code::relationship::RelationKind;
@@ -216,6 +216,9 @@ impl IndexFacade {
             .to_string_lossy()
             .to_string();
 
+        // Collect symbol IDs before deleting (for embedding cleanup)
+        let symbol_ids = self.get_symbol_ids_for_path(&rel_path);
+
         let mut writer = self.index.writer()?;
         // Delete file registration doc (stored with absolute path)
         writer.delete_term(Term::from_field_text(schema.file_path, &abs_path));
@@ -224,12 +227,44 @@ impl IndexFacade {
         writer.commit()?;
         self.index.reload()?;
 
-        // Unresolved relationships reference file_id, not file_path.
-        // Since we've deleted the file docs, we can't map path → file_id.
-        // Stale entries are harmless (resolve_relationship_targets will
-        // find no symbols) and will be cleaned on next full reindex.
+        // Remove stale embeddings for deleted symbols
+        if !symbol_ids.is_empty() {
+            if let Some(ref semantic) = self.semantic {
+                if let Err(e) = semantic.remove_embeddings(&symbol_ids) {
+                    tracing::warn!("Failed to clean stale embeddings: {e}");
+                }
+            }
+        }
 
         Ok(())
+    }
+
+    /// Get symbol IDs for all symbols in a file (by relative path).
+    fn get_symbol_ids_for_path(&self, rel_path: &str) -> HashSet<u32> {
+        let searcher = self.index.reader().searcher();
+        let schema = self.index.schema();
+
+        let path_term = Term::from_field_text(schema.file_path, rel_path);
+        let type_term = Term::from_field_text(schema.doc_type, "symbol");
+
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(TermQuery::new(path_term, IndexRecordOption::Basic))),
+            (Occur::Must, Box::new(TermQuery::new(type_term, IndexRecordOption::Basic))),
+        ]);
+
+        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(100_000)) else {
+            return HashSet::new();
+        };
+
+        let mut ids = HashSet::new();
+        for (_score, addr) in top {
+            if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(addr) {
+                if let Some(id) = doc.get_first(schema.symbol_id).and_then(|v| v.as_u64()) {
+                    ids.insert(id as u32);
+                }
+            }
+        }
+        ids
     }
 
     /// Incrementally reindex only changed files.
