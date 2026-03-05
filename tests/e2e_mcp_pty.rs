@@ -638,16 +638,15 @@ fn test_mcp_tool_search_with_collection() {
     );
     let text = McpTestHarness::get_text_content(&result);
 
-    assert!(text.contains("docs:"), "Should find docs collection result");
-    // The collection prefix should be docs, not notes
-    let lines: Vec<&str> = text.lines().filter(|l| l.contains("rust")).collect();
-    for line in &lines {
-        assert!(
-            !line.contains("notes:"),
-            "Should not find notes results. Got: {}",
-            line
-        );
-    }
+    assert!(text.contains("rust.md"), "Should find docs collection result");
+    // Collection filter should return only one result (docs, not notes)
+    let result_lines: Vec<&str> = text.lines().filter(|l| l.starts_with('[')).collect();
+    assert_eq!(
+        result_lines.len(),
+        1,
+        "Should find exactly one result with collection filter. Got: {:?}",
+        result_lines
+    );
 }
 
 /// Test: search tool with memory scope.

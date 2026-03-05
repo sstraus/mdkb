@@ -1637,21 +1637,36 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 
 /// Format search results for output.
 fn format_search_results(results: &[SearchResult]) -> String {
+    let results: Vec<_> = results.iter().filter(|r| r.score != 0.0).collect();
+
     if results.is_empty() {
         return "No matching documents found.".to_string();
     }
 
     let mut output = String::new();
-    for r in results {
+    for r in &results {
         let title = r.title.as_deref().unwrap_or("(untitled)");
         output.push_str(&format!(
-            "[{}] {}:{} - {} (score: {:.2})\n",
-            r.id, r.collection, r.path, title, r.score
+            "[{}] {} - {} (score: {:.2})\n",
+            r.id, r.path, title, r.score
         ));
         for snippet in &r.snippets {
             output.push_str(&format!("  {}\n", snippet));
         }
     }
+
+    // Hint: guide the model toward get() for retrieval
+    let ids: Vec<_> = results.iter().map(|r| r.id.to_string()).collect();
+    if ids.len() == 1 {
+        output.push_str(&format!("\nUse get(\"{}\") to read.", ids[0]));
+    } else {
+        output.push_str(&format!(
+            "\nUse get(\"{}\") to read one, or get(\"{}\") for all.",
+            ids[0],
+            ids.join(",")
+        ));
+    }
+
     output
 }
 
@@ -1718,7 +1733,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_search_results_with_results() {
+    fn test_format_search_results_no_collection_prefix() {
         let results = vec![SearchResult {
             id: 1,
             collection: "docs".to_string(),
@@ -1730,10 +1745,67 @@ mod tests {
             superseded_by: None,
         }];
         let output = format_search_results(&results);
-        assert!(output.contains("[1]"));
-        assert!(output.contains("docs"));
-        assert!(output.contains("readme.md"));
+        assert!(output.contains("[1] readme.md"), "Should show path without collection prefix, got: {output}");
+        assert!(!output.contains("docs:"), "Should not contain collection prefix, got: {output}");
         assert!(output.contains("README"));
+    }
+
+    #[test]
+    fn test_format_search_results_get_hint() {
+        let results = vec![
+            SearchResult {
+                id: 10,
+                collection: "docs".to_string(),
+                path: "auth.md".to_string(),
+                title: Some("Auth Guide".to_string()),
+                score: 0.85,
+                snippets: vec![],
+                status: None,
+                superseded_by: None,
+            },
+            SearchResult {
+                id: 20,
+                collection: "wiki".to_string(),
+                path: "security.md".to_string(),
+                title: Some("Security".to_string()),
+                score: 0.70,
+                snippets: vec![],
+                status: None,
+                superseded_by: None,
+            },
+        ];
+        let output = format_search_results(&results);
+        assert!(output.contains("get(\"10\")"), "Should hint single get, got: {output}");
+        assert!(output.contains("get(\"10,20\")"), "Should hint batch get, got: {output}");
+    }
+
+    #[test]
+    fn test_format_search_results_filters_zero_score() {
+        let results = vec![
+            SearchResult {
+                id: 1,
+                collection: "docs".to_string(),
+                path: "good.md".to_string(),
+                title: Some("Good".to_string()),
+                score: 0.85,
+                snippets: vec![],
+                status: None,
+                superseded_by: None,
+            },
+            SearchResult {
+                id: 2,
+                collection: "docs".to_string(),
+                path: "zero.md".to_string(),
+                title: Some("Zero".to_string()),
+                score: 0.00,
+                snippets: vec![],
+                status: None,
+                superseded_by: None,
+            },
+        ];
+        let output = format_search_results(&results);
+        assert!(output.contains("good.md"), "Should include result with positive score");
+        assert!(!output.contains("zero.md"), "Should filter out result with score 0.00, got: {output}");
     }
 
     #[test]
