@@ -1,7 +1,7 @@
 //! Memory entry storage operations.
 
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ErrorKind, Result};
@@ -293,7 +293,7 @@ pub fn get_entry_without_tracking(conn: &Connection, id: &str) -> Result<Option<
             last_accessed: row.get(10)?,
             source_path: row.get(11)?,
         })
-    }).ok();
+    }).optional()?;
 
     Ok(entry)
 }
@@ -411,7 +411,13 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
 
     let ids: Vec<String> = stmt
         .query_map(params![cutoff], |row| row.get(0))?
-        .filter_map(|r| r.ok())
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("Failed to read prunable entry ID: {e}");
+                None
+            }
+        })
         .collect();
 
     if !dry_run && !ids.is_empty() {
