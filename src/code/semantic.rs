@@ -152,12 +152,12 @@ impl VectorStore {
         if ids.is_empty() {
             return Ok(0);
         }
-        let entries = self.load()?;
+        let mut entries = self.load()?;
         let before = entries.len();
-        let filtered: Vec<_> = entries.into_iter().filter(|(id, _)| !ids.contains(id)).collect();
-        let removed = before - filtered.len();
+        entries.retain(|(id, _)| !ids.contains(id));
+        let removed = before - entries.len();
         if removed > 0 {
-            self.write_all(&filtered)?;
+            self.write_all(&entries)?;
         }
         Ok(removed)
     }
@@ -356,9 +356,7 @@ impl SemanticSearch {
     /// Each entry is `(symbol_id, text_to_embed)`.
     pub fn generate_embeddings(&self, symbols: &[(u32, String)]) -> anyhow::Result<()> {
         // Invalidate cache since we're rewriting the store
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = None;
-        }
+        self.invalidate_cache();
 
         if symbols.is_empty() {
             return self.store.clear();
@@ -411,10 +409,7 @@ impl SemanticSearch {
         existing: &[(u32, Vec<f32>)],
         new_symbols: &[(u32, String)],
     ) -> anyhow::Result<()> {
-        // Invalidate cache
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = None;
-        }
+        self.invalidate_cache();
 
         if new_symbols.is_empty() && existing.is_empty() {
             return self.store.clear();
@@ -483,6 +478,16 @@ impl SemanticSearch {
         Ok(scored)
     }
 
+    /// Invalidate the in-memory cache. Logs a warning if the mutex is poisoned
+    /// (a thread panicked while holding it), but does not propagate — callers
+    /// proceed to mutate the store, and the next `ensure_cache` will reload.
+    fn invalidate_cache(&self) {
+        match self.cache.lock() {
+            Ok(mut cache) => *cache = None,
+            Err(e) => tracing::warn!("Cache mutex poisoned during invalidation: {e}"),
+        }
+    }
+
     /// Ensure the embedding cache is populated from disk.
     fn ensure_cache(&self) -> anyhow::Result<()> {
         let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("Cache lock poisoned: {e}"))?;
@@ -501,18 +506,13 @@ impl SemanticSearch {
         if ids.is_empty() {
             return Ok(0);
         }
-        // Invalidate cache before modifying the store
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = None;
-        }
+        self.invalidate_cache();
         self.store.remove_by_ids(ids)
     }
 
     /// Clear the vector store and invalidate the cache.
     pub fn clear(&self) -> anyhow::Result<()> {
-        if let Ok(mut cache) = self.cache.lock() {
-            *cache = None;
-        }
+        self.invalidate_cache();
         self.store.clear()
     }
 
@@ -777,6 +777,66 @@ mod tests {
         let removed = store.remove_by_ids(&to_remove).unwrap();
         assert_eq!(removed, 0);
         assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_vector_store_remove_by_ids_all_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(dir.path().join("test.bin")).unwrap();
+
+        let entries: Vec<(u32, Vec<f32>)> = vec![
+            (1, vec![0.1; EMBEDDING_DIM]),
+            (2, vec![0.2; EMBEDDING_DIM]),
+            (3, vec![0.3; EMBEDDING_DIM]),
+        ];
+        store.write_all(&entries).unwrap();
+
+        let to_remove: HashSet<u32> = [1, 2, 3].into_iter().collect();
+        let removed = store.remove_by_ids(&to_remove).unwrap();
+        assert_eq!(removed, 3);
+        assert_eq!(store.count().unwrap(), 0);
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    // --- SemanticSearch-level tests (no model needed) ---
+
+    #[test]
+    fn test_semantic_search_remove_embeddings_clears_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_path = dir.path().join("vectors.bin");
+
+        // Create a SemanticSearch and manually populate the store
+        let search = SemanticSearch::new(&store_path).unwrap();
+        let entries: Vec<(u32, Vec<f32>)> = vec![
+            (1, vec![0.5; EMBEDDING_DIM]),
+            (2, vec![0.6; EMBEDDING_DIM]),
+            (3, vec![0.7; EMBEDDING_DIM]),
+        ];
+        search.store.write_all(&entries).unwrap();
+        assert_eq!(search.count().unwrap(), 3);
+
+        // Warm the cache by calling ensure_cache
+        search.ensure_cache().unwrap();
+
+        // Remove some entries
+        let to_remove: HashSet<u32> = [1, 3].into_iter().collect();
+        let removed = search.remove_embeddings(&to_remove).unwrap();
+        assert_eq!(removed, 2);
+
+        // Count should reflect removal (reads from store, not stale cache)
+        assert_eq!(search.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_semantic_search_remove_embeddings_empty_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let search = SemanticSearch::new(dir.path().join("vectors.bin")).unwrap();
+        search.store.write_all(&[(1, vec![0.5; EMBEDDING_DIM])]).unwrap();
+
+        let empty: HashSet<u32> = HashSet::new();
+        let removed = search.remove_embeddings(&empty).unwrap();
+        assert_eq!(removed, 0);
+        assert_eq!(search.count().unwrap(), 1);
     }
 
     // --- Cosine similarity tests ---

@@ -1591,13 +1591,16 @@ Scopes (`code`, `symbols`, `docs`) are filters, not starting points.
 /// Currently only `default` exists. Unknown variants fall back to default with a warning.
 /// Add new variants here for A/B testing, then validate with `e2e_search_behaviour` tests.
 fn select_base_instructions() -> &'static str {
-    match std::env::var("MDKB_INSTRUCTIONS_VARIANT").as_deref() {
-        Ok("default") | Err(_) => BASE_INSTRUCTIONS,
-        Ok(variant) => {
-            tracing::warn!("Unknown MDKB_INSTRUCTIONS_VARIANT={variant:?}, falling back to default");
-            BASE_INSTRUCTIONS
+    static VARIANT: std::sync::OnceLock<&str> = std::sync::OnceLock::new();
+    *VARIANT.get_or_init(|| {
+        match std::env::var("MDKB_INSTRUCTIONS_VARIANT").as_deref() {
+            Ok("default") | Err(_) => BASE_INSTRUCTIONS,
+            Ok(variant) => {
+                tracing::warn!(variant, "Unknown MDKB_INSTRUCTIONS_VARIANT, falling back to default");
+                BASE_INSTRUCTIONS
+            }
         }
-    }
+    })
 }
 
 /// Build server instructions combining base instructions with memory index.
@@ -1649,7 +1652,11 @@ fn truncate_text(text: &str, max_len: usize) -> String {
     if text.len() <= max_len {
         text
     } else {
-        format!("{}...", &text[..max_len.saturating_sub(3)])
+        let mut cut = max_len.saturating_sub(3);
+        while !text.is_char_boundary(cut) && cut > 0 {
+            cut -= 1;
+        }
+        format!("{}...", &text[..cut])
     }
 }
 

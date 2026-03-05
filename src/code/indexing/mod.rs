@@ -227,12 +227,15 @@ impl IndexFacade {
         writer.commit()?;
         self.index.reload()?;
 
-        // Remove stale embeddings for deleted symbols
-        if !symbol_ids.is_empty() {
-            if let Some(ref semantic) = self.semantic {
-                if let Err(e) = semantic.remove_embeddings(&symbol_ids) {
-                    tracing::warn!("Failed to clean stale embeddings: {e}");
-                }
+        // Only remove embeddings if semantic is already initialized;
+        // avoid triggering lazy model load (~300-800 MB) for a delete operation.
+        if let Some(ref semantic) = self.semantic {
+            if let Err(e) = semantic.remove_embeddings(&symbol_ids) {
+                tracing::error!(
+                    error = %e,
+                    symbol_count = symbol_ids.len(),
+                    "Failed to remove embeddings for deleted symbols — orphaned embeddings remain in vector store"
+                );
             }
         }
 
@@ -252,15 +255,26 @@ impl IndexFacade {
             (Occur::Must, Box::new(TermQuery::new(type_term, IndexRecordOption::Basic))),
         ]);
 
-        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(100_000)) else {
-            return HashSet::new();
+        let top = match searcher.search(&query, &TopDocs::with_limit(100_000)) {
+            Ok(top) => top,
+            Err(e) => {
+                tracing::error!(
+                    rel_path,
+                    error = %e,
+                    "Tantivy search failed in get_symbol_ids_for_path — embeddings will not be cleaned"
+                );
+                return HashSet::new();
+            }
         };
 
         let mut ids = HashSet::new();
         for (_score, addr) in top {
             if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(addr) {
-                if let Some(id) = doc.get_first(schema.symbol_id).and_then(|v| v.as_u64()) {
-                    ids.insert(id as u32);
+                if let Some(id) = doc.get_first(schema.symbol_id)
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| u32::try_from(v).ok())
+                {
+                    ids.insert(id);
                 }
             }
         }
@@ -532,6 +546,8 @@ impl IndexFacade {
         limit: usize,
         threshold: f32,
     ) -> anyhow::Result<Vec<(Symbol, f32)>> {
+        // ensure_semantic() borrows &mut self for lazy init. We check is_none() and
+        // re-borrow as &self via as_ref().unwrap() to release the &mut borrow.
         if self.ensure_semantic().is_none() {
             return Ok(Vec::new());
         }
@@ -592,6 +608,7 @@ impl IndexFacade {
 
     /// Generate embeddings only for symbols in the given files.
     fn generate_symbol_embeddings_for_files(&mut self, paths: &[PathBuf], root: &Path) {
+        // ensure_semantic() borrows &mut self; unwrap() re-borrows as &self.
         if self.ensure_semantic().is_none() {
             return;
         }
@@ -618,10 +635,8 @@ impl IndexFacade {
 
         // Load existing embeddings, filter out the ones we're regenerating,
         // then append new ones
-        let existing = semantic.store_load_filtered(|id| {
-            // Keep embeddings NOT belonging to the changed files' symbols
-            !symbols.iter().any(|s| s.id.value() == id)
-        });
+        let changed_ids: HashSet<u32> = symbols.iter().map(|s| s.id.value()).collect();
+        let existing = semantic.store_load_filtered(|id| !changed_ids.contains(&id));
 
         let embed_inputs: Vec<(u32, String)> = symbols
             .iter()
@@ -651,6 +666,7 @@ impl IndexFacade {
 
     /// Generate embeddings for all indexed symbols and write to the vector store.
     fn generate_symbol_embeddings(&mut self) {
+        // ensure_semantic() borrows &mut self; unwrap() re-borrows as &self.
         if self.ensure_semantic().is_none() {
             return;
         }
