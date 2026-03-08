@@ -571,23 +571,26 @@ fn update_collection(
         return Ok(());
     }
 
-    // Validate path stays within root to prevent path traversal (fixes P2-SEC-001)
-    let canonical_root = root.canonicalize().map_err(|e| {
-        Error::other(format!("Failed to canonicalize root path: {}", e))
-    })?;
-    let canonical_base = base_path.canonicalize().map_err(|e| {
-        Error::other(format!(
-            "Failed to canonicalize collection path '{}': {}",
-            base_path.display(),
-            e
-        ))
-    })?;
+    // Validate path stays within root to prevent path traversal (fixes P2-SEC-001).
+    // System-managed collections (e.g. claude_sessions) are allowed outside root.
+    if collection.source != crate::domain::COLLECTION_SOURCE_SESSIONS {
+        let canonical_root = root.canonicalize().map_err(|e| {
+            Error::other(format!("Failed to canonicalize root path: {}", e))
+        })?;
+        let canonical_base = base_path.canonicalize().map_err(|e| {
+            Error::other(format!(
+                "Failed to canonicalize collection path '{}': {}",
+                base_path.display(),
+                e
+            ))
+        })?;
 
-    if !canonical_base.starts_with(&canonical_root) {
-        return Err(Error::other(format!(
-            "Collection path '{}' escapes root directory (path traversal blocked)",
-            collection.path
-        )));
+        if !canonical_base.starts_with(&canonical_root) {
+            return Err(Error::other(format!(
+                "Collection path '{}' escapes root directory (path traversal blocked)",
+                collection.path
+            )));
+        }
     }
 
     // Build glob matcher
