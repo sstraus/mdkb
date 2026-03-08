@@ -46,8 +46,8 @@ fn test_instructions_content() {
         &instructions[..instructions.len().min(200)]
     );
     assert!(
-        instructions.contains("filters, not starting points"),
-        "Instructions must explain scopes are filters. Got: {}",
+        instructions.contains("scope="),
+        "Instructions must show scope usage for code/symbols. Got: {}",
         &instructions[..instructions.len().min(300)]
     );
     assert!(

@@ -467,7 +467,7 @@ impl McpServer {
     }
 
     /// Search documents using hybrid search (BM25 + semantic with RRF fusion).
-    #[tool(description = "Search markdown documents using hybrid search (combines keyword and semantic search)")]
+    #[tool(description = "Search docs+memory (default), code symbols (scope=\"symbols\"), or semantic code (scope=\"code\").")]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -1597,11 +1597,13 @@ const BASE_INSTRUCTIONS: &str = "\
 | Need | Tool |
 |---|---|
 | Any search (docs, memory, bugs, decisions) | `search(query)` |
-| Call graph / impact | `code_graph(name)` |
+| Find symbol by name/kind | `search(query, scope=\"symbols\")` |
+| Semantic code search | `search(query, scope=\"code\")` |
+| Call graph / impact analysis | `code_graph(name)` |
 | Exact text pattern | Grep |
 | Browse memories | `memory_list()` |
 
-Scopes (`code`, `symbols`, `docs`) are filters, not starting points.
+Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after finding a symbol to trace callers or impact.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
