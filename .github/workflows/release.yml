@@ -29,9 +29,11 @@ jobs:
             os: macos-latest
             name: macos-x64
           # macOS ARM64 (native Apple Silicon runner)
+          # RUSTFLAGS: ring 0.17.14 needs explicit cpu features (briansmith/ring#2527)
           - target: aarch64-apple-darwin
             os: macos-latest
             name: macos-arm64
+            rustflags: '-C target-cpu=apple-m1'
           # Windows x64
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -47,6 +49,8 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags || '' }}
 
       # Package binary
       - name: Package binary (Linux)
