@@ -120,6 +120,11 @@ tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 
+# ring 0.17.14 panics on aarch64-apple-darwin with recent Rust/macOS runners
+# (briansmith/ring#2527). Fixed on main but unreleased.
+[patch.crates-io]
+ring = { git = "https://github.com/briansmith/ring.git", branch = "main" }
+
 [profile.release]
 lto = true
 codegen-units = 1
