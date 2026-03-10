@@ -25,13 +25,13 @@ jobs:
             os: ubuntu-latest
             name: linux-arm64
             use_cross: true
-          # macOS x64 (Intel runner)
+          # macOS x64 (cross-compiled from ARM64 runner)
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-latest
             name: macos-x64
-          # macOS ARM64 (Apple Silicon runner)
+          # macOS ARM64 (native Apple Silicon runner)
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             name: macos-arm64
           # Windows x64
           - target: x86_64-pc-windows-msvc
@@ -42,7 +42,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93
         with:
           targets: ${{ matrix.target }}
 

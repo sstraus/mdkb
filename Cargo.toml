@@ -71,7 +71,7 @@ pulldown-cmark = "0.12"
 regex = "1"
 
 # Embedding - semantic search with local ONNX models
-fastembed = "4"
+fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
 
 # Token counting for usage metrics
 tiktoken-rs = "0.6"
