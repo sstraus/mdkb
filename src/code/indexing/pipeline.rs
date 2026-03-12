@@ -439,15 +439,14 @@ fn stage_collect(
         let file_path_str: Box<str> = file_path.to_string_lossy().into();
 
         let mtime = hasher::file_mtime(&parsed.path).unwrap_or(0);
-        let timestamp = hasher::utc_timestamp();
 
         // Register file
         batch.file_registrations.push(FileRegistration {
             path: parsed.path.clone(),
+            rel_path: file_path_str.clone(),
             file_id,
             content_hash: parsed.content_hash,
             language: parsed.language,
-            timestamp,
             mtime,
         });
 
@@ -540,12 +539,9 @@ fn stage_index(
         // Write file registrations
         for reg in &batch.file_registrations {
             let abs_path = reg.path.to_string_lossy();
-            let rel_path = reg.path.file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_else(|| abs_path.to_string());
             db.insert_file(
                 &abs_path,
-                &rel_path,
+                &reg.rel_path,
                 &reg.content_hash,
                 Some(reg.language.config_key()),
                 Some(reg.mtime as i64),

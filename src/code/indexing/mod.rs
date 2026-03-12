@@ -94,32 +94,23 @@ impl IndexFacade {
     /// Uses content hashes to skip unchanged files and deletes stale entries
     /// for changed files before re-indexing, preventing duplicates.
     pub fn index_directory(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
-        let indexed_hashes = self.db.get_file_hashes()?;
+        let indexed_mtimes = self.db.get_file_mtimes()?;
 
-        let stats = if indexed_hashes.is_empty() {
+        let stats = if indexed_mtimes.is_empty() {
             // Fresh index — no dedup needed
             pipeline::index_directory(root, &self.db, &self.config)?
         } else {
-            // Incremental — discover files, filter changed, delete stale, re-index
+            // Incremental — discover files, filter by mtime, delete stale, re-index.
+            // Uses mtime comparison (filesystem metadata) to avoid reading file contents.
             let discovered = walker::discover_files(root, &self.config.ignore_patterns);
             let mut changed = Vec::new();
 
             for path in &discovered {
-                let content = match std::fs::read_to_string(path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to read {} during incremental hash check: {e}. File skipped.",
-                            path.display()
-                        );
-                        continue;
-                    }
-                };
-                let hash = hasher::content_hash(&content);
                 let key = path.to_string_lossy().to_string();
+                let current_mtime = hasher::file_mtime(path).unwrap_or(0);
 
-                match indexed_hashes.get(&key) {
-                    Some(old) if *old == hash => {} // unchanged
+                match indexed_mtimes.get(&key) {
+                    Some(&old) if old == current_mtime => {} // unchanged
                     _ => changed.push(path.clone()),
                 }
             }
@@ -140,7 +131,6 @@ impl IndexFacade {
         };
 
         self.generate_symbol_embeddings();
-        crate::llm::release_cached_service();
         Ok(stats)
     }
 
@@ -163,14 +153,15 @@ impl IndexFacade {
     pub fn index_files(&mut self, root: &Path, paths: &[PathBuf]) -> anyhow::Result<IndexStats> {
         let stats = pipeline::index_files(paths, root, &self.db, &self.config)?;
         self.generate_symbol_embeddings_for_files(paths, root);
-        // Release the ONNX model to free memory arenas (re-acquired on next search)
-        crate::llm::release_cached_service();
         Ok(stats)
     }
 
     /// Get a map of absolute file path → content hash for all indexed files.
     pub fn get_indexed_file_hashes(&self) -> HashMap<String, String> {
-        self.db.get_file_hashes().unwrap_or_default()
+        self.db.get_file_hashes().unwrap_or_else(|e| {
+            tracing::error!("Failed to read file hashes: {e}. All files will be treated as new.");
+            HashMap::new()
+        })
     }
 
     /// Delete a file and all its symbols/relationships from the index.
@@ -297,7 +288,10 @@ impl IndexFacade {
             return HashMap::new();
         }
         let db_ids: Vec<i64> = ids.iter().map(|id| i64::from(id.value())).collect();
-        let db_map = self.db.get_symbols_batch(&db_ids).unwrap_or_default();
+        let db_map = self.db.get_symbols_batch(&db_ids).unwrap_or_else(|e| {
+            tracing::error!("Failed to batch-fetch {} symbols: {e}", db_ids.len());
+            HashMap::new()
+        });
 
         db_map
             .into_iter()
@@ -310,19 +304,28 @@ impl IndexFacade {
 
     /// Find all symbols matching a name (may return multiple across files).
     pub fn find_symbols_by_name(&self, name: &str) -> Vec<Symbol> {
-        self.db.find_symbols_by_name(name).unwrap_or_default()
+        self.db.find_symbols_by_name(name).unwrap_or_else(|e| {
+            tracing::error!("DB error in find_symbols_by_name('{name}'): {e}");
+            Vec::new()
+        })
     }
 
     /// Search symbols by a query string (uses FTS5 trigram for partial matching).
     pub fn search_symbols(&self, query: &str, limit: usize) -> Vec<Symbol> {
-        self.db.search_symbols(query, limit).unwrap_or_default()
+        self.db.search_symbols(query, limit).unwrap_or_else(|e| {
+            tracing::error!("DB error in search_symbols('{query}'): {e}");
+            Vec::new()
+        })
     }
 
     /// Get functions/methods called by the given symbol.
     pub fn get_called_functions(&self, symbol_id: SymbolId) -> Vec<Symbol> {
         self.db
             .get_called_functions(i64::from(symbol_id.value()))
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::error!("DB error in get_called_functions({symbol_id:?}): {e}");
+                Vec::new()
+            })
     }
 
     /// Get functions/methods that call the given symbol.
@@ -332,7 +335,10 @@ impl IndexFacade {
         };
         self.db
             .get_calling_functions(symbol.as_name())
-            .unwrap_or_default()
+            .unwrap_or_else(|e| {
+                tracing::error!("DB error in get_calling_functions({symbol_id:?}): {e}");
+                Vec::new()
+            })
     }
 
     /// Compute the impact radius: all symbols reachable from the given one
@@ -344,7 +350,10 @@ impl IndexFacade {
         let impact = self
             .db
             .get_impact_radius(symbol.as_name(), max_depth as u32)
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                tracing::error!("DB error in get_impact_radius({start:?}): {e}");
+                Vec::new()
+            });
         impact
             .into_iter()
             .map(|s| s.id)

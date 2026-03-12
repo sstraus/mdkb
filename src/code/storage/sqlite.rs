@@ -87,8 +87,12 @@ impl CodeDb {
         mtime: Option<i64>,
     ) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO code_files (path, rel_path, hash, language, mtime, indexed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch())",
+            "INSERT INTO code_files (path, rel_path, hash, language, mtime, indexed_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch()) \
+             ON CONFLICT(path) DO UPDATE SET \
+             rel_path=excluded.rel_path, hash=excluded.hash, \
+             language=excluded.language, mtime=excluded.mtime, \
+             indexed_at=unixepoch()",
             params![path, rel_path, hash, language, mtime],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -96,6 +100,13 @@ impl CodeDb {
 
     /// Delete a file and all its symbols/relationships (via CASCADE).
     pub fn delete_by_file(&self, path: &str) -> rusqlite::Result<usize> {
+        // Delete symbols explicitly first so the FTS5 delete trigger fires.
+        // CASCADE deletes do NOT invoke row-level triggers in SQLite.
+        self.conn.execute(
+            "DELETE FROM code_symbols WHERE file_id = \
+             (SELECT id FROM code_files WHERE path = ?1)",
+            [path],
+        )?;
         self.conn
             .execute("DELETE FROM code_files WHERE path = ?1", [path])
     }
@@ -110,6 +121,22 @@ impl CodeDb {
         for row in rows {
             let (path, hash) = row?;
             map.insert(path, hash);
+        }
+        Ok(map)
+    }
+
+    /// Retrieve stored mtimes keyed by absolute path.
+    pub fn get_file_mtimes(&self) -> rusqlite::Result<HashMap<String, u64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, mtime FROM code_files WHERE mtime IS NOT NULL")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (path, mtime) = row?;
+            map.insert(path, mtime);
         }
         Ok(map)
     }
@@ -232,17 +259,24 @@ impl CodeDb {
     /// For queries shorter than 3 characters, falls back to LIKE.
     pub fn search_symbols(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<Symbol>> {
         if query.len() < 3 {
-            // Trigram requires >= 3 chars; fall back to LIKE
-            let pattern = format!("%{query}%");
+            // Trigram requires >= 3 chars; fall back to LIKE with escaped metacharacters
+            let escaped = query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let pattern = format!("%{escaped}%");
             let mut stmt = self.conn.prepare_cached(
-                &format!("{SYMBOL_COLUMNS} FROM code_symbols WHERE name LIKE ?1 LIMIT ?2"),
+                &format!(
+                    "{SYMBOL_COLUMNS} FROM code_symbols WHERE name LIKE ?1 ESCAPE '\\' LIMIT ?2"
+                ),
             )?;
             let rows = stmt.query_map(params![pattern, limit as i64], |row| row_to_symbol(row))?;
             return rows.collect();
         }
 
-        // FTS5 trigram: quote the query for substring matching
-        let fts_query = format!("\"{query}\"");
+        // FTS5 trigram: escape embedded double-quotes to prevent query injection
+        let escaped = query.replace('"', "\"\"");
+        let fts_query = format!("\"{escaped}\"");
         let mut stmt = self.conn.prepare_cached(SYMBOL_SELECT_FTS)?;
         let rows = stmt.query_map(params![fts_query, limit as i64], |row| row_to_symbol(row))?;
         rows.collect()
@@ -340,8 +374,9 @@ impl CodeDb {
                      SELECT r.from_symbol_id, 0 FROM code_relationships r WHERE r.to_name = ?1 \
                      UNION \
                      SELECT r.from_symbol_id, i.depth + 1 \
-                     FROM code_relationships r \
-                     JOIN impact i ON r.to_name = (SELECT name FROM code_symbols WHERE id = i.sym_id) \
+                     FROM impact i \
+                     JOIN code_symbols cs ON cs.id = i.sym_id \
+                     JOIN code_relationships r ON r.to_name = cs.name \
                      WHERE i.depth < ?2 \
                  ) \
                  SELECT DISTINCT {SYMBOL_COLUMNS_BARE} \
@@ -838,5 +873,95 @@ mod tests {
 
         db.insert_relationship(None, "a", "b", "Calls", file_id, None, None).unwrap();
         assert_eq!(db.relationship_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_get_file_mtimes() {
+        let (_dir, db) = temp_db();
+        db.insert_file("/a", "a", "h1", None, Some(1000)).unwrap();
+        db.insert_file("/b", "b", "h2", None, Some(2000)).unwrap();
+        db.insert_file("/c", "c", "h3", None, None).unwrap();
+
+        let mtimes = db.get_file_mtimes().unwrap();
+        assert_eq!(mtimes.len(), 2); // /c excluded (NULL mtime)
+        assert_eq!(mtimes["/a"], 1000);
+        assert_eq!(mtimes["/b"], 2000);
+    }
+
+    #[test]
+    fn test_fts5_sync_after_symbol_delete() {
+        // Verifies FTS5 index stays in sync when symbols are deleted
+        let (_dir, db) = temp_db();
+        let file_id = insert_test_file(&db);
+        db.insert_symbol("ArchiveService", "Struct", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
+
+        // FTS5 should find it
+        let results = db.search_symbols("Archive", 10).unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Delete the file (which deletes symbols first, firing FTS5 triggers)
+        db.delete_by_file("/abs/test.rs").unwrap();
+
+        // FTS5 should no longer find it
+        let results = db.search_symbols("Archive", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_search_symbols_escapes_quotes() {
+        // FTS5 query with double-quotes should not cause SQL errors
+        let (_dir, db) = temp_db();
+        let file_id = insert_test_file(&db);
+        db.insert_symbol("MyService", "Struct", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
+
+        // Query containing quotes should not panic or error
+        let results = db.search_symbols(r#"My"Service"#, 10).unwrap();
+        // May or may not match depending on escaping, but must not error
+        assert!(results.len() <= 1);
+    }
+
+    #[test]
+    fn test_search_symbols_escapes_like_wildcards() {
+        // LIKE metacharacters should be treated as literals
+        let (_dir, db) = temp_db();
+        let file_id = insert_test_file(&db);
+        db.insert_symbol("go", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol("gx", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
+
+        // "g%" would match both if unescaped; should match neither as literal "g%"
+        let results = db.search_symbols("g%", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_row_to_symbol_unknown_kind_errors() {
+        // Inserting a symbol with a kind that doesn't parse should cause an error on retrieval
+        let (_dir, db) = temp_db();
+        let file_id = insert_test_file(&db);
+        // Insert directly with an invalid kind string
+        db.conn.execute(
+            "INSERT INTO code_symbols (name, kind, file_id, file_path, line_start, visibility) \
+             VALUES ('bad', 'Unicorn', ?1, 'test.rs', 1, 0)",
+            [file_id],
+        ).unwrap();
+
+        // get_symbol should return an error, not silently default
+        let result = db.get_symbol(1);
+        assert!(result.is_err() || result.unwrap().is_none());
+    }
+
+    #[test]
+    fn test_insert_file_upsert_preserves_symbols() {
+        // ON CONFLICT DO UPDATE should not cascade-delete symbols
+        let (_dir, db) = temp_db();
+        let file_id = db.insert_file("/abs/main.rs", "main.rs", "hash1", Some("Rust"), None).unwrap();
+        db.insert_symbol("my_fn", "Function", file_id, "main.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
+        assert_eq!(db.symbol_count().unwrap(), 1);
+
+        // Upsert the same file with a new hash
+        db.insert_file("/abs/main.rs", "main.rs", "hash2", Some("Rust"), None).unwrap();
+
+        // Symbol should still exist (not cascade-deleted by INSERT OR REPLACE)
+        assert_eq!(db.symbol_count().unwrap(), 1);
     }
 }

@@ -2978,7 +2978,7 @@ pub fn handle_code_index(
     let mut facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 
-    if paths.is_empty() {
+    let result = if paths.is_empty() {
         facade
             .index_directory(root)
             .map_err(|e| Error::other(format!("Indexing failed: {}", e)))
@@ -2996,7 +2996,9 @@ pub fn handle_code_index(
             total.errors += stats.errors;
         }
         Ok(total)
-    }
+    };
+    crate::llm::release_cached_service();
+    result
 }
 
 /// Handle `mdkb code search` - fuzzy symbol search.

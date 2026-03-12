@@ -66,10 +66,11 @@ pub struct ParsedFile {
 #[derive(Debug)]
 pub struct FileRegistration {
     pub path: PathBuf,
+    /// Path relative to the indexed root directory (e.g. `src/main.rs`).
+    pub rel_path: Box<str>,
     pub file_id: FileId,
     pub content_hash: String,
     pub language: Language,
-    pub timestamp: u64,
     pub mtime: u64,
 }
 

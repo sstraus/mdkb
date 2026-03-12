@@ -1319,6 +1319,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                     let all_files = crate::code::indexing::walker::discover_files(&startup_root, &startup_server.code_ignore_patterns);
                     facade.reindex_files(&startup_root, &all_files)
                 };
+                crate::llm::release_cached_service();
                 match result {
                     Ok(stats) => {
                         if stats.symbols_indexed > 0 || stats.files_indexed > 0 {
@@ -1568,6 +1569,7 @@ async fn flush_code_batch(
             }
             Err(e) => tracing::error!("Code reindex failed: {}", e),
         }
+        crate::llm::release_cached_service();
     }
 }
 
