@@ -5,6 +5,7 @@
 //! inverse (e.g. Calls/CalledBy) for bidirectional traversal.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 /// The kind of relationship between two symbols.
 ///
@@ -42,6 +43,25 @@ impl RelationKind {
             Self::References => Self::ReferencedBy,
             Self::ReferencedBy => Self::References,
         }
+    }
+}
+
+impl fmt::Display for RelationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Calls => "Calls",
+            Self::CalledBy => "CalledBy",
+            Self::Extends => "Extends",
+            Self::ExtendedBy => "ExtendedBy",
+            Self::Implements => "Implements",
+            Self::ImplementedBy => "ImplementedBy",
+            Self::Uses => "Uses",
+            Self::UsedBy => "UsedBy",
+            Self::Defines => "Defines",
+            Self::DefinedIn => "DefinedIn",
+            Self::References => "References",
+            Self::ReferencedBy => "ReferencedBy",
+        })
     }
 }
 

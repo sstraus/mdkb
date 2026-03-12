@@ -101,9 +101,10 @@ Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectura
 mdkb indexes source code with tree-sitter parsers for **13 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, and GDScript.
 
 The code index supports:
-- **Symbol search** — find functions, structs, methods by name
+- **Substring search** — find symbols by partial name (FTS5 trigram, works from 3 characters)
 - **Semantic code search** — find conceptually similar code using embeddings
-- **Call graph** — trace what a function calls, what calls it, or impact radius
+- **Persistent call graph** — function calls, callers, and transitive impact radius survive restarts
+- **Duplicate prevention** — UNIQUE constraints guarantee one entry per symbol per location
 
 Generate semantic embeddings (downloads ~30MB ONNX model on first run):
 
@@ -198,7 +199,7 @@ All data stays local in `.mdkb/`:
 .mdkb/
 ├── config.toml
 ├── index.sqlite      # FTS5 + document metadata
-├── code-index/       # Tantivy index for source code
+├── code.sqlite       # SQLite index for source code
 └── memory/           # Memory entries (markdown files)
 ```
 
@@ -223,7 +224,7 @@ Configurable via `[code.indexing] ignore_patterns` in `config.toml`.
 The MCP server watches your project for file changes and reindexes automatically:
 
 - **Documents** — on change, the server reconciles each collection against the filesystem. New files are added, modified files re-parsed, and files deleted from disk are removed from the index.
-- **Code** — changed files are batched (30s idle window) and reindexed incrementally. Content hashes skip unchanged files; deleted files are purged from both Tantivy and the vector store.
+- **Code** — changed files are batched (30s idle window) and reindexed incrementally. Content hashes skip unchanged files; deleted files are purged from both SQLite and the vector store.
 - **Startup** — if an index already exists, the server performs an incremental reindex (hash-based diff). A fresh index triggers a full reindex.
 
 The file watcher uses OS-native notifications (`notify` crate) with 100ms debounce. Code exclusion patterns (e.g. `node_modules`) apply to both full and incremental reindexing.

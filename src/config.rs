@@ -196,7 +196,7 @@ pub struct CodeIndexingConfig {
     /// Glob patterns to ignore during indexing.
     pub ignore_patterns: Vec<String>,
 
-    /// Batch size for Tantivy commits.
+    /// Batch size for pipeline commits.
     pub batch_size: usize,
 }
 
@@ -218,7 +218,7 @@ impl Default for CodeConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            index_path: "code-index".to_string(),
+            index_path: "code.sqlite".to_string(),
             indexing: CodeIndexingConfig::default(),
             semantic_search: CodeSemanticSearchConfig::default(),
         }
@@ -429,7 +429,7 @@ const DEFAULT_CODE_IGNORE_PATTERNS: &[&str] = &[
     "**/.venv/**",
 ];
 
-/// Batch size for Tantivy commits during code indexing.
+/// Batch size for pipeline commits during code indexing.
 /// 500 balances memory usage with commit overhead.
 const DEFAULT_CODE_BATCH_SIZE: usize = 500;
 
@@ -817,7 +817,7 @@ default_limit = 20
     fn test_code_config_defaults() {
         let config = Config::default();
         assert!(config.code.enabled);
-        assert_eq!(config.code.index_path, "code-index");
+        assert_eq!(config.code.index_path, "code.sqlite");
         assert_eq!(config.code.indexing.parallelism, 0);
         assert_eq!(config.code.indexing.batch_size, 500);
         assert!(!config.code.indexing.ignore_patterns.is_empty());

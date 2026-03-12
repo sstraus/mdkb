@@ -460,7 +460,7 @@ async fn main() -> Result<()> {
             match cmd {
                 CodeCommand::Init => {
                     mdkb::cli::handlers::handle_code_init(&cwd)?;
-                    println!("Initialized code index at .mdkb/code-index/");
+                    println!("Initialized code index at .mdkb/code.sqlite");
                 }
                 CodeCommand::Index { paths } => {
                     let stats = mdkb::cli::handlers::handle_code_index(&cwd, &paths)?;

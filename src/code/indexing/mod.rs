@@ -4,69 +4,60 @@
 //! using crossbeam channels for stage-to-stage communication.
 //!
 //! The main entry point is [`IndexFacade`], which wraps the pipeline and
-//! provides query methods over the Tantivy index.
+//! provides query methods over the SQLite index.
 
 pub mod hasher;
 pub mod pipeline;
 pub mod types;
 pub mod walker;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, QueryParser, TermQuery};
-use tantivy::schema::{IndexRecordOption, Value};
-use tantivy::Term;
-
-use crate::code::relationship::RelationKind;
 use crate::code::semantic::{SemanticSearch, format_symbol_text};
-use crate::code::storage::CodeIndex;
-use crate::code::symbol::{Symbol, Visibility};
-use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
+use crate::code::storage::CodeDb;
+use crate::code::symbol::Symbol;
+use crate::code::types::SymbolId;
 
 use self::pipeline::PipelineConfig;
-use self::types::{IndexStats, UnresolvedRelationship};
+use self::types::IndexStats;
 
-/// Facade over the indexing pipeline and Tantivy queries.
+/// Facade over the indexing pipeline and SQLite queries.
 ///
-/// Owns the code index and provides both mutation (indexing) and
+/// Owns the code database and provides both mutation (indexing) and
 /// query (search, graph traversal) operations.
 #[derive(Debug)]
 pub struct IndexFacade {
-    index: CodeIndex,
+    db: CodeDb,
     config: PipelineConfig,
-    unresolved: Vec<UnresolvedRelationship>,
     semantic: Option<SemanticSearch>,
     /// false = not yet attempted to initialize semantic search.
     semantic_initialized: bool,
 }
 
 impl IndexFacade {
-    /// Create a new facade with an index at the given path.
+    /// Create a new facade with a database at the given path.
     ///
     /// The ONNX embedding model is NOT loaded until first use
     /// (lazy initialization to save ~300-800 MB per idle instance).
-    pub fn create(index_path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let index = CodeIndex::create(index_path)?;
+    pub fn create(db_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let db = CodeDb::create(db_path)?;
         Ok(Self {
-            index,
+            db,
             config: PipelineConfig::default(),
-            unresolved: Vec::new(),
             semantic: None,
             semantic_initialized: false,
         })
     }
 
-    /// Open an existing index, or create one if it doesn't exist.
+    /// Open an existing database, or create one if it doesn't exist.
     ///
     /// The ONNX embedding model is NOT loaded until first use.
-    pub fn open_or_create(index_path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let index = CodeIndex::open_or_create(index_path)?;
+    pub fn open_or_create(db_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let db = CodeDb::open_or_create(db_path)?;
         Ok(Self {
-            index,
+            db,
             config: PipelineConfig::default(),
-            unresolved: Vec::new(),
             semantic: None,
             semantic_initialized: false,
         })
@@ -84,9 +75,14 @@ impl IndexFacade {
     fn ensure_semantic(&mut self) -> Option<&SemanticSearch> {
         if !self.semantic_initialized {
             self.semantic_initialized = true;
-            self.semantic = init_semantic(self.index.path());
+            self.semantic = init_semantic(self.db.path());
         }
         self.semantic.as_ref()
+    }
+
+    /// Get a reference to the underlying database.
+    pub fn db(&self) -> &CodeDb {
+        &self.db
     }
 
     // -----------------------------------------------------------------------
@@ -95,15 +91,14 @@ impl IndexFacade {
 
     /// Index all source files under the given directory.
     ///
-    /// Uses content hashes to skip unchanged files and deletes stale docs
+    /// Uses content hashes to skip unchanged files and deletes stale entries
     /// for changed files before re-indexing, preventing duplicates.
     pub fn index_directory(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
-        // Get hashes of already-indexed files to detect changes
-        let indexed_hashes = self.get_indexed_file_hashes();
+        let indexed_hashes = self.db.get_file_hashes()?;
 
-        let (stats, unresolved) = if indexed_hashes.is_empty() {
+        let stats = if indexed_hashes.is_empty() {
             // Fresh index — no dedup needed
-            pipeline::index_directory(root, &self.index, &self.config)?
+            pipeline::index_directory(root, &self.db, &self.config)?
         } else {
             // Incremental — discover files, filter changed, delete stale, re-index
             let discovered = walker::discover_files(root, &self.config.ignore_patterns);
@@ -130,15 +125,14 @@ impl IndexFacade {
                 });
             }
 
-            // Delete stale docs for changed files
+            // Delete stale entries for changed files
             for path in &changed {
                 self.delete_by_file(path, root)?;
             }
 
-            pipeline::index_files(&changed, root, &self.index, &self.config)?
+            pipeline::index_files(&changed, root, &self.db, &self.config)?
         };
 
-        self.unresolved.extend(unresolved);
         self.generate_symbol_embeddings();
         crate::llm::release_cached_service();
         Ok(stats)
@@ -146,21 +140,13 @@ impl IndexFacade {
 
     /// Re-index a directory (full reindex, discarding previous data).
     pub fn reindex(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
-        // Clear existing data by deleting all documents.
-        // Scope the writer so it's dropped before index_directory creates a new one.
-        {
-            let mut writer = self.index.writer()?;
-            writer.delete_all_documents()?;
-            writer.commit()?;
-        }
-        self.unresolved.clear();
+        self.db.clear()?;
         // Only clear semantic if already initialized (don't trigger lazy load for a clear)
         if let Some(ref semantic) = self.semantic {
             if let Err(e) = semantic.clear() {
                 tracing::error!("Failed to clear semantic index: {e}. Impact: old embeddings may persist.");
             }
         }
-        self.index.reload()?;
 
         self.index_directory(root)
     }
@@ -169,8 +155,7 @@ impl IndexFacade {
     ///
     /// Like `index_directory` but takes explicit file paths instead of walking.
     pub fn index_files(&mut self, root: &Path, paths: &[PathBuf]) -> anyhow::Result<IndexStats> {
-        let (stats, unresolved) = pipeline::index_files(paths, root, &self.index, &self.config)?;
-        self.unresolved.extend(unresolved);
+        let stats = pipeline::index_files(paths, root, &self.db, &self.config)?;
         self.generate_symbol_embeddings_for_files(paths, root);
         // Release the ONNX model to free memory arenas (re-acquired on next search)
         crate::llm::release_cached_service();
@@ -179,53 +164,17 @@ impl IndexFacade {
 
     /// Get a map of absolute file path → content hash for all indexed files.
     pub fn get_indexed_file_hashes(&self) -> HashMap<String, String> {
-        let searcher = self.index.reader().searcher();
-        let schema = self.index.schema();
-
-        let type_term = Term::from_field_text(schema.doc_type, "file");
-        let query = TermQuery::new(type_term, IndexRecordOption::Basic);
-
-        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(1_000_000)) else {
-            return HashMap::new();
-        };
-
-        let mut result = HashMap::new();
-        for (_score, addr) in top {
-            let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(addr) else {
-                continue;
-            };
-            let path = doc_get_text(&doc, schema.file_path);
-            let hash = doc_get_text(&doc, schema.file_hash);
-            if let (Some(p), Some(h)) = (path, hash) {
-                result.insert(p, h);
-            }
-        }
-        result
+        self.db.get_file_hashes().unwrap_or_default()
     }
 
-    /// Delete all Tantivy docs (file registration + symbols) for a given file.
-    ///
-    /// Issues delete_term calls for both absolute path (file registration docs)
-    /// and relative path (symbol docs), then clears related unresolved relationships.
-    pub fn delete_by_file(&mut self, file_path: &Path, root: &Path) -> anyhow::Result<()> {
-        let schema = self.index.schema();
+    /// Delete a file and all its symbols/relationships from the index.
+    pub fn delete_by_file(&mut self, file_path: &Path, _root: &Path) -> anyhow::Result<()> {
         let abs_path = file_path.to_string_lossy().to_string();
-        let rel_path = file_path
-            .strip_prefix(root)
-            .unwrap_or(file_path)
-            .to_string_lossy()
-            .to_string();
 
         // Collect symbol IDs before deleting (for embedding cleanup)
-        let symbol_ids = self.get_symbol_ids_for_path(&rel_path);
+        let symbol_ids = self.get_symbol_ids_for_path(file_path);
 
-        let mut writer = self.index.writer()?;
-        // Delete file registration doc (stored with absolute path)
-        writer.delete_term(Term::from_field_text(schema.file_path, &abs_path));
-        // Delete symbol docs (stored with relative path)
-        writer.delete_term(Term::from_field_text(schema.file_path, &rel_path));
-        writer.commit()?;
-        self.index.reload()?;
+        self.db.delete_by_file(&abs_path)?;
 
         // Only remove embeddings if semantic is already initialized;
         // avoid triggering lazy model load (~300-800 MB) for a delete operation.
@@ -242,43 +191,17 @@ impl IndexFacade {
         Ok(())
     }
 
-    /// Get symbol IDs for all symbols in a file (by relative path).
-    fn get_symbol_ids_for_path(&self, rel_path: &str) -> HashSet<u32> {
-        let searcher = self.index.reader().searcher();
-        let schema = self.index.schema();
-
-        let path_term = Term::from_field_text(schema.file_path, rel_path);
-        let type_term = Term::from_field_text(schema.doc_type, "symbol");
-
-        let query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(TermQuery::new(path_term, IndexRecordOption::Basic))),
-            (Occur::Must, Box::new(TermQuery::new(type_term, IndexRecordOption::Basic))),
-        ]);
-
-        let top = match searcher.search(&query, &TopDocs::with_limit(100_000)) {
-            Ok(top) => top,
-            Err(e) => {
-                tracing::error!(
-                    rel_path,
-                    error = %e,
-                    "Tantivy search failed in get_symbol_ids_for_path — embeddings will not be cleaned"
-                );
-                return HashSet::new();
-            }
-        };
-
-        let mut ids = HashSet::new();
-        for (_score, addr) in top {
-            if let Ok(doc) = searcher.doc::<tantivy::TantivyDocument>(addr) {
-                if let Some(id) = doc.get_first(schema.symbol_id)
-                    .and_then(|v| v.as_u64())
-                    .and_then(|v| u32::try_from(v).ok())
-                {
-                    ids.insert(id);
-                }
-            }
-        }
-        ids
+    /// Get symbol IDs for all symbols in a file.
+    fn get_symbol_ids_for_path(&self, file_path: &Path) -> HashSet<u32> {
+        // Find all symbols for this file by checking file_path in code_files
+        let all = self.db.all_symbols().unwrap_or_default();
+        all.into_iter()
+            .filter(|s| {
+                // Match on either the stored abs path or the relative file_path
+                file_path.ends_with(&*s.file_path)
+            })
+            .map(|s| s.id.value())
+            .collect()
     }
 
     /// Incrementally reindex only changed files.
@@ -287,7 +210,7 @@ impl IndexFacade {
     /// Only re-parses and re-indexes files whose content hash has changed.
     /// Files that no longer exist on disk are removed from the index.
     pub fn reindex_files(&mut self, root: &Path, paths: &[PathBuf]) -> anyhow::Result<IndexStats> {
-        let indexed_hashes = self.get_indexed_file_hashes();
+        let indexed_hashes = self.db.get_file_hashes()?;
 
         let mut changed: Vec<PathBuf> = Vec::new();
         let mut deleted: Vec<PathBuf> = Vec::new();
@@ -344,232 +267,81 @@ impl IndexFacade {
         self.index_files(root, &changed)
     }
 
-    /// Access unresolved relationships (for future resolution phases).
-    pub fn unresolved_relationships(&self) -> &[UnresolvedRelationship] {
-        &self.unresolved
-    }
-
     // -----------------------------------------------------------------------
     // Query operations
     // -----------------------------------------------------------------------
 
     /// Find a symbol by exact name. Returns the first match.
     pub fn get_symbol_by_name(&self, name: &str) -> Option<Symbol> {
-        let searcher = self.index.reader().searcher();
-        let schema = self.index.schema();
-
-        let name_term = Term::from_field_text(schema.name, name);
-        let type_term = Term::from_field_text(schema.doc_type, "symbol");
-
-        let query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(TermQuery::new(name_term, IndexRecordOption::Basic))),
-            (Occur::Must, Box::new(TermQuery::new(type_term, IndexRecordOption::Basic))),
-        ]);
-
-        let top = searcher.search(&query, &TopDocs::with_limit(1)).ok()?;
-        let (_score, addr) = top.into_iter().next()?;
-        let doc = searcher.doc::<tantivy::TantivyDocument>(addr).ok()?;
-        doc_to_symbol(&doc, schema)
+        self.db.find_symbols_by_name(name).ok()?.into_iter().next()
     }
 
     /// Find a symbol by its ID.
     pub fn get_symbol(&self, id: SymbolId) -> Option<Symbol> {
-        let searcher = self.index.reader().searcher();
-        let schema = self.index.schema();
-
-        let id_term = Term::from_field_u64(schema.symbol_id, u64::from(id.value()));
-        let type_term = Term::from_field_text(schema.doc_type, "symbol");
-
-        let query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(TermQuery::new(id_term, IndexRecordOption::Basic))),
-            (Occur::Must, Box::new(TermQuery::new(type_term, IndexRecordOption::Basic))),
-        ]);
-
-        let top = searcher.search(&query, &TopDocs::with_limit(1)).ok()?;
-        let (_score, addr) = top.into_iter().next()?;
-        let doc = searcher.doc::<tantivy::TantivyDocument>(addr).ok()?;
-        doc_to_symbol(&doc, schema)
+        self.db.get_symbol(i64::from(id.value())).ok()?
     }
 
-    /// Fetch multiple symbols by ID in a single Tantivy query.
+    /// Fetch multiple symbols by ID in a single query.
     ///
     /// Returns a map of SymbolId → Symbol. IDs not found are silently omitted.
     pub fn get_symbols_batch(&self, ids: &[SymbolId]) -> HashMap<SymbolId, Symbol> {
         if ids.is_empty() {
             return HashMap::new();
         }
-        let searcher = self.index.reader().searcher();
-        let schema = self.index.schema();
+        let db_ids: Vec<i64> = ids.iter().map(|id| i64::from(id.value())).collect();
+        let db_map = self.db.get_symbols_batch(&db_ids).unwrap_or_default();
 
-        // OR across all symbol IDs
-        let id_clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = ids
-            .iter()
-            .map(|id| {
-                let term = Term::from_field_u64(schema.symbol_id, u64::from(id.value()));
-                (Occur::Should, Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn tantivy::query::Query>)
-            })
-            .collect();
-
-        let query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(BooleanQuery::new(id_clauses)) as Box<dyn tantivy::query::Query>),
-            (Occur::Must, Box::new(TermQuery::new(
-                Term::from_field_text(schema.doc_type, "symbol"),
-                IndexRecordOption::Basic,
-            )) as Box<dyn tantivy::query::Query>),
-        ]);
-
-        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(ids.len())) else {
-            return HashMap::new();
-        };
-
-        top.into_iter()
-            .filter_map(|(_score, addr)| {
-                let doc = searcher.doc::<tantivy::TantivyDocument>(addr).ok()?;
-                let symbol = doc_to_symbol(&doc, schema)?;
-                Some((symbol.id, symbol))
+        db_map
+            .into_iter()
+            .filter_map(|(db_id, sym)| {
+                let sid = SymbolId::new(db_id as u32)?;
+                Some((sid, sym))
             })
             .collect()
     }
 
     /// Find all symbols matching a name (may return multiple across files).
     pub fn find_symbols_by_name(&self, name: &str) -> Vec<Symbol> {
-        let searcher = self.index.reader().searcher();
-        let schema = self.index.schema();
-
-        let name_term = Term::from_field_text(schema.name, name);
-        let type_term = Term::from_field_text(schema.doc_type, "symbol");
-
-        let query = BooleanQuery::new(vec![
-            (Occur::Must, Box::new(TermQuery::new(name_term, IndexRecordOption::Basic))),
-            (Occur::Must, Box::new(TermQuery::new(type_term, IndexRecordOption::Basic))),
-        ]);
-
-        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(100)) else {
-            return Vec::new();
-        };
-
-        top.into_iter()
-            .filter_map(|(_score, addr)| {
-                let doc = searcher.doc::<tantivy::TantivyDocument>(addr).ok()?;
-                doc_to_symbol(&doc, schema)
-            })
-            .collect()
+        self.db.find_symbols_by_name(name).unwrap_or_default()
     }
 
-    /// Search symbols by a query string (uses ngram tokenizer for partial matching).
+    /// Search symbols by a query string (uses FTS5 trigram for partial matching).
     pub fn search_symbols(&self, query: &str, limit: usize) -> Vec<Symbol> {
-        let searcher = self.index.reader().searcher();
-        let schema = self.index.schema();
-
-        let parser = QueryParser::for_index(
-            self.index.index(),
-            vec![schema.name_text, schema.doc_comment, schema.signature],
-        );
-
-        let Ok(parsed) = parser.parse_query(query) else {
-            return Vec::new();
-        };
-
-        // Combine with doc_type filter
-        let type_term = Term::from_field_text(schema.doc_type, "symbol");
-        let combined = BooleanQuery::new(vec![
-            (Occur::Must, parsed),
-            (Occur::Must, Box::new(TermQuery::new(type_term, IndexRecordOption::Basic))),
-        ]);
-
-        let Ok(top) = searcher.search(&combined, &TopDocs::with_limit(limit)) else {
-            return Vec::new();
-        };
-
-        top.into_iter()
-            .filter_map(|(_score, addr)| {
-                let doc = searcher.doc::<tantivy::TantivyDocument>(addr).ok()?;
-                doc_to_symbol(&doc, schema)
-            })
-            .collect()
+        self.db.search_symbols(query, limit).unwrap_or_default()
     }
 
-    /// Get functions/methods called by the given symbol (via unresolved relationships).
+    /// Get functions/methods called by the given symbol.
     pub fn get_called_functions(&self, symbol_id: SymbolId) -> Vec<Symbol> {
-        self.resolve_relationship_targets(symbol_id, RelationKind::Calls)
+        self.db
+            .get_called_functions(i64::from(symbol_id.value()))
+            .unwrap_or_default()
     }
 
     /// Get functions/methods that call the given symbol.
     pub fn get_calling_functions(&self, symbol_id: SymbolId) -> Vec<Symbol> {
-        // Look for relationships where to_name matches our symbol
         let Some(symbol) = self.get_symbol(symbol_id) else {
             return Vec::new();
         };
-
-        self.unresolved
-            .iter()
-            .filter(|r| r.kind == RelationKind::Calls && &*r.to_name == symbol.as_name())
-            .filter_map(|r| r.from_id)
-            .filter_map(|id| self.get_symbol(id))
-            .collect()
+        self.db
+            .get_calling_functions(symbol.as_name())
+            .unwrap_or_default()
     }
 
     /// Compute the impact radius: all symbols reachable from the given one
-    /// within `max_depth` hops via any relationship.
+    /// within `max_depth` hops via call relationships.
     pub fn get_impact_radius(&self, start: SymbolId, max_depth: usize) -> Vec<SymbolId> {
-        // Build adjacency list once to avoid N+1 Tantivy queries during graph walk
-        let adjacency = self.build_adjacency_list();
-
-        let mut visited = HashSet::new();
-        let mut queue = VecDeque::new();
-        visited.insert(start);
-        queue.push_back((start, 0usize));
-
-        while let Some((current, depth)) = queue.pop_front() {
-            if depth >= max_depth {
-                continue;
-            }
-
-            // Use hash lookup instead of querying Tantivy for each edge
-            if let Some(targets) = adjacency.get(&current) {
-                for &target in targets {
-                    if visited.insert(target) {
-                        queue.push_back((target, depth + 1));
-                    }
-                }
-            }
-        }
-
-        visited.into_iter().filter(|&id| id != start).collect()
-    }
-
-    /// Build an adjacency list from unresolved relationships for efficient graph traversal.
-    ///
-    /// Returns a HashMap<SymbolId, Vec<SymbolId>> mapping source symbols to target symbols.
-    /// Resolves target names to IDs via batch Tantivy queries.
-    fn build_adjacency_list(&self) -> std::collections::HashMap<SymbolId, Vec<SymbolId>> {
-        let mut adjacency: std::collections::HashMap<SymbolId, Vec<SymbolId>> =
-            std::collections::HashMap::new();
-
-        // Build a cache of name -> Vec<SymbolId> to minimize Tantivy queries
-        let mut name_cache: std::collections::HashMap<&str, Vec<SymbolId>> =
-            std::collections::HashMap::new();
-
-        for rel in &self.unresolved {
-            let Some(from_id) = rel.from_id else {
-                continue;
-            };
-
-            // Look up target IDs, caching results
-            let target_ids = name_cache.entry(&rel.to_name).or_insert_with(|| {
-                self.find_symbols_by_name(&rel.to_name)
-                    .into_iter()
-                    .map(|s| s.id)
-                    .collect()
-            });
-
-            adjacency
-                .entry(from_id)
-                .or_default()
-                .extend(target_ids.iter().copied());
-        }
-
-        adjacency
+        let Some(symbol) = self.get_symbol(start) else {
+            return Vec::new();
+        };
+        let impact = self
+            .db
+            .get_impact_radius(symbol.as_name(), max_depth as u32)
+            .unwrap_or_default();
+        impact
+            .into_iter()
+            .map(|s| s.id)
+            .filter(|&id| id != start)
+            .collect()
     }
 
     // -----------------------------------------------------------------------
@@ -586,8 +358,6 @@ impl IndexFacade {
         limit: usize,
         threshold: f32,
     ) -> anyhow::Result<Vec<(Symbol, f32)>> {
-        // ensure_semantic() borrows &mut self for lazy init. We check is_none() and
-        // re-borrow as &self via as_ref().unwrap() to release the &mut borrow.
         if self.ensure_semantic().is_none() {
             return Ok(Vec::new());
         }
@@ -595,7 +365,7 @@ impl IndexFacade {
 
         let matches = semantic.search(query, limit, threshold)?;
 
-        // Batch-fetch all symbols in a single Tantivy query instead of N+1
+        // Batch-fetch all symbols
         let ids: Vec<SymbolId> = matches
             .iter()
             .filter_map(|m| SymbolId::new(m.symbol_id))
@@ -615,9 +385,6 @@ impl IndexFacade {
     }
 
     /// Check if semantic search is available.
-    ///
-    /// Returns true if the embedding service was initialized successfully
-    /// and the vector store is accessible. Triggers lazy initialization.
     pub fn has_semantic_search(&mut self) -> bool {
         self.ensure_semantic().is_some()
     }
@@ -636,17 +403,17 @@ impl IndexFacade {
 
     /// Total number of indexed symbols.
     pub fn symbol_count(&self) -> u64 {
-        count_by_type(&self.index, "symbol")
+        self.db.symbol_count().unwrap_or(0)
     }
 
     /// Total number of indexed files.
     pub fn file_count(&self) -> u64 {
-        count_by_type(&self.index, "file")
+        self.db.file_count().unwrap_or(0)
     }
 
-    /// Total number of collected relationships (unresolved).
+    /// Total number of persisted relationships.
     pub fn relationship_count(&self) -> usize {
-        self.unresolved.len()
+        self.db.relationship_count().unwrap_or(0) as usize
     }
 
     // -----------------------------------------------------------------------
@@ -655,7 +422,6 @@ impl IndexFacade {
 
     /// Generate embeddings only for symbols in the given files.
     fn generate_symbol_embeddings_for_files(&mut self, paths: &[PathBuf], root: &Path) {
-        // ensure_semantic() borrows &mut self; unwrap() re-borrows as &self.
         if self.ensure_semantic().is_none() {
             return;
         }
@@ -671,7 +437,9 @@ impl IndexFacade {
             .collect();
 
         let symbols: Vec<Symbol> = self
-            .all_symbols(100_000)
+            .db
+            .all_symbols()
+            .unwrap_or_default()
             .into_iter()
             .filter(|s| rel_paths.contains(&*s.file_path))
             .collect();
@@ -713,13 +481,12 @@ impl IndexFacade {
 
     /// Generate embeddings for all indexed symbols and write to the vector store.
     fn generate_symbol_embeddings(&mut self) {
-        // ensure_semantic() borrows &mut self; unwrap() re-borrows as &self.
         if self.ensure_semantic().is_none() {
             return;
         }
         let semantic = self.semantic.as_ref().unwrap();
 
-        let symbols = self.all_symbols(100_000);
+        let symbols = self.db.all_symbols().unwrap_or_default();
         if symbols.is_empty() {
             return;
         }
@@ -745,50 +512,19 @@ impl IndexFacade {
             );
         }
     }
-
-    /// Query all symbol documents from the Tantivy index.
-    fn all_symbols(&self, limit: usize) -> Vec<Symbol> {
-        let searcher = self.index.reader().searcher();
-        let schema = self.index.schema();
-
-        let type_term = Term::from_field_text(schema.doc_type, "symbol");
-        let query = TermQuery::new(type_term, IndexRecordOption::Basic);
-
-        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(limit)) else {
-            return Vec::new();
-        };
-
-        top.into_iter()
-            .filter_map(|(_score, addr)| {
-                let doc = searcher.doc::<tantivy::TantivyDocument>(addr).ok()?;
-                doc_to_symbol(&doc, schema)
-            })
-            .collect()
-    }
-
-    /// Resolve relationship targets for a given source symbol and relation kind.
-    fn resolve_relationship_targets(&self, source: SymbolId, kind: RelationKind) -> Vec<Symbol> {
-        self.unresolved
-            .iter()
-            .filter(|r| r.from_id == Some(source) && r.kind == kind)
-            .filter_map(|r| {
-                let targets = self.find_symbols_by_name(&r.to_name);
-                targets.into_iter().next()
-            })
-            .collect()
-    }
 }
 
 // ---------------------------------------------------------------------------
 // Semantic search initialization
 // ---------------------------------------------------------------------------
 
-/// Try to initialize `SemanticSearch` at `{index_path}/vectors.bin`.
+/// Try to initialize `SemanticSearch` at `{db_path}/../vectors.bin`.
 ///
 /// Returns `None` if initialization fails (logged as error with impact).
 /// Does NOT load the ONNX model — that happens lazily on first use.
-fn init_semantic(index_path: &Path) -> Option<SemanticSearch> {
-    let vectors_path = index_path.join("vectors.bin");
+fn init_semantic(db_path: &Path) -> Option<SemanticSearch> {
+    // vectors.bin lives next to code.sqlite in the .mdkb directory
+    let vectors_path = db_path.parent()?.join("vectors.bin");
     match SemanticSearch::new(&vectors_path) {
         Ok(s) => Some(s),
         Err(e) => {
@@ -798,103 +534,6 @@ fn init_semantic(index_path: &Path) -> Option<SemanticSearch> {
             );
             None
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Document → Symbol conversion
-// ---------------------------------------------------------------------------
-
-/// Extract a Symbol from a Tantivy document.
-fn doc_to_symbol(
-    doc: &tantivy::TantivyDocument,
-    schema: &crate::code::storage::IndexSchema,
-) -> Option<Symbol> {
-    use tantivy::schema::OwnedValue;
-
-    let get_text = |field| -> Option<String> {
-        let owned: OwnedValue = doc.get_first(field)?.into();
-        match owned {
-            OwnedValue::Str(s) => Some(s),
-            _ => None,
-        }
-    };
-
-    let get_u64 = |field| -> Option<u64> {
-        let owned: OwnedValue = doc.get_first(field)?.into();
-        match owned {
-            OwnedValue::U64(n) => Some(n),
-            _ => None,
-        }
-    };
-
-    let symbol_id = SymbolId::new(get_u64(schema.symbol_id)? as u32)?;
-    let name = get_text(schema.name)?;
-    let kind_str = get_text(schema.kind)?;
-    let kind: SymbolKind = kind_str.parse().ok()?;
-    let file_id = FileId::new(get_u64(schema.file_id)? as u32)?;
-    let file_path = get_text(schema.file_path)?;
-
-    let start_line = get_u64(schema.line_number).unwrap_or(0) as u32;
-    let start_col = get_u64(schema.column).unwrap_or(0) as u16;
-    let end_line = get_u64(schema.end_line).unwrap_or(0) as u32;
-    let end_col = get_u64(schema.end_column).unwrap_or(0) as u16;
-
-    let visibility_num = get_u64(schema.visibility).unwrap_or(0);
-    let visibility = match visibility_num {
-        0 => Visibility::Public,
-        1 => Visibility::Crate,
-        2 => Visibility::Module,
-        _ => Visibility::Private,
-    };
-
-    let mut symbol = Symbol {
-        id: symbol_id,
-        name: name.into(),
-        kind,
-        file_id,
-        range: Range::new(start_line, start_col, end_line, end_col),
-        file_path: file_path.into(),
-        signature: None,
-        doc_comment: None,
-        module_path: None,
-        visibility,
-        scope_context: None,
-    };
-
-    if let Some(sig) = get_text(schema.signature) {
-        symbol.signature = Some(sig.into());
-    }
-    if let Some(doc) = get_text(schema.doc_comment) {
-        symbol.doc_comment = Some(doc.into());
-    }
-    if let Some(module) = get_text(schema.module_path) {
-        symbol.module_path = Some(module.into());
-    }
-
-    Some(symbol)
-}
-
-/// Extract a text field value from a Tantivy document.
-fn doc_get_text(doc: &tantivy::TantivyDocument, field: tantivy::schema::Field) -> Option<String> {
-    use tantivy::schema::OwnedValue;
-    let owned: OwnedValue = doc.get_first(field)?.into();
-    match owned {
-        OwnedValue::Str(s) => Some(s),
-        _ => None,
-    }
-}
-
-/// Count documents of a given type in the index.
-fn count_by_type(index: &CodeIndex, doc_type: &str) -> u64 {
-    let searcher = index.reader().searcher();
-    let schema = index.schema();
-    let term = Term::from_field_text(schema.doc_type, doc_type);
-    let query = TermQuery::new(term, IndexRecordOption::Basic);
-
-    match searcher.search(&query, &tantivy::collector::Count) {
-        Ok(count) => count as u64,
-        Err(_) => 0,
     }
 }
 
@@ -909,8 +548,8 @@ mod tests {
 
     #[test]
     fn test_facade_create_does_not_load_model() {
-        let idx_dir = tempfile::tempdir().unwrap();
-        let facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let facade = IndexFacade::create(dir.path().join("code.sqlite")).unwrap();
 
         // Semantic should NOT be initialized on construction (lazy)
         assert!(!facade.semantic_initialized, "semantic should not be initialized on create");
@@ -919,8 +558,8 @@ mod tests {
 
     #[test]
     fn test_facade_open_or_create_does_not_load_model() {
-        let idx_dir = tempfile::tempdir().unwrap();
-        let facade = IndexFacade::open_or_create(idx_dir.path().join("idx")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let facade = IndexFacade::open_or_create(dir.path().join("code.sqlite")).unwrap();
 
         assert!(!facade.semantic_initialized, "semantic should not be initialized on open_or_create");
         assert!(facade.semantic.is_none(), "semantic should be None on open_or_create");
@@ -943,8 +582,8 @@ pub fn world() {
         )
         .unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         let stats = facade.index_directory(src_dir.path()).unwrap();
 
         assert_eq!(stats.files_indexed, 1);
@@ -958,8 +597,8 @@ pub fn world() {
         let src_dir = tempfile::tempdir().unwrap();
         fs::write(src_dir.path().join("lib.rs"), "pub fn unique_symbol_name() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         let sym = facade.get_symbol_by_name("unique_symbol_name");
@@ -972,8 +611,8 @@ pub fn world() {
         let src_dir = tempfile::tempdir().unwrap();
         fs::write(src_dir.path().join("lib.rs"), "pub fn my_func() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         let sym = facade.get_symbol_by_name("my_func").unwrap();
@@ -991,8 +630,8 @@ pub fn world() {
         )
         .unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         let a = facade.get_symbol_by_name("alpha").unwrap();
@@ -1022,8 +661,8 @@ pub fn world() {
         fs::write(src_dir.path().join("a.rs"), "pub fn shared_name() {}").unwrap();
         fs::write(src_dir.path().join("b.rs"), "pub fn shared_name() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         let syms = facade.find_symbols_by_name("shared_name");
@@ -1039,8 +678,8 @@ pub fn world() {
         )
         .unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         let results = facade.search_symbols("calculate", 10);
@@ -1053,8 +692,8 @@ pub fn world() {
         let src_dir = tempfile::tempdir().unwrap();
         fs::write(src_dir.path().join("lib.rs"), "fn original() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
         assert!(facade.get_symbol_by_name("original").is_some());
 
@@ -1078,11 +717,11 @@ pub fn world() {
         )
         .unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
-        assert!(facade.relationship_count() > 0);
+        assert!(facade.relationship_count() > 0, "relationships should be persisted");
     }
 
     #[test]
@@ -1092,8 +731,8 @@ pub fn world() {
         fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
         fs::write(src_dir.path().join("c.rs"), "pub fn ccc() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         let hashes = facade.get_indexed_file_hashes();
@@ -1112,8 +751,8 @@ pub fn world() {
         fs::write(src_dir.path().join("keep.rs"), "pub fn keep_me() {}").unwrap();
         fs::write(src_dir.path().join("remove.rs"), "pub fn remove_me() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         assert!(facade.get_symbol_by_name("keep_me").is_some());
@@ -1134,8 +773,8 @@ pub fn world() {
         let src_dir = tempfile::tempdir().unwrap();
         fs::write(src_dir.path().join("lib.rs"), "pub fn foo() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         assert!(facade.get_symbol_by_name("foo").is_some());
@@ -1157,8 +796,8 @@ pub fn world() {
         fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
         fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         // Reindex without changing anything
@@ -1180,8 +819,8 @@ pub fn world() {
         fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
         fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
         assert!(facade.get_symbol_by_name("aaa").is_some());
@@ -1202,8 +841,8 @@ pub fn world() {
         let src_dir = tempfile::tempdir().unwrap();
         fs::write(src_dir.path().join("lib.rs"), "pub fn foo() {}\npub fn bar() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
 
         let stats1 = facade.index_directory(src_dir.path()).unwrap();
         assert_eq!(stats1.symbols_indexed, 2);
