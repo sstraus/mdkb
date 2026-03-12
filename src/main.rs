@@ -1513,21 +1513,17 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
                 "files_indexed": stats.files_indexed,
                 "symbols_indexed": stats.symbols_indexed,
                 "relationships_collected": stats.relationships_collected,
-                "files_skipped": stats.files_skipped,
-                "errors": stats.errors,
             });
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
         }
         OutputFormat::Csv => {
-            println!("files_discovered,files_indexed,symbols_indexed,relationships,skipped,errors");
+            println!("files_discovered,files_indexed,symbols_indexed,relationships");
             println!(
-                "{},{},{},{},{},{}",
+                "{},{},{},{}",
                 stats.files_discovered,
                 stats.files_indexed,
                 stats.symbols_indexed,
                 stats.relationships_collected,
-                stats.files_skipped,
-                stats.errors,
             );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
@@ -1535,12 +1531,6 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
             println!("Files indexed:    {}", stats.files_indexed);
             println!("Symbols indexed:  {}", stats.symbols_indexed);
             println!("Relationships:    {}", stats.relationships_collected);
-            if stats.files_skipped > 0 {
-                println!("Files skipped:    {}", stats.files_skipped);
-            }
-            if stats.errors > 0 {
-                println!("Errors:           {}", stats.errors);
-            }
         }
     }
 }

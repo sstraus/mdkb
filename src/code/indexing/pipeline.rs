@@ -19,7 +19,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 use crate::code::indexing::hasher;
 use crate::code::indexing::types::{
     FileContent, FileRegistration, IndexBatch, IndexStats, ParsedFile, RawRelationship,
-    RawSymbol, UnresolvedRelationship,
+    RawSymbol, CollectedRelationship,
 };
 use crate::code::indexing::walker;
 use crate::code::parsing::c_lang::CParser;
@@ -27,7 +27,6 @@ use crate::code::parsing::cpp::CppParser;
 use crate::code::parsing::csharp::CSharpParser;
 use crate::code::parsing::gdscript::GdscriptParser;
 use crate::code::parsing::go::GoParser;
-use crate::code::parsing::import::Import;
 use crate::code::parsing::java::JavaParser;
 use crate::code::parsing::kotlin::KotlinParser;
 use crate::code::parsing::language::Language;
@@ -41,7 +40,7 @@ use crate::code::parsing::typescript::TypeScriptParser;
 use crate::code::relationship::RelationKind;
 use crate::code::storage::CodeDb;
 use crate::code::symbol::Symbol;
-use crate::code::types::{FileId, Range, SymbolCounter, SymbolId};
+use crate::code::types::{FileId, SymbolCounter, SymbolId};
 
 /// Default channel buffer size for inter-stage communication.
 const CHANNEL_SIZE: usize = 256;
@@ -249,7 +248,7 @@ fn create_parser(language: Language) -> Option<Box<dyn LanguageParser>> {
 fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
     let mut errors = 0u32;
     // Cache parsers by language to avoid re-creating them per file
-    let mut parsers: HashMap<Language, Box<dyn LanguageParser>> = HashMap::new();
+    let mut parsers: HashMap<Language, Option<Box<dyn LanguageParser>>> = HashMap::new();
 
     while let Ok(fc) = rx.recv() {
         let Some(language) = Language::from_path(&fc.path) else {
@@ -259,18 +258,13 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
         };
 
         // Get or create parser for this language
-        let parser = match parsers.entry(language).or_insert_with(|| {
-            // This creates a None for unsupported languages. We handle it below.
-            create_parser(language).unwrap_or_else(|| {
-                // Placeholder: will be caught by the None check
-                Box::new(NullParser)
-            })
-        }) {
-            p if p.language() == language => p,
-            _ => {
-                errors += 1;
-                continue;
-            }
+        let Some(parser) = parsers
+            .entry(language)
+            .or_insert_with(|| create_parser(language))
+            .as_mut()
+        else {
+            errors += 1;
+            continue;
         };
 
         // Use a temporary counter - real IDs assigned in COLLECT
@@ -368,37 +362,6 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
     errors
 }
 
-/// Stub parser for unsupported languages. Never actually called for parsing.
-struct NullParser;
-
-impl LanguageParser for NullParser {
-    fn parse(&mut self, _: &str, _: FileId, _: &mut SymbolCounter) -> Vec<Symbol> {
-        Vec::new()
-    }
-    fn language(&self) -> Language {
-        // Return a language that won't match anything expected
-        Language::Lua
-    }
-    fn extract_doc_comment(&self, _: &tree_sitter::Node, _: &str) -> Option<String> {
-        None
-    }
-    fn find_calls<'a>(&mut self, _: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
-    }
-    fn find_implementations<'a>(&mut self, _: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
-    }
-    fn find_uses<'a>(&mut self, _: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
-    }
-    fn find_defines<'a>(&mut self, _: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
-    }
-    fn find_imports(&mut self, _: &str, _: FileId) -> Vec<Import> {
-        Vec::new()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Stage 4: COLLECT
 // ---------------------------------------------------------------------------
@@ -490,7 +453,7 @@ fn stage_collect(
                         .copied()
                 });
 
-            batch.unresolved_relationships.push(UnresolvedRelationship {
+            batch.unresolved_relationships.push(CollectedRelationship {
                 from_id,
                 from_name: raw_rel.from_name,
                 to_name: raw_rel.to_name,

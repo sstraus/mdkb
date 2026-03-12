@@ -124,7 +124,7 @@ impl IndexFacade {
 
             // Delete stale entries for changed files
             for path in &changed {
-                self.delete_by_file(path, root)?;
+                self.delete_by_file(path)?;
             }
 
             pipeline::index_files(&changed, root, &self.db, &self.config)?
@@ -165,7 +165,7 @@ impl IndexFacade {
     }
 
     /// Delete a file and all its symbols/relationships from the index.
-    pub fn delete_by_file(&mut self, file_path: &Path, _root: &Path) -> anyhow::Result<()> {
+    pub fn delete_by_file(&mut self, file_path: &Path) -> anyhow::Result<()> {
         let abs_path = file_path.to_string_lossy().to_string();
 
         // Collect symbol IDs before deleting (for embedding cleanup)
@@ -255,7 +255,7 @@ impl IndexFacade {
 
         // Delete old data for changed and deleted files
         for path in deleted.iter().chain(changed.iter()) {
-            self.delete_by_file(path, root)?;
+            self.delete_by_file(path)?;
         }
 
         // Re-index changed files
@@ -778,7 +778,7 @@ pub fn world() {
 
         // Delete the remove.rs file from the index
         let remove_path = src_dir.path().join("remove.rs");
-        facade.delete_by_file(&remove_path, src_dir.path()).unwrap();
+        facade.delete_by_file(&remove_path).unwrap();
 
         assert!(facade.get_symbol_by_name("keep_me").is_some(), "keep_me should survive");
         assert!(facade.get_symbol_by_name("remove_me").is_none(), "remove_me should be deleted");

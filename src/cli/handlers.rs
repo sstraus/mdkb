@@ -2993,7 +2993,6 @@ pub fn handle_code_index(
             total.files_indexed += stats.files_indexed;
             total.symbols_indexed += stats.symbols_indexed;
             total.relationships_collected += stats.relationships_collected;
-            total.errors += stats.errors;
         }
         Ok(total)
     };

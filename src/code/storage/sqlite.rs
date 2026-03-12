@@ -484,7 +484,12 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         2 => Visibility::Module,
         _ => Visibility::Private,
     };
-    let scope_context = scope_context_str.and_then(|s| serde_json::from_str(&s).ok());
+    let scope_context = scope_context_str.and_then(|s| {
+        serde_json::from_str(&s).map_err(|e| {
+            tracing::warn!("Malformed scope_context JSON for symbol {id}: {e}");
+            e
+        }).ok()
+    });
 
     let mut sym = Symbol::new(symbol_id, &*name, kind, fid, range)
         .with_file_path(file_path)
@@ -963,5 +968,52 @@ mod tests {
 
         // Symbol should still exist (not cascade-deleted by INSERT OR REPLACE)
         assert_eq!(db.symbol_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_search_symbols_empty_db() {
+        let (_dir, db) = temp_db();
+        let results = db.search_symbols("anything", 10).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_get_impact_radius_no_callers() {
+        let (_dir, db) = temp_db();
+        let file_id = insert_test_file(&db);
+        db.insert_symbol("orphan", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
+
+        let impact = db.get_impact_radius("orphan", 5).unwrap();
+        assert!(impact.is_empty());
+    }
+
+    #[test]
+    fn test_get_impact_radius_cycle() {
+        // a calls b, b calls a — should not infinite-loop
+        let (_dir, db) = temp_db();
+        let file_id = insert_test_file(&db);
+        let a_id = db.insert_symbol("a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
+        let b_id = db.insert_symbol("b", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_relationship(Some(a_id), "a", "b", "Calls", file_id, None, None).unwrap();
+        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, None, None).unwrap();
+
+        // UNION in the CTE deduplicates, so this should terminate
+        let impact = db.get_impact_radius("a", 10).unwrap();
+        assert!(impact.len() <= 2);
+    }
+
+    #[test]
+    fn test_find_symbols_by_name_not_found() {
+        let (_dir, db) = temp_db();
+        let results = db.find_symbols_by_name("nonexistent").unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_delete_by_file_nonexistent() {
+        let (_dir, db) = temp_db();
+        // Should not error when deleting a file that doesn't exist
+        let deleted = db.delete_by_file("/nonexistent").unwrap();
+        assert_eq!(deleted, 0);
     }
 }

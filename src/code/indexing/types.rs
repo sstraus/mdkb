@@ -77,7 +77,7 @@ pub struct FileRegistration {
 /// A relationship where the source symbol may be resolved but the target
 /// is still a name string (resolved in a later phase).
 #[derive(Debug)]
-pub struct UnresolvedRelationship {
+pub struct CollectedRelationship {
     pub from_id: Option<SymbolId>,
     pub from_name: Box<str>,
     pub to_name: Box<str>,
@@ -90,7 +90,7 @@ pub struct UnresolvedRelationship {
 #[derive(Debug)]
 pub struct IndexBatch {
     pub symbols: Vec<(Symbol, PathBuf)>,
-    pub unresolved_relationships: Vec<UnresolvedRelationship>,
+    pub unresolved_relationships: Vec<CollectedRelationship>,
     pub file_registrations: Vec<FileRegistration>,
 }
 
@@ -121,6 +121,4 @@ pub struct IndexStats {
     pub files_indexed: u32,
     pub symbols_indexed: u32,
     pub relationships_collected: u32,
-    pub files_skipped: u32,
-    pub errors: u32,
 }
