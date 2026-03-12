@@ -248,6 +248,20 @@ impl CodeDb {
         rows.collect()
     }
 
+    /// Get symbol IDs for all symbols belonging to a file (by absolute path).
+    pub fn get_symbol_ids_for_file(&self, abs_path: &str) -> rusqlite::Result<Vec<u32>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT s.id FROM code_symbols s \
+             JOIN code_files f ON s.file_id = f.id \
+             WHERE f.path = ?1",
+        )?;
+        let rows = stmt.query_map(params![abs_path], |row| {
+            let id: i64 = row.get(0)?;
+            Ok(id as u32)
+        })?;
+        rows.collect()
+    }
+
     /// Get all symbols (for embedding generation).
     pub fn all_symbols(&self) -> rusqlite::Result<Vec<Symbol>> {
         let mut stmt = self
@@ -404,12 +418,25 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let module_path: Option<String> = row.get(12)?;
     let scope_context_str: Option<String> = row.get(13)?;
 
-    let symbol_id = SymbolId::new(id as u32).unwrap_or_else(|| {
-        // Fallback for id=0 edge case (shouldn't happen with INTEGER PRIMARY KEY)
-        SymbolId::new(1).unwrap()
-    });
-    let kind = kind_str.parse::<SymbolKind>().unwrap_or(SymbolKind::Function);
-    let fid = FileId::new(file_id as u32).unwrap_or_else(|| FileId::new(1).unwrap());
+    let symbol_id = u32::try_from(id)
+        .ok()
+        .and_then(SymbolId::new)
+        .ok_or_else(|| {
+            rusqlite::Error::IntegralValueOutOfRange(0, id)
+        })?;
+    let kind = kind_str.parse::<SymbolKind>().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            2,
+            rusqlite::types::Type::Text,
+            format!("Unknown SymbolKind: {kind_str}").into(),
+        )
+    })?;
+    let fid = u32::try_from(file_id)
+        .ok()
+        .and_then(FileId::new)
+        .ok_or_else(|| {
+            rusqlite::Error::IntegralValueOutOfRange(3, file_id)
+        })?;
     let range = Range::new(
         line_start,
         col_start.map_or(0, |v| v as u16),

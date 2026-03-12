@@ -5,7 +5,6 @@
 
 use std::path::PathBuf;
 
-use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::relationship::RelationKind;
 use crate::code::symbol::{Symbol, Visibility, ScopeContext};
@@ -39,15 +38,6 @@ pub struct RawSymbol {
     pub scope_context: Option<ScopeContext>,
 }
 
-/// An import extracted from parsing, before file ID assignment.
-#[derive(Debug)]
-pub struct RawImport {
-    pub path: String,
-    pub alias: Option<String>,
-    pub is_glob: bool,
-    pub is_type_only: bool,
-}
-
 /// A relationship extracted from parsing, before symbol ID resolution.
 #[derive(Debug)]
 pub struct RawRelationship {
@@ -65,7 +55,6 @@ pub struct ParsedFile {
     pub content_hash: String,
     pub language: Language,
     pub raw_symbols: Vec<RawSymbol>,
-    pub raw_imports: Vec<RawImport>,
     pub raw_relationships: Vec<RawRelationship>,
 }
 
@@ -100,7 +89,6 @@ pub struct UnresolvedRelationship {
 #[derive(Debug)]
 pub struct IndexBatch {
     pub symbols: Vec<(Symbol, PathBuf)>,
-    pub imports: Vec<Import>,
     pub unresolved_relationships: Vec<UnresolvedRelationship>,
     pub file_registrations: Vec<FileRegistration>,
 }
@@ -115,7 +103,6 @@ impl Default for IndexBatch {
     fn default() -> Self {
         Self {
             symbols: Vec::new(),
-            imports: Vec::new(),
             unresolved_relationships: Vec::new(),
             file_registrations: Vec::new(),
         }

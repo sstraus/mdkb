@@ -18,7 +18,7 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 
 use crate::code::indexing::hasher;
 use crate::code::indexing::types::{
-    FileContent, FileRegistration, IndexBatch, IndexStats, ParsedFile, RawImport, RawRelationship,
+    FileContent, FileRegistration, IndexBatch, IndexStats, ParsedFile, RawRelationship,
     RawSymbol, UnresolvedRelationship,
 };
 use crate::code::indexing::walker;
@@ -278,7 +278,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
         let mut counter = SymbolCounter::new();
 
         let symbols = parser.parse(&fc.content, dummy_file_id, &mut counter);
-        let imports_raw = parser.find_imports(&fc.content, dummy_file_id);
+        let _imports = parser.find_imports(&fc.content, dummy_file_id);
         let calls = parser.find_calls(&fc.content);
         let implementations = parser.find_implementations(&fc.content);
         let extends = parser.find_extends(&fc.content);
@@ -296,17 +296,6 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 doc_comment: s.doc_comment,
                 visibility: s.visibility,
                 scope_context: s.scope_context,
-            })
-            .collect();
-
-        // Convert imports to RawImport (strip dummy file_id)
-        let raw_imports: Vec<RawImport> = imports_raw
-            .into_iter()
-            .map(|i| RawImport {
-                path: i.path,
-                alias: i.alias,
-                is_glob: i.is_glob,
-                is_type_only: i.is_type_only,
             })
             .collect();
 
@@ -368,7 +357,6 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
             content_hash: fc.hash,
             language,
             raw_symbols,
-            raw_imports,
             raw_relationships,
         };
 
@@ -492,17 +480,6 @@ fn stage_collect(
             batch.symbols.push((symbol, parsed.path.clone()));
         }
 
-        // Convert raw imports
-        for raw_import in parsed.raw_imports {
-            batch.imports.push(Import {
-                path: raw_import.path,
-                alias: raw_import.alias,
-                file_id,
-                is_glob: raw_import.is_glob,
-                is_type_only: raw_import.is_type_only,
-            });
-        }
-
         // Convert raw relationships, resolving from_id where possible
         for raw_rel in parsed.raw_relationships {
             let from_id = symbol_lookup
@@ -556,6 +533,10 @@ fn stage_index(
     let mut stats = IndexStats::default();
 
     while let Ok(batch) = rx.recv() {
+        // Wrap each batch in a transaction for atomicity and performance.
+        // Without this, each INSERT is an autocommit with its own fsync.
+        db.conn().execute_batch("BEGIN")?;
+
         // Write file registrations
         for reg in &batch.file_registrations {
             let abs_path = reg.path.to_string_lossy();
@@ -610,6 +591,8 @@ fn stage_index(
             )?;
             stats.relationships_collected += 1;
         }
+
+        db.conn().execute_batch("COMMIT")?;
     }
 
     Ok(stats)

@@ -107,7 +107,13 @@ impl IndexFacade {
             for path in &discovered {
                 let content = match std::fs::read_to_string(path) {
                     Ok(c) => c,
-                    Err(_) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            "Failed to read {} during incremental hash check: {e}. File skipped.",
+                            path.display()
+                        );
+                        continue;
+                    }
                 };
                 let hash = hasher::content_hash(&content);
                 let key = path.to_string_lossy().to_string();
@@ -193,15 +199,17 @@ impl IndexFacade {
 
     /// Get symbol IDs for all symbols in a file.
     fn get_symbol_ids_for_path(&self, file_path: &Path) -> HashSet<u32> {
-        // Find all symbols for this file by checking file_path in code_files
-        let all = self.db.all_symbols().unwrap_or_default();
-        all.into_iter()
-            .filter(|s| {
-                // Match on either the stored abs path or the relative file_path
-                file_path.ends_with(&*s.file_path)
-            })
-            .map(|s| s.id.value())
-            .collect()
+        let abs_path = file_path.to_string_lossy();
+        match self.db.get_symbol_ids_for_file(&abs_path) {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                tracing::error!(
+                    "Failed to load symbol IDs for {}: {e}. Embeddings may be orphaned.",
+                    file_path.display()
+                );
+                HashSet::new()
+            }
+        }
     }
 
     /// Incrementally reindex only changed files.
