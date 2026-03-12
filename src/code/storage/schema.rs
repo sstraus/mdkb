@@ -1,216 +1,306 @@
-//! Tantivy schema definition for the code intelligence index.
+//! SQL schema for the code intelligence index.
 //!
-//! A single Tantivy index stores multiple document types (symbols,
-//! relationships, files, metadata) distinguished by a `doc_type` field.
+//! All code intelligence data (symbols, relationships, files) lives in
+//! a single SQLite database (`code.sqlite`). FTS5 with trigram tokenizer
+//! enables substring matching on symbol names.
 
-use tantivy::schema::{
-    Field, IndexRecordOption, NumericOptions, Schema, SchemaBuilder, TextFieldIndexing,
-    TextOptions, FAST, STORED, STRING,
-};
+/// SQL statements to initialize the code index schema.
+///
+/// Executed inside a transaction by [`init_schema`].
+pub const CREATE_TABLES: &str = r#"
+CREATE TABLE IF NOT EXISTS code_files (
+    id INTEGER PRIMARY KEY,
+    path TEXT NOT NULL UNIQUE,
+    rel_path TEXT NOT NULL,
+    hash TEXT NOT NULL,
+    language TEXT,
+    mtime INTEGER,
+    indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
 
-/// All named fields in the Tantivy schema, grouped by document type.
-#[derive(Debug)]
-pub struct IndexSchema {
-    // Document type discriminator: "symbol", "relationship", "file", "metadata"
-    pub doc_type: Field,
+CREATE TABLE IF NOT EXISTS code_symbols (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
+    file_path TEXT NOT NULL,
+    line_start INTEGER NOT NULL,
+    col_start INTEGER,
+    line_end INTEGER,
+    col_end INTEGER,
+    visibility INTEGER NOT NULL DEFAULT 0,
+    signature TEXT,
+    doc_comment TEXT,
+    module_path TEXT,
+    scope_context TEXT,
+    UNIQUE(name, file_id, line_start)
+);
 
-    // --- Symbol fields ---
-    pub symbol_id: Field,
-    /// Exact match on full symbol name (STRING, no tokenization).
-    pub name: Field,
-    /// Ngram-tokenized name for partial/substring matching.
-    pub name_text: Field,
-    pub doc_comment: Field,
-    pub signature: Field,
-    pub module_path: Field,
-    pub kind: Field,
-    pub file_path: Field,
-    pub line_number: Field,
-    pub column: Field,
-    pub end_line: Field,
-    pub end_column: Field,
-    pub context: Field,
-    pub visibility: Field,
-    pub scope_context: Field,
-    pub language: Field,
+CREATE TABLE IF NOT EXISTS code_relationships (
+    id INTEGER PRIMARY KEY,
+    from_symbol_id INTEGER REFERENCES code_symbols(id) ON DELETE CASCADE,
+    from_name TEXT NOT NULL,
+    to_name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
+    to_line INTEGER,
+    to_col INTEGER
+);
 
-    // --- Relationship fields ---
-    pub from_symbol_id: Field,
-    pub to_symbol_id: Field,
-    pub relation_kind: Field,
-    pub relation_weight: Field,
-    pub relation_line: Field,
-    pub relation_column: Field,
-    pub relation_context: Field,
+CREATE INDEX IF NOT EXISTS idx_symbols_name ON code_symbols(name);
+CREATE INDEX IF NOT EXISTS idx_symbols_file ON code_symbols(file_id);
+CREATE INDEX IF NOT EXISTS idx_symbols_kind ON code_symbols(kind);
+CREATE INDEX IF NOT EXISTS idx_rels_from ON code_relationships(from_symbol_id);
+CREATE INDEX IF NOT EXISTS idx_rels_to_name ON code_relationships(to_name);
+CREATE INDEX IF NOT EXISTS idx_rels_file ON code_relationships(file_id);
+CREATE INDEX IF NOT EXISTS idx_files_hash ON code_files(hash);
 
-    // --- File info fields ---
-    pub file_id: Field,
-    pub file_hash: Field,
-    pub file_timestamp: Field,
-    pub file_mtime: Field,
+CREATE VIRTUAL TABLE IF NOT EXISTS code_symbols_fts USING fts5(
+    name, doc_comment, signature,
+    content=code_symbols,
+    content_rowid=id,
+    tokenize='trigram case_sensitive 0'
+);
+"#;
 
-    // --- Metadata fields (counters, index state) ---
-    pub meta_key: Field,
-    pub meta_value: Field,
-}
+/// Triggers to keep the FTS5 index in sync with `code_symbols`.
+///
+/// Separate from `CREATE_TABLES` because triggers cannot use `IF NOT EXISTS`.
+/// Call [`init_schema`] which handles idempotency.
+pub const CREATE_TRIGGERS: &str = r#"
+CREATE TRIGGER code_symbols_fts_insert AFTER INSERT ON code_symbols BEGIN
+    INSERT INTO code_symbols_fts(rowid, name, doc_comment, signature)
+    VALUES (new.id, new.name, COALESCE(new.doc_comment, ''), COALESCE(new.signature, ''));
+END;
 
-impl IndexSchema {
-    /// Build the Tantivy schema and return the (Schema, IndexSchema) pair.
-    pub fn build() -> (Schema, Self) {
-        let mut builder = SchemaBuilder::default();
+CREATE TRIGGER code_symbols_fts_delete AFTER DELETE ON code_symbols BEGIN
+    INSERT INTO code_symbols_fts(code_symbols_fts, rowid, name, doc_comment, signature)
+    VALUES ('delete', old.id, COALESCE(old.name, ''), COALESCE(old.doc_comment, ''), COALESCE(old.signature, ''));
+END;
 
-        let doc_type = builder.add_text_field("doc_type", STRING | STORED | FAST);
+CREATE TRIGGER code_symbols_fts_update AFTER UPDATE ON code_symbols BEGIN
+    INSERT INTO code_symbols_fts(code_symbols_fts, rowid, name, doc_comment, signature)
+    VALUES ('delete', old.id, COALESCE(old.name, ''), COALESCE(old.doc_comment, ''), COALESCE(old.signature, ''));
+    INSERT INTO code_symbols_fts(rowid, name, doc_comment, signature)
+    VALUES (new.id, new.name, COALESCE(new.doc_comment, ''), COALESCE(new.signature, ''));
+END;
+"#;
 
-        let indexed_u64 = NumericOptions::default()
-            .set_indexed()
-            .set_stored()
-            .set_fast();
+/// Initialize the code index schema on an open connection.
+///
+/// Idempotent: safe to call on an already-initialized database.
+/// Enables WAL mode and foreign keys as a side effect.
+pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    conn.execute_batch(CREATE_TABLES)?;
 
-        // --- Symbol fields ---
-        let symbol_id = builder.add_u64_field("symbol_id", indexed_u64.clone());
-        let name = builder.add_text_field("name", STRING | STORED);
-
-        let ngram_text = TextOptions::default()
-            .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("ngram")
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-            )
-            .set_stored();
-        let name_text = builder.add_text_field("name_text", ngram_text);
-
-        let text_options = TextOptions::default()
-            .set_indexing_options(
-                TextFieldIndexing::default()
-                    .set_tokenizer("default")
-                    .set_index_option(IndexRecordOption::WithFreqsAndPositions),
-            )
-            .set_stored();
-
-        let doc_comment = builder.add_text_field("doc_comment", text_options.clone());
-        let signature = builder.add_text_field("signature", text_options.clone());
-        let context = builder.add_text_field("context", text_options.clone());
-        let module_path = builder.add_text_field("module_path", STRING | STORED);
-        let kind = builder.add_text_field("kind", STRING | STORED);
-        let file_path = builder.add_text_field("file_path", STRING | STORED);
-        let line_number = builder.add_u64_field("line_number", indexed_u64.clone());
-        let column = builder.add_u64_field("column", STORED);
-        let end_line = builder.add_u64_field("end_line", STORED | FAST);
-        let end_column = builder.add_u64_field("end_column", STORED);
-        let visibility = builder.add_u64_field("visibility", STORED);
-        let scope_context = builder.add_text_field("scope_context", STRING | STORED);
-        let language = builder.add_text_field("language", STRING | STORED | FAST);
-
-        // --- Relationship fields ---
-        let from_symbol_id = builder.add_u64_field("from_symbol_id", indexed_u64.clone());
-        let to_symbol_id = builder.add_u64_field("to_symbol_id", indexed_u64.clone());
-        let relation_kind = builder.add_text_field("relation_kind", STRING | STORED | FAST);
-        let relation_weight = builder.add_f64_field("relation_weight", STORED);
-        let relation_line = builder.add_u64_field("relation_line", STORED);
-        let relation_column = builder.add_u64_field("relation_column", STORED);
-        let relation_context = builder.add_text_field("relation_context", text_options);
-
-        // --- File info fields ---
-        let file_id = builder.add_u64_field("file_id", indexed_u64);
-        let file_hash = builder.add_text_field("file_hash", STRING | STORED);
-        let file_timestamp = builder.add_u64_field("file_timestamp", STORED | FAST);
-        let file_mtime = builder.add_u64_field("file_mtime", STORED | FAST);
-
-        // --- Metadata fields ---
-        let meta_key = builder.add_text_field("meta_key", STRING | STORED | FAST);
-        let meta_value = builder.add_u64_field("meta_value", STORED | FAST);
-
-        let schema = builder.build();
-        let index_schema = Self {
-            doc_type,
-            symbol_id,
-            name,
-            name_text,
-            doc_comment,
-            signature,
-            module_path,
-            kind,
-            file_path,
-            line_number,
-            column,
-            end_line,
-            end_column,
-            context,
-            visibility,
-            scope_context,
-            language,
-            from_symbol_id,
-            to_symbol_id,
-            relation_kind,
-            relation_weight,
-            relation_line,
-            relation_column,
-            relation_context,
-            file_id,
-            file_hash,
-            file_timestamp,
-            file_mtime,
-            meta_key,
-            meta_value,
-        };
-
-        (schema, index_schema)
+    // Triggers don't support IF NOT EXISTS — check before creating.
+    let trigger_exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='code_symbols_fts_insert')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !trigger_exists {
+        conn.execute_batch(CREATE_TRIGGERS)?;
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
 
     #[test]
-    fn test_schema_builds_successfully() {
-        let (schema, _index_schema) = IndexSchema::build();
-        // Verify key fields exist
-        assert!(schema.get_field("doc_type").is_ok());
-        assert!(schema.get_field("symbol_id").is_ok());
-        assert!(schema.get_field("name").is_ok());
-        assert!(schema.get_field("name_text").is_ok());
-        assert!(schema.get_field("relation_kind").is_ok());
-        assert!(schema.get_field("file_id").is_ok());
-        assert!(schema.get_field("meta_key").is_ok());
+    fn test_schema_init_creates_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // Verify all three tables exist
+        for table in &["code_files", "code_symbols", "code_relationships"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "table {table} should exist");
+        }
     }
 
     #[test]
-    fn test_schema_field_count() {
-        let (schema, _) = IndexSchema::build();
-        // 16 symbol + 7 relationship + 4 file + 2 metadata + 1 doc_type = 30
-        let field_count = schema.fields().count();
-        assert_eq!(field_count, 30);
+    fn test_schema_init_creates_fts_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_symbols_fts')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "FTS5 table should exist");
     }
 
     #[test]
-    fn test_schema_fields_match_struct() {
-        let (schema, index_schema) = IndexSchema::build();
-        // Verify each struct field resolves to the correct schema field
-        assert_eq!(
-            schema.get_field("doc_type").unwrap(),
-            index_schema.doc_type
+    fn test_schema_init_creates_triggers() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        for trigger in &[
+            "code_symbols_fts_insert",
+            "code_symbols_fts_delete",
+            "code_symbols_fts_update",
+        ] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?1)",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(exists, "trigger {trigger} should exist");
+        }
+    }
+
+    #[test]
+    fn test_schema_init_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        // Second call should not fail
+        init_schema(&conn).unwrap();
+    }
+
+    #[test]
+    fn test_schema_foreign_keys_enabled() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let fk_enabled: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_enabled, 1);
+    }
+
+    #[test]
+    fn test_schema_cascade_delete() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // Insert a file
+        conn.execute(
+            "INSERT INTO code_files (path, rel_path, hash) VALUES (?1, ?2, ?3)",
+            ["abs/path.rs", "path.rs", "abc123"],
+        )
+        .unwrap();
+        let file_id: i64 = conn.last_insert_rowid();
+
+        // Insert a symbol
+        conn.execute(
+            "INSERT INTO code_symbols (name, kind, file_id, file_path, line_start) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["my_fn", "Function", file_id, "path.rs", 10],
+        )
+        .unwrap();
+        let sym_id: i64 = conn.last_insert_rowid();
+
+        // Insert a relationship
+        conn.execute(
+            "INSERT INTO code_relationships (from_symbol_id, from_name, to_name, kind, file_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![sym_id, "my_fn", "other_fn", "Calls", file_id],
+        )
+        .unwrap();
+
+        // Verify counts
+        let sym_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sym_count, 1);
+
+        let rel_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_relationships", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rel_count, 1);
+
+        // Delete file — CASCADE should remove symbols and relationships
+        conn.execute("DELETE FROM code_files WHERE id = ?1", [file_id])
+            .unwrap();
+
+        let sym_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_symbols", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sym_count, 0, "symbols should be cascade-deleted");
+
+        let rel_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_relationships", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rel_count, 0, "relationships should be cascade-deleted");
+    }
+
+    #[test]
+    fn test_schema_unique_constraint_on_symbols() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO code_files (path, rel_path, hash) VALUES ('a', 'a', 'h')",
+            [],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO code_symbols (name, kind, file_id, file_path, line_start) VALUES ('foo', 'Function', ?1, 'a', 10)",
+            [file_id],
+        )
+        .unwrap();
+
+        // Same name + file + line should fail
+        let result = conn.execute(
+            "INSERT INTO code_symbols (name, kind, file_id, file_path, line_start) VALUES ('foo', 'Function', ?1, 'a', 10)",
+            [file_id],
         );
-        assert_eq!(
-            schema.get_field("symbol_id").unwrap(),
-            index_schema.symbol_id
-        );
-        assert_eq!(schema.get_field("name").unwrap(), index_schema.name);
-        assert_eq!(
-            schema.get_field("name_text").unwrap(),
-            index_schema.name_text
-        );
-        assert_eq!(
-            schema.get_field("from_symbol_id").unwrap(),
-            index_schema.from_symbol_id
-        );
-        assert_eq!(
-            schema.get_field("file_hash").unwrap(),
-            index_schema.file_hash
-        );
-        assert_eq!(
-            schema.get_field("meta_key").unwrap(),
-            index_schema.meta_key
-        );
+        assert!(result.is_err(), "duplicate symbol should be rejected");
+    }
+
+    #[test]
+    fn test_fts5_trigram_search() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO code_files (path, rel_path, hash) VALUES ('a', 'a', 'h')",
+            [],
+        )
+        .unwrap();
+        let file_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO code_symbols (name, kind, file_id, file_path, line_start) VALUES ('ArchiveAppService', 'Struct', ?1, 'a', 1)",
+            [file_id],
+        )
+        .unwrap();
+
+        // Trigram search for substring "Archive"
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_symbols_fts WHERE code_symbols_fts MATCH '\"Archive\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "trigram should match substring 'Archive'");
+
+        // Trigram search for substring "Service"
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM code_symbols_fts WHERE code_symbols_fts MATCH '\"Service\"'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "trigram should match substring 'Service'");
     }
 }

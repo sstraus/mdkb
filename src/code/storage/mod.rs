@@ -1,10 +1,16 @@
-//! Tantivy-backed storage for the code intelligence index.
+//! Storage backends for the code intelligence index.
 //!
-//! Provides a single Tantivy index that stores symbols, relationships,
-//! files, and metadata as distinct document types. An ngram tokenizer
-//! enables partial symbol name matching ("Archive" finds "ArchiveAppService").
+//! Currently contains both the legacy Tantivy backend (`CodeIndex`) and
+//! the new SQLite backend (`CodeDb`). The Tantivy backend will be removed
+//! once all consumers are migrated.
 
 pub mod schema;
+pub mod tantivy_schema;
+
+mod sqlite;
+pub use sqlite::CodeDb;
+
+// --- Legacy Tantivy backend (to be removed in Step 6) ---
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -12,7 +18,7 @@ use std::path::{Path, PathBuf};
 use tantivy::tokenizer::{NgramTokenizer, TextAnalyzer};
 use tantivy::{Index, IndexReader, ReloadPolicy};
 
-pub use schema::IndexSchema;
+pub use tantivy_schema::IndexSchema;
 
 /// Tantivy-backed code intelligence index.
 ///
