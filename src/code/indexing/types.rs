@@ -96,7 +96,7 @@ pub struct UnresolvedRelationship {
     pub to_range: Option<Range>,
 }
 
-/// A batch of index data ready for Tantivy writes.
+/// A batch of index data ready for SQLite writes.
 #[derive(Debug)]
 pub struct IndexBatch {
     pub symbols: Vec<(Symbol, PathBuf)>,

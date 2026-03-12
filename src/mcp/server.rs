@@ -825,7 +825,7 @@ impl McpServer {
             )
         }; // ctx_guard dropped here
 
-        // Phase 2: Reindex source code (tree-sitter + Tantivy)
+        // Phase 2: Reindex source code (tree-sitter + SQLite)
         let code_output = {
             let mut idx_guard = self.acquire_code_index().await?;
             if let Some(facade) = idx_guard.as_mut() {

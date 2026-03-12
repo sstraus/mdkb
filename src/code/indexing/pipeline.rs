@@ -8,7 +8,7 @@
 //! Stages communicate via bounded crossbeam channels.
 //! DISCOVER, READ, and PARSE run on multiple threads; COLLECT and
 //! INDEX are single-threaded to guarantee sequential ID assignment
-//! and consistent Tantivy commits.
+//! and consistent SQLite commits.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
