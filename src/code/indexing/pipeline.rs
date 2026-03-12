@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! DISCOVER ──► READ ──► PARSE ──► COLLECT ──► INDEX
-//! (walk FS)  (I/O)   (CPU)    (assign IDs)  (Tantivy)
+//! (walk FS)  (I/O)   (CPU)    (assign IDs)  (SQLite)
 //! ```
 //!
 //! Stages communicate via bounded crossbeam channels.

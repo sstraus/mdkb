@@ -2957,7 +2957,7 @@ pub struct CodeInfoResult {
 
 /// Handle `mdkb code init` - initialize code index directory.
 pub fn handle_code_init(root: &Path) -> Result<()> {
-    let index_path = root.join(".mdkb/code-index");
+    let index_path = root.join(".mdkb/code.sqlite");
     if index_path.exists() {
         return Err(Error::other(format!(
             "Code index already exists at {}",
@@ -2974,7 +2974,7 @@ pub fn handle_code_index(
     root: &Path,
     paths: &[String],
 ) -> Result<crate::code::indexing::types::IndexStats> {
-    let index_path = root.join(".mdkb/code-index");
+    let index_path = root.join(".mdkb/code.sqlite");
     let mut facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 
@@ -3006,7 +3006,7 @@ pub fn handle_code_search(
     limit: usize,
     kind_filter: Option<&str>,
 ) -> Result<Vec<crate::code::symbol::Symbol>> {
-    let index_path = root.join(".mdkb/code-index");
+    let index_path = root.join(".mdkb/code.sqlite");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 
@@ -3030,7 +3030,7 @@ pub fn handle_code_find(
     kind_filter: Option<&str>,
     file_filter: Option<&str>,
 ) -> Result<Vec<crate::code::symbol::Symbol>> {
-    let index_path = root.join(".mdkb/code-index");
+    let index_path = root.join(".mdkb/code.sqlite");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 
@@ -3055,7 +3055,7 @@ pub fn handle_code_calls(
     root: &Path,
     name: &str,
 ) -> Result<(crate::code::symbol::Symbol, Vec<crate::code::symbol::Symbol>)> {
-    let index_path = root.join(".mdkb/code-index");
+    let index_path = root.join(".mdkb/code.sqlite");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 
@@ -3072,7 +3072,7 @@ pub fn handle_code_callers(
     root: &Path,
     name: &str,
 ) -> Result<(crate::code::symbol::Symbol, Vec<crate::code::symbol::Symbol>)> {
-    let index_path = root.join(".mdkb/code-index");
+    let index_path = root.join(".mdkb/code.sqlite");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 
@@ -3090,7 +3090,7 @@ pub fn handle_code_impact(
     name: &str,
     depth: usize,
 ) -> Result<(crate::code::symbol::Symbol, Vec<crate::code::symbol::Symbol>)> {
-    let index_path = root.join(".mdkb/code-index");
+    let index_path = root.join(".mdkb/code.sqlite");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 
@@ -3109,7 +3109,7 @@ pub fn handle_code_impact(
 
 /// Handle `mdkb code info` - show index statistics.
 pub fn handle_code_info(root: &Path) -> Result<CodeInfoResult> {
-    let index_path = root.join(".mdkb/code-index");
+    let index_path = root.join(".mdkb/code.sqlite");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 

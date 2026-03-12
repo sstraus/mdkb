@@ -76,9 +76,6 @@ fastembed = { version = "4", default-features = false, features = ["ort-download
 # Token counting for usage metrics
 tiktoken-rs = "0.6"
 
-# Code intelligence - search backend
-tantivy = "0.25.0"
-
 # Code intelligence - tree-sitter parsing
 tree-sitter = "0.26.5"
 tree-sitter-rust = "0.24.0"

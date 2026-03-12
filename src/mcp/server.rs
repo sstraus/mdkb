@@ -46,7 +46,7 @@ pub struct McpServer {
     root: PathBuf,
     /// Shared database context.
     ctx: Arc<Mutex<Option<Context>>>,
-    /// Code intelligence index (Tantivy-backed).
+    /// Code intelligence index (SQLite-backed).
     code_index: Arc<Mutex<Option<IndexFacade>>>,
     /// Tool router.
     tool_router: ToolRouter<Self>,
@@ -377,9 +377,7 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Initialize the code intelligence index (Tantivy-backed).
-    ///
-    /// Opens or creates the index at `.mdkb/code-index/`.
+    /// Opens or creates the SQLite code index at `.mdkb/code.sqlite`.
     /// Acquire the code index lock, lazily initializing the facade if needed.
     ///
     /// Single lock acquisition eliminates the TOCTOU gap of the old
@@ -394,7 +392,7 @@ impl McpServer {
         }
         let mut idx_guard = self.code_index.lock().await;
         if idx_guard.is_none() {
-            let index_path = self.root.join(".mdkb/code-index");
+            let index_path = self.root.join(".mdkb/code.sqlite");
             let mut facade = IndexFacade::open_or_create(&index_path)
                 .map_err(|e| mcp_error(format!("Failed to open code index: {}", e)))?;
             if !self.code_ignore_patterns.is_empty() {
@@ -2434,7 +2432,7 @@ pub fn utility() -> i32 {
 "#).unwrap();
 
             // Create code index
-            let index_path = root.join(".mdkb/code-index");
+            let index_path = root.join(".mdkb/code.sqlite");
             let mut facade = IndexFacade::create(&index_path)
                 .expect("Failed to create code index");
             facade.index_directory(&src_dir)
