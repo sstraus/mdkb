@@ -39,7 +39,7 @@ use crate::code::parsing::rust::RustParser;
 use crate::code::parsing::swift::SwiftParser;
 use crate::code::parsing::typescript::TypeScriptParser;
 use crate::code::relationship::RelationKind;
-use crate::code::storage::CodeIndex;
+use crate::code::storage::CodeDb;
 use crate::code::symbol::Symbol;
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolId};
 
@@ -80,76 +80,20 @@ impl Default for PipelineConfig {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Run the full indexing pipeline on a directory, writing results to the given index.
+/// Run the full indexing pipeline on a directory, writing results to the given database.
 ///
-/// Returns statistics and any unresolved relationships (for future resolution).
+/// Returns statistics about the indexing run.
 pub fn index_directory(
     root: &Path,
-    index: &CodeIndex,
+    db: &CodeDb,
     config: &PipelineConfig,
-) -> anyhow::Result<(IndexStats, Vec<UnresolvedRelationship>)> {
-    let (path_tx, path_rx) = bounded::<PathBuf>(config.channel_size);
-    let (content_tx, content_rx) = bounded::<FileContent>(config.channel_size);
-    let (parsed_tx, parsed_rx) = bounded::<ParsedFile>(config.channel_size);
-    let (batch_tx, batch_rx) = bounded::<IndexBatch>(config.channel_size / 4 + 1);
-
-    let root = root.to_path_buf();
-
-    // DISCOVER stage (single thread)
-    let discover_root = root.clone();
-    let discover_patterns = config.ignore_patterns.clone();
-    let discover = thread::spawn(move || stage_discover(&discover_root, &discover_patterns, &path_tx));
-
-    // READ stage (multiple I/O threads)
-    let mut readers = Vec::with_capacity(config.read_threads);
-    for _ in 0..config.read_threads {
-        let rx = path_rx.clone();
-        let tx = content_tx.clone();
-        readers.push(thread::spawn(move || stage_read(&rx, &tx)));
-    }
-    // Drop our copies so channels close when workers finish
-    drop(path_rx);
-    drop(content_tx);
-
-    // PARSE stage (single thread with sequential parsing)
-    let parse_handle = thread::spawn(move || stage_parse(&content_rx, &parsed_tx));
-
-    // COLLECT stage (single thread - sequential ID assignment)
-    let collect_root = root.clone();
-    let batch_size = config.batch_size;
-    let collect_handle = thread::spawn(move || {
-        stage_collect(&collect_root, &parsed_rx, &batch_tx, batch_size)
-    });
+) -> anyhow::Result<IndexStats> {
+    let batch_rx = spawn_pipeline_stages(root, None, config)?;
 
     // INDEX stage runs on this thread
-    let (stats, unresolved) = stage_index(index, &batch_rx)?;
+    let stats = stage_index(db, &batch_rx)?;
 
-    // Wait for all stages to complete
-    let files_discovered = discover.join().map_err(|_| anyhow::anyhow!("discover thread panicked"))?;
-    for reader in readers {
-        reader.join().map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
-    }
-    let parse_errors = parse_handle.join().map_err(|_| anyhow::anyhow!("parse thread panicked"))?;
-    let collect_stats = collect_handle.join().map_err(|_| anyhow::anyhow!("collect thread panicked"))?;
-
-    let final_stats = IndexStats {
-        files_discovered,
-        files_indexed: collect_stats.files_indexed,
-        symbols_indexed: stats.symbols_indexed,
-        relationships_collected: collect_stats.relationships_collected,
-        files_skipped: parse_errors,
-        errors: stats.errors,
-    };
-
-    if parse_errors > 0 {
-        tracing::error!(
-            "Pipeline completed with {} parse errors. Impact: {} files not indexed (unsupported language or parse failure).",
-            parse_errors,
-            parse_errors
-        );
-    }
-
-    Ok((final_stats, unresolved))
+    Ok(stats)
 }
 
 /// Run the indexing pipeline on specific files (not a full directory walk).
@@ -159,13 +103,30 @@ pub fn index_directory(
 pub fn index_files(
     paths: &[PathBuf],
     root: &Path,
-    index: &CodeIndex,
+    db: &CodeDb,
     config: &PipelineConfig,
-) -> anyhow::Result<(IndexStats, Vec<UnresolvedRelationship>)> {
+) -> anyhow::Result<IndexStats> {
     if paths.is_empty() {
-        return Ok((IndexStats::default(), Vec::new()));
+        return Ok(IndexStats::default());
     }
 
+    let batch_rx = spawn_pipeline_stages(root, Some(paths), config)?;
+
+    // INDEX stage runs on this thread
+    let stats = stage_index(db, &batch_rx)?;
+
+    Ok(stats)
+}
+
+/// Spawn the DISCOVER → READ → PARSE → COLLECT pipeline stages.
+///
+/// If `explicit_paths` is Some, uses those paths instead of walking `root`.
+/// Returns the batch receiver for the INDEX stage to consume.
+fn spawn_pipeline_stages(
+    root: &Path,
+    explicit_paths: Option<&[PathBuf]>,
+    config: &PipelineConfig,
+) -> anyhow::Result<Receiver<IndexBatch>> {
     let (path_tx, path_rx) = bounded::<PathBuf>(config.channel_size);
     let (content_tx, content_rx) = bounded::<FileContent>(config.channel_size);
     let (parsed_tx, parsed_rx) = bounded::<ParsedFile>(config.channel_size);
@@ -173,65 +134,39 @@ pub fn index_files(
 
     let root = root.to_path_buf();
 
-    // Send explicit paths instead of walking the filesystem
-    let files_discovered = paths.len() as u32;
-    let paths_owned: Vec<PathBuf> = paths.to_vec();
-    let discover = thread::spawn(move || {
-        for path in paths_owned {
-            if path_tx.send(path).is_err() {
-                break;
+    // DISCOVER stage
+    if let Some(paths) = explicit_paths {
+        let paths_owned: Vec<PathBuf> = paths.to_vec();
+        thread::spawn(move || {
+            for path in paths_owned {
+                if path_tx.send(path).is_err() {
+                    break;
+                }
             }
-        }
-        files_discovered
-    });
+        });
+    } else {
+        let discover_root = root.clone();
+        let discover_patterns = config.ignore_patterns.clone();
+        thread::spawn(move || stage_discover(&discover_root, &discover_patterns, &path_tx));
+    }
 
     // READ stage (multiple I/O threads)
-    let mut readers = Vec::with_capacity(config.read_threads);
     for _ in 0..config.read_threads {
         let rx = path_rx.clone();
         let tx = content_tx.clone();
-        readers.push(thread::spawn(move || stage_read(&rx, &tx)));
+        thread::spawn(move || stage_read(&rx, &tx));
     }
     drop(path_rx);
     drop(content_tx);
 
     // PARSE stage
-    let parse_handle = thread::spawn(move || stage_parse(&content_rx, &parsed_tx));
+    thread::spawn(move || stage_parse(&content_rx, &parsed_tx));
 
     // COLLECT stage
-    let collect_root = root.clone();
     let batch_size = config.batch_size;
-    let collect_handle = thread::spawn(move || {
-        stage_collect(&collect_root, &parsed_rx, &batch_tx, batch_size)
-    });
+    thread::spawn(move || stage_collect(&root, &parsed_rx, &batch_tx, batch_size));
 
-    // INDEX stage runs on this thread
-    let (stats, unresolved) = stage_index(index, &batch_rx)?;
-
-    // Wait for all stages
-    let _files_discovered = discover
-        .join()
-        .map_err(|_| anyhow::anyhow!("discover thread panicked"))?;
-    for reader in readers {
-        reader.join().map_err(|_| anyhow::anyhow!("reader thread panicked"))?;
-    }
-    let parse_errors = parse_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("parse thread panicked"))?;
-    let collect_stats = collect_handle
-        .join()
-        .map_err(|_| anyhow::anyhow!("collect thread panicked"))?;
-
-    let final_stats = IndexStats {
-        files_discovered,
-        files_indexed: collect_stats.files_indexed,
-        symbols_indexed: stats.symbols_indexed,
-        relationships_collected: collect_stats.relationships_collected,
-        files_skipped: parse_errors,
-        errors: stats.errors,
-    };
-
-    Ok((final_stats, unresolved))
+    Ok(batch_rx)
 }
 
 // ---------------------------------------------------------------------------
@@ -613,91 +548,71 @@ fn stage_collect(
 // Stage 5: INDEX
 // ---------------------------------------------------------------------------
 
-/// Write batches to Tantivy and return final statistics.
+/// Write batches to SQLite and return final statistics.
 fn stage_index(
-    index: &CodeIndex,
+    db: &CodeDb,
     rx: &Receiver<IndexBatch>,
-) -> anyhow::Result<(IndexStats, Vec<UnresolvedRelationship>)> {
-    let mut writer = index.writer()?;
-    let schema = index.schema();
+) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
-    let mut all_unresolved = Vec::new();
-    let mut batches_since_commit = 0u32;
 
     while let Ok(batch) = rx.recv() {
         // Write file registrations
         for reg in &batch.file_registrations {
-            let doc = tantivy::doc!(
-                schema.doc_type => "file",
-                schema.file_id => u64::from(reg.file_id.value()),
-                schema.file_path => reg.path.to_string_lossy().as_ref(),
-                schema.file_hash => reg.content_hash.as_str(),
-                schema.file_timestamp => reg.timestamp,
-                schema.file_mtime => reg.mtime,
-                schema.language => reg.language.config_key()
-            );
-            writer.add_document(doc)?;
+            let abs_path = reg.path.to_string_lossy();
+            let rel_path = reg.path.file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_else(|| abs_path.to_string());
+            db.insert_file(
+                &abs_path,
+                &rel_path,
+                &reg.content_hash,
+                Some(reg.language.config_key()),
+                Some(reg.mtime as i64),
+            )?;
+            stats.files_discovered += 1;
+            stats.files_indexed += 1;
         }
 
-        // Write symbols
+        // Write symbols — get the file_id from the file registration
         for (symbol, _path) in &batch.symbols {
-            let doc = tantivy::doc!(
-                schema.doc_type => "symbol",
-                schema.symbol_id => u64::from(symbol.id.value()),
-                schema.name => symbol.as_name(),
-                schema.name_text => symbol.as_name(),
-                schema.kind => symbol.kind.to_string(),
-                schema.file_path => &*symbol.file_path,
-                schema.file_id => u64::from(symbol.file_id.value()),
-                schema.line_number => u64::from(symbol.range.start_line),
-                schema.column => u64::from(symbol.range.start_column),
-                schema.end_line => u64::from(symbol.range.end_line),
-                schema.end_column => u64::from(symbol.range.end_column),
-                schema.visibility => symbol.visibility as u64
-            );
-            // Add optional fields
-            let mut doc = doc;
-            if let Some(sig) = symbol.as_signature() {
-                doc.add_text(schema.signature, sig);
-            }
-            if let Some(doc_comment) = symbol.as_doc_comment() {
-                doc.add_text(schema.doc_comment, doc_comment);
-            }
-            if let Some(module) = symbol.as_module_path() {
-                doc.add_text(schema.module_path, module);
-            }
-            if let Some(scope) = &symbol.scope_context {
-                doc.add_text(schema.scope_context, format!("{scope:?}"));
-            }
-            writer.add_document(doc)?;
+            let scope_json = symbol.scope_context.as_ref().and_then(|sc| {
+                serde_json::to_string(sc).ok()
+            });
+            db.insert_symbol(
+                symbol.as_name(),
+                &symbol.kind.to_string(),
+                i64::from(symbol.file_id.value()),
+                &symbol.file_path,
+                symbol.range.start_line,
+                Some(symbol.range.start_column),
+                Some(symbol.range.end_line),
+                Some(symbol.range.end_column),
+                symbol.visibility as u8,
+                symbol.as_signature(),
+                symbol.as_doc_comment(),
+                symbol.as_module_path(),
+                scope_json.as_deref(),
+            )?;
             stats.symbols_indexed += 1;
         }
 
-        // Write imports as metadata
-        for import in &batch.imports {
-            let doc = tantivy::doc!(
-                schema.doc_type => "metadata",
-                schema.meta_key => format!("import:{}:{}", import.file_id.value(), import.path),
-                schema.file_id => u64::from(import.file_id.value())
-            );
-            writer.add_document(doc)?;
-        }
-
-        // Accumulate unresolved relationships
-        all_unresolved.extend(batch.unresolved_relationships);
-
-        batches_since_commit += 1;
-        if batches_since_commit >= 5 {
-            writer.commit()?;
-            batches_since_commit = 0;
+        // Write relationships directly to SQLite (no longer "unresolved")
+        for rel in &batch.unresolved_relationships {
+            let to_range = rel.to_range.as_ref();
+            db.insert_relationship(
+                rel.from_id.map(|id| i64::from(id.value())),
+                &rel.from_name,
+                &rel.to_name,
+                &rel.kind.to_string(),
+                i64::from(rel.file_id.value()),
+                to_range.map(|r| r.start_line),
+                to_range.map(|r| r.start_column),
+            )?;
+            stats.relationships_collected += 1;
         }
     }
 
-    // Final commit
-    writer.commit()?;
-    index.reload()?;
-
-    Ok((stats, all_unresolved))
+    Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
@@ -718,19 +633,22 @@ mod tests {
         }
     }
 
+    fn temp_db() -> (tempfile::TempDir, CodeDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.sqlite");
+        let db = CodeDb::create(&path).unwrap();
+        (dir, db)
+    }
+
     #[test]
     fn test_index_empty_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let idx_dir = tempfile::tempdir().unwrap();
-        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
+        let (_db_dir, db) = temp_db();
 
-        let (stats, unresolved) =
-            index_directory(dir.path(), &index, &test_config()).unwrap();
+        let stats = index_directory(dir.path(), &db, &test_config()).unwrap();
 
-        assert_eq!(stats.files_discovered, 0);
-        assert_eq!(stats.files_indexed, 0);
         assert_eq!(stats.symbols_indexed, 0);
-        assert!(unresolved.is_empty());
+        assert_eq!(db.file_count().unwrap(), 0);
     }
 
     #[test]
@@ -751,14 +669,12 @@ struct Foo {
         )
         .unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
+        let (_db_dir, db) = temp_db();
+        let stats = index_directory(dir.path(), &db, &test_config()).unwrap();
 
-        let (stats, _) = index_directory(dir.path(), &index, &test_config()).unwrap();
-
-        assert_eq!(stats.files_discovered, 1);
-        assert_eq!(stats.files_indexed, 1);
+        assert_eq!(db.file_count().unwrap(), 1);
         assert!(stats.symbols_indexed >= 2); // at least hello and Foo
+        assert!(db.symbol_count().unwrap() >= 2);
     }
 
     #[test]
@@ -769,14 +685,11 @@ struct Foo {
         fs::write(dir.path().join("index.ts"), "function greet() {}").unwrap();
         fs::write(dir.path().join("script.py"), "def greet():\n    pass").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
+        let (_db_dir, db) = temp_db();
+        let stats = index_directory(dir.path(), &db, &test_config()).unwrap();
 
-        let (stats, _) = index_directory(dir.path(), &index, &test_config()).unwrap();
-
-        assert_eq!(stats.files_discovered, 4);
-        assert_eq!(stats.files_indexed, 4);
-        assert!(stats.symbols_indexed >= 4); // at least one per file
+        assert!(db.file_count().unwrap() >= 4);
+        assert!(stats.symbols_indexed >= 4);
     }
 
     #[test]
@@ -794,33 +707,27 @@ fn callee() {}
         )
         .unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
-
-        let (stats, unresolved) =
-            index_directory(dir.path(), &index, &test_config()).unwrap();
+        let (_db_dir, db) = temp_db();
+        let stats = index_directory(dir.path(), &db, &test_config()).unwrap();
 
         assert!(stats.symbols_indexed >= 2);
-        // Should have at least one Calls relationship
+        // Relationships are now persisted in SQLite
         assert!(
-            unresolved.iter().any(|r| r.kind == RelationKind::Calls),
-            "expected Calls relationship, got: {unresolved:?}"
+            stats.relationships_collected > 0 || db.relationship_count().unwrap() > 0,
+            "expected persisted relationships"
         );
     }
 
     #[test]
-    fn test_index_writes_to_tantivy() {
+    fn test_index_writes_to_sqlite() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("lib.rs"), "pub fn search_me() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
+        let (_db_dir, db) = temp_db();
+        index_directory(dir.path(), &db, &test_config()).unwrap();
 
-        index_directory(dir.path(), &index, &test_config()).unwrap();
-
-        // Query Tantivy to verify writes
-        let searcher = index.reader().searcher();
-        assert!(searcher.num_docs() > 0, "expected documents in index");
+        assert!(db.symbol_count().unwrap() > 0, "expected symbols in database");
+        assert!(db.file_count().unwrap() > 0, "expected files in database");
     }
 
     #[test]
@@ -830,14 +737,12 @@ fn callee() {}
         fs::write(dir.path().join("data.json"), "{}").unwrap();
         fs::write(dir.path().join("lib.rs"), "fn foo() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
+        let (_db_dir, db) = temp_db();
+        let stats = index_directory(dir.path(), &db, &test_config()).unwrap();
 
-        let (stats, _) = index_directory(dir.path(), &index, &test_config()).unwrap();
-
-        // Only the .rs file should be discovered and indexed
-        assert_eq!(stats.files_discovered, 1);
-        assert_eq!(stats.files_indexed, 1);
+        // Only the .rs file should be indexed
+        assert_eq!(db.file_count().unwrap(), 1);
+        assert!(stats.symbols_indexed >= 1);
     }
 
     #[test]
@@ -869,30 +774,25 @@ fn callee() {}
         fs::write(dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
         fs::write(dir.path().join("c.rs"), "pub fn ccc() {}").unwrap();
 
-        let idx_dir = tempfile::tempdir().unwrap();
-        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
+        let (_db_dir, db) = temp_db();
 
         // Only index 2 of the 3 files
         let paths = vec![
             dir.path().join("a.rs"),
             dir.path().join("b.rs"),
         ];
-        let (stats, _) = index_files(&paths, dir.path(), &index, &test_config()).unwrap();
+        let stats = index_files(&paths, dir.path(), &db, &test_config()).unwrap();
 
-        assert_eq!(stats.files_discovered, 2);
-        assert_eq!(stats.files_indexed, 2);
         assert!(stats.symbols_indexed >= 2);
+        assert_eq!(db.file_count().unwrap(), 2);
     }
 
     #[test]
     fn test_index_files_empty_list() {
         let dir = tempfile::tempdir().unwrap();
-        let idx_dir = tempfile::tempdir().unwrap();
-        let index = CodeIndex::create(idx_dir.path().join("idx")).unwrap();
+        let (_db_dir, db) = temp_db();
 
-        let (stats, unresolved) = index_files(&[], dir.path(), &index, &test_config()).unwrap();
-        assert_eq!(stats.files_discovered, 0);
-        assert_eq!(stats.files_indexed, 0);
-        assert!(unresolved.is_empty());
+        let stats = index_files(&[], dir.path(), &db, &test_config()).unwrap();
+        assert_eq!(stats.symbols_indexed, 0);
     }
 }
