@@ -218,6 +218,16 @@ These paths are excluded from code indexing:
 
 Configurable via `[code.indexing] ignore_patterns` in `config.toml`.
 
+### Incremental Indexing
+
+The MCP server watches your project for file changes and reindexes automatically:
+
+- **Documents** — on change, the server reconciles each collection against the filesystem. New files are added, modified files re-parsed, and files deleted from disk are removed from the index.
+- **Code** — changed files are batched (30s idle window) and reindexed incrementally. Content hashes skip unchanged files; deleted files are purged from both Tantivy and the vector store.
+- **Startup** — if an index already exists, the server performs an incremental reindex (hash-based diff). A fresh index triggers a full reindex.
+
+The file watcher uses OS-native notifications (`notify` crate) with 100ms debounce. Code exclusion patterns (e.g. `node_modules`) apply to both full and incremental reindexing.
+
 ## License
 
 MIT

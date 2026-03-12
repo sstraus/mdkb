@@ -391,6 +391,46 @@ impl IndexFacade {
         doc_to_symbol(&doc, schema)
     }
 
+    /// Fetch multiple symbols by ID in a single Tantivy query.
+    ///
+    /// Returns a map of SymbolId → Symbol. IDs not found are silently omitted.
+    pub fn get_symbols_batch(&self, ids: &[SymbolId]) -> HashMap<SymbolId, Symbol> {
+        if ids.is_empty() {
+            return HashMap::new();
+        }
+        let searcher = self.index.reader().searcher();
+        let schema = self.index.schema();
+
+        // OR across all symbol IDs
+        let id_clauses: Vec<(Occur, Box<dyn tantivy::query::Query>)> = ids
+            .iter()
+            .map(|id| {
+                let term = Term::from_field_u64(schema.symbol_id, u64::from(id.value()));
+                (Occur::Should, Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn tantivy::query::Query>)
+            })
+            .collect();
+
+        let query = BooleanQuery::new(vec![
+            (Occur::Must, Box::new(BooleanQuery::new(id_clauses)) as Box<dyn tantivy::query::Query>),
+            (Occur::Must, Box::new(TermQuery::new(
+                Term::from_field_text(schema.doc_type, "symbol"),
+                IndexRecordOption::Basic,
+            )) as Box<dyn tantivy::query::Query>),
+        ]);
+
+        let Ok(top) = searcher.search(&query, &TopDocs::with_limit(ids.len())) else {
+            return HashMap::new();
+        };
+
+        top.into_iter()
+            .filter_map(|(_score, addr)| {
+                let doc = searcher.doc::<tantivy::TantivyDocument>(addr).ok()?;
+                let symbol = doc_to_symbol(&doc, schema)?;
+                Some((symbol.id, symbol))
+            })
+            .collect()
+    }
+
     /// Find all symbols matching a name (may return multiple across files).
     pub fn find_symbols_by_name(&self, name: &str) -> Vec<Symbol> {
         let searcher = self.index.reader().searcher();
@@ -555,11 +595,18 @@ impl IndexFacade {
 
         let matches = semantic.search(query, limit, threshold)?;
 
+        // Batch-fetch all symbols in a single Tantivy query instead of N+1
+        let ids: Vec<SymbolId> = matches
+            .iter()
+            .filter_map(|m| SymbolId::new(m.symbol_id))
+            .collect();
+        let symbol_map = self.get_symbols_batch(&ids);
+
         let results: Vec<(Symbol, f32)> = matches
             .into_iter()
             .filter_map(|m| {
                 let id = SymbolId::new(m.symbol_id)?;
-                let symbol = self.get_symbol(id)?;
+                let symbol = symbol_map.get(&id)?.clone();
                 Some((symbol, m.score))
             })
             .collect();
@@ -933,6 +980,40 @@ pub fn world() {
         let by_id = facade.get_symbol(sym.id);
         assert!(by_id.is_some());
         assert_eq!(by_id.unwrap().as_name(), "my_func");
+    }
+
+    #[test]
+    fn test_facade_get_symbols_batch() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            src_dir.path().join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\npub fn gamma() {}",
+        )
+        .unwrap();
+
+        let idx_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(idx_dir.path().join("idx")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        let a = facade.get_symbol_by_name("alpha").unwrap();
+        let b = facade.get_symbol_by_name("beta").unwrap();
+        let g = facade.get_symbol_by_name("gamma").unwrap();
+
+        let batch = facade.get_symbols_batch(&[a.id, b.id, g.id]);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(batch.get(&a.id).unwrap().as_name(), "alpha");
+        assert_eq!(batch.get(&b.id).unwrap().as_name(), "beta");
+        assert_eq!(batch.get(&g.id).unwrap().as_name(), "gamma");
+
+        // Empty input returns empty map
+        let empty = facade.get_symbols_batch(&[]);
+        assert!(empty.is_empty());
+
+        // Non-existent ID returns partial results
+        let fake_id = SymbolId::new(99999).unwrap();
+        let partial = facade.get_symbols_batch(&[a.id, fake_id]);
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial.get(&a.id).unwrap().as_name(), "alpha");
     }
 
     #[test]

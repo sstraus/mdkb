@@ -380,11 +380,17 @@ impl McpServer {
     /// Initialize the code intelligence index (Tantivy-backed).
     ///
     /// Opens or creates the index at `.mdkb/code-index/`.
-    async fn ensure_code_index(&self) -> Result<(), McpError> {
-        // If startup reindex took the facade, don't recreate it — the startup
-        // task will put it back when done.
+    /// Acquire the code index lock, lazily initializing the facade if needed.
+    ///
+    /// Single lock acquisition eliminates the TOCTOU gap of the old
+    /// ensure + re-lock pattern.
+    async fn acquire_code_index(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<IndexFacade>>, McpError> {
+        // If startup reindex took the facade, return the (empty) guard — callers
+        // already handle the None case.
         if self.code_reindex_active.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(self.code_index.lock().await);
         }
         let mut idx_guard = self.code_index.lock().await;
         if idx_guard.is_none() {
@@ -400,7 +406,7 @@ impl McpServer {
             }
             *idx_guard = Some(facade);
         }
-        Ok(())
+        Ok(idx_guard)
     }
 
     /// Resolve a symbol by ID or name, returning an error for disambiguation.
@@ -547,9 +553,7 @@ impl McpServer {
                     drop(ctx_guard);
 
                     {
-                        self.ensure_code_index().await?;
-
-                        let mut idx_guard = self.code_index.lock().await;
+                        let mut idx_guard = self.acquire_code_index().await?;
                         let facade = match idx_guard.as_mut() {
                             Some(f) => f,
                             None => {
@@ -776,10 +780,7 @@ impl McpServer {
         }; // ctx_guard dropped here
 
         // Always show code index stats (initialize if needed)
-        {
-            // Try to open the code index for stats
-            let _ = self.ensure_code_index().await;
-            let idx_guard = self.code_index.lock().await;
+        if let Ok(idx_guard) = self.acquire_code_index().await {
             if let Some(facade) = idx_guard.as_ref() {
                 let symbols = facade.symbol_count();
                 let files = facade.file_count();
@@ -828,8 +829,7 @@ impl McpServer {
 
         // Phase 2: Reindex source code (tree-sitter + Tantivy)
         let code_output = {
-            self.ensure_code_index().await?;
-            let mut idx_guard = self.code_index.lock().await;
+            let mut idx_guard = self.acquire_code_index().await?;
             if let Some(facade) = idx_guard.as_mut() {
                 match facade.reindex(&self.root) {
                     Ok(stats) => {
@@ -1050,10 +1050,8 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<CodeGraphParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_code_index().await?;
-
         let output = {
-            let idx_guard = self.code_index.lock().await;
+            let idx_guard = self.acquire_code_index().await?;
             let facade = match idx_guard.as_ref() {
                 Some(f) => f,
                 None => {
@@ -1305,14 +1303,15 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
             // Run code reindex (incremental if index already exists).
             // Take the facade out of the lock to avoid blocking tool calls
             // during the (potentially slow) reindex + embedding generation.
-            if let Err(e) = startup_server.ensure_code_index().await {
-                tracing::error!("Startup code index init failed: {:?}", e);
-                return;
-            }
-            startup_server.code_reindex_active.store(true, Ordering::Relaxed);
-            let taken_facade = {
-                let mut idx_guard = startup_server.code_index.lock().await;
-                idx_guard.take()
+            let taken_facade = match startup_server.acquire_code_index().await {
+                Ok(mut guard) => {
+                    startup_server.code_reindex_active.store(true, Ordering::Relaxed);
+                    guard.take()
+                }
+                Err(e) => {
+                    tracing::error!("Startup code index init failed: {:?}", e);
+                    return;
+                }
             }; // lock released immediately
 
             if let Some(mut facade) = taken_facade {
@@ -1347,12 +1346,14 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
     let watcher_ctx = server.ctx.clone();
     let watcher_code_index = server.code_index.clone();
     let watcher_code_enabled = server.full_config.code.enabled;
+    let watcher_ignore_patterns = server.code_ignore_patterns.clone();
     tokio::spawn(async move {
         if let Err(e) = run_file_watcher(
             watcher_root,
             watcher_ctx,
             watcher_code_index,
             watcher_code_enabled,
+            watcher_ignore_patterns,
         )
         .await
         {
@@ -1408,9 +1409,27 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
 ///
 /// Returns `(is_code, is_doc)` — a file can be both (e.g., a `.rs` file
 /// inside a collection path).
-fn classify_change(path: &Path, collection_paths: &[PathBuf]) -> (bool, bool) {
+/// Build a GlobSet from ignore patterns for filtering code changes.
+fn build_code_excludes(root: &Path, patterns: &[String]) -> globset::GlobSet {
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        // Patterns are relative globs (e.g. "**/node_modules/**").
+        // Prefix with root so they match absolute paths from the watcher.
+        let abs_pattern = format!("{}/{pattern}", root.display());
+        match globset::Glob::new(&abs_pattern) {
+            Ok(g) => { builder.add(g); }
+            Err(e) => tracing::warn!("Invalid code exclude pattern '{pattern}': {e}"),
+        }
+    }
+    builder.build().unwrap_or_else(|e| {
+        tracing::error!("Failed to build code exclude GlobSet: {e}");
+        globset::GlobSet::empty()
+    })
+}
+
+fn classify_change(path: &Path, collection_paths: &[PathBuf], code_excludes: &globset::GlobSet) -> (bool, bool) {
     use crate::code::parsing::language::Language;
-    let is_code = Language::from_path(path).is_some();
+    let is_code = Language::from_path(path).is_some() && !code_excludes.is_match(path);
     let is_doc = collection_paths.iter().any(|cp| path.starts_with(cp));
     (is_code, is_doc)
 }
@@ -1430,6 +1449,7 @@ async fn run_file_watcher(
     ctx: Arc<Mutex<Option<Context>>>,
     code_index: Arc<Mutex<Option<IndexFacade>>>,
     code_enabled: bool,
+    code_ignore_patterns: Vec<String>,
 ) -> crate::error::Result<()> {
     let config = WatcherConfig::default();
     let mut watcher = FileWatcher::new(config)?;
@@ -1453,6 +1473,9 @@ async fn run_file_watcher(
         .map(|coll| root.join(&coll.path))
         .filter(|p| p.exists())
         .collect();
+
+    // Build exclude matcher for code changes (node_modules, dist, target, etc.)
+    let code_excludes = build_code_excludes(&root, &code_ignore_patterns);
 
     // Watch root recursively (covers both code and collections inside root)
     if code_enabled {
@@ -1506,7 +1529,7 @@ async fn run_file_watcher(
 
         tracing::debug!("File change detected: {:?}", change.path);
 
-        let (is_code, is_doc) = classify_change(&change.path, &collection_paths);
+        let (is_code, is_doc) = classify_change(&change.path, &collection_paths, &code_excludes);
 
         if is_code {
             code_batch.push(change.path.clone());
@@ -2743,28 +2766,65 @@ pub fn utility() -> i32 {
     fn test_classify_change_rs_outside_collection() {
         let path = Path::new("/project/src/main.rs");
         let collections = vec![PathBuf::from("/project/docs")];
-        assert_eq!(classify_change(path, &collections), (true, false));
+        let excludes = build_code_excludes(Path::new("/project"), &[]);
+        assert_eq!(classify_change(path, &collections, &excludes), (true, false));
     }
 
     #[test]
     fn test_classify_change_md_in_collection() {
         let path = Path::new("/project/docs/readme.md");
         let collections = vec![PathBuf::from("/project/docs")];
-        assert_eq!(classify_change(path, &collections), (false, true));
+        let excludes = build_code_excludes(Path::new("/project"), &[]);
+        assert_eq!(classify_change(path, &collections, &excludes), (false, true));
     }
 
     #[test]
     fn test_classify_change_rs_in_collection() {
         let path = Path::new("/project/docs/example.rs");
         let collections = vec![PathBuf::from("/project/docs")];
-        assert_eq!(classify_change(path, &collections), (true, true));
+        let excludes = build_code_excludes(Path::new("/project"), &[]);
+        assert_eq!(classify_change(path, &collections, &excludes), (true, true));
     }
 
     #[test]
     fn test_classify_change_irrelevant_file() {
         let path = Path::new("/project/data.json");
         let collections = vec![PathBuf::from("/project/docs")];
-        assert_eq!(classify_change(path, &collections), (false, false));
+        let excludes = build_code_excludes(Path::new("/project"), &[]);
+        assert_eq!(classify_change(path, &collections, &excludes), (false, false));
+    }
+
+    #[test]
+    fn test_classify_change_excludes_node_modules() {
+        let root = Path::new("/project");
+        let collections = vec![PathBuf::from("/project/docs")];
+        let patterns = vec!["**/node_modules/**".to_string()];
+        let excludes = build_code_excludes(root, &patterns);
+
+        // .js in node_modules should NOT be classified as code
+        let path = Path::new("/project/node_modules/lodash/index.js");
+        assert_eq!(classify_change(path, &collections, &excludes), (false, false));
+
+        // .js outside node_modules should still be code
+        let path = Path::new("/project/src/app.js");
+        assert_eq!(classify_change(path, &collections, &excludes), (true, false));
+    }
+
+    #[test]
+    fn test_classify_change_excludes_multiple_patterns() {
+        let root = Path::new("/project");
+        let collections: Vec<PathBuf> = vec![];
+        let patterns = vec![
+            "**/node_modules/**".to_string(),
+            "**/dist/**".to_string(),
+            "**/target/**".to_string(),
+        ];
+        let excludes = build_code_excludes(root, &patterns);
+
+        assert_eq!(classify_change(Path::new("/project/node_modules/x/a.js"), &collections, &excludes), (false, false));
+        assert_eq!(classify_change(Path::new("/project/dist/bundle.js"), &collections, &excludes), (false, false));
+        assert_eq!(classify_change(Path::new("/project/target/debug/build.rs"), &collections, &excludes), (false, false));
+        assert_eq!(classify_change(Path::new("/project/src/main.rs"), &collections, &excludes), (true, false));
     }
 
     #[tokio::test]

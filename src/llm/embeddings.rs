@@ -75,7 +75,7 @@ impl EmbeddingService {
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         let mut results = self
             .model
-            .embed(vec![text], None)
+            .embed(vec![text], Some(EMBED_BATCH_SIZE))
             .map_err(|e| Error::other(format!("Failed to embed query: {e}")))?;
         results
             .pop()
