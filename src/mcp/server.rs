@@ -380,11 +380,17 @@ impl McpServer {
     /// Initialize the code intelligence index (Tantivy-backed).
     ///
     /// Opens or creates the index at `.mdkb/code-index/`.
-    async fn ensure_code_index(&self) -> Result<(), McpError> {
-        // If startup reindex took the facade, don't recreate it — the startup
-        // task will put it back when done.
+    /// Acquire the code index lock, lazily initializing the facade if needed.
+    ///
+    /// Single lock acquisition eliminates the TOCTOU gap of the old
+    /// ensure + re-lock pattern.
+    async fn acquire_code_index(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<IndexFacade>>, McpError> {
+        // If startup reindex took the facade, return the (empty) guard — callers
+        // already handle the None case.
         if self.code_reindex_active.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(self.code_index.lock().await);
         }
         let mut idx_guard = self.code_index.lock().await;
         if idx_guard.is_none() {
@@ -400,7 +406,7 @@ impl McpServer {
             }
             *idx_guard = Some(facade);
         }
-        Ok(())
+        Ok(idx_guard)
     }
 
     /// Resolve a symbol by ID or name, returning an error for disambiguation.
@@ -547,9 +553,7 @@ impl McpServer {
                     drop(ctx_guard);
 
                     {
-                        self.ensure_code_index().await?;
-
-                        let mut idx_guard = self.code_index.lock().await;
+                        let mut idx_guard = self.acquire_code_index().await?;
                         let facade = match idx_guard.as_mut() {
                             Some(f) => f,
                             None => {
@@ -776,10 +780,7 @@ impl McpServer {
         }; // ctx_guard dropped here
 
         // Always show code index stats (initialize if needed)
-        {
-            // Try to open the code index for stats
-            let _ = self.ensure_code_index().await;
-            let idx_guard = self.code_index.lock().await;
+        if let Ok(idx_guard) = self.acquire_code_index().await {
             if let Some(facade) = idx_guard.as_ref() {
                 let symbols = facade.symbol_count();
                 let files = facade.file_count();
@@ -828,8 +829,7 @@ impl McpServer {
 
         // Phase 2: Reindex source code (tree-sitter + Tantivy)
         let code_output = {
-            self.ensure_code_index().await?;
-            let mut idx_guard = self.code_index.lock().await;
+            let mut idx_guard = self.acquire_code_index().await?;
             if let Some(facade) = idx_guard.as_mut() {
                 match facade.reindex(&self.root) {
                     Ok(stats) => {
@@ -1050,10 +1050,8 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<CodeGraphParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_code_index().await?;
-
         let output = {
-            let idx_guard = self.code_index.lock().await;
+            let idx_guard = self.acquire_code_index().await?;
             let facade = match idx_guard.as_ref() {
                 Some(f) => f,
                 None => {
@@ -1305,14 +1303,15 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
             // Run code reindex (incremental if index already exists).
             // Take the facade out of the lock to avoid blocking tool calls
             // during the (potentially slow) reindex + embedding generation.
-            if let Err(e) = startup_server.ensure_code_index().await {
-                tracing::error!("Startup code index init failed: {:?}", e);
-                return;
-            }
-            startup_server.code_reindex_active.store(true, Ordering::Relaxed);
-            let taken_facade = {
-                let mut idx_guard = startup_server.code_index.lock().await;
-                idx_guard.take()
+            let taken_facade = match startup_server.acquire_code_index().await {
+                Ok(mut guard) => {
+                    startup_server.code_reindex_active.store(true, Ordering::Relaxed);
+                    guard.take()
+                }
+                Err(e) => {
+                    tracing::error!("Startup code index init failed: {:?}", e);
+                    return;
+                }
             }; // lock released immediately
 
             if let Some(mut facade) = taken_facade {
