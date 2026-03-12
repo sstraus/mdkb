@@ -101,9 +101,10 @@ Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectura
 mdkb indexes source code with tree-sitter parsers for **13 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, and GDScript.
 
 The code index supports:
-- **Symbol search** — find functions, structs, methods by name
+- **Substring search** — find symbols by partial name (FTS5 trigram, works from 3 characters)
 - **Semantic code search** — find conceptually similar code using embeddings
-- **Call graph** — trace what a function calls, what calls it, or impact radius
+- **Persistent call graph** — function calls, callers, and transitive impact radius survive restarts
+- **Duplicate prevention** — UNIQUE constraints guarantee one entry per symbol per location
 
 Generate semantic embeddings (downloads ~30MB ONNX model on first run):
 
