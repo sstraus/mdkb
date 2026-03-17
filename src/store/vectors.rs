@@ -58,6 +58,30 @@ pub fn init_vector_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Memory embeddings storage
+    conn.execute(
+        r#"
+        CREATE TABLE IF NOT EXISTS memory_embeddings (
+            memory_rowid INTEGER PRIMARY KEY,
+            embedding BLOB NOT NULL,
+            model TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        )
+        "#,
+        [],
+    )?;
+
+    // Vector index for memory entries
+    conn.execute(
+        r#"
+        CREATE VIRTUAL TABLE IF NOT EXISTS vec_memory USING vec0(
+            memory_rowid INTEGER PRIMARY KEY,
+            embedding FLOAT[384]
+        )
+        "#,
+        [],
+    )?;
+
     Ok(())
 }
 
@@ -237,6 +261,73 @@ pub fn count_embeddings(conn: &Connection) -> Result<usize> {
     Ok(count as usize)
 }
 
+// =============================================================================
+// Memory entry embeddings
+// =============================================================================
+
+/// Store embedding for a memory entry (keyed by rowid).
+pub fn store_memory_embedding(
+    conn: &Connection,
+    memory_rowid: i64,
+    embedding: &[f32],
+    model: &str,
+) -> Result<()> {
+    let now = chrono::Utc::now().timestamp();
+    let embedding_bytes = embedding.as_bytes();
+
+    conn.execute(
+        "INSERT OR REPLACE INTO memory_embeddings (memory_rowid, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
+        params![memory_rowid, embedding_bytes, model, now],
+    )?;
+
+    // sqlite-vec doesn't support INSERT OR REPLACE
+    conn.execute(
+        "DELETE FROM vec_memory WHERE memory_rowid = ?1",
+        params![memory_rowid],
+    )?;
+    conn.execute(
+        "INSERT INTO vec_memory (memory_rowid, embedding) VALUES (?1, ?2)",
+        params![memory_rowid, embedding_bytes],
+    )?;
+
+    Ok(())
+}
+
+/// Search for similar memory entries by vector.
+pub fn memory_vector_search(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: usize,
+) -> Result<Vec<(i64, f32)>> {
+    let embedding_bytes = query_embedding.as_bytes();
+
+    let mut stmt = conn.prepare(
+        "SELECT memory_rowid, distance FROM vec_memory WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
+    )?;
+
+    let results = stmt
+        .query_map(params![embedding_bytes, limit as i64], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    Ok(results)
+}
+
+/// Delete embedding for a memory entry.
+pub fn delete_memory_embedding(conn: &Connection, memory_rowid: i64) -> Result<bool> {
+    let rows = conn.execute(
+        "DELETE FROM memory_embeddings WHERE memory_rowid = ?1",
+        params![memory_rowid],
+    )?;
+    conn.execute(
+        "DELETE FROM vec_memory WHERE memory_rowid = ?1",
+        params![memory_rowid],
+    )?;
+    Ok(rows > 0)
+}
+
 /// Embedding dimension (384 for AllMiniLML6V2).
 pub const EMBEDDING_DIM: usize = 384;
 
@@ -244,7 +335,6 @@ pub const EMBEDDING_DIM: usize = 384;
 mod tests {
     use super::*;
     use crate::store::schema::init_schema;
-    use std::sync::Once;
 
     static INIT: Once = Once::new();
 
@@ -508,5 +598,78 @@ mod tests {
         // Retrieved embedding should be the updated one
         let retrieved = get_embedding(&conn, 1).unwrap().unwrap();
         assert!((retrieved[0] - 0.9).abs() < 0.001);
+    }
+
+    // ==================== Memory Embedding Tests ====================
+
+    fn insert_memory_entry(conn: &Connection, id: &str, title: &str, content: &str) -> i64 {
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at)
+             VALUES (?1, ?2, ?3, 'topic', '[]', 'active', ?4, ?4)",
+            params![id, title, content, now],
+        ).unwrap();
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn test_store_and_search_memory_embedding() {
+        let conn = setup_db();
+
+        let rowid1 = insert_memory_entry(&conn, "auth-flow", "OAuth PKCE Flow", "How we handle authentication with PKCE");
+        let rowid2 = insert_memory_entry(&conn, "db-perf", "Database Performance", "SQLite tuning and WAL mode configuration");
+        let rowid3 = insert_memory_entry(&conn, "jwt-refresh", "JWT Refresh Strategy", "Token expiration and refresh flow design");
+
+        // Embeddings: auth entries (1,3) get similar vectors, db entry (2) gets different
+        let auth_embedding = test_embedding(0.1);
+        let db_embedding = test_embedding(0.5);
+        let jwt_embedding = test_embedding(0.12); // close to auth
+
+        store_memory_embedding(&conn, rowid1, &auth_embedding, "test").unwrap();
+        store_memory_embedding(&conn, rowid2, &db_embedding, "test").unwrap();
+        store_memory_embedding(&conn, rowid3, &jwt_embedding, "test").unwrap();
+
+        // Search with query close to auth topics
+        let query = test_embedding(0.11);
+        let results = memory_vector_search(&conn, &query, 3).unwrap();
+
+        assert_eq!(results.len(), 3);
+        // Auth entries should be closest
+        let top_2_rowids: Vec<i64> = results.iter().take(2).map(|(id, _)| *id).collect();
+        assert!(top_2_rowids.contains(&rowid1), "auth-flow should be in top 2");
+        assert!(top_2_rowids.contains(&rowid3), "jwt-refresh should be in top 2");
+    }
+
+    #[test]
+    fn test_delete_memory_embedding() {
+        let conn = setup_db();
+
+        let rowid = insert_memory_entry(&conn, "test-entry", "Test", "Test content");
+        store_memory_embedding(&conn, rowid, &test_embedding(0.1), "test").unwrap();
+
+        let deleted = delete_memory_embedding(&conn, rowid).unwrap();
+        assert!(deleted);
+
+        // Search should return empty
+        let results = memory_vector_search(&conn, &test_embedding(0.1), 10).unwrap();
+        assert!(results.is_empty());
+
+        // Deleting again should return false
+        assert!(!delete_memory_embedding(&conn, rowid).unwrap());
+    }
+
+    #[test]
+    fn test_memory_embedding_update_replaces() {
+        let conn = setup_db();
+
+        let rowid = insert_memory_entry(&conn, "evolving", "Evolving Entry", "Content v1");
+        store_memory_embedding(&conn, rowid, &test_embedding(0.1), "test").unwrap();
+        store_memory_embedding(&conn, rowid, &test_embedding(0.9), "test").unwrap();
+
+        // Search should find entry once, with updated embedding
+        let query = test_embedding(0.89);
+        let results = memory_vector_search(&conn, &query, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, rowid);
     }
 }

@@ -352,6 +352,149 @@ pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Ve
     Ok(entries)
 }
 
+/// BM25 search returning (rowid, entry) pairs for RRF fusion.
+fn bm25_search_with_rowid(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(i64, MemoryEntry)>> {
+    let fts_query = crate::store::search::escape_fts5_query(query);
+    let mut stmt = conn.prepare(
+        "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path
+         FROM memory_entries m
+         JOIN memory_fts f ON m.rowid = f.rowid
+         WHERE memory_fts MATCH ?1
+         ORDER BY bm25(memory_fts)
+         LIMIT ?2"
+    )?;
+
+    let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+        let rowid: i64 = row.get(0)?;
+        let tags_json: String = row.get(5)?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        let entry_type_str: String = row.get(4)?;
+        let status_str: String = row.get(6)?;
+
+        let entry = MemoryEntry {
+            id: row.get(1)?,
+            title: row.get(2)?,
+            content: row.get(3)?,
+            entry_type: entry_type_str.parse().unwrap_or(EntryType::Topic),
+            tags,
+            status: status_str.parse().unwrap_or(EntryStatus::Active),
+            created_at: row.get(7)?,
+            updated_at: row.get(8)?,
+            superseded_by: row.get(9)?,
+            access_count: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+            last_accessed: row.get(11)?,
+            source_path: row.get(12)?,
+        };
+        Ok((rowid, entry))
+    })?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
+/// Get memory entry by rowid.
+fn get_entry_by_rowid(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
+    let entry = conn
+        .query_row(
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path
+             FROM memory_entries WHERE rowid = ?1",
+            params![rowid],
+            row_to_entry,
+        )
+        .optional()?;
+    Ok(entry)
+}
+
+/// Hybrid search for memory entries: BM25 + vector with RRF fusion.
+///
+/// Falls back to BM25-only if no embeddings exist or embedding service is unavailable.
+pub fn search_entries_hybrid(
+    conn: &Connection,
+    query: &str,
+    query_embedding: Option<&[f32]>,
+    limit: usize,
+) -> Result<Vec<MemoryEntry>> {
+    use crate::store::{hybrid, vectors};
+    use std::collections::HashMap;
+
+    // BM25 search (get more for fusion)
+    let bm25_results = bm25_search_with_rowid(conn, query, limit * 2)?;
+
+    // If no embedding provided, fall back to BM25-only
+    let query_embedding = match query_embedding {
+        Some(emb) => emb,
+        None => {
+            return Ok(bm25_results.into_iter().take(limit).map(|(_, e)| e).collect());
+        }
+    };
+
+    // Vector search
+    let vector_results = vectors::memory_vector_search(conn, query_embedding, limit * 2)?;
+
+    // If no vector results, fall back to BM25-only
+    if vector_results.is_empty() {
+        return Ok(bm25_results.into_iter().take(limit).map(|(_, e)| e).collect());
+    }
+
+    // Build SearchResult wrappers for BM25 (RRF needs SearchResult with i64 id)
+    let bm25_for_rrf: Vec<crate::domain::SearchResult> = bm25_results
+        .iter()
+        .enumerate()
+        .map(|(_, (rowid, _))| crate::domain::SearchResult {
+            id: *rowid,
+            collection: String::new(),
+            path: String::new(),
+            title: None,
+            score: 0.0,
+            snippets: vec![],
+            status: None,
+            superseded_by: None,
+        })
+        .collect();
+
+    // RRF fusion
+    let config = hybrid::HybridConfig::default();
+    let fused = hybrid::rrf_fusion(&bm25_for_rrf, &vector_results, &config);
+
+    // Build a lookup map from rowid -> MemoryEntry (from BM25 results)
+    let mut entry_map: HashMap<i64, MemoryEntry> = bm25_results
+        .into_iter()
+        .collect();
+
+    // Resolve fused results to MemoryEntry, fetching from DB if only in vector results
+    let mut results = Vec::new();
+    for (rowid, _score) in fused {
+        let entry = if let Some(e) = entry_map.remove(&rowid) {
+            e
+        } else if let Some(e) = get_entry_by_rowid(conn, rowid)? {
+            e
+        } else {
+            continue;
+        };
+        results.push(entry);
+        if results.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(results)
+}
+
+/// Get rowid for a memory entry by its slug ID.
+pub fn get_rowid(conn: &Connection, id: &str) -> Result<Option<i64>> {
+    let rowid = conn
+        .query_row(
+            "SELECT rowid FROM memory_entries WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(rowid)
+}
+
 /// Get warmup index - compact list of top entries by access count.
 ///
 /// Uses a targeted query selecting only needed columns (no content).
@@ -1129,5 +1272,160 @@ mod tests {
         let big = "x".repeat(MAX_CONTENT_SIZE + 1);
         let err = validate_entry_input("ok-id", "Title", &[], &big).unwrap_err();
         assert!(err.to_string().contains("Content exceeds"), "{err}");
+    }
+
+    // ==================== Hybrid Search Tests ====================
+
+    fn setup_db_with_vectors() -> Connection {
+        use crate::store::vectors;
+        vectors::init_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        vectors::init_vector_schema(&conn).unwrap();
+        conn
+    }
+
+    fn test_embedding(seed: f32) -> Vec<f32> {
+        (0..crate::store::vectors::EMBEDDING_DIM)
+            .map(|i| seed + i as f32 * 0.001)
+            .collect()
+    }
+
+    #[test]
+    fn test_hybrid_search_falls_back_to_bm25_without_embedding() {
+        let conn = setup_db_with_vectors();
+
+        let entry = MemoryEntry {
+            id: "test-entry".to_string(),
+            title: "OAuth PKCE Flow".to_string(),
+            content: "How we handle authentication with PKCE protocol".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec!["auth".to_string()],
+            status: EntryStatus::Active,
+            created_at: 1000,
+            updated_at: 1000,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        // Search without embedding — should fall back to BM25
+        let results = search_entries_hybrid(&conn, "OAuth PKCE", None, 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "test-entry");
+    }
+
+    #[test]
+    fn test_hybrid_search_finds_semantic_match() {
+        let conn = setup_db_with_vectors();
+        use crate::store::vectors;
+
+        // Entry 1: keyword match for "authentication"
+        let e1 = MemoryEntry {
+            id: "auth-basic".to_string(),
+            title: "Basic Authentication Setup".to_string(),
+            content: "How to configure basic authentication".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: 1000, updated_at: 1000,
+            superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
+        };
+        add_entry(&conn, &e1).unwrap();
+        let rowid1 = get_rowid(&conn, "auth-basic").unwrap().unwrap();
+        vectors::store_memory_embedding(&conn, rowid1, &test_embedding(0.1), "test").unwrap();
+
+        // Entry 2: different keywords but semantically similar embedding
+        let e2 = MemoryEntry {
+            id: "jwt-refresh".to_string(),
+            title: "JWT Token Refresh Strategy".to_string(),
+            content: "Design for token expiration and refresh flow".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: 1000, updated_at: 1000,
+            superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
+        };
+        add_entry(&conn, &e2).unwrap();
+        let rowid2 = get_rowid(&conn, "jwt-refresh").unwrap().unwrap();
+        // Give jwt-refresh a similar embedding to the query
+        vectors::store_memory_embedding(&conn, rowid2, &test_embedding(0.11), "test").unwrap();
+
+        // Entry 3: unrelated
+        let e3 = MemoryEntry {
+            id: "db-tuning".to_string(),
+            title: "Database Tuning Notes".to_string(),
+            content: "SQLite WAL mode and pragma settings".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: 1000, updated_at: 1000,
+            superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
+        };
+        add_entry(&conn, &e3).unwrap();
+        let rowid3 = get_rowid(&conn, "db-tuning").unwrap().unwrap();
+        vectors::store_memory_embedding(&conn, rowid3, &test_embedding(0.9), "test").unwrap();
+
+        // Query: "token expiration" — BM25 matches jwt-refresh, vector matches auth-basic+jwt-refresh
+        // Query embedding close to auth entries
+        let query_emb = test_embedding(0.105);
+        let results = search_entries_hybrid(&conn, "token expiration", Some(&query_emb), 10).unwrap();
+
+        // jwt-refresh should be found (has both BM25 keyword match and vector similarity)
+        let result_ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
+        assert!(result_ids.contains(&"jwt-refresh"), "jwt-refresh should be found via BM25+vector");
+        // auth-basic should be found via vector similarity even without keyword match
+        assert!(result_ids.contains(&"auth-basic"), "auth-basic should be found via vector similarity");
+    }
+
+    #[test]
+    fn test_hybrid_search_respects_limit() {
+        let conn = setup_db_with_vectors();
+        use crate::store::vectors;
+
+        for i in 1..=10 {
+            let entry = MemoryEntry {
+                id: format!("entry-{i}"),
+                title: format!("Test Entry {i}"),
+                content: format!("Content for searchable entry number {i}"),
+                entry_type: EntryType::Topic,
+                tags: vec![],
+                status: EntryStatus::Active,
+                created_at: 1000, updated_at: 1000,
+                superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
+            };
+            add_entry(&conn, &entry).unwrap();
+            let rowid = get_rowid(&conn, &format!("entry-{i}")).unwrap().unwrap();
+            vectors::store_memory_embedding(&conn, rowid, &test_embedding(i as f32 * 0.1), "test").unwrap();
+        }
+
+        let query_emb = test_embedding(0.5);
+        let results = search_entries_hybrid(&conn, "searchable entry", Some(&query_emb), 3).unwrap();
+        assert_eq!(results.len(), 3, "Should respect limit of 3");
+    }
+
+    #[test]
+    fn test_get_rowid() {
+        let conn = setup_db_with_vectors();
+        let entry = MemoryEntry {
+            id: "my-entry".to_string(),
+            title: "My Entry".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: 1000, updated_at: 1000,
+            superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        let rowid = get_rowid(&conn, "my-entry").unwrap();
+        assert!(rowid.is_some());
+
+        let missing = get_rowid(&conn, "nonexistent").unwrap();
+        assert!(missing.is_none());
     }
 }

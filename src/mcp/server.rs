@@ -502,8 +502,16 @@ impl McpServer {
                     (output, tokens, results.len())
                 }
                 Some("memory") => {
-                    let entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
-                        .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
+                    let query_embedding = crate::llm::get_cached_service()
+                        .ok()
+                        .and_then(|s| s.embed_query(&params.query).ok());
+                    let entries = memory::search_entries_hybrid(
+                        &ctx.conn,
+                        &params.query,
+                        query_embedding.as_deref(),
+                        params.limit,
+                    )
+                    .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
                     let output = format_memory_search_results(&entries);
                     let tokens = count_tokens(&output);
@@ -519,8 +527,16 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-                    let mem_entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
-                        .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
+                    let query_embedding = crate::llm::get_cached_service()
+                        .ok()
+                        .and_then(|s| s.embed_query(&params.query).ok());
+                    let mem_entries = memory::search_entries_hybrid(
+                        &ctx.conn,
+                        &params.query,
+                        query_embedding.as_deref(),
+                        params.limit,
+                    )
+                    .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
                     let total = doc_results.len() + mem_entries.len();
 
@@ -942,6 +958,23 @@ impl McpServer {
                     .map_err(|e| mcp_error(format!("Failed to create memory entry: {}", e)))?;
                 format!("Created memory entry: {}", params.id)
             };
+
+            // Generate embedding for hybrid search
+            if let Ok(service) = crate::llm::get_cached_service() {
+                let embed_text = format!("{} {}", params.title, params.content);
+                if let Ok(embedding) = service.embed_query(&embed_text) {
+                    if let Some(rowid) = memory::get_rowid(&ctx.conn, &params.id)
+                        .unwrap_or(None)
+                    {
+                        let _ = crate::store::vectors::store_memory_embedding(
+                            &ctx.conn,
+                            rowid,
+                            &embedding,
+                            crate::llm::embeddings::MODEL_NAME,
+                        );
+                    }
+                }
+            }
 
             let tokens = count_tokens(&output);
             (output, tokens)
