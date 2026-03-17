@@ -497,7 +497,7 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-                    let output = format_search_results(&results);
+                    let output = format_search_results(&results, params.limit);
                     let tokens = count_tokens(&output);
                     (output, tokens, results.len())
                 }
@@ -548,7 +548,7 @@ impl McpServer {
                         let mut output = String::new();
 
                         if !doc_results.is_empty() {
-                            output.push_str(&format_search_results(&doc_results));
+                            output.push_str(&format_search_results(&doc_results, params.limit));
                         }
 
                         if !mem_entries.is_empty() {
@@ -1737,15 +1737,26 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 }
 
 /// Format search results for output.
-fn format_search_results(results: &[SearchResult]) -> String {
-    let results: Vec<_> = results.iter().filter(|r| r.score != 0.0).collect();
+fn format_search_results(results: &[SearchResult], limit: usize) -> String {
+    use crate::store::hybrid::lost_in_middle_reorder;
 
-    if results.is_empty() {
+    let filtered: Vec<_> = results.iter().filter(|r| r.score != 0.0).collect();
+
+    if filtered.is_empty() {
         return "No matching documents found.".to_string();
     }
 
-    let mut output = String::new();
-    for r in &results {
+    // Apply lost-in-the-middle reordering
+    let mut ordered: Vec<_> = filtered;
+    lost_in_middle_reorder(&mut ordered);
+
+    let mut output = if ordered.len() >= limit {
+        format!("Showing {} results (limit reached, refine query for more precise results):\n", ordered.len())
+    } else {
+        String::new()
+    };
+
+    for r in &ordered {
         let title = r.title.as_deref().unwrap_or("(untitled)");
         output.push_str(&format!(
             "[{}] {} - {} (score: {:.2})\n",
@@ -1757,7 +1768,7 @@ fn format_search_results(results: &[SearchResult]) -> String {
     }
 
     // Hint: guide the model toward get() for retrieval
-    let ids: Vec<_> = results.iter().map(|r| r.id.to_string()).collect();
+    let ids: Vec<_> = ordered.iter().map(|r| r.id.to_string()).collect();
     if ids.len() == 1 {
         output.push_str(&format!("\nUse get(\"{}\") to read.", ids[0]));
     } else {
@@ -1773,12 +1784,18 @@ fn format_search_results(results: &[SearchResult]) -> String {
 
 /// Format memory search results for output.
 fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
+    use crate::store::hybrid::lost_in_middle_reorder;
+
     if entries.is_empty() {
         return "No matching memory entries found.".to_string();
     }
 
+    // Apply lost-in-the-middle reordering
+    let mut ordered: Vec<_> = entries.iter().collect();
+    lost_in_middle_reorder(&mut ordered);
+
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
-    for entry in entries {
+    for entry in &ordered {
         out.push_str(&format!(
             "- [{}] {} ({}): {}\n",
             entry.id,
@@ -1829,7 +1846,7 @@ mod tests {
     #[test]
     fn test_format_search_results_empty() {
         let results: Vec<SearchResult> = vec![];
-        let output = format_search_results(&results);
+        let output = format_search_results(&results, 10);
         assert!(output.starts_with("No matching documents"), "Should start with 'No matching documents', got: {}", output);
     }
 
@@ -1845,7 +1862,7 @@ mod tests {
             status: None,
             superseded_by: None,
         }];
-        let output = format_search_results(&results);
+        let output = format_search_results(&results, 10);
         assert!(output.contains("[1] readme.md"), "Should show path without collection prefix, got: {output}");
         assert!(!output.contains("docs:"), "Should not contain collection prefix, got: {output}");
         assert!(output.contains("README"));
@@ -1875,7 +1892,7 @@ mod tests {
                 superseded_by: None,
             },
         ];
-        let output = format_search_results(&results);
+        let output = format_search_results(&results, 10);
         assert!(output.contains("get(\"10\")"), "Should hint single get, got: {output}");
         assert!(output.contains("get(\"10,20\")"), "Should hint batch get, got: {output}");
     }
@@ -1904,7 +1921,7 @@ mod tests {
                 superseded_by: None,
             },
         ];
-        let output = format_search_results(&results);
+        let output = format_search_results(&results, 10);
         assert!(output.contains("good.md"), "Should include result with positive score");
         assert!(!output.contains("zero.md"), "Should filter out result with score 0.00, got: {output}");
     }
