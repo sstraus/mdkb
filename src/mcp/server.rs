@@ -1724,8 +1724,12 @@ const BASE_INSTRUCTIONS: &str = "\
 | Call graph / impact analysis | `code_graph(name)` |
 | Exact text pattern | Grep |
 | Browse memories | `memory_list()` |
+| Validate knowledge still correct | `memory_confirm(id)` |
+| Flag incorrect knowledge | `memory_correct(id, correction)` |
 
 Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after finding a symbol to trace callers or impact.
+
+Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Use `memory_confirm` when you verify knowledge is still accurate. Use `memory_correct` when you find errors.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
