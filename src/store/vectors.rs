@@ -9,6 +9,7 @@ use sqlite_vec::sqlite3_vec_init;
 use zerocopy::AsBytes;
 
 use crate::error::Result;
+use crate::store::chunks;
 
 /// Ensures sqlite-vec extension is initialized exactly once.
 static INIT_SQLITE_VEC: Once = Once::new();
@@ -111,6 +112,16 @@ pub fn init_vector_schema(conn: &Connection) -> Result<()> {
         )
         "#,
         [],
+    )?;
+
+    // Cleanup triggers: delete orphan embeddings when memory entries are deleted
+    conn.execute_batch(
+        r#"
+        CREATE TRIGGER IF NOT EXISTS memory_delete_embeddings AFTER DELETE ON memory_entries BEGIN
+            DELETE FROM memory_embeddings WHERE memory_rowid = OLD.rowid;
+            DELETE FROM vec_memory WHERE memory_rowid = OLD.rowid;
+        END;
+        "#,
     )?;
 
     Ok(())
@@ -216,13 +227,14 @@ pub fn store_embedding(
 
 /// Get embedding for a document.
 pub fn get_embedding(conn: &Connection, document_id: i64) -> Result<Option<Vec<f32>>> {
+    use rusqlite::OptionalExtension;
     let result: Option<Vec<u8>> = conn
         .query_row(
             "SELECT embedding FROM embeddings WHERE document_id = ?1",
             params![document_id],
             |row| row.get(0),
         )
-        .ok();
+        .optional()?;
 
     Ok(result.map(|bytes| {
         bytes
@@ -302,53 +314,56 @@ pub fn count_embeddings(conn: &Connection) -> Result<usize> {
 pub fn store_chunk_embeddings(
     conn: &Connection,
     document_id: i64,
-    chunks: &[crate::store::chunks::Chunk],
+    chunks: &[chunks::Chunk],
     embeddings: &[Vec<f32>],
     model: &str,
 ) -> Result<()> {
-    assert_eq!(chunks.len(), embeddings.len());
+    if chunks.len() != embeddings.len() {
+        return Err(crate::error::ErrorKind::InvalidQuery(
+            format!("chunks/embeddings length mismatch: {} vs {}", chunks.len(), embeddings.len())
+        ).into());
+    }
     let now = chrono::Utc::now().timestamp();
 
-    // Delete existing chunks and their embeddings for this document
-    delete_chunk_embeddings(conn, document_id)?;
+    // Atomic: delete old + insert new in one transaction
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    let result = (|| -> Result<()> {
+        delete_chunk_embeddings(conn, document_id)?;
 
-    for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
-        // Insert chunk record
-        conn.execute(
-            "INSERT INTO document_chunks (document_id, chunk_index, content, heading_path) VALUES (?1, ?2, ?3, ?4)",
-            params![document_id, chunk.index as i64, chunk.content, chunk.heading_path],
-        )?;
-        let chunk_id = conn.last_insert_rowid();
+        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
+            conn.execute(
+                "INSERT INTO document_chunks (document_id, chunk_index, content, heading_path) VALUES (?1, ?2, ?3, ?4)",
+                params![document_id, chunk.index as i64, chunk.content, chunk.heading_path],
+            )?;
+            let chunk_id = conn.last_insert_rowid();
 
-        // Store embedding in vec_chunks
-        let embedding_bytes = embedding.as_bytes();
-        conn.execute(
-            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
-            params![chunk_id, embedding_bytes],
-        )?;
+            let embedding_bytes = embedding.as_bytes();
+            conn.execute(
+                "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+                params![chunk_id, embedding_bytes],
+            )?;
+        }
 
-        // Also store in embeddings-style table for persistence
-        // Reuse the embeddings table with chunk_id as document_id
-        // (chunks are a superset of whole-doc embeddings)
+        // Mark doc as having embeddings (for has_embedding() check)
+        if let Some(first_emb) = embeddings.first() {
+            let embedding_bytes = first_emb.as_bytes();
+            conn.execute(
+                "INSERT OR REPLACE INTO embeddings (document_id, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
+                params![document_id, embedding_bytes, model, now],
+            )?;
+            conn.execute("DELETE FROM vec_documents WHERE document_id = ?1", params![document_id])?;
+            conn.execute(
+                "INSERT INTO vec_documents (document_id, embedding) VALUES (?1, ?2)",
+                params![document_id, embedding_bytes],
+            )?;
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => { conn.execute("COMMIT", [])?; Ok(()) }
+        Err(e) => { let _ = conn.execute("ROLLBACK", []); Err(e) }
     }
-
-    // Store a marker in embeddings table so has_embedding() returns true
-    // Use the first chunk's embedding as the doc-level embedding
-    if let Some(first_emb) = embeddings.first() {
-        let embedding_bytes = first_emb.as_bytes();
-        conn.execute(
-            "INSERT OR REPLACE INTO embeddings (document_id, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![document_id, embedding_bytes, model, now],
-        )?;
-        // Also keep vec_documents in sync for backward compatibility
-        conn.execute("DELETE FROM vec_documents WHERE document_id = ?1", params![document_id])?;
-        conn.execute(
-            "INSERT INTO vec_documents (document_id, embedding) VALUES (?1, ?2)",
-            params![document_id, embedding_bytes],
-        )?;
-    }
-
-    Ok(())
 }
 
 /// Search for similar documents via chunk-level vector search.
@@ -361,52 +376,20 @@ pub fn chunk_vector_search(
     limit: usize,
 ) -> Result<Vec<(i64, f32)>> {
     let embedding_bytes = query_embedding.as_bytes();
+    let fetch_limit = limit * 5;
 
-    // Check if we have any chunks
-    let has_chunks: bool = conn
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type='table' AND name='document_chunks'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap_or(false);
-
-    if !has_chunks {
-        // Fall back to doc-level search
-        return vector_search(conn, query_embedding, limit);
-    }
-
-    let chunk_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM document_chunks", [], |row| row.get(0))
-        .unwrap_or(0);
-
-    if chunk_count == 0 {
-        // No chunks exist yet, fall back to doc-level search
-        return vector_search(conn, query_embedding, limit);
-    }
-
-    // Combine results from both chunk-level and doc-level vector search.
-    // Documents may have chunks (large docs) or whole-doc embeddings (small docs).
+    // Combine results from chunk-level and doc-level vector search.
     let mut best_per_doc: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
 
-    // 1. Search chunk-level vectors
-    let fetch_limit = limit * 5;
-    let chunk_hits = search_vec_chunks(conn, embedding_bytes, fetch_limit);
-
-    for (chunk_id, distance) in &chunk_hits {
-        if let Ok(doc_id) = conn.query_row(
-            "SELECT document_id FROM document_chunks WHERE id = ?1",
-            params![chunk_id],
-            |row| row.get::<_, i64>(0),
-        ) {
-            let entry = best_per_doc.entry(doc_id).or_insert(f32::MAX);
-            if *distance < *entry {
-                *entry = *distance;
-            }
+    // 1. Chunk-level search (batch-resolved to document_id)
+    for (doc_id, distance) in search_vec_chunks_by_doc(conn, embedding_bytes, fetch_limit) {
+        let entry = best_per_doc.entry(doc_id).or_insert(f32::MAX);
+        if distance < *entry {
+            *entry = distance;
         }
     }
 
-    // 2. Also search doc-level vectors (for docs without chunks)
+    // 2. Doc-level search (for small docs without chunks)
     let doc_results = vector_search(conn, query_embedding, fetch_limit)?;
     for (doc_id, distance) in doc_results {
         let entry = best_per_doc.entry(doc_id).or_insert(f32::MAX);
@@ -419,7 +402,6 @@ pub fn chunk_vector_search(
         return Ok(Vec::new());
     }
 
-    // Sort by distance ascending (best first), take limit
     let mut results: Vec<(i64, f32)> = best_per_doc.into_iter().collect();
     results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
@@ -448,20 +430,57 @@ pub fn delete_chunk_embeddings(conn: &Connection, document_id: i64) -> Result<()
     Ok(())
 }
 
-/// Search vec_chunks table, returning (chunk_id, distance). Empty vec on error.
-fn search_vec_chunks(conn: &Connection, embedding_bytes: &[u8], limit: usize) -> Vec<(i64, f32)> {
-    let mut stmt = match conn.prepare(
+/// Search vec_chunks, returning (document_id, distance) aggregated by best chunk per doc.
+fn search_vec_chunks_by_doc(conn: &Connection, embedding_bytes: &[u8], limit: usize) -> Vec<(i64, f32)> {
+    // Phase 1: vector search for chunk IDs + distances
+    let chunk_hits: Vec<(i64, f32)> = match conn.prepare(
         "SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
     ) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+        Ok(mut stmt) => stmt
+            .query_map(params![embedding_bytes, limit as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
+            })
+            .map(|rows| rows.filter_map(|r| r.ok()).collect())
+            .unwrap_or_else(|e| {
+                tracing::warn!("vec_chunks query failed: {e}");
+                Vec::new()
+            }),
+        Err(e) => {
+            tracing::warn!("Failed to prepare vec_chunks query: {e}");
+            return Vec::new();
+        }
     };
 
-    stmt.query_map(params![embedding_bytes, limit as i64], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
-    })
-    .map(|rows| rows.filter_map(|r| r.ok()).collect())
-    .unwrap_or_default()
+    if chunk_hits.is_empty() {
+        return Vec::new();
+    }
+
+    // Phase 2: batch resolve chunk_id → document_id in single query
+    let placeholders: String = chunk_hits.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(",");
+    let sql = format!("SELECT id, document_id FROM document_chunks WHERE id IN ({placeholders})");
+    let chunk_to_doc: std::collections::HashMap<i64, i64> = conn
+        .prepare(&sql)
+        .and_then(|mut stmt| {
+            let rows: Vec<(i64, i64)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            Ok(rows.into_iter().collect())
+        })
+        .unwrap_or_default();
+
+    // Aggregate: best distance per document
+    let mut best_per_doc: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
+    for (chunk_id, distance) in &chunk_hits {
+        if let Some(&doc_id) = chunk_to_doc.get(chunk_id) {
+            let entry = best_per_doc.entry(doc_id).or_insert(f32::MAX);
+            if *distance < *entry {
+                *entry = *distance;
+            }
+        }
+    }
+
+    best_per_doc.into_iter().collect()
 }
 
 /// Check if document has chunk-level embeddings.
@@ -470,7 +489,7 @@ pub fn has_chunk_embeddings(conn: &Connection, document_id: i64) -> Result<bool>
         "SELECT COUNT(*) FROM document_chunks WHERE document_id = ?1",
         params![document_id],
         |row| row.get(0),
-    ).unwrap_or(0);
+    )?;
     Ok(count > 0)
 }
 

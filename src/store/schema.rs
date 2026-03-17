@@ -196,7 +196,20 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 }
 
 /// Migrate schema from old version to current.
+///
+/// Wrapped in a transaction for atomicity — partial migration on crash
+/// is rolled back automatically by SQLite.
 fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
+    conn.execute("BEGIN IMMEDIATE", [])?;
+    let result = migrate_schema_inner(conn, from_version);
+    match &result {
+        Ok(()) => { conn.execute("COMMIT", [])?; }
+        Err(_) => { let _ = conn.execute("ROLLBACK", []); }
+    }
+    result
+}
+
+fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // Migration from v1 to v2: add status/version columns to documents and evolution table
     if from_version < 2 {
         // Add new columns to documents table if they don't exist

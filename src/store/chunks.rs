@@ -35,7 +35,11 @@ pub fn split(content: &str, config: &ChunkingConfig) -> Vec<Chunk> {
 
     match config.strategy.as_str() {
         "markdown" => split_markdown(content, config),
-        "fixed" | _ => split_fixed(content, config),
+        "fixed" => split_fixed(content, config),
+        other => {
+            tracing::warn!("Unknown chunking strategy '{other}', falling back to fixed");
+            split_fixed(content, config)
+        }
     }
 }
 
@@ -138,7 +142,7 @@ fn split_fixed(content: &str, config: &ChunkingConfig) -> Vec<Chunk> {
         }
 
         // Move start forward, accounting for overlap
-        let overlap_lines = find_overlap_start(&lines, start, end, config.overlap_tokens);
+        let overlap_lines = find_overlap_start(&lines, end, config.overlap_tokens);
         start = if overlap_lines > start { overlap_lines } else { end };
 
         // Safety: prevent infinite loop
@@ -151,7 +155,7 @@ fn split_fixed(content: &str, config: &ChunkingConfig) -> Vec<Chunk> {
 }
 
 /// Find the line index where the overlap window starts.
-fn find_overlap_start(lines: &[&str], _start: usize, end: usize, overlap_tokens: usize) -> usize {
+fn find_overlap_start(lines: &[&str], end: usize, overlap_tokens: usize) -> usize {
     if overlap_tokens == 0 || end == 0 {
         return end;
     }
