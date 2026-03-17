@@ -91,8 +91,6 @@ pub struct SearchConfig {
     /// Vector weight in hybrid search.
     pub vector_weight: f64,
 
-    /// Top-k for reranking.
-    pub rerank_top_k: usize,
 }
 
 /// Memory index settings (Phase 6).
@@ -127,18 +125,6 @@ pub struct ModelsConfig {
 
     /// Embedding model filename.
     pub embedding_file: String,
-
-    /// HuggingFace repo for reranker model.
-    pub reranker_repo: String,
-
-    /// Reranker model filename.
-    pub reranker_file: String,
-
-    /// HuggingFace repo for condensation model.
-    pub condense_repo: String,
-
-    /// Condensation model filename.
-    pub condense_file: String,
 
     /// Inactivity timeout before unloading models (seconds).
     pub inactivity_timeout_secs: u64,
@@ -300,7 +286,6 @@ impl Default for SearchConfig {
             rrf_k: DEFAULT_RRF_K,
             bm25_weight: DEFAULT_BM25_WEIGHT,
             vector_weight: DEFAULT_VECTOR_WEIGHT,
-            rerank_top_k: DEFAULT_RERANK_TOP_K,
         }
     }
 }
@@ -323,10 +308,6 @@ impl Default for ModelsConfig {
         Self {
             embedding_repo: "nomic-ai/nomic-embed-text-v1.5-GGUF".to_string(),
             embedding_file: "nomic-embed-text-v1.5.Q4_K_M.gguf".to_string(),
-            reranker_repo: "BAAI/bge-reranker-base-GGUF".to_string(),
-            reranker_file: "bge-reranker-base.Q4_K_M.gguf".to_string(),
-            condense_repo: "bartowski/Llama-3.2-3B-Instruct-GGUF".to_string(),
-            condense_file: "Llama-3.2-3B-Instruct-Q4_K_M.gguf".to_string(),
             inactivity_timeout_secs: DEFAULT_INACTIVITY_TIMEOUT_SECS,
         }
     }
@@ -397,11 +378,6 @@ const DEFAULT_MAX_RESPONSE_TOKENS: usize = 50_000;
 /// 10,000 tokens per document prevents single large files from consuming
 /// the entire response budget. Set to 0 for unlimited.
 const DEFAULT_MAX_DOCUMENT_TOKENS: usize = 10_000;
-
-/// Top-k candidates for reranking.
-/// 50 provides a good balance: enough candidates for the reranker to find good
-/// results, but not so many that reranking becomes slow.
-const DEFAULT_RERANK_TOP_K: usize = 50;
 
 /// Maximum documents in memory warmup index.
 /// 50 entries is enough for common documents without excessive memory use.
@@ -620,10 +596,6 @@ mod tests {
             config.models.embedding_file,
             "nomic-embed-text-v1.5.Q4_K_M.gguf"
         );
-        assert_eq!(
-            config.models.condense_repo,
-            "bartowski/Llama-3.2-3B-Instruct-GGUF"
-        );
     }
 
     #[test]
@@ -632,7 +604,6 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         assert!(toml_str.contains("[models]"));
         assert!(toml_str.contains("embedding_repo"));
-        assert!(toml_str.contains("condense_repo"));
     }
 
     // ==================== Validation Tests ====================
