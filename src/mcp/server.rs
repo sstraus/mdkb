@@ -1613,7 +1613,7 @@ const BASE_INSTRUCTIONS: &str = "\
 1. `search(query)` — ALWAYS start here. Searches docs AND memory together.
 2. Only add a scope param if step 1 returned too many irrelevant results.
 3. No results? Broaden query, then Grep/Glob.
-4. After solving problems: `memory_write`
+4. After solving problems: `memory_write` — but first `search(query, scope=\"memory\")` to check for duplicates. Update existing entries instead of creating new ones.
 
 ## Tools
 
