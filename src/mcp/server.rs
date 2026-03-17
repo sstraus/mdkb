@@ -26,7 +26,8 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
     CodeGraphParams,
-    GetParams, MemoryDeleteParams, MemoryListParams, MemoryWriteParams,
+    GetParams, MemoryConfirmParams, MemoryCorrectParams, MemoryDeleteParams,
+    MemoryListParams, MemoryWriteParams,
     SearchParams,
 };
 
@@ -927,10 +928,16 @@ impl McpServer {
                 .parse()
                 .map_err(|e: String| mcp_error(format!("{e}. Valid types: topic, problem, decision")))?;
 
+            // Parse source type
+            let source_type: memory::SourceType = params
+                .source_type
+                .parse()
+                .map_err(|e: String| mcp_error(e))?;
+
             let now = chrono::Utc::now().timestamp();
 
             let output = if let Some(mut existing_entry) = existing {
-                // Update existing entry
+                // Update existing entry — does NOT reset confidence counters
                 existing_entry.title = params.title.clone();
                 existing_entry.content = params.content.clone();
                 existing_entry.entry_type = entry_type;
@@ -953,6 +960,10 @@ impl McpServer {
                     access_count: 0,
                     last_accessed: None,
                     source_path: None,
+                    confirmations: 0,
+                    corrections: 0,
+                    last_confirmed_at: None,
+                    source_type,
                 };
                 memory::add_entry(&ctx.conn, &entry)
                     .map_err(|e| mcp_error(format!("Failed to create memory entry: {}", e)))?;
@@ -1016,6 +1027,54 @@ impl McpServer {
         self.record_persistent_call("memory_delete", tokens, 1, false).await;
         tracing::debug!("mdkb_memory_delete: {}", output);
 
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Confirm a memory entry — positive confidence signal.
+    #[tool(description = "Confirm a memory entry is still accurate (boosts confidence score).")]
+    async fn memory_confirm(
+        &self,
+        Parameters(params): Parameters<MemoryConfirmParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let output = memory::confirm_entry(&ctx.conn, &params.id)
+                .map_err(|e| mcp_error(e.to_string()))?;
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        };
+
+        self.record_persistent_call("memory_confirm", tokens, 1, false).await;
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Correct a memory entry — negative confidence signal.
+    #[tool(description = "Mark a memory entry as incorrect (lowers confidence score, optionally appends correction).")]
+    async fn memory_correct(
+        &self,
+        Parameters(params): Parameters<MemoryCorrectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let output = memory::correct_entry(&ctx.conn, &params.id, params.correction.as_deref())
+                .map_err(|e| mcp_error(e.to_string()))?;
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        };
+
+        self.record_persistent_call("memory_correct", tokens, 1, false).await;
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -2158,6 +2217,7 @@ mod tests {
             content: "This will be deleted.".to_string(),
             entry_type: "topic".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         }))
         .await
         .expect("Failed to write memory entry");
@@ -2223,6 +2283,7 @@ mod tests {
             content: "Content".to_string(),
             entry_type: "topic".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         })))
         .await.expect("timeout").expect("memory_write failed");
 
@@ -2385,6 +2446,7 @@ mod tests {
             content: "Content A".to_string(),
             entry_type: "topic".to_string(),
             tags: vec!["tag1".to_string()],
+            source_type: "user_statement".to_string(),
         })).await.expect("write A");
 
         server.memory_write(Parameters(MemoryWriteParams {
@@ -2393,6 +2455,7 @@ mod tests {
             content: "Content B".to_string(),
             entry_type: "problem".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         })).await.expect("write B");
 
         let result = server.memory_list(Parameters(MemoryListParams {
@@ -2891,6 +2954,7 @@ pub fn utility() -> i32 {
             content: "Initial content".to_string(),
             entry_type: "topic".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         })).await.expect("write should succeed");
 
         // Get access_count after creation
@@ -2908,6 +2972,7 @@ pub fn utility() -> i32 {
             content: "Updated content".to_string(),
             entry_type: "topic".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         })).await.expect("update should succeed");
 
         // access_count must not have changed

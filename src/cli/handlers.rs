@@ -1074,6 +1074,10 @@ pub fn handle_memory_add(
         access_count: 0,
         last_accessed: None,
         source_path: None,
+        confirmations: 0,
+        corrections: 0,
+        last_confirmed_at: None,
+        source_type: memory::SourceType::UserStatement,
     };
 
     memory::add_entry(&ctx.conn, &entry)?;

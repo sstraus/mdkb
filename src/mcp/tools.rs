@@ -72,10 +72,36 @@ pub struct MemoryWriteParams {
     /// Tags for categorization.
     #[serde(default)]
     pub tags: Vec<String>,
+
+    /// Source type: official_docs, user_statement (default), or inference.
+    #[serde(default = "default_source_type")]
+    pub source_type: String,
 }
 
 fn default_entry_type() -> String {
     "topic".to_string()
+}
+
+fn default_source_type() -> String {
+    "user_statement".to_string()
+}
+
+/// Parameters for the memory_confirm tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryConfirmParams {
+    /// Memory entry ID.
+    pub id: String,
+}
+
+/// Parameters for the memory_correct tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryCorrectParams {
+    /// Memory entry ID.
+    pub id: String,
+
+    /// Optional correction text (appended under ## Correction header).
+    #[serde(default)]
+    pub correction: Option<String>,
 }
 
 /// Parameters for the memory_delete tool.
