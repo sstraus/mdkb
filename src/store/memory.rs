@@ -608,7 +608,8 @@ pub fn search_entries_hybrid(
 
     // RRF fusion
     let config = hybrid::HybridConfig::default();
-    let fused = hybrid::rrf_fusion(&bm25_for_rrf, &vector_results, &config);
+    let mut fused = hybrid::rrf_fusion(&bm25_for_rrf, &vector_results, &config);
+    hybrid::normalize_scores(&mut fused);
 
     // Build a lookup map from rowid -> MemoryEntry (from BM25 results)
     let mut entry_map: HashMap<i64, MemoryEntry> = bm25_results
@@ -616,8 +617,9 @@ pub fn search_entries_hybrid(
         .collect();
 
     // Resolve fused results to MemoryEntry, fetching from DB if only in vector results
-    let mut results = Vec::new();
-    for (rowid, _score) in fused {
+    // Apply confidence-weighted re-ranking: final = rrf_norm * 0.7 + confidence * 0.3
+    let mut scored_results: Vec<(MemoryEntry, f64)> = Vec::new();
+    for (rowid, rrf_score) in fused {
         let entry = if let Some(e) = entry_map.remove(&rowid) {
             e
         } else if let Some(e) = get_entry_by_rowid(conn, rowid)? {
@@ -625,13 +627,14 @@ pub fn search_entries_hybrid(
         } else {
             continue;
         };
-        results.push(entry);
-        if results.len() >= limit {
-            break;
-        }
+        let final_score = rrf_score * 0.7 + entry.confidence() * 0.3;
+        scored_results.push((entry, final_score));
     }
 
-    Ok(results)
+    // Re-sort by final score descending
+    scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    Ok(scored_results.into_iter().take(limit).map(|(e, _)| e).collect())
 }
 
 /// Get rowid for a memory entry by its slug ID.

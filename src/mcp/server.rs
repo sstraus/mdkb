@@ -727,14 +727,28 @@ impl McpServer {
             } else {
                 entry.content.clone()
             };
+            // Confidence breakdown
+            let conf = entry.confidence();
+            let last_conf = entry.last_confirmed_at
+                .map(|ts| {
+                    let days = (chrono::Utc::now().timestamp() - ts) as f64 / 86400.0;
+                    if days < 1.0 { "today".to_string() } else { format!("{}d ago", days as u64) }
+                })
+                .unwrap_or_else(|| "never".to_string());
+            let conf_line = format!(
+                "Confidence: {:.2} ({}↑ {}↓, confirmed {}, source: {})",
+                conf, entry.confirmations, entry.corrections, last_conf, entry.source_type
+            );
+
             let output = format!(
-                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times\n\n{}",
+                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}\n\n{}",
                 entry.title,
                 entry.id,
                 entry.entry_type,
                 entry.status,
                 if entry.tags.is_empty() { "none".to_string() } else { entry.tags.join(", ") },
                 entry.access_count,
+                conf_line,
                 body
             );
             let tokens = count_tokens(&output);
@@ -1867,10 +1881,11 @@ fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
     for entry in &ordered {
         out.push_str(&format!(
-            "- [{}] {} ({}): {}\n",
+            "- [{}] {} ({}, conf:{:.2}): {}\n",
             entry.id,
             entry.title,
             entry.entry_type,
+            entry.confidence(),
             truncate_text(&entry.content, 100)
         ));
     }
