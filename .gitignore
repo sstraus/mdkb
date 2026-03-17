@@ -1,10 +1,13 @@
 /target
 .claude/
 CLAUDE.md
+# mdkb:index
 stories/
+# mdkb:index
 plans/
 patches/
 .mdkb/
 .mcp.json
 .fastembed_cache/
+# mdkb:index
 reviews/

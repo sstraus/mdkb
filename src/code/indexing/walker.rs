@@ -9,10 +9,18 @@ use ignore::WalkBuilder;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Parse `.gitignore` at `root` for lines annotated with `# mdkb:index`.
+/// Parse `.gitignore` at `root` for patterns preceded by a `# mdkb:index` comment line.
 ///
-/// Returns the gitignore patterns (without the comment) that should be
-/// force-included in the code index despite being gitignored.
+/// Git does not support inline comments, so the annotation must appear on its
+/// own line immediately before the pattern:
+///
+/// ```text
+/// # mdkb:index
+/// generated/
+/// ```
+///
+/// Returns the patterns that should be force-included in the code index
+/// despite being gitignored.
 fn parse_mdkb_index_annotations(root: &Path) -> Vec<String> {
     let gitignore_path = root.join(".gitignore");
     let content = match std::fs::read_to_string(&gitignore_path) {
@@ -20,19 +28,23 @@ fn parse_mdkb_index_annotations(root: &Path) -> Vec<String> {
         Err(_) => return Vec::new(),
     };
 
-    content
-        .lines()
-        .filter_map(|line| {
-            let (pattern, comment) = line.split_once('#')?;
-            if comment.trim().eq_ignore_ascii_case("mdkb:index") {
-                let pattern = pattern.trim();
-                if !pattern.is_empty() {
-                    return Some(pattern.to_string());
-                }
+    let mut results = Vec::new();
+    let mut next_is_forced = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.eq_ignore_ascii_case("# mdkb:index") {
+            next_is_forced = true;
+        } else if next_is_forced {
+            next_is_forced = false;
+            // Skip blank lines and pure comments after the annotation
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                results.push(trimmed.to_string());
             }
-            None
-        })
-        .collect()
+        }
+    }
+
+    results
 }
 
 /// Walk `root` collecting only files that match `force_patterns`, ignoring
@@ -288,8 +300,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // generated.rs is gitignored but annotated with mdkb:index
-        fs::write(root.join(".gitignore"), "generated.rs # mdkb:index\n").unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "# mdkb:index\ngenerated.rs\n",
+        )
+        .unwrap();
         fs::write(root.join("generated.rs"), "fn generated() {}").unwrap();
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
@@ -308,8 +323,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // main.rs is NOT gitignored and also annotated — should not appear twice
-        fs::write(root.join(".gitignore"), "main.rs # mdkb:index\n").unwrap();
+        // main.rs is NOT gitignored but annotated — should not appear twice
+        fs::write(
+            root.join(".gitignore"),
+            "# mdkb:index\nmain.rs\n",
+        )
+        .unwrap();
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
         let files = discover_files(root, &[]);
@@ -325,7 +344,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        fs::write(root.join(".gitignore"), "gen/*.rs # mdkb:index\n").unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            "# mdkb:index\ngen/*.rs\n",
+        )
+        .unwrap();
         fs::create_dir_all(root.join("gen")).unwrap();
         fs::write(root.join("gen/types.rs"), "struct Foo {}").unwrap();
         fs::write(root.join("gen/helpers.rs"), "fn help() {}").unwrap();
@@ -347,10 +370,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        // Two gitignore entries: one annotated, one not
         fs::write(
             root.join(".gitignore"),
-            "generated.rs # mdkb:index\nignored.rs\n",
+            "# mdkb:index\ngenerated.rs\nignored.rs\n",
         )
         .unwrap();
         fs::write(root.join("generated.rs"), "fn generated() {}").unwrap();
@@ -374,10 +396,11 @@ mod tests {
 
         fs::write(
             root.join(".gitignore"),
-            "generated.rs # mdkb:index\n\
+            "# mdkb:index\ngenerated.rs\n\
              ignored.rs\n\
              # a comment\n\
-             gen/*.rs # MDKB:INDEX\n\
+             # MDKB:INDEX\n\
+             gen/*.rs\n\
              # mdkb:index\n",
         )
         .unwrap();
