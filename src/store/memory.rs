@@ -367,6 +367,13 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
     let now = Utc::now().timestamp();
 
     if let Some(text) = correction {
+        // Validate correction size before allocating
+        const MAX_CORRECTION_LEN: usize = MAX_CONTENT_SIZE / 2;
+        if text.len() > MAX_CORRECTION_LEN {
+            return Err(ErrorKind::InvalidQuery(
+                format!("Correction text exceeds {MAX_CORRECTION_LEN} bytes")
+            ).into());
+        }
         // Append correction to content
         let timestamp = chrono::DateTime::from_timestamp(now, 0)
             .map(|dt| dt.format("%Y-%m-%d").to_string())
@@ -546,9 +553,36 @@ fn bm25_search_with_rowid(conn: &Connection, query: &str, limit: usize) -> Resul
     Ok(entries)
 }
 
-/// Get memory entry by rowid (public, for duplicate detection).
-pub fn get_entry_by_rowid_pub(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
-    get_entry_by_rowid(conn, rowid)
+/// L2 distance threshold for duplicate detection (~cosine similarity > 0.85).
+const SIMILARITY_THRESHOLD: f32 = 0.55;
+
+/// Weight for RRF/relevance score in confidence-weighted ranking.
+const RELEVANCE_WEIGHT: f64 = 0.7;
+/// Weight for confidence score in confidence-weighted ranking.
+const CONFIDENCE_WEIGHT: f64 = 0.3;
+
+/// Find memory entries similar to the given embedding, excluding `exclude_rowid`.
+///
+/// Returns a formatted warning string for any matches above the similarity threshold.
+pub fn find_similar_entries(conn: &Connection, embedding: &[f32], exclude_rowid: i64, exclude_id: &str) -> String {
+    let mut warnings = String::new();
+    if let Ok(similar) = crate::store::vectors::memory_vector_search(conn, embedding, 5) {
+        for (sim_rowid, distance) in &similar {
+            if *sim_rowid == exclude_rowid || *distance > SIMILARITY_THRESHOLD {
+                continue;
+            }
+            if let Ok(Some(sim_entry)) = get_entry_by_rowid(conn, *sim_rowid) {
+                if sim_entry.id != exclude_id {
+                    let similarity = 1.0 - (*distance as f64 * *distance as f64 / 2.0);
+                    warnings.push_str(&format!(
+                        "\nSimilar entry exists: {} (similarity: {:.2}). Consider updating it instead.",
+                        sim_entry.id, similarity
+                    ));
+                }
+            }
+        }
+    }
+    warnings
 }
 
 /// Get memory entry by rowid (internal, for hybrid search).
@@ -632,7 +666,7 @@ pub fn search_entries_hybrid(
         } else {
             continue;
         };
-        let final_score = rrf_score * 0.7 + entry.confidence() * 0.3;
+        let final_score = rrf_score * RELEVANCE_WEIGHT + entry.confidence() * CONFIDENCE_WEIGHT;
         scored_results.push((entry, final_score));
     }
 

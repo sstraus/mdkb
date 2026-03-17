@@ -37,9 +37,6 @@ pub struct SearchParams {
     #[serde(default)]
     pub file: Option<String>,
 
-    /// Include content snippet in search results (default: false).
-    #[serde(default)]
-    pub include_snippet: bool,
 }
 
 fn default_limit() -> usize {

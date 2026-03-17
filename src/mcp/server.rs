@@ -480,6 +480,7 @@ impl McpServer {
         self.ensure_context().await?;
 
         let scope = params.scope.as_deref();
+        let limit = params.limit.min(100); // Cap to prevent unbounded result sets
 
         let (output, tokens, result_count) = {
             let ctx_guard = self.ctx.lock().await;
@@ -492,13 +493,13 @@ impl McpServer {
                     let results = handle_hybrid_search(
                         ctx,
                         &params.query,
-                        params.limit,
+                        limit,
                         params.collection.as_deref(),
                         params.include_superseded,
                     )
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-                    let output = format_search_results(&results, params.limit);
+                    let output = format_search_results(&results, limit);
                     let tokens = count_tokens(&output);
                     (output, tokens, results.len())
                 }
@@ -510,7 +511,7 @@ impl McpServer {
                         &ctx.conn,
                         &params.query,
                         query_embedding.as_deref(),
-                        params.limit,
+                        limit,
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
@@ -522,7 +523,7 @@ impl McpServer {
                     let doc_results = handle_hybrid_search(
                         ctx,
                         &params.query,
-                        params.limit,
+                        limit,
                         params.collection.as_deref(),
                         params.include_superseded,
                     )
@@ -535,7 +536,7 @@ impl McpServer {
                         &ctx.conn,
                         &params.query,
                         query_embedding.as_deref(),
-                        params.limit,
+                        limit,
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
@@ -549,7 +550,7 @@ impl McpServer {
                         let mut output = String::new();
 
                         if !doc_results.is_empty() {
-                            output.push_str(&format_search_results(&doc_results, params.limit));
+                            output.push_str(&format_search_results(&doc_results, limit));
                         }
 
                         if !mem_entries.is_empty() {
@@ -956,6 +957,7 @@ impl McpServer {
                 .map_err(|e: String| mcp_error(e))?;
 
             let now = chrono::Utc::now().timestamp();
+            let existing_was_none = existing.is_none();
 
             let output = if let Some(mut existing_entry) = existing {
                 // Update existing entry — does NOT reset confidence counters
@@ -991,40 +993,31 @@ impl McpServer {
                 format!("Created memory entry: {}", params.id)
             };
 
-            // Generate embedding for hybrid search + duplicate detection
+            // Generate embedding for hybrid search
             let mut output = output;
+            let is_new = existing_was_none;
             if let Ok(service) = crate::llm::get_cached_service() {
                 let embed_text = format!("{} {}", params.title, params.content);
-                if let Ok(embedding) = service.embed_query(&embed_text) {
-                    if let Some(rowid) = memory::get_rowid(&ctx.conn, &params.id)
-                        .unwrap_or(None)
-                    {
-                        let _ = crate::store::vectors::store_memory_embedding(
-                            &ctx.conn,
-                            rowid,
-                            &embedding,
-                            crate::llm::embeddings::MODEL_NAME,
-                        );
+                match service.embed_query(&embed_text) {
+                    Ok(embedding) => {
+                        if let Some(rowid) = memory::get_rowid(&ctx.conn, &params.id)
+                            .unwrap_or(None)
+                        {
+                            if let Err(e) = crate::store::vectors::store_memory_embedding(
+                                &ctx.conn, rowid, &embedding, crate::llm::embeddings::MODEL_NAME,
+                            ) {
+                                tracing::warn!("Failed to store memory embedding for '{}': {e}", params.id);
+                            }
 
-                        // Check for similar existing entries (duplicate detection)
-                        // L2 distance < 0.55 ≈ cosine similarity > 0.85 for normalized 384-dim vectors
-                        if let Ok(similar) = crate::store::vectors::memory_vector_search(&ctx.conn, &embedding, 5) {
-                            for (sim_rowid, distance) in &similar {
-                                if *sim_rowid == rowid || *distance > 0.55 {
-                                    continue;
-                                }
-                                // Found a similar entry — look up its ID
-                                if let Ok(Some(sim_entry)) = memory::get_entry_by_rowid_pub(&ctx.conn, *sim_rowid) {
-                                    if sim_entry.id != params.id {
-                                        let similarity = 1.0 - (*distance as f64 / 2.0); // rough cosine approximation
-                                        output.push_str(&format!(
-                                            "\nSimilar entry exists: {} (similarity: {:.2}). Consider updating it instead.",
-                                            sim_entry.id, similarity
-                                        ));
-                                    }
-                                }
+                            // Duplicate detection only on new entries
+                            if is_new {
+                                let warnings = memory::find_similar_entries(&ctx.conn, &embedding, rowid, &params.id);
+                                output.push_str(&warnings);
                             }
                         }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to embed memory entry '{}': {e}", params.id);
                     }
                 }
             }
@@ -1282,11 +1275,7 @@ fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
         out.push_str(&format!("    Signature: {}\n", sig));
     }
     if let Some(ref doc) = sym.doc_comment {
-        let truncated = if doc.len() > 120 {
-            format!("{}...", &doc[..120])
-        } else {
-            doc.to_string()
-        };
+        let truncated = truncate_text(doc, 120);
         out.push_str(&format!("    Doc: {}\n", truncated));
     }
     out
@@ -2401,8 +2390,8 @@ mod tests {
             include_superseded: false,
             scope: None,
             kind: None,
+            file: None,
             threshold: 0.3,
-            file: None, include_snippet: false,
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
@@ -2439,8 +2428,8 @@ mod tests {
             include_superseded: false,
             scope: Some("memory".to_string()),
             kind: None,
+            file: None,
             threshold: 0.3,
-            file: None, include_snippet: false,
         })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
@@ -2616,8 +2605,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: None,
+            file: None,
                 threshold: 0.3,
-                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2638,8 +2627,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: None,
+            file: None,
                 threshold: 0.3,
-                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2659,8 +2648,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: Some("struct".to_string()),
+                file: None,
                 threshold: 0.3,
-                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols kind=struct failed");
 
@@ -2681,9 +2670,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: None,
-                threshold: 0.3,
                 file: Some("lib.rs".to_string()),
-                include_snippet: false,
+                threshold: 0.3,
             })))
             .await.expect("timeout").expect("search scope=symbols file=lib.rs failed");
 
@@ -2704,8 +2692,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: Some("invalid_kind".to_string()),
+                file: None,
                 threshold: 0.3,
-                file: None, include_snippet: false,
             })))
             .await.expect("timeout");
 
@@ -2724,8 +2712,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: None,
+            file: None,
                 threshold: 0.3,
-                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2809,8 +2797,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: None,
+            file: None,
                 threshold: 0.3,
-                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2840,8 +2828,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: None,
+            file: None,
                 threshold: 0.3,
-                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2852,8 +2840,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: None,
+            file: None,
                 threshold: 0.3,
-                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed (second call)");
 
@@ -2891,8 +2879,8 @@ pub fn utility() -> i32 {
                 include_superseded: false,
                 scope: Some("symbols".to_string()),
                 kind: None,
+            file: None,
                 threshold: 0.3,
-                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
