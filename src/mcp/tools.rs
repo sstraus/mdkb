@@ -36,6 +36,10 @@ pub struct SearchParams {
     /// Filter by file path (substring match) when scope is "symbols".
     #[serde(default)]
     pub file: Option<String>,
+
+    /// Include content snippet in search results (default: false).
+    #[serde(default)]
+    pub include_snippet: bool,
 }
 
 fn default_limit() -> usize {
@@ -51,6 +55,10 @@ pub struct GetParams {
     /// Optional line range (e.g., "10:50").
     #[serde(default)]
     pub lines: Option<String>,
+
+    /// Output format: "full" (default) or "summary" (title + first paragraph + metadata).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 /// Parameters for the memory write tool.

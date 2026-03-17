@@ -720,6 +720,13 @@ impl McpServer {
 
         // Try memory slug
         if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+            let is_summary = params.format.as_deref() == Some("summary");
+            let body = if is_summary {
+                // Summary: first paragraph only
+                entry.content.split("\n\n").next().unwrap_or(&entry.content).to_string()
+            } else {
+                entry.content.clone()
+            };
             let output = format!(
                 "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times\n\n{}",
                 entry.title,
@@ -728,7 +735,7 @@ impl McpServer {
                 entry.status,
                 if entry.tags.is_empty() { "none".to_string() } else { entry.tags.join(", ") },
                 entry.access_count,
-                entry.content
+                body
             );
             let tokens = count_tokens(&output);
             drop(ctx_guard);
@@ -2244,7 +2251,7 @@ mod tests {
         let get_result = server
             .get(Parameters(GetParams {
                 id: "test-delete-me".to_string(),
-                lines: None,
+                lines: None, format: None,
             }))
             .await;
         assert!(get_result.is_err(), "get should fail for deleted memory entry");
@@ -2317,7 +2324,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "nonexistent".to_string(),
-            lines: None,
+            lines: None, format: None,
         })).await;
 
         let msg = extract_error_msg(result);
@@ -2333,7 +2340,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "999999".to_string(),
-            lines: None,
+            lines: None, format: None,
         })).await;
 
         let msg = extract_error_msg(result);
@@ -2355,7 +2362,7 @@ mod tests {
             scope: None,
             kind: None,
             threshold: 0.3,
-            file: None,
+            file: None, include_snippet: false,
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
@@ -2371,7 +2378,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "nonexistent/**/*.md".to_string(),
-            lines: None,
+            lines: None, format: None,
         })).await.expect("get with glob should not error");
 
         let text = extract_text(&result);
@@ -2393,7 +2400,7 @@ mod tests {
             scope: Some("memory".to_string()),
             kind: None,
             threshold: 0.3,
-            file: None,
+            file: None, include_snippet: false,
         })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
@@ -2570,7 +2577,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2592,7 +2599,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2613,7 +2620,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: Some("struct".to_string()),
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols kind=struct failed");
 
@@ -2636,6 +2643,7 @@ pub fn utility() -> i32 {
                 kind: None,
                 threshold: 0.3,
                 file: Some("lib.rs".to_string()),
+                include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols file=lib.rs failed");
 
@@ -2657,7 +2665,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: Some("invalid_kind".to_string()),
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout");
 
@@ -2677,7 +2685,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2762,7 +2770,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2793,7 +2801,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2805,7 +2813,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed (second call)");
 
@@ -2844,7 +2852,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
