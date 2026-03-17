@@ -1,5 +1,6 @@
 //! Storage layer - SQLite with FTS5 for full-text search.
 
+pub mod chunks;
 pub mod collections;
 pub mod documents;
 pub mod evolution;

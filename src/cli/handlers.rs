@@ -275,7 +275,7 @@ pub fn handle_hybrid_search(
     // Use cached service to avoid reloading
     let service = crate::llm::get_cached_service()?;
     let query_embedding = service.embed_query(query_text)?;
-    let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, limit * 2)?;
+    let vector_results = vectors::chunk_vector_search(&ctx.conn, &query_embedding, limit * 2)?;
 
     // Fuse results using RRF
     let config = hybrid::HybridConfig::default();
@@ -746,6 +746,9 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
     // Use cached service to avoid reloading
     let service = crate::llm::get_cached_service()?;
 
+    // Load chunking config once
+    let chunking_config = crate::config::Config::load_or_default(&ctx.config_path).chunking;
+
     // Get all documents
     let all_collections = collections::list_collections(&ctx.conn)?;
 
@@ -777,22 +780,48 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
                 continue;
             };
 
-            // Generate embedding
-            match service.embed_query(content) {
-                Ok(embedding) => {
-                    vectors::store_embedding(
-                        &ctx.conn,
-                        doc.id,
-                        &embedding,
-                        crate::llm::embeddings::MODEL_NAME,
-                    )?;
-                    result.generated += 1;
+            // Split into chunks using configured strategy
+            let chunks = crate::store::chunks::split(content, &chunking_config);
+
+            if chunks.len() <= 1 {
+                // Small doc: single embedding (no chunking overhead)
+                match service.embed_query(content) {
+                    Ok(embedding) => {
+                        vectors::store_embedding(
+                            &ctx.conn,
+                            doc.id,
+                            &embedding,
+                            crate::llm::embeddings::MODEL_NAME,
+                        )?;
+                        result.generated += 1;
+                    }
+                    Err(e) => {
+                        result.errors.push(format!(
+                            "Failed to embed doc {} ({}): {}",
+                            doc.id, doc.relative_path, e
+                        ));
+                    }
                 }
-                Err(e) => {
-                    result.errors.push(format!(
-                        "Failed to embed doc {} ({}): {}",
-                        doc.id, doc.relative_path, e
-                    ));
+            } else {
+                // Multi-chunk doc: embed each chunk
+                let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+                match service.embed_documents(&texts) {
+                    Ok(embeddings) => {
+                        vectors::store_chunk_embeddings(
+                            &ctx.conn,
+                            doc.id,
+                            &chunks,
+                            &embeddings,
+                            crate::llm::embeddings::MODEL_NAME,
+                        )?;
+                        result.generated += chunks.len();
+                    }
+                    Err(e) => {
+                        result.errors.push(format!(
+                            "Failed to embed doc {} ({}, {} chunks): {}",
+                            doc.id, doc.relative_path, chunks.len(), e
+                        ));
+                    }
                 }
             }
         }
