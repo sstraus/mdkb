@@ -546,7 +546,12 @@ fn bm25_search_with_rowid(conn: &Connection, query: &str, limit: usize) -> Resul
     Ok(entries)
 }
 
-/// Get memory entry by rowid.
+/// Get memory entry by rowid (public, for duplicate detection).
+pub fn get_entry_by_rowid_pub(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
+    get_entry_by_rowid(conn, rowid)
+}
+
+/// Get memory entry by rowid (internal, for hybrid search).
 fn get_entry_by_rowid(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
     let entry = conn
         .query_row(

@@ -991,7 +991,8 @@ impl McpServer {
                 format!("Created memory entry: {}", params.id)
             };
 
-            // Generate embedding for hybrid search
+            // Generate embedding for hybrid search + duplicate detection
+            let mut output = output;
             if let Ok(service) = crate::llm::get_cached_service() {
                 let embed_text = format!("{} {}", params.title, params.content);
                 if let Ok(embedding) = service.embed_query(&embed_text) {
@@ -1004,6 +1005,26 @@ impl McpServer {
                             &embedding,
                             crate::llm::embeddings::MODEL_NAME,
                         );
+
+                        // Check for similar existing entries (duplicate detection)
+                        // L2 distance < 0.55 ≈ cosine similarity > 0.85 for normalized 384-dim vectors
+                        if let Ok(similar) = crate::store::vectors::memory_vector_search(&ctx.conn, &embedding, 5) {
+                            for (sim_rowid, distance) in &similar {
+                                if *sim_rowid == rowid || *distance > 0.55 {
+                                    continue;
+                                }
+                                // Found a similar entry — look up its ID
+                                if let Ok(Some(sim_entry)) = memory::get_entry_by_rowid_pub(&ctx.conn, *sim_rowid) {
+                                    if sim_entry.id != params.id {
+                                        let similarity = 1.0 - (*distance as f64 / 2.0); // rough cosine approximation
+                                        output.push_str(&format!(
+                                            "\nSimilar entry exists: {} (similarity: {:.2}). Consider updating it instead.",
+                                            sim_entry.id, similarity
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
