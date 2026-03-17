@@ -1,0 +1,36 @@
+src/code/indexing/walker.rs
+  0870b4cd709ce498 9,12-79,86-88,113,133-147,287-388
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "9d69d241268c589b39c18b1a244d270c680351b5",
+  "prompts": {
+    "0870b4cd709ce498": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a27da300-5e49-4187-a0a9-2cf8cd2cadb7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 196,
+      "total_deletions": 7,
+      "accepted_lines": 191,
+      "overriden_lines": 0
+    },
+    "b588b8532f26a1ce": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "94de6285-b18e-473e-9d27-0c7fa3a0c5b3",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
