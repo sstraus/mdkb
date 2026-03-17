@@ -56,6 +56,39 @@ pub fn rrf_fusion(
     results
 }
 
+/// Reorder results to mitigate "lost in the middle" attention bias.
+///
+/// LLMs attend more to content at the beginning and end of their context.
+/// This reorders a ranked list so the strongest results land at positions
+/// 1 and N, with weaker results in the middle.
+///
+/// Input must be sorted by score descending (strongest first).
+/// Output: positions 1,3,5... get odd-ranked items; positions N,N-1,N-2...
+/// get even-ranked items.
+pub fn lost_in_middle_reorder<T>(items: &mut Vec<T>) {
+    if items.len() <= 2 {
+        return;
+    }
+
+    let original: Vec<T> = items.drain(..).collect();
+    let mut front = Vec::new();
+    let mut back = Vec::new();
+
+    for (i, item) in original.into_iter().enumerate() {
+        if i % 2 == 0 {
+            front.push(item);
+        } else {
+            back.push(item);
+        }
+    }
+
+    // Back items go in reverse (weakest in middle, stronger toward end)
+    back.reverse();
+
+    items.extend(front);
+    items.extend(back);
+}
+
 /// Normalize scores to [0, 1] range.
 pub fn normalize_scores(scores: &mut [(i64, f64)]) {
     if scores.is_empty() {
@@ -343,5 +376,59 @@ mod tests {
         // RRF score = bm25_weight / (k + rank + 1) = 1.0 / (60 + 0 + 1) = 1/61
         let expected = 1.0 / 61.0;
         assert!((fused[0].1 - expected).abs() < 0.0001);
+    }
+
+    // ==================== Lost-in-the-Middle Tests ====================
+
+    #[test]
+    fn test_lost_in_middle_reorder_basic() {
+        // Input ranked by score: [1st, 2nd, 3rd, 4th, 5th]
+        let mut items = vec![1, 2, 3, 4, 5];
+        lost_in_middle_reorder(&mut items);
+
+        // Expected: front gets 1,3,5 (odd positions); back gets 4,2 (even, reversed)
+        // Result: [1, 3, 5, 4, 2]
+        // Strongest (1) at position 1, second strongest (2) at position N
+        assert_eq!(items[0], 1, "strongest at position 1");
+        assert_eq!(items[items.len() - 1], 2, "second strongest at position N");
+        // Weakest in the middle
+        assert_eq!(items, vec![1, 3, 5, 4, 2]);
+    }
+
+    #[test]
+    fn test_lost_in_middle_reorder_small() {
+        // 0 items: no-op
+        let mut empty: Vec<i32> = vec![];
+        lost_in_middle_reorder(&mut empty);
+        assert!(empty.is_empty());
+
+        // 1 item: no-op
+        let mut single = vec![42];
+        lost_in_middle_reorder(&mut single);
+        assert_eq!(single, vec![42]);
+
+        // 2 items: no-op
+        let mut pair = vec![1, 2];
+        lost_in_middle_reorder(&mut pair);
+        assert_eq!(pair, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_lost_in_middle_reorder_three() {
+        let mut items = vec![1, 2, 3];
+        lost_in_middle_reorder(&mut items);
+        // front: 1, 3; back: 2 (reversed = 2)
+        // Result: [1, 3, 2]
+        assert_eq!(items[0], 1, "strongest at position 1");
+        assert_eq!(items[2], 2, "second strongest at position N");
+    }
+
+    #[test]
+    fn test_lost_in_middle_preserves_length() {
+        for len in 0..=20 {
+            let mut items: Vec<i32> = (0..len).collect();
+            lost_in_middle_reorder(&mut items);
+            assert_eq!(items.len(), len as usize, "length must be preserved for len={len}");
+        }
     }
 }

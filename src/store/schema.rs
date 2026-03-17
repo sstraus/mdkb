@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -95,7 +95,11 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     superseded_by TEXT,               -- ID of newer entry
     access_count INTEGER DEFAULT 0,   -- Track usage for ranking
     last_accessed INTEGER,
-    source_path TEXT                  -- Original file path (for journal imports)
+    source_path TEXT,                 -- Original file path (for journal imports)
+    confirmations INTEGER DEFAULT 0,  -- Positive confidence signals
+    corrections INTEGER DEFAULT 0,    -- Negative confidence signals
+    last_confirmed_at INTEGER,        -- Timestamp of last confirmation
+    source_type TEXT DEFAULT 'user_statement'  -- official_docs, user_statement, inference
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
@@ -308,6 +312,28 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
             FROM memory_entries;
             "#,
         )?;
+    }
+
+    // Migration from v6 to v7: add confidence columns to memory_entries
+    if from_version < 7 {
+        let has_confirmations: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'confirmations'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !has_confirmations {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE memory_entries ADD COLUMN confirmations INTEGER DEFAULT 0;
+                ALTER TABLE memory_entries ADD COLUMN corrections INTEGER DEFAULT 0;
+                ALTER TABLE memory_entries ADD COLUMN last_confirmed_at INTEGER;
+                ALTER TABLE memory_entries ADD COLUMN source_type TEXT DEFAULT 'user_statement';
+                "#,
+            )?;
+        }
     }
 
     // Update schema version

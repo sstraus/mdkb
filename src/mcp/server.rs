@@ -26,7 +26,8 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
     CodeGraphParams,
-    GetParams, MemoryDeleteParams, MemoryListParams, MemoryWriteParams,
+    GetParams, MemoryConfirmParams, MemoryCorrectParams, MemoryDeleteParams,
+    MemoryListParams, MemoryWriteParams,
     SearchParams,
 };
 
@@ -497,13 +498,21 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-                    let output = format_search_results(&results);
+                    let output = format_search_results(&results, params.limit);
                     let tokens = count_tokens(&output);
                     (output, tokens, results.len())
                 }
                 Some("memory") => {
-                    let entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
-                        .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
+                    let query_embedding = crate::llm::get_cached_service()
+                        .ok()
+                        .and_then(|s| s.embed_query(&params.query).ok());
+                    let entries = memory::search_entries_hybrid(
+                        &ctx.conn,
+                        &params.query,
+                        query_embedding.as_deref(),
+                        params.limit,
+                    )
+                    .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
                     let output = format_memory_search_results(&entries);
                     let tokens = count_tokens(&output);
@@ -519,8 +528,16 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-                    let mem_entries = memory::search_entries(&ctx.conn, &params.query, params.limit)
-                        .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
+                    let query_embedding = crate::llm::get_cached_service()
+                        .ok()
+                        .and_then(|s| s.embed_query(&params.query).ok());
+                    let mem_entries = memory::search_entries_hybrid(
+                        &ctx.conn,
+                        &params.query,
+                        query_embedding.as_deref(),
+                        params.limit,
+                    )
+                    .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
                     let total = doc_results.len() + mem_entries.len();
 
@@ -532,7 +549,7 @@ impl McpServer {
                         let mut output = String::new();
 
                         if !doc_results.is_empty() {
-                            output.push_str(&format_search_results(&doc_results));
+                            output.push_str(&format_search_results(&doc_results, params.limit));
                         }
 
                         if !mem_entries.is_empty() {
@@ -703,15 +720,36 @@ impl McpServer {
 
         // Try memory slug
         if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+            let is_summary = params.format.as_deref() == Some("summary");
+            let body = if is_summary {
+                // Summary: first paragraph only
+                entry.content.split("\n\n").next().unwrap_or(&entry.content).to_string()
+            } else {
+                entry.content.clone()
+            };
+            // Confidence breakdown
+            let conf = entry.confidence();
+            let last_conf = entry.last_confirmed_at
+                .map(|ts| {
+                    let days = (chrono::Utc::now().timestamp() - ts) as f64 / 86400.0;
+                    if days < 1.0 { "today".to_string() } else { format!("{}d ago", days as u64) }
+                })
+                .unwrap_or_else(|| "never".to_string());
+            let conf_line = format!(
+                "Confidence: {:.2} ({}↑ {}↓, confirmed {}, source: {})",
+                conf, entry.confirmations, entry.corrections, last_conf, entry.source_type
+            );
+
             let output = format!(
-                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times\n\n{}",
+                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}\n\n{}",
                 entry.title,
                 entry.id,
                 entry.entry_type,
                 entry.status,
                 if entry.tags.is_empty() { "none".to_string() } else { entry.tags.join(", ") },
                 entry.access_count,
-                entry.content
+                conf_line,
+                body
             );
             let tokens = count_tokens(&output);
             drop(ctx_guard);
@@ -911,10 +949,16 @@ impl McpServer {
                 .parse()
                 .map_err(|e: String| mcp_error(format!("{e}. Valid types: topic, problem, decision")))?;
 
+            // Parse source type
+            let source_type: memory::SourceType = params
+                .source_type
+                .parse()
+                .map_err(|e: String| mcp_error(e))?;
+
             let now = chrono::Utc::now().timestamp();
 
             let output = if let Some(mut existing_entry) = existing {
-                // Update existing entry
+                // Update existing entry — does NOT reset confidence counters
                 existing_entry.title = params.title.clone();
                 existing_entry.content = params.content.clone();
                 existing_entry.entry_type = entry_type;
@@ -937,11 +981,53 @@ impl McpServer {
                     access_count: 0,
                     last_accessed: None,
                     source_path: None,
+                    confirmations: 0,
+                    corrections: 0,
+                    last_confirmed_at: None,
+                    source_type,
                 };
                 memory::add_entry(&ctx.conn, &entry)
                     .map_err(|e| mcp_error(format!("Failed to create memory entry: {}", e)))?;
                 format!("Created memory entry: {}", params.id)
             };
+
+            // Generate embedding for hybrid search + duplicate detection
+            let mut output = output;
+            if let Ok(service) = crate::llm::get_cached_service() {
+                let embed_text = format!("{} {}", params.title, params.content);
+                if let Ok(embedding) = service.embed_query(&embed_text) {
+                    if let Some(rowid) = memory::get_rowid(&ctx.conn, &params.id)
+                        .unwrap_or(None)
+                    {
+                        let _ = crate::store::vectors::store_memory_embedding(
+                            &ctx.conn,
+                            rowid,
+                            &embedding,
+                            crate::llm::embeddings::MODEL_NAME,
+                        );
+
+                        // Check for similar existing entries (duplicate detection)
+                        // L2 distance < 0.55 ≈ cosine similarity > 0.85 for normalized 384-dim vectors
+                        if let Ok(similar) = crate::store::vectors::memory_vector_search(&ctx.conn, &embedding, 5) {
+                            for (sim_rowid, distance) in &similar {
+                                if *sim_rowid == rowid || *distance > 0.55 {
+                                    continue;
+                                }
+                                // Found a similar entry — look up its ID
+                                if let Ok(Some(sim_entry)) = memory::get_entry_by_rowid_pub(&ctx.conn, *sim_rowid) {
+                                    if sim_entry.id != params.id {
+                                        let similarity = 1.0 - (*distance as f64 / 2.0); // rough cosine approximation
+                                        output.push_str(&format!(
+                                            "\nSimilar entry exists: {} (similarity: {:.2}). Consider updating it instead.",
+                                            sim_entry.id, similarity
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
 
             let tokens = count_tokens(&output);
             (output, tokens)
@@ -983,6 +1069,54 @@ impl McpServer {
         self.record_persistent_call("memory_delete", tokens, 1, false).await;
         tracing::debug!("mdkb_memory_delete: {}", output);
 
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Confirm a memory entry — positive confidence signal.
+    #[tool(description = "Confirm a memory entry is still accurate (boosts confidence score).")]
+    async fn memory_confirm(
+        &self,
+        Parameters(params): Parameters<MemoryConfirmParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let output = memory::confirm_entry(&ctx.conn, &params.id)
+                .map_err(|e| mcp_error(e.to_string()))?;
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        };
+
+        self.record_persistent_call("memory_confirm", tokens, 1, false).await;
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Correct a memory entry — negative confidence signal.
+    #[tool(description = "Mark a memory entry as incorrect (lowers confidence score, optionally appends correction).")]
+    async fn memory_correct(
+        &self,
+        Parameters(params): Parameters<MemoryCorrectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.ensure_context().await?;
+
+        let (output, tokens) = {
+            let ctx_guard = self.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let output = memory::correct_entry(&ctx.conn, &params.id, params.correction.as_deref())
+                .map_err(|e| mcp_error(e.to_string()))?;
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        };
+
+        self.record_persistent_call("memory_correct", tokens, 1, false).await;
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -1625,8 +1759,12 @@ const BASE_INSTRUCTIONS: &str = "\
 | Call graph / impact analysis | `code_graph(name)` |
 | Exact text pattern | Grep |
 | Browse memories | `memory_list()` |
+| Validate knowledge still correct | `memory_confirm(id)` |
+| Flag incorrect knowledge | `memory_correct(id, correction)` |
 
 Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after finding a symbol to trace callers or impact.
+
+Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Use `memory_confirm` when you verify knowledge is still accurate. Use `memory_correct` when you find errors.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
@@ -1704,15 +1842,26 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 }
 
 /// Format search results for output.
-fn format_search_results(results: &[SearchResult]) -> String {
-    let results: Vec<_> = results.iter().filter(|r| r.score != 0.0).collect();
+fn format_search_results(results: &[SearchResult], limit: usize) -> String {
+    use crate::store::hybrid::lost_in_middle_reorder;
 
-    if results.is_empty() {
+    let filtered: Vec<_> = results.iter().filter(|r| r.score != 0.0).collect();
+
+    if filtered.is_empty() {
         return "No matching documents found.".to_string();
     }
 
-    let mut output = String::new();
-    for r in &results {
+    // Apply lost-in-the-middle reordering
+    let mut ordered: Vec<_> = filtered;
+    lost_in_middle_reorder(&mut ordered);
+
+    let mut output = if ordered.len() >= limit {
+        format!("Showing {} results (limit reached, refine query for more precise results):\n", ordered.len())
+    } else {
+        String::new()
+    };
+
+    for r in &ordered {
         let title = r.title.as_deref().unwrap_or("(untitled)");
         output.push_str(&format!(
             "[{}] {} - {} (score: {:.2})\n",
@@ -1724,7 +1873,7 @@ fn format_search_results(results: &[SearchResult]) -> String {
     }
 
     // Hint: guide the model toward get() for retrieval
-    let ids: Vec<_> = results.iter().map(|r| r.id.to_string()).collect();
+    let ids: Vec<_> = ordered.iter().map(|r| r.id.to_string()).collect();
     if ids.len() == 1 {
         output.push_str(&format!("\nUse get(\"{}\") to read.", ids[0]));
     } else {
@@ -1740,17 +1889,24 @@ fn format_search_results(results: &[SearchResult]) -> String {
 
 /// Format memory search results for output.
 fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
+    use crate::store::hybrid::lost_in_middle_reorder;
+
     if entries.is_empty() {
         return "No matching memory entries found.".to_string();
     }
 
+    // Apply lost-in-the-middle reordering
+    let mut ordered: Vec<_> = entries.iter().collect();
+    lost_in_middle_reorder(&mut ordered);
+
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
-    for entry in entries {
+    for entry in &ordered {
         out.push_str(&format!(
-            "- [{}] {} ({}): {}\n",
+            "- [{}] {} ({}, conf:{:.2}): {}\n",
             entry.id,
             entry.title,
             entry.entry_type,
+            entry.confidence(),
             truncate_text(&entry.content, 100)
         ));
     }
@@ -1796,7 +1952,7 @@ mod tests {
     #[test]
     fn test_format_search_results_empty() {
         let results: Vec<SearchResult> = vec![];
-        let output = format_search_results(&results);
+        let output = format_search_results(&results, 10);
         assert!(output.starts_with("No matching documents"), "Should start with 'No matching documents', got: {}", output);
     }
 
@@ -1812,7 +1968,7 @@ mod tests {
             status: None,
             superseded_by: None,
         }];
-        let output = format_search_results(&results);
+        let output = format_search_results(&results, 10);
         assert!(output.contains("[1] readme.md"), "Should show path without collection prefix, got: {output}");
         assert!(!output.contains("docs:"), "Should not contain collection prefix, got: {output}");
         assert!(output.contains("README"));
@@ -1842,7 +1998,7 @@ mod tests {
                 superseded_by: None,
             },
         ];
-        let output = format_search_results(&results);
+        let output = format_search_results(&results, 10);
         assert!(output.contains("get(\"10\")"), "Should hint single get, got: {output}");
         assert!(output.contains("get(\"10,20\")"), "Should hint batch get, got: {output}");
     }
@@ -1871,7 +2027,7 @@ mod tests {
                 superseded_by: None,
             },
         ];
-        let output = format_search_results(&results);
+        let output = format_search_results(&results, 10);
         assert!(output.contains("good.md"), "Should include result with positive score");
         assert!(!output.contains("zero.md"), "Should filter out result with score 0.00, got: {output}");
     }
@@ -2108,6 +2264,7 @@ mod tests {
             content: "This will be deleted.".to_string(),
             entry_type: "topic".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         }))
         .await
         .expect("Failed to write memory entry");
@@ -2134,7 +2291,7 @@ mod tests {
         let get_result = server
             .get(Parameters(GetParams {
                 id: "test-delete-me".to_string(),
-                lines: None,
+                lines: None, format: None,
             }))
             .await;
         assert!(get_result.is_err(), "get should fail for deleted memory entry");
@@ -2173,6 +2330,7 @@ mod tests {
             content: "Content".to_string(),
             entry_type: "topic".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         })))
         .await.expect("timeout").expect("memory_write failed");
 
@@ -2206,7 +2364,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "nonexistent".to_string(),
-            lines: None,
+            lines: None, format: None,
         })).await;
 
         let msg = extract_error_msg(result);
@@ -2222,7 +2380,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "999999".to_string(),
-            lines: None,
+            lines: None, format: None,
         })).await;
 
         let msg = extract_error_msg(result);
@@ -2244,7 +2402,7 @@ mod tests {
             scope: None,
             kind: None,
             threshold: 0.3,
-            file: None,
+            file: None, include_snippet: false,
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
@@ -2260,7 +2418,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "nonexistent/**/*.md".to_string(),
-            lines: None,
+            lines: None, format: None,
         })).await.expect("get with glob should not error");
 
         let text = extract_text(&result);
@@ -2282,7 +2440,7 @@ mod tests {
             scope: Some("memory".to_string()),
             kind: None,
             threshold: 0.3,
-            file: None,
+            file: None, include_snippet: false,
         })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
@@ -2335,6 +2493,7 @@ mod tests {
             content: "Content A".to_string(),
             entry_type: "topic".to_string(),
             tags: vec!["tag1".to_string()],
+            source_type: "user_statement".to_string(),
         })).await.expect("write A");
 
         server.memory_write(Parameters(MemoryWriteParams {
@@ -2343,6 +2502,7 @@ mod tests {
             content: "Content B".to_string(),
             entry_type: "problem".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         })).await.expect("write B");
 
         let result = server.memory_list(Parameters(MemoryListParams {
@@ -2457,7 +2617,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2479,7 +2639,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2500,7 +2660,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: Some("struct".to_string()),
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols kind=struct failed");
 
@@ -2523,6 +2683,7 @@ pub fn utility() -> i32 {
                 kind: None,
                 threshold: 0.3,
                 file: Some("lib.rs".to_string()),
+                include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols file=lib.rs failed");
 
@@ -2544,7 +2705,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: Some("invalid_kind".to_string()),
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout");
 
@@ -2564,7 +2725,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2649,7 +2810,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2680,7 +2841,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2692,7 +2853,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed (second call)");
 
@@ -2731,7 +2892,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 threshold: 0.3,
-                file: None,
+                file: None, include_snippet: false,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2841,6 +3002,7 @@ pub fn utility() -> i32 {
             content: "Initial content".to_string(),
             entry_type: "topic".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         })).await.expect("write should succeed");
 
         // Get access_count after creation
@@ -2858,6 +3020,7 @@ pub fn utility() -> i32 {
             content: "Updated content".to_string(),
             entry_type: "topic".to_string(),
             tags: vec![],
+            source_type: "user_statement".to_string(),
         })).await.expect("update should succeed");
 
         // access_count must not have changed

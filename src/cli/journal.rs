@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use crate::store::memory::{EntryStatus, EntryType, MemoryEntry};
+use crate::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType};
 
 /// Parsed sections from a journal entry.
 #[derive(Debug, Default)]
@@ -215,6 +215,10 @@ pub fn journal_to_memory_entries(
                 access_count: 0,
                 last_accessed: None,
                 source_path: Some(source.clone()),
+                confirmations: 0,
+                corrections: 0,
+                last_confirmed_at: None,
+                source_type: SourceType::UserStatement,
             });
         }
     }
@@ -241,6 +245,10 @@ pub fn journal_to_memory_entries(
             access_count: 0,
             last_accessed: None,
             source_path: Some(source.clone()),
+            confirmations: 0,
+            corrections: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
         });
     }
 
@@ -266,6 +274,10 @@ pub fn journal_to_memory_entries(
             access_count: 0,
             last_accessed: None,
             source_path: Some(source.clone()),
+            confirmations: 0,
+            corrections: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
         });
     }
 
@@ -299,6 +311,10 @@ pub fn journal_to_memory_entries(
             access_count: 0,
             last_accessed: None,
             source_path: Some(source.clone()),
+            confirmations: 0,
+            corrections: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
         });
     }
 

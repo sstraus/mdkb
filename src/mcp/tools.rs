@@ -36,6 +36,10 @@ pub struct SearchParams {
     /// Filter by file path (substring match) when scope is "symbols".
     #[serde(default)]
     pub file: Option<String>,
+
+    /// Include content snippet in search results (default: false).
+    #[serde(default)]
+    pub include_snippet: bool,
 }
 
 fn default_limit() -> usize {
@@ -51,6 +55,10 @@ pub struct GetParams {
     /// Optional line range (e.g., "10:50").
     #[serde(default)]
     pub lines: Option<String>,
+
+    /// Output format: "full" (default) or "summary" (title + first paragraph + metadata).
+    #[serde(default)]
+    pub format: Option<String>,
 }
 
 /// Parameters for the memory write tool.
@@ -72,10 +80,36 @@ pub struct MemoryWriteParams {
     /// Tags for categorization.
     #[serde(default)]
     pub tags: Vec<String>,
+
+    /// Source type: official_docs, user_statement (default), or inference.
+    #[serde(default = "default_source_type")]
+    pub source_type: String,
 }
 
 fn default_entry_type() -> String {
     "topic".to_string()
+}
+
+fn default_source_type() -> String {
+    "user_statement".to_string()
+}
+
+/// Parameters for the memory_confirm tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryConfirmParams {
+    /// Memory entry ID.
+    pub id: String,
+}
+
+/// Parameters for the memory_correct tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryCorrectParams {
+    /// Memory entry ID.
+    pub id: String,
+
+    /// Optional correction text (appended under ## Correction header).
+    #[serde(default)]
+    pub correction: Option<String>,
 }
 
 /// Parameters for the memory_delete tool.
