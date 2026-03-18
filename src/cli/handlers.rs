@@ -58,6 +58,12 @@ impl Context {
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
+        // Run schema migrations and vector table creation on every open.
+        // This ensures tables added in newer versions (e.g. vec_memory)
+        // exist even on databases created by older versions.
+        schema::init_schema(&conn)?;
+        vectors::init_vector_schema(&conn)?;
+
         Ok(Self {
             conn,
             config_path,
@@ -1914,6 +1920,43 @@ mod tests {
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         assert!(ctx.db_path.exists());
+    }
+
+    #[test]
+    fn test_context_open_creates_vec_memory_on_legacy_db() {
+        use rusqlite::Connection;
+
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+
+        // Simulate a legacy DB by dropping vec_memory
+        {
+            let db_path = temp.path().join(".mdkb/index.sqlite");
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS vec_memory").unwrap();
+
+            // Verify it's gone
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_memory')",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(!exists, "vec_memory should be dropped");
+        }
+
+        // Re-open — should recreate vec_memory
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+        let exists: bool = ctx
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='vec_memory')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(exists, "vec_memory should be recreated by Context::open");
     }
 
     // ==================== Collection Tests ====================

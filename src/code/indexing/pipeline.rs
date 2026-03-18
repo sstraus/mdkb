@@ -499,62 +499,78 @@ fn stage_index(
         // Without this, each INSERT is an autocommit with its own fsync.
         db.conn().execute_batch("BEGIN")?;
 
-        // Write file registrations
-        for reg in &batch.file_registrations {
-            let abs_path = reg.path.to_string_lossy();
-            db.insert_file(
-                &abs_path,
-                &reg.rel_path,
-                &reg.content_hash,
-                Some(reg.language.config_key()),
-                Some(reg.mtime as i64),
-            )?;
-            stats.files_discovered += 1;
-            stats.files_indexed += 1;
+        let result = write_batch(db, &batch, &mut stats);
+        match result {
+            Ok(()) => db.conn().execute_batch("COMMIT")?,
+            Err(e) => {
+                let _ = db.conn().execute_batch("ROLLBACK");
+                return Err(e);
+            }
         }
-
-        // Write symbols — get the file_id from the file registration
-        for (symbol, _path) in &batch.symbols {
-            let scope_json = symbol.scope_context.as_ref().and_then(|sc| {
-                serde_json::to_string(sc).ok()
-            });
-            db.insert_symbol(
-                symbol.as_name(),
-                &symbol.kind.to_string(),
-                i64::from(symbol.file_id.value()),
-                &symbol.file_path,
-                symbol.range.start_line,
-                Some(symbol.range.start_column),
-                Some(symbol.range.end_line),
-                Some(symbol.range.end_column),
-                symbol.visibility as u8,
-                symbol.as_signature(),
-                symbol.as_doc_comment(),
-                symbol.as_module_path(),
-                scope_json.as_deref(),
-            )?;
-            stats.symbols_indexed += 1;
-        }
-
-        // Write relationships directly to SQLite (no longer "unresolved")
-        for rel in &batch.unresolved_relationships {
-            let to_range = rel.to_range.as_ref();
-            db.insert_relationship(
-                rel.from_id.map(|id| i64::from(id.value())),
-                &rel.from_name,
-                &rel.to_name,
-                &rel.kind.to_string(),
-                i64::from(rel.file_id.value()),
-                to_range.map(|r| r.start_line),
-                to_range.map(|r| r.start_column),
-            )?;
-            stats.relationships_collected += 1;
-        }
-
-        db.conn().execute_batch("COMMIT")?;
     }
 
     Ok(stats)
+}
+
+/// Write a single batch of index data to the database.
+///
+/// Called within a transaction managed by `stage_index`.
+fn write_batch(
+    db: &CodeDb,
+    batch: &IndexBatch,
+    stats: &mut IndexStats,
+) -> anyhow::Result<()> {
+    for reg in &batch.file_registrations {
+        let abs_path = reg.path.to_string_lossy();
+        db.insert_file(
+            &abs_path,
+            &reg.rel_path,
+            &reg.content_hash,
+            Some(reg.language.config_key()),
+            Some(reg.mtime as i64),
+        )?;
+        stats.files_discovered += 1;
+        stats.files_indexed += 1;
+    }
+
+    for (symbol, _path) in &batch.symbols {
+        let scope_json = symbol.scope_context.as_ref().and_then(|sc| {
+            serde_json::to_string(sc).ok()
+        });
+        db.insert_symbol(
+            symbol.as_name(),
+            &symbol.kind.to_string(),
+            i64::from(symbol.file_id.value()),
+            &symbol.file_path,
+            symbol.range.start_line,
+            Some(symbol.range.start_column),
+            Some(symbol.range.end_line),
+            Some(symbol.range.end_column),
+            symbol.visibility as u8,
+            symbol.as_signature(),
+            symbol.as_doc_comment(),
+            symbol.as_module_path(),
+            scope_json.as_deref(),
+        )?;
+        stats.symbols_indexed += 1;
+    }
+
+    // Write relationships directly to SQLite (no longer "unresolved")
+    for rel in &batch.unresolved_relationships {
+        let to_range = rel.to_range.as_ref();
+        db.insert_relationship(
+            rel.from_id.map(|id| i64::from(id.value())),
+            &rel.from_name,
+            &rel.to_name,
+            &rel.kind.to_string(),
+            i64::from(rel.file_id.value()),
+            to_range.map(|r| r.start_line),
+            to_range.map(|r| r.start_column),
+        )?;
+        stats.relationships_collected += 1;
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

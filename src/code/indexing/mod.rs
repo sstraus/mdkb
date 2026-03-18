@@ -136,6 +136,8 @@ impl IndexFacade {
 
     /// Re-index a directory (full reindex, discarding previous data).
     pub fn reindex(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
+        // Roll back any dangling transaction from a previous failed reindex.
+        let _ = self.db.conn().execute_batch("ROLLBACK");
         self.db.clear()?;
         // Only clear semantic if already initialized (don't trigger lazy load for a clear)
         if let Some(ref semantic) = self.semantic {
