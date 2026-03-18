@@ -1,0 +1,27 @@
+src/code/indexing/mod.rs
+  f35f9bd1331ad82d 139-140
+src/code/indexing/pipeline.rs
+  f35f9bd1331ad82d 502-508,510,512,515-533,552-555,558-573
+src/cli/handlers.rs
+  f35f9bd1331ad82d 61-66,1925-1961
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "57f06142b4c9b4bb5f105295e1bffea496c0aa06",
+  "prompts": {
+    "f35f9bd1331ad82d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9de2364f-0159-49a9-b3e6-0f41dbc6541f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 111,
+      "total_deletions": 50,
+      "accepted_lines": 93,
+      "overriden_lines": 0
+    }
+  }
+}
