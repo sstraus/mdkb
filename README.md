@@ -62,7 +62,7 @@ Add to your Claude Code MCP config (`.claude/mcp.json` or `~/.claude/mcp.json`):
 
 The `cwd` must point to a directory with `.mdkb/` initialized.
 
-## MCP Tools (8)
+## MCP Tools (10)
 
 | Tool | Description |
 |------|-------------|
@@ -71,9 +71,11 @@ The `cwd` must point to a directory with `.mdkb/` initialized.
 | `code_graph` | Call graph queries: `calls`, `callers`, or `impact` (transitive) |
 | `status` | Index health, collections, and code index stats |
 | `update` | Differential reindex of all collections and source code |
-| `memory_write` | Create or update a memory entry |
+| `memory_write` | Create or update a memory entry (with duplicate detection) |
 | `memory_delete` | Delete a memory entry |
 | `memory_list` | List memory entries sorted by recency, popularity, or creation date |
+| `memory_confirm` | Confirm a memory entry is still accurate (increases confidence) |
+| `memory_correct` | Flag a memory entry as incorrect with a correction note |
 
 ### Search Scopes
 
@@ -91,8 +93,9 @@ Memory entries persist AI knowledge across sessions — decisions, patterns, sol
 
 - **Session start**: Top 50 entries loaded in server instructions (~1.5K tokens)
 - **On demand**: AI calls `get(slug)` for full content
-- **Learning**: AI calls `memory_write` to persist new knowledge
-- **Search**: AI calls `search(query, scope="memory")` for related entries
+- **Learning**: AI calls `memory_write` to persist new knowledge (with duplicate detection)
+- **Search**: AI calls `search(query, scope="memory")` for hybrid BM25+vector results
+- **Confidence**: Entries have confidence scores (0-1) based on age, confirmations, and corrections. Use `memory_confirm` to validate entries, `memory_correct` to flag errors.
 
 Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices).
 

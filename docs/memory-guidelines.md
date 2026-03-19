@@ -4,7 +4,7 @@ Guidelines for AI assistants on when and how to use the mdkb memory system for k
 
 ## When to Write Memories
 
-Use `mdkb_memory_write` in these scenarios:
+Use `memory_write` in these scenarios:
 
 ### 1. After Solving a Problem (type: `problem`)
 
@@ -34,7 +34,7 @@ How to avoid in future
 
 **Example**:
 ```
-mdkb_memory_write(
+memory_write(
   id: "bug-null-email-panic",
   title: "Null email panic in notifications",
   type: "problem",
@@ -69,7 +69,7 @@ Trade-offs accepted, future implications
 
 **Example**:
 ```
-mdkb_memory_write(
+memory_write(
   id: "decision-sqlx-vs-diesel",
   title: "sqlx vs diesel for database access",
   type: "decision",
@@ -103,7 +103,7 @@ Links to docs, other memories
 
 **Example**:
 ```
-mdkb_memory_write(
+memory_write(
   id: "topic-error-handling-patterns",
   title: "Error handling patterns in this codebase",
   type: "topic",
@@ -141,7 +141,7 @@ Did you just...
 
 ## When to Update vs Create New
 
-**Update existing** (`mdkb_memory_write` with same ID):
+**Update existing** (`memory_write` with same ID):
 - Adding detail to existing entry
 - Correcting information
 - Entry is still fundamentally about the same thing
@@ -166,10 +166,11 @@ Use 2-5 tags per entry:
 
 ## Memory Search vs Memory Index
 
-- **Warmup index** (`mdkb_memory_index`): Top 50 entries by usage. Check this first.
-- **Search** (`mdkb_memory_search`): Find specific entries not in top 50.
+- **Warmup index** (`memory_list`): Top 50 entries by usage. Check this first.
+- **Search** (`search(query, scope="memory")`): Hybrid BM25+vector search for specific entries.
+- **Confidence**: Each entry has a confidence score (0-1) based on temporal decay, confirmations, and corrections. Use `memory_confirm(id)` when you verify knowledge is still accurate. Use `memory_correct(id, correction)` when you find errors.
 
-The warmup index auto-loads at session start. Use `mdkb_memory_get(id)` to retrieve full content.
+The warmup index auto-loads at session start. Use `get(id)` to retrieve full content.
 
 ## Integration with Claude Code
 
@@ -180,7 +181,7 @@ Add to your project's `CLAUDE.md`:
 
 This project uses mdkb for memory persistence. At session start, you'll receive a memory index.
 
-- Use `mdkb_memory_get(id)` to retrieve full content
-- Use `mdkb_memory_write(...)` after solving problems, making decisions, or learning patterns
+- Use `get(id)` to retrieve full content
+- Use `memory_write(...)` after solving problems, making decisions, or learning patterns
 - Follow memory guidelines in docs/memory-guidelines.md
 ```
