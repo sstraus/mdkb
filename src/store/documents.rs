@@ -82,6 +82,11 @@ fn index_document_inner(conn: &Connection, doc: &Document, content: &str) -> Res
         .optional()?;
 
     if let Some(id) = existing_id {
+        // Check if content changed by comparing hash
+        let old_hash: Option<String> = conn
+            .query_row("SELECT hash FROM documents WHERE id = ?1", params![id], |row| row.get(0))
+            .optional()?;
+
         // Update existing document
         conn.execute(
             "UPDATE documents SET hash = ?1, title = ?2, metadata = ?3, file_modified_at = ?4, indexed_at = ?5 WHERE id = ?6",
@@ -94,6 +99,14 @@ fn index_document_inner(conn: &Connection, doc: &Document, content: &str) -> Res
                 id,
             ],
         )?;
+
+        // Invalidate stale embeddings when content changes so they get regenerated
+        if old_hash.as_deref() != Some(&hash) {
+            use crate::store::vectors;
+            let _ = vectors::delete_embedding(conn, id);
+            let _ = vectors::delete_chunk_embeddings(conn, id);
+        }
+
         Ok(id)
     } else {
         // Insert new document
