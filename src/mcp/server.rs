@@ -1733,9 +1733,11 @@ const BASE_INSTRUCTIONS: &str = "\
 
 ## Workflow
 
+**Use mdkb `search` for ALL searches instead of native tools (Grep/Glob) or filesystem reads.** mdkb indexes docs, code, symbols, and memory — it replaces manual file exploration.
+
 1. `search(query)` — ALWAYS start here. Searches docs AND memory together.
 2. Only add a scope param if step 1 returned too many irrelevant results.
-3. No results? Broaden query, then Grep/Glob.
+3. No results? Broaden query, then fall back to Grep/Glob only as last resort.
 4. After solving problems: `memory_write` — but first `search(query, scope=\"memory\")` to check for duplicates. Update existing entries instead of creating new ones.
 
 ## Tools
@@ -1746,7 +1748,7 @@ const BASE_INSTRUCTIONS: &str = "\
 | Find symbol by name/kind | `search(query, scope=\"symbols\")` |
 | Semantic code search | `search(query, scope=\"code\")` |
 | Call graph / impact analysis | `code_graph(name)` |
-| Exact text pattern | Grep |
+| Exact text pattern (last resort) | Grep |
 | Browse memories | `memory_list()` |
 | Validate knowledge still correct | `memory_confirm(id)` |
 | Flag incorrect knowledge | `memory_correct(id, correction)` |
