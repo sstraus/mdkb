@@ -270,22 +270,36 @@ impl McpServer {
             // Try numeric ID
             if let Ok(numeric_id) = id.parse::<i64>() {
                 if let Ok(Some(doc)) = documents::get_document(&ctx.conn, numeric_id) {
-                    if let Ok(content) = self.get_document_content(ctx, &doc, lines) {
-                        let title = doc.title.as_deref().unwrap_or("(untitled)");
-                        output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
-                        found += 1;
-                        continue;
+                    match self.get_document_content(ctx, &doc, lines) {
+                        Ok(content) => {
+                            let title = doc.title.as_deref().unwrap_or("(untitled)");
+                            output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
+                            found += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            output.push_str(&format!("=== [{}] {} ===\nContent error: {}\n\n", doc.id, doc.relative_path, e));
+                            found += 1;
+                            continue;
+                        }
                     }
                 }
             }
 
             // Try path resolution
             if let Ok(doc) = resolve_document(&ctx.conn, id) {
-                if let Ok(content) = self.get_document_content(ctx, &doc, lines) {
-                    let title = doc.title.as_deref().unwrap_or("(untitled)");
-                    output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
-                    found += 1;
-                    continue;
+                match self.get_document_content(ctx, &doc, lines) {
+                    Ok(content) => {
+                        let title = doc.title.as_deref().unwrap_or("(untitled)");
+                        output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
+                        found += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        output.push_str(&format!("=== [{}] {} ===\nContent error: {}\n\n", doc.id, doc.relative_path, e));
+                        found += 1;
+                        continue;
+                    }
                 }
             }
 
