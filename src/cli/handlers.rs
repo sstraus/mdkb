@@ -298,6 +298,12 @@ pub fn handle_hybrid_search(
     let doc_ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
     let docs = documents::get_documents_batch(&ctx.conn, &doc_ids)?;
 
+    // Batch-fetch document statuses for vector-side filtering
+    let status_map = documents::get_statuses_batch(&ctx.conn, &doc_ids)?;
+
+    // Build BM25 lookup for status/superseded_by metadata
+    let bm25_map: HashMap<i64, &SearchResult> = bm25_results.iter().map(|r| (r.id, r)).collect();
+
     // Build a map for quick lookup
     let doc_map: std::collections::HashMap<i64, _> = docs.into_iter().map(|d| (d.id, d)).collect();
 
@@ -314,6 +320,16 @@ pub fn handle_hybrid_search(
                 continue;
             }
 
+            // Filter superseded/retracted documents (vector search doesn't filter by status)
+            let doc_status = status_map.get(&doc_id).and_then(|s| s.as_deref());
+            if !include_superseded {
+                if matches!(doc_status, Some("superseded" | "retracted")) {
+                    continue;
+                }
+            }
+
+            // Populate status from DB; superseded_by from BM25 results if available
+            let bm25 = bm25_map.get(&doc_id);
             results.push(SearchResult {
                 id: doc.id,
                 collection: doc.collection.clone(),
@@ -321,8 +337,8 @@ pub fn handle_hybrid_search(
                 title: doc.title.clone(),
                 score,
                 snippets: vec![],
-                status: None, // Will be populated from BM25 results if available
-                superseded_by: None,
+                status: doc_status.map(String::from),
+                superseded_by: bm25.and_then(|r| r.superseded_by.clone()),
             });
 
             // Stop once we have enough results

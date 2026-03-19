@@ -255,6 +255,35 @@ pub fn get_documents_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<Documen
     Ok(documents)
 }
 
+/// Get document statuses by ID in a single batch query.
+pub fn get_statuses_batch(conn: &Connection, ids: &[i64]) -> Result<std::collections::HashMap<i64, Option<String>>> {
+    use std::collections::HashMap;
+
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+    let query = format!(
+        "SELECT id, status FROM documents WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+
+    let mut map = HashMap::new();
+    for row in rows {
+        let (id, status) = row?;
+        map.insert(id, status);
+    }
+    Ok(map)
+}
+
 /// Get multiple content entries by their hashes in a single query (fixes N+1 query pattern).
 pub fn get_content_batch(conn: &Connection, hashes: &[&str]) -> Result<std::collections::HashMap<String, String>> {
     use std::collections::HashMap;
