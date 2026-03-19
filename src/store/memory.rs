@@ -1,5 +1,7 @@
 //! Memory entry storage operations.
 
+use std::collections::HashMap;
+
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -598,6 +600,32 @@ fn get_entry_by_rowid(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntr
     Ok(entry)
 }
 
+/// Batch fetch memory entries by rowids in a single query.
+fn get_entries_by_rowids(conn: &Connection, rowids: &[i64]) -> Result<HashMap<i64, MemoryEntry>> {
+    if rowids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let placeholders: Vec<String> = (1..=rowids.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        "SELECT rowid, id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, source_type
+         FROM memory_entries WHERE rowid IN ({})",
+        placeholders.join(", ")
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = rowids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        let rowid: i64 = row.get(0)?;
+        let entry = row_to_entry_offset(row, 1)?;
+        Ok((rowid, entry))
+    })?;
+    let mut map = HashMap::new();
+    for row in rows {
+        let (rowid, entry) = row?;
+        map.insert(rowid, entry);
+    }
+    Ok(map)
+}
+
 /// Hybrid search for memory entries: BM25 + vector with RRF fusion.
 ///
 /// Falls back to BM25-only if no embeddings exist or embedding service is unavailable.
@@ -608,7 +636,6 @@ pub fn search_entries_hybrid(
     limit: usize,
 ) -> Result<Vec<MemoryEntry>> {
     use crate::store::{hybrid, vectors};
-    use std::collections::HashMap;
 
     // BM25 search (get more for fusion)
     let bm25_results = bm25_search_with_rowid(conn, query, limit * 2)?;
@@ -655,13 +682,20 @@ pub fn search_entries_hybrid(
         .into_iter()
         .collect();
 
-    // Resolve fused results to MemoryEntry, fetching from DB if only in vector results
+    // Batch-fetch vector-only entries (not in BM25 results) in a single query
+    let vector_only_rowids: Vec<i64> = fused.iter()
+        .filter(|(rowid, _)| !entry_map.contains_key(rowid))
+        .map(|(rowid, _)| *rowid)
+        .collect();
+    let mut vector_entries = get_entries_by_rowids(conn, &vector_only_rowids)?;
+
+    // Resolve fused results to MemoryEntry
     // Apply confidence-weighted re-ranking: final = rrf_norm * 0.7 + confidence * 0.3
     let mut scored_results: Vec<(MemoryEntry, f64)> = Vec::new();
     for (rowid, rrf_score) in fused {
         let entry = if let Some(e) = entry_map.remove(&rowid) {
             e
-        } else if let Some(e) = get_entry_by_rowid(conn, rowid)? {
+        } else if let Some(e) = vector_entries.remove(&rowid) {
             e
         } else {
             continue;
@@ -794,28 +828,33 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
-    let tags_json: String = row.get(4)?;
+    row_to_entry_offset(row, 0)
+}
+
+/// Parse a MemoryEntry from a row with a column offset (for queries that prepend extra columns).
+fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<MemoryEntry> {
+    let tags_json: String = row.get(off + 4)?;
     let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-    let entry_type_str: String = row.get(3)?;
-    let status_str: String = row.get(5)?;
-    let source_type_str: String = row.get::<_, Option<String>>(15)?.unwrap_or_default();
+    let entry_type_str: String = row.get(off + 3)?;
+    let status_str: String = row.get(off + 5)?;
+    let source_type_str: String = row.get::<_, Option<String>>(off + 15)?.unwrap_or_default();
 
     Ok(MemoryEntry {
-        id: row.get(0)?,
-        title: row.get(1)?,
-        content: row.get(2)?,
+        id: row.get(off)?,
+        title: row.get(off + 1)?,
+        content: row.get(off + 2)?,
         entry_type: entry_type_str.parse().unwrap_or(EntryType::Topic),
         tags,
         status: status_str.parse().unwrap_or(EntryStatus::Active),
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
-        superseded_by: row.get(8)?,
-        access_count: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
-        last_accessed: row.get(10)?,
-        source_path: row.get(11)?,
-        confirmations: row.get::<_, Option<i64>>(12)?.unwrap_or(0) as u32,
-        corrections: row.get::<_, Option<i64>>(13)?.unwrap_or(0) as u32,
-        last_confirmed_at: row.get(14)?,
+        created_at: row.get(off + 6)?,
+        updated_at: row.get(off + 7)?,
+        superseded_by: row.get(off + 8)?,
+        access_count: u64::try_from(row.get::<_, i64>(off + 9)?).unwrap_or(0),
+        last_accessed: row.get(off + 10)?,
+        source_path: row.get(off + 11)?,
+        confirmations: row.get::<_, Option<i64>>(off + 12)?.unwrap_or(0) as u32,
+        corrections: row.get::<_, Option<i64>>(off + 13)?.unwrap_or(0) as u32,
+        last_confirmed_at: row.get(off + 14)?,
         source_type: source_type_str.parse().unwrap_or(SourceType::UserStatement),
     })
 }

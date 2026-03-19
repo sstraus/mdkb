@@ -1,5 +1,7 @@
 //! FTS5 search operations.
 
+use std::collections::HashMap;
+
 use crate::domain::{IndexStatus, SearchQuery, SearchResult};
 use crate::error::Result;
 use rusqlite::{Connection, params};
@@ -137,25 +139,42 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
 
 /// Populate the superseded_by field for search results.
 fn populate_superseded_by(conn: &Connection, results: &mut [SearchResult]) -> Result<()> {
-    for result in results.iter_mut() {
-        if result.status.as_deref() == Some("superseded") {
-            // Find what document superseded this one
-            let superseding = conn.query_row(
-                r#"
-                SELECT d.relative_path
-                FROM evolution e
-                JOIN documents d ON d.id = e.source_doc_id
-                WHERE e.target_doc_id = ?1 AND e.relationship = 'supersedes'
-                ORDER BY e.created_at DESC
-                LIMIT 1
-            "#,
-                params![result.id],
-                |row| row.get(0),
-            );
+    let superseded_ids: Vec<i64> = results.iter()
+        .filter(|r| r.status.as_deref() == Some("superseded"))
+        .map(|r| r.id)
+        .collect();
 
-            if let Ok(path) = superseding {
-                result.superseded_by = Some(path);
-            }
+    if superseded_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Batch fetch: for each superseded doc, find the superseding doc's path
+    let placeholders: Vec<String> = (1..=superseded_ids.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        r#"SELECT e.target_doc_id, d.relative_path
+           FROM evolution e
+           JOIN documents d ON d.id = e.source_doc_id
+           WHERE e.target_doc_id IN ({}) AND e.relationship = 'supersedes'
+           ORDER BY e.created_at DESC"#,
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = superseded_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    // First entry per target_doc_id wins (ORDER BY created_at DESC)
+    let mut superseded_map = std::collections::HashMap::new();
+    for row in rows {
+        let (target_id, path) = row?;
+        superseded_map.entry(target_id).or_insert(path);
+    }
+
+    for result in results.iter_mut() {
+        if let Some(path) = superseded_map.remove(&result.id) {
+            result.superseded_by = Some(path);
         }
     }
     Ok(())

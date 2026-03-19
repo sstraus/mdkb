@@ -415,23 +415,11 @@ pub fn chunk_vector_search(
 }
 
 /// Delete all chunks and their embeddings for a document.
+///
+/// The `chunks_delete_vec` trigger automatically cleans up `vec_chunks`
+/// when `document_chunks` rows are deleted.
 pub fn delete_chunk_embeddings(conn: &Connection, document_id: i64) -> Result<()> {
-    // Get chunk IDs to delete from vec_chunks
-    let chunk_ids: Vec<i64> = {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM document_chunks WHERE document_id = ?1",
-        )?;
-        stmt.query_map(params![document_id], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect()
-    };
-
-    for chunk_id in &chunk_ids {
-        conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![chunk_id])?;
-    }
-
     conn.execute("DELETE FROM document_chunks WHERE document_id = ?1", params![document_id])?;
-
     Ok(())
 }
 
