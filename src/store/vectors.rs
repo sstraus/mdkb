@@ -267,14 +267,13 @@ pub fn vector_search(
         "#,
     )?;
 
-    let results = stmt
+    let results: std::result::Result<Vec<_>, _> = stmt
         .query_map(params![embedding_bytes, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
         })?
-        .filter_map(|r| r.ok())
         .collect();
 
-    Ok(results)
+    Ok(results?)
 }
 
 /// Delete embedding for a document.
@@ -429,15 +428,24 @@ fn search_vec_chunks_by_doc(conn: &Connection, embedding_bytes: &[u8], limit: us
     let chunk_hits: Vec<(i64, f32)> = match conn.prepare(
         "SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
     ) {
-        Ok(mut stmt) => stmt
-            .query_map(params![embedding_bytes, limit as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_else(|e| {
-                tracing::warn!("vec_chunks query failed: {e}");
-                Vec::new()
-            }),
+        Ok(mut stmt) => {
+            let rows: std::result::Result<Vec<_>, _> = stmt
+                .query_map(params![embedding_bytes, limit as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
+                })
+                .map(|rows| rows.collect())
+                .unwrap_or_else(|e| {
+                    tracing::warn!("vec_chunks query failed: {e}");
+                    Ok(Vec::new())
+                });
+            match rows {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("vec_chunks row error: {e}");
+                    Vec::new()
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!("Failed to prepare vec_chunks query: {e}");
             return Vec::new();
@@ -454,13 +462,15 @@ fn search_vec_chunks_by_doc(conn: &Connection, embedding_bytes: &[u8], limit: us
     let chunk_to_doc: std::collections::HashMap<i64, i64> = conn
         .prepare(&sql)
         .and_then(|mut stmt| {
-            let rows: Vec<(i64, i64)> = stmt
+            let rows: rusqlite::Result<Vec<(i64, i64)>> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
                 .collect();
-            Ok(rows.into_iter().collect())
+            Ok(rows?.into_iter().collect())
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!("chunk_id→document_id resolution failed: {e}");
+            std::collections::HashMap::new()
+        });
 
     // Aggregate: best distance per document
     let mut best_per_doc: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
@@ -534,14 +544,13 @@ pub fn memory_vector_search(
         "SELECT memory_rowid, distance FROM vec_memory WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
     )?;
 
-    let results = stmt
+    let results: std::result::Result<Vec<_>, _> = stmt
         .query_map(params![embedding_bytes, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
         })?
-        .filter_map(|r| r.ok())
         .collect();
 
-    Ok(results)
+    Ok(results?)
 }
 
 /// Delete embedding for a memory entry.
