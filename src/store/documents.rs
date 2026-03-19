@@ -241,7 +241,7 @@ pub fn get_documents_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<Documen
     // Build parameterized query with placeholders
     let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
     let query = format!(
-        "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at \
+        "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at, status \
          FROM documents WHERE id IN ({})",
         placeholders.join(", ")
     );
