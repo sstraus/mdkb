@@ -197,6 +197,8 @@ fn detect_embedding_dimension(conn: &Connection) -> Option<usize> {
 }
 
 /// Store embedding for a document.
+///
+/// Atomic: embeddings + vec_documents are kept in sync via transaction.
 pub fn store_embedding(
     conn: &Connection,
     document_id: i64,
@@ -204,35 +206,28 @@ pub fn store_embedding(
     model: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-
-    // Convert to bytes for storage using zerocopy
     let embedding_bytes = embedding.as_bytes();
 
-    // Store in embeddings table
-    conn.execute(
-        r#"
-        INSERT OR REPLACE INTO embeddings (document_id, embedding, model, created_at)
-        VALUES (?1, ?2, ?3, ?4)
-        "#,
-        params![document_id, embedding_bytes, model, now],
-    )?;
+    conn.execute("SAVEPOINT store_embedding", [])?;
+    let result = (|| -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO embeddings (document_id, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![document_id, embedding_bytes, model, now],
+        )?;
 
-    // Store in vector index
-    // Note: sqlite-vec virtual tables don't support INSERT OR REPLACE,
-    // so we need to delete first then insert
-    conn.execute(
-        "DELETE FROM vec_documents WHERE document_id = ?1",
-        params![document_id],
-    )?;
-    conn.execute(
-        r#"
-        INSERT INTO vec_documents (document_id, embedding)
-        VALUES (?1, ?2)
-        "#,
-        params![document_id, embedding_bytes],
-    )?;
+        // sqlite-vec virtual tables don't support INSERT OR REPLACE
+        conn.execute("DELETE FROM vec_documents WHERE document_id = ?1", params![document_id])?;
+        conn.execute(
+            "INSERT INTO vec_documents (document_id, embedding) VALUES (?1, ?2)",
+            params![document_id, embedding_bytes],
+        )?;
+        Ok(())
+    })();
 
-    Ok(())
+    match result {
+        Ok(()) => { conn.execute("RELEASE store_embedding", [])?; Ok(()) }
+        Err(e) => { let _ = conn.execute("ROLLBACK TO store_embedding", []); Err(e) }
+    }
 }
 
 /// Get embedding for a document.
@@ -517,22 +512,26 @@ pub fn store_memory_embedding(
     let now = chrono::Utc::now().timestamp();
     let embedding_bytes = embedding.as_bytes();
 
-    conn.execute(
-        "INSERT OR REPLACE INTO memory_embeddings (memory_rowid, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![memory_rowid, embedding_bytes, model, now],
-    )?;
+    conn.execute("SAVEPOINT store_memory_embedding", [])?;
+    let result = (|| -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_embeddings (memory_rowid, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![memory_rowid, embedding_bytes, model, now],
+        )?;
 
-    // sqlite-vec doesn't support INSERT OR REPLACE
-    conn.execute(
-        "DELETE FROM vec_memory WHERE memory_rowid = ?1",
-        params![memory_rowid],
-    )?;
-    conn.execute(
-        "INSERT INTO vec_memory (memory_rowid, embedding) VALUES (?1, ?2)",
-        params![memory_rowid, embedding_bytes],
-    )?;
+        // sqlite-vec doesn't support INSERT OR REPLACE
+        conn.execute("DELETE FROM vec_memory WHERE memory_rowid = ?1", params![memory_rowid])?;
+        conn.execute(
+            "INSERT INTO vec_memory (memory_rowid, embedding) VALUES (?1, ?2)",
+            params![memory_rowid, embedding_bytes],
+        )?;
+        Ok(())
+    })();
 
-    Ok(())
+    match result {
+        Ok(()) => { conn.execute("RELEASE store_memory_embedding", [])?; Ok(()) }
+        Err(e) => { let _ = conn.execute("ROLLBACK TO store_memory_embedding", []); Err(e) }
+    }
 }
 
 /// Search for similar memory entries by vector.

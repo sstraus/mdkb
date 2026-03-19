@@ -110,35 +110,43 @@ pub fn add_evolution(
 ) -> Result<i64> {
     let now = Utc::now().timestamp();
 
-    conn.execute(
-        "INSERT INTO evolution (source_doc_id, target_doc_id, relationship, scope, reason, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            source_doc_id,
-            target_doc_id,
-            relationship.to_string(),
-            scope,
-            reason,
-            now,
-        ],
-    )?;
+    // Atomic: evolution record + status update must be consistent.
+    // Use SAVEPOINT (not BEGIN) to support nesting inside existing transactions.
+    conn.execute("SAVEPOINT add_evolution", [])?;
+    let result = (|| -> Result<i64> {
+        conn.execute(
+            "INSERT INTO evolution (source_doc_id, target_doc_id, relationship, scope, reason, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                source_doc_id,
+                target_doc_id,
+                relationship.to_string(),
+                scope,
+                reason,
+                now,
+            ],
+        )?;
 
-    let id = conn.last_insert_rowid();
+        let id = conn.last_insert_rowid();
 
-    // Update target document status for supersedes/retracts
-    match relationship {
-        RelationshipType::Supersedes => {
-            update_document_status(conn, target_doc_id, DocumentStatus::Superseded, reason)?;
+        // Update target document status for supersedes/retracts
+        match relationship {
+            RelationshipType::Supersedes => {
+                update_document_status(conn, target_doc_id, DocumentStatus::Superseded, reason)?;
+            }
+            RelationshipType::Retracts => {
+                update_document_status(conn, target_doc_id, DocumentStatus::Retracted, reason)?;
+            }
+            _ => {}
         }
-        RelationshipType::Retracts => {
-            update_document_status(conn, target_doc_id, DocumentStatus::Retracted, reason)?;
-        }
-        _ => {
-            // Updates, corrects, extends don't change the target status
-        }
+
+        Ok(id)
+    })();
+
+    match result {
+        Ok(id) => { conn.execute("RELEASE add_evolution", [])?; Ok(id) }
+        Err(e) => { let _ = conn.execute("ROLLBACK TO add_evolution", []); Err(e) }
     }
-
-    Ok(id)
 }
 
 /// Update a document's status.
