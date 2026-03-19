@@ -114,9 +114,19 @@ pub fn init_vector_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Cleanup triggers: delete orphan embeddings when memory entries are deleted
+    // Cleanup triggers: delete orphan vector entries when parent rows are deleted.
+    // FK CASCADE handles `embeddings` and `document_chunks`, but sqlite-vec
+    // virtual tables don't support FK constraints, so we need explicit triggers.
     conn.execute_batch(
         r#"
+        CREATE TRIGGER IF NOT EXISTS documents_delete_vec AFTER DELETE ON documents BEGIN
+            DELETE FROM vec_documents WHERE document_id = OLD.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS chunks_delete_vec AFTER DELETE ON document_chunks BEGIN
+            DELETE FROM vec_chunks WHERE chunk_id = OLD.id;
+        END;
+
         CREATE TRIGGER IF NOT EXISTS memory_delete_embeddings AFTER DELETE ON memory_entries BEGIN
             DELETE FROM memory_embeddings WHERE memory_rowid = OLD.rowid;
             DELETE FROM vec_memory WHERE memory_rowid = OLD.rowid;
@@ -1013,5 +1023,54 @@ mod tests {
         let results = chunk_vector_search(&conn, &test_embedding(0.49), 10).unwrap();
         assert_eq!(results.len(), 1, "Should fall back to doc-level search");
         assert_eq!(results[0].0, 1);
+    }
+
+    #[test]
+    fn test_delete_document_cascades_to_vec_documents() {
+        let conn = setup_db();
+        setup_doc(&conn, 1, "doc.md");
+
+        store_embedding(&conn, 1, &test_embedding(0.5), "test").unwrap();
+
+        // Verify embedding exists
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM vec_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "vec_documents should have 1 entry");
+
+        // Delete the document — should cascade to vec_documents
+        conn.execute("DELETE FROM documents WHERE id = 1", []).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM vec_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "vec_documents should be empty after document delete");
+    }
+
+    #[test]
+    fn test_delete_document_cascades_to_vec_chunks() {
+        let conn = setup_db();
+        setup_doc(&conn, 1, "doc.md");
+
+        let chunks = vec![
+            crate::store::chunks::Chunk { index: 0, content: "A".into(), heading_path: None },
+            crate::store::chunks::Chunk { index: 1, content: "B".into(), heading_path: None },
+        ];
+        let embeddings = vec![test_embedding(0.1), test_embedding(0.2)];
+        store_chunk_embeddings(&conn, 1, &chunks, &embeddings, "test").unwrap();
+
+        // Verify chunks exist in vec_chunks
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "vec_chunks should have 2 entries");
+
+        // Delete the document — should cascade to vec_chunks via document_chunks
+        conn.execute("DELETE FROM documents WHERE id = 1", []).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "vec_chunks should be empty after document delete");
     }
 }
