@@ -459,7 +459,6 @@ pub fn delete_entry(conn: &Connection, id: &str) -> Result<bool> {
     Ok(rows > 0)
 }
 
-/// List memory entries ordered by access count (most used first).
 /// List memory entries sorted by access count (most popular first).
 ///
 /// This is a convenience wrapper around `list_entries_sorted` with `Popular` sort order.
@@ -503,30 +502,7 @@ fn bm25_search_with_rowid(conn: &Connection, query: &str, limit: usize) -> Resul
 
     let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
         let rowid: i64 = row.get(0)?;
-        let tags_json: String = row.get(5)?;
-        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-        let entry_type_str: String = row.get(4)?;
-        let status_str: String = row.get(6)?;
-        let source_type_str: String = row.get::<_, Option<String>>(16)?.unwrap_or_default();
-
-        let entry = MemoryEntry {
-            id: row.get(1)?,
-            title: row.get(2)?,
-            content: row.get(3)?,
-            entry_type: entry_type_str.parse().unwrap_or(EntryType::Topic),
-            tags,
-            status: status_str.parse().unwrap_or(EntryStatus::Active),
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
-            superseded_by: row.get(9)?,
-            access_count: u64::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
-            last_accessed: row.get(11)?,
-            source_path: row.get(12)?,
-            confirmations: row.get::<_, Option<i64>>(13)?.unwrap_or(0) as u32,
-            corrections: row.get::<_, Option<i64>>(14)?.unwrap_or(0) as u32,
-            last_confirmed_at: row.get(15)?,
-            source_type: source_type_str.parse().unwrap_or(SourceType::UserStatement),
-        };
+        let entry = row_to_entry_offset(row, 1)?;
         Ok((rowid, entry))
     })?;
 
@@ -846,7 +822,10 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
         confirmations: row.get::<_, Option<i64>>(off + 12)?.unwrap_or(0) as u32,
         corrections: row.get::<_, Option<i64>>(off + 13)?.unwrap_or(0) as u32,
         last_confirmed_at: row.get(off + 14)?,
-        source_type: source_type_str.parse().unwrap_or(SourceType::UserStatement),
+        source_type: source_type_str.parse().unwrap_or_else(|_| {
+            tracing::warn!("Unknown source_type '{}', defaulting to UserStatement", source_type_str);
+            SourceType::UserStatement
+        }),
     })
 }
 

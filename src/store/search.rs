@@ -1,7 +1,6 @@
 //! FTS5 search operations.
 
 use std::collections::HashMap;
-
 use crate::domain::{IndexStatus, SearchQuery, SearchResult};
 use crate::error::Result;
 use rusqlite::{Connection, params};
@@ -135,7 +134,7 @@ fn populate_superseded_by(conn: &Connection, results: &mut [SearchResult]) -> Re
     })?;
 
     // First entry per target_doc_id wins (ORDER BY created_at DESC)
-    let mut superseded_map = std::collections::HashMap::new();
+    let mut superseded_map = HashMap::new();
     for row in rows {
         let (target_id, path) = row?;
         superseded_map.entry(target_id).or_insert(path);
@@ -277,6 +276,7 @@ mod tests {
                 metadata: None,
                 file_modified_at: now,
                 indexed_at: now,
+                status: None,
             };
             index_document(&conn, &doc, content).unwrap();
         }
@@ -367,6 +367,7 @@ mod tests {
             metadata: None,
             file_modified_at: now,
             indexed_at: now,
+            status: None,
         };
         index_document(&conn, &doc, "A note about Rust").unwrap();
 
@@ -474,6 +475,7 @@ mod tests {
             metadata: None,
             file_modified_at: now,
             indexed_at: now,
+            status: None,
         };
         index_document(&conn, &doc, "Old Rust programming guide, now superseded.").unwrap();
 
@@ -515,6 +517,7 @@ mod tests {
             metadata: None,
             file_modified_at: now,
             indexed_at: now,
+            status: None,
         };
         index_document(&conn, &doc, "Old Rust programming guide, now superseded.").unwrap();
 
@@ -556,6 +559,7 @@ mod tests {
             metadata: None,
             file_modified_at: now,
             indexed_at: now,
+            status: None,
         };
         index_document(&conn, &doc, "Old Rust programming guide.").unwrap();
 

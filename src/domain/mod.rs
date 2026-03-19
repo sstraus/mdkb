@@ -73,6 +73,9 @@ pub struct Document {
 
     /// Indexing time (Unix seconds).
     pub indexed_at: i64,
+
+    /// Document status (current, superseded, retracted).
+    pub status: Option<String>,
 }
 
 /// Search query parameters.

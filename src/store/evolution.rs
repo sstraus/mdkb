@@ -145,7 +145,12 @@ pub fn add_evolution(
 
     match result {
         Ok(id) => { conn.execute("RELEASE add_evolution", [])?; Ok(id) }
-        Err(e) => { let _ = conn.execute("ROLLBACK TO add_evolution", []); Err(e) }
+        Err(e) => {
+            if let Err(rb) = conn.execute("ROLLBACK TO add_evolution", []) {
+                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
+            }
+            Err(e)
+        }
     }
 }
 

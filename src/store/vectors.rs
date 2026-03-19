@@ -226,7 +226,12 @@ pub fn store_embedding(
 
     match result {
         Ok(()) => { conn.execute("RELEASE store_embedding", [])?; Ok(()) }
-        Err(e) => { let _ = conn.execute("ROLLBACK TO store_embedding", []); Err(e) }
+        Err(e) => {
+            if let Err(rb) = conn.execute("ROLLBACK TO store_embedding", []) {
+                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
+            }
+            Err(e)
+        }
     }
 }
 
@@ -528,7 +533,12 @@ pub fn store_memory_embedding(
 
     match result {
         Ok(()) => { conn.execute("RELEASE store_memory_embedding", [])?; Ok(()) }
-        Err(e) => { let _ = conn.execute("ROLLBACK TO store_memory_embedding", []); Err(e) }
+        Err(e) => {
+            if let Err(rb) = conn.execute("ROLLBACK TO store_memory_embedding", []) {
+                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
+            }
+            Err(e)
+        }
     }
 }
 
