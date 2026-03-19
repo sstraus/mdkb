@@ -460,29 +460,11 @@ pub fn delete_entry(conn: &Connection, id: &str) -> Result<bool> {
 }
 
 /// List memory entries ordered by access count (most used first).
+/// List memory entries sorted by access count (most popular first).
+///
+/// This is a convenience wrapper around `list_entries_sorted` with `Popular` sort order.
 pub fn list_entries(conn: &Connection, limit: usize, status_filter: Option<EntryStatus>) -> Result<Vec<MemoryEntry>> {
-    let sql = if status_filter.is_some() {
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, source_type
-         FROM memory_entries WHERE status = ?1 ORDER BY access_count DESC LIMIT ?2"
-    } else {
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, source_type
-         FROM memory_entries ORDER BY access_count DESC LIMIT ?1"
-    };
-
-    let mut stmt = conn.prepare(sql)?;
-
-    let rows = if let Some(status) = status_filter {
-        stmt.query_map(params![status.to_string(), limit as i64], row_to_entry)?
-    } else {
-        stmt.query_map(params![limit as i64], row_to_entry)?
-    };
-
-    let mut entries = Vec::new();
-    for row in rows {
-        entries.push(row?);
-    }
-
-    Ok(entries)
+    list_entries_sorted(conn, limit, MemorySortOrder::Popular, status_filter)
 }
 
 /// Search memory entries using full-text search.
