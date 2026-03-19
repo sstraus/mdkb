@@ -114,9 +114,19 @@ pub fn init_vector_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
-    // Cleanup triggers: delete orphan embeddings when memory entries are deleted
+    // Cleanup triggers: delete orphan vector entries when parent rows are deleted.
+    // FK CASCADE handles `embeddings` and `document_chunks`, but sqlite-vec
+    // virtual tables don't support FK constraints, so we need explicit triggers.
     conn.execute_batch(
         r#"
+        CREATE TRIGGER IF NOT EXISTS documents_delete_vec AFTER DELETE ON documents BEGIN
+            DELETE FROM vec_documents WHERE document_id = OLD.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS chunks_delete_vec AFTER DELETE ON document_chunks BEGIN
+            DELETE FROM vec_chunks WHERE chunk_id = OLD.id;
+        END;
+
         CREATE TRIGGER IF NOT EXISTS memory_delete_embeddings AFTER DELETE ON memory_entries BEGIN
             DELETE FROM memory_embeddings WHERE memory_rowid = OLD.rowid;
             DELETE FROM vec_memory WHERE memory_rowid = OLD.rowid;
@@ -187,6 +197,8 @@ fn detect_embedding_dimension(conn: &Connection) -> Option<usize> {
 }
 
 /// Store embedding for a document.
+///
+/// Atomic: embeddings + vec_documents are kept in sync via transaction.
 pub fn store_embedding(
     conn: &Connection,
     document_id: i64,
@@ -194,35 +206,33 @@ pub fn store_embedding(
     model: &str,
 ) -> Result<()> {
     let now = chrono::Utc::now().timestamp();
-
-    // Convert to bytes for storage using zerocopy
     let embedding_bytes = embedding.as_bytes();
 
-    // Store in embeddings table
-    conn.execute(
-        r#"
-        INSERT OR REPLACE INTO embeddings (document_id, embedding, model, created_at)
-        VALUES (?1, ?2, ?3, ?4)
-        "#,
-        params![document_id, embedding_bytes, model, now],
-    )?;
+    conn.execute("SAVEPOINT store_embedding", [])?;
+    let result = (|| -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO embeddings (document_id, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![document_id, embedding_bytes, model, now],
+        )?;
 
-    // Store in vector index
-    // Note: sqlite-vec virtual tables don't support INSERT OR REPLACE,
-    // so we need to delete first then insert
-    conn.execute(
-        "DELETE FROM vec_documents WHERE document_id = ?1",
-        params![document_id],
-    )?;
-    conn.execute(
-        r#"
-        INSERT INTO vec_documents (document_id, embedding)
-        VALUES (?1, ?2)
-        "#,
-        params![document_id, embedding_bytes],
-    )?;
+        // sqlite-vec virtual tables don't support INSERT OR REPLACE
+        conn.execute("DELETE FROM vec_documents WHERE document_id = ?1", params![document_id])?;
+        conn.execute(
+            "INSERT INTO vec_documents (document_id, embedding) VALUES (?1, ?2)",
+            params![document_id, embedding_bytes],
+        )?;
+        Ok(())
+    })();
 
-    Ok(())
+    match result {
+        Ok(()) => { conn.execute("RELEASE store_embedding", [])?; Ok(()) }
+        Err(e) => {
+            if let Err(rb) = conn.execute("ROLLBACK TO store_embedding", []) {
+                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Get embedding for a document.
@@ -262,14 +272,13 @@ pub fn vector_search(
         "#,
     )?;
 
-    let results = stmt
+    let results: std::result::Result<Vec<_>, _> = stmt
         .query_map(params![embedding_bytes, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
         })?
-        .filter_map(|r| r.ok())
         .collect();
 
-    Ok(results)
+    Ok(results?)
 }
 
 /// Delete embedding for a document.
@@ -410,23 +419,11 @@ pub fn chunk_vector_search(
 }
 
 /// Delete all chunks and their embeddings for a document.
+///
+/// The `chunks_delete_vec` trigger automatically cleans up `vec_chunks`
+/// when `document_chunks` rows are deleted.
 pub fn delete_chunk_embeddings(conn: &Connection, document_id: i64) -> Result<()> {
-    // Get chunk IDs to delete from vec_chunks
-    let chunk_ids: Vec<i64> = {
-        let mut stmt = conn.prepare(
-            "SELECT id FROM document_chunks WHERE document_id = ?1",
-        )?;
-        stmt.query_map(params![document_id], |row| row.get(0))?
-            .filter_map(|r| r.ok())
-            .collect()
-    };
-
-    for chunk_id in &chunk_ids {
-        conn.execute("DELETE FROM vec_chunks WHERE chunk_id = ?1", params![chunk_id])?;
-    }
-
     conn.execute("DELETE FROM document_chunks WHERE document_id = ?1", params![document_id])?;
-
     Ok(())
 }
 
@@ -436,15 +433,24 @@ fn search_vec_chunks_by_doc(conn: &Connection, embedding_bytes: &[u8], limit: us
     let chunk_hits: Vec<(i64, f32)> = match conn.prepare(
         "SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
     ) {
-        Ok(mut stmt) => stmt
-            .query_map(params![embedding_bytes, limit as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
-            })
-            .map(|rows| rows.filter_map(|r| r.ok()).collect())
-            .unwrap_or_else(|e| {
-                tracing::warn!("vec_chunks query failed: {e}");
-                Vec::new()
-            }),
+        Ok(mut stmt) => {
+            let rows: std::result::Result<Vec<_>, _> = stmt
+                .query_map(params![embedding_bytes, limit as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
+                })
+                .map(|rows| rows.collect())
+                .unwrap_or_else(|e| {
+                    tracing::warn!("vec_chunks query failed: {e}");
+                    Ok(Vec::new())
+                });
+            match rows {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("vec_chunks row error: {e}");
+                    Vec::new()
+                }
+            }
+        }
         Err(e) => {
             tracing::warn!("Failed to prepare vec_chunks query: {e}");
             return Vec::new();
@@ -461,13 +467,15 @@ fn search_vec_chunks_by_doc(conn: &Connection, embedding_bytes: &[u8], limit: us
     let chunk_to_doc: std::collections::HashMap<i64, i64> = conn
         .prepare(&sql)
         .and_then(|mut stmt| {
-            let rows: Vec<(i64, i64)> = stmt
+            let rows: rusqlite::Result<Vec<(i64, i64)>> = stmt
                 .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                .filter_map(|r| r.ok())
                 .collect();
-            Ok(rows.into_iter().collect())
+            Ok(rows?.into_iter().collect())
         })
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            tracing::warn!("chunk_id→document_id resolution failed: {e}");
+            std::collections::HashMap::new()
+        });
 
     // Aggregate: best distance per document
     let mut best_per_doc: std::collections::HashMap<i64, f32> = std::collections::HashMap::new();
@@ -507,22 +515,31 @@ pub fn store_memory_embedding(
     let now = chrono::Utc::now().timestamp();
     let embedding_bytes = embedding.as_bytes();
 
-    conn.execute(
-        "INSERT OR REPLACE INTO memory_embeddings (memory_rowid, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![memory_rowid, embedding_bytes, model, now],
-    )?;
+    conn.execute("SAVEPOINT store_memory_embedding", [])?;
+    let result = (|| -> Result<()> {
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_embeddings (memory_rowid, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![memory_rowid, embedding_bytes, model, now],
+        )?;
 
-    // sqlite-vec doesn't support INSERT OR REPLACE
-    conn.execute(
-        "DELETE FROM vec_memory WHERE memory_rowid = ?1",
-        params![memory_rowid],
-    )?;
-    conn.execute(
-        "INSERT INTO vec_memory (memory_rowid, embedding) VALUES (?1, ?2)",
-        params![memory_rowid, embedding_bytes],
-    )?;
+        // sqlite-vec doesn't support INSERT OR REPLACE
+        conn.execute("DELETE FROM vec_memory WHERE memory_rowid = ?1", params![memory_rowid])?;
+        conn.execute(
+            "INSERT INTO vec_memory (memory_rowid, embedding) VALUES (?1, ?2)",
+            params![memory_rowid, embedding_bytes],
+        )?;
+        Ok(())
+    })();
 
-    Ok(())
+    match result {
+        Ok(()) => { conn.execute("RELEASE store_memory_embedding", [])?; Ok(()) }
+        Err(e) => {
+            if let Err(rb) = conn.execute("ROLLBACK TO store_memory_embedding", []) {
+                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Search for similar memory entries by vector.
@@ -537,14 +554,13 @@ pub fn memory_vector_search(
         "SELECT memory_rowid, distance FROM vec_memory WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
     )?;
 
-    let results = stmt
+    let results: std::result::Result<Vec<_>, _> = stmt
         .query_map(params![embedding_bytes, limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
         })?
-        .filter_map(|r| r.ok())
         .collect();
 
-    Ok(results)
+    Ok(results?)
 }
 
 /// Delete embedding for a memory entry.
@@ -1013,5 +1029,54 @@ mod tests {
         let results = chunk_vector_search(&conn, &test_embedding(0.49), 10).unwrap();
         assert_eq!(results.len(), 1, "Should fall back to doc-level search");
         assert_eq!(results[0].0, 1);
+    }
+
+    #[test]
+    fn test_delete_document_cascades_to_vec_documents() {
+        let conn = setup_db();
+        setup_doc(&conn, 1, "doc.md");
+
+        store_embedding(&conn, 1, &test_embedding(0.5), "test").unwrap();
+
+        // Verify embedding exists
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM vec_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "vec_documents should have 1 entry");
+
+        // Delete the document — should cascade to vec_documents
+        conn.execute("DELETE FROM documents WHERE id = 1", []).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM vec_documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "vec_documents should be empty after document delete");
+    }
+
+    #[test]
+    fn test_delete_document_cascades_to_vec_chunks() {
+        let conn = setup_db();
+        setup_doc(&conn, 1, "doc.md");
+
+        let chunks = vec![
+            crate::store::chunks::Chunk { index: 0, content: "A".into(), heading_path: None },
+            crate::store::chunks::Chunk { index: 1, content: "B".into(), heading_path: None },
+        ];
+        let embeddings = vec![test_embedding(0.1), test_embedding(0.2)];
+        store_chunk_embeddings(&conn, 1, &chunks, &embeddings, "test").unwrap();
+
+        // Verify chunks exist in vec_chunks
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2, "vec_chunks should have 2 entries");
+
+        // Delete the document — should cascade to vec_chunks via document_chunks
+        conn.execute("DELETE FROM documents WHERE id = 1", []).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "vec_chunks should be empty after document delete");
     }
 }

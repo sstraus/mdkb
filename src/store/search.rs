@@ -1,5 +1,6 @@
 //! FTS5 search operations.
 
+use std::collections::HashMap;
 use crate::domain::{IndexStatus, SearchQuery, SearchResult};
 use crate::error::Result;
 use rusqlite::{Connection, params};
@@ -51,80 +52,49 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
         "bm25(documents_fts)"
     };
 
-    // Build FTS5 query with optional collection filter
-    if let Some(ref collection) = query.collection {
-        let sql = format!(
-            r#"
-            SELECT d.id, d.collection, d.relative_path, d.title,
-                   {score_expr} as score,
-                   snippet(documents_fts, 1, '<b>', '</b>', '...', 32) as snippet,
-                   d.status
-            FROM documents_fts f
-            JOIN documents d ON d.id = f.rowid
-            WHERE documents_fts MATCH ?1 AND d.collection = ?2
-            {status_filter}
-            ORDER BY {score_expr}
-            LIMIT ?3
+    // Build FTS5 query with optional collection filter.
+    // Note: snippet() is not used because documents_fts is contentless (content='').
+    let (collection_clause, collection_param): (&str, Option<&str>) = match &query.collection {
+        Some(c) => ("AND d.collection = ?2", Some(c.as_str())),
+        None => ("", None),
+    };
+    let limit_param_idx = if collection_param.is_some() { "?3" } else { "?2" };
+
+    let sql = format!(
+        r#"
+        SELECT d.id, d.collection, d.relative_path, d.title,
+               {score_expr} as score, d.status
+        FROM documents_fts f
+        JOIN documents d ON d.id = f.rowid
+        WHERE documents_fts MATCH ?1 {collection_clause}
+        {status_filter}
+        ORDER BY score
+        LIMIT {limit_param_idx}
         "#
-        );
+    );
 
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            params![&fts_query, collection, query.limit as i64],
-            |row| {
-                let snippet: Option<String> = row.get(5)?;
-                let status: Option<String> = row.get(6)?;
-                Ok(SearchResult {
-                    id: row.get(0)?,
-                    collection: row.get(1)?,
-                    path: row.get(2)?,
-                    title: row.get(3)?,
-                    score: row.get(4)?,
-                    snippets: snippet.map(|s| vec![s]).unwrap_or_default(),
-                    status,
-                    superseded_by: None, // Populated later if needed
-                })
-            },
-        )?;
+    let mut stmt = conn.prepare(&sql)?;
+    let row_mapper = |row: &rusqlite::Row| {
+        Ok(SearchResult {
+            id: row.get(0)?,
+            collection: row.get(1)?,
+            path: row.get(2)?,
+            title: row.get(3)?,
+            score: row.get(4)?,
+            snippets: vec![],
+            status: row.get(5)?,
+            superseded_by: None,
+        })
+    };
 
-        for result in rows {
-            search_results.push(result?);
-        }
+    let rows = if let Some(coll) = collection_param {
+        stmt.query_map(params![&fts_query, coll, query.limit as i64], row_mapper)?
     } else {
-        let sql = format!(
-            r#"
-            SELECT d.id, d.collection, d.relative_path, d.title,
-                   {score_expr} as score,
-                   snippet(documents_fts, 1, '<b>', '</b>', '...', 32) as snippet,
-                   d.status
-            FROM documents_fts f
-            JOIN documents d ON d.id = f.rowid
-            WHERE documents_fts MATCH ?1
-            {status_filter}
-            ORDER BY {score_expr}
-            LIMIT ?2
-        "#
-        );
+        stmt.query_map(params![&fts_query, query.limit as i64], row_mapper)?
+    };
 
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![&fts_query, query.limit as i64], |row| {
-            let snippet: Option<String> = row.get(5)?;
-            let status: Option<String> = row.get(6)?;
-            Ok(SearchResult {
-                id: row.get(0)?,
-                collection: row.get(1)?,
-                path: row.get(2)?,
-                title: row.get(3)?,
-                score: row.get(4)?,
-                snippets: snippet.map(|s| vec![s]).unwrap_or_default(),
-                status,
-                superseded_by: None, // Populated later if needed
-            })
-        })?;
-
-        for result in rows {
-            search_results.push(result?);
-        }
+    for result in rows {
+        search_results.push(result?);
     }
 
     // If including superseded docs, populate the superseded_by field
@@ -137,25 +107,42 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
 
 /// Populate the superseded_by field for search results.
 fn populate_superseded_by(conn: &Connection, results: &mut [SearchResult]) -> Result<()> {
-    for result in results.iter_mut() {
-        if result.status.as_deref() == Some("superseded") {
-            // Find what document superseded this one
-            let superseding = conn.query_row(
-                r#"
-                SELECT d.relative_path
-                FROM evolution e
-                JOIN documents d ON d.id = e.source_doc_id
-                WHERE e.target_doc_id = ?1 AND e.relationship = 'supersedes'
-                ORDER BY e.created_at DESC
-                LIMIT 1
-            "#,
-                params![result.id],
-                |row| row.get(0),
-            );
+    let superseded_ids: Vec<i64> = results.iter()
+        .filter(|r| r.status.as_deref() == Some("superseded"))
+        .map(|r| r.id)
+        .collect();
 
-            if let Ok(path) = superseding {
-                result.superseded_by = Some(path);
-            }
+    if superseded_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Batch fetch: for each superseded doc, find the superseding doc's path
+    let placeholders: Vec<String> = (1..=superseded_ids.len()).map(|i| format!("?{i}")).collect();
+    let sql = format!(
+        r#"SELECT e.target_doc_id, d.relative_path
+           FROM evolution e
+           JOIN documents d ON d.id = e.source_doc_id
+           WHERE e.target_doc_id IN ({}) AND e.relationship = 'supersedes'
+           ORDER BY e.created_at DESC"#,
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::ToSql> = superseded_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    // First entry per target_doc_id wins (ORDER BY created_at DESC)
+    let mut superseded_map = HashMap::new();
+    for row in rows {
+        let (target_id, path) = row?;
+        superseded_map.entry(target_id).or_insert(path);
+    }
+
+    for result in results.iter_mut() {
+        if let Some(path) = superseded_map.remove(&result.id) {
+            result.superseded_by = Some(path);
         }
     }
     Ok(())
@@ -289,6 +276,7 @@ mod tests {
                 metadata: None,
                 file_modified_at: now,
                 indexed_at: now,
+                status: None,
             };
             index_document(&conn, &doc, content).unwrap();
         }
@@ -379,6 +367,7 @@ mod tests {
             metadata: None,
             file_modified_at: now,
             indexed_at: now,
+            status: None,
         };
         index_document(&conn, &doc, "A note about Rust").unwrap();
 
@@ -486,6 +475,7 @@ mod tests {
             metadata: None,
             file_modified_at: now,
             indexed_at: now,
+            status: None,
         };
         index_document(&conn, &doc, "Old Rust programming guide, now superseded.").unwrap();
 
@@ -527,6 +517,7 @@ mod tests {
             metadata: None,
             file_modified_at: now,
             indexed_at: now,
+            status: None,
         };
         index_document(&conn, &doc, "Old Rust programming guide, now superseded.").unwrap();
 
@@ -568,6 +559,7 @@ mod tests {
             metadata: None,
             file_modified_at: now,
             indexed_at: now,
+            status: None,
         };
         index_document(&conn, &doc, "Old Rust programming guide.").unwrap();
 

@@ -200,6 +200,7 @@ mod tests {
             metadata: None,
             file_modified_at: 1234567890,
             indexed_at: 1234567890,
+            status: None,
         };
 
         let id = store.index_document(&doc, "# Test\n\nContent").unwrap();
@@ -226,6 +227,7 @@ mod tests {
             metadata: None,
             file_modified_at: 0,
             indexed_at: 0,
+            status: None,
         };
 
         let id = store.index_document(&doc, "content").unwrap();
@@ -250,6 +252,7 @@ mod tests {
                 metadata: None,
                 file_modified_at: 0,
                 indexed_at: 0,
+                status: None,
             };
             store.index_document(&doc, &format!("content {i}")).unwrap();
         }
@@ -263,6 +266,7 @@ mod tests {
             metadata: None,
             file_modified_at: 0,
             indexed_at: 0,
+            status: None,
         };
         store.index_document(&doc, "other content").unwrap();
 

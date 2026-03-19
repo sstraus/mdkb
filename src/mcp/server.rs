@@ -270,22 +270,36 @@ impl McpServer {
             // Try numeric ID
             if let Ok(numeric_id) = id.parse::<i64>() {
                 if let Ok(Some(doc)) = documents::get_document(&ctx.conn, numeric_id) {
-                    if let Ok(content) = self.get_document_content(ctx, &doc, lines) {
-                        let title = doc.title.as_deref().unwrap_or("(untitled)");
-                        output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
-                        found += 1;
-                        continue;
+                    match self.get_document_content(ctx, &doc, lines) {
+                        Ok(content) => {
+                            let title = doc.title.as_deref().unwrap_or("(untitled)");
+                            output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
+                            found += 1;
+                            continue;
+                        }
+                        Err(e) => {
+                            output.push_str(&format!("=== [{}] {} ===\nContent error: {}\n\n", doc.id, doc.relative_path, e));
+                            found += 1;
+                            continue;
+                        }
                     }
                 }
             }
 
             // Try path resolution
             if let Ok(doc) = resolve_document(&ctx.conn, id) {
-                if let Ok(content) = self.get_document_content(ctx, &doc, lines) {
-                    let title = doc.title.as_deref().unwrap_or("(untitled)");
-                    output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
-                    found += 1;
-                    continue;
+                match self.get_document_content(ctx, &doc, lines) {
+                    Ok(content) => {
+                        let title = doc.title.as_deref().unwrap_or("(untitled)");
+                        output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
+                        found += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        output.push_str(&format!("=== [{}] {} ===\nContent error: {}\n\n", doc.id, doc.relative_path, e));
+                        found += 1;
+                        continue;
+                    }
                 }
             }
 
@@ -504,9 +518,14 @@ impl McpServer {
                     (output, tokens, results.len())
                 }
                 Some("memory") => {
-                    let query_embedding = crate::llm::get_cached_service()
-                        .ok()
-                        .and_then(|s| s.embed_query(&params.query).ok());
+                    let query_embedding = match crate::llm::get_cached_service()
+                        .and_then(|s| s.embed_query(&params.query)) {
+                        Ok(emb) => Some(emb),
+                        Err(e) => {
+                            tracing::warn!("Memory search falling back to BM25-only: {e}");
+                            None
+                        }
+                    };
                     let entries = memory::search_entries_hybrid(
                         &ctx.conn,
                         &params.query,
@@ -529,9 +548,14 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-                    let query_embedding = crate::llm::get_cached_service()
-                        .ok()
-                        .and_then(|s| s.embed_query(&params.query).ok());
+                    let query_embedding = match crate::llm::get_cached_service()
+                        .and_then(|s| s.embed_query(&params.query)) {
+                        Ok(emb) => Some(emb),
+                        Err(e) => {
+                            tracing::warn!("Memory search falling back to BM25-only: {e}");
+                            None
+                        }
+                    };
                     let mem_entries = memory::search_entries_hybrid(
                         &ctx.conn,
                         &params.query,

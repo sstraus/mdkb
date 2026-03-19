@@ -89,24 +89,21 @@ pub fn lost_in_middle_reorder<T>(items: &mut Vec<T>) {
     items.extend(back);
 }
 
-/// Normalize scores to [0, 1] range.
+/// Normalize scores to [0, 1] range using max-normalization.
+///
+/// Divides all scores by the maximum observed score, preserving relative
+/// differences between entries. This avoids the min-max problem where
+/// single-source results get their differences artificially amplified.
 pub fn normalize_scores(scores: &mut [(i64, f64)]) {
     if scores.is_empty() {
         return;
     }
 
     let max = scores.iter().map(|(_, s)| *s).fold(0.0_f64, f64::max);
-    let min = scores.iter().map(|(_, s)| *s).fold(f64::MAX, f64::min);
-    let range = max - min;
 
-    if range > 0.0 {
+    if max > 0.0 {
         for (_, score) in scores.iter_mut() {
-            *score = (*score - min) / range;
-        }
-    } else {
-        // All scores are equal, normalize to 1.0
-        for (_, score) in scores.iter_mut() {
-            *score = 1.0;
+            *score /= max;
         }
     }
 }
@@ -197,9 +194,10 @@ mod tests {
 
         normalize_scores(&mut scores);
 
-        // Highest should be 1.0, lowest 0.0
+        // Highest should be 1.0, others proportional (max-normalization)
         assert!((scores.iter().find(|(id, _)| *id == 1).unwrap().1 - 1.0).abs() < 0.001);
-        assert!((scores.iter().find(|(id, _)| *id == 2).unwrap().1 - 0.0).abs() < 0.001);
+        assert!((scores.iter().find(|(id, _)| *id == 2).unwrap().1 - 0.5).abs() < 0.001);
+        assert!((scores.iter().find(|(id, _)| *id == 3).unwrap().1 - 0.75).abs() < 0.001);
     }
 
     #[test]
@@ -307,8 +305,8 @@ mod tests {
 
         // Highest original score should become 1.0
         assert!((scores[0].1 - 1.0).abs() < 0.001);
-        // Lowest original score should become 0.0
-        assert!((scores[2].1 - 0.0).abs() < 0.001);
+        // Lowest original score (0.01) should become 0.01/0.05 = 0.2
+        assert!((scores[2].1 - 0.2).abs() < 0.001);
     }
 
     #[test]

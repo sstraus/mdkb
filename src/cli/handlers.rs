@@ -278,10 +278,16 @@ pub fn handle_hybrid_search(
     };
     let bm25_results = search::search(&ctx.conn, &bm25_query)?;
 
-    // Use cached service to avoid reloading
-    let service = crate::llm::get_cached_service()?;
-    let query_embedding = service.embed_query(query_text)?;
-    let vector_results = vectors::chunk_vector_search(&ctx.conn, &query_embedding, limit * 2)?;
+    // Vector search — falls back to BM25-only if embedding service is unavailable
+    let vector_results = match crate::llm::get_cached_service()
+        .and_then(|s| s.embed_query(query_text))
+    {
+        Ok(query_embedding) => vectors::chunk_vector_search(&ctx.conn, &query_embedding, limit * 2)?,
+        Err(e) => {
+            tracing::debug!("Hybrid search falling back to BM25-only: {e}");
+            Vec::new()
+        }
+    };
 
     // Fuse results using RRF
     let config = hybrid::HybridConfig::default();
@@ -294,9 +300,12 @@ pub fn handle_hybrid_search(
         return Ok(Vec::new());
     }
 
-    // Batch retrieve all documents in a single query (fixes N+1 query pattern)
+    // Batch retrieve all documents in a single query (includes status)
     let doc_ids: Vec<i64> = fused.iter().map(|(id, _)| *id).collect();
     let docs = documents::get_documents_batch(&ctx.conn, &doc_ids)?;
+
+    // Build BM25 lookup for superseded_by metadata
+    let bm25_map: HashMap<i64, &SearchResult> = bm25_results.iter().map(|r| (r.id, r)).collect();
 
     // Build a map for quick lookup
     let doc_map: std::collections::HashMap<i64, _> = docs.into_iter().map(|d| (d.id, d)).collect();
@@ -314,6 +323,15 @@ pub fn handle_hybrid_search(
                 continue;
             }
 
+            // Filter superseded/retracted documents (vector search doesn't filter by status)
+            if !include_superseded {
+                if matches!(doc.status.as_deref(), Some("superseded" | "retracted")) {
+                    continue;
+                }
+            }
+
+            // Populate superseded_by from BM25 results if available
+            let bm25 = bm25_map.get(&doc_id);
             results.push(SearchResult {
                 id: doc.id,
                 collection: doc.collection.clone(),
@@ -321,8 +339,8 @@ pub fn handle_hybrid_search(
                 title: doc.title.clone(),
                 score,
                 snippets: vec![],
-                status: None, // Will be populated from BM25 results if available
-                superseded_by: None,
+                status: doc.status.clone(),
+                superseded_by: bm25.and_then(|r| r.superseded_by.clone()),
             });
 
             // Stop once we have enough results
@@ -694,6 +712,7 @@ fn update_collection(
             metadata: parsed.frontmatter.clone(),
             file_modified_at: file_mtime,
             indexed_at: now,
+            status: None,
         };
 
         // Use in-transaction version since we're inside a transaction
@@ -3002,6 +3021,7 @@ pub fn handle_session_index(
                 metadata: None,
                 file_modified_at: file_mtime,
                 indexed_at: now,
+                status: None,
             };
 
             documents::index_document_in_tx(&ctx.conn, &doc, &sdoc.content)?;

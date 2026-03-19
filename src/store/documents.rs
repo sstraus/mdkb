@@ -72,16 +72,17 @@ fn index_document_inner(conn: &Connection, doc: &Document, content: &str) -> Res
         }))
         .transpose()?;
 
-    // Check if document already exists
-    let existing_id: Option<i64> = conn
+    // Check if document already exists (fetch id + hash in one query)
+    let existing: Option<(i64, String)> = conn
         .query_row(
-            "SELECT id FROM documents WHERE collection = ?1 AND relative_path = ?2",
+            "SELECT id, hash FROM documents WHERE collection = ?1 AND relative_path = ?2",
             params![doc.collection, doc.relative_path],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
 
-    if let Some(id) = existing_id {
+    if let Some((id, old_hash)) = existing {
+
         // Update existing document
         conn.execute(
             "UPDATE documents SET hash = ?1, title = ?2, metadata = ?3, file_modified_at = ?4, indexed_at = ?5 WHERE id = ?6",
@@ -94,6 +95,18 @@ fn index_document_inner(conn: &Connection, doc: &Document, content: &str) -> Res
                 id,
             ],
         )?;
+
+        // Invalidate stale embeddings when content changes so they get regenerated
+        if old_hash != hash {
+            use crate::store::vectors;
+            if let Err(e) = vectors::delete_embedding(conn, id) {
+                tracing::warn!("Failed to invalidate doc embedding for id={id}: {e}");
+            }
+            if let Err(e) = vectors::delete_chunk_embeddings(conn, id) {
+                tracing::warn!("Failed to invalidate chunk embeddings for id={id}: {e}");
+            }
+        }
+
         Ok(id)
     } else {
         // Insert new document
@@ -130,7 +143,7 @@ fn store_content_inner(conn: &Connection, content: &str) -> Result<String> {
 pub fn get_document(conn: &Connection, id: i64) -> Result<Option<Document>> {
     let result = conn
         .query_row(
-            "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at FROM documents WHERE id = ?1",
+            "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at, status FROM documents WHERE id = ?1",
             params![id],
             |row| {
                 let metadata_str: Option<String> = row.get(5)?;
@@ -145,6 +158,7 @@ pub fn get_document(conn: &Connection, id: i64) -> Result<Option<Document>> {
                     metadata,
                     file_modified_at: row.get(6)?,
                     indexed_at: row.get(7)?,
+                    status: row.get(8)?,
                 })
             },
         )
@@ -160,7 +174,7 @@ pub fn get_document_by_path(
 ) -> Result<Option<Document>> {
     let result = conn
         .query_row(
-            "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at FROM documents WHERE collection = ?1 AND relative_path = ?2",
+            "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at, status FROM documents WHERE collection = ?1 AND relative_path = ?2",
             params![collection, path],
             |row| {
                 let metadata_str: Option<String> = row.get(5)?;
@@ -175,6 +189,7 @@ pub fn get_document_by_path(
                     metadata,
                     file_modified_at: row.get(6)?,
                     indexed_at: row.get(7)?,
+                    status: row.get(8)?,
                 })
             },
         )
@@ -191,7 +206,7 @@ pub fn delete_document(conn: &Connection, id: i64) -> Result<bool> {
 /// List all documents in a collection.
 pub fn list_documents(conn: &Connection, collection: &str) -> Result<Vec<Document>> {
     let mut stmt = conn.prepare(
-        "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at FROM documents WHERE collection = ?1",
+        "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at, status FROM documents WHERE collection = ?1",
     )?;
 
     let rows = stmt.query_map(params![collection], |row| {
@@ -206,6 +221,7 @@ pub fn list_documents(conn: &Connection, collection: &str) -> Result<Vec<Documen
             metadata,
             file_modified_at: row.get(6)?,
             indexed_at: row.get(7)?,
+            status: row.get(8)?,
         })
     })?;
 
@@ -225,7 +241,7 @@ pub fn get_documents_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<Documen
     // Build parameterized query with placeholders
     let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
     let query = format!(
-        "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at \
+        "SELECT id, collection, relative_path, hash, title, metadata, file_modified_at, indexed_at, status \
          FROM documents WHERE id IN ({})",
         placeholders.join(", ")
     );
@@ -245,6 +261,7 @@ pub fn get_documents_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<Documen
             metadata,
             file_modified_at: row.get(6)?,
             indexed_at: row.get(7)?,
+            status: row.get(8)?,
         })
     })?;
 
@@ -253,6 +270,35 @@ pub fn get_documents_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<Documen
         documents.push(row?);
     }
     Ok(documents)
+}
+
+/// Get document statuses by ID in a single batch query.
+pub fn get_statuses_batch(conn: &Connection, ids: &[i64]) -> Result<std::collections::HashMap<i64, Option<String>>> {
+    use std::collections::HashMap;
+
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
+    let query = format!(
+        "SELECT id, status FROM documents WHERE id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut stmt = conn.prepare(&query)?;
+    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+
+    let rows = stmt.query_map(params.as_slice(), |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+
+    let mut map = HashMap::new();
+    for row in rows {
+        let (id, status) = row?;
+        map.insert(id, status);
+    }
+    Ok(map)
 }
 
 /// Get multiple content entries by their hashes in a single query (fixes N+1 query pattern).
@@ -350,6 +396,7 @@ mod tests {
             metadata: None,
             file_modified_at: now,
             indexed_at: now,
+            status: None,
         }
     }
 
