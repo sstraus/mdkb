@@ -834,7 +834,10 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
 /// Parse a MemoryEntry from a row with a column offset (for queries that prepend extra columns).
 fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<MemoryEntry> {
     let tags_json: String = row.get(off + 4)?;
-    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+    let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_else(|e| {
+        tracing::warn!("Failed to deserialize tags, defaulting to empty: {e}");
+        Vec::new()
+    });
     let entry_type_str: String = row.get(off + 3)?;
     let status_str: String = row.get(off + 5)?;
     let source_type_str: String = row.get::<_, Option<String>>(off + 15)?.unwrap_or_default();
@@ -843,9 +846,15 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
         id: row.get(off)?,
         title: row.get(off + 1)?,
         content: row.get(off + 2)?,
-        entry_type: entry_type_str.parse().unwrap_or(EntryType::Topic),
+        entry_type: entry_type_str.parse().unwrap_or_else(|_| {
+            tracing::warn!("Unknown entry_type '{}', defaulting to Topic", entry_type_str);
+            EntryType::Topic
+        }),
         tags,
-        status: status_str.parse().unwrap_or(EntryStatus::Active),
+        status: status_str.parse().unwrap_or_else(|_| {
+            tracing::warn!("Unknown status '{}', defaulting to Active", status_str);
+            EntryStatus::Active
+        }),
         created_at: row.get(off + 6)?,
         updated_at: row.get(off + 7)?,
         superseded_by: row.get(off + 8)?,

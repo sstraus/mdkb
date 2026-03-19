@@ -518,9 +518,14 @@ impl McpServer {
                     (output, tokens, results.len())
                 }
                 Some("memory") => {
-                    let query_embedding = crate::llm::get_cached_service()
-                        .ok()
-                        .and_then(|s| s.embed_query(&params.query).ok());
+                    let query_embedding = match crate::llm::get_cached_service()
+                        .and_then(|s| s.embed_query(&params.query)) {
+                        Ok(emb) => Some(emb),
+                        Err(e) => {
+                            tracing::warn!("Memory search falling back to BM25-only: {e}");
+                            None
+                        }
+                    };
                     let entries = memory::search_entries_hybrid(
                         &ctx.conn,
                         &params.query,
@@ -543,9 +548,14 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-                    let query_embedding = crate::llm::get_cached_service()
-                        .ok()
-                        .and_then(|s| s.embed_query(&params.query).ok());
+                    let query_embedding = match crate::llm::get_cached_service()
+                        .and_then(|s| s.embed_query(&params.query)) {
+                        Ok(emb) => Some(emb),
+                        Err(e) => {
+                            tracing::warn!("Memory search falling back to BM25-only: {e}");
+                            None
+                        }
+                    };
                     let mem_entries = memory::search_entries_hybrid(
                         &ctx.conn,
                         &params.query,
