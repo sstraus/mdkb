@@ -227,7 +227,7 @@ impl Default for CodeIndexingConfig {
 impl Default for CodeSemanticSearchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             model: DEFAULT_CODE_SEMANTIC_MODEL.to_string(),
             threshold: DEFAULT_CODE_SEMANTIC_THRESHOLD,
         }
@@ -793,7 +793,7 @@ default_limit = 20
         assert_eq!(config.code.indexing.batch_size, 500);
         assert!(!config.code.indexing.ignore_patterns.is_empty());
         assert!(config.code.indexing.ignore_patterns.contains(&"**/target/**".to_string()));
-        assert!(!config.code.semantic_search.enabled);
+        assert!(config.code.semantic_search.enabled);
         assert_eq!(config.code.semantic_search.model, "AllMiniLML6V2");
     }
 

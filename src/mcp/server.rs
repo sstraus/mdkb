@@ -604,6 +604,12 @@ impl McpServer {
                         };
 
                         if scope == Some("code") {
+                            // Check if semantic search is enabled
+                            if !self.full_config.code.semantic_search.enabled {
+                                return Err(mcp_error(
+                                    "Semantic code search is disabled. Enable it in mdkb.toml: [code.semantic_search] enabled = true, then re-index.".to_string(),
+                                ));
+                            }
                             // Semantic search (embedding similarity)
                             // Cap at 5 to avoid flooding context with low-quality matches
                             let code_limit = params.limit.min(5);
@@ -1826,7 +1832,7 @@ const BASE_INSTRUCTIONS: &str = "\
 |---|---|
 | Any search (docs, memory, bugs, decisions) | `search(query)` |
 | Find symbol by name/kind | `search(query, scope=\"symbols\")` |
-| Semantic code search | `search(query, scope=\"code\")` |
+| Semantic code search (requires embeddings) | `search(query, scope=\"code\")` |
 | Call graph / impact analysis | `code_graph(name)` |
 | Exact text pattern (last resort) | Grep |
 | Browse memories | `memory_list()` |
