@@ -1,0 +1,23 @@
+src/watcher/mod.rs
+  85bd9a3d45a1a2eb 74-75,122-127,130,140-142,147-148,154,160,164-165,171-173,176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "db5ca50472545ffcd0d810582e9024e25bfc2a55",
+  "prompts": {
+    "85bd9a3d45a1a2eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "350327f9-77b1-4d12-887a-8725fc6aee42",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 29,
+      "total_deletions": 18,
+      "accepted_lines": 23,
+      "overriden_lines": 0
+    }
+  }
+}
