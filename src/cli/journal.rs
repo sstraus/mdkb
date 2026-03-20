@@ -216,7 +216,7 @@ pub fn journal_to_memory_entries(
                 last_accessed: None,
                 source_path: Some(source.clone()),
                 confirmations: 0,
-                corrections: 0,
+
                 last_confirmed_at: None,
                 source_type: SourceType::UserStatement,
             });
@@ -246,7 +246,6 @@ pub fn journal_to_memory_entries(
             last_accessed: None,
             source_path: Some(source.clone()),
             confirmations: 0,
-            corrections: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         });
@@ -275,7 +274,6 @@ pub fn journal_to_memory_entries(
             last_accessed: None,
             source_path: Some(source.clone()),
             confirmations: 0,
-            corrections: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         });
@@ -312,7 +310,6 @@ pub fn journal_to_memory_entries(
             last_accessed: None,
             source_path: Some(source.clone()),
             confirmations: 0,
-            corrections: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         });

@@ -784,8 +784,8 @@ impl McpServer {
                 })
                 .unwrap_or_else(|| "never".to_string());
             let conf_line = format!(
-                "Confidence: {:.2} ({}↑ {}↓, confirmed {}, source: {})",
-                conf, entry.confirmations, entry.corrections, last_conf, entry.source_type
+                "Confidence: {:.2} ({}↑, confirmed {}, source: {})",
+                conf, entry.confirmations, last_conf, entry.source_type
             );
 
             // Revision history summary
@@ -1065,7 +1065,6 @@ impl McpServer {
                     last_accessed: None,
                     source_path: None,
                     confirmations: 0,
-                    corrections: 0,
                     last_confirmed_at: None,
                     source_type,
                 };

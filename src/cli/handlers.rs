@@ -1101,7 +1101,7 @@ pub fn handle_memory_add(
         last_accessed: None,
         source_path: None,
         confirmations: 0,
-        corrections: 0,
+
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
     };
@@ -1299,7 +1299,7 @@ pub fn handle_memory_import(
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
+    
             last_confirmed_at: None,
             source_type,
         };
