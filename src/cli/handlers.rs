@@ -2397,6 +2397,34 @@ mod tests {
         assert_eq!(result.added, 2);
     }
 
+    #[test]
+    fn test_handle_update_indexes_gitignored_collection() {
+        let temp = setup_temp_dir();
+
+        // Initialize git repo so .gitignore is respected by git-aware tools
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(temp.path())
+            .output()
+            .expect("git init");
+
+        // Create stories/ dir with content, then gitignore it
+        let stories_dir = temp.path().join("stories");
+        std::fs::create_dir(&stories_dir).unwrap();
+        std::fs::write(stories_dir.join("001-done.md"), "# Story 1\n\nCompleted work").unwrap();
+        std::fs::write(stories_dir.join("002-done.md"), "# Story 2\n\nMore work").unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "stories/\n").unwrap();
+
+        // Init mdkb and manually register collection (as wiz would do)
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+        handle_collection_add(&ctx, "stories", "stories", "**/*.md").unwrap();
+
+        // Update should index both files despite gitignore
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(result.added, 2, "gitignored directory should still be indexed by collection walker");
+    }
+
     // ==================== Mget Tests ====================
 
     #[test]
