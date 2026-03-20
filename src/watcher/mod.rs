@@ -71,8 +71,8 @@ impl FileWatcher {
                             kind: ChangeKind::CreateOrModify,
                         };
 
-                        // Non-blocking send, drop if channel is full
-                        let _ = tx.blocking_send(change);
+                        // Non-blocking send from non-tokio thread, drop if channel is full
+                        let _ = tx.try_send(change);
                     }
                 }
             },
@@ -119,10 +119,15 @@ mod tests {
     use tokio::time::timeout;
 
     fn setup_temp_dir() -> TempDir {
-        tempfile::tempdir().expect("failed to create temp dir")
+        // On macOS, /tmp is a symlink to /private/tmp. FSEvents reports canonical paths,
+        // so the watcher must use a canonical (non-symlinked) base dir.
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        tempfile::tempdir_in(base).expect("failed to create temp dir")
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_watcher_detects_file_creation() {
         let temp = setup_temp_dir();
         let config = WatcherConfig { debounce_ms: 50 };
@@ -132,37 +137,43 @@ mod tests {
             .watch(&temp.path().to_path_buf())
             .expect("watch should succeed");
 
+        // Give FSEvents time to register the watch (macOS is async)
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         // Create a file
         let file_path = temp.path().join("test.md");
         fs::write(&file_path, "# Test").expect("write should succeed");
 
-        // Wait for event with timeout
-        let result = timeout(Duration::from_secs(2), watcher.recv()).await;
+        // FSEvents on macOS can be slow under load
+        let result = timeout(Duration::from_secs(5), watcher.recv()).await;
         assert!(result.is_ok(), "Should receive event within timeout");
         let event = result.unwrap();
         assert!(event.is_some(), "Should receive a file change event");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_watcher_detects_file_modification() {
         let temp = setup_temp_dir();
         let config = WatcherConfig { debounce_ms: 50 };
         let mut watcher = FileWatcher::new(config).expect("watcher creation should succeed");
 
-        // Create file first
+        // Create file before watching to avoid catching the create event
         let file_path = temp.path().join("test.md");
         fs::write(&file_path, "# Original").expect("write should succeed");
+
+        // Small delay so FS timestamps differ
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         watcher
             .watch(&temp.path().to_path_buf())
             .expect("watch should succeed");
 
-        // Wait a bit then modify
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        // Give FSEvents time to register the watch
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
         fs::write(&file_path, "# Modified").expect("write should succeed");
 
-        // Wait for event
-        let result = timeout(Duration::from_secs(2), watcher.recv()).await;
+        let result = timeout(Duration::from_secs(5), watcher.recv()).await;
         assert!(result.is_ok(), "Should receive event within timeout");
     }
 
