@@ -99,6 +99,19 @@ Memory entries persist AI knowledge across sessions — decisions, patterns, sol
 
 Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices).
 
+Source types control confidence weighting:
+
+| Source Type | Multiplier | Use Case |
+|-------------|-----------|----------|
+| `official_docs` | 1.0 | Verified documentation |
+| `user_statement` | 0.85 | Human-stated facts (default) |
+| `auto_extracted` | 0.70 | Automated knowledge capture |
+| `inference` | 0.65 | AI-inferred knowledge |
+
+### Revision History
+
+Manual entries (`user_statement`, `official_docs`) track up to 3 revision diffs. When `get(id)` shows "History: N revisions (dates)", use `get(id, format="history")` to view diffs.
+
 ## Code Intelligence
 
 mdkb indexes source code with tree-sitter parsers for **13 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, and GDScript.
@@ -174,7 +187,31 @@ mdkb memory show auth-patterns
 mdkb memory list
 mdkb memory search "authentication"
 mdkb memory warmup                # Compact index for session start
+mdkb memory history auth-patterns # View revision diffs
+mdkb memory import entries.json   # Import from JSON file
+mdkb memory import entries.json --dry-run --skip-duplicates
 ```
+
+### Memory Import
+
+Bulk-import entries from a JSON file:
+
+```json
+{
+  "entries": [
+    {
+      "id": "use-postgresql",
+      "title": "Use PostgreSQL for sessions",
+      "content": "Context: needed session storage...",
+      "entryType": "decision",
+      "tags": ["database"],
+      "sourceType": "auto_extracted"
+    }
+  ]
+}
+```
+
+Fields `createdAt`/`updatedAt` are optional (default: now). Use `--dry-run` to preview, `--skip-duplicates` to skip existing IDs silently.
 
 ## Configuration
 

@@ -20,7 +20,7 @@ use mdkb::cli::handlers::{
     handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end, handle_experiment_list,
     handle_experiment_status, handle_get, handle_history, handle_hybrid_search, handle_init, handle_memory_add,
-    handle_memory_list, handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show,
+    handle_memory_import, handle_memory_list, handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show,
     handle_memory_warmup, handle_metrics_export, handle_metrics_latency, handle_metrics_show,
     handle_mget, handle_session_index, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
@@ -325,6 +325,35 @@ async fn main() -> Result<()> {
                         println!("Deleted memory entry '{id}'");
                     } else {
                         println!("Memory entry '{id}' not found");
+                    }
+                }
+                MemoryCommand::History { id } => {
+                    let revisions = mdkb::store::memory::get_revisions(&ctx.conn, &id)?;
+                    if revisions.is_empty() {
+                        println!("No revision history for '{id}'");
+                    } else {
+                        println!("Revision history for '{}' ({} revision{}):\n",
+                            id, revisions.len(), if revisions.len() == 1 { "" } else { "s" });
+                        for (i, rev) in revisions.iter().enumerate() {
+                            let date = chrono::DateTime::<chrono::Utc>::from_timestamp(rev.created_at, 0)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            println!("--- Revision {} ({}) ---\n{}\n", i + 1, date, rev.diff);
+                        }
+                    }
+                }
+                MemoryCommand::Import { path, dry_run, skip_duplicates } => {
+                    let result = handle_memory_import(&ctx, &path, dry_run, skip_duplicates)?;
+                    if dry_run {
+                        println!("Dry run: would import {} entries", result.imported);
+                    } else {
+                        println!("Imported {} entries", result.imported);
+                    }
+                    if result.skipped > 0 {
+                        println!("Skipped {} duplicates", result.skipped);
+                    }
+                    for err in &result.errors {
+                        eprintln!("Error: {err}");
                     }
                 }
                 MemoryCommand::Prune { days, dry_run } => {

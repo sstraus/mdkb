@@ -1207,7 +1207,7 @@ fn test_memory_complete_workflow() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
     };
 
     let entry2 = memory::MemoryEntry {
@@ -1222,7 +1222,7 @@ fn test_memory_complete_workflow() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
     };
 
     memory::add_entry(&env.ctx.conn, &entry1).expect("Failed to add entry1");
@@ -1314,7 +1314,7 @@ fn test_memory_stats_integration() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
     };
     memory::add_entry(&env.ctx.conn, &entry).expect("Failed to add entry");
 
@@ -1371,7 +1371,7 @@ fn test_memory_index_persistence() {
             superseded_by: None,
             access_count: i as u64,
             last_accessed: if i > 0 { Some(now) } else { None },
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
         };
         memory::add_entry(&env.ctx.conn, &entry).expect("Failed to add entry");
     }
@@ -1427,7 +1427,7 @@ fn test_memory_condense_finds_related() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
     };
 
     // Entry 2: auth + jwt
@@ -1443,7 +1443,7 @@ fn test_memory_condense_finds_related() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
     };
 
     // Entry 3: auth + jwt
@@ -1459,7 +1459,7 @@ fn test_memory_condense_finds_related() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
     };
 
     // Entry 4: different tags (should not be grouped)
@@ -1475,7 +1475,7 @@ fn test_memory_condense_finds_related() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
     };
 
     mdkb::store::memory::add_entry(&ctx.conn, &e1).expect("add e1");
@@ -1525,7 +1525,7 @@ fn test_memory_condense_dry_run() {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
         };
         mdkb::store::memory::add_entry(&ctx.conn, &entry).expect("add entry");
     }
@@ -1579,7 +1579,7 @@ fn test_memory_condense_creates_merged_entry() {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
-            source_path: None, confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
         };
         mdkb::store::memory::add_entry(&ctx.conn, &entry).expect("add entry");
     }

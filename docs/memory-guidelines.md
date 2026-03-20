@@ -164,6 +164,32 @@ Use 2-5 tags per entry:
 - **Technology tags**: `rust`, `sqlite`, `tokio`
 - **Severity tags**: `critical`, `minor` (for problems)
 
+## Source Types
+
+Control how much weight a memory entry gets in confidence scoring:
+
+| Source Type | Multiplier | When to Use |
+|-------------|-----------|-------------|
+| `official_docs` | 1.0 | Verified documentation, official sources |
+| `user_statement` | 0.85 | Human-stated facts (default) |
+| `auto_extracted` | 0.70 | Automated capture from worklogs, CI, tooling |
+| `inference` | 0.65 | AI-inferred knowledge, uncertain conclusions |
+
+Set via the `source_type` parameter on `memory_write`.
+
+## Revision History
+
+Manual entries (`user_statement`, `official_docs`) automatically track up to 3 revision diffs. Automated entries (`auto_extracted`, `inference`) do not track revisions.
+
+When viewing an entry with `get(id)`, the output includes a history line if revisions exist:
+```
+History: 2 revisions (2026-03-15, 2026-03-20)
+```
+
+To view the actual diffs, use `get(id, format="history")`. This returns compact unified diffs — use it to understand how knowledge evolved over time.
+
+CLI equivalent: `mdkb memory history <id>`
+
 ## Memory Search vs Memory Index
 
 - **Warmup index** (`memory_list`): Top 50 entries by usage. Check this first.

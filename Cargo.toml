@@ -1,6 +1,6 @@
 [package]
 name = "mdkb"
-version = "0.9.0"
+version = "1.0.0"
 edition = "2024"
 description = "Local markdown knowledge base with semantic search"
 license = "MIT"
@@ -57,6 +57,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Allocator (M-USE-ALLOCATOR-OPTIMIZED)
 mimalloc = "0.1"
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
+
+# Text diffing (memory revision history)
+similar = "2"
 
 # Utilities
 sha2 = "0.10"

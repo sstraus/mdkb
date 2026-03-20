@@ -745,6 +745,29 @@ impl McpServer {
 
         // Try memory slug
         if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+            // History format: return revision diffs instead of content
+            if params.format.as_deref() == Some("history") {
+                let revisions = memory::get_revisions(&ctx.conn, &entry.id)
+                    .unwrap_or_default();
+                let output = if revisions.is_empty() {
+                    format!("No revision history for '{}'", entry.id)
+                } else {
+                    let mut parts = vec![format!("# Revision history for '{}' ({} revision{})\n",
+                        entry.id, revisions.len(), if revisions.len() == 1 { "" } else { "s" })];
+                    for (i, rev) in revisions.iter().enumerate() {
+                        let date = chrono::DateTime::from_timestamp(rev.created_at, 0)
+                            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        parts.push(format!("## Revision {} ({})\n```diff\n{}\n```", i + 1, date, rev.diff));
+                    }
+                    parts.join("\n\n")
+                };
+                let tokens = count_tokens(&output);
+                drop(ctx_guard);
+                self.record_persistent_call("get", tokens, 1, false).await;
+                return Ok(CallToolResult::success(vec![Content::text(output)]));
+            }
+
             let is_summary = params.format.as_deref() == Some("summary");
             let body = if is_summary {
                 // Summary: first paragraph only
@@ -761,12 +784,25 @@ impl McpServer {
                 })
                 .unwrap_or_else(|| "never".to_string());
             let conf_line = format!(
-                "Confidence: {:.2} ({}↑ {}↓, confirmed {}, source: {})",
-                conf, entry.confirmations, entry.corrections, last_conf, entry.source_type
+                "Confidence: {:.2} ({}↑, confirmed {}, source: {})",
+                conf, entry.confirmations, last_conf, entry.source_type
             );
 
+            // Revision history summary
+            let rev_line = memory::get_revision_summary(&ctx.conn, &entry.id)
+                .map(|s| {
+                    if s.count == 0 { return String::new(); }
+                    let dates: Vec<String> = s.dates.iter().map(|&ts| {
+                        chrono::DateTime::from_timestamp(ts, 0)
+                            .map(|dt| dt.format("%Y-%m-%d").to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    }).collect();
+                    format!("\nHistory: {} revision{} ({})", s.count, if s.count == 1 { "" } else { "s" }, dates.join(", "))
+                })
+                .unwrap_or_default();
+
             let output = format!(
-                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}\n\n{}",
+                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}{}\n\n{}",
                 entry.title,
                 entry.id,
                 entry.entry_type,
@@ -774,6 +810,7 @@ impl McpServer {
                 if entry.tags.is_empty() { "none".to_string() } else { entry.tags.join(", ") },
                 entry.access_count,
                 conf_line,
+                rev_line,
                 body
             );
             let tokens = count_tokens(&output);
@@ -984,6 +1021,17 @@ impl McpServer {
             let existing_was_none = existing.is_none();
 
             let output = if let Some(mut existing_entry) = existing {
+                // Save revision diff before updating (only for manual entries)
+                if let Err(e) = memory::save_revision(
+                    &ctx.conn,
+                    &params.id,
+                    &existing_entry.content,
+                    &params.content,
+                    existing_entry.source_type,
+                ) {
+                    tracing::warn!("Failed to save revision for {}: {e}", params.id);
+                }
+
                 // Update existing entry — does NOT reset confidence counters
                 existing_entry.title = params.title.clone();
                 existing_entry.content = params.content.clone();
@@ -991,7 +1039,16 @@ impl McpServer {
                 existing_entry.tags = params.tags.clone();
                 memory::update_entry(&ctx.conn, &existing_entry)
                     .map_err(|e| mcp_error(format!("Failed to update memory entry: {}", e)))?;
-                format!("Updated memory entry: {}", params.id)
+
+                // Include revision count in response
+                let rev_info = memory::get_revision_summary(&ctx.conn, &params.id)
+                    .map(|s| if s.count > 0 {
+                        format!(" ({} revisions)", s.count)
+                    } else {
+                        String::new()
+                    })
+                    .unwrap_or_default();
+                format!("Updated memory entry: {}{}", params.id, rev_info)
             } else {
                 // Create new entry
                 let entry = memory::MemoryEntry {
@@ -1008,7 +1065,6 @@ impl McpServer {
                     last_accessed: None,
                     source_path: None,
                     confirmations: 0,
-                    corrections: 0,
                     last_confirmed_at: None,
                     source_type,
                 };
@@ -1113,8 +1169,8 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Correct a memory entry — negative confidence signal.
-    #[tool(description = "Mark a memory entry as incorrect (lowers confidence score, optionally appends correction).")]
+    /// Correct a memory entry — positive confidence signal.
+    #[tool(description = "Correct a memory entry (boosts confidence, optionally appends correction text).")]
     async fn memory_correct(
         &self,
         Parameters(params): Parameters<MemoryCorrectParams>,
@@ -1384,7 +1440,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
     );
 
     // Load memory warmup before starting server
-    let warmup_limit = 50; // TODO: get from memory config when added
+    let warmup_limit = full_config.memory.warmup_limit;
     let instructions = load_server_instructions(&root, warmup_limit);
 
     let server = McpServer::with_warmup(root.clone(), full_config, Some(instructions), code_ignore_patterns);
@@ -1775,11 +1831,14 @@ const BASE_INSTRUCTIONS: &str = "\
 | Exact text pattern (last resort) | Grep |
 | Browse memories | `memory_list()` |
 | Validate knowledge still correct | `memory_confirm(id)` |
-| Flag incorrect knowledge | `memory_correct(id, correction)` |
+| Correct and improve knowledge | `memory_correct(id, correction)` |
+| View revision history | `get(id, format=\"history\")` |
 
 Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after finding a symbol to trace callers or impact.
 
-Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Use `memory_confirm` when you verify knowledge is still accurate. Use `memory_correct` when you find errors.
+Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Both `memory_confirm` and `memory_correct` boost confidence. Use `memory_delete` to remove bad entries.
+
+When `get` shows \"History: N revisions (dates)\", use `get(id, format=\"history\")` to see diffs. Only manual entries (user_statement, official_docs) track revisions.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.

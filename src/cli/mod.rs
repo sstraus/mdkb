@@ -415,6 +415,26 @@ pub enum MemoryCommand {
         id: String,
     },
 
+    /// Show revision history for a memory entry
+    History {
+        /// Entry ID
+        id: String,
+    },
+
+    /// Import memory entries from JSON file
+    Import {
+        /// Path to JSON file
+        path: String,
+
+        /// Show what would be imported without saving
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip entries that already exist (by ID)
+        #[arg(long)]
+        skip_duplicates: bool,
+    },
+
     /// Archive unused memory entries
     Prune {
         /// Days since last access to consider entry stale (default: 90)

@@ -16,6 +16,7 @@ use crate::store::stats;
 use crate::store::vectors;
 use globset::Glob;
 use rusqlite::Connection;
+use serde::Deserialize;
 use walkdir::WalkDir;
 
 /// Context for CLI operations.
@@ -1100,7 +1101,7 @@ pub fn handle_memory_add(
         last_accessed: None,
         source_path: None,
         confirmations: 0,
-        corrections: 0,
+
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
     };
@@ -1180,6 +1181,143 @@ pub fn handle_memory_prune(ctx: &Context, days: u32, dry_run: bool) -> Result<Ve
         }
     }
     Ok(pruned)
+}
+
+// ==================== Memory Import ====================
+
+/// JSON format for memory import (matches wiz fallback format).
+#[derive(Debug, Deserialize)]
+struct ImportFile {
+    entries: Vec<ImportEntry>,
+}
+
+/// A single entry in the import JSON file.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportEntry {
+    id: String,
+    title: String,
+    content: String,
+    #[serde(default = "default_import_entry_type")]
+    entry_type: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default = "default_import_source_type")]
+    source_type: String,
+    #[serde(default)]
+    created_at: Option<i64>,
+    #[serde(default)]
+    updated_at: Option<i64>,
+}
+
+fn default_import_entry_type() -> String { "topic".to_string() }
+fn default_import_source_type() -> String { "user_statement".to_string() }
+
+/// Result of a memory import operation.
+#[derive(Debug)]
+pub struct ImportResult {
+    pub imported: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+/// Handle `mdkb memory import` command.
+pub fn handle_memory_import(
+    ctx: &Context,
+    path: &str,
+    dry_run: bool,
+    skip_duplicates: bool,
+) -> Result<ImportResult> {
+    let file_content = std::fs::read_to_string(path)
+        .map_err(|e| Error::from(ErrorKind::Io {
+            path: std::path::PathBuf::from(path),
+            operation: format!("read: {e}"),
+        }))?;
+
+    let import_file: ImportFile = serde_json::from_str(&file_content)
+        .map_err(|e| Error::from(ErrorKind::InvalidQuery(
+            format!("Failed to parse {path}: {e}")
+        )))?;
+
+    let mut result = ImportResult { imported: 0, skipped: 0, errors: Vec::new() };
+    let now = chrono::Utc::now().timestamp();
+
+    for raw in &import_file.entries {
+        // Parse entry_type
+        let entry_type: EntryType = match raw.entry_type.parse() {
+            Ok(t) => t,
+            Err(e) => {
+                result.errors.push(format!("{}: {e}", raw.id));
+                continue;
+            }
+        };
+
+        // Parse source_type
+        let source_type: memory::SourceType = match raw.source_type.parse() {
+            Ok(t) => t,
+            Err(e) => {
+                result.errors.push(format!("{}: {e}", raw.id));
+                continue;
+            }
+        };
+
+        // Validate fields
+        if let Err(e) = memory::validate_entry_input(&raw.id, &raw.title, &raw.tags, &raw.content) {
+            result.errors.push(format!("{}: {e}", raw.id));
+            continue;
+        }
+
+        // Check for duplicates
+        match memory::get_entry_without_tracking(&ctx.conn, &raw.id)? {
+            Some(_) => {
+                if skip_duplicates {
+                    result.skipped += 1;
+                    continue;
+                }
+                result.errors.push(format!("{}: already exists (use --skip-duplicates to ignore)", raw.id));
+                continue;
+            }
+            None => {}
+        }
+
+        if dry_run {
+            result.imported += 1;
+            continue;
+        }
+
+        let entry = MemoryEntry {
+            id: raw.id.clone(),
+            title: raw.title.clone(),
+            content: raw.content.clone(),
+            entry_type,
+            tags: raw.tags.clone(),
+            status: EntryStatus::Active,
+            created_at: raw.created_at.unwrap_or(now),
+            updated_at: raw.updated_at.unwrap_or(now),
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+    
+            last_confirmed_at: None,
+            source_type,
+        };
+
+        memory::add_entry(&ctx.conn, &entry)?;
+        if let Err(e) = save_entry_to_disk(ctx, &entry) {
+            tracing::warn!("Failed to save imported entry {} to disk: {e}", raw.id);
+        }
+        result.imported += 1;
+    }
+
+    if !dry_run && result.imported > 0 {
+        if let Err(e) = generate_memory_index(ctx) {
+            tracing::warn!("Failed to regenerate memory index: {e}");
+        }
+    }
+
+    Ok(result)
 }
 
 // ==================== Memory Condense (LLM feature) ====================
@@ -2259,6 +2397,34 @@ mod tests {
         assert_eq!(result.added, 2);
     }
 
+    #[test]
+    fn test_handle_update_indexes_gitignored_collection() {
+        let temp = setup_temp_dir();
+
+        // Initialize git repo so .gitignore is respected by git-aware tools
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(temp.path())
+            .output()
+            .expect("git init");
+
+        // Create stories/ dir with content, then gitignore it
+        let stories_dir = temp.path().join("stories");
+        std::fs::create_dir(&stories_dir).unwrap();
+        std::fs::write(stories_dir.join("001-done.md"), "# Story 1\n\nCompleted work").unwrap();
+        std::fs::write(stories_dir.join("002-done.md"), "# Story 2\n\nMore work").unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "stories/\n").unwrap();
+
+        // Init mdkb and manually register collection (as wiz would do)
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+        handle_collection_add(&ctx, "stories", "stories", "**/*.md").unwrap();
+
+        // Update should index both files despite gitignore
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(result.added, 2, "gitignored directory should still be indexed by collection walker");
+    }
+
     // ==================== Mget Tests ====================
 
     #[test]
@@ -2660,6 +2826,157 @@ mod tests {
         assert_eq!(result.added, 0);
         assert_eq!(result.updated, 0);
         assert_eq!(result.unchanged, 0);
+    }
+
+    // ==================== Memory Import Tests ====================
+
+    fn write_import_json(dir: &std::path::Path, content: &str) -> String {
+        let path = dir.join("import.json");
+        std::fs::write(&path, content).unwrap();
+        path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn test_memory_import_basic() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let json = r#"{"entries": [
+            {"id": "test-import", "title": "Test Import", "content": "Some content", "entryType": "decision", "tags": ["db"], "sourceType": "auto_extracted"}
+        ]}"#;
+        let path = write_import_json(temp.path(), json);
+
+        let result = handle_memory_import(&ctx, &path, false, false).unwrap();
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.skipped, 0);
+        assert!(result.errors.is_empty());
+
+        let entry = handle_memory_show(&ctx, "test-import").unwrap().unwrap();
+        assert_eq!(entry.title, "Test Import");
+        assert_eq!(entry.source_type, memory::SourceType::AutoExtracted);
+    }
+
+    #[test]
+    fn test_memory_import_dry_run() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let json = r#"{"entries": [
+            {"id": "dry-run-entry", "title": "Dry Run", "content": "Content"}
+        ]}"#;
+        let path = write_import_json(temp.path(), json);
+
+        let result = handle_memory_import(&ctx, &path, true, false).unwrap();
+        assert_eq!(result.imported, 1);
+
+        // Entry should NOT exist in DB
+        let entry = handle_memory_show(&ctx, "dry-run-entry").unwrap();
+        assert!(entry.is_none(), "dry-run should not create entries");
+    }
+
+    #[test]
+    fn test_memory_import_skip_duplicates() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Add an entry first
+        handle_memory_add(&ctx, "existing", "Existing", "topic", None, "Content").unwrap();
+
+        let json = r#"{"entries": [
+            {"id": "existing", "title": "Duplicate", "content": "Content"},
+            {"id": "new-one", "title": "New One", "content": "Content"}
+        ]}"#;
+        let path = write_import_json(temp.path(), json);
+
+        let result = handle_memory_import(&ctx, &path, false, true).unwrap();
+        assert_eq!(result.imported, 1);
+        assert_eq!(result.skipped, 1);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_memory_import_duplicate_warns() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        handle_memory_add(&ctx, "existing", "Existing", "topic", None, "Content").unwrap();
+
+        let json = r#"{"entries": [
+            {"id": "existing", "title": "Duplicate", "content": "Content"}
+        ]}"#;
+        let path = write_import_json(temp.path(), json);
+
+        let result = handle_memory_import(&ctx, &path, false, false).unwrap();
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("already exists"));
+    }
+
+    #[test]
+    fn test_memory_import_empty_entries() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let json = r#"{"entries": []}"#;
+        let path = write_import_json(temp.path(), json);
+
+        let result = handle_memory_import(&ctx, &path, false, false).unwrap();
+        assert_eq!(result.imported, 0);
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_memory_import_malformed_json() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let path = write_import_json(temp.path(), "not json at all");
+
+        let result = handle_memory_import(&ctx, &path, false, false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_memory_import_defaults() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Minimal JSON — only required fields
+        let json = r#"{"entries": [
+            {"id": "minimal", "title": "Minimal Entry", "content": "Content"}
+        ]}"#;
+        let path = write_import_json(temp.path(), json);
+
+        let result = handle_memory_import(&ctx, &path, false, false).unwrap();
+        assert_eq!(result.imported, 1);
+
+        let entry = handle_memory_show(&ctx, "minimal").unwrap().unwrap();
+        assert_eq!(entry.source_type, memory::SourceType::UserStatement);
+        assert_eq!(entry.entry_type, EntryType::Topic);
+        assert!(entry.tags.is_empty());
+    }
+
+    #[test]
+    fn test_memory_import_invalid_entry_type() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let json = r#"{"entries": [
+            {"id": "bad-type", "title": "Bad Type", "content": "Content", "entryType": "invalid"}
+        ]}"#;
+        let path = write_import_json(temp.path(), json);
+
+        let result = handle_memory_import(&ctx, &path, false, false).unwrap();
+        assert_eq!(result.imported, 0);
+        assert_eq!(result.errors.len(), 1);
     }
 }
 

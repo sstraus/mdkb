@@ -65,6 +65,7 @@ pub enum SourceType {
     OfficialDocs,
     #[default]
     UserStatement,
+    AutoExtracted,
     Inference,
 }
 
@@ -73,6 +74,7 @@ impl std::fmt::Display for SourceType {
         match self {
             Self::OfficialDocs => write!(f, "official_docs"),
             Self::UserStatement => write!(f, "user_statement"),
+            Self::AutoExtracted => write!(f, "auto_extracted"),
             Self::Inference => write!(f, "inference"),
         }
     }
@@ -84,8 +86,9 @@ impl std::str::FromStr for SourceType {
         match s {
             "official_docs" => Ok(Self::OfficialDocs),
             "user_statement" => Ok(Self::UserStatement),
+            "auto_extracted" => Ok(Self::AutoExtracted),
             "inference" => Ok(Self::Inference),
-            _ => Err(format!("Invalid source_type: {s}. Valid: official_docs, user_statement, inference")),
+            _ => Err(format!("Invalid source_type: {s}. Valid: official_docs, user_statement, auto_extracted, inference")),
         }
     }
 }
@@ -112,8 +115,6 @@ pub struct MemoryEntry {
     #[serde(default)]
     pub confirmations: u32,
     #[serde(default)]
-    pub corrections: u32,
-    #[serde(default)]
     pub last_confirmed_at: Option<i64>,
     #[serde(default)]
     pub source_type: SourceType,
@@ -130,10 +131,8 @@ impl MemoryEntry {
 
     /// Calculate confidence at a specific timestamp (for testing).
     pub fn confidence_at(&self, now: i64) -> f64 {
-        // Bayesian belief: how verified is this knowledge?
-        let alpha = 1.0 + self.confirmations as f64;
-        let beta = 1.0 + self.corrections as f64;
-        let belief = alpha / (alpha + beta);
+        // Belief: sigmoid over confirmations. 0 confirms = 0.5, 10 = 0.91, 50 = 0.98.
+        let belief = (1.0 + self.confirmations as f64) / (2.0 + self.confirmations as f64);
 
         // Temporal decay: how fresh is the verification?
         let reference_time = self.last_confirmed_at.unwrap_or(self.created_at);
@@ -146,6 +145,7 @@ impl MemoryEntry {
         let source_mult = match self.source_type {
             SourceType::OfficialDocs => 1.0,
             SourceType::UserStatement => 0.85,
+            SourceType::AutoExtracted => 0.70,
             SourceType::Inference => 0.65,
         };
 
@@ -257,12 +257,12 @@ pub fn list_entries_sorted(
 
     let sql = if status_filter.is_some() {
         format!(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, source_type
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
              FROM memory_entries WHERE status = ?1 {order_clause} LIMIT ?2"
         )
     } else {
         format!(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, source_type
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
              FROM memory_entries {order_clause} LIMIT ?1"
         )
     };
@@ -288,8 +288,8 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
     let tags_json = serde_json::to_string(&entry.tags)?;
 
     conn.execute(
-        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, source_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             entry.id,
             entry.title,
@@ -303,7 +303,6 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
             entry.last_accessed,
             entry.source_path,
             entry.confirmations,
-            entry.corrections,
             entry.last_confirmed_at,
             entry.source_type.to_string(),
         ],
@@ -346,9 +345,10 @@ pub fn confirm_entry(conn: &Connection, id: &str) -> Result<String> {
     }
 }
 
-/// Correct a memory entry — negative confidence signal.
+/// Correct a memory entry — positive confidence signal.
 ///
-/// Increments corrections counter. Optionally appends correction text.
+/// Correcting = improving the entry. Always boosts confidence.
+/// Optionally appends correction text. To remove bad entries, use delete.
 /// Returns error if entry is superseded or archived.
 pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> Result<String> {
     let entry = get_entry_without_tracking(conn, id)?
@@ -368,6 +368,7 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
 
     let now = Utc::now().timestamp();
 
+    // Correction = improving the entry → always boost confidence
     if let Some(text) = correction {
         // Validate correction size before allocating
         const MAX_CORRECTION_LEN: usize = MAX_CONTENT_SIZE / 2;
@@ -376,14 +377,12 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
                 format!("Correction text exceeds {MAX_CORRECTION_LEN} bytes")
             ).into());
         }
-        // Append correction to content
         let timestamp = chrono::DateTime::from_timestamp(now, 0)
             .map(|dt| dt.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let correction_block = format!("\n\n## Correction ({})\n\n{}", timestamp, text);
         let new_content = format!("{}{}", entry.content, correction_block);
 
-        // Check content size limit
         if new_content.len() > MAX_CONTENT_SIZE {
             return Err(ErrorKind::InvalidQuery(
                 format!("Correction would exceed max content size ({MAX_CONTENT_SIZE} bytes)")
@@ -391,16 +390,16 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
         }
 
         conn.execute(
-            "UPDATE memory_entries SET corrections = corrections + 1, content = ?1, updated_at = ?2 WHERE id = ?3",
-            params![new_content, now, id],
+            "UPDATE memory_entries SET confirmations = confirmations + 1, last_confirmed_at = ?1, content = ?2, updated_at = ?1 WHERE id = ?3",
+            params![now, new_content, id],
         )?;
-        Ok(format!("Corrected: {id} (correction appended, {} corrections total)", entry.corrections + 1))
+        Ok(format!("Corrected: {id} (correction appended, confidence boosted)"))
     } else {
         conn.execute(
-            "UPDATE memory_entries SET corrections = corrections + 1, updated_at = ?1 WHERE id = ?2",
+            "UPDATE memory_entries SET confirmations = confirmations + 1, last_confirmed_at = ?1, updated_at = ?1 WHERE id = ?2",
             params![now, id],
         )?;
-        Ok(format!("Corrected: {id} ({} corrections total)", entry.corrections + 1))
+        Ok(format!("Corrected: {id} (confidence boosted)"))
     }
 }
 
@@ -428,6 +427,112 @@ pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
     Ok(())
 }
 
+/// Maximum number of revisions to keep per memory entry.
+const MAX_REVISIONS: usize = 3;
+
+/// A stored revision (diff between two versions of content).
+#[derive(Debug, Clone)]
+pub struct Revision {
+    pub id: i64,
+    pub memory_id: String,
+    pub diff: String,
+    pub created_at: i64,
+}
+
+/// Summary of revision history for a memory entry.
+#[derive(Debug, Clone)]
+pub struct RevisionSummary {
+    pub count: usize,
+    pub dates: Vec<i64>,
+}
+
+/// Save a revision diff when a memory entry is updated.
+///
+/// Only saves for manually-written entries (`UserStatement`, `OfficialDocs`).
+/// Keeps at most `MAX_REVISIONS` per entry, pruning the oldest.
+/// Skips saving when content is identical.
+pub fn save_revision(
+    conn: &Connection,
+    memory_id: &str,
+    old_content: &str,
+    new_content: &str,
+    source_type: SourceType,
+) -> Result<()> {
+    // Only track revisions for manually-written entries
+    match source_type {
+        SourceType::UserStatement | SourceType::OfficialDocs => {}
+        _ => return Ok(()),
+    }
+
+    // Skip if content is identical
+    if old_content == new_content {
+        return Ok(());
+    }
+
+    // Compute unified diff
+    let text_diff = similar::TextDiff::from_lines(old_content, new_content);
+    let diff = text_diff
+        .unified_diff()
+        .context_radius(2)
+        .to_string();
+
+    let now = Utc::now().timestamp();
+
+    conn.execute(
+        "INSERT INTO memory_revisions (memory_id, diff, created_at) VALUES (?1, ?2, ?3)",
+        params![memory_id, diff, now],
+    )?;
+
+    // Prune oldest revisions beyond MAX_REVISIONS
+    conn.execute(
+        "DELETE FROM memory_revisions WHERE id IN (
+            SELECT id FROM memory_revisions
+            WHERE memory_id = ?1
+            ORDER BY created_at DESC, id DESC
+            LIMIT -1 OFFSET ?2
+        )",
+        params![memory_id, MAX_REVISIONS as i64],
+    )?;
+
+    Ok(())
+}
+
+/// Get all revisions for a memory entry, ordered oldest first.
+pub fn get_revisions(conn: &Connection, memory_id: &str) -> Result<Vec<Revision>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, memory_id, diff, created_at FROM memory_revisions
+         WHERE memory_id = ?1 ORDER BY created_at ASC, id ASC"
+    )?;
+    let revisions = stmt.query_map(params![memory_id], |row| {
+        Ok(Revision {
+            id: row.get(0)?,
+            memory_id: row.get(1)?,
+            diff: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(revisions)
+}
+
+/// Get a summary of revisions (count + dates) for display metadata.
+pub fn get_revision_summary(conn: &Connection, memory_id: &str) -> Result<RevisionSummary> {
+    let mut stmt = conn.prepare(
+        "SELECT created_at FROM memory_revisions
+         WHERE memory_id = ?1 ORDER BY created_at ASC"
+    )?;
+    let dates: Vec<i64> = stmt.query_map(params![memory_id], |row| {
+        row.get(0)
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(RevisionSummary {
+        count: dates.len(),
+        dates,
+    })
+}
+
 /// Get a memory entry by ID and increment access count.
 pub fn get_entry(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
     let now = Utc::now().timestamp();
@@ -444,7 +549,7 @@ pub fn get_entry(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
 /// Get a memory entry by ID without incrementing access count.
 pub fn get_entry_without_tracking(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, source_type
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
          FROM memory_entries WHERE id = ?1"
     )?;
 
@@ -470,7 +575,7 @@ pub fn list_entries(conn: &Connection, limit: usize, status_filter: Option<Entry
 pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.source_type
+        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -492,7 +597,7 @@ pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Ve
 fn bm25_search_with_rowid(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(i64, MemoryEntry)>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
     let mut stmt = conn.prepare(
-        "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.source_type
+        "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -549,7 +654,7 @@ pub fn find_similar_entries(conn: &Connection, embedding: &[f32], exclude_rowid:
 fn get_entry_by_rowid(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
     let entry = conn
         .query_row(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, source_type
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
              FROM memory_entries WHERE rowid = ?1",
             params![rowid],
             row_to_entry,
@@ -565,7 +670,7 @@ fn get_entries_by_rowids(conn: &Connection, rowids: &[i64]) -> Result<HashMap<i6
     }
     let placeholders: Vec<String> = (1..=rowids.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
-        "SELECT rowid, id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, source_type
+        "SELECT rowid, id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
          FROM memory_entries WHERE rowid IN ({})",
         placeholders.join(", ")
     );
@@ -798,7 +903,7 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
     });
     let entry_type_str: String = row.get(off + 3)?;
     let status_str: String = row.get(off + 5)?;
-    let source_type_str: String = row.get::<_, Option<String>>(off + 15)?.unwrap_or_default();
+    let source_type_str: String = row.get::<_, Option<String>>(off + 14)?.unwrap_or_default();
 
     Ok(MemoryEntry {
         id: row.get(off)?,
@@ -820,8 +925,7 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
         last_accessed: row.get(off + 10)?,
         source_path: row.get(off + 11)?,
         confirmations: row.get::<_, Option<i64>>(off + 12)?.unwrap_or(0) as u32,
-        corrections: row.get::<_, Option<i64>>(off + 13)?.unwrap_or(0) as u32,
-        last_confirmed_at: row.get(off + 14)?,
+        last_confirmed_at: row.get(off + 13)?,
         source_type: source_type_str.parse().unwrap_or_else(|_| {
             tracing::warn!("Unknown source_type '{}', defaulting to UserStatement", source_type_str);
             SourceType::UserStatement
@@ -860,8 +964,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -894,8 +997,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -929,8 +1031,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -962,7 +1063,7 @@ mod tests {
                 access_count: count,
                 last_accessed: None,
             source_path: None,
-            confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
             };
             add_entry(&conn, &entry).unwrap();
         }
@@ -993,8 +1094,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -1012,8 +1112,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -1044,8 +1143,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1075,8 +1173,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -1112,7 +1209,7 @@ mod tests {
                 access_count: 0,
                 last_accessed: None,
             source_path: None,
-            confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
             };
             add_entry(&conn, &entry).unwrap();
         }
@@ -1141,8 +1238,7 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1177,8 +1273,7 @@ mod tests {
             last_accessed: Some(old_time),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1214,8 +1309,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1246,8 +1340,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1283,8 +1376,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1315,8 +1407,7 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &recent).unwrap();
@@ -1336,8 +1427,7 @@ mod tests {
             last_accessed: Some(old_time),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &stale).unwrap();
@@ -1374,8 +1464,7 @@ mod tests {
             last_accessed: Some(now - 200),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         let low = MemoryEntry {
@@ -1392,8 +1481,7 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &low).unwrap();
@@ -1424,8 +1512,7 @@ mod tests {
             last_accessed: Some(now - 1000),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         let recent = MemoryEntry {
@@ -1442,8 +1529,7 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &old_accessed).unwrap();
@@ -1474,8 +1560,7 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         let newer = MemoryEntry {
@@ -1492,8 +1577,7 @@ mod tests {
             last_accessed: Some(now - 500),
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &older).unwrap();
@@ -1599,8 +1683,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-            corrections: 0,
-            last_confirmed_at: None,
+                       last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1626,7 +1709,7 @@ mod tests {
             status: EntryStatus::Active,
             created_at: 1000, updated_at: 1000,
             superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-            confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &e1).unwrap();
         let rowid1 = get_rowid(&conn, "auth-basic").unwrap().unwrap();
@@ -1642,7 +1725,7 @@ mod tests {
             status: EntryStatus::Active,
             created_at: 1000, updated_at: 1000,
             superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-            confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &e2).unwrap();
         let rowid2 = get_rowid(&conn, "jwt-refresh").unwrap().unwrap();
@@ -1659,7 +1742,7 @@ mod tests {
             status: EntryStatus::Active,
             created_at: 1000, updated_at: 1000,
             superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-            confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &e3).unwrap();
         let rowid3 = get_rowid(&conn, "db-tuning").unwrap().unwrap();
@@ -1692,7 +1775,7 @@ mod tests {
                 status: EntryStatus::Active,
                 created_at: 1000, updated_at: 1000,
                 superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-                confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+                confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
             };
             add_entry(&conn, &entry).unwrap();
             let rowid = get_rowid(&conn, &format!("entry-{i}")).unwrap().unwrap();
@@ -1716,7 +1799,7 @@ mod tests {
             status: EntryStatus::Active,
             created_at: 1000, updated_at: 1000,
             superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-            confirmations: 0, corrections: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1729,20 +1812,20 @@ mod tests {
 
     // ==================== Confidence Formula Tests ====================
 
-    fn make_entry_at(created: i64, confirmations: u32, corrections: u32, access_count: u64, last_confirmed: Option<i64>, source: SourceType) -> MemoryEntry {
+    fn make_entry_at(created: i64, confirmations: u32, access_count: u64, last_confirmed: Option<i64>, source: SourceType) -> MemoryEntry {
         MemoryEntry {
             id: "test".to_string(), title: "Test".to_string(), content: "Content".to_string(),
             entry_type: EntryType::Topic, tags: vec![], status: EntryStatus::Active,
             created_at: created, updated_at: created, superseded_by: None,
             access_count, last_accessed: None, source_path: None,
-            confirmations, corrections, last_confirmed_at: last_confirmed, source_type: source,
+            confirmations, last_confirmed_at: last_confirmed, source_type: source,
         }
     }
 
     #[test]
     fn test_confidence_new_user_statement() {
         let now = 1000;
-        let entry = make_entry_at(now, 0, 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(now, 0, 0, None, SourceType::UserStatement);
         let conf = entry.confidence_at(now);
         // belief=0.5, decay=1.0, source=0.85 → 0.425
         assert!((conf - 0.425).abs() < 0.01, "New user_statement should be ~0.425, got {conf}");
@@ -1752,7 +1835,7 @@ mod tests {
     fn test_confidence_90_day_stale() {
         let created = 0;
         let now = 90 * 86400; // 90 days later
-        let entry = make_entry_at(created, 0, 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(created, 0, 0, None, SourceType::UserStatement);
         let conf = entry.confidence_at(now);
         // belief=0.5, decay=e^(-1)≈0.368, source=0.85 → ~0.156
         assert!((conf - 0.156).abs() < 0.02, "90-day stale should be ~0.156, got {conf}");
@@ -1761,27 +1844,18 @@ mod tests {
     #[test]
     fn test_confidence_heavily_confirmed() {
         let now = 1000;
-        let entry = make_entry_at(now, 5, 0, 0, Some(now), SourceType::OfficialDocs);
+        let entry = make_entry_at(now, 5, 0, Some(now), SourceType::OfficialDocs);
         let conf = entry.confidence_at(now);
         // belief=6/7≈0.857, decay=1.0, source=1.0 → ~0.857
         assert!((conf - 0.857).abs() < 0.01, "Heavily confirmed should be ~0.857, got {conf}");
     }
 
     #[test]
-    fn test_confidence_equal_confirm_correct_drops() {
-        let now = 1000;
-        let entry = make_entry_at(now, 5, 5, 0, Some(now), SourceType::UserStatement);
-        let conf = entry.confidence_at(now);
-        // belief=6/12=0.5, decay=1.0, source=0.85 → 0.425
-        assert!((conf - 0.425).abs() < 0.01, "Equal confirm/correct should be ~0.425, got {conf}");
-    }
-
-    #[test]
     fn test_confidence_access_slows_decay() {
         let created = 0;
         let now = 90 * 86400;
-        let no_access = make_entry_at(created, 0, 0, 0, None, SourceType::UserStatement);
-        let high_access = make_entry_at(created, 0, 0, 10, None, SourceType::UserStatement);
+        let no_access = make_entry_at(created, 0, 0, None, SourceType::UserStatement);
+        let high_access = make_entry_at(created, 0, 10, None, SourceType::UserStatement);
         let conf_no = no_access.confidence_at(now);
         let conf_hi = high_access.confidence_at(now);
         assert!(conf_hi > conf_no, "High access should slow decay: {conf_hi} > {conf_no}");
@@ -1791,17 +1865,174 @@ mod tests {
     fn test_confidence_floor() {
         let created = 0;
         let now = 365 * 5 * 86400; // 5 years
-        let entry = make_entry_at(created, 0, 10, 0, None, SourceType::Inference);
+        let entry = make_entry_at(created, 0, 0, None, SourceType::Inference);
         let conf = entry.confidence_at(now);
-        assert!((conf - CONFIDENCE_FLOOR).abs() < 0.001, "Very old+corrected should hit floor {CONFIDENCE_FLOOR}, got {conf}");
+        assert!((conf - CONFIDENCE_FLOOR).abs() < 0.001, "Very old entry should hit floor {CONFIDENCE_FLOOR}, got {conf}");
     }
 
     #[test]
     fn test_confidence_inference_lower_than_user() {
         let now = 1000;
-        let user = make_entry_at(now, 0, 0, 0, None, SourceType::UserStatement);
-        let infer = make_entry_at(now, 0, 0, 0, None, SourceType::Inference);
+        let user = make_entry_at(now, 0, 0, None, SourceType::UserStatement);
+        let infer = make_entry_at(now, 0, 0, None, SourceType::Inference);
         assert!(user.confidence_at(now) > infer.confidence_at(now), "user_statement should score higher than inference");
+    }
+
+    #[test]
+    fn test_confidence_new_auto_extracted() {
+        let now = 1000;
+        let entry = make_entry_at(now, 0, 0, None, SourceType::AutoExtracted);
+        let conf = entry.confidence_at(now);
+        // belief=0.5, decay=1.0, source=0.70 → 0.35
+        assert!((conf - 0.35).abs() < 0.01, "New auto_extracted should be ~0.35, got {conf}");
+    }
+
+    #[test]
+    fn test_confidence_auto_extracted_90_day_stale() {
+        let created = 0;
+        let now = 90 * 86400;
+        let entry = make_entry_at(created, 0, 0, None, SourceType::AutoExtracted);
+        let conf = entry.confidence_at(now);
+        // belief=0.5, decay=e^(-1)≈0.368, source=0.70 → ~0.129
+        assert!((conf - 0.129).abs() < 0.02, "90-day auto_extracted should be ~0.129, got {conf}");
+    }
+
+    #[test]
+    fn test_confidence_auto_extracted_after_confirmation() {
+        let now = 1000;
+        let entry = make_entry_at(now, 1, 0, Some(now), SourceType::AutoExtracted);
+        let conf = entry.confidence_at(now);
+        // belief=2/3≈0.667, decay=1.0, source=0.70 → ~0.467
+        assert!((conf - 0.467).abs() < 0.01, "Confirmed auto_extracted should be ~0.467, got {conf}");
+    }
+
+    #[test]
+    fn test_confidence_auto_extracted_between_inference_and_user() {
+        let now = 1000;
+        let auto = make_entry_at(now, 0, 0, None, SourceType::AutoExtracted);
+        let user = make_entry_at(now, 0, 0, None, SourceType::UserStatement);
+        let infer = make_entry_at(now, 0, 0, None, SourceType::Inference);
+        let conf_auto = auto.confidence_at(now);
+        let conf_user = user.confidence_at(now);
+        let conf_infer = infer.confidence_at(now);
+        assert!(conf_user > conf_auto, "user > auto_extracted: {conf_user} > {conf_auto}");
+        assert!(conf_auto > conf_infer, "auto_extracted > inference: {conf_auto} > {conf_infer}");
+    }
+
+    #[test]
+    fn test_source_type_auto_extracted_roundtrip() {
+        let parsed: SourceType = "auto_extracted".parse().unwrap();
+        assert_eq!(parsed, SourceType::AutoExtracted);
+        assert_eq!(parsed.to_string(), "auto_extracted");
+    }
+
+    // ==================== Revision History Tests ====================
+
+    #[test]
+    fn test_save_revision_creates_diff() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "Old content", "New content", SourceType::UserStatement).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert!(revisions[0].diff.contains("Old content"));
+        assert!(revisions[0].diff.contains("New content"));
+    }
+
+    #[test]
+    fn test_save_revision_skips_auto_extracted() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::AutoExtracted);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "Old", "New", SourceType::AutoExtracted).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert!(revisions.is_empty(), "auto_extracted should not create revisions");
+    }
+
+    #[test]
+    fn test_save_revision_skips_inference() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::Inference);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "Old", "New", SourceType::Inference).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert!(revisions.is_empty(), "inference should not create revisions");
+    }
+
+    #[test]
+    fn test_save_revision_keeps_max_three() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "v0", "v1", SourceType::UserStatement).unwrap();
+        save_revision(&conn, "test", "v1", "v2", SourceType::UserStatement).unwrap();
+        save_revision(&conn, "test", "v2", "v3", SourceType::UserStatement).unwrap();
+        save_revision(&conn, "test", "v3", "v4", SourceType::UserStatement).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert_eq!(revisions.len(), 3, "should keep max 3 revisions");
+        // Oldest should be v1→v2 (v0→v1 pruned)
+        assert!(revisions[0].diff.contains("v1"), "oldest should reference v1→v2");
+        assert!(revisions[0].diff.contains("v2"), "oldest should reference v1→v2");
+    }
+
+    #[test]
+    fn test_save_revision_skips_identical_content() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "Same content", "Same content", SourceType::UserStatement).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert!(revisions.is_empty(), "no revision for identical content");
+    }
+
+    #[test]
+    fn test_revision_summary() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "v0", "v1", SourceType::UserStatement).unwrap();
+        save_revision(&conn, "test", "v1", "v2", SourceType::UserStatement).unwrap();
+
+        let summary = get_revision_summary(&conn, "test").unwrap();
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.dates.len(), 2);
+    }
+
+    #[test]
+    fn test_revision_summary_empty() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        let summary = get_revision_summary(&conn, "test").unwrap();
+        assert_eq!(summary.count, 0);
+        assert!(summary.dates.is_empty());
+    }
+
+    #[test]
+    fn test_revisions_deleted_with_entry() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "v0", "v1", SourceType::UserStatement).unwrap();
+
+        delete_entry(&conn, "test").unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert!(revisions.is_empty(), "revisions should be cascade-deleted");
     }
 
     // ==================== Confirm/Correct Tests ====================
@@ -1809,7 +2040,7 @@ mod tests {
     #[test]
     fn test_confirm_entry_increments() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
         add_entry(&conn, &entry).unwrap();
 
         let result = confirm_entry(&conn, "test").unwrap();
@@ -1823,7 +2054,7 @@ mod tests {
     #[test]
     fn test_confirm_archived_restores() {
         let conn = setup_db();
-        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
         entry.status = EntryStatus::Archived;
         add_entry(&conn, &entry).unwrap();
 
@@ -1837,7 +2068,7 @@ mod tests {
     #[test]
     fn test_confirm_superseded_blocked() {
         let conn = setup_db();
-        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
         entry.status = EntryStatus::Superseded;
         add_entry(&conn, &entry).unwrap();
 
@@ -1848,20 +2079,21 @@ mod tests {
     #[test]
     fn test_correct_entry_increments() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
         add_entry(&conn, &entry).unwrap();
 
         let result = correct_entry(&conn, "test", None).unwrap();
         assert!(result.contains("Corrected"), "{result}");
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
-        assert_eq!(updated.corrections, 1);
+        assert_eq!(updated.confirmations, 1, "correct always boosts confidence");
+
     }
 
     #[test]
-    fn test_correct_with_text_appends() {
+    fn test_correct_with_text_appends_and_boosts() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
         add_entry(&conn, &entry).unwrap();
 
         correct_entry(&conn, "test", Some("The API changed to v3")).unwrap();
@@ -1869,12 +2101,27 @@ mod tests {
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
         assert!(updated.content.contains("## Correction"), "Should have correction header");
         assert!(updated.content.contains("The API changed to v3"), "Should contain correction text");
+        assert_eq!(updated.confirmations, 1, "correction should boost confidence");
+        assert!(updated.last_confirmed_at.is_some(), "should set last_confirmed_at");
+    }
+
+    #[test]
+    fn test_correct_without_text_boosts() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        correct_entry(&conn, "test", None).unwrap();
+
+        let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        assert_eq!(updated.confirmations, 1, "correction should boost confidence");
+        assert!(updated.last_confirmed_at.is_some(), "should set last_confirmed_at");
     }
 
     #[test]
     fn test_correct_superseded_blocked() {
         let conn = setup_db();
-        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
         entry.status = EntryStatus::Superseded;
         add_entry(&conn, &entry).unwrap();
 
@@ -1884,7 +2131,7 @@ mod tests {
     #[test]
     fn test_correct_archived_blocked() {
         let conn = setup_db();
-        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
         entry.status = EntryStatus::Archived;
         add_entry(&conn, &entry).unwrap();
 

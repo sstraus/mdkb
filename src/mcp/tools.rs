@@ -53,7 +53,7 @@ pub struct GetParams {
     #[serde(default)]
     pub lines: Option<String>,
 
-    /// Output format: "full" (default) or "summary" (title + first paragraph + metadata).
+    /// Output format: "full" (default), "summary" (title + first paragraph), or "history" (revision diffs, memory only).
     #[serde(default)]
     pub format: Option<String>,
 }
@@ -78,7 +78,7 @@ pub struct MemoryWriteParams {
     #[serde(default)]
     pub tags: Vec<String>,
 
-    /// Source type: official_docs, user_statement (default), or inference.
+    /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
     #[serde(default = "default_source_type")]
     pub source_type: String,
 }

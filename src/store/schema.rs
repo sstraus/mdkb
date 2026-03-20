@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -139,6 +139,17 @@ CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory_entries BEGIN
     VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content,
             REPLACE(REPLACE(REPLACE(NEW.tags, '"', ''), '[', ''), ']', ''));
 END;
+
+-- Memory revision history (max 3 per entry, stores diffs)
+CREATE TABLE IF NOT EXISTS memory_revisions (
+    id INTEGER PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    diff TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY (memory_id) REFERENCES memory_entries(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_id ON memory_revisions(memory_id);
 
 -- Evolution tracking for document relationships (RFC-style)
 CREATE TABLE IF NOT EXISTS evolution (
@@ -347,6 +358,23 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 "#,
             )?;
         }
+    }
+
+    // Migration from v7 to v8: add memory_revisions table for change history
+    if from_version < 8 {
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS memory_revisions (
+                id INTEGER PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                diff TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (memory_id) REFERENCES memory_entries(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_id
+                ON memory_revisions(memory_id);
+            "#,
+        )?;
     }
 
     // Update schema version
