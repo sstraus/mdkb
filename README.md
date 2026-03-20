@@ -10,11 +10,21 @@ AI assistants can't read your entire codebase. mdkb solves this by indexing your
 
 ## Installation
 
+### Homebrew (macOS/Linux)
+
+```bash
+brew install sstraus/tap/mdkb
+```
+
+### From source
+
 ```bash
 cargo install --path .
 ```
 
-Or download a pre-built binary from [Releases](https://github.com/sstraus/mdkb/releases).
+### Pre-built binaries
+
+Download from [Releases](https://github.com/sstraus/mdkb/releases) — available for macOS (arm64/x64), Linux (arm64/x64), and Windows (x64).
 
 ## Quick Start
 
