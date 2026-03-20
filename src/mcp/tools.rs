@@ -53,7 +53,7 @@ pub struct GetParams {
     #[serde(default)]
     pub lines: Option<String>,
 
-    /// Output format: "full" (default) or "summary" (title + first paragraph + metadata).
+    /// Output format: "full" (default), "summary" (title + first paragraph), or "history" (revision diffs, memory only).
     #[serde(default)]
     pub format: Option<String>,
 }

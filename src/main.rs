@@ -327,6 +327,21 @@ async fn main() -> Result<()> {
                         println!("Memory entry '{id}' not found");
                     }
                 }
+                MemoryCommand::History { id } => {
+                    let revisions = mdkb::store::memory::get_revisions(&ctx.conn, &id)?;
+                    if revisions.is_empty() {
+                        println!("No revision history for '{id}'");
+                    } else {
+                        println!("Revision history for '{}' ({} revision{}):\n",
+                            id, revisions.len(), if revisions.len() == 1 { "" } else { "s" });
+                        for (i, rev) in revisions.iter().enumerate() {
+                            let date = chrono::DateTime::<chrono::Utc>::from_timestamp(rev.created_at, 0)
+                                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            println!("--- Revision {} ({}) ---\n{}\n", i + 1, date, rev.diff);
+                        }
+                    }
+                }
                 MemoryCommand::Import { path, dry_run, skip_duplicates } => {
                     let result = handle_memory_import(&ctx, &path, dry_run, skip_duplicates)?;
                     if dry_run {

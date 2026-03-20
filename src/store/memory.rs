@@ -432,6 +432,112 @@ pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
     Ok(())
 }
 
+/// Maximum number of revisions to keep per memory entry.
+const MAX_REVISIONS: usize = 3;
+
+/// A stored revision (diff between two versions of content).
+#[derive(Debug, Clone)]
+pub struct Revision {
+    pub id: i64,
+    pub memory_id: String,
+    pub diff: String,
+    pub created_at: i64,
+}
+
+/// Summary of revision history for a memory entry.
+#[derive(Debug, Clone)]
+pub struct RevisionSummary {
+    pub count: usize,
+    pub dates: Vec<i64>,
+}
+
+/// Save a revision diff when a memory entry is updated.
+///
+/// Only saves for manually-written entries (`UserStatement`, `OfficialDocs`).
+/// Keeps at most `MAX_REVISIONS` per entry, pruning the oldest.
+/// Skips saving when content is identical.
+pub fn save_revision(
+    conn: &Connection,
+    memory_id: &str,
+    old_content: &str,
+    new_content: &str,
+    source_type: SourceType,
+) -> Result<()> {
+    // Only track revisions for manually-written entries
+    match source_type {
+        SourceType::UserStatement | SourceType::OfficialDocs => {}
+        _ => return Ok(()),
+    }
+
+    // Skip if content is identical
+    if old_content == new_content {
+        return Ok(());
+    }
+
+    // Compute unified diff
+    let text_diff = similar::TextDiff::from_lines(old_content, new_content);
+    let diff = text_diff
+        .unified_diff()
+        .context_radius(2)
+        .to_string();
+
+    let now = Utc::now().timestamp();
+
+    conn.execute(
+        "INSERT INTO memory_revisions (memory_id, diff, created_at) VALUES (?1, ?2, ?3)",
+        params![memory_id, diff, now],
+    )?;
+
+    // Prune oldest revisions beyond MAX_REVISIONS
+    conn.execute(
+        "DELETE FROM memory_revisions WHERE id IN (
+            SELECT id FROM memory_revisions
+            WHERE memory_id = ?1
+            ORDER BY created_at DESC, id DESC
+            LIMIT -1 OFFSET ?2
+        )",
+        params![memory_id, MAX_REVISIONS as i64],
+    )?;
+
+    Ok(())
+}
+
+/// Get all revisions for a memory entry, ordered oldest first.
+pub fn get_revisions(conn: &Connection, memory_id: &str) -> Result<Vec<Revision>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, memory_id, diff, created_at FROM memory_revisions
+         WHERE memory_id = ?1 ORDER BY created_at ASC, id ASC"
+    )?;
+    let revisions = stmt.query_map(params![memory_id], |row| {
+        Ok(Revision {
+            id: row.get(0)?,
+            memory_id: row.get(1)?,
+            diff: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(revisions)
+}
+
+/// Get a summary of revisions (count + dates) for display metadata.
+pub fn get_revision_summary(conn: &Connection, memory_id: &str) -> Result<RevisionSummary> {
+    let mut stmt = conn.prepare(
+        "SELECT created_at FROM memory_revisions
+         WHERE memory_id = ?1 ORDER BY created_at ASC"
+    )?;
+    let dates: Vec<i64> = stmt.query_map(params![memory_id], |row| {
+        row.get(0)
+    })?
+    .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    Ok(RevisionSummary {
+        count: dates.len(),
+        dates,
+    })
+}
+
 /// Get a memory entry by ID and increment access count.
 pub fn get_entry(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
     let now = Utc::now().timestamp();
@@ -1854,6 +1960,115 @@ mod tests {
         let parsed: SourceType = "auto_extracted".parse().unwrap();
         assert_eq!(parsed, SourceType::AutoExtracted);
         assert_eq!(parsed.to_string(), "auto_extracted");
+    }
+
+    // ==================== Revision History Tests ====================
+
+    #[test]
+    fn test_save_revision_creates_diff() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "Old content", "New content", SourceType::UserStatement).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert!(revisions[0].diff.contains("Old content"));
+        assert!(revisions[0].diff.contains("New content"));
+    }
+
+    #[test]
+    fn test_save_revision_skips_auto_extracted() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::AutoExtracted);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "Old", "New", SourceType::AutoExtracted).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert!(revisions.is_empty(), "auto_extracted should not create revisions");
+    }
+
+    #[test]
+    fn test_save_revision_skips_inference() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::Inference);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "Old", "New", SourceType::Inference).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert!(revisions.is_empty(), "inference should not create revisions");
+    }
+
+    #[test]
+    fn test_save_revision_keeps_max_three() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "v0", "v1", SourceType::UserStatement).unwrap();
+        save_revision(&conn, "test", "v1", "v2", SourceType::UserStatement).unwrap();
+        save_revision(&conn, "test", "v2", "v3", SourceType::UserStatement).unwrap();
+        save_revision(&conn, "test", "v3", "v4", SourceType::UserStatement).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert_eq!(revisions.len(), 3, "should keep max 3 revisions");
+        // Oldest should be v1→v2 (v0→v1 pruned)
+        assert!(revisions[0].diff.contains("v1"), "oldest should reference v1→v2");
+        assert!(revisions[0].diff.contains("v2"), "oldest should reference v1→v2");
+    }
+
+    #[test]
+    fn test_save_revision_skips_identical_content() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "Same content", "Same content", SourceType::UserStatement).unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert!(revisions.is_empty(), "no revision for identical content");
+    }
+
+    #[test]
+    fn test_revision_summary() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "v0", "v1", SourceType::UserStatement).unwrap();
+        save_revision(&conn, "test", "v1", "v2", SourceType::UserStatement).unwrap();
+
+        let summary = get_revision_summary(&conn, "test").unwrap();
+        assert_eq!(summary.count, 2);
+        assert_eq!(summary.dates.len(), 2);
+    }
+
+    #[test]
+    fn test_revision_summary_empty() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        let summary = get_revision_summary(&conn, "test").unwrap();
+        assert_eq!(summary.count, 0);
+        assert!(summary.dates.is_empty());
+    }
+
+    #[test]
+    fn test_revisions_deleted_with_entry() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        save_revision(&conn, "test", "v0", "v1", SourceType::UserStatement).unwrap();
+
+        delete_entry(&conn, "test").unwrap();
+
+        let revisions = get_revisions(&conn, "test").unwrap();
+        assert!(revisions.is_empty(), "revisions should be cascade-deleted");
     }
 
     // ==================== Confirm/Correct Tests ====================

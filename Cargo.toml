@@ -58,6 +58,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 mimalloc = "0.1"
 libmimalloc-sys = { version = "0.1", features = ["extended"] }
 
+# Text diffing (memory revision history)
+similar = "2"
+
 # Utilities
 sha2 = "0.10"
 walkdir = "2"

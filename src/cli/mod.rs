@@ -415,6 +415,12 @@ pub enum MemoryCommand {
         id: String,
     },
 
+    /// Show revision history for a memory entry
+    History {
+        /// Entry ID
+        id: String,
+    },
+
     /// Import memory entries from JSON file
     Import {
         /// Path to JSON file
