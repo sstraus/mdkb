@@ -78,7 +78,7 @@ pub struct MemoryWriteParams {
     #[serde(default)]
     pub tags: Vec<String>,
 
-    /// Source type: official_docs, user_statement (default), or inference.
+    /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
     #[serde(default = "default_source_type")]
     pub source_type: String,
 }

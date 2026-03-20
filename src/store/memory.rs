@@ -65,6 +65,7 @@ pub enum SourceType {
     OfficialDocs,
     #[default]
     UserStatement,
+    AutoExtracted,
     Inference,
 }
 
@@ -73,6 +74,7 @@ impl std::fmt::Display for SourceType {
         match self {
             Self::OfficialDocs => write!(f, "official_docs"),
             Self::UserStatement => write!(f, "user_statement"),
+            Self::AutoExtracted => write!(f, "auto_extracted"),
             Self::Inference => write!(f, "inference"),
         }
     }
@@ -84,8 +86,9 @@ impl std::str::FromStr for SourceType {
         match s {
             "official_docs" => Ok(Self::OfficialDocs),
             "user_statement" => Ok(Self::UserStatement),
+            "auto_extracted" => Ok(Self::AutoExtracted),
             "inference" => Ok(Self::Inference),
-            _ => Err(format!("Invalid source_type: {s}. Valid: official_docs, user_statement, inference")),
+            _ => Err(format!("Invalid source_type: {s}. Valid: official_docs, user_statement, auto_extracted, inference")),
         }
     }
 }
@@ -146,6 +149,7 @@ impl MemoryEntry {
         let source_mult = match self.source_type {
             SourceType::OfficialDocs => 1.0,
             SourceType::UserStatement => 0.85,
+            SourceType::AutoExtracted => 0.70,
             SourceType::Inference => 0.65,
         };
 
@@ -1802,6 +1806,54 @@ mod tests {
         let user = make_entry_at(now, 0, 0, 0, None, SourceType::UserStatement);
         let infer = make_entry_at(now, 0, 0, 0, None, SourceType::Inference);
         assert!(user.confidence_at(now) > infer.confidence_at(now), "user_statement should score higher than inference");
+    }
+
+    #[test]
+    fn test_confidence_new_auto_extracted() {
+        let now = 1000;
+        let entry = make_entry_at(now, 0, 0, 0, None, SourceType::AutoExtracted);
+        let conf = entry.confidence_at(now);
+        // belief=0.5, decay=1.0, source=0.70 → 0.35
+        assert!((conf - 0.35).abs() < 0.01, "New auto_extracted should be ~0.35, got {conf}");
+    }
+
+    #[test]
+    fn test_confidence_auto_extracted_90_day_stale() {
+        let created = 0;
+        let now = 90 * 86400;
+        let entry = make_entry_at(created, 0, 0, 0, None, SourceType::AutoExtracted);
+        let conf = entry.confidence_at(now);
+        // belief=0.5, decay=e^(-1)≈0.368, source=0.70 → ~0.129
+        assert!((conf - 0.129).abs() < 0.02, "90-day auto_extracted should be ~0.129, got {conf}");
+    }
+
+    #[test]
+    fn test_confidence_auto_extracted_after_confirmation() {
+        let now = 1000;
+        let entry = make_entry_at(now, 1, 0, 0, Some(now), SourceType::AutoExtracted);
+        let conf = entry.confidence_at(now);
+        // belief=2/3≈0.667, decay=1.0, source=0.70 → ~0.467
+        assert!((conf - 0.467).abs() < 0.01, "Confirmed auto_extracted should be ~0.467, got {conf}");
+    }
+
+    #[test]
+    fn test_confidence_auto_extracted_between_inference_and_user() {
+        let now = 1000;
+        let auto = make_entry_at(now, 0, 0, 0, None, SourceType::AutoExtracted);
+        let user = make_entry_at(now, 0, 0, 0, None, SourceType::UserStatement);
+        let infer = make_entry_at(now, 0, 0, 0, None, SourceType::Inference);
+        let conf_auto = auto.confidence_at(now);
+        let conf_user = user.confidence_at(now);
+        let conf_infer = infer.confidence_at(now);
+        assert!(conf_user > conf_auto, "user > auto_extracted: {conf_user} > {conf_auto}");
+        assert!(conf_auto > conf_infer, "auto_extracted > inference: {conf_auto} > {conf_infer}");
+    }
+
+    #[test]
+    fn test_source_type_auto_extracted_roundtrip() {
+        let parsed: SourceType = "auto_extracted".parse().unwrap();
+        assert_eq!(parsed, SourceType::AutoExtracted);
+        assert_eq!(parsed.to_string(), "auto_extracted");
     }
 
     // ==================== Confirm/Correct Tests ====================

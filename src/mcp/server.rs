@@ -1384,7 +1384,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
     );
 
     // Load memory warmup before starting server
-    let warmup_limit = 50; // TODO: get from memory config when added
+    let warmup_limit = full_config.memory.warmup_limit;
     let instructions = load_server_instructions(&root, warmup_limit);
 
     let server = McpServer::with_warmup(root.clone(), full_config, Some(instructions), code_ignore_patterns);

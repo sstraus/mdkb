@@ -19,6 +19,7 @@ pub struct ProposedCollection {
 const BUILTIN_CONVENTIONS: &[(&str, &str, &str)] = &[
     ("docs", "docs", "**/*.md"),
     ("archive", "archive", "**/*.md"),
+    ("stories", "stories", "**/*.md"),
 ];
 
 /// Detect collections based on directory conventions.
@@ -186,5 +187,14 @@ mod tests {
         assert!(proposals.iter().any(|p| p.name == "docs"));
         assert!(proposals.iter().any(|p| p.name == "archive"));
         assert!(proposals.iter().any(|p| p.name == "_root"));
+    }
+
+    #[test]
+    fn test_detect_stories_directory() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("stories")).unwrap();
+
+        let proposals = detect_conventions(tmp.path(), &[]);
+        assert!(proposals.iter().any(|p| p.name == "stories"));
     }
 }
