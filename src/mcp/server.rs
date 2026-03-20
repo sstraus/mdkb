@@ -1170,8 +1170,8 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Correct a memory entry — negative confidence signal.
-    #[tool(description = "Mark a memory entry as incorrect (lowers confidence score, optionally appends correction).")]
+    /// Correct a memory entry — positive confidence signal.
+    #[tool(description = "Correct a memory entry (boosts confidence, optionally appends correction text).")]
     async fn memory_correct(
         &self,
         Parameters(params): Parameters<MemoryCorrectParams>,
@@ -1832,12 +1832,12 @@ const BASE_INSTRUCTIONS: &str = "\
 | Exact text pattern (last resort) | Grep |
 | Browse memories | `memory_list()` |
 | Validate knowledge still correct | `memory_confirm(id)` |
-| Flag incorrect knowledge | `memory_correct(id, correction)` |
+| Correct and improve knowledge | `memory_correct(id, correction)` |
 | View revision history | `get(id, format=\"history\")` |
 
 Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after finding a symbol to trace callers or impact.
 
-Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Use `memory_confirm` when you verify knowledge is still accurate. Use `memory_correct` when you find errors.
+Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Both `memory_confirm` and `memory_correct` boost confidence. Use `memory_delete` to remove bad entries.
 
 When `get` shows \"History: N revisions (dates)\", use `get(id, format=\"history\")` to see diffs. Only manual entries (user_statement, official_docs) track revisions.
 ";

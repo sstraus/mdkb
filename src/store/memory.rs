@@ -350,9 +350,10 @@ pub fn confirm_entry(conn: &Connection, id: &str) -> Result<String> {
     }
 }
 
-/// Correct a memory entry — negative confidence signal.
+/// Correct a memory entry — positive confidence signal.
 ///
-/// Increments corrections counter. Optionally appends correction text.
+/// Correcting = improving the entry. Always boosts confidence.
+/// Optionally appends correction text. To remove bad entries, use delete.
 /// Returns error if entry is superseded or archived.
 pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> Result<String> {
     let entry = get_entry_without_tracking(conn, id)?
@@ -372,6 +373,7 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
 
     let now = Utc::now().timestamp();
 
+    // Correction = improving the entry → always boost confidence
     if let Some(text) = correction {
         // Validate correction size before allocating
         const MAX_CORRECTION_LEN: usize = MAX_CONTENT_SIZE / 2;
@@ -380,14 +382,12 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
                 format!("Correction text exceeds {MAX_CORRECTION_LEN} bytes")
             ).into());
         }
-        // Append correction to content
         let timestamp = chrono::DateTime::from_timestamp(now, 0)
             .map(|dt| dt.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "unknown".to_string());
         let correction_block = format!("\n\n## Correction ({})\n\n{}", timestamp, text);
         let new_content = format!("{}{}", entry.content, correction_block);
 
-        // Check content size limit
         if new_content.len() > MAX_CONTENT_SIZE {
             return Err(ErrorKind::InvalidQuery(
                 format!("Correction would exceed max content size ({MAX_CONTENT_SIZE} bytes)")
@@ -395,16 +395,16 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
         }
 
         conn.execute(
-            "UPDATE memory_entries SET corrections = corrections + 1, content = ?1, updated_at = ?2 WHERE id = ?3",
-            params![new_content, now, id],
+            "UPDATE memory_entries SET confirmations = confirmations + 1, last_confirmed_at = ?1, content = ?2, updated_at = ?1 WHERE id = ?3",
+            params![now, new_content, id],
         )?;
-        Ok(format!("Corrected: {id} (correction appended, {} corrections total)", entry.corrections + 1))
+        Ok(format!("Corrected: {id} (correction appended, confidence boosted)"))
     } else {
         conn.execute(
-            "UPDATE memory_entries SET corrections = corrections + 1, updated_at = ?1 WHERE id = ?2",
+            "UPDATE memory_entries SET confirmations = confirmations + 1, last_confirmed_at = ?1, updated_at = ?1 WHERE id = ?2",
             params![now, id],
         )?;
-        Ok(format!("Corrected: {id} ({} corrections total)", entry.corrections + 1))
+        Ok(format!("Corrected: {id} (confidence boosted)"))
     }
 }
 
@@ -2122,7 +2122,8 @@ mod tests {
         assert!(result.contains("Corrected"), "{result}");
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
-        assert_eq!(updated.corrections, 1);
+        assert_eq!(updated.confirmations, 1, "correct always boosts confidence");
+        assert_eq!(updated.corrections, 0, "corrections counter should not increment");
     }
 
     #[test]
@@ -2136,6 +2137,38 @@ mod tests {
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
         assert!(updated.content.contains("## Correction"), "Should have correction header");
         assert!(updated.content.contains("The API changed to v3"), "Should contain correction text");
+        assert_eq!(updated.confirmations, 1, "correction with text should boost confidence");
+        assert_eq!(updated.corrections, 0, "correction with text should not penalize");
+    }
+
+    #[test]
+    fn test_correct_with_text_boosts_confidence() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        correct_entry(&conn, "test", Some("The API changed to v3")).unwrap();
+
+        let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        // Correction WITH text should increment confirmations, not corrections
+        assert_eq!(updated.confirmations, 1, "should increment confirmations");
+        assert_eq!(updated.corrections, 0, "should NOT increment corrections");
+        assert!(updated.last_confirmed_at.is_some(), "should set last_confirmed_at");
+    }
+
+    #[test]
+    fn test_correct_without_text_boosts_confidence() {
+        let conn = setup_db();
+        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        correct_entry(&conn, "test", None).unwrap();
+
+        let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        // Correction always boosts confidence
+        assert_eq!(updated.confirmations, 1, "should increment confirmations");
+        assert_eq!(updated.corrections, 0, "should NOT increment corrections");
+        assert!(updated.last_confirmed_at.is_some(), "should set last_confirmed_at");
     }
 
     #[test]
