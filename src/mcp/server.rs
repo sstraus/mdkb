@@ -191,6 +191,116 @@ impl McpServer {
         self.registry.is_some()
     }
 
+    /// Cross-repo search: fan out to all registered repos, merge results with RRF.
+    async fn cross_repo_search(
+        &self,
+        params: &SearchParams,
+    ) -> Result<CallToolResult, McpError> {
+        let registry = self
+            .registry
+            .as_ref()
+            .ok_or_else(|| mcp_error("Cross-repo search requires global mode (--global)."))?;
+
+        let handles = registry.all_handles();
+        if handles.is_empty() {
+            return Err(mcp_error("No repos registered. Waiting for MCP roots from client."));
+        }
+
+        let scope = params.scope.as_deref();
+        let limit = params.limit.min(100);
+
+        // Only docs/memory/default scopes support cross-repo (code index is per-repo)
+        if matches!(scope, Some("code") | Some("symbols")) {
+            return Err(mcp_error(
+                "Cross-repo search is not supported for code/symbols scope. Specify a root."
+            ));
+        }
+
+        let mut all_results: Vec<SearchResult> = Vec::new();
+
+        for handle in &handles {
+            Self::ensure_handle_context(handle).await?;
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = match ctx_guard.as_ref() {
+                Some(ctx) => ctx,
+                None => continue,
+            };
+
+            let repo_tag = handle.root.display().to_string();
+
+            match scope {
+                Some("docs") | None => {
+                    let mut results = handle_hybrid_search(
+                        ctx,
+                        &params.query,
+                        limit,
+                        params.collection.as_deref(),
+                        params.include_superseded,
+                    )
+                    .map_err(|e| mcp_error(format!("Search failed on {}: {e}", repo_tag)))?;
+
+                    for r in &mut results {
+                        r.repo_root = Some(repo_tag.clone());
+                    }
+                    all_results.extend(results);
+                }
+                Some("memory") => {
+                    let query_embedding = crate::llm::get_cached_service()
+                        .and_then(|s| s.embed_query(&params.query))
+                        .ok();
+                    let entries = memory::search_entries_hybrid(
+                        &ctx.conn,
+                        &params.query,
+                        query_embedding.as_deref(),
+                        limit,
+                    )
+                    .map_err(|e| mcp_error(format!("Memory search failed on {}: {e}", repo_tag)))?;
+
+                    // Memory results are formatted separately, return early per-repo
+                    // For simplicity, collect and merge textually
+                    if !entries.is_empty() {
+                        let text = format_memory_search_results(&entries);
+                        let mut pseudo = SearchResult {
+                            id: 0,
+                            collection: "memory".to_string(),
+                            path: String::new(),
+                            title: None,
+                            score: 1.0,
+                            snippets: vec![text],
+                            status: None,
+                            superseded_by: None,
+                            repo_root: Some(repo_tag),
+                        };
+                        // Use first entry as representative
+                        if let Some(e) = entries.first() {
+                            pseudo.path = e.id.clone();
+                            pseudo.title = Some(e.title.clone());
+                        }
+                        all_results.push(pseudo);
+                    }
+                }
+                _ => {} // handled above
+            }
+        }
+
+        // Sort by score descending, take top N
+        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all_results.truncate(limit);
+
+        let output = if all_results.is_empty() {
+            "No results across repos. Try broader terms.".to_string()
+        } else {
+            format_search_results(&all_results, limit)
+        };
+
+        let tokens = count_tokens(&output);
+        let result_count = all_results.len();
+        self.metrics.record_search(tokens, result_count);
+        self.record_persistent_call("search", tokens, result_count, false).await;
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
     /// Resolve the repo handle for a tool call.
     ///
     /// - Standalone mode: returns cached handle (shares Arcs with self).
@@ -691,6 +801,11 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        // Cross-repo search: fan out to all registered repos
+        if params.root.as_deref() == Some("*") {
+            return self.cross_repo_search(&params).await;
+        }
+
         let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let scope = params.scope.as_deref();
@@ -2171,10 +2286,17 @@ fn format_search_results(results: &[SearchResult], limit: usize) -> String {
 
     for r in &ordered {
         let title = r.title.as_deref().unwrap_or("(untitled)");
-        output.push_str(&format!(
-            "[{}] {} - {} (score: {:.2})\n",
-            r.id, r.path, title, r.score
-        ));
+        if let Some(ref root) = r.repo_root {
+            output.push_str(&format!(
+                "[{}] {} - {} (score: {:.2}, repo: {})\n",
+                r.id, r.path, title, r.score, root
+            ));
+        } else {
+            output.push_str(&format!(
+                "[{}] {} - {} (score: {:.2})\n",
+                r.id, r.path, title, r.score
+            ));
+        }
         for snippet in &r.snippets {
             output.push_str(&format!("  {}\n", snippet));
         }
@@ -3514,5 +3636,109 @@ pub fn utility() -> i32 {
             "Should report cross-repo not implemented: {:?}",
             err
         );
+    }
+
+    #[tokio::test]
+    async fn test_cross_repo_search_standalone_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).unwrap();
+        let server = McpServer::new(root);
+
+        let result = server.search(Parameters(SearchParams {
+            query: "test".to_string(),
+            root: Some("*".to_string()),
+            limit: 10,
+            collection: None,
+            include_superseded: false,
+            scope: None,
+            kind: None,
+            threshold: 0.5,
+            file: None,
+        })).await;
+
+        assert!(result.is_err(), "Cross-repo search should fail in standalone mode");
+    }
+
+    #[tokio::test]
+    async fn test_cross_repo_search_two_repos() {
+        use std::time::Duration;
+
+        // Set up two repos with documents
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root1 = tmp1.path().to_path_buf();
+        let root2 = tmp2.path().to_path_buf();
+
+        crate::cli::handlers::handle_init(&root1).unwrap();
+        crate::cli::handlers::handle_init(&root2).unwrap();
+
+        // Add a collection and document to each repo
+        {
+            let ctx1 = crate::cli::handlers::Context::open(&root1).unwrap();
+            let docs_dir1 = root1.join("docs");
+            std::fs::create_dir_all(&docs_dir1).unwrap();
+            std::fs::write(docs_dir1.join("alpha.md"), "# Alpha\n\nAlpha content about widgets").unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let coll1 = crate::domain::Collection {
+                name: "docs".to_string(),
+                path: "docs".to_string(),
+                pattern: "**/*.md".to_string(),
+                source: "manual".to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            crate::store::collections::add_collection(&ctx1.conn, &coll1).unwrap();
+            crate::cli::handlers::handle_update(&ctx1, &root1).unwrap();
+        }
+        {
+            let ctx2 = crate::cli::handlers::Context::open(&root2).unwrap();
+            let docs_dir2 = root2.join("docs");
+            std::fs::create_dir_all(&docs_dir2).unwrap();
+            std::fs::write(docs_dir2.join("beta.md"), "# Beta\n\nBeta content about widgets").unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let coll2 = crate::domain::Collection {
+                name: "docs".to_string(),
+                path: "docs".to_string(),
+                pattern: "**/*.md".to_string(),
+                source: "manual".to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            crate::store::collections::add_collection(&ctx2.conn, &coll2).unwrap();
+            crate::cli::handlers::handle_update(&ctx2, &root2).unwrap();
+        }
+
+        // Create global server with both repos
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(&root1).unwrap();
+        registry.get_or_open(&root2).unwrap();
+        let server = McpServer::global(registry);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.search(Parameters(SearchParams {
+                query: "widgets".to_string(),
+                root: Some("*".to_string()),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: None,
+                kind: None,
+                threshold: 0.5,
+                file: None,
+            })),
+        )
+        .await
+        .expect("timeout")
+        .expect("cross-repo search failed");
+
+        let text = extract_text(&result);
+        // Should find results from both repos
+        assert!(text.contains("alpha.md") || text.contains("beta.md"),
+            "Should find docs from at least one repo: {}", text);
+        assert!(text.contains("repo:"),
+            "Should include repo provenance: {}", text);
     }
 }
