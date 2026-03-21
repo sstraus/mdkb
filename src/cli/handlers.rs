@@ -3437,7 +3437,17 @@ pub fn handle_code_reindex(
     let target = if paths.is_empty() {
         root.to_path_buf()
     } else {
-        root.join(&paths[0])
+        let candidate = root.join(&paths[0]);
+        let canonical = candidate.canonicalize()
+            .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", paths[0])))?;
+        let root_canonical = root.canonicalize()
+            .map_err(|e| Error::other(format!("Cannot resolve root: {e}")))?;
+        if !canonical.starts_with(&root_canonical) {
+            return Err(Error::other(format!(
+                "Path '{}' escapes project root", paths[0]
+            )));
+        }
+        canonical
     };
 
     let result = facade

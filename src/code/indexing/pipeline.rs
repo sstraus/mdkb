@@ -527,7 +527,7 @@ fn write_batch(
     // Build mapping from pipeline-assigned file IDs to real SQLite rowids.
     // The pipeline assigns sequential IDs (1,2,3...) but after incremental
     // reindex, SQLite rowids won't match (e.g. auto-incremented past old max).
-    let mut file_id_map: HashMap<u32, i64> = HashMap::new();
+    let mut file_id_map: HashMap<u32, i64> = HashMap::with_capacity(batch.file_registrations.len());
 
     for reg in &batch.file_registrations {
         let abs_path = reg.path.to_string_lossy();

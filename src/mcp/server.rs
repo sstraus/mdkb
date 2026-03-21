@@ -615,7 +615,10 @@ impl McpServer {
                             let code_limit = params.limit.min(5);
                             let mut results = facade
                                 .semantic_search(&params.query, code_limit, params.threshold)
-                                .map_err(|e| mcp_error(format!("Semantic code search failed: {e}")))?;
+                                .map_err(|e| {
+                                    tracing::error!("Semantic code search failed: {e}");
+                                    mcp_error("Semantic code search failed. The embedding model may not be installed — run `mdkb code index` to initialize.".to_string())
+                                })?;
 
                             // Apply kind filter
                             if let Some(ref kind_str) = params.kind {
