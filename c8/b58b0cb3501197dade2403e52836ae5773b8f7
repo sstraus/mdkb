@@ -1,0 +1,25 @@
+src/code/parsing/go/parser.rs
+  85bd9a3d45a1a2eb 1099,1101-1103,1128,1138,1151,1153-1155,1189,1199,1211,1213-1215,1278,1332,1344,1346-1348,1382,1392
+src/code/parsing/typescript/parser.rs
+  85bd9a3d45a1a2eb 815,817-819,851,861,874,876-878,917,927,1059,1061-1063,1102,1131,1143,1145-1147,1189,1199
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "c8b58b0cb3501197dade2403e52836ae5773b8f7",
+  "prompts": {
+    "85bd9a3d45a1a2eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "350327f9-77b1-4d12-887a-8725fc6aee42",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 48,
+      "total_deletions": 16,
+      "accepted_lines": 48,
+      "overriden_lines": 0
+    }
+  }
+}
