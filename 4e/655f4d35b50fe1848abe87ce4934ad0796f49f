@@ -1,0 +1,25 @@
+src/code/parsing/parser.rs
+  85bd9a3d45a1a2eb 19
+src/code/parsing/caching_parser.rs
+  85bd9a3d45a1a2eb 5-6,12-15,18-19,22-25,37,39-40,42-44,46,48-49,55,58,60-65,67
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "4e655f4d35b50fe1848abe87ce4934ad0796f49f",
+  "prompts": {
+    "85bd9a3d45a1a2eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "350327f9-77b1-4d12-887a-8725fc6aee42",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 31,
+      "overriden_lines": 0
+    }
+  }
+}
