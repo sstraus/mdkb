@@ -12,8 +12,12 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, EmptyObject, ErrorCode, Implementation, ServerCapabilities, ServerInfo,
 };
+use rmcp::service::NotificationContext;
+use rmcp::service::RoleServer;
 use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
+
+use crate::daemon::registry::RepoRegistry;
 
 use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update};
 use crate::code::indexing::IndexFacade;
@@ -67,6 +71,8 @@ pub struct McpServer {
     doc_reindex_active: Arc<AtomicBool>,
     /// True while startup code reindex is in progress (prevents concurrent facade creation).
     code_reindex_active: Arc<AtomicBool>,
+    /// Multi-repo registry for global mode. None in standalone mode.
+    registry: Option<Arc<RepoRegistry>>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -99,6 +105,7 @@ impl McpServer {
             code_ignore_patterns: Vec::new(),
             code_reindex_active: Arc::new(AtomicBool::new(false)),
             doc_reindex_active: Arc::new(AtomicBool::new(false)),
+            registry: None,
         }
     }
 
@@ -123,6 +130,67 @@ impl McpServer {
             code_ignore_patterns,
             code_reindex_active: Arc::new(AtomicBool::new(false)),
             doc_reindex_active: Arc::new(AtomicBool::new(false)),
+            registry: None,
+        }
+    }
+
+    /// Create a global-mode server with a RepoRegistry.
+    /// Roots are populated via MCP `roots/list` after handshake.
+    pub fn global(registry: Arc<RepoRegistry>) -> Self {
+        Self {
+            root: PathBuf::new(), // placeholder, not used in global mode
+            ctx: Arc::new(Mutex::new(None)),
+            code_index: Arc::new(Mutex::new(None)),
+            tool_router: Self::tool_router(),
+            metrics: Arc::new(UsageMetrics::new()),
+            config: McpConfig::default(),
+            session_id: Arc::new(AtomicI64::new(0)),
+            warmup_instructions: None,
+            full_config: crate::Config::default(),
+            code_ignore_patterns: Vec::new(),
+            code_reindex_active: Arc::new(AtomicBool::new(false)),
+            doc_reindex_active: Arc::new(AtomicBool::new(false)),
+            registry: Some(registry),
+        }
+    }
+
+    /// Whether this server is in global (multi-repo) mode.
+    pub fn is_global(&self) -> bool {
+        self.registry.is_some()
+    }
+
+    /// Query MCP roots from the client and register them in the registry.
+    async fn sync_roots_from_client(
+        &self,
+        context: &NotificationContext<RoleServer>,
+        registry: &RepoRegistry,
+    ) {
+        match context.peer.list_roots().await {
+            Ok(result) => {
+                for root in &result.roots {
+                    if let Some(path) = uri_to_path(&root.uri) {
+                        match registry.get_or_open(&path) {
+                            Ok(_) => {
+                                tracing::info!(
+                                    "Registered root from MCP client: {}",
+                                    path.display()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to register root {}: {e}",
+                                    path.display()
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!("Ignoring non-file root URI: {}", root.uri);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Client does not support roots/list: {e}");
+            }
         }
     }
 
@@ -1371,6 +1439,17 @@ fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
 }
 
 /// Resolve a document by path or ID.
+/// Convert a `file://` URI to a local filesystem path.
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let path_str = uri.strip_prefix("file://")?;
+    let path = PathBuf::from(path_str);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 fn resolve_document(conn: &rusqlite::Connection, path_or_id: &str) -> crate::error::Result<crate::domain::Document> {
     // Try to parse as ID first
     if let Ok(id) = path_or_id.parse::<i64>() {
@@ -1404,6 +1483,18 @@ impl ServerHandler for McpServer {
                 ..Default::default()
             },
             instructions: self.warmup_instructions.clone(),
+        }
+    }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        if let Some(registry) = &self.registry {
+            self.sync_roots_from_client(&context, registry).await;
+        }
+    }
+
+    async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
+        if let Some(registry) = &self.registry {
+            self.sync_roots_from_client(&context, registry).await;
         }
     }
 }
@@ -3159,5 +3250,36 @@ pub fn utility() -> i32 {
         // ctx should still be None (no new ctx created)
         let ctx_guard = server.ctx.lock().await;
         assert!(ctx_guard.is_none(), "ctx should remain None while reindex is active");
+    }
+
+    #[test]
+    fn test_uri_to_path_valid() {
+        let path = uri_to_path("file:///Users/me/project");
+        assert_eq!(path, Some(PathBuf::from("/Users/me/project")));
+    }
+
+    #[test]
+    fn test_uri_to_path_no_scheme() {
+        assert_eq!(uri_to_path("/Users/me/project"), None);
+    }
+
+    #[test]
+    fn test_uri_to_path_http_scheme() {
+        assert_eq!(uri_to_path("http://example.com"), None);
+    }
+
+    #[test]
+    fn test_global_constructor() {
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = std::sync::Arc::new(RepoRegistry::new(config));
+        let server = McpServer::global(registry);
+        assert!(server.is_global());
+    }
+
+    #[test]
+    fn test_standalone_not_global() {
+        let root = tempfile::TempDir::new().unwrap();
+        let server = McpServer::new(root.path().to_path_buf());
+        assert!(!server.is_global());
     }
 }
