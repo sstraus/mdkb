@@ -774,4 +774,41 @@ fn callee() {}
         let stats = index_files(&[], dir.path(), &db, &test_config()).unwrap();
         assert_eq!(stats.symbols_indexed, 0);
     }
+
+    /// Regression test: incremental index_files after deleting stale entries
+    /// must not trigger FOREIGN KEY constraint failures. The pipeline assigns
+    /// sequential IDs (1,2,3...) but after delete + re-insert, SQLite rowids
+    /// won't start at 1. write_batch must remap pipeline IDs to real rowids.
+    #[test]
+    fn test_incremental_index_after_delete_no_fk_violation() {
+        let dir = tempfile::tempdir().unwrap();
+        // Phase 1: initial index with several files to push rowids up
+        fs::write(dir.path().join("a.rs"), "pub fn aaa() { bbb(); }\nfn bbb() {}").unwrap();
+        fs::write(dir.path().join("b.rs"), "pub fn ccc() {}").unwrap();
+        fs::write(dir.path().join("c.rs"), "pub fn ddd() {}").unwrap();
+
+        let (_db_dir, db) = temp_db();
+        let stats1 = index_directory(dir.path(), &db, &test_config()).unwrap();
+        assert!(stats1.files_indexed >= 3);
+
+        // Phase 2: simulate incremental reindex — delete stale files, then re-index.
+        // This mimics what CodeIndexer::index_directory does for changed files.
+        let a_path = dir.path().join("a.rs").to_string_lossy().to_string();
+        let b_path = dir.path().join("b.rs").to_string_lossy().to_string();
+        // Delete symbols first (for FTS trigger), then files
+        db.conn().execute("DELETE FROM code_symbols WHERE file_id IN (SELECT id FROM code_files WHERE path IN (?1, ?2))", rusqlite::params![a_path, b_path]).unwrap();
+        db.conn().execute("DELETE FROM code_files WHERE path IN (?1, ?2)", rusqlite::params![a_path, b_path]).unwrap();
+
+        // Re-index the deleted files with modified content
+        fs::write(dir.path().join("a.rs"), "pub fn aaa_v2() { bbb_v2(); }\nfn bbb_v2() {}").unwrap();
+        fs::write(dir.path().join("b.rs"), "pub fn ccc_v2() {}").unwrap();
+
+        let paths = vec![dir.path().join("a.rs"), dir.path().join("b.rs")];
+        // This would fail with "FOREIGN KEY constraint failed" before the fix
+        let stats2 = index_files(&paths, dir.path(), &db, &test_config()).unwrap();
+
+        assert!(stats2.files_indexed >= 2);
+        assert!(stats2.symbols_indexed >= 3); // aaa_v2, bbb_v2, ccc_v2
+        assert!(db.file_count().unwrap() >= 3); // a, b (re-added) + c (untouched)
+    }
 }
