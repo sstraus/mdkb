@@ -118,7 +118,7 @@ impl std::fmt::Debug for RepoRegistry {
         f.debug_struct("RepoRegistry")
             .field("active", &self.handles.len())
             .field("max_active", &self.max_active)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
