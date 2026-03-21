@@ -106,10 +106,13 @@ impl IndexFacade {
             let mut changed = Vec::new();
 
             for path in &discovered {
-                let key = path.to_string_lossy().to_string();
+                let rel_key = path.strip_prefix(root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .to_string();
                 let current_mtime = hasher::file_mtime(path).unwrap_or(0);
 
-                match indexed_mtimes.get(&key) {
+                match indexed_mtimes.get(&rel_key) {
                     Some(&old) if old == current_mtime => {} // unchanged
                     _ => changed.push(path.clone()),
                 }
@@ -124,7 +127,7 @@ impl IndexFacade {
 
             // Delete stale entries for changed files
             for path in &changed {
-                self.delete_by_file(path)?;
+                self.delete_by_file(path, root)?;
             }
 
             pipeline::index_files(&changed, root, &self.db, &self.config)?
@@ -158,7 +161,7 @@ impl IndexFacade {
         Ok(stats)
     }
 
-    /// Get a map of absolute file path → content hash for all indexed files.
+    /// Get a map of relative file path → content hash for all indexed files.
     pub fn get_indexed_file_hashes(&self) -> HashMap<String, String> {
         self.db.get_file_hashes().unwrap_or_else(|e| {
             tracing::error!("Failed to read file hashes: {e}. All files will be treated as new.");
@@ -167,13 +170,19 @@ impl IndexFacade {
     }
 
     /// Delete a file and all its symbols/relationships from the index.
-    pub fn delete_by_file(&mut self, file_path: &Path) -> anyhow::Result<()> {
-        let abs_path = file_path.to_string_lossy().to_string();
+    ///
+    /// `file_path` is an absolute path; `root` is used to derive the relative
+    /// path key stored in the database.
+    pub fn delete_by_file(&mut self, file_path: &Path, root: &Path) -> anyhow::Result<()> {
+        let rel_path = file_path.strip_prefix(root)
+            .unwrap_or(file_path)
+            .to_string_lossy()
+            .to_string();
 
         // Collect symbol IDs before deleting (for embedding cleanup)
-        let symbol_ids = self.get_symbol_ids_for_path(file_path);
+        let symbol_ids = self.get_symbol_ids_for_path(&rel_path);
 
-        self.db.delete_by_file(&abs_path)?;
+        self.db.delete_by_file(&rel_path)?;
 
         // Only remove embeddings if semantic is already initialized;
         // avoid triggering lazy model load (~300-800 MB) for a delete operation.
@@ -190,15 +199,13 @@ impl IndexFacade {
         Ok(())
     }
 
-    /// Get symbol IDs for all symbols in a file.
-    fn get_symbol_ids_for_path(&self, file_path: &Path) -> HashSet<u32> {
-        let abs_path = file_path.to_string_lossy();
-        match self.db.get_symbol_ids_for_file(&abs_path) {
+    /// Get symbol IDs for all symbols in a file (by relative path key).
+    fn get_symbol_ids_for_path(&self, rel_path: &str) -> HashSet<u32> {
+        match self.db.get_symbol_ids_for_file(rel_path) {
             Ok(ids) => ids.into_iter().collect(),
             Err(e) => {
                 tracing::error!(
-                    "Failed to load symbol IDs for {}: {e}. Embeddings may be orphaned.",
-                    file_path.display()
+                    "Failed to load symbol IDs for {rel_path}: {e}. Embeddings may be orphaned.",
                 );
                 HashSet::new()
             }
@@ -217,9 +224,14 @@ impl IndexFacade {
         let mut deleted: Vec<PathBuf> = Vec::new();
 
         for path in paths {
+            let rel_key = path.strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+
             if !path.exists() {
                 // File deleted from disk
-                if indexed_hashes.contains_key(&path.to_string_lossy().to_string()) {
+                if indexed_hashes.contains_key(&rel_key) {
                     deleted.push(path.clone());
                 }
                 continue;
@@ -234,8 +246,7 @@ impl IndexFacade {
             };
             let current_hash = hasher::content_hash(&content);
 
-            let abs_key = path.to_string_lossy().to_string();
-            match indexed_hashes.get(&abs_key) {
+            match indexed_hashes.get(&rel_key) {
                 Some(old_hash) if *old_hash == current_hash => {
                     // Unchanged — skip
                 }
@@ -257,7 +268,7 @@ impl IndexFacade {
 
         // Delete old data for changed and deleted files
         for path in deleted.iter().chain(changed.iter()) {
-            self.delete_by_file(path)?;
+            self.delete_by_file(path, root)?;
         }
 
         // Re-index changed files
@@ -780,7 +791,7 @@ pub fn world() {
 
         // Delete the remove.rs file from the index
         let remove_path = src_dir.path().join("remove.rs");
-        facade.delete_by_file(&remove_path).unwrap();
+        facade.delete_by_file(&remove_path, src_dir.path()).unwrap();
 
         assert!(facade.get_symbol_by_name("keep_me").is_some(), "keep_me should survive");
         assert!(facade.get_symbol_by_name("remove_me").is_none(), "remove_me should be deleted");

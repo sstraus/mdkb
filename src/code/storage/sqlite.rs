@@ -111,7 +111,7 @@ impl CodeDb {
             .execute("DELETE FROM code_files WHERE path = ?1", [path])
     }
 
-    /// Get a map of (absolute_path -> content_hash) for all indexed files.
+    /// Get a map of (relative_path -> content_hash) for all indexed files.
     pub fn get_file_hashes(&self) -> rusqlite::Result<HashMap<String, String>> {
         let mut stmt = self.conn.prepare("SELECT path, hash FROM code_files")?;
         let rows = stmt.query_map([], |row| {
@@ -125,7 +125,7 @@ impl CodeDb {
         Ok(map)
     }
 
-    /// Retrieve stored mtimes keyed by absolute path.
+    /// Retrieve stored mtimes keyed by relative path.
     pub fn get_file_mtimes(&self) -> rusqlite::Result<HashMap<String, u64>> {
         let mut stmt = self
             .conn
@@ -282,14 +282,14 @@ impl CodeDb {
         rows.collect()
     }
 
-    /// Get symbol IDs for all symbols belonging to a file (by absolute path).
-    pub fn get_symbol_ids_for_file(&self, abs_path: &str) -> rusqlite::Result<Vec<u32>> {
+    /// Get symbol IDs for all symbols belonging to a file (by relative path).
+    pub fn get_symbol_ids_for_file(&self, rel_path: &str) -> rusqlite::Result<Vec<u32>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT s.id FROM code_symbols s \
              JOIN code_files f ON s.file_id = f.id \
              WHERE f.path = ?1",
         )?;
-        let rows = stmt.query_map(params![abs_path], |row| {
+        let rows = stmt.query_map(params![rel_path], |row| {
             let id: i64 = row.get(0)?;
             Ok(id as u32)
         })?;
@@ -532,7 +532,7 @@ mod tests {
 
     /// Insert a test file and return its rowid.
     fn insert_test_file(db: &CodeDb) -> i64 {
-        db.insert_file("/abs/test.rs", "test.rs", "hash123", Some("Rust"), None)
+        db.insert_file("test.rs", "test.rs", "hash123", Some("Rust"), None)
             .unwrap()
     }
 
@@ -574,7 +574,7 @@ mod tests {
         let path = dir.path().join("code.sqlite");
         {
             let db = CodeDb::create(&path).unwrap();
-            db.insert_file("/a", "a", "h", None, None).unwrap();
+            db.insert_file("a", "a", "h", None, None).unwrap();
         }
         let db = CodeDb::open_or_create(&path).unwrap();
         assert_eq!(db.file_count().unwrap(), 1);
@@ -584,7 +584,7 @@ mod tests {
     fn test_insert_file() {
         let (_dir, db) = temp_db();
         let id = db
-            .insert_file("/abs/main.rs", "main.rs", "abc", Some("Rust"), Some(12345))
+            .insert_file("main.rs", "main.rs", "abc", Some("Rust"), Some(12345))
             .unwrap();
         assert!(id > 0);
         assert_eq!(db.file_count().unwrap(), 1);
@@ -593,25 +593,25 @@ mod tests {
     #[test]
     fn test_insert_file_replaces_on_conflict() {
         let (_dir, db) = temp_db();
-        db.insert_file("/abs/main.rs", "main.rs", "hash1", None, None)
+        db.insert_file("main.rs", "main.rs", "hash1", None, None)
             .unwrap();
-        db.insert_file("/abs/main.rs", "main.rs", "hash2", None, None)
+        db.insert_file("main.rs", "main.rs", "hash2", None, None)
             .unwrap();
         assert_eq!(db.file_count().unwrap(), 1);
         let hashes = db.get_file_hashes().unwrap();
-        assert_eq!(hashes.get("/abs/main.rs").unwrap(), "hash2");
+        assert_eq!(hashes.get("main.rs").unwrap(), "hash2");
     }
 
     #[test]
     fn test_get_file_hashes() {
         let (_dir, db) = temp_db();
-        db.insert_file("/a", "a", "h1", None, None).unwrap();
-        db.insert_file("/b", "b", "h2", None, None).unwrap();
+        db.insert_file("a", "a", "h1", None, None).unwrap();
+        db.insert_file("b", "b", "h2", None, None).unwrap();
 
         let hashes = db.get_file_hashes().unwrap();
         assert_eq!(hashes.len(), 2);
-        assert_eq!(hashes.get("/a").unwrap(), "h1");
-        assert_eq!(hashes.get("/b").unwrap(), "h2");
+        assert_eq!(hashes.get("a").unwrap(), "h1");
+        assert_eq!(hashes.get("b").unwrap(), "h2");
     }
 
     #[test]
@@ -622,7 +622,7 @@ mod tests {
             .unwrap();
         assert_eq!(db.symbol_count().unwrap(), 1);
 
-        let deleted = db.delete_by_file("/abs/test.rs").unwrap();
+        let deleted = db.delete_by_file("test.rs").unwrap();
         assert_eq!(deleted, 1);
         assert_eq!(db.file_count().unwrap(), 0);
         assert_eq!(db.symbol_count().unwrap(), 0);
@@ -858,7 +858,7 @@ mod tests {
         assert_eq!(db.symbol_count().unwrap(), 1);
         assert_eq!(db.relationship_count().unwrap(), 1);
 
-        db.delete_by_file("/abs/test.rs").unwrap();
+        db.delete_by_file("test.rs").unwrap();
         assert_eq!(db.symbol_count().unwrap(), 0);
         assert_eq!(db.relationship_count().unwrap(), 0);
     }
@@ -883,14 +883,14 @@ mod tests {
     #[test]
     fn test_get_file_mtimes() {
         let (_dir, db) = temp_db();
-        db.insert_file("/a", "a", "h1", None, Some(1000)).unwrap();
-        db.insert_file("/b", "b", "h2", None, Some(2000)).unwrap();
-        db.insert_file("/c", "c", "h3", None, None).unwrap();
+        db.insert_file("a", "a", "h1", None, Some(1000)).unwrap();
+        db.insert_file("b", "b", "h2", None, Some(2000)).unwrap();
+        db.insert_file("c", "c", "h3", None, None).unwrap();
 
         let mtimes = db.get_file_mtimes().unwrap();
-        assert_eq!(mtimes.len(), 2); // /c excluded (NULL mtime)
-        assert_eq!(mtimes["/a"], 1000);
-        assert_eq!(mtimes["/b"], 2000);
+        assert_eq!(mtimes.len(), 2); // "c" excluded (NULL mtime)
+        assert_eq!(mtimes["a"], 1000);
+        assert_eq!(mtimes["b"], 2000);
     }
 
     #[test]
@@ -905,7 +905,7 @@ mod tests {
         assert_eq!(results.len(), 1);
 
         // Delete the file (which deletes symbols first, firing FTS5 triggers)
-        db.delete_by_file("/abs/test.rs").unwrap();
+        db.delete_by_file("test.rs").unwrap();
 
         // FTS5 should no longer find it
         let results = db.search_symbols("Archive", 10).unwrap();
@@ -959,12 +959,12 @@ mod tests {
     fn test_insert_file_upsert_preserves_symbols() {
         // ON CONFLICT DO UPDATE should not cascade-delete symbols
         let (_dir, db) = temp_db();
-        let file_id = db.insert_file("/abs/main.rs", "main.rs", "hash1", Some("Rust"), None).unwrap();
+        let file_id = db.insert_file("main.rs", "main.rs", "hash1", Some("Rust"), None).unwrap();
         db.insert_symbol("my_fn", "Function", file_id, "main.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
         assert_eq!(db.symbol_count().unwrap(), 1);
 
         // Upsert the same file with a new hash
-        db.insert_file("/abs/main.rs", "main.rs", "hash2", Some("Rust"), None).unwrap();
+        db.insert_file("main.rs", "main.rs", "hash2", Some("Rust"), None).unwrap();
 
         // Symbol should still exist (not cascade-deleted by INSERT OR REPLACE)
         assert_eq!(db.symbol_count().unwrap(), 1);
@@ -1013,7 +1013,7 @@ mod tests {
     fn test_delete_by_file_nonexistent() {
         let (_dir, db) = temp_db();
         // Should not error when deleting a file that doesn't exist
-        let deleted = db.delete_by_file("/nonexistent").unwrap();
+        let deleted = db.delete_by_file("nonexistent").unwrap();
         assert_eq!(deleted, 0);
     }
 }

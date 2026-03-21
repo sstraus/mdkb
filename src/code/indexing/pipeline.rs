@@ -530,9 +530,8 @@ fn write_batch(
     let mut file_id_map: HashMap<u32, i64> = HashMap::with_capacity(batch.file_registrations.len());
 
     for reg in &batch.file_registrations {
-        let abs_path = reg.path.to_string_lossy();
         let real_id = db.insert_file(
-            &abs_path,
+            &reg.rel_path,
             &reg.rel_path,
             &reg.content_hash,
             Some(reg.language.config_key()),
@@ -797,8 +796,8 @@ fn callee() {}
 
         // Phase 2: simulate incremental reindex — delete stale files, then re-index.
         // This mimics what CodeIndexer::index_directory does for changed files.
-        let a_path = dir.path().join("a.rs").to_string_lossy().to_string();
-        let b_path = dir.path().join("b.rs").to_string_lossy().to_string();
+        let a_path = "a.rs";
+        let b_path = "b.rs";
         // Delete symbols first (for FTS trigger), then files
         db.conn().execute("DELETE FROM code_symbols WHERE file_id IN (SELECT id FROM code_files WHERE path IN (?1, ?2))", rusqlite::params![a_path, b_path]).unwrap();
         db.conn().execute("DELETE FROM code_files WHERE path IN (?1, ?2)", rusqlite::params![a_path, b_path]).unwrap();
