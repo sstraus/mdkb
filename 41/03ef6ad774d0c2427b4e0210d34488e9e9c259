@@ -1,0 +1,27 @@
+src/code/indexing/pipeline.rs
+  85bd9a3d45a1a2eb 530
+src/mcp/server.rs
+  85bd9a3d45a1a2eb 618-621
+src/cli/handlers.rs
+  85bd9a3d45a1a2eb 3440-3450
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "4103ef6ad774d0c2427b4e0210d34488e9e9c259",
+  "prompts": {
+    "85bd9a3d45a1a2eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "350327f9-77b1-4d12-887a-8725fc6aee42",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 16,
+      "total_deletions": 3,
+      "accepted_lines": 16,
+      "overriden_lines": 0
+    }
+  }
+}
