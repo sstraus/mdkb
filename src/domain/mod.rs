@@ -125,6 +125,10 @@ pub struct SearchResult {
     /// Path of document that superseded this one, if any.
     #[serde(default)]
     pub superseded_by: Option<String>,
+
+    /// Repository root path (set in daemon mode for cross-repo search provenance).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<String>,
 }
 
 /// Index status information.

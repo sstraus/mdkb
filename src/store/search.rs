@@ -84,6 +84,7 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
             snippets: vec![],
             status: row.get(5)?,
             superseded_by: None,
+                repo_root: None,
         })
     };
 

@@ -2050,6 +2050,7 @@ mod tests {
             snippets: vec!["...matching text...".to_string()],
             status: None,
             superseded_by: None,
+                repo_root: None,
         }];
         let output = format_search_results(&results, 10);
         assert!(output.contains("[1] readme.md"), "Should show path without collection prefix, got: {output}");
@@ -2069,6 +2070,7 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                repo_root: None,
             },
             SearchResult {
                 id: 20,
@@ -2079,6 +2081,7 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                repo_root: None,
             },
         ];
         let output = format_search_results(&results, 10);
@@ -2098,6 +2101,7 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                repo_root: None,
             },
             SearchResult {
                 id: 2,
@@ -2108,6 +2112,7 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                repo_root: None,
             },
         ];
         let output = format_search_results(&results, 10);

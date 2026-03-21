@@ -732,6 +732,7 @@ pub fn search_entries_hybrid(
             snippets: vec![],
             status: None,
             superseded_by: None,
+                repo_root: None,
         })
         .collect();
 

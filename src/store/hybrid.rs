@@ -122,6 +122,7 @@ mod tests {
             snippets: vec![],
             status: None,
             superseded_by: None,
+            repo_root: None,
         }
     }
 
