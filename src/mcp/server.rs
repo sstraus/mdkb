@@ -452,8 +452,8 @@ impl McpServer {
     }
 
     /// Retrieve multiple documents by comma-separated IDs/paths/slugs.
-    async fn get_batch(&self, ids: &str, lines: &Option<String>) -> Result<CallToolResult, McpError> {
-        let ctx_guard = self.ctx.lock().await;
+    async fn get_batch(&self, handle: &RepoHandle, ids: &str, lines: &Option<String>) -> Result<CallToolResult, McpError> {
+        let ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -526,13 +526,13 @@ impl McpServer {
     }
 
     /// Retrieve multiple documents matching a glob pattern.
-    async fn get_glob(&self, pattern: &str) -> Result<CallToolResult, McpError> {
+    async fn get_glob(&self, handle: &RepoHandle, pattern: &str) -> Result<CallToolResult, McpError> {
         let doc_limit = self.config.max_document_tokens;
         let truncate_ellipsis = self.config.truncate_with_ellipsis;
         let max_response_tokens = self.config.max_response_tokens;
 
         let (output, result_count) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -691,13 +691,13 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let scope = params.scope.as_deref();
         let limit = params.limit.min(100); // Cap to prevent unbounded result sets
 
         let (output, tokens, result_count) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -793,7 +793,7 @@ impl McpServer {
                     drop(ctx_guard);
 
                     {
-                        let mut idx_guard = self.acquire_code_index().await?;
+                        let mut idx_guard = Self::acquire_handle_code_index(&handle).await?;
                         let facade = match idx_guard.as_mut() {
                             Some(f) => f,
                             None => {
@@ -805,7 +805,7 @@ impl McpServer {
 
                         if scope == Some("code") {
                             // Check if semantic search is enabled
-                            if !self.full_config.code.semantic_search.enabled {
+                            if !handle.config.code.semantic_search.enabled {
                                 return Err(mcp_error(
                                     "Semantic code search is disabled. Enable it in mdkb.toml: [code.semantic_search] enabled = true, then re-index.".to_string(),
                                 ));
@@ -906,21 +906,21 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GetParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let id = &params.id;
 
         // Comma-separated list → batch retrieve
         if id.contains(',') {
-            return self.get_batch(id, &params.lines).await;
+            return self.get_batch(&handle, id, &params.lines).await;
         }
 
         // Glob pattern → batch retrieve by pattern
         if id.contains('*') || id.contains('?') {
-            return self.get_glob(id).await;
+            return self.get_glob(&handle, id).await;
         }
 
-        let ctx_guard = self.ctx.lock().await;
+        let ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1048,10 +1048,10 @@ impl McpServer {
         &self,
         Parameters(_): Parameters<EmptyObject>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(None).await?;
 
         let mut output = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1087,7 +1087,7 @@ impl McpServer {
         }; // ctx_guard dropped here
 
         // Always show code index stats (initialize if needed)
-        if let Ok(idx_guard) = self.acquire_code_index().await {
+        if let Ok(idx_guard) = Self::acquire_handle_code_index(&handle).await {
             if let Some(facade) = idx_guard.as_ref() {
                 let symbols = facade.symbol_count();
                 let files = facade.file_count();
@@ -1116,16 +1116,16 @@ impl McpServer {
         &self,
         Parameters(_): Parameters<EmptyObject>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(None).await?;
 
         // Phase 1: Reindex documents (markdown collections)
         let doc_output = {
-            let mut ctx_guard = self.ctx.lock().await;
+            let mut ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_mut()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            let result = handle_update(ctx, &self.root)
+            let result = handle_update(ctx, &handle.root)
                 .map_err(|e| mcp_error(format!("Document update failed: {}", e)))?;
 
             format!(
@@ -1136,9 +1136,9 @@ impl McpServer {
 
         // Phase 2: Reindex source code (tree-sitter + SQLite)
         let code_output = {
-            let mut idx_guard = self.acquire_code_index().await?;
+            let mut idx_guard = Self::acquire_handle_code_index(&handle).await?;
             if let Some(facade) = idx_guard.as_mut() {
-                match facade.reindex(&self.root) {
+                match facade.reindex(&handle.root) {
                     Ok(stats) => {
                         format!(
                             "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
@@ -1161,9 +1161,9 @@ impl McpServer {
                 std::env::var("HOME").unwrap_or_default(),
             )
             .join(".claude/projects");
-            let project_root = self.root.to_string_lossy().to_string();
+            let project_root = handle.root.to_string_lossy().to_string();
 
-            let mut ctx_guard = self.ctx.lock().await;
+            let mut ctx_guard = handle.ctx.lock().await;
             if let Some(ctx) = ctx_guard.as_mut() {
                 match handle_session_index(ctx, &sessions_base, &project_root) {
                     Ok(sr) if sr.added > 0 || sr.updated > 0 => {
@@ -1198,10 +1198,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryWriteParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1328,10 +1328,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryDeleteParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1360,10 +1360,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryConfirmParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1384,10 +1384,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryCorrectParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1408,13 +1408,13 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryListParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let sort: memory::MemorySortOrder = params.sort.parse()
             .map_err(|e: String| mcp_error(e))?;
 
         let (output, tokens, count) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1464,8 +1464,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<CodeGraphParams>,
     ) -> Result<CallToolResult, McpError> {
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
+
         let output = {
-            let idx_guard = self.acquire_code_index().await?;
+            let idx_guard = Self::acquire_handle_code_index(&handle).await?;
             let facade = match idx_guard.as_ref() {
                 Some(f) => f,
                 None => {
