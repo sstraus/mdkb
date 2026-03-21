@@ -29,9 +29,9 @@ pub struct RepoHandle {
     /// Unix timestamp of last access (for LRU eviction).
     pub last_access: AtomicI64,
     /// True while startup doc/session reindex holds ctx.
-    pub doc_reindex_active: AtomicBool,
+    pub doc_reindex_active: Arc<AtomicBool>,
     /// True while startup code reindex is in progress.
-    pub code_reindex_active: AtomicBool,
+    pub code_reindex_active: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RepoHandle {
@@ -67,9 +67,32 @@ impl RepoHandle {
             config,
             code_ignore_patterns,
             last_access: AtomicI64::new(now_unix()),
-            doc_reindex_active: AtomicBool::new(false),
-            code_reindex_active: AtomicBool::new(false),
+            doc_reindex_active: Arc::new(AtomicBool::new(false)),
+            code_reindex_active: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    /// Create a handle from pre-existing shared state (for standalone mode).
+    /// The Arcs are shared with McpServer so startup reindex flags stay in sync.
+    pub fn from_shared(
+        root: PathBuf,
+        ctx: Arc<Mutex<Option<Context>>>,
+        code_index: Arc<Mutex<Option<IndexFacade>>>,
+        config: Config,
+        code_ignore_patterns: Vec<String>,
+        doc_reindex_active: Arc<AtomicBool>,
+        code_reindex_active: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            root,
+            ctx,
+            code_index,
+            config,
+            code_ignore_patterns,
+            last_access: AtomicI64::new(now_unix()),
+            doc_reindex_active,
+            code_reindex_active,
+        }
     }
 
     /// Touch the last_access timestamp (called on each tool invocation).
@@ -334,6 +357,36 @@ mod tests {
 
         let handles = registry.all_handles();
         assert_eq!(handles.len(), 2);
+    }
+
+    #[test]
+    fn test_repo_handle_from_shared() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let ctx = Arc::new(Mutex::new(None));
+        let code_index = Arc::new(Mutex::new(None));
+        let doc_flag = Arc::new(AtomicBool::new(false));
+        let code_flag = Arc::new(AtomicBool::new(false));
+
+        let handle = RepoHandle::from_shared(
+            root.clone(),
+            ctx.clone(),
+            code_index.clone(),
+            Config::default(),
+            Vec::new(),
+            doc_flag.clone(),
+            code_flag.clone(),
+        );
+
+        // Shared Arcs point to same underlying data
+        assert!(Arc::ptr_eq(&handle.ctx, &ctx));
+        assert!(Arc::ptr_eq(&handle.code_index, &code_index));
+        assert!(Arc::ptr_eq(&handle.doc_reindex_active, &doc_flag));
+        assert!(Arc::ptr_eq(&handle.code_reindex_active, &code_flag));
+
+        // Mutating via one Arc is visible through the other
+        doc_flag.store(true, Ordering::Relaxed);
+        assert!(handle.doc_reindex_active.load(Ordering::Relaxed));
     }
 
     #[test]
