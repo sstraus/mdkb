@@ -30,6 +30,7 @@ use mdkb::cli::journal::JournalImportResult;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
 use mdkb::mcp::server::run_server;
+use rmcp::ServiceExt;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -233,24 +234,47 @@ async fn main() -> Result<()> {
             let result = handle_embed(&ctx)?;
             format_embed_result(&result, cli.format);
         }
-        Command::Serve { http, https, bind, token } => {
-            let transport = if https {
-                mdkb::mcp::server::TransportMode::Https {
-                    bind: bind.unwrap_or_else(|| "127.0.0.1:8443".to_string()),
-                    token,
-                }
-            } else if http {
-                mdkb::mcp::server::TransportMode::Http {
-                    bind: bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
-                    token,
-                }
+        Command::Serve { http, https, bind, token, global } => {
+            if global {
+                // Global mode: single process serving multiple repos via MCP roots
+                let daemon_config = mdkb::DaemonConfig::load_or_default(
+                    &mdkb::DaemonConfig::config_path(),
+                )?;
+                let registry = std::sync::Arc::new(
+                    mdkb::daemon::registry::RepoRegistry::new(daemon_config),
+                );
+                let server = mdkb::mcp::server::McpServer::global(registry);
+
+                tracing::info!("Starting mdkb MCP server in global mode (stdio)...");
+                let (stdin, stdout) = rmcp::transport::io::stdio();
+                let service = server
+                    .serve((stdin, stdout))
+                    .await
+                    .map_err(|e| mdkb::Error::other(format!("Failed to start server: {e}")))?;
+                service
+                    .waiting()
+                    .await
+                    .map_err(|e| mdkb::Error::other(format!("Server error: {e}")))?;
             } else {
-                if bind.is_some() || token.is_some() {
-                    eprintln!("Warning: --bind and --token are only used with --http or --https");
-                }
-                mdkb::mcp::server::TransportMode::Stdio
-            };
-            run_server(cwd, transport).await?;
+                // Standalone mode: single repo from cwd (existing behavior)
+                let transport = if https {
+                    mdkb::mcp::server::TransportMode::Https {
+                        bind: bind.unwrap_or_else(|| "127.0.0.1:8443".to_string()),
+                        token,
+                    }
+                } else if http {
+                    mdkb::mcp::server::TransportMode::Http {
+                        bind: bind.unwrap_or_else(|| "127.0.0.1:8080".to_string()),
+                        token,
+                    }
+                } else {
+                    if bind.is_some() || token.is_some() {
+                        eprintln!("Warning: --bind and --token are only used with --http or --https");
+                    }
+                    mdkb::mcp::server::TransportMode::Stdio
+                };
+                run_server(cwd, transport).await?;
+            }
         }
         Command::Stats { sessions, aggregate } => {
             let ctx = Context::open(&cwd)?;
