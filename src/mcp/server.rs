@@ -2348,6 +2348,7 @@ mod tests {
             entry_type: "topic".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         }))
         .await
         .expect("Failed to write memory entry");
@@ -2356,7 +2357,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             server.memory_delete(Parameters(MemoryDeleteParams {
-                id: "test-delete-me".to_string(),
+                id: "test-delete-me".to_string(),            root: None,
             })),
         )
         .await;
@@ -2374,7 +2375,7 @@ mod tests {
         let get_result = server
             .get(Parameters(GetParams {
                 id: "test-delete-me".to_string(),
-                lines: None, format: None,
+                lines: None, format: None,            root: None,
             }))
             .await;
         assert!(get_result.is_err(), "get should fail for deleted memory entry");
@@ -2382,7 +2383,7 @@ mod tests {
         // Deleting nonexistent entry should report not found
         let result = server
             .memory_delete(Parameters(MemoryDeleteParams {
-                id: "nonexistent".to_string(),
+                id: "nonexistent".to_string(),            root: None,
             }))
             .await
             .expect("Should not error");
@@ -2414,11 +2415,12 @@ mod tests {
             entry_type: "topic".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         })))
         .await.expect("timeout").expect("memory_write failed");
 
         tokio::time::timeout(timeout, server.memory_delete(Parameters(MemoryDeleteParams {
-            id: "deadlock-test".to_string(),
+            id: "deadlock-test".to_string(),            root: None,
         })))
         .await.expect("timeout").expect("memory_delete failed");
 
@@ -2447,7 +2449,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "nonexistent".to_string(),
-            lines: None, format: None,
+            lines: None, format: None,            root: None,
         })).await;
 
         let msg = extract_error_msg(result);
@@ -2463,7 +2465,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "999999".to_string(),
-            lines: None, format: None,
+            lines: None, format: None,            root: None,
         })).await;
 
         let msg = extract_error_msg(result);
@@ -2485,7 +2487,7 @@ mod tests {
             scope: None,
             kind: None,
             file: None,
-            threshold: 0.3,
+            threshold: 0.3,            root: None,
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
@@ -2501,7 +2503,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "nonexistent/**/*.md".to_string(),
-            lines: None, format: None,
+            lines: None, format: None,            root: None,
         })).await.expect("get with glob should not error");
 
         let text = extract_text(&result);
@@ -2523,7 +2525,7 @@ mod tests {
             scope: Some("memory".to_string()),
             kind: None,
             file: None,
-            threshold: 0.3,
+            threshold: 0.3,            root: None,
         })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
@@ -2538,7 +2540,7 @@ mod tests {
         let server = McpServer::new(root);
 
         let result = server.memory_delete(Parameters(MemoryDeleteParams {
-            id: "nonexistent-entry".to_string(),
+            id: "nonexistent-entry".to_string(),            root: None,
         })).await.expect("memory_delete should not error");
 
         let text = extract_text(&result);
@@ -2555,7 +2557,7 @@ mod tests {
 
         let result = server.memory_list(Parameters(MemoryListParams {
             limit: 20,
-            sort: "recent".to_string(),
+            sort: "recent".to_string(),            root: None,
         })).await.expect("memory_list should not error");
 
         let text = extract_text(&result);
@@ -2577,6 +2579,7 @@ mod tests {
             entry_type: "topic".to_string(),
             tags: vec!["tag1".to_string()],
             source_type: "user_statement".to_string(),
+            root: None,
         })).await.expect("write A");
 
         server.memory_write(Parameters(MemoryWriteParams {
@@ -2586,11 +2589,12 @@ mod tests {
             entry_type: "problem".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         })).await.expect("write B");
 
         let result = server.memory_list(Parameters(MemoryListParams {
             limit: 20,
-            sort: "newest".to_string(),
+            sort: "newest".to_string(),            root: None,
         })).await.expect("memory_list should not error");
 
         let text = extract_text(&result);
@@ -2608,7 +2612,7 @@ mod tests {
 
         let result = server.memory_list(Parameters(MemoryListParams {
             limit: 20,
-            sort: "invalid".to_string(),
+            sort: "invalid".to_string(),            root: None,
         })).await;
 
         assert!(result.is_err(), "Should error on invalid sort");
@@ -2700,7 +2704,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2722,7 +2726,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2743,7 +2747,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: Some("struct".to_string()),
                 file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols kind=struct failed");
 
@@ -2765,7 +2769,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 file: Some("lib.rs".to_string()),
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols file=lib.rs failed");
 
@@ -2787,7 +2791,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: Some("invalid_kind".to_string()),
                 file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout");
 
@@ -2807,7 +2811,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2824,7 +2828,7 @@ pub fn utility() -> i32 {
                 name: "process_data".to_string(),
                 direction: "calls".to_string(),
                 symbol_id: None,
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout").expect("code_graph direction=calls failed");
 
@@ -2845,7 +2849,7 @@ pub fn utility() -> i32 {
                 name: "process_data".to_string(),
                 direction: "callers".to_string(),
                 symbol_id: None,
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout").expect("code_graph direction=callers failed");
 
@@ -2866,7 +2870,7 @@ pub fn utility() -> i32 {
                 name: "validate".to_string(),
                 direction: "impact".to_string(),
                 symbol_id: None,
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout").expect("code_graph direction=impact failed");
 
@@ -2892,7 +2896,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2923,7 +2927,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2935,7 +2939,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed (second call)");
 
@@ -2953,7 +2957,7 @@ pub fn utility() -> i32 {
                 name: "nonexistent_fn".to_string(),
                 direction: "calls".to_string(),
                 symbol_id: None,
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout");
 
@@ -2974,7 +2978,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2992,7 +2996,7 @@ pub fn utility() -> i32 {
                 name: "main".to_string(),
                 direction: "calls".to_string(),
                 symbol_id: Some(sym_id),
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout").expect("code_graph with ID failed");
 
@@ -3085,6 +3089,7 @@ pub fn utility() -> i32 {
             entry_type: "topic".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         })).await.expect("write should succeed");
 
         // Get access_count after creation
@@ -3103,6 +3108,7 @@ pub fn utility() -> i32 {
             entry_type: "topic".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         })).await.expect("update should succeed");
 
         // access_count must not have changed
