@@ -520,27 +520,40 @@ fn write_batch(
     batch: &IndexBatch,
     stats: &mut IndexStats,
 ) -> anyhow::Result<()> {
+    // Build mapping from pipeline-assigned file IDs to real SQLite rowids.
+    // The pipeline assigns sequential IDs (1,2,3...) but after incremental
+    // reindex, SQLite rowids won't match (e.g. auto-incremented past old max).
+    let mut file_id_map: HashMap<u32, i64> = HashMap::new();
+
     for reg in &batch.file_registrations {
         let abs_path = reg.path.to_string_lossy();
-        db.insert_file(
+        let real_id = db.insert_file(
             &abs_path,
             &reg.rel_path,
             &reg.content_hash,
             Some(reg.language.config_key()),
             Some(reg.mtime as i64),
         )?;
+        file_id_map.insert(reg.file_id.value(), real_id);
         stats.files_discovered += 1;
         stats.files_indexed += 1;
     }
 
+    // Map pipeline symbol IDs to real SQLite rowids
+    let mut symbol_id_map: HashMap<u32, i64> = HashMap::with_capacity(batch.symbols.len());
+
     for (symbol, _path) in &batch.symbols {
+        let real_file_id = file_id_map
+            .get(&symbol.file_id.value())
+            .copied()
+            .unwrap_or(i64::from(symbol.file_id.value()));
         let scope_json = symbol.scope_context.as_ref().and_then(|sc| {
             serde_json::to_string(sc).ok()
         });
-        db.insert_symbol(
+        let real_sym_id = db.insert_symbol(
             symbol.as_name(),
             &symbol.kind.to_string(),
-            i64::from(symbol.file_id.value()),
+            real_file_id,
             &symbol.file_path,
             symbol.range.start_line,
             Some(symbol.range.start_column),
@@ -552,18 +565,26 @@ fn write_batch(
             symbol.as_module_path(),
             scope_json.as_deref(),
         )?;
+        symbol_id_map.insert(symbol.id.value(), real_sym_id);
         stats.symbols_indexed += 1;
     }
 
-    // Write relationships directly to SQLite (no longer "unresolved")
+    // Write relationships, remapping both file_id and from_symbol_id
     for rel in &batch.unresolved_relationships {
+        let real_file_id = file_id_map
+            .get(&rel.file_id.value())
+            .copied()
+            .unwrap_or(i64::from(rel.file_id.value()));
+        let real_from_id = rel.from_id.and_then(|id| {
+            symbol_id_map.get(&id.value()).copied()
+        });
         let to_range = rel.to_range.as_ref();
         db.insert_relationship(
-            rel.from_id.map(|id| i64::from(id.value())),
+            real_from_id,
             &rel.from_name,
             &rel.to_name,
             &rel.kind.to_string(),
-            i64::from(rel.file_id.value()),
+            real_file_id,
             to_range.map(|r| r.start_line),
             to_range.map(|r| r.start_column),
         )?;
