@@ -1096,7 +1096,11 @@ impl GoParser {
         code: &'a str,
         current_function: Option<&'a str>,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         let function_context = if node.kind() == "function_declaration"
             || node.kind() == "method_declaration"
             || node.kind() == "func_literal"
@@ -1121,7 +1125,7 @@ impl GoParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_calls_recursive(&child, code, function_context, calls);
+            self.extract_calls_recursive(&child, code, function_context, calls, depth + 1);
         }
     }
 
@@ -1131,7 +1135,7 @@ impl GoParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.extract_calls_recursive(&tree.root_node(), code, None, &mut calls);
+        self.extract_calls_recursive(&tree.root_node(), code, None, &mut calls, 0);
         calls
     }
 
@@ -1144,7 +1148,11 @@ impl GoParser {
         code: &str,
         current_function: Option<&str>,
         calls: &mut Vec<MethodCall>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         let function_context = if node.kind() == "function_declaration"
             || node.kind() == "method_declaration"
             || node.kind() == "func_literal"
@@ -1178,7 +1186,7 @@ impl GoParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_method_calls_recursive(&child, code, function_context, calls);
+            self.extract_method_calls_recursive(&child, code, function_context, calls, depth + 1);
         }
     }
 
@@ -1188,7 +1196,7 @@ impl GoParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.extract_method_calls_recursive(&tree.root_node(), code, None, &mut calls);
+        self.extract_method_calls_recursive(&tree.root_node(), code, None, &mut calls, 0);
         calls
     }
 
@@ -1200,7 +1208,11 @@ impl GoParser {
         node: &Node,
         code: &'a str,
         uses: &mut Vec<(&'a str, &'a str, Range)>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         match node.kind() {
             "function_declaration" | "method_declaration" => {
                 let context_name = node
@@ -1263,7 +1275,7 @@ impl GoParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_type_uses_recursive(&child, code, uses);
+            self.extract_type_uses_recursive(&child, code, uses, depth + 1);
         }
     }
 
@@ -1317,7 +1329,7 @@ impl GoParser {
             None => return Vec::new(),
         };
         let mut uses = Vec::new();
-        self.extract_type_uses_recursive(&tree.root_node(), code, &mut uses);
+        self.extract_type_uses_recursive(&tree.root_node(), code, &mut uses, 0);
         uses
     }
 
@@ -1329,7 +1341,11 @@ impl GoParser {
         node: &Node,
         code: &'a str,
         defines: &mut Vec<(&'a str, &'a str, Range)>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         match node.kind() {
             "interface_type" => {
                 let interface_name = "interface";
@@ -1363,7 +1379,7 @@ impl GoParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_method_defines_recursive(&child, code, defines);
+            self.extract_method_defines_recursive(&child, code, defines, depth + 1);
         }
     }
 
@@ -1373,7 +1389,7 @@ impl GoParser {
             None => return Vec::new(),
         };
         let mut defines = Vec::new();
-        self.extract_method_defines_recursive(&tree.root_node(), code, &mut defines);
+        self.extract_method_defines_recursive(&tree.root_node(), code, &mut defines, 0);
         defines
     }
 }

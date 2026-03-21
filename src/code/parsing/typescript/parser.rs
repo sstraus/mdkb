@@ -812,7 +812,11 @@ impl TypeScriptParser {
         code: &'a str,
         current_fn: Option<&'a str>,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         let fn_ctx = match node.kind() {
             "function_declaration" | "generator_function_declaration"
             | "method_declaration" => {
@@ -844,7 +848,7 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_calls_recursive(&child, code, fn_ctx, calls);
+            self.extract_calls_recursive(&child, code, fn_ctx, calls, depth + 1);
         }
     }
 
@@ -854,7 +858,7 @@ impl TypeScriptParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.extract_calls_recursive(&tree.root_node(), code, None, &mut calls);
+        self.extract_calls_recursive(&tree.root_node(), code, None, &mut calls, 0);
         calls
     }
 
@@ -867,7 +871,11 @@ impl TypeScriptParser {
         code: &str,
         current_fn: Option<&str>,
         calls: &mut Vec<MethodCall>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         let fn_ctx = match node.kind() {
             "function_declaration" | "generator_function_declaration"
             | "method_declaration" => {
@@ -906,7 +914,7 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_method_calls_recursive(&child, code, fn_ctx, calls);
+            self.extract_method_calls_recursive(&child, code, fn_ctx, calls, depth + 1);
         }
     }
 
@@ -916,7 +924,7 @@ impl TypeScriptParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.extract_method_calls_recursive(&tree.root_node(), code, None, &mut calls);
+        self.extract_method_calls_recursive(&tree.root_node(), code, None, &mut calls, 0);
         calls
     }
 
@@ -1048,7 +1056,11 @@ impl TypeScriptParser {
         node: &Node,
         code: &'a str,
         uses: &mut Vec<(&'a str, &'a str, Range)>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         match node.kind() {
             "function_declaration" | "method_definition" => {
                 let ctx = node
@@ -1087,7 +1099,7 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_type_uses_recursive(&child, code, uses);
+            self.extract_type_uses_recursive(&child, code, uses, depth + 1);
         }
     }
 
@@ -1116,7 +1128,7 @@ impl TypeScriptParser {
             None => return Vec::new(),
         };
         let mut uses = Vec::new();
-        self.extract_type_uses_recursive(&tree.root_node(), code, &mut uses);
+        self.extract_type_uses_recursive(&tree.root_node(), code, &mut uses, 0);
         uses
     }
 
@@ -1128,7 +1140,11 @@ impl TypeScriptParser {
         node: &Node,
         code: &'a str,
         defines: &mut Vec<(&'a str, &'a str, Range)>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         match node.kind() {
             "interface_declaration" => {
                 let iface_name = node
@@ -1170,7 +1186,7 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_method_defines_recursive(&child, code, defines);
+            self.extract_method_defines_recursive(&child, code, defines, depth + 1);
         }
     }
 
@@ -1180,7 +1196,7 @@ impl TypeScriptParser {
             None => return Vec::new(),
         };
         let mut defines = Vec::new();
-        self.extract_method_defines_recursive(&tree.root_node(), code, &mut defines);
+        self.extract_method_defines_recursive(&tree.root_node(), code, &mut defines, 0);
         defines
     }
 }
