@@ -17,7 +17,7 @@ use rmcp::service::RoleServer;
 use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
 
-use crate::daemon::registry::RepoRegistry;
+use crate::daemon::registry::{RepoHandle, RepoRegistry};
 
 use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update};
 use crate::code::indexing::IndexFacade;
@@ -73,6 +73,8 @@ pub struct McpServer {
     code_reindex_active: Arc<AtomicBool>,
     /// Multi-repo registry for global mode. None in standalone mode.
     registry: Option<Arc<RepoRegistry>>,
+    /// Cached standalone handle (wraps self's Arcs). None in global mode.
+    standalone_handle: Option<Arc<RepoHandle>>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -92,20 +94,35 @@ impl McpServer {
 
     /// Create a new MCP server with custom config.
     pub fn with_config(root: PathBuf, config: McpConfig) -> Self {
+        let ctx = Arc::new(Mutex::new(None));
+        let code_index = Arc::new(Mutex::new(None));
+        let doc_reindex_active = Arc::new(AtomicBool::new(false));
+        let code_reindex_active = Arc::new(AtomicBool::new(false));
+        let full_config = crate::Config::default();
+        let standalone_handle = Arc::new(RepoHandle::from_shared(
+            root.clone(),
+            ctx.clone(),
+            code_index.clone(),
+            full_config.clone(),
+            Vec::new(),
+            doc_reindex_active.clone(),
+            code_reindex_active.clone(),
+        ));
         Self {
             root,
-            ctx: Arc::new(Mutex::new(None)),
-            code_index: Arc::new(Mutex::new(None)),
+            ctx,
+            code_index,
             tool_router: Self::tool_router(),
             metrics: Arc::new(UsageMetrics::new()),
             config,
             session_id: Arc::new(AtomicI64::new(0)),
             warmup_instructions: None,
-            full_config: crate::Config::default(),
+            full_config,
             code_ignore_patterns: Vec::new(),
-            code_reindex_active: Arc::new(AtomicBool::new(false)),
-            doc_reindex_active: Arc::new(AtomicBool::new(false)),
+            code_reindex_active,
+            doc_reindex_active,
             registry: None,
+            standalone_handle: Some(standalone_handle),
         }
     }
 
@@ -117,10 +134,23 @@ impl McpServer {
         code_ignore_patterns: Vec<String>,
     ) -> Self {
         let config = full_config.mcp.clone();
+        let ctx = Arc::new(Mutex::new(None));
+        let code_index = Arc::new(Mutex::new(None));
+        let doc_reindex_active = Arc::new(AtomicBool::new(false));
+        let code_reindex_active = Arc::new(AtomicBool::new(false));
+        let standalone_handle = Arc::new(RepoHandle::from_shared(
+            root.clone(),
+            ctx.clone(),
+            code_index.clone(),
+            full_config.clone(),
+            code_ignore_patterns.clone(),
+            doc_reindex_active.clone(),
+            code_reindex_active.clone(),
+        ));
         Self {
             root,
-            ctx: Arc::new(Mutex::new(None)),
-            code_index: Arc::new(Mutex::new(None)),
+            ctx,
+            code_index,
             tool_router: Self::tool_router(),
             metrics: Arc::new(UsageMetrics::new()),
             config,
@@ -128,9 +158,10 @@ impl McpServer {
             warmup_instructions: warmup,
             full_config,
             code_ignore_patterns,
-            code_reindex_active: Arc::new(AtomicBool::new(false)),
-            doc_reindex_active: Arc::new(AtomicBool::new(false)),
+            code_reindex_active,
+            doc_reindex_active,
             registry: None,
+            standalone_handle: Some(standalone_handle),
         }
     }
 
@@ -151,12 +182,113 @@ impl McpServer {
             code_reindex_active: Arc::new(AtomicBool::new(false)),
             doc_reindex_active: Arc::new(AtomicBool::new(false)),
             registry: Some(registry),
+            standalone_handle: None, // global mode uses registry instead
         }
     }
 
     /// Whether this server is in global (multi-repo) mode.
     pub fn is_global(&self) -> bool {
         self.registry.is_some()
+    }
+
+    /// Resolve the repo handle for a tool call.
+    ///
+    /// - Standalone mode: returns cached handle (shares Arcs with self).
+    /// - Global mode, `root` = None, 1 registered repo: auto-selects it.
+    /// - Global mode, `root` = None, N > 1 repos: error listing available roots.
+    /// - Global mode, `root` = Some(path): resolves from registry.
+    /// - `root` = "*": reserved for cross-repo search (not yet implemented).
+    async fn resolve_handle(&self, root: Option<&str>) -> Result<Arc<RepoHandle>, McpError> {
+        if let Some(registry) = &self.registry {
+            // Global mode: resolve from registry
+            let handle = match root {
+                None => {
+                    let handles = registry.all_handles();
+                    match handles.len() {
+                        0 => return Err(mcp_error(
+                            "No repos registered. Waiting for MCP roots from client."
+                        )),
+                        1 => handles.into_iter().next().unwrap(),
+                        _ => {
+                            let roots: Vec<_> = registry
+                                .list()
+                                .into_iter()
+                                .map(|(p, _)| p.display().to_string())
+                                .collect();
+                            return Err(mcp_error(format!(
+                                "Multiple repos registered. Specify root: {}",
+                                roots.join(", ")
+                            )));
+                        }
+                    }
+                }
+                Some("*") => {
+                    return Err(mcp_error(
+                        "Cross-repo search (root=\"*\") not yet implemented."
+                    ));
+                }
+                Some(path) => {
+                    registry.get_or_open(Path::new(path))
+                        .map_err(|e| mcp_error(format!("{e}")))?
+                }
+            };
+            Self::ensure_handle_context(&handle).await?;
+            Ok(handle)
+        } else {
+            // Standalone mode: use cached handle that shares self's Arcs
+            let handle = self
+                .standalone_handle
+                .as_ref()
+                .expect("standalone_handle must be set in non-global mode");
+            self.ensure_context().await?;
+            Ok(Arc::clone(handle))
+        }
+    }
+
+    /// Initialize database context on a RepoHandle (global mode).
+    /// Auto-creates `.mdkb/` if it doesn't exist.
+    async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> {
+        let mut ctx_guard = handle.ctx.lock().await;
+        if ctx_guard.is_none() {
+            if handle.doc_reindex_active.load(Ordering::Relaxed) {
+                return Err(mcp_error("Repo initializing, retry shortly"));
+            }
+            let ctx = match Context::open(&handle.root) {
+                Ok(ctx) => ctx,
+                Err(e) if e.is_not_found() => {
+                    tracing::info!("Auto-initializing mdkb at {}", handle.root.display());
+                    Context::init(&handle.root)
+                        .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {e}")))?
+                }
+                Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
+            };
+            *ctx_guard = Some(ctx);
+        }
+        Ok(())
+    }
+
+    /// Acquire the code index lock on a RepoHandle, lazily initializing if needed.
+    async fn acquire_handle_code_index(
+        handle: &RepoHandle,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<IndexFacade>>, McpError> {
+        if handle.code_reindex_active.load(Ordering::Relaxed) {
+            return Ok(handle.code_index.lock().await);
+        }
+        let mut idx_guard = handle.code_index.lock().await;
+        if idx_guard.is_none() {
+            let index_path = handle.root.join(".mdkb/code.sqlite");
+            let mut facade = IndexFacade::open_or_create(&index_path)
+                .map_err(|e| mcp_error(format!("Failed to open code index: {e}")))?;
+            if !handle.code_ignore_patterns.is_empty() {
+                let config = crate::code::indexing::pipeline::PipelineConfig {
+                    ignore_patterns: handle.code_ignore_patterns.clone(),
+                    ..Default::default()
+                };
+                facade = facade.with_config(config);
+            }
+            *idx_guard = Some(facade);
+        }
+        Ok(idx_guard)
     }
 
     /// Query MCP roots from the client and register them in the registry.
@@ -3281,5 +3413,104 @@ pub fn utility() -> i32 {
         let root = tempfile::TempDir::new().unwrap();
         let server = McpServer::new(root.path().to_path_buf());
         assert!(!server.is_global());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_standalone_shares_arcs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).unwrap();
+        let server = McpServer::new(root);
+
+        let handle = server.resolve_handle(None).await.unwrap();
+        // The handle's ctx and code_index must be the SAME Arcs as the server's
+        assert!(Arc::ptr_eq(&handle.ctx, &server.ctx));
+        assert!(Arc::ptr_eq(&handle.code_index, &server.code_index));
+        assert!(Arc::ptr_eq(&handle.doc_reindex_active, &server.doc_reindex_active));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_global_single_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(&root).unwrap();
+
+        let server = McpServer::global(Arc::clone(&registry));
+        // No root param, 1 root registered → auto-selects
+        let handle = server.resolve_handle(None).await.unwrap();
+        assert_eq!(handle.root, root.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_global_no_roots() {
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+
+        let server = McpServer::global(registry);
+        let err = server.resolve_handle(None).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("No repos registered"),
+            "Should error on empty registry: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_global_multiple_roots_no_param() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp1.path().join(".mdkb")).unwrap();
+        std::fs::create_dir_all(tmp2.path().join(".mdkb")).unwrap();
+
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(tmp1.path()).unwrap();
+        registry.get_or_open(tmp2.path()).unwrap();
+
+        let server = McpServer::global(registry);
+        let err = server.resolve_handle(None).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("Multiple repos"),
+            "Should error listing roots: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_global_specific_root() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp1.path().join(".mdkb")).unwrap();
+        std::fs::create_dir_all(tmp2.path().join(".mdkb")).unwrap();
+
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(tmp1.path()).unwrap();
+        registry.get_or_open(tmp2.path()).unwrap();
+
+        let server = McpServer::global(registry);
+        let handle = server
+            .resolve_handle(Some(tmp2.path().to_str().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(handle.root, tmp2.path().canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_cross_repo_not_implemented() {
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        let server = McpServer::global(registry);
+
+        let err = server.resolve_handle(Some("*")).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("Cross-repo"),
+            "Should report cross-repo not implemented: {:?}",
+            err
+        );
     }
 }
