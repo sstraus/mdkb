@@ -246,6 +246,7 @@ pub fn handle_vsearch(
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                repo_root: None,
             });
 
             // Stop once we have enough results
@@ -342,6 +343,7 @@ pub fn handle_hybrid_search(
                 snippets: vec![],
                 status: doc.status.clone(),
                 superseded_by: bm25.and_then(|r| r.superseded_by.clone()),
+                repo_root: None,
             });
 
             // Stop once we have enough results

@@ -119,6 +119,11 @@ pub enum Command {
         /// Bearer token for authentication (required for HTTP/HTTPS)
         #[arg(long, env = "MDKB_TOKEN")]
         token: Option<String>,
+
+        /// Global mode: serve multiple repos, discover roots via MCP roots/list protocol.
+        /// Config loaded from ~/.mdkb/daemon.toml (whitelist, max_active_repos).
+        #[arg(long)]
+        global: bool,
     },
 
     /// Show usage statistics

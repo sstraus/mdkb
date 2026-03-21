@@ -9,6 +9,10 @@ pub struct SearchParams {
     /// Search query text.
     pub query: String,
 
+    /// Repository root path (daemon mode). Omit for default/standalone repo. Use "*" for cross-repo search.
+    #[serde(default)]
+    pub root: Option<String>,
+
     /// Maximum number of results (default: 10).
     #[serde(default = "default_limit")]
     pub limit: usize,
@@ -49,6 +53,10 @@ pub struct GetParams {
     /// Document ID, path, or memory slug.
     pub id: String,
 
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
+
     /// Optional line range (e.g., "10:50").
     #[serde(default)]
     pub lines: Option<String>,
@@ -63,6 +71,10 @@ pub struct GetParams {
 pub struct MemoryWriteParams {
     /// Entry ID (slug, e.g., "auth-oauth2-flow").
     pub id: String,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
 
     /// Concise title (max 50 chars).
     pub title: String,
@@ -96,6 +108,10 @@ fn default_source_type() -> String {
 pub struct MemoryConfirmParams {
     /// Memory entry ID.
     pub id: String,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
 }
 
 /// Parameters for the memory_correct tool.
@@ -103,6 +119,10 @@ pub struct MemoryConfirmParams {
 pub struct MemoryCorrectParams {
     /// Memory entry ID.
     pub id: String,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
 
     /// Optional correction text (appended under ## Correction header).
     #[serde(default)]
@@ -114,11 +134,19 @@ pub struct MemoryCorrectParams {
 pub struct MemoryDeleteParams {
     /// Memory entry ID.
     pub id: String,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
 }
 
 /// Parameters for the memory_list tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct MemoryListParams {
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
+
     /// Maximum entries to return (default: 20).
     #[serde(default = "default_memory_list_limit")]
     pub limit: usize,
@@ -145,6 +173,10 @@ fn default_memory_list_sort() -> String {
 pub struct CodeGraphParams {
     /// Symbol name to look up.
     pub name: String,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
 
     /// Graph direction: "calls" (default, outgoing), "callers" (incoming), or "impact" (transitive).
     #[serde(default = "default_direction")]
@@ -299,6 +331,65 @@ mod tests {
         assert_eq!(params.direction, "impact");
         assert_eq!(params.symbol_id, Some(1));
         assert_eq!(params.max_depth, 5);
+    }
+
+    // --- Root parameter backward compatibility tests ---
+
+    #[test]
+    fn test_search_params_root_absent() {
+        let json = r#"{"query": "test"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert!(params.root.is_none());
+    }
+
+    #[test]
+    fn test_search_params_root_present() {
+        let json = r#"{"query": "test", "root": "/repos/projectA"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.root.as_deref(), Some("/repos/projectA"));
+    }
+
+    #[test]
+    fn test_search_params_root_cross_repo() {
+        let json = r#"{"query": "test", "root": "*"}"#;
+        let params: SearchParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.root.as_deref(), Some("*"));
+    }
+
+    #[test]
+    fn test_get_params_root_absent() {
+        let json = r#"{"id": "readme.md"}"#;
+        let params: GetParams = serde_json::from_str(json).unwrap();
+        assert!(params.root.is_none());
+    }
+
+    #[test]
+    fn test_get_params_root_present() {
+        let json = r#"{"id": "readme.md", "root": "/repos/projectA"}"#;
+        let params: GetParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.root.as_deref(), Some("/repos/projectA"));
+    }
+
+    #[test]
+    fn test_memory_write_params_root() {
+        let json = r#"{"id": "test", "title": "t", "content": "c", "root": "/foo"}"#;
+        let params: MemoryWriteParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.root.as_deref(), Some("/foo"));
+    }
+
+    #[test]
+    fn test_memory_list_params_root() {
+        let json = r#"{"root": "/bar"}"#;
+        let params: MemoryListParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.root.as_deref(), Some("/bar"));
+    }
+
+    #[test]
+    fn test_code_graph_params_root() {
+        let json = r#"{"name": "main", "root": "/project"}"#;
+        let params: CodeGraphParams = serde_json::from_str(json).unwrap();
+        assert_eq!(params.root.as_deref(), Some("/project"));
+        assert!(params.symbol_id.is_none());
     }
 
 }

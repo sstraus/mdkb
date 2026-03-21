@@ -16,7 +16,7 @@ use tree_sitter::Node;
 ///
 /// Each language (Rust, Go, TypeScript, Python, ...) implements this
 /// trait to extract symbols and relationships from source code.
-pub trait LanguageParser: Send + Sync {
+pub trait LanguageParser: Send {
     /// Parse source code and extract symbols.
     fn parse(
         &mut self,

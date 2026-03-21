@@ -12,8 +12,12 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, EmptyObject, ErrorCode, Implementation, ServerCapabilities, ServerInfo,
 };
+use rmcp::service::NotificationContext;
+use rmcp::service::RoleServer;
 use rmcp::{ErrorData as McpError, tool, tool_handler, tool_router};
 use tokio::sync::Mutex;
+
+use crate::daemon::registry::{RepoHandle, RepoRegistry};
 
 use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update};
 use crate::code::indexing::IndexFacade;
@@ -67,6 +71,10 @@ pub struct McpServer {
     doc_reindex_active: Arc<AtomicBool>,
     /// True while startup code reindex is in progress (prevents concurrent facade creation).
     code_reindex_active: Arc<AtomicBool>,
+    /// Multi-repo registry for global mode. None in standalone mode.
+    registry: Option<Arc<RepoRegistry>>,
+    /// Cached standalone handle (wraps self's Arcs). None in global mode.
+    standalone_handle: Option<Arc<RepoHandle>>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -86,19 +94,35 @@ impl McpServer {
 
     /// Create a new MCP server with custom config.
     pub fn with_config(root: PathBuf, config: McpConfig) -> Self {
+        let ctx = Arc::new(Mutex::new(None));
+        let code_index = Arc::new(Mutex::new(None));
+        let doc_reindex_active = Arc::new(AtomicBool::new(false));
+        let code_reindex_active = Arc::new(AtomicBool::new(false));
+        let full_config = crate::Config::default();
+        let standalone_handle = Arc::new(RepoHandle::from_shared(
+            root.clone(),
+            ctx.clone(),
+            code_index.clone(),
+            full_config.clone(),
+            Vec::new(),
+            doc_reindex_active.clone(),
+            code_reindex_active.clone(),
+        ));
         Self {
             root,
-            ctx: Arc::new(Mutex::new(None)),
-            code_index: Arc::new(Mutex::new(None)),
+            ctx,
+            code_index,
             tool_router: Self::tool_router(),
             metrics: Arc::new(UsageMetrics::new()),
             config,
             session_id: Arc::new(AtomicI64::new(0)),
             warmup_instructions: None,
-            full_config: crate::Config::default(),
+            full_config,
             code_ignore_patterns: Vec::new(),
-            code_reindex_active: Arc::new(AtomicBool::new(false)),
-            doc_reindex_active: Arc::new(AtomicBool::new(false)),
+            code_reindex_active,
+            doc_reindex_active,
+            registry: None,
+            standalone_handle: Some(standalone_handle),
         }
     }
 
@@ -110,10 +134,23 @@ impl McpServer {
         code_ignore_patterns: Vec<String>,
     ) -> Self {
         let config = full_config.mcp.clone();
+        let ctx = Arc::new(Mutex::new(None));
+        let code_index = Arc::new(Mutex::new(None));
+        let doc_reindex_active = Arc::new(AtomicBool::new(false));
+        let code_reindex_active = Arc::new(AtomicBool::new(false));
+        let standalone_handle = Arc::new(RepoHandle::from_shared(
+            root.clone(),
+            ctx.clone(),
+            code_index.clone(),
+            full_config.clone(),
+            code_ignore_patterns.clone(),
+            doc_reindex_active.clone(),
+            code_reindex_active.clone(),
+        ));
         Self {
             root,
-            ctx: Arc::new(Mutex::new(None)),
-            code_index: Arc::new(Mutex::new(None)),
+            ctx,
+            code_index,
             tool_router: Self::tool_router(),
             metrics: Arc::new(UsageMetrics::new()),
             config,
@@ -121,8 +158,281 @@ impl McpServer {
             warmup_instructions: warmup,
             full_config,
             code_ignore_patterns,
+            code_reindex_active,
+            doc_reindex_active,
+            registry: None,
+            standalone_handle: Some(standalone_handle),
+        }
+    }
+
+    /// Create a global-mode server with a RepoRegistry.
+    /// Roots are populated via MCP `roots/list` after handshake.
+    pub fn global(registry: Arc<RepoRegistry>) -> Self {
+        Self {
+            root: PathBuf::new(), // placeholder, not used in global mode
+            ctx: Arc::new(Mutex::new(None)),
+            code_index: Arc::new(Mutex::new(None)),
+            tool_router: Self::tool_router(),
+            metrics: Arc::new(UsageMetrics::new()),
+            config: McpConfig::default(),
+            session_id: Arc::new(AtomicI64::new(0)),
+            warmup_instructions: None,
+            full_config: crate::Config::default(),
+            code_ignore_patterns: Vec::new(),
             code_reindex_active: Arc::new(AtomicBool::new(false)),
             doc_reindex_active: Arc::new(AtomicBool::new(false)),
+            registry: Some(registry),
+            standalone_handle: None, // global mode uses registry instead
+        }
+    }
+
+    /// Whether this server is in global (multi-repo) mode.
+    pub fn is_global(&self) -> bool {
+        self.registry.is_some()
+    }
+
+    /// Cross-repo search: fan out to all registered repos, merge results with RRF.
+    async fn cross_repo_search(
+        &self,
+        params: &SearchParams,
+    ) -> Result<CallToolResult, McpError> {
+        let registry = self
+            .registry
+            .as_ref()
+            .ok_or_else(|| mcp_error("Cross-repo search requires global mode (--global)."))?;
+
+        let handles = registry.all_handles();
+        if handles.is_empty() {
+            return Err(mcp_error("No repos registered. Waiting for MCP roots from client."));
+        }
+
+        let scope = params.scope.as_deref();
+        let limit = params.limit.min(100);
+
+        // Only docs/memory/default scopes support cross-repo (code index is per-repo)
+        if matches!(scope, Some("code") | Some("symbols")) {
+            return Err(mcp_error(
+                "Cross-repo search is not supported for code/symbols scope. Specify a root."
+            ));
+        }
+
+        let mut all_results: Vec<SearchResult> = Vec::new();
+
+        for handle in &handles {
+            Self::ensure_handle_context(handle).await?;
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = match ctx_guard.as_ref() {
+                Some(ctx) => ctx,
+                None => continue,
+            };
+
+            let repo_tag = handle.root.display().to_string();
+
+            match scope {
+                Some("docs") | None => {
+                    let mut results = handle_hybrid_search(
+                        ctx,
+                        &params.query,
+                        limit,
+                        params.collection.as_deref(),
+                        params.include_superseded,
+                    )
+                    .map_err(|e| mcp_error(format!("Search failed on {}: {e}", repo_tag)))?;
+
+                    for r in &mut results {
+                        r.repo_root = Some(repo_tag.clone());
+                    }
+                    all_results.extend(results);
+                }
+                Some("memory") => {
+                    let query_embedding = crate::llm::get_cached_service()
+                        .and_then(|s| s.embed_query(&params.query))
+                        .ok();
+                    let entries = memory::search_entries_hybrid(
+                        &ctx.conn,
+                        &params.query,
+                        query_embedding.as_deref(),
+                        limit,
+                    )
+                    .map_err(|e| mcp_error(format!("Memory search failed on {}: {e}", repo_tag)))?;
+
+                    // Memory results are formatted separately, return early per-repo
+                    // For simplicity, collect and merge textually
+                    if !entries.is_empty() {
+                        let text = format_memory_search_results(&entries);
+                        let mut pseudo = SearchResult {
+                            id: 0,
+                            collection: "memory".to_string(),
+                            path: String::new(),
+                            title: None,
+                            score: 1.0,
+                            snippets: vec![text],
+                            status: None,
+                            superseded_by: None,
+                            repo_root: Some(repo_tag),
+                        };
+                        // Use first entry as representative
+                        if let Some(e) = entries.first() {
+                            pseudo.path = e.id.clone();
+                            pseudo.title = Some(e.title.clone());
+                        }
+                        all_results.push(pseudo);
+                    }
+                }
+                _ => {} // handled above
+            }
+        }
+
+        // Sort by score descending, take top N
+        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all_results.truncate(limit);
+
+        let output = if all_results.is_empty() {
+            "No results across repos. Try broader terms.".to_string()
+        } else {
+            format_search_results(&all_results, limit)
+        };
+
+        let tokens = count_tokens(&output);
+        let result_count = all_results.len();
+        self.metrics.record_search(tokens, result_count);
+        self.record_persistent_call("search", tokens, result_count, false).await;
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Resolve the repo handle for a tool call.
+    ///
+    /// - Standalone mode: returns cached handle (shares Arcs with self).
+    /// - Global mode, `root` = None, 1 registered repo: auto-selects it.
+    /// - Global mode, `root` = None, N > 1 repos: error listing available roots.
+    /// - Global mode, `root` = Some(path): resolves from registry.
+    /// - `root` = "*": reserved for cross-repo search (not yet implemented).
+    async fn resolve_handle(&self, root: Option<&str>) -> Result<Arc<RepoHandle>, McpError> {
+        if let Some(registry) = &self.registry {
+            // Global mode: resolve from registry
+            let handle = match root {
+                None => {
+                    let handles = registry.all_handles();
+                    match handles.len() {
+                        0 => return Err(mcp_error(
+                            "No repos registered. Waiting for MCP roots from client."
+                        )),
+                        1 => handles.into_iter().next().unwrap(),
+                        _ => {
+                            let roots: Vec<_> = registry
+                                .list()
+                                .into_iter()
+                                .map(|(p, _)| p.display().to_string())
+                                .collect();
+                            return Err(mcp_error(format!(
+                                "Multiple repos registered. Specify root: {}",
+                                roots.join(", ")
+                            )));
+                        }
+                    }
+                }
+                Some("*") => {
+                    return Err(mcp_error(
+                        "Cross-repo search (root=\"*\") not yet implemented."
+                    ));
+                }
+                Some(path) => {
+                    registry.get_or_open(Path::new(path))
+                        .map_err(|e| mcp_error(format!("{e}")))?
+                }
+            };
+            Self::ensure_handle_context(&handle).await?;
+            Ok(handle)
+        } else {
+            // Standalone mode: use cached handle that shares self's Arcs
+            let handle = self
+                .standalone_handle
+                .as_ref()
+                .expect("standalone_handle must be set in non-global mode");
+            self.ensure_context().await?;
+            Ok(Arc::clone(handle))
+        }
+    }
+
+    /// Initialize database context on a RepoHandle (global mode).
+    /// Auto-creates `.mdkb/` if it doesn't exist.
+    async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> {
+        let mut ctx_guard = handle.ctx.lock().await;
+        if ctx_guard.is_none() {
+            if handle.doc_reindex_active.load(Ordering::Relaxed) {
+                return Err(mcp_error("Repo initializing, retry shortly"));
+            }
+            let ctx = match Context::open(&handle.root) {
+                Ok(ctx) => ctx,
+                Err(e) if e.is_not_found() => {
+                    tracing::info!("Auto-initializing mdkb at {}", handle.root.display());
+                    Context::init(&handle.root)
+                        .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {e}")))?
+                }
+                Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
+            };
+            *ctx_guard = Some(ctx);
+        }
+        Ok(())
+    }
+
+    /// Acquire the code index lock on a RepoHandle, lazily initializing if needed.
+    async fn acquire_handle_code_index(
+        handle: &RepoHandle,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<IndexFacade>>, McpError> {
+        if handle.code_reindex_active.load(Ordering::Relaxed) {
+            return Ok(handle.code_index.lock().await);
+        }
+        let mut idx_guard = handle.code_index.lock().await;
+        if idx_guard.is_none() {
+            let index_path = handle.root.join(".mdkb/code.sqlite");
+            let mut facade = IndexFacade::open_or_create(&index_path)
+                .map_err(|e| mcp_error(format!("Failed to open code index: {e}")))?;
+            if !handle.code_ignore_patterns.is_empty() {
+                let config = crate::code::indexing::pipeline::PipelineConfig {
+                    ignore_patterns: handle.code_ignore_patterns.clone(),
+                    ..Default::default()
+                };
+                facade = facade.with_config(config);
+            }
+            *idx_guard = Some(facade);
+        }
+        Ok(idx_guard)
+    }
+
+    /// Query MCP roots from the client and register them in the registry.
+    async fn sync_roots_from_client(
+        &self,
+        context: &NotificationContext<RoleServer>,
+        registry: &RepoRegistry,
+    ) {
+        match context.peer.list_roots().await {
+            Ok(result) => {
+                for root in &result.roots {
+                    if let Some(path) = uri_to_path(&root.uri) {
+                        match registry.get_or_open(&path) {
+                            Ok(_) => {
+                                tracing::info!(
+                                    "Registered root from MCP client: {}",
+                                    path.display()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to register root {}: {e}",
+                                    path.display()
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!("Ignoring non-file root URI: {}", root.uri);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Client does not support roots/list: {e}");
+            }
         }
     }
 
@@ -252,8 +562,8 @@ impl McpServer {
     }
 
     /// Retrieve multiple documents by comma-separated IDs/paths/slugs.
-    async fn get_batch(&self, ids: &str, lines: &Option<String>) -> Result<CallToolResult, McpError> {
-        let ctx_guard = self.ctx.lock().await;
+    async fn get_batch(&self, handle: &RepoHandle, ids: &str, lines: &Option<String>) -> Result<CallToolResult, McpError> {
+        let ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -326,13 +636,13 @@ impl McpServer {
     }
 
     /// Retrieve multiple documents matching a glob pattern.
-    async fn get_glob(&self, pattern: &str) -> Result<CallToolResult, McpError> {
+    async fn get_glob(&self, handle: &RepoHandle, pattern: &str) -> Result<CallToolResult, McpError> {
         let doc_limit = self.config.max_document_tokens;
         let truncate_ellipsis = self.config.truncate_with_ellipsis;
         let max_response_tokens = self.config.max_response_tokens;
 
         let (output, result_count) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -491,13 +801,18 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        // Cross-repo search: fan out to all registered repos
+        if params.root.as_deref() == Some("*") {
+            return self.cross_repo_search(&params).await;
+        }
+
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let scope = params.scope.as_deref();
         let limit = params.limit.min(100); // Cap to prevent unbounded result sets
 
         let (output, tokens, result_count) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -593,7 +908,7 @@ impl McpServer {
                     drop(ctx_guard);
 
                     {
-                        let mut idx_guard = self.acquire_code_index().await?;
+                        let mut idx_guard = Self::acquire_handle_code_index(&handle).await?;
                         let facade = match idx_guard.as_mut() {
                             Some(f) => f,
                             None => {
@@ -605,7 +920,7 @@ impl McpServer {
 
                         if scope == Some("code") {
                             // Check if semantic search is enabled
-                            if !self.full_config.code.semantic_search.enabled {
+                            if !handle.config.code.semantic_search.enabled {
                                 return Err(mcp_error(
                                     "Semantic code search is disabled. Enable it in mdkb.toml: [code.semantic_search] enabled = true, then re-index.".to_string(),
                                 ));
@@ -706,21 +1021,21 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GetParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let id = &params.id;
 
         // Comma-separated list → batch retrieve
         if id.contains(',') {
-            return self.get_batch(id, &params.lines).await;
+            return self.get_batch(&handle, id, &params.lines).await;
         }
 
         // Glob pattern → batch retrieve by pattern
         if id.contains('*') || id.contains('?') {
-            return self.get_glob(id).await;
+            return self.get_glob(&handle, id).await;
         }
 
-        let ctx_guard = self.ctx.lock().await;
+        let ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -848,10 +1163,10 @@ impl McpServer {
         &self,
         Parameters(_): Parameters<EmptyObject>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(None).await?;
 
         let mut output = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -887,7 +1202,7 @@ impl McpServer {
         }; // ctx_guard dropped here
 
         // Always show code index stats (initialize if needed)
-        if let Ok(idx_guard) = self.acquire_code_index().await {
+        if let Ok(idx_guard) = Self::acquire_handle_code_index(&handle).await {
             if let Some(facade) = idx_guard.as_ref() {
                 let symbols = facade.symbol_count();
                 let files = facade.file_count();
@@ -916,16 +1231,16 @@ impl McpServer {
         &self,
         Parameters(_): Parameters<EmptyObject>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(None).await?;
 
         // Phase 1: Reindex documents (markdown collections)
         let doc_output = {
-            let mut ctx_guard = self.ctx.lock().await;
+            let mut ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_mut()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            let result = handle_update(ctx, &self.root)
+            let result = handle_update(ctx, &handle.root)
                 .map_err(|e| mcp_error(format!("Document update failed: {}", e)))?;
 
             format!(
@@ -936,9 +1251,9 @@ impl McpServer {
 
         // Phase 2: Reindex source code (tree-sitter + SQLite)
         let code_output = {
-            let mut idx_guard = self.acquire_code_index().await?;
+            let mut idx_guard = Self::acquire_handle_code_index(&handle).await?;
             if let Some(facade) = idx_guard.as_mut() {
-                match facade.reindex(&self.root) {
+                match facade.reindex(&handle.root) {
                     Ok(stats) => {
                         format!(
                             "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
@@ -961,9 +1276,9 @@ impl McpServer {
                 std::env::var("HOME").unwrap_or_default(),
             )
             .join(".claude/projects");
-            let project_root = self.root.to_string_lossy().to_string();
+            let project_root = handle.root.to_string_lossy().to_string();
 
-            let mut ctx_guard = self.ctx.lock().await;
+            let mut ctx_guard = handle.ctx.lock().await;
             if let Some(ctx) = ctx_guard.as_mut() {
                 match handle_session_index(ctx, &sessions_base, &project_root) {
                     Ok(sr) if sr.added > 0 || sr.updated > 0 => {
@@ -998,10 +1313,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryWriteParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1128,10 +1443,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryDeleteParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1160,10 +1475,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryConfirmParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1184,10 +1499,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryCorrectParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let (output, tokens) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1208,13 +1523,13 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryListParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.ensure_context().await?;
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
 
         let sort: memory::MemorySortOrder = params.sort.parse()
             .map_err(|e: String| mcp_error(e))?;
 
         let (output, tokens, count) = {
-            let ctx_guard = self.ctx.lock().await;
+            let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1264,8 +1579,10 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<CodeGraphParams>,
     ) -> Result<CallToolResult, McpError> {
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
+
         let output = {
-            let idx_guard = self.acquire_code_index().await?;
+            let idx_guard = Self::acquire_handle_code_index(&handle).await?;
             let facade = match idx_guard.as_ref() {
                 Some(f) => f,
                 None => {
@@ -1371,6 +1688,17 @@ fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
 }
 
 /// Resolve a document by path or ID.
+/// Convert a `file://` URI to a local filesystem path.
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let path_str = uri.strip_prefix("file://")?;
+    let path = PathBuf::from(path_str);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 fn resolve_document(conn: &rusqlite::Connection, path_or_id: &str) -> crate::error::Result<crate::domain::Document> {
     // Try to parse as ID first
     if let Ok(id) = path_or_id.parse::<i64>() {
@@ -1404,6 +1732,18 @@ impl ServerHandler for McpServer {
                 ..Default::default()
             },
             instructions: self.warmup_instructions.clone(),
+        }
+    }
+
+    async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
+        if let Some(registry) = &self.registry {
+            self.sync_roots_from_client(&context, registry).await;
+        }
+    }
+
+    async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
+        if let Some(registry) = &self.registry {
+            self.sync_roots_from_client(&context, registry).await;
         }
     }
 }
@@ -1848,6 +2188,10 @@ Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after 
 Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Both `memory_confirm` and `memory_correct` boost confidence. Use `memory_delete` to remove bad entries.
 
 When `get` shows \"History: N revisions (dates)\", use `get(id, format=\"history\")` to see diffs. Only manual entries (user_statement, official_docs) track revisions.
+
+## Multi-repo (global mode)
+
+All tools accept an optional `root` param to target a specific repo. With 1 registered repo, `root` is auto-selected. With multiple repos and no `root`, an error lists available roots. Use `root=\"*\"` on `search` for cross-repo results.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
@@ -1946,10 +2290,17 @@ fn format_search_results(results: &[SearchResult], limit: usize) -> String {
 
     for r in &ordered {
         let title = r.title.as_deref().unwrap_or("(untitled)");
-        output.push_str(&format!(
-            "[{}] {} - {} (score: {:.2})\n",
-            r.id, r.path, title, r.score
-        ));
+        if let Some(ref root) = r.repo_root {
+            output.push_str(&format!(
+                "[{}] {} - {} (score: {:.2}, repo: {})\n",
+                r.id, r.path, title, r.score, root
+            ));
+        } else {
+            output.push_str(&format!(
+                "[{}] {} - {} (score: {:.2})\n",
+                r.id, r.path, title, r.score
+            ));
+        }
         for snippet in &r.snippets {
             output.push_str(&format!("  {}\n", snippet));
         }
@@ -2050,6 +2401,7 @@ mod tests {
             snippets: vec!["...matching text...".to_string()],
             status: None,
             superseded_by: None,
+                repo_root: None,
         }];
         let output = format_search_results(&results, 10);
         assert!(output.contains("[1] readme.md"), "Should show path without collection prefix, got: {output}");
@@ -2069,6 +2421,7 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                repo_root: None,
             },
             SearchResult {
                 id: 20,
@@ -2079,6 +2432,7 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                repo_root: None,
             },
         ];
         let output = format_search_results(&results, 10);
@@ -2098,6 +2452,7 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                repo_root: None,
             },
             SearchResult {
                 id: 2,
@@ -2108,6 +2463,7 @@ mod tests {
                 snippets: vec![],
                 status: None,
                 superseded_by: None,
+                repo_root: None,
             },
         ];
         let output = format_search_results(&results, 10);
@@ -2348,6 +2704,7 @@ mod tests {
             entry_type: "topic".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         }))
         .await
         .expect("Failed to write memory entry");
@@ -2356,7 +2713,7 @@ mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             server.memory_delete(Parameters(MemoryDeleteParams {
-                id: "test-delete-me".to_string(),
+                id: "test-delete-me".to_string(),            root: None,
             })),
         )
         .await;
@@ -2374,7 +2731,7 @@ mod tests {
         let get_result = server
             .get(Parameters(GetParams {
                 id: "test-delete-me".to_string(),
-                lines: None, format: None,
+                lines: None, format: None,            root: None,
             }))
             .await;
         assert!(get_result.is_err(), "get should fail for deleted memory entry");
@@ -2382,7 +2739,7 @@ mod tests {
         // Deleting nonexistent entry should report not found
         let result = server
             .memory_delete(Parameters(MemoryDeleteParams {
-                id: "nonexistent".to_string(),
+                id: "nonexistent".to_string(),            root: None,
             }))
             .await
             .expect("Should not error");
@@ -2414,11 +2771,12 @@ mod tests {
             entry_type: "topic".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         })))
         .await.expect("timeout").expect("memory_write failed");
 
         tokio::time::timeout(timeout, server.memory_delete(Parameters(MemoryDeleteParams {
-            id: "deadlock-test".to_string(),
+            id: "deadlock-test".to_string(),            root: None,
         })))
         .await.expect("timeout").expect("memory_delete failed");
 
@@ -2447,7 +2805,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "nonexistent".to_string(),
-            lines: None, format: None,
+            lines: None, format: None,            root: None,
         })).await;
 
         let msg = extract_error_msg(result);
@@ -2463,7 +2821,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "999999".to_string(),
-            lines: None, format: None,
+            lines: None, format: None,            root: None,
         })).await;
 
         let msg = extract_error_msg(result);
@@ -2485,7 +2843,7 @@ mod tests {
             scope: None,
             kind: None,
             file: None,
-            threshold: 0.3,
+            threshold: 0.3,            root: None,
         })).await.expect("search should not error");
 
         let text = extract_text(&result);
@@ -2501,7 +2859,7 @@ mod tests {
 
         let result = server.get(Parameters(GetParams {
             id: "nonexistent/**/*.md".to_string(),
-            lines: None, format: None,
+            lines: None, format: None,            root: None,
         })).await.expect("get with glob should not error");
 
         let text = extract_text(&result);
@@ -2523,7 +2881,7 @@ mod tests {
             scope: Some("memory".to_string()),
             kind: None,
             file: None,
-            threshold: 0.3,
+            threshold: 0.3,            root: None,
         })).await.expect("search with memory scope should not error");
 
         let text = extract_text(&result);
@@ -2538,7 +2896,7 @@ mod tests {
         let server = McpServer::new(root);
 
         let result = server.memory_delete(Parameters(MemoryDeleteParams {
-            id: "nonexistent-entry".to_string(),
+            id: "nonexistent-entry".to_string(),            root: None,
         })).await.expect("memory_delete should not error");
 
         let text = extract_text(&result);
@@ -2555,7 +2913,7 @@ mod tests {
 
         let result = server.memory_list(Parameters(MemoryListParams {
             limit: 20,
-            sort: "recent".to_string(),
+            sort: "recent".to_string(),            root: None,
         })).await.expect("memory_list should not error");
 
         let text = extract_text(&result);
@@ -2577,6 +2935,7 @@ mod tests {
             entry_type: "topic".to_string(),
             tags: vec!["tag1".to_string()],
             source_type: "user_statement".to_string(),
+            root: None,
         })).await.expect("write A");
 
         server.memory_write(Parameters(MemoryWriteParams {
@@ -2586,11 +2945,12 @@ mod tests {
             entry_type: "problem".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         })).await.expect("write B");
 
         let result = server.memory_list(Parameters(MemoryListParams {
             limit: 20,
-            sort: "newest".to_string(),
+            sort: "newest".to_string(),            root: None,
         })).await.expect("memory_list should not error");
 
         let text = extract_text(&result);
@@ -2608,7 +2968,7 @@ mod tests {
 
         let result = server.memory_list(Parameters(MemoryListParams {
             limit: 20,
-            sort: "invalid".to_string(),
+            sort: "invalid".to_string(),            root: None,
         })).await;
 
         assert!(result.is_err(), "Should error on invalid sort");
@@ -2700,7 +3060,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2722,7 +3082,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2743,7 +3103,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: Some("struct".to_string()),
                 file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols kind=struct failed");
 
@@ -2765,7 +3125,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
                 file: Some("lib.rs".to_string()),
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols file=lib.rs failed");
 
@@ -2787,7 +3147,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: Some("invalid_kind".to_string()),
                 file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout");
 
@@ -2807,7 +3167,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2824,7 +3184,7 @@ pub fn utility() -> i32 {
                 name: "process_data".to_string(),
                 direction: "calls".to_string(),
                 symbol_id: None,
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout").expect("code_graph direction=calls failed");
 
@@ -2845,7 +3205,7 @@ pub fn utility() -> i32 {
                 name: "process_data".to_string(),
                 direction: "callers".to_string(),
                 symbol_id: None,
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout").expect("code_graph direction=callers failed");
 
@@ -2866,7 +3226,7 @@ pub fn utility() -> i32 {
                 name: "validate".to_string(),
                 direction: "impact".to_string(),
                 symbol_id: None,
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout").expect("code_graph direction=impact failed");
 
@@ -2892,7 +3252,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2923,7 +3283,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2935,7 +3295,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed (second call)");
 
@@ -2953,7 +3313,7 @@ pub fn utility() -> i32 {
                 name: "nonexistent_fn".to_string(),
                 direction: "calls".to_string(),
                 symbol_id: None,
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout");
 
@@ -2974,7 +3334,7 @@ pub fn utility() -> i32 {
                 scope: Some("symbols".to_string()),
                 kind: None,
             file: None,
-                threshold: 0.3,
+                threshold: 0.3,            root: None,
             })))
             .await.expect("timeout").expect("search scope=symbols failed");
 
@@ -2992,7 +3352,7 @@ pub fn utility() -> i32 {
                 name: "main".to_string(),
                 direction: "calls".to_string(),
                 symbol_id: Some(sym_id),
-                max_depth: 3,
+                max_depth: 3,            root: None,
             })))
             .await.expect("timeout").expect("code_graph with ID failed");
 
@@ -3085,6 +3445,7 @@ pub fn utility() -> i32 {
             entry_type: "topic".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         })).await.expect("write should succeed");
 
         // Get access_count after creation
@@ -3103,6 +3464,7 @@ pub fn utility() -> i32 {
             entry_type: "topic".to_string(),
             tags: vec![],
             source_type: "user_statement".to_string(),
+            root: None,
         })).await.expect("update should succeed");
 
         // access_count must not have changed
@@ -3148,5 +3510,358 @@ pub fn utility() -> i32 {
         // ctx should still be None (no new ctx created)
         let ctx_guard = server.ctx.lock().await;
         assert!(ctx_guard.is_none(), "ctx should remain None while reindex is active");
+    }
+
+    #[test]
+    fn test_uri_to_path_valid() {
+        let path = uri_to_path("file:///Users/me/project");
+        assert_eq!(path, Some(PathBuf::from("/Users/me/project")));
+    }
+
+    #[test]
+    fn test_uri_to_path_no_scheme() {
+        assert_eq!(uri_to_path("/Users/me/project"), None);
+    }
+
+    #[test]
+    fn test_uri_to_path_http_scheme() {
+        assert_eq!(uri_to_path("http://example.com"), None);
+    }
+
+    #[test]
+    fn test_global_constructor() {
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = std::sync::Arc::new(RepoRegistry::new(config));
+        let server = McpServer::global(registry);
+        assert!(server.is_global());
+    }
+
+    #[test]
+    fn test_standalone_not_global() {
+        let root = tempfile::TempDir::new().unwrap();
+        let server = McpServer::new(root.path().to_path_buf());
+        assert!(!server.is_global());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_standalone_shares_arcs() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).unwrap();
+        let server = McpServer::new(root);
+
+        let handle = server.resolve_handle(None).await.unwrap();
+        // The handle's ctx and code_index must be the SAME Arcs as the server's
+        assert!(Arc::ptr_eq(&handle.ctx, &server.ctx));
+        assert!(Arc::ptr_eq(&handle.code_index, &server.code_index));
+        assert!(Arc::ptr_eq(&handle.doc_reindex_active, &server.doc_reindex_active));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_global_single_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(&root).unwrap();
+
+        let server = McpServer::global(Arc::clone(&registry));
+        // No root param, 1 root registered → auto-selects
+        let handle = server.resolve_handle(None).await.unwrap();
+        assert_eq!(handle.root, root.canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_global_no_roots() {
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+
+        let server = McpServer::global(registry);
+        let err = server.resolve_handle(None).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("No repos registered"),
+            "Should error on empty registry: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_global_multiple_roots_no_param() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp1.path().join(".mdkb")).unwrap();
+        std::fs::create_dir_all(tmp2.path().join(".mdkb")).unwrap();
+
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(tmp1.path()).unwrap();
+        registry.get_or_open(tmp2.path()).unwrap();
+
+        let server = McpServer::global(registry);
+        let err = server.resolve_handle(None).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("Multiple repos"),
+            "Should error listing roots: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_global_specific_root() {
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp1.path().join(".mdkb")).unwrap();
+        std::fs::create_dir_all(tmp2.path().join(".mdkb")).unwrap();
+
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(tmp1.path()).unwrap();
+        registry.get_or_open(tmp2.path()).unwrap();
+
+        let server = McpServer::global(registry);
+        let handle = server
+            .resolve_handle(Some(tmp2.path().to_str().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(handle.root, tmp2.path().canonicalize().unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_resolve_handle_cross_repo_not_implemented() {
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        let server = McpServer::global(registry);
+
+        let err = server.resolve_handle(Some("*")).await.unwrap_err();
+        assert!(
+            format!("{:?}", err).contains("Cross-repo"),
+            "Should report cross-repo not implemented: {:?}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cross_repo_search_standalone_errors() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).unwrap();
+        let server = McpServer::new(root);
+
+        let result = server.search(Parameters(SearchParams {
+            query: "test".to_string(),
+            root: Some("*".to_string()),
+            limit: 10,
+            collection: None,
+            include_superseded: false,
+            scope: None,
+            kind: None,
+            threshold: 0.5,
+            file: None,
+        })).await;
+
+        assert!(result.is_err(), "Cross-repo search should fail in standalone mode");
+    }
+
+    #[tokio::test]
+    async fn test_cross_repo_search_two_repos() {
+        use std::time::Duration;
+
+        // Set up two repos with documents
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root1 = tmp1.path().to_path_buf();
+        let root2 = tmp2.path().to_path_buf();
+
+        crate::cli::handlers::handle_init(&root1).unwrap();
+        crate::cli::handlers::handle_init(&root2).unwrap();
+
+        // Add a collection and document to each repo
+        {
+            let ctx1 = crate::cli::handlers::Context::open(&root1).unwrap();
+            let docs_dir1 = root1.join("docs");
+            std::fs::create_dir_all(&docs_dir1).unwrap();
+            std::fs::write(docs_dir1.join("alpha.md"), "# Alpha\n\nAlpha content about widgets").unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let coll1 = crate::domain::Collection {
+                name: "docs".to_string(),
+                path: "docs".to_string(),
+                pattern: "**/*.md".to_string(),
+                source: "manual".to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            crate::store::collections::add_collection(&ctx1.conn, &coll1).unwrap();
+            crate::cli::handlers::handle_update(&ctx1, &root1).unwrap();
+        }
+        {
+            let ctx2 = crate::cli::handlers::Context::open(&root2).unwrap();
+            let docs_dir2 = root2.join("docs");
+            std::fs::create_dir_all(&docs_dir2).unwrap();
+            std::fs::write(docs_dir2.join("beta.md"), "# Beta\n\nBeta content about widgets").unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let coll2 = crate::domain::Collection {
+                name: "docs".to_string(),
+                path: "docs".to_string(),
+                pattern: "**/*.md".to_string(),
+                source: "manual".to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            crate::store::collections::add_collection(&ctx2.conn, &coll2).unwrap();
+            crate::cli::handlers::handle_update(&ctx2, &root2).unwrap();
+        }
+
+        // Create global server with both repos
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(&root1).unwrap();
+        registry.get_or_open(&root2).unwrap();
+        let server = McpServer::global(registry);
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.search(Parameters(SearchParams {
+                query: "widgets".to_string(),
+                root: Some("*".to_string()),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: None,
+                kind: None,
+                threshold: 0.5,
+                file: None,
+            })),
+        )
+        .await
+        .expect("timeout")
+        .expect("cross-repo search failed");
+
+        let text = extract_text(&result);
+        // Should find results from both repos
+        assert!(text.contains("alpha.md") || text.contains("beta.md"),
+            "Should find docs from at least one repo: {}", text);
+        assert!(text.contains("repo:"),
+            "Should include repo provenance: {}", text);
+    }
+
+    /// Backward compatibility: standalone mode (no --global) works exactly as before.
+    #[tokio::test]
+    async fn test_backward_compat_standalone_search() {
+        use std::time::Duration;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).unwrap();
+
+        // Add a doc
+        let ctx = crate::cli::handlers::Context::open(&root).unwrap();
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# Hello\n\nBackward compat test").unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let coll = crate::domain::Collection {
+            name: "docs".to_string(),
+            path: "docs".to_string(),
+            pattern: "**/*.md".to_string(),
+            source: "manual".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        crate::store::collections::add_collection(&ctx.conn, &coll).unwrap();
+        drop(ctx);
+        {
+            let mut ctx = crate::cli::handlers::Context::open(&root).unwrap();
+            crate::cli::handlers::handle_update(&mut ctx, &root).unwrap();
+        }
+
+        // Standalone server — no registry, no root param
+        let server = McpServer::new(root);
+        assert!(!server.is_global());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.search(Parameters(SearchParams {
+                query: "backward".to_string(),
+                root: None, // no root param — standalone
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: None,
+                kind: None,
+                threshold: 0.5,
+                file: None,
+            })),
+        )
+        .await
+        .expect("timeout")
+        .expect("search failed");
+
+        let text = extract_text(&result);
+        assert!(text.contains("readme.md"), "Should find doc in standalone mode: {}", text);
+    }
+
+    /// Global mode with specific root param routes to the right repo.
+    #[tokio::test]
+    async fn test_global_mode_specific_root_search() {
+        use std::time::Duration;
+
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root1 = tmp1.path().to_path_buf();
+        let root2 = tmp2.path().to_path_buf();
+
+        crate::cli::handlers::handle_init(&root1).unwrap();
+        crate::cli::handlers::handle_init(&root2).unwrap();
+
+        // Add doc only to repo2
+        {
+            let ctx = crate::cli::handlers::Context::open(&root2).unwrap();
+            let docs_dir = root2.join("docs");
+            std::fs::create_dir_all(&docs_dir).unwrap();
+            std::fs::write(docs_dir.join("unique.md"), "# Unique\n\nOnly in repo2").unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let coll = crate::domain::Collection {
+                name: "docs".to_string(),
+                path: "docs".to_string(),
+                pattern: "**/*.md".to_string(),
+                source: "manual".to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            crate::store::collections::add_collection(&ctx.conn, &coll).unwrap();
+            drop(ctx);
+            let mut ctx = crate::cli::handlers::Context::open(&root2).unwrap();
+            crate::cli::handlers::handle_update(&mut ctx, &root2).unwrap();
+        }
+
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(&root1).unwrap();
+        registry.get_or_open(&root2).unwrap();
+        let server = McpServer::global(registry);
+
+        // Search with root pointing to repo2
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.search(Parameters(SearchParams {
+                query: "unique".to_string(),
+                root: Some(root2.to_string_lossy().to_string()),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: None,
+                kind: None,
+                threshold: 0.5,
+                file: None,
+            })),
+        )
+        .await
+        .expect("timeout")
+        .expect("search with root failed");
+
+        let text = extract_text(&result);
+        assert!(text.contains("unique.md"), "Should find doc in targeted repo: {}", text);
     }
 }

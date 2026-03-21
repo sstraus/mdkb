@@ -13,6 +13,7 @@
 pub mod cli;
 pub mod code;
 pub mod config;
+pub mod daemon;
 pub mod domain;
 pub mod error;
 pub mod llm;
@@ -24,5 +25,7 @@ pub mod watcher;
 // Re-export main types
 #[doc(inline)]
 pub use config::Config;
+#[doc(inline)]
+pub use daemon::config::DaemonConfig;
 #[doc(inline)]
 pub use error::{Error, ErrorKind, Result};
