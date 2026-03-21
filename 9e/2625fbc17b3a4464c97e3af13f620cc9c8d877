@@ -1,0 +1,27 @@
+src/code/indexing/pipeline.rs
+  85bd9a3d45a1a2eb 534,799-800
+src/code/storage/sqlite.rs
+  85bd9a3d45a1a2eb 114,128,285-286,292,535,577,587,596,598,602,608-609,613-614,625,861,886-888,891-893,908,962,967,1016
+src/code/indexing/mod.rs
+  85bd9a3d45a1a2eb 109-110,115,130,164,173-180,183,185,202-204,208,227-231,234,249,271,794
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "9e2625fbc17b3a4464c97e3af13f620cc9c8d877",
+  "prompts": {
+    "85bd9a3d45a1a2eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "350327f9-77b1-4d12-887a-8725fc6aee42",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 223,
+      "total_deletions": 153,
+      "accepted_lines": 122,
+      "overriden_lines": 0
+    }
+  }
+}
