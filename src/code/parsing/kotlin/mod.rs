@@ -10,10 +10,11 @@ use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
+use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct KotlinParser {
-    parser: Parser,
+    parser: CachingParser,
     context: ParserContext,
 }
 
@@ -27,13 +28,13 @@ impl std::fmt::Debug for KotlinParser {
 
 impl KotlinParser {
     pub fn new() -> Result<Self, String> {
-        let mut parser = Parser::new();
-        parser
+        let mut ts_parser = tree_sitter::Parser::new();
+        ts_parser
             .set_language(&tree_sitter_kotlin_codanna::language())
             .map_err(|e| format!("Failed to set Kotlin language: {e}"))?;
 
         Ok(Self {
-            parser,
+            parser: CachingParser::new(ts_parser),
             context: ParserContext::new(),
         })
     }
@@ -76,7 +77,7 @@ impl KotlinParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -526,7 +527,7 @@ impl KotlinParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -577,7 +578,7 @@ impl KotlinParser {
     // ── Calls ───────────────────────────────────────────────────────────
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -624,7 +625,7 @@ impl KotlinParser {
     // ── Method calls ────────────────────────────────────────────────────
 
     fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -1103,7 +1104,7 @@ impl LanguageParser for KotlinParser {
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -1113,7 +1114,7 @@ impl LanguageParser for KotlinParser {
     }
 
     fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -1123,7 +1124,7 @@ impl LanguageParser for KotlinParser {
     }
 
     fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };

@@ -9,10 +9,11 @@ use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
+use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct TypeScriptParser {
-    parser: Parser,
+    parser: CachingParser,
     context: ParserContext,
     /// Symbols marked as default exported (export default <name>).
     default_exported: std::collections::HashSet<String>,
@@ -30,15 +31,15 @@ impl std::fmt::Debug for TypeScriptParser {
 
 impl TypeScriptParser {
     pub fn new() -> Result<Self, String> {
-        let mut parser = Parser::new();
+        let mut ts_parser = tree_sitter::Parser::new();
         // Use the TSX grammar so TSX/JSX syntax parses correctly.
         let language: tree_sitter::Language = tree_sitter_typescript::LANGUAGE_TSX.into();
-        parser
+        ts_parser
             .set_language(&language)
             .map_err(|e| format!("Failed to set TypeScript language: {e}"))?;
 
         Ok(Self {
-            parser,
+            parser: CachingParser::new(ts_parser),
             context: ParserContext::new(),
             default_exported: std::collections::HashSet::new(),
             named_exported: std::collections::HashSet::new(),
@@ -86,7 +87,7 @@ impl TypeScriptParser {
         self.default_exported.clear();
         self.named_exported.clear();
 
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -634,7 +635,7 @@ impl TypeScriptParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -853,7 +854,7 @@ impl TypeScriptParser {
     }
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -919,7 +920,7 @@ impl TypeScriptParser {
     }
 
     fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -1123,7 +1124,7 @@ impl TypeScriptParser {
     }
 
     fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -1191,7 +1192,7 @@ impl TypeScriptParser {
     }
 
     fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -1356,7 +1357,7 @@ impl LanguageParser for TypeScriptParser {
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -1366,7 +1367,7 @@ impl LanguageParser for TypeScriptParser {
     }
 
     fn find_extends<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };

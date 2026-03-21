@@ -7,7 +7,8 @@ use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
+use crate::code::parsing::caching_parser::CachingParser;
 
 /// Classification for Rust doc comment types.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -20,7 +21,7 @@ enum DocCommentType {
 }
 
 pub struct RustParser {
-    parser: Parser,
+    parser: CachingParser,
     context: ParserContext,
 }
 
@@ -34,13 +35,13 @@ impl std::fmt::Debug for RustParser {
 
 impl RustParser {
     pub fn new() -> Result<Self, String> {
-        let mut parser = Parser::new();
-        parser
+        let mut ts_parser = tree_sitter::Parser::new();
+        ts_parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
             .map_err(|e| format!("Failed to set Rust language: {e}"))?;
 
         Ok(Self {
-            parser,
+            parser: CachingParser::new(ts_parser),
             context: ParserContext::new(),
         })
     }
@@ -48,7 +49,7 @@ impl RustParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -199,7 +200,7 @@ impl RustParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -707,7 +708,7 @@ impl RustParser {
     // ── Calls ───────────────────────────────────────────────────────────
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -755,7 +756,7 @@ impl RustParser {
     // ── Method calls (structured) ───────────────────────────────────────
 
     fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -828,7 +829,7 @@ impl RustParser {
         &mut self,
         code: &'a str,
     ) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -869,7 +870,7 @@ impl RustParser {
     // ── Type uses ───────────────────────────────────────────────────────
 
     fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -954,7 +955,7 @@ impl RustParser {
     // ── Defines ─────────────────────────────────────────────────────────
 
     fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -1024,7 +1025,7 @@ impl RustParser {
     // ── Variable types ──────────────────────────────────────────────────
 
     fn find_variable_types_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(t) => t,
             None => return Vec::new(),
         };
@@ -1082,7 +1083,7 @@ impl RustParser {
     // ── Inherent methods ────────────────────────────────────────────────
 
     fn find_inherent_methods_impl(&mut self, code: &str) -> Vec<(String, String, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(t) => t,
             None => return Vec::new(),
         };

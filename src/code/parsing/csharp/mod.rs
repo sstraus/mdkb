@@ -6,10 +6,11 @@ use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
-use tree_sitter::{Node, Parser};
+use tree_sitter::Node;
+use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct CSharpParser {
-    parser: Parser,
+    parser: CachingParser,
     context: ParserContext,
 }
 
@@ -23,13 +24,13 @@ impl std::fmt::Debug for CSharpParser {
 
 impl CSharpParser {
     pub fn new() -> Result<Self, String> {
-        let mut parser = Parser::new();
-        parser
+        let mut ts_parser = tree_sitter::Parser::new();
+        ts_parser
             .set_language(&tree_sitter_c_sharp::LANGUAGE.into())
             .map_err(|e| format!("Failed to set C# language: {e}"))?;
 
         Ok(Self {
-            parser,
+            parser: CachingParser::new(ts_parser),
             context: ParserContext::new(),
         })
     }
@@ -68,7 +69,7 @@ impl CSharpParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -414,7 +415,7 @@ impl CSharpParser {
     }
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -441,7 +442,7 @@ impl CSharpParser {
     }
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };
@@ -588,7 +589,7 @@ impl LanguageParser for CSharpParser {
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse(code, None) {
+        let tree = match self.parser.parse_cached(code) {
             Some(tree) => tree,
             None => return Vec::new(),
         };

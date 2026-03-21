@@ -3,6 +3,7 @@
 //! Provides the [`LanguageParser`] trait and supporting types for extracting
 //! symbols, relationships, and call graphs from source code via tree-sitter.
 
+pub mod caching_parser;
 pub mod context;
 pub mod import;
 pub mod language;
