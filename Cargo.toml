@@ -33,6 +33,10 @@ gray_matter = "0.2"
 
 # Async (for MCP)
 tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+# Concurrent collections
+dashmap = "6"
 
 # MCP protocol
 rmcp = { version = "0.14", features = ["server", "transport-io"] }
@@ -40,7 +44,6 @@ rmcp = { version = "0.14", features = ["server", "transport-io"] }
 # HTTP server (for MCP HTTP transport)
 axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
-tokio-util = { version = "0.7", features = ["rt"], optional = true }
 
 # File watching
 notify = "6"
@@ -112,7 +115,7 @@ rustls = { version = "0.23", features = ["ring"], default-features = false, opti
 [features]
 default = []
 llm = []  # Enable LLM-powered features like memory condense
-http-server = ["dep:axum", "dep:tower", "dep:tokio-util", "dep:subtle", "rmcp/transport-streamable-http-server"]
+http-server = ["dep:axum", "dep:tower", "dep:subtle", "rmcp/transport-streamable-http-server"]
 https-server = ["http-server", "dep:rcgen", "dep:axum-server", "dep:rustls"]
 
 [dev-dependencies]
