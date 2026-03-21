@@ -636,9 +636,21 @@ fn update_collection(
         .collect();
     let mut existing_paths: HashSet<String> = existing_by_path.keys().cloned().collect();
 
-    // Walk directory and process files
+    // Walk directory and process files, pruning build/dependency directories
     for entry in WalkDir::new(&base_path)
         .into_iter()
+        .filter_entry(|e| {
+            if e.file_type().is_dir() {
+                let name = e.file_name().to_string_lossy();
+                !matches!(
+                    name.as_ref(),
+                    "target" | "node_modules" | ".git" | "vendor" | "dist"
+                    | "build" | "__pycache__" | ".tox" | ".venv"
+                )
+            } else {
+                true
+            }
+        })
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
     {

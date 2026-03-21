@@ -158,8 +158,12 @@ fn spawn_pipeline_stages(
     drop(path_rx);
     drop(content_tx);
 
-    // PARSE stage
-    thread::spawn(move || stage_parse(&content_rx, &parsed_tx));
+    // PARSE stage — needs larger stack for deeply nested ASTs (e.g. minified JS)
+    thread::Builder::new()
+        .name("mdkb-parse".into())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || stage_parse(&content_rx, &parsed_tx))
+        .map_err(|e| anyhow::anyhow!("Failed to spawn parse thread: {e}"))?;
 
     // COLLECT stage
     let batch_size = config.batch_size;
