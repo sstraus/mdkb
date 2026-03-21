@@ -1,0 +1,29 @@
+src/code/parsing/python/parser.rs
+  85bd9a3d45a1a2eb 29,1139
+src/code/parsing/typescript/parser.rs
+  85bd9a3d45a1a2eb 37
+src/code/parsing/mod.rs
+  85bd9a3d45a1a2eb 6
+src/code/parsing/caching_parser.rs
+  85bd9a3d45a1a2eb 1-59
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "657ff7be9cfb08a9269b6497dad0ca13a12c7194",
+  "prompts": {
+    "85bd9a3d45a1a2eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "350327f9-77b1-4d12-887a-8725fc6aee42",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 63,
+      "overriden_lines": 0
+    }
+  }
+}
