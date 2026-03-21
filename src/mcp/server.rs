@@ -2188,6 +2188,10 @@ Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after 
 Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Both `memory_confirm` and `memory_correct` boost confidence. Use `memory_delete` to remove bad entries.
 
 When `get` shows \"History: N revisions (dates)\", use `get(id, format=\"history\")` to see diffs. Only manual entries (user_statement, official_docs) track revisions.
+
+## Multi-repo (global mode)
+
+All tools accept an optional `root` param to target a specific repo. With 1 registered repo, `root` is auto-selected. With multiple repos and no `root`, an error lists available roots. Use `root=\"*\"` on `search` for cross-repo results.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
@@ -3740,5 +3744,124 @@ pub fn utility() -> i32 {
             "Should find docs from at least one repo: {}", text);
         assert!(text.contains("repo:"),
             "Should include repo provenance: {}", text);
+    }
+
+    /// Backward compatibility: standalone mode (no --global) works exactly as before.
+    #[tokio::test]
+    async fn test_backward_compat_standalone_search() {
+        use std::time::Duration;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).unwrap();
+
+        // Add a doc
+        let ctx = crate::cli::handlers::Context::open(&root).unwrap();
+        let docs_dir = root.join("docs");
+        std::fs::create_dir_all(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# Hello\n\nBackward compat test").unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let coll = crate::domain::Collection {
+            name: "docs".to_string(),
+            path: "docs".to_string(),
+            pattern: "**/*.md".to_string(),
+            source: "manual".to_string(),
+            created_at: now,
+            updated_at: now,
+        };
+        crate::store::collections::add_collection(&ctx.conn, &coll).unwrap();
+        drop(ctx);
+        {
+            let mut ctx = crate::cli::handlers::Context::open(&root).unwrap();
+            crate::cli::handlers::handle_update(&mut ctx, &root).unwrap();
+        }
+
+        // Standalone server — no registry, no root param
+        let server = McpServer::new(root);
+        assert!(!server.is_global());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.search(Parameters(SearchParams {
+                query: "backward".to_string(),
+                root: None, // no root param — standalone
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: None,
+                kind: None,
+                threshold: 0.5,
+                file: None,
+            })),
+        )
+        .await
+        .expect("timeout")
+        .expect("search failed");
+
+        let text = extract_text(&result);
+        assert!(text.contains("readme.md"), "Should find doc in standalone mode: {}", text);
+    }
+
+    /// Global mode with specific root param routes to the right repo.
+    #[tokio::test]
+    async fn test_global_mode_specific_root_search() {
+        use std::time::Duration;
+
+        let tmp1 = tempfile::tempdir().unwrap();
+        let tmp2 = tempfile::tempdir().unwrap();
+        let root1 = tmp1.path().to_path_buf();
+        let root2 = tmp2.path().to_path_buf();
+
+        crate::cli::handlers::handle_init(&root1).unwrap();
+        crate::cli::handlers::handle_init(&root2).unwrap();
+
+        // Add doc only to repo2
+        {
+            let ctx = crate::cli::handlers::Context::open(&root2).unwrap();
+            let docs_dir = root2.join("docs");
+            std::fs::create_dir_all(&docs_dir).unwrap();
+            std::fs::write(docs_dir.join("unique.md"), "# Unique\n\nOnly in repo2").unwrap();
+            let now = chrono::Utc::now().timestamp();
+            let coll = crate::domain::Collection {
+                name: "docs".to_string(),
+                path: "docs".to_string(),
+                pattern: "**/*.md".to_string(),
+                source: "manual".to_string(),
+                created_at: now,
+                updated_at: now,
+            };
+            crate::store::collections::add_collection(&ctx.conn, &coll).unwrap();
+            drop(ctx);
+            let mut ctx = crate::cli::handlers::Context::open(&root2).unwrap();
+            crate::cli::handlers::handle_update(&mut ctx, &root2).unwrap();
+        }
+
+        let config = crate::daemon::config::DaemonConfig::default();
+        let registry = Arc::new(RepoRegistry::new(config));
+        registry.get_or_open(&root1).unwrap();
+        registry.get_or_open(&root2).unwrap();
+        let server = McpServer::global(registry);
+
+        // Search with root pointing to repo2
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server.search(Parameters(SearchParams {
+                query: "unique".to_string(),
+                root: Some(root2.to_string_lossy().to_string()),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: None,
+                kind: None,
+                threshold: 0.5,
+                file: None,
+            })),
+        )
+        .await
+        .expect("timeout")
+        .expect("search with root failed");
+
+        let text = extract_text(&result);
+        assert!(text.contains("unique.md"), "Should find doc in targeted repo: {}", text);
     }
 }
