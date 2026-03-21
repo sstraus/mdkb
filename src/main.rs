@@ -491,8 +491,12 @@ async fn main() -> Result<()> {
                     mdkb::cli::handlers::handle_code_init(&cwd)?;
                     println!("Initialized code index at .mdkb/code.sqlite");
                 }
-                CodeCommand::Index { paths } => {
-                    let stats = mdkb::cli::handlers::handle_code_index(&cwd, &paths)?;
+                CodeCommand::Index { paths, force } => {
+                    let stats = if force {
+                        mdkb::cli::handlers::handle_code_reindex(&cwd, &paths)?
+                    } else {
+                        mdkb::cli::handlers::handle_code_index(&cwd, &paths)?
+                    };
                     format_code_index_stats(&stats, cli.format);
                 }
                 CodeCommand::Search { query, limit, kind } => {

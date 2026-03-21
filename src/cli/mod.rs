@@ -573,6 +573,10 @@ pub enum CodeCommand {
     Index {
         /// Paths to index (defaults to current directory)
         paths: Vec<String>,
+
+        /// Force full reindex (discard existing index)
+        #[arg(long)]
+        force: bool,
     },
 
     /// Fuzzy symbol search

@@ -3425,6 +3425,28 @@ pub fn handle_code_index(
     result
 }
 
+/// Handle `mdkb code index --force` - full reindex discarding existing data.
+pub fn handle_code_reindex(
+    root: &Path,
+    paths: &[String],
+) -> Result<crate::code::indexing::types::IndexStats> {
+    let index_path = root.join(".mdkb/code.sqlite");
+    let mut facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
+        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+
+    let target = if paths.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(&paths[0])
+    };
+
+    let result = facade
+        .reindex(&target)
+        .map_err(|e| Error::other(format!("Reindexing failed: {}", e)));
+    crate::llm::release_cached_service();
+    result
+}
+
 /// Handle `mdkb code search` - fuzzy symbol search.
 pub fn handle_code_search(
     root: &Path,
