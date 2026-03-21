@@ -1,0 +1,23 @@
+src/code/indexing/pipeline.rs
+  85bd9a3d45a1a2eb 523-527,530,537,542-544,546-549,553,556,568,572,574-580,583,587
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.15",
+  "base_commit_sha": "9a369323ef919506b5d6742c9575bfde231fd42c",
+  "prompts": {
+    "85bd9a3d45a1a2eb": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "350327f9-77b1-4d12-887a-8725fc6aee42",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus <stefano@straus.it>",
+      "messages": [],
+      "total_additions": 32,
+      "total_deletions": 11,
+      "accepted_lines": 27,
+      "overriden_lines": 0
+    }
+  }
+}
