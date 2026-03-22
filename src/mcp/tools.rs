@@ -40,7 +40,6 @@ pub struct SearchParams {
     /// Filter by file path (substring match) when scope is "symbols".
     #[serde(default)]
     pub file: Option<String>,
-
 }
 
 fn default_limit() -> usize {
@@ -391,5 +390,4 @@ mod tests {
         assert_eq!(params.root.as_deref(), Some("/project"));
         assert!(params.symbol_id.is_none());
     }
-
 }

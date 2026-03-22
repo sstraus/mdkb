@@ -4,8 +4,8 @@
 //! that respects `.gitignore` rules and custom ignore patterns.
 
 use crate::code::parsing::language::Language;
-use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -274,10 +274,7 @@ mod tests {
         fs::write(root.join("dist/bundle.js"), "function bundle() {}").unwrap();
         fs::write(root.join("main.go"), "package main").unwrap();
 
-        let patterns = vec![
-            "**/vendor/**".to_string(),
-            "**/dist/**".to_string(),
-        ];
+        let patterns = vec!["**/vendor/**".to_string(), "**/dist/**".to_string()];
         let files = discover_files(root, &patterns);
 
         assert_eq!(files.len(), 1);
@@ -300,11 +297,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        fs::write(
-            root.join(".gitignore"),
-            "# mdkb:index\ngenerated.rs\n",
-        )
-        .unwrap();
+        fs::write(root.join(".gitignore"), "# mdkb:index\ngenerated.rs\n").unwrap();
         fs::write(root.join("generated.rs"), "fn generated() {}").unwrap();
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
@@ -313,7 +306,10 @@ mod tests {
             .iter()
             .filter_map(|p| p.file_name()?.to_str())
             .collect();
-        assert!(names.contains(&"generated.rs"), "mdkb:index file should be included");
+        assert!(
+            names.contains(&"generated.rs"),
+            "mdkb:index file should be included"
+        );
         assert!(names.contains(&"main.rs"));
         assert_eq!(files.len(), 2);
     }
@@ -324,11 +320,7 @@ mod tests {
         let root = dir.path();
 
         // main.rs is NOT gitignored but annotated — should not appear twice
-        fs::write(
-            root.join(".gitignore"),
-            "# mdkb:index\nmain.rs\n",
-        )
-        .unwrap();
+        fs::write(root.join(".gitignore"), "# mdkb:index\nmain.rs\n").unwrap();
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
         let files = discover_files(root, &[]);
@@ -344,11 +336,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
 
-        fs::write(
-            root.join(".gitignore"),
-            "# mdkb:index\ngen/*.rs\n",
-        )
-        .unwrap();
+        fs::write(root.join(".gitignore"), "# mdkb:index\ngen/*.rs\n").unwrap();
         fs::create_dir_all(root.join("gen")).unwrap();
         fs::write(root.join("gen/types.rs"), "struct Foo {}").unwrap();
         fs::write(root.join("gen/helpers.rs"), "fn help() {}").unwrap();
@@ -384,8 +372,14 @@ mod tests {
             .iter()
             .filter_map(|p| p.file_name()?.to_str())
             .collect();
-        assert!(names.contains(&"generated.rs"), "annotated file should be included");
-        assert!(!names.contains(&"ignored.rs"), "non-annotated file should stay ignored");
+        assert!(
+            names.contains(&"generated.rs"),
+            "annotated file should be included"
+        );
+        assert!(
+            !names.contains(&"ignored.rs"),
+            "non-annotated file should stay ignored"
+        );
         assert!(names.contains(&"main.rs"));
     }
 

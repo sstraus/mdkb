@@ -313,9 +313,7 @@ mod tests {
     #[test]
     fn test_rrf_many_results() {
         // Test with many results to verify scalability
-        let bm25: Vec<SearchResult> = (1..=50)
-            .map(|i| make_bm25_result(i, -(i as f64)))
-            .collect();
+        let bm25: Vec<SearchResult> = (1..=50).map(|i| make_bm25_result(i, -(i as f64))).collect();
         let vector: Vec<(i64, f32)> = (51..=100).map(|i| (i, i as f32 * 0.01)).collect();
 
         let config = HybridConfig::default();
@@ -427,7 +425,11 @@ mod tests {
         for len in 0..=20 {
             let mut items: Vec<i32> = (0..len).collect();
             lost_in_middle_reorder(&mut items);
-            assert_eq!(items.len(), len as usize, "length must be preserved for len={len}");
+            assert_eq!(
+                items.len(),
+                len as usize,
+                "length must be preserved for len={len}"
+            );
         }
     }
 }

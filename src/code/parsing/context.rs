@@ -91,14 +91,14 @@ impl ParserContext {
         for scope in self.scope_stack.iter().rev() {
             match scope {
                 ScopeType::Function { hoisting } => {
-                    let (parent_name, parent_kind) =
-                        if let Some(func_name) = &self.current_function {
-                            (Some(func_name.as_str().into()), Some(SymbolKind::Function))
-                        } else if let Some(class_name) = &self.current_class {
-                            (Some(class_name.as_str().into()), Some(SymbolKind::Class))
-                        } else {
-                            (None, None)
-                        };
+                    let (parent_name, parent_kind) = if let Some(func_name) = &self.current_function
+                    {
+                        (Some(func_name.as_str().into()), Some(SymbolKind::Function))
+                    } else if let Some(class_name) = &self.current_class {
+                        (Some(class_name.as_str().into()), Some(SymbolKind::Class))
+                    } else {
+                        (None, None)
+                    };
                     return ScopeContext::Local {
                         hoisted: *hoisting,
                         parent_name,
@@ -106,14 +106,14 @@ impl ParserContext {
                     };
                 }
                 ScopeType::Block => {
-                    let (parent_name, parent_kind) =
-                        if let Some(func_name) = &self.current_function {
-                            (Some(func_name.as_str().into()), Some(SymbolKind::Function))
-                        } else if let Some(class_name) = &self.current_class {
-                            (Some(class_name.as_str().into()), Some(SymbolKind::Class))
-                        } else {
-                            (None, None)
-                        };
+                    let (parent_name, parent_kind) = if let Some(func_name) = &self.current_function
+                    {
+                        (Some(func_name.as_str().into()), Some(SymbolKind::Function))
+                    } else if let Some(class_name) = &self.current_class {
+                        (Some(class_name.as_str().into()), Some(SymbolKind::Class))
+                    } else {
+                        (None, None)
+                    };
                     return ScopeContext::Local {
                         hoisted: false,
                         parent_name,

@@ -1,8 +1,8 @@
 //! Per-repo state management and concurrent registry with LRU eviction.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -51,7 +51,10 @@ impl RepoHandle {
             match Config::load(&config_path) {
                 Ok(c) => c,
                 Err(e) => {
-                    tracing::warn!("Failed to load config for {}, using defaults: {e}", root.display());
+                    tracing::warn!(
+                        "Failed to load config for {}, using defaults: {e}",
+                        root.display()
+                    );
                     Config::default()
                 }
             }
@@ -183,7 +186,10 @@ impl RepoRegistry {
 
     /// Get all active repo handles (for cross-repo operations).
     pub fn all_handles(&self) -> Vec<Arc<RepoHandle>> {
-        self.handles.iter().map(|entry| Arc::clone(entry.value())).collect()
+        self.handles
+            .iter()
+            .map(|entry| Arc::clone(entry.value()))
+            .collect()
     }
 
     /// Evict the least recently used repo handle.

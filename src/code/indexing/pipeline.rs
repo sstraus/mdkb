@@ -14,12 +14,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::thread;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::code::indexing::hasher;
 use crate::code::indexing::types::{
-    FileContent, FileRegistration, IndexBatch, IndexStats, ParsedFile, RawRelationship,
-    RawSymbol, CollectedRelationship,
+    CollectedRelationship, FileContent, FileRegistration, IndexBatch, IndexStats, ParsedFile,
+    RawRelationship, RawSymbol,
 };
 use crate::code::indexing::walker;
 use crate::code::parsing::c_lang::CParser;
@@ -206,7 +206,14 @@ fn stage_read(rx: &Receiver<PathBuf>, tx: &Sender<FileContent>) {
             }
         };
         let hash = hasher::content_hash(&content);
-        if tx.send(FileContent { path, content, hash }).is_err() {
+        if tx
+            .send(FileContent {
+                path,
+                content,
+                hash,
+            })
+            .is_err()
+        {
             break;
         }
     }
@@ -219,31 +226,45 @@ fn stage_read(rx: &Receiver<PathBuf>, tx: &Sender<FileContent>) {
 /// Create a language parser for the given language.
 fn create_parser(language: Language) -> Option<Box<dyn LanguageParser>> {
     match language {
-        Language::Rust => RustParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Go => GoParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::TypeScript | Language::JavaScript => {
-            TypeScriptParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
-        }
-        Language::Python => {
-            PythonParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
-        }
-        Language::Java => JavaParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::C => CParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Cpp => CppParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::CSharp => {
-            CSharpParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
-        }
-        Language::Php => PhpParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Swift => {
-            SwiftParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
-        }
-        Language::Lua => LuaParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Gdscript => {
-            GdscriptParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
-        }
-        Language::Kotlin => {
-            KotlinParser::new().ok().map(|p| Box::new(p) as Box<dyn LanguageParser>)
-        }
+        Language::Rust => RustParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Go => GoParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::TypeScript | Language::JavaScript => TypeScriptParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Python => PythonParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Java => JavaParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::C => CParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Cpp => CppParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::CSharp => CSharpParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Php => PhpParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Swift => SwiftParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Lua => LuaParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Gdscript => GdscriptParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Kotlin => KotlinParser::new()
+            .ok()
+            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
     }
 }
 
@@ -256,7 +277,10 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
 
     while let Ok(fc) = rx.recv() {
         let Some(language) = Language::from_path(&fc.path) else {
-            tracing::warn!("Unsupported or unknown language for file: {}", fc.path.display());
+            tracing::warn!(
+                "Unsupported or unknown language for file: {}",
+                fc.path.display()
+            );
             errors += 1;
             continue;
         };
@@ -449,7 +473,11 @@ fn stage_collect(
         // Convert raw relationships, resolving from_id where possible
         for raw_rel in parsed.raw_relationships {
             let from_id = symbol_lookup
-                .get(&(raw_rel.from_name.clone(), file_id.value(), raw_rel.from_range.start_line))
+                .get(&(
+                    raw_rel.from_name.clone(),
+                    file_id.value(),
+                    raw_rel.from_range.start_line,
+                ))
                 .copied()
                 .or_else(|| {
                     name_in_file
@@ -492,10 +520,7 @@ fn stage_collect(
 // ---------------------------------------------------------------------------
 
 /// Write batches to SQLite and return final statistics.
-fn stage_index(
-    db: &CodeDb,
-    rx: &Receiver<IndexBatch>,
-) -> anyhow::Result<IndexStats> {
+fn stage_index(db: &CodeDb, rx: &Receiver<IndexBatch>) -> anyhow::Result<IndexStats> {
     let mut stats = IndexStats::default();
 
     while let Ok(batch) = rx.recv() {
@@ -519,11 +544,7 @@ fn stage_index(
 /// Write a single batch of index data to the database.
 ///
 /// Called within a transaction managed by `stage_index`.
-fn write_batch(
-    db: &CodeDb,
-    batch: &IndexBatch,
-    stats: &mut IndexStats,
-) -> anyhow::Result<()> {
+fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyhow::Result<()> {
     // Build mapping from pipeline-assigned file IDs to real SQLite rowids.
     // The pipeline assigns sequential IDs (1,2,3...) but after incremental
     // reindex, SQLite rowids won't match (e.g. auto-incremented past old max).
@@ -550,9 +571,10 @@ fn write_batch(
             .get(&symbol.file_id.value())
             .copied()
             .unwrap_or(i64::from(symbol.file_id.value()));
-        let scope_json = symbol.scope_context.as_ref().and_then(|sc| {
-            serde_json::to_string(sc).ok()
-        });
+        let scope_json = symbol
+            .scope_context
+            .as_ref()
+            .and_then(|sc| serde_json::to_string(sc).ok());
         let real_sym_id = db.insert_symbol(
             symbol.as_name(),
             &symbol.kind.to_string(),
@@ -578,9 +600,9 @@ fn write_batch(
             .get(&rel.file_id.value())
             .copied()
             .unwrap_or(i64::from(rel.file_id.value()));
-        let real_from_id = rel.from_id.and_then(|id| {
-            symbol_id_map.get(&id.value()).copied()
-        });
+        let real_from_id = rel
+            .from_id
+            .and_then(|id| symbol_id_map.get(&id.value()).copied());
         let to_range = rel.to_range.as_ref();
         db.insert_relationship(
             real_from_id,
@@ -708,7 +730,10 @@ fn callee() {}
         let (_db_dir, db) = temp_db();
         index_directory(dir.path(), &db, &test_config()).unwrap();
 
-        assert!(db.symbol_count().unwrap() > 0, "expected symbols in database");
+        assert!(
+            db.symbol_count().unwrap() > 0,
+            "expected symbols in database"
+        );
         assert!(db.file_count().unwrap() > 0, "expected files in database");
     }
 
@@ -759,10 +784,7 @@ fn callee() {}
         let (_db_dir, db) = temp_db();
 
         // Only index 2 of the 3 files
-        let paths = vec![
-            dir.path().join("a.rs"),
-            dir.path().join("b.rs"),
-        ];
+        let paths = vec![dir.path().join("a.rs"), dir.path().join("b.rs")];
         let stats = index_files(&paths, dir.path(), &db, &test_config()).unwrap();
 
         assert!(stats.symbols_indexed >= 2);
@@ -786,7 +808,11 @@ fn callee() {}
     fn test_incremental_index_after_delete_no_fk_violation() {
         let dir = tempfile::tempdir().unwrap();
         // Phase 1: initial index with several files to push rowids up
-        fs::write(dir.path().join("a.rs"), "pub fn aaa() { bbb(); }\nfn bbb() {}").unwrap();
+        fs::write(
+            dir.path().join("a.rs"),
+            "pub fn aaa() { bbb(); }\nfn bbb() {}",
+        )
+        .unwrap();
         fs::write(dir.path().join("b.rs"), "pub fn ccc() {}").unwrap();
         fs::write(dir.path().join("c.rs"), "pub fn ddd() {}").unwrap();
 
@@ -800,10 +826,19 @@ fn callee() {}
         let b_path = "b.rs";
         // Delete symbols first (for FTS trigger), then files
         db.conn().execute("DELETE FROM code_symbols WHERE file_id IN (SELECT id FROM code_files WHERE path IN (?1, ?2))", rusqlite::params![a_path, b_path]).unwrap();
-        db.conn().execute("DELETE FROM code_files WHERE path IN (?1, ?2)", rusqlite::params![a_path, b_path]).unwrap();
+        db.conn()
+            .execute(
+                "DELETE FROM code_files WHERE path IN (?1, ?2)",
+                rusqlite::params![a_path, b_path],
+            )
+            .unwrap();
 
         // Re-index the deleted files with modified content
-        fs::write(dir.path().join("a.rs"), "pub fn aaa_v2() { bbb_v2(); }\nfn bbb_v2() {}").unwrap();
+        fs::write(
+            dir.path().join("a.rs"),
+            "pub fn aaa_v2() { bbb_v2(); }\nfn bbb_v2() {}",
+        )
+        .unwrap();
         fs::write(dir.path().join("b.rs"), "pub fn ccc_v2() {}").unwrap();
 
         let paths = vec![dir.path().join("a.rs"), dir.path().join("b.rs")];

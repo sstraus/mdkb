@@ -67,7 +67,10 @@ fn split_markdown(content: &str, config: &ChunkingConfig) -> Vec<Chunk> {
             }
 
             // Update heading stack: pop headings at same or deeper level
-            while heading_stack.last().is_some_and(|(lvl, _)| *lvl >= heading_level) {
+            while heading_stack
+                .last()
+                .is_some_and(|(lvl, _)| *lvl >= heading_level)
+            {
                 heading_stack.pop();
             }
             let heading_text = line.trim_start_matches('#').trim().to_string();
@@ -143,7 +146,11 @@ fn split_fixed(content: &str, config: &ChunkingConfig) -> Vec<Chunk> {
 
         // Move start forward, accounting for overlap
         let overlap_lines = find_overlap_start(&lines, end, config.overlap_tokens);
-        start = if overlap_lines > start { overlap_lines } else { end };
+        start = if overlap_lines > start {
+            overlap_lines
+        } else {
+            end
+        };
 
         // Safety: prevent infinite loop
         if start == end && end < lines.len() {
@@ -194,7 +201,13 @@ fn format_heading_path(stack: &[(usize, String)], include: bool) -> Option<Strin
     if !include || stack.is_empty() {
         return None;
     }
-    Some(stack.iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join(" > "))
+    Some(
+        stack
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join(" > "),
+    )
 }
 
 /// Merge chunks smaller than min_tokens into the previous chunk.
@@ -268,11 +281,18 @@ Here is the advanced section with more details about configuration options. You 
 
         let chunks = split(content, &config);
 
-        assert!(chunks.len() >= 2, "Should split into multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "Should split into multiple chunks, got {}",
+            chunks.len()
+        );
 
         // Each chunk should have heading context
         let has_heading_paths = chunks.iter().filter(|c| c.heading_path.is_some()).count();
-        assert!(has_heading_paths > 0, "Some chunks should have heading paths");
+        assert!(
+            has_heading_paths > 0,
+            "Some chunks should have heading paths"
+        );
     }
 
     #[test]
@@ -296,15 +316,19 @@ Deep content.";
         let chunks = split(content, &config);
 
         // Find a chunk under "Sub > Deep"
-        let deep_chunk = chunks.iter().find(|c| {
-            c.heading_path
-                .as_ref()
-                .is_some_and(|p| p.contains("Deep"))
-        });
+        let deep_chunk = chunks
+            .iter()
+            .find(|c| c.heading_path.as_ref().is_some_and(|p| p.contains("Deep")));
         if let Some(chunk) = deep_chunk {
             let path = chunk.heading_path.as_ref().unwrap();
-            assert!(path.contains("Top"), "Should include parent heading, got: {path}");
-            assert!(path.contains("Sub"), "Should include parent heading, got: {path}");
+            assert!(
+                path.contains("Top"),
+                "Should include parent heading, got: {path}"
+            );
+            assert!(
+                path.contains("Sub"),
+                "Should include parent heading, got: {path}"
+            );
         }
     }
 
@@ -324,7 +348,11 @@ Deep content.";
 
         let chunks = split(&content, &config);
 
-        assert!(chunks.len() >= 2, "Should split into multiple chunks, got {}", chunks.len());
+        assert!(
+            chunks.len() >= 2,
+            "Should split into multiple chunks, got {}",
+            chunks.len()
+        );
 
         // Chunks should be indexed sequentially
         for (i, chunk) in chunks.iter().enumerate() {
@@ -339,9 +367,7 @@ Deep content.";
 
     #[test]
     fn test_fixed_strategy_with_overlap() {
-        let lines: Vec<String> = (0..20)
-            .map(|i| format!("Unique line {i}"))
-            .collect();
+        let lines: Vec<String> = (0..20).map(|i| format!("Unique line {i}")).collect();
         let content = lines.join("\n");
 
         let config = ChunkingConfig {
@@ -360,7 +386,11 @@ Deep content.";
             let last_of_0 = chunk0_lines.last().unwrap();
             // The overlap means chunk1 should start with lines from near the end of chunk0
             let overlap = chunk1_lines.iter().any(|l| chunk0_lines.contains(l));
-            assert!(overlap, "Adjacent chunks should overlap. Chunk0 ends with: {last_of_0}, Chunk1 starts with: {}", chunk1_lines[0]);
+            assert!(
+                overlap,
+                "Adjacent chunks should overlap. Chunk0 ends with: {last_of_0}, Chunk1 starts with: {}",
+                chunk1_lines[0]
+            );
         }
     }
 
@@ -395,7 +425,11 @@ Content C here.";
         config.max_tokens = 30;
 
         let chunks = split(content, &config);
-        let all_text: String = chunks.iter().map(|c| c.content.as_str()).collect::<Vec<_>>().join("\n");
+        let all_text: String = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(all_text.contains("Content A"), "Should contain Content A");
         assert!(all_text.contains("Content B"), "Should contain Content B");

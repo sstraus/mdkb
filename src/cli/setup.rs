@@ -48,8 +48,16 @@ impl std::fmt::Display for McpScope {
 /// * `cwd` - Current working directory (used for local installs and as server cwd)
 /// * `global` - Whether to install globally (--scope user) or locally (--scope project)
 /// * `skip_confirm` - Skip confirmation prompt
-pub fn handle_setup_mcp_claude(cwd: &Path, global: bool, skip_confirm: bool) -> Result<McpSetupResult> {
-    let scope = if global { McpScope::Global } else { McpScope::Local };
+pub fn handle_setup_mcp_claude(
+    cwd: &Path,
+    global: bool,
+    skip_confirm: bool,
+) -> Result<McpSetupResult> {
+    let scope = if global {
+        McpScope::Global
+    } else {
+        McpScope::Local
+    };
 
     // Find the mdkb binary
     let binary_path = find_mdkb_binary()?;
@@ -149,10 +157,7 @@ pub fn handle_setup_mcp_claude(cwd: &Path, global: bool, skip_confirm: bool) -> 
                     scope,
                     binary_path,
                     cwd: server_cwd_str,
-                    message: format!(
-                        "Successfully registered mdkb MCP server (scope: {})",
-                        scope
-                    ),
+                    message: format!("Successfully registered mdkb MCP server (scope: {})", scope),
                 })
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -173,7 +178,11 @@ pub fn handle_setup_mcp_claude(cwd: &Path, global: bool, skip_confirm: bool) -> 
                         message: format!(
                             "Failed to register MCP server: {}{}",
                             stderr,
-                            if stdout.is_empty() { String::new() } else { format!("\n{}", stdout) }
+                            if stdout.is_empty() {
+                                String::new()
+                            } else {
+                                format!("\n{}", stdout)
+                            }
                         ),
                     }))
                 }

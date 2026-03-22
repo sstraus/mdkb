@@ -344,7 +344,10 @@ mod tests {
 
     #[test]
     fn test_symbol_kind_from_str() {
-        assert_eq!("Function".parse::<SymbolKind>().unwrap(), SymbolKind::Function);
+        assert_eq!(
+            "Function".parse::<SymbolKind>().unwrap(),
+            SymbolKind::Function
+        );
         assert_eq!("method".parse::<SymbolKind>().unwrap(), SymbolKind::Method);
         assert!("unknown".parse::<SymbolKind>().is_err());
     }

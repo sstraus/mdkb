@@ -3,6 +3,7 @@
 //! Supports classes, objects, interfaces, enums, functions, properties,
 //! companion objects, constructors, KDoc extraction, imports, and call graphs.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -11,7 +12,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct KotlinParser {
     parser: CachingParser,
@@ -115,14 +115,19 @@ impl KotlinParser {
         match node.kind() {
             "class_declaration" => {
                 self.process_class_declaration(
-                    node, code, file_id, counter, symbols, module_path, depth,
+                    node,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    module_path,
+                    depth,
                 );
             }
 
             "object_declaration" => {
                 let obj_name = find_type_identifier(node, code);
-                if let Some(symbol) =
-                    self.process_object(node, code, file_id, counter, module_path)
+                if let Some(symbol) = self.process_object(node, code, file_id, counter, module_path)
                 {
                     symbols.push(symbol);
                 }
@@ -134,7 +139,13 @@ impl KotlinParser {
                 if let Some(body) = find_child_by_kind(node, "class_body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -148,7 +159,13 @@ impl KotlinParser {
                 if let Some(body) = find_child_by_kind(node, "class_body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -171,7 +188,13 @@ impl KotlinParser {
                 if let Some(body) = find_child_by_kind(node, "function_body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -203,7 +226,13 @@ impl KotlinParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -261,7 +290,12 @@ impl KotlinParser {
         // Primary constructor parameters (val/var promote to fields)
         if let Some(ctor) = find_child_by_kind(node, "primary_constructor") {
             self.process_primary_constructor_params(
-                ctor, code, file_id, counter, symbols, module_path,
+                ctor,
+                code,
+                file_id,
+                counter,
+                symbols,
+                module_path,
             );
         }
 
@@ -296,7 +330,13 @@ impl KotlinParser {
                     }
                 } else {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -373,7 +413,10 @@ impl KotlinParser {
             SymbolKind::Class,
             file_id,
             node_range(node),
-            Some(format!("object {}", find_type_identifier(node, code).unwrap_or_default())),
+            Some(format!(
+                "object {}",
+                find_type_identifier(node, code).unwrap_or_default()
+            )),
             doc,
             module_path,
             visibility,
@@ -511,17 +554,26 @@ impl KotlinParser {
         let name = find_type_identifier(node, code)?;
         let visibility = determine_kotlin_visibility(node, code);
 
-        Some(self.create_symbol(
-            counter.next_id(),
-            name.clone(),
-            SymbolKind::TypeAlias,
-            file_id,
-            node_range(node),
-            Some(code[node.byte_range()].lines().next().unwrap_or("").trim().to_string()),
-            extract_kdoc(&node, code),
-            module_path,
-            visibility,
-        ))
+        Some(
+            self.create_symbol(
+                counter.next_id(),
+                name.clone(),
+                SymbolKind::TypeAlias,
+                file_id,
+                node_range(node),
+                Some(
+                    code[node.byte_range()]
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string(),
+                ),
+                extract_kdoc(&node, code),
+                module_path,
+                visibility,
+            ),
+        )
     }
 
     // ── Imports ─────────────────────────────────────────────────────────
@@ -550,14 +602,13 @@ impl KotlinParser {
             // Extract path from the identifier child
             let path = find_child_by_kind(node, "identifier")
                 .map(|n| code[n.byte_range()].to_string())
-                .unwrap_or_else(|| {
-                    text.trim_start_matches("import ")
-                        .trim()
-                        .to_string()
-                });
+                .unwrap_or_else(|| text.trim_start_matches("import ").trim().to_string());
 
             let alias = find_child_by_kind(node, "import_alias")
-                .and_then(|n| find_child_by_kind(n, "type_identifier").or_else(|| find_child_by_kind(n, "simple_identifier")))
+                .and_then(|n| {
+                    find_child_by_kind(n, "type_identifier")
+                        .or_else(|| find_child_by_kind(n, "simple_identifier"))
+                })
                 .map(|n| code[n.byte_range()].to_string());
 
             imports.push(Import {
@@ -924,8 +975,8 @@ fn build_class_signature(node: Node, code: &str, kind: SymbolKind) -> String {
     };
 
     let name = find_type_identifier(node, code).unwrap_or_else(|| "?".to_string());
-    let type_params = find_child_by_kind(node, "type_parameters")
-        .map(|n| code[n.byte_range()].to_string());
+    let type_params =
+        find_child_by_kind(node, "type_parameters").map(|n| code[n.byte_range()].to_string());
 
     match type_params {
         Some(tp) => format!("{keyword} {name}{tp}"),
@@ -1013,11 +1064,7 @@ fn extract_kdoc(node: &Node, code: &str) -> Option<String> {
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    if inner.is_empty() {
-        None
-    } else {
-        Some(inner)
-    }
+    if inner.is_empty() { None } else { Some(inner) }
 }
 
 /// Extract the method name from a navigation_expression (last simple_identifier in nav suffix).
@@ -1078,12 +1125,7 @@ fn extract_delegation_type<'a>(
 // ── LanguageParser trait impl ───────────────────────────────────────────
 
 impl LanguageParser for KotlinParser {
-    fn parse(
-        &mut self,
-        code: &str,
-        file_id: FileId,
-        counter: &mut SymbolCounter,
-    ) -> Vec<Symbol> {
+    fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
 
@@ -1142,7 +1184,6 @@ impl LanguageParser for KotlinParser {
 mod tests {
     use super::*;
 
-
     #[test]
     fn test_parse_class_and_methods() {
         let mut parser = KotlinParser::new().unwrap();
@@ -1173,16 +1214,21 @@ class Calculator(val initial: Int) {
                 && s.kind == SymbolKind::Class
                 && s.visibility == Visibility::Public),
             "expected Calculator class, got: {:?}",
-            symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            symbols
+                .iter()
+                .map(|s| (&s.name, &s.kind))
+                .collect::<Vec<_>>()
         );
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Calculator.initial"
-                && s.kind == SymbolKind::Field),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Calculator.initial" && s.kind == SymbolKind::Field),
             "expected Calculator.initial field"
         );
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Calculator.add"
-                && s.kind == SymbolKind::Method),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Calculator.add" && s.kind == SymbolKind::Method),
             "expected Calculator.add method"
         );
         assert!(
@@ -1192,8 +1238,9 @@ class Calculator(val initial: Int) {
             "expected Calculator.reset private method"
         );
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Calculator.value"
-                && s.kind == SymbolKind::Field),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Calculator.value" && s.kind == SymbolKind::Field),
             "expected Calculator.value field"
         );
     }
@@ -1217,19 +1264,25 @@ enum class Color {
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Serializable"
-                && s.kind == SymbolKind::Interface),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Serializable" && s.kind == SymbolKind::Interface),
             "expected Serializable interface, got: {:?}",
-            symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            symbols
+                .iter()
+                .map(|s| (&s.name, &s.kind))
+                .collect::<Vec<_>>()
         );
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Color"
-                && s.kind == SymbolKind::Enum),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum),
             "expected Color enum"
         );
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Color.RED"
-                && s.kind == SymbolKind::Constant),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Color.RED" && s.kind == SymbolKind::Constant),
             "expected Color.RED constant"
         );
     }
@@ -1255,21 +1308,27 @@ class MyClass {
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Singleton"
-                && s.kind == SymbolKind::Class),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Singleton" && s.kind == SymbolKind::Class),
             "expected Singleton object"
         );
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Singleton.instance"
-                && s.kind == SymbolKind::Method),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Singleton.instance" && s.kind == SymbolKind::Method),
             "expected Singleton.instance method"
         );
         // companion object method should be scoped under the class
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "MyClass.create"
-                && s.kind == SymbolKind::Method),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "MyClass.create" && s.kind == SymbolKind::Method),
             "expected MyClass.create from companion, got: {:?}",
-            symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            symbols
+                .iter()
+                .map(|s| (&s.name, &s.kind))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1286,12 +1345,21 @@ import java.util.Map as JavaMap
 
         let imports = parser.find_imports(code, file_id);
 
-        assert!(imports.iter().any(|i| i.path.contains("kotlin.collections.List")));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.path.contains("kotlin.collections.List"))
+        );
         assert!(imports.iter().any(|i| i.is_glob));
         assert!(
-            imports.iter().any(|i| i.alias.as_deref() == Some("JavaMap")),
+            imports
+                .iter()
+                .any(|i| i.alias.as_deref() == Some("JavaMap")),
             "expected alias JavaMap, got: {:?}",
-            imports.iter().map(|i| (&i.path, &i.alias)).collect::<Vec<_>>()
+            imports
+                .iter()
+                .map(|i| (&i.path, &i.alias))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1312,12 +1380,16 @@ class App {
 
         let calls = parser.find_calls_impl(code);
         assert!(
-            calls.iter().any(|(caller, target, _)| *caller == "main" && *target == "process"),
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "process"),
             "expected main->process call, got: {:?}",
             calls
         );
         assert!(
-            calls.iter().any(|(caller, target, _)| *caller == "main" && *target == "println"),
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "println"),
             "expected main->println call"
         );
     }
@@ -1336,16 +1408,22 @@ class Derived : Base(), Printable, Serializable
 
         let impls = parser.find_implementations(code);
         assert!(
-            impls.iter().any(|(cls, base, _)| *cls == "Derived" && *base == "Base"),
+            impls
+                .iter()
+                .any(|(cls, base, _)| *cls == "Derived" && *base == "Base"),
             "expected Derived extends Base, got: {:?}",
             impls
         );
         assert!(
-            impls.iter().any(|(cls, iface, _)| *cls == "Derived" && *iface == "Printable"),
+            impls
+                .iter()
+                .any(|(cls, iface, _)| *cls == "Derived" && *iface == "Printable"),
             "expected Derived implements Printable"
         );
         assert!(
-            impls.iter().any(|(cls, iface, _)| *cls == "Derived" && *iface == "Serializable"),
+            impls
+                .iter()
+                .any(|(cls, iface, _)| *cls == "Derived" && *iface == "Serializable"),
             "expected Derived implements Serializable"
         );
     }
@@ -1391,10 +1469,14 @@ fun topLevel(x: Int): String {
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "topLevel"
-                && s.kind == SymbolKind::Function),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "topLevel" && s.kind == SymbolKind::Function),
             "expected topLevel function, got: {:?}",
-            symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            symbols
+                .iter()
+                .map(|s| (&s.name, &s.kind))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1411,15 +1493,21 @@ data class Point(val x: Int, val y: Int)
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Point" && s.kind == SymbolKind::Class),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Point" && s.kind == SymbolKind::Class),
             "expected Point class"
         );
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Point.x" && s.kind == SymbolKind::Field),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Point.x" && s.kind == SymbolKind::Field),
             "expected Point.x field"
         );
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Point.y" && s.kind == SymbolKind::Field),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Point.y" && s.kind == SymbolKind::Field),
             "expected Point.y field"
         );
     }
@@ -1442,14 +1530,19 @@ class Config {
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Config.MAX_SIZE"
-                && s.kind == SymbolKind::Constant),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Config.MAX_SIZE" && s.kind == SymbolKind::Constant),
             "expected Config.MAX_SIZE constant, got: {:?}",
-            symbols.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            symbols
+                .iter()
+                .map(|s| (&s.name, &s.kind))
+                .collect::<Vec<_>>()
         );
         assert!(
-            symbols.iter().any(|s| s.name.as_ref() == "Config.name"
-                && s.kind == SymbolKind::Field),
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Config.name" && s.kind == SymbolKind::Field),
             "expected Config.name field"
         );
     }

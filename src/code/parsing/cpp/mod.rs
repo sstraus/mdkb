@@ -1,5 +1,6 @@
 //! C++ language parser implementation using tree-sitter-cpp 0.23.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -7,7 +8,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct CppParser {
     parser: CachingParser,
@@ -115,7 +115,13 @@ impl CppParser {
                     if let Some(body) = node.child_by_field_name("body") {
                         for child in body.children(&mut body.walk()) {
                             self.extract_symbols_from_node(
-                                child, code, file_id, counter, symbols, module_path, depth + 1,
+                                child,
+                                code,
+                                file_id,
+                                counter,
+                                symbols,
+                                module_path,
+                                depth + 1,
                             );
                         }
                     }
@@ -162,7 +168,13 @@ impl CppParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -185,7 +197,13 @@ impl CppParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, &new_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            &new_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -233,7 +251,13 @@ impl CppParser {
                 // Recurse into template body
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -245,7 +269,13 @@ impl CppParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -266,7 +296,11 @@ impl CppParser {
 
         let type_node = node.child_by_field_name("type");
         let sig = match type_node {
-            Some(t) => format!("{} {}", &code[t.byte_range()], &code[declarator.byte_range()]),
+            Some(t) => format!(
+                "{} {}",
+                &code[t.byte_range()],
+                &code[declarator.byte_range()]
+            ),
             None => code[declarator.byte_range()].to_string(),
         };
 
@@ -317,7 +351,10 @@ impl CppParser {
             name.to_string()
         };
 
-        let sig = code[node.byte_range()].trim_end_matches(';').trim().to_string();
+        let sig = code[node.byte_range()]
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
 
         Some(self.create_symbol(
             counter.next_id(),
@@ -356,7 +393,12 @@ impl CppParser {
                     SymbolKind::Field,
                     file_id,
                     node_range(node),
-                    Some(code[node.byte_range()].trim_end_matches(';').trim().to_string()),
+                    Some(
+                        code[node.byte_range()]
+                            .trim_end_matches(';')
+                            .trim()
+                            .to_string(),
+                    ),
                     None,
                     module_path,
                     Visibility::Private,
@@ -483,7 +525,9 @@ fn extract_cpp_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str>
             node.child_by_field_name("name")
                 .and_then(|n| extract_cpp_declarator_name(n, code))
         }
-        "pointer_declarator" | "reference_declarator" | "array_declarator"
+        "pointer_declarator"
+        | "reference_declarator"
+        | "array_declarator"
         | "parenthesized_declarator" => node
             .child_by_field_name("declarator")
             .and_then(|d| extract_cpp_declarator_name(d, code)),
@@ -516,7 +560,11 @@ fn extract_cpp_doc(node: &Node, code: &str) -> Option<String> {
         if inner.is_empty() { None } else { Some(inner) }
     } else if text.starts_with("///") {
         let inner = text.trim_start_matches("///").trim();
-        if inner.is_empty() { None } else { Some(inner.to_string()) }
+        if inner.is_empty() {
+            None
+        } else {
+            Some(inner.to_string())
+        }
     } else {
         None
     }
@@ -613,13 +661,21 @@ void standalone() {}
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Rectangle" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Rectangle::area"
-            && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "standalone"
-            && s.kind == SymbolKind::Function));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Rectangle" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Rectangle::area" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "standalone" && s.kind == SymbolKind::Function)
+        );
     }
 
     #[test]
@@ -635,7 +691,10 @@ namespace mylib {
 "#;
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
-        let func = symbols.iter().find(|s| s.name.as_ref() == "helper").unwrap();
+        let func = symbols
+            .iter()
+            .find(|s| s.name.as_ref() == "helper")
+            .unwrap();
         assert_eq!(func.module_path.as_deref(), Some("mylib"));
     }
 
@@ -649,9 +708,11 @@ class Derived : public Base {};
 "#;
 
         let impls = parser.find_implementations(code);
-        assert!(impls
-            .iter()
-            .any(|(cls, base, _)| *cls == "Derived" && *base == "Base"));
+        assert!(
+            impls
+                .iter()
+                .any(|(cls, base, _)| *cls == "Derived" && *base == "Base")
+        );
     }
 
     #[test]

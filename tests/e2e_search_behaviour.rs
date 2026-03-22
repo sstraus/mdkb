@@ -31,9 +31,7 @@ fn test_instructions_content() {
     let mut harness = McpTestHarness::new();
     let response = harness.initialize();
 
-    let instructions = response["result"]["instructions"]
-        .as_str()
-        .unwrap_or("");
+    let instructions = response["result"]["instructions"].as_str().unwrap_or("");
 
     assert!(
         instructions.contains("search(query)"),
@@ -135,10 +133,22 @@ fn test_search_results_format() {
 fn test_search_results_multiple_get_hint() {
     let mut harness = McpTestHarness::new();
 
-    harness.create_file("docs/intro.md", "# Rust Introduction\n\nGetting started with Rust programming language basics.");
-    harness.create_file("docs/advanced.md", "# Rust Advanced\n\nAdvanced Rust programming patterns and techniques.");
-    harness.create_file("docs/tutorial.md", "# Rust Tutorial\n\nA hands-on Rust programming tutorial for beginners.");
-    harness.create_file("docs/unrelated.md", "# Python Guide\n\nPython is a dynamic language.");
+    harness.create_file(
+        "docs/intro.md",
+        "# Rust Introduction\n\nGetting started with Rust programming language basics.",
+    );
+    harness.create_file(
+        "docs/advanced.md",
+        "# Rust Advanced\n\nAdvanced Rust programming patterns and techniques.",
+    );
+    harness.create_file(
+        "docs/tutorial.md",
+        "# Rust Tutorial\n\nA hands-on Rust programming tutorial for beginners.",
+    );
+    harness.create_file(
+        "docs/unrelated.md",
+        "# Python Guide\n\nPython is a dynamic language.",
+    );
     harness.add_collection("docs", "docs", "**/*.md");
     harness.update_index();
     harness.initialize();
@@ -270,9 +280,7 @@ fn test_instructions_variant_default() {
     let mut harness = McpTestHarness::with_env(&[("MDKB_INSTRUCTIONS_VARIANT", "default")]);
     let response = harness.initialize();
 
-    let instructions = response["result"]["instructions"]
-        .as_str()
-        .unwrap_or("");
+    let instructions = response["result"]["instructions"].as_str().unwrap_or("");
 
     assert!(
         !instructions.is_empty(),
@@ -287,13 +295,10 @@ fn test_instructions_variant_default() {
 /// Unknown variant falls back to default without error.
 #[test]
 fn test_instructions_variant_unknown_falls_back() {
-    let mut harness =
-        McpTestHarness::with_env(&[("MDKB_INSTRUCTIONS_VARIANT", "nonexistent_v99")]);
+    let mut harness = McpTestHarness::with_env(&[("MDKB_INSTRUCTIONS_VARIANT", "nonexistent_v99")]);
     let response = harness.initialize();
 
-    let instructions = response["result"]["instructions"]
-        .as_str()
-        .unwrap_or("");
+    let instructions = response["result"]["instructions"].as_str().unwrap_or("");
 
     // Should still get valid instructions (fallback to default)
     assert!(

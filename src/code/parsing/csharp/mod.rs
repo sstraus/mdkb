@@ -1,5 +1,6 @@
 //! C# language parser implementation using tree-sitter-c-sharp 0.23.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -7,7 +8,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct CSharpParser {
     parser: CachingParser,
@@ -130,7 +130,13 @@ impl CSharpParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -168,7 +174,13 @@ impl CSharpParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -199,7 +211,13 @@ impl CSharpParser {
                 self.context.enter_scope(ScopeType::Class);
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
                 self.context.exit_scope();
@@ -239,14 +257,26 @@ impl CSharpParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, &new_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            &new_path,
+                            depth + 1,
                         );
                     }
                 } else {
                     // File-scoped namespace: everything after is in this namespace
                     for child in node.children(&mut node.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, &new_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            &new_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -357,7 +387,13 @@ impl CSharpParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -388,12 +424,11 @@ impl CSharpParser {
                                 SymbolKind::Field
                             };
 
-                            let qualified_name =
-                                if let Some(cls) = self.context.current_class() {
-                                    format!("{cls}.{name}")
-                                } else {
-                                    name.to_string()
-                                };
+                            let qualified_name = if let Some(cls) = self.context.current_class() {
+                                format!("{cls}.{name}")
+                            } else {
+                                name.to_string()
+                            };
 
                             let symbol = self.create_symbol(
                                 counter.next_id(),
@@ -495,11 +530,7 @@ impl CSharpParser {
                 if let Some(bases) = node.child_by_field_name("bases") {
                     for child in bases.children(&mut bases.walk()) {
                         if child.kind() == "identifier" || child.kind() == "generic_name" {
-                            results.push((
-                                type_name,
-                                &code[child.byte_range()],
-                                node_range(child),
-                            ));
+                            results.push((type_name, &code[child.byte_range()], node_range(child)));
                         }
                     }
                 }
@@ -642,8 +673,11 @@ namespace MyApp {
         assert!(symbols.iter().any(|s| s.name.as_ref() == "Calculator"
             && s.kind == SymbolKind::Class
             && s.visibility == Visibility::Public));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Calculator.Add"
-            && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Calculator.Add" && s.kind == SymbolKind::Method)
+        );
         assert!(symbols.iter().any(|s| s.name.as_ref() == "Calculator.Calculator"
             && s.kind == SymbolKind::Method));
     }
@@ -668,11 +702,16 @@ public enum Color {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "ISerializable"
-            && s.kind == SymbolKind::Interface));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "ISerializable" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum)
+        );
     }
 
     #[test]
@@ -687,9 +726,11 @@ using System.Collections.Generic;
 
         let imports = parser.find_imports(code, file_id);
         assert!(imports.iter().any(|i| i.path == "System"));
-        assert!(imports
-            .iter()
-            .any(|i| i.path == "System.Collections.Generic"));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.path == "System.Collections.Generic")
+        );
     }
 
     #[test]

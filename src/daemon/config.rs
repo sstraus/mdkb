@@ -56,12 +56,10 @@ impl DaemonConfig {
     /// Load config from a TOML file, or return default if the file doesn't exist.
     pub fn load_or_default(path: &Path) -> Result<Self> {
         if path.exists() {
-            let content = std::fs::read_to_string(path).map_err(|e| {
-                Error::other(format!("Failed to read daemon config: {e}"))
-            })?;
-            toml::from_str(&content).map_err(|e| {
-                Error::config(format!("Failed to parse daemon config: {e}"))
-            })
+            let content = std::fs::read_to_string(path)
+                .map_err(|e| Error::other(format!("Failed to read daemon config: {e}")))?;
+            toml::from_str(&content)
+                .map_err(|e| Error::config(format!("Failed to parse daemon config: {e}")))
         } else {
             Ok(Self::default())
         }
@@ -70,16 +68,13 @@ impl DaemonConfig {
     /// Save config to a TOML file.
     pub fn save(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                Error::other(format!("Failed to create daemon config dir: {e}"))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| Error::other(format!("Failed to create daemon config dir: {e}")))?;
         }
-        let content = toml::to_string_pretty(self).map_err(|e| {
-            Error::config(format!("Failed to serialize daemon config: {e}"))
-        })?;
-        std::fs::write(path, content).map_err(|e| {
-            Error::other(format!("Failed to write daemon config: {e}"))
-        })
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| Error::config(format!("Failed to serialize daemon config: {e}")))?;
+        std::fs::write(path, content)
+            .map_err(|e| Error::other(format!("Failed to write daemon config: {e}")))
     }
 
     /// Resolve the daemon home directory (~/.mdkb/).
@@ -174,8 +169,12 @@ mod tests {
             max_active_repos: 10,
             whitelist_dirs: vec!["~/Gits".to_string(), "~/Projects".to_string()],
             repos: vec![
-                RepoEntry { root: "/Users/me/Gits/projectA".to_string() },
-                RepoEntry { root: "/Users/me/Gits/projectB".to_string() },
+                RepoEntry {
+                    root: "/Users/me/Gits/projectA".to_string(),
+                },
+                RepoEntry {
+                    root: "/Users/me/Gits/projectB".to_string(),
+                },
             ],
         };
 
@@ -224,7 +223,9 @@ whitelist_dirs = ["~/Code"]
             socket_path: None,
             max_active_repos: 7,
             whitelist_dirs: vec!["~/Gits".to_string()],
-            repos: vec![RepoEntry { root: "/foo/bar".to_string() }],
+            repos: vec![RepoEntry {
+                root: "/foo/bar".to_string(),
+            }],
         };
         config.save(&path).unwrap();
 
@@ -288,7 +289,10 @@ whitelist_dirs = ["~/Code"]
         let result = config.check_whitelist(Path::new("/somewhere/else"));
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("not in the daemon whitelist"), "Error: {err_msg}");
+        assert!(
+            err_msg.contains("not in the daemon whitelist"),
+            "Error: {err_msg}"
+        );
         assert!(err_msg.contains("whitelist_dirs"), "Error: {err_msg}");
     }
 

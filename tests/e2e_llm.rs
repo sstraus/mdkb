@@ -121,7 +121,9 @@ fn test_embedding_service_loads() {
     let service = mdkb::llm::get_cached_service().expect("failed to load service");
 
     // Verify we can generate an embedding
-    let embedding = service.embed_query("test text").expect("failed to generate embedding");
+    let embedding = service
+        .embed_query("test text")
+        .expect("failed to generate embedding");
 
     // AllMiniLML6V2 produces 384-dimensional embeddings
     assert_eq!(embedding.len(), 384);
@@ -133,7 +135,10 @@ fn test_embedding_service_caching() {
     let svc1 = mdkb::llm::get_cached_service().expect("failed to load service");
     let svc2 = mdkb::llm::get_cached_service().expect("failed to get cached service");
 
-    assert!(Arc::ptr_eq(&svc1, &svc2), "get_cached_service should return same Arc instance");
+    assert!(
+        Arc::ptr_eq(&svc1, &svc2),
+        "get_cached_service should return same Arc instance"
+    );
 }
 
 #[test]
@@ -141,7 +146,9 @@ fn test_embedding_service_caching() {
 fn test_query_vs_document_embeddings() {
     let service = mdkb::llm::get_cached_service().expect("failed to load service");
 
-    let doc_embeddings = service.embed_documents(&["Rust programming language"]).unwrap();
+    let doc_embeddings = service
+        .embed_documents(&["Rust programming language"])
+        .unwrap();
     let query_embedding = service.embed_query("What is Rust?").unwrap();
 
     assert_eq!(doc_embeddings[0].len(), 384);
@@ -161,7 +168,9 @@ fn test_semantic_similarity() {
     let python = service.embed_query("Python scripting language").unwrap();
 
     // This should be very different
-    let cooking = service.embed_query("How to bake chocolate chip cookies").unwrap();
+    let cooking = service
+        .embed_query("How to bake chocolate chip cookies")
+        .unwrap();
 
     let sim_rust_rust = mdkb::llm::cosine_similarity(&rust1, &rust2);
     let sim_rust_python = mdkb::llm::cosine_similarity(&rust1, &python);

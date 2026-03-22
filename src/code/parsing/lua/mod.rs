@@ -1,5 +1,6 @@
 //! Lua language parser implementation using tree-sitter-lua 0.4.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::ParserContext;
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -7,7 +8,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct LuaParser {
     parser: CachingParser,
@@ -197,7 +197,13 @@ impl LuaParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -347,8 +353,11 @@ end
         assert!(symbols.iter().any(|s| s.name.as_ref() == "_helper"
             && s.kind == SymbolKind::Function
             && s.visibility == Visibility::Private));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "MyModule:update"
-            && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "MyModule:update" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -369,10 +378,11 @@ end
             .iter()
             .find(|s| s.name.as_ref() == "multiply")
             .expect("should find multiply");
-        assert!(func
-            .doc_comment
-            .as_deref()
-            .unwrap()
-            .contains("Compute the product"));
+        assert!(
+            func.doc_comment
+                .as_deref()
+                .unwrap()
+                .contains("Compute the product")
+        );
     }
 }

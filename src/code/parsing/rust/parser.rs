@@ -1,5 +1,6 @@
 //! Rust language parser implementation using tree-sitter-rust 0.24 (ABI-15).
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -8,7 +9,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 /// Classification for Rust doc comment types.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -281,9 +281,14 @@ impl RustParser {
                     .map(|n| code[n.byte_range()].to_string());
 
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Some(mut sym) =
-                        self.create_symbol(counter, node, name_node, SymbolKind::Struct, file_id, code)
-                    {
+                    if let Some(mut sym) = self.create_symbol(
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::Struct,
+                        file_id,
+                        code,
+                    ) {
                         sym = sym.with_signature(self.extract_struct_signature(node, code));
                         symbols.push(sym);
                     }
@@ -300,7 +305,12 @@ impl RustParser {
                         if child.kind() == "field_declaration" {
                             if let Some(name_node) = child.child_by_field_name("name") {
                                 if let Some(sym) = self.create_symbol(
-                                    counter, child, name_node, SymbolKind::Field, file_id, code,
+                                    counter,
+                                    child,
+                                    name_node,
+                                    SymbolKind::Field,
+                                    file_id,
+                                    code,
                                 ) {
                                     symbols.push(sym);
                                 }
@@ -321,9 +331,14 @@ impl RustParser {
             }
             "enum_item" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Some(mut sym) =
-                        self.create_symbol(counter, node, name_node, SymbolKind::Enum, file_id, code)
-                    {
+                    if let Some(mut sym) = self.create_symbol(
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::Enum,
+                        file_id,
+                        code,
+                    ) {
                         sym = sym.with_signature(self.extract_enum_signature(node, code));
                         symbols.push(sym);
                     }
@@ -334,7 +349,12 @@ impl RustParser {
                         if child.kind() == "enum_variant" {
                             if let Some(name_node) = child.child_by_field_name("name") {
                                 if let Some(sym) = self.create_symbol(
-                                    counter, child, name_node, SymbolKind::Constant, file_id, code,
+                                    counter,
+                                    child,
+                                    name_node,
+                                    SymbolKind::Constant,
+                                    file_id,
+                                    code,
                                 ) {
                                     symbols.push(sym);
                                 }
@@ -346,7 +366,12 @@ impl RustParser {
             "type_item" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     if let Some(mut sym) = self.create_symbol(
-                        counter, node, name_node, SymbolKind::TypeAlias, file_id, code,
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::TypeAlias,
+                        file_id,
+                        code,
                     ) {
                         sym = sym.with_signature(self.extract_type_alias_signature(node, code));
                         symbols.push(sym);
@@ -356,7 +381,12 @@ impl RustParser {
             "const_item" | "static_item" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     if let Some(mut sym) = self.create_symbol(
-                        counter, node, name_node, SymbolKind::Constant, file_id, code,
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::Constant,
+                        file_id,
+                        code,
                     ) {
                         sym = sym.with_signature(self.extract_const_signature(node, code));
                         symbols.push(sym);
@@ -365,9 +395,14 @@ impl RustParser {
             }
             "trait_item" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Some(mut sym) =
-                        self.create_symbol(counter, node, name_node, SymbolKind::Trait, file_id, code)
-                    {
+                    if let Some(mut sym) = self.create_symbol(
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::Trait,
+                        file_id,
+                        code,
+                    ) {
                         sym = sym.with_signature(self.extract_trait_signature(node, code));
                         symbols.push(sym);
                     }
@@ -380,7 +415,12 @@ impl RustParser {
                             {
                                 if let Some(mn) = child.child_by_field_name("name") {
                                     if let Some(mut ms) = self.create_symbol(
-                                        counter, child, mn, SymbolKind::Method, file_id, code,
+                                        counter,
+                                        child,
+                                        mn,
+                                        SymbolKind::Method,
+                                        file_id,
+                                        code,
                                     ) {
                                         ms = ms.with_signature(self.extract_signature(child, code));
                                         symbols.push(ms);
@@ -416,9 +456,14 @@ impl RustParser {
             }
             "mod_item" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Some(sym) =
-                        self.create_symbol(counter, node, name_node, SymbolKind::Module, file_id, code)
-                    {
+                    if let Some(sym) = self.create_symbol(
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::Module,
+                        file_id,
+                        code,
+                    ) {
                         symbols.push(sym);
                     }
                 }
@@ -431,9 +476,14 @@ impl RustParser {
             }
             "macro_definition" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Some(sym) =
-                        self.create_symbol(counter, node, name_node, SymbolKind::Macro, file_id, code)
-                    {
+                    if let Some(sym) = self.create_symbol(
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::Macro,
+                        file_id,
+                        code,
+                    ) {
                         symbols.push(sym);
                     }
                 }
@@ -765,12 +815,7 @@ impl RustParser {
         calls
     }
 
-    fn find_method_calls_in_node(
-        &self,
-        node: Node,
-        code: &str,
-        calls: &mut Vec<MethodCall>,
-    ) {
+    fn find_method_calls_in_node(&self, node: Node, code: &str, calls: &mut Vec<MethodCall>) {
         let containing_fn = self.find_containing_function(node, code);
 
         if node.kind() == "call_expression" {
@@ -825,10 +870,7 @@ impl RustParser {
 
     // ── Implementations ─────────────────────────────────────────────────
 
-    fn find_implementations_impl<'a>(
-        &mut self,
-        code: &'a str,
-    ) -> Vec<(&'a str, &'a str, Range)> {
+    fn find_implementations_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         let tree = match self.parser.parse_cached(code) {
             Some(t) => t,
             None => return Vec::new(),
@@ -893,8 +935,7 @@ impl RustParser {
                         for child in body.children(&mut body.walk()) {
                             if child.kind() == "field_declaration" {
                                 if let Some(type_node) = child.child_by_field_name("type") {
-                                    if let Some(type_name) =
-                                        self.extract_type_name(type_node, code)
+                                    if let Some(type_name) = self.extract_type_name(type_node, code)
                                     {
                                         let range = Range::new(
                                             type_node.start_position().row as u32,
@@ -917,8 +958,7 @@ impl RustParser {
                         for param in params.children(&mut params.walk()) {
                             if param.kind() == "parameter" {
                                 if let Some(type_node) = param.child_by_field_name("type") {
-                                    if let Some(type_name) =
-                                        self.extract_type_name(type_node, code)
+                                    if let Some(type_name) = self.extract_type_name(type_node, code)
                                     {
                                         let range = Range::new(
                                             type_node.start_position().row as u32,
@@ -1006,8 +1046,7 @@ impl RustParser {
                                             child.end_position().row as u32,
                                             child.end_position().column as u16,
                                         );
-                                        defines
-                                            .push((type_name, &code[mn.byte_range()], range));
+                                        defines.push((type_name, &code[mn.byte_range()], range));
                                     }
                                 }
                             }
@@ -1068,14 +1107,13 @@ impl RustParser {
             "struct_expression" => node
                 .child_by_field_name("name")
                 .and_then(|n| self.extract_type_name(n, code)),
-            "call_expression" => {
-                node.child_by_field_name("function")
-                    .filter(|f| f.kind() == "scoped_identifier")
-                    .and_then(|f| {
-                        let full = &code[f.byte_range()];
-                        full.find("::").map(|pos| &full[..pos])
-                    })
-            }
+            "call_expression" => node
+                .child_by_field_name("function")
+                .filter(|f| f.kind() == "scoped_identifier")
+                .and_then(|f| {
+                    let full = &code[f.byte_range()];
+                    full.find("::").map(|pos| &full[..pos])
+                }),
             _ => None,
         }
     }
@@ -1131,12 +1169,7 @@ impl RustParser {
 // ── LanguageParser trait ────────────────────────────────────────────────
 
 impl LanguageParser for RustParser {
-    fn parse(
-        &mut self,
-        code: &str,
-        file_id: FileId,
-        counter: &mut SymbolCounter,
-    ) -> Vec<Symbol> {
+    fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
 
@@ -1212,18 +1245,26 @@ pub struct MyStruct {
         assert!(symbols.iter().any(|s| s.name.as_ref() == "public_function"
             && s.kind == SymbolKind::Function
             && s.visibility == Visibility::Public));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "private_function" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(
-            |s| s.name.as_ref() == "MyStruct" && s.kind == SymbolKind::Struct
-        ));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "name" && s.kind == SymbolKind::Field));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "age" && s.kind == SymbolKind::Field));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "private_function" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "MyStruct" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "name" && s.kind == SymbolKind::Field)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "age" && s.kind == SymbolKind::Field)
+        );
     }
 
     #[test]
@@ -1242,21 +1283,31 @@ pub trait Drawable {
         let mut counter = SymbolCounter::new();
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Red" && s.kind == SymbolKind::Constant));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Drawable" && s.kind == SymbolKind::Trait));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "draw" && s.kind == SymbolKind::Method));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "area" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Red" && s.kind == SymbolKind::Constant)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Drawable" && s.kind == SymbolKind::Trait)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "draw" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "area" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -1275,12 +1326,16 @@ impl Point {
         let mut counter = SymbolCounter::new();
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "new" && s.kind == SymbolKind::Method));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "distance" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "new" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "distance" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -1296,15 +1351,21 @@ fn process() {}
         "#;
 
         let calls = parser.find_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "process"));
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "String::new"));
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "push"));
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "String::new")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "push")
+        );
     }
 
     #[test]
@@ -1334,12 +1395,18 @@ use std::path::*;
         "#;
 
         let imports = parser.extract_imports(code, file_id);
-        assert!(imports.iter().any(|i| i.path == "std::collections::HashMap"));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.path == "std::collections::HashMap")
+        );
         assert!(imports.iter().any(|i| i.path == "std::io::Read"));
         assert!(imports.iter().any(|i| i.path == "std::io::Write"));
-        assert!(imports
-            .iter()
-            .any(|i| i.path == "crate::config::Settings" && i.alias.as_deref() == Some("Config")));
+        assert!(
+            imports.iter().any(
+                |i| i.path == "crate::config::Settings" && i.alias.as_deref() == Some("Config")
+            )
+        );
         assert!(imports.iter().any(|i| i.is_glob));
     }
 
@@ -1352,12 +1419,14 @@ fn process(input: Config) -> Result {}
         "#;
 
         let uses = parser.find_uses_impl(code);
-        assert!(uses
-            .iter()
-            .any(|(ctx, typ, _)| *ctx == "Container" && *typ == "Vec"));
-        assert!(uses
-            .iter()
-            .any(|(ctx, typ, _)| *ctx == "process" && *typ == "Config"));
+        assert!(
+            uses.iter()
+                .any(|(ctx, typ, _)| *ctx == "Container" && *typ == "Vec")
+        );
+        assert!(
+            uses.iter()
+                .any(|(ctx, typ, _)| *ctx == "process" && *typ == "Config")
+        );
     }
 
     #[test]
@@ -1375,12 +1444,16 @@ impl Server {
         "#;
 
         let defines = parser.find_defines_impl(code);
-        assert!(defines
-            .iter()
-            .any(|(definer, method, _)| *definer == "Handler" && *method == "handle"));
-        assert!(defines
-            .iter()
-            .any(|(definer, method, _)| *definer == "Server" && *method == "start"));
+        assert!(
+            defines
+                .iter()
+                .any(|(definer, method, _)| *definer == "Handler" && *method == "handle")
+        );
+        assert!(
+            defines
+                .iter()
+                .any(|(definer, method, _)| *definer == "Server" && *method == "start")
+        );
     }
 
     #[test]
@@ -1427,19 +1500,17 @@ fn main() {
         "#;
 
         let calls = parser.find_method_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|c| c.caller == "main" && c.method_name == "new" && c.is_static));
-        assert!(calls
-            .iter()
-            .any(|c| c.caller == "main"
-                && c.method_name == "push"
-                && c.receiver.as_deref() == Some("data")));
-        assert!(calls
-            .iter()
-            .any(|c| c.caller == "main"
-                && c.method_name == "validate"
-                && c.receiver.as_deref() == Some("self")));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.caller == "main" && c.method_name == "new" && c.is_static)
+        );
+        assert!(calls.iter().any(|c| c.caller == "main"
+            && c.method_name == "push"
+            && c.receiver.as_deref() == Some("data")));
+        assert!(calls.iter().any(|c| c.caller == "main"
+            && c.method_name == "validate"
+            && c.receiver.as_deref() == Some("self")));
     }
 
     #[test]
@@ -1454,12 +1525,16 @@ fn main() {
         "#;
 
         let bindings = parser.find_variable_types_impl(code);
-        assert!(bindings
-            .iter()
-            .any(|(var, typ, _)| *var == "config" && *typ == "Config"));
-        assert!(bindings
-            .iter()
-            .any(|(var, typ, _)| *var == "server" && *typ == "Server"));
+        assert!(
+            bindings
+                .iter()
+                .any(|(var, typ, _)| *var == "config" && *typ == "Config")
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|(var, typ, _)| *var == "server" && *typ == "Server")
+        );
         // Literals don't produce type bindings.
         assert!(!bindings.iter().any(|(var, _, _)| *var == "name"));
     }
@@ -1478,12 +1553,16 @@ impl Foo for MyType { fn foo(&self) {} }
         "#;
 
         let methods = parser.find_inherent_methods_impl(code);
-        assert!(methods
-            .iter()
-            .any(|(t, m, _)| t == "MyType" && m == "method_a"));
-        assert!(methods
-            .iter()
-            .any(|(t, m, _)| t == "MyType" && m == "method_b"));
+        assert!(
+            methods
+                .iter()
+                .any(|(t, m, _)| t == "MyType" && m == "method_a")
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|(t, m, _)| t == "MyType" && m == "method_b")
+        );
         // Trait impl methods should NOT appear in inherent methods.
         assert!(!methods.iter().any(|(_, m, _)| m == "foo"));
     }

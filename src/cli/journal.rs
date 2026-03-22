@@ -58,7 +58,13 @@ pub fn parse_journal(content: &str) -> ParsedJournal {
 
         // Parse date line
         if line.starts_with("**Date:**") || line.starts_with("Date:") {
-            let date = line.split(':').skip(1).collect::<Vec<_>>().join(":").trim().to_string();
+            let date = line
+                .split(':')
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join(":")
+                .trim()
+                .to_string();
             journal.date = Some(date.trim_matches('*').trim().to_string());
             continue;
         }
@@ -118,7 +124,9 @@ fn save_section(journal: &mut ParsedJournal, section_name: &str, content: &str) 
     } else if lower.contains("recommend") {
         journal.recommendations = extract_bullet_points(content);
     } else {
-        journal.other_sections.push((section_name.to_string(), content.to_string()));
+        journal
+            .other_sections
+            .push((section_name.to_string(), content.to_string()));
     }
 }
 
@@ -130,14 +138,22 @@ fn extract_bullet_points(content: &str) -> Vec<String> {
         let trimmed = line.trim();
 
         // New bullet point
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") ||
-           trimmed.starts_with("• ") || (trimmed.len() > 2 && trimmed.chars().next().unwrap().is_ascii_digit() && trimmed.contains(". ")) {
+        if trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("• ")
+            || (trimmed.len() > 2
+                && trimmed.chars().next().unwrap().is_ascii_digit()
+                && trimmed.contains(". "))
+        {
             // Save previous point
             if !current_point.is_empty() {
                 points.push(current_point.trim().to_string());
             }
             // Start new point (remove bullet)
-            let text = if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("• ") {
+            let text = if trimmed.starts_with("- ")
+                || trimmed.starts_with("* ")
+                || trimmed.starts_with("• ")
+            {
                 &trimmed[2..]
             } else {
                 // Numbered list: skip "N. "
@@ -325,7 +341,13 @@ pub fn path_to_base_id(path: &Path) -> String {
         .unwrap_or("journal")
         .to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -364,7 +386,10 @@ This was a productive session.
 
         assert_eq!(journal.title, "Session: test-session");
         assert_eq!(journal.date, Some("2026-01-31".to_string()));
-        assert_eq!(journal.summary, Some("This was a productive session.".to_string()));
+        assert_eq!(
+            journal.summary,
+            Some("This was a productive session.".to_string())
+        );
         assert_eq!(journal.key_findings.len(), 2);
         assert!(journal.key_findings[0].contains("bug"));
         assert_eq!(journal.decisions.len(), 2);
@@ -410,7 +435,7 @@ Test summary.
         let journal = parse_journal(content);
         let entries = journal_to_memory_entries(&journal, Path::new("/test/journal.md"), "test");
 
-        assert_eq!(entries.len(), 1);  // Only insights entry
+        assert_eq!(entries.len(), 1); // Only insights entry
         assert_eq!(entries[0].id, "test-insights");
         assert_eq!(entries[0].entry_type, EntryType::Topic);
         assert!(entries[0].source_path.is_some());
@@ -419,7 +444,9 @@ Test summary.
     #[test]
     fn test_path_to_base_id() {
         assert_eq!(
-            path_to_base_id(Path::new("/home/user/.claude/journal/2026-01-31-session-1.md")),
+            path_to_base_id(Path::new(
+                "/home/user/.claude/journal/2026-01-31-session-1.md"
+            )),
             "2026-01-31-session-1"
         );
         assert_eq!(

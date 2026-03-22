@@ -1,5 +1,6 @@
 //! Go language parser implementation using tree-sitter-go 0.25.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -8,7 +9,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct GoParser {
     parser: CachingParser,
@@ -17,9 +17,7 @@ pub struct GoParser {
 
 impl std::fmt::Debug for GoParser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GoParser")
-            .field("language", &"Go")
-            .finish()
+        f.debug_struct("GoParser").field("language", &"Go").finish()
     }
 }
 
@@ -86,12 +84,16 @@ impl GoParser {
                     symbols.push(symbol);
 
                     // Enter function scope and process children
-                    self.context.enter_scope(ScopeType::Function {
-                        hoisting: false,
-                    });
+                    self.context
+                        .enter_scope(ScopeType::Function { hoisting: false });
                     if let Some(params) = node.child_by_field_name("parameters") {
                         self.process_method_parameters(
-                            params, code, file_id, counter, symbols, module_path,
+                            params,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
                         );
                     }
                     for child in node.children(&mut node.walk()) {
@@ -119,19 +121,28 @@ impl GoParser {
                     symbols.push(symbol);
 
                     // Enter function scope and process children
-                    self.context.enter_scope(ScopeType::Function {
-                        hoisting: false,
-                    });
+                    self.context
+                        .enter_scope(ScopeType::Function { hoisting: false });
                     // Process receiver
                     if let Some(receiver) = node.child_by_field_name("receiver") {
                         self.process_method_receiver(
-                            receiver, code, file_id, counter, symbols, module_path,
+                            receiver,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
                         );
                     }
                     // Process parameters
                     if let Some(params) = node.child_by_field_name("parameters") {
                         self.process_method_parameters(
-                            params, code, file_id, counter, symbols, module_path,
+                            params,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
                         );
                     }
                     for child in node.children(&mut node.walk()) {
@@ -152,21 +163,15 @@ impl GoParser {
             }
 
             "type_declaration" => {
-                self.process_type_declaration(
-                    node, code, file_id, counter, symbols, module_path,
-                );
+                self.process_type_declaration(node, code, file_id, counter, symbols, module_path);
             }
 
             "var_declaration" => {
-                self.process_var_declaration(
-                    node, code, file_id, counter, symbols, module_path,
-                );
+                self.process_var_declaration(node, code, file_id, counter, symbols, module_path);
             }
 
             "const_declaration" => {
-                self.process_const_declaration(
-                    node, code, file_id, counter, symbols, module_path,
-                );
+                self.process_const_declaration(node, code, file_id, counter, symbols, module_path);
             }
 
             "if_statement" | "for_statement" | "switch_statement" => {
@@ -176,7 +181,13 @@ impl GoParser {
                     for child in node.children(&mut node.walk()) {
                         if child.kind() == "range_clause" {
                             self.process_range_clause(
-                                child, code, file_id, counter, symbols, module_path, depth,
+                                child,
+                                code,
+                                file_id,
+                                counter,
+                                symbols,
+                                module_path,
+                                depth,
                             );
                         }
                     }
@@ -184,7 +195,13 @@ impl GoParser {
                 for child in node.children(&mut node.walk()) {
                     if child.kind() != "range_clause" {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -196,7 +213,13 @@ impl GoParser {
                 self.context.enter_scope(ScopeType::Block);
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
                 self.context.exit_scope();
@@ -205,7 +228,12 @@ impl GoParser {
 
             "short_var_declaration" => {
                 self.process_short_var_declaration(
-                    node, code, file_id, counter, symbols, module_path,
+                    node,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    module_path,
                 );
             }
 
@@ -219,7 +247,13 @@ impl GoParser {
         ) {
             for child in node.children(&mut node.walk()) {
                 self.extract_symbols_from_node(
-                    child, code, file_id, counter, symbols, module_path, depth + 1,
+                    child,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    module_path,
+                    depth + 1,
                 );
             }
         }
@@ -369,7 +403,13 @@ impl GoParser {
                 symbols.push(symbol);
 
                 self.extract_struct_fields(
-                    type_node, code, file_id, counter, symbols, module_path, name,
+                    type_node,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    module_path,
+                    name,
                 );
             }
             "interface_type" => {
@@ -391,7 +431,13 @@ impl GoParser {
                 symbols.push(symbol);
 
                 self.extract_interface_methods(
-                    type_node, code, file_id, counter, symbols, module_path, name,
+                    type_node,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    module_path,
+                    name,
                 );
             }
             _ => {
@@ -433,7 +479,12 @@ impl GoParser {
                 for field_child in child.children(&mut child.walk()) {
                     if field_child.kind() == "field_declaration" {
                         self.process_struct_field(
-                            field_child, code, file_id, counter, symbols, module_path,
+                            field_child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
                             struct_name,
                         );
                     }
@@ -506,7 +557,13 @@ impl GoParser {
         for child in interface_node.children(&mut interface_node.walk()) {
             if child.kind() == "method_elem" {
                 self.process_interface_method(
-                    child, code, file_id, counter, symbols, module_path, interface_name,
+                    child,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    module_path,
+                    interface_name,
                 );
             }
         }
@@ -859,7 +916,13 @@ impl GoParser {
                 }
                 _ => {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -984,7 +1047,11 @@ impl GoParser {
         }
 
         let joined = filtered.join("\n").trim().to_string();
-        if joined.is_empty() { None } else { Some(joined) }
+        if joined.is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
     }
 
     // ── Imports ─────────────────────────────────────────────────────────
@@ -1366,12 +1433,12 @@ impl GoParser {
             "method_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let method_name = &code[name_node.byte_range()];
-                    let receiver_type =
-                        if let Some(receiver) = node.child_by_field_name("receiver") {
-                            extract_receiver_type(receiver, code).unwrap_or("unknown")
-                        } else {
-                            "unknown"
-                        };
+                    let receiver_type = if let Some(receiver) = node.child_by_field_name("receiver")
+                    {
+                        extract_receiver_type(receiver, code).unwrap_or("unknown")
+                    } else {
+                        "unknown"
+                    };
                     defines.push((receiver_type, method_name, node_range(*node)));
                 }
             }
@@ -1470,9 +1537,10 @@ fn extract_method_signature<'a>(
 fn extract_go_type_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
         "type_identifier" | "qualified_type" => Some(&code[node.byte_range()]),
-        "pointer_type" => node.children(&mut node.walk()).nth(1).and_then(|child| {
-            extract_go_type_name(&child, code)
-        }),
+        "pointer_type" => node
+            .children(&mut node.walk())
+            .nth(1)
+            .and_then(|child| extract_go_type_name(&child, code)),
         "array_type" | "slice_type" => node
             .child_by_field_name("element")
             .and_then(|el| extract_go_type_name(&el, code)),
@@ -1489,12 +1557,7 @@ fn extract_go_type_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
 // ── LanguageParser trait impl ───────────────────────────────────────────
 
 impl LanguageParser for GoParser {
-    fn parse(
-        &mut self,
-        code: &str,
-        file_id: FileId,
-        counter: &mut SymbolCounter,
-    ) -> Vec<Symbol> {
+    fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
 
@@ -1607,14 +1670,26 @@ func (f *FileProcessor) Write(data []byte) (int, error) {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Writer"
-            && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Writer.Write"
-            && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "FileProcessor"
-            && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Write"
-            && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Writer" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Writer.Write" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "FileProcessor" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Write" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -1641,10 +1716,16 @@ var privateVariable = 42
         assert!(symbols.iter().any(|s| s.name.as_ref() == "privateConstant"
             && s.kind == SymbolKind::Constant
             && s.visibility == Visibility::Private));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "PublicVariable"
-            && s.kind == SymbolKind::Variable));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "privateVariable"
-            && s.kind == SymbolKind::Variable));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "PublicVariable" && s.kind == SymbolKind::Variable)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "privateVariable" && s.kind == SymbolKind::Variable)
+        );
     }
 
     #[test]
@@ -1669,16 +1750,19 @@ import (
 
         assert_eq!(imports.len(), 6);
         assert!(imports.iter().any(|i| i.path == "fmt" && i.alias.is_none()));
-        assert!(imports
-            .iter()
-            .any(|i| i.path == "github.com/user/repo/utils"
-                && i.alias == Some("utils".to_string())));
-        assert!(imports
-            .iter()
-            .any(|i| i.path == "encoding/json" && i.alias == Some(".".to_string())));
-        assert!(imports
-            .iter()
-            .any(|i| i.path == "database/sql" && i.alias == Some("_".to_string())));
+        assert!(imports.iter().any(
+            |i| i.path == "github.com/user/repo/utils" && i.alias == Some("utils".to_string())
+        ));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.path == "encoding/json" && i.alias == Some(".".to_string()))
+        );
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.path == "database/sql" && i.alias == Some("_".to_string()))
+        );
     }
 
     #[test]
@@ -1717,10 +1801,16 @@ type privateStruct struct {
         assert!(!public.is_empty());
         assert!(!private.is_empty());
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "PublicFunction"
-            && s.visibility == Visibility::Public));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "privateFunction"
-            && s.visibility == Visibility::Private));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "PublicFunction" && s.visibility == Visibility::Public)
+        );
+        assert!(
+            symbols.iter().any(
+                |s| s.name.as_ref() == "privateFunction" && s.visibility == Visibility::Private
+            )
+        );
     }
 
     #[test]
@@ -1770,12 +1860,16 @@ func getData() string { return "" }
 "#;
 
         let calls = parser.find_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "process"));
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "getData"));
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "getData")
+        );
     }
 
     #[test]
@@ -1799,12 +1893,16 @@ func main() {
 "#;
 
         let calls = parser.find_method_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|c| c.caller == "main" && c.method_name == "Start"));
-        assert!(calls
-            .iter()
-            .any(|c| c.caller == "main" && c.method_name == "Println"));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.caller == "main" && c.method_name == "Start")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.caller == "main" && c.method_name == "Println")
+        );
     }
 
     #[test]
@@ -1821,12 +1919,16 @@ func (s *Server) Stop() {}
 "#;
 
         let defines = parser.find_defines_impl(code);
-        assert!(defines
-            .iter()
-            .any(|(receiver, method, _)| *receiver == "*Server" && *method == "Start"));
-        assert!(defines
-            .iter()
-            .any(|(receiver, method, _)| *receiver == "*Server" && *method == "Stop"));
+        assert!(
+            defines
+                .iter()
+                .any(|(receiver, method, _)| *receiver == "*Server" && *method == "Start")
+        );
+        assert!(
+            defines
+                .iter()
+                .any(|(receiver, method, _)| *receiver == "*Server" && *method == "Stop")
+        );
     }
 
     #[test]
@@ -1882,12 +1984,22 @@ type Processor[T any] interface {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Identity"
-            && s.kind == SymbolKind::Function
-            && s.signature.as_deref().is_some_and(|sig| sig.contains("[T any]"))));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Container"
-            && s.kind == SymbolKind::Struct));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Processor"
-            && s.kind == SymbolKind::Interface));
+        assert!(symbols.iter().any(|s| {
+            s.name.as_ref() == "Identity"
+                && s.kind == SymbolKind::Function
+                && s.signature
+                    .as_deref()
+                    .is_some_and(|sig| sig.contains("[T any]"))
+        }));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Container" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Processor" && s.kind == SymbolKind::Interface)
+        );
     }
 }

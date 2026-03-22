@@ -83,11 +83,7 @@ pub fn encode_project_path(path: &str) -> String {
 pub fn find_session_dir(sessions_base: &Path, project_root: &str) -> Option<std::path::PathBuf> {
     let encoded = encode_project_path(project_root);
     let dir = sessions_base.join(encoded);
-    if dir.is_dir() {
-        Some(dir)
-    } else {
-        None
-    }
+    if dir.is_dir() { Some(dir) } else { None }
 }
 
 // =============================================================================
@@ -459,7 +455,10 @@ mod tests {
 
         let config = SessionParseConfig::default();
         let docs = parse_session_file(&path, &config).unwrap();
-        assert!(docs.is_empty(), "sessions below min_turns should return empty");
+        assert!(
+            docs.is_empty(),
+            "sessions below min_turns should return empty"
+        );
     }
 
     #[test]
@@ -489,7 +488,10 @@ mod tests {
             chunk_overlap: 2,
         };
         let docs = parse_session_file(&path, &config).unwrap();
-        assert!(docs.len() >= 2, "long session should produce multiple chunks");
+        assert!(
+            docs.len() >= 2,
+            "long session should produce multiple chunks"
+        );
         assert_eq!(docs[0].relative_path, "sess-long-chunk-000");
         assert_eq!(docs[1].relative_path, "sess-long-chunk-001");
     }
@@ -515,7 +517,8 @@ mod tests {
         let path = dir.path().join("mixed.jsonl");
         let mut content = String::new();
         content.push_str("{\"type\":\"progress\"}\n");
-        content.push_str("{\"type\":\"file-history-snapshot\",\"messageId\":\"x\",\"snapshot\":{}}\n");
+        content
+            .push_str("{\"type\":\"file-history-snapshot\",\"messageId\":\"x\",\"snapshot\":{}}\n");
         for i in 0..3 {
             content.push_str(&format!(
                 r#"{{"type":"user","sessionId":"mixed","message":{{"role":"user","content":"Q{}"}},"timestamp":"2026-01-01T00:0{}:00Z"}}"#,

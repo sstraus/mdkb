@@ -2,8 +2,8 @@
 
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
@@ -19,20 +19,22 @@ use tokio::sync::Mutex;
 
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 
-use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update};
+use crate::cli::handlers::{
+    Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update,
+};
 use crate::code::indexing::IndexFacade;
 use crate::code::types::SymbolId;
 use crate::config::McpConfig;
 use crate::domain::SearchResult;
-use crate::metrics::{count_tokens, truncate_with_continuation, truncate_with_ellipsis, UsageMetrics};
+use crate::metrics::{
+    UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
+};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    CodeGraphParams,
-    GetParams, MemoryConfirmParams, MemoryCorrectParams, MemoryDeleteParams,
-    MemoryListParams, MemoryWriteParams,
-    SearchParams,
+    CodeGraphParams, GetParams, MemoryConfirmParams, MemoryCorrectParams, MemoryDeleteParams,
+    MemoryListParams, MemoryWriteParams, SearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -192,10 +194,7 @@ impl McpServer {
     }
 
     /// Cross-repo search: fan out to all registered repos, merge results with RRF.
-    async fn cross_repo_search(
-        &self,
-        params: &SearchParams,
-    ) -> Result<CallToolResult, McpError> {
+    async fn cross_repo_search(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
         let registry = self
             .registry
             .as_ref()
@@ -203,7 +202,9 @@ impl McpServer {
 
         let handles = registry.all_handles();
         if handles.is_empty() {
-            return Err(mcp_error("No repos registered. Waiting for MCP roots from client."));
+            return Err(mcp_error(
+                "No repos registered. Waiting for MCP roots from client.",
+            ));
         }
 
         let scope = params.scope.as_deref();
@@ -212,7 +213,7 @@ impl McpServer {
         // Only docs/memory/default scopes support cross-repo (code index is per-repo)
         if matches!(scope, Some("code") | Some("symbols")) {
             return Err(mcp_error(
-                "Cross-repo search is not supported for code/symbols scope. Specify a root."
+                "Cross-repo search is not supported for code/symbols scope. Specify a root.",
             ));
         }
 
@@ -284,7 +285,11 @@ impl McpServer {
         }
 
         // Sort by score descending, take top N
-        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        all_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         all_results.truncate(limit);
 
         let output = if all_results.is_empty() {
@@ -296,7 +301,8 @@ impl McpServer {
         let tokens = count_tokens(&output);
         let result_count = all_results.len();
         self.metrics.record_search(tokens, result_count);
-        self.record_persistent_call("search", tokens, result_count, false).await;
+        self.record_persistent_call("search", tokens, result_count, false)
+            .await;
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -315,9 +321,11 @@ impl McpServer {
                 None => {
                     let handles = registry.all_handles();
                     match handles.len() {
-                        0 => return Err(mcp_error(
-                            "No repos registered. Waiting for MCP roots from client."
-                        )),
+                        0 => {
+                            return Err(mcp_error(
+                                "No repos registered. Waiting for MCP roots from client.",
+                            ));
+                        }
                         1 => handles.into_iter().next().unwrap(),
                         _ => {
                             let roots: Vec<_> = registry
@@ -334,13 +342,12 @@ impl McpServer {
                 }
                 Some("*") => {
                     return Err(mcp_error(
-                        "Cross-repo search (root=\"*\") not yet implemented."
+                        "Cross-repo search (root=\"*\") not yet implemented.",
                     ));
                 }
-                Some(path) => {
-                    registry.get_or_open(Path::new(path))
-                        .map_err(|e| mcp_error(format!("{e}")))?
-                }
+                Some(path) => registry
+                    .get_or_open(Path::new(path))
+                    .map_err(|e| mcp_error(format!("{e}")))?,
             };
             Self::ensure_handle_context(&handle).await?;
             Ok(handle)
@@ -419,10 +426,7 @@ impl McpServer {
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "Failed to register root {}: {e}",
-                                    path.display()
-                                );
+                                tracing::warn!("Failed to register root {}: {e}", path.display());
                             }
                         }
                     } else {
@@ -484,7 +488,10 @@ impl McpServer {
     }
 
     /// Detect and register convention-based collections if enabled.
-    fn apply_conventions(&self, ctx: &Context) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn apply_conventions(
+        &self,
+        ctx: &Context,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         if !self.full_config.conventions.enabled {
             return Ok(());
         }
@@ -531,7 +538,9 @@ impl McpServer {
                 // Show what supersedes this document
                 if let Ok(descendants) = evolution::get_superseded_by(&ctx.conn, doc.id) {
                     for evo in &descendants {
-                        if let Ok(Some(source)) = documents::get_document(&ctx.conn, evo.source_doc_id) {
+                        if let Ok(Some(source)) =
+                            documents::get_document(&ctx.conn, evo.source_doc_id)
+                        {
                             output.push_str(&format!(
                                 "\n**Superseded by:** {} ({})",
                                 source.relative_path, evo.relationship
@@ -562,7 +571,12 @@ impl McpServer {
     }
 
     /// Retrieve multiple documents by comma-separated IDs/paths/slugs.
-    async fn get_batch(&self, handle: &RepoHandle, ids: &str, lines: &Option<String>) -> Result<CallToolResult, McpError> {
+    async fn get_batch(
+        &self,
+        handle: &RepoHandle,
+        ids: &str,
+        lines: &Option<String>,
+    ) -> Result<CallToolResult, McpError> {
         let ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard
             .as_ref()
@@ -583,12 +597,18 @@ impl McpServer {
                     match self.get_document_content(ctx, &doc, lines) {
                         Ok(content) => {
                             let title = doc.title.as_deref().unwrap_or("(untitled)");
-                            output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
+                            output.push_str(&format!(
+                                "=== [{}] {} - {} ===\n{}\n\n",
+                                doc.id, doc.relative_path, title, content
+                            ));
                             found += 1;
                             continue;
                         }
                         Err(e) => {
-                            output.push_str(&format!("=== [{}] {} ===\nContent error: {}\n\n", doc.id, doc.relative_path, e));
+                            output.push_str(&format!(
+                                "=== [{}] {} ===\nContent error: {}\n\n",
+                                doc.id, doc.relative_path, e
+                            ));
                             found += 1;
                             continue;
                         }
@@ -601,12 +621,18 @@ impl McpServer {
                 match self.get_document_content(ctx, &doc, lines) {
                     Ok(content) => {
                         let title = doc.title.as_deref().unwrap_or("(untitled)");
-                        output.push_str(&format!("=== [{}] {} - {} ===\n{}\n\n", doc.id, doc.relative_path, title, content));
+                        output.push_str(&format!(
+                            "=== [{}] {} - {} ===\n{}\n\n",
+                            doc.id, doc.relative_path, title, content
+                        ));
                         found += 1;
                         continue;
                     }
                     Err(e) => {
-                        output.push_str(&format!("=== [{}] {} ===\nContent error: {}\n\n", doc.id, doc.relative_path, e));
+                        output.push_str(&format!(
+                            "=== [{}] {} ===\nContent error: {}\n\n",
+                            doc.id, doc.relative_path, e
+                        ));
                         found += 1;
                         continue;
                     }
@@ -636,7 +662,11 @@ impl McpServer {
     }
 
     /// Retrieve multiple documents matching a glob pattern.
-    async fn get_glob(&self, handle: &RepoHandle, pattern: &str) -> Result<CallToolResult, McpError> {
+    async fn get_glob(
+        &self,
+        handle: &RepoHandle,
+        pattern: &str,
+    ) -> Result<CallToolResult, McpError> {
         let doc_limit = self.config.max_document_tokens;
         let truncate_ellipsis = self.config.truncate_with_ellipsis;
         let max_response_tokens = self.config.max_response_tokens;
@@ -696,8 +726,14 @@ impl McpServer {
         let tokens = count_tokens(&output);
 
         self.metrics.record_get(tokens);
-        self.record_persistent_call("get", tokens, result_count, truncated).await;
-        tracing::debug!("mdkb_get_glob: {} tokens, {} docs, truncated={}", tokens, result_count, truncated);
+        self.record_persistent_call("get", tokens, result_count, truncated)
+            .await;
+        tracing::debug!(
+            "mdkb_get_glob: {} tokens, {} docs, truncated={}",
+            tokens,
+            result_count,
+            truncated
+        );
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -743,8 +779,8 @@ impl McpServer {
         symbol_id: Option<u32>,
     ) -> Result<crate::code::symbol::Symbol, McpError> {
         if let Some(id) = symbol_id {
-            let sid = SymbolId::new(id)
-                .ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved."))?;
+            let sid =
+                SymbolId::new(id).ok_or_else(|| mcp_error("Invalid symbol_id: 0 is reserved."))?;
             return facade
                 .get_symbol(sid)
                 .ok_or_else(|| mcp_error(format!("Symbol not found: sym#{id}.")));
@@ -752,7 +788,9 @@ impl McpServer {
 
         let matches = facade.find_symbols_by_name(name);
         match matches.len() {
-            0 => Err(mcp_error(format!("No symbol found with name '{name}'. Try `search(query, scope=\"symbols\")` for fuzzy matching."))),
+            0 => Err(mcp_error(format!(
+                "No symbol found with name '{name}'. Try `search(query, scope=\"symbols\")` for fuzzy matching."
+            ))),
             1 => Ok(matches.into_iter().next().unwrap()),
             _ => {
                 let mut msg = format!(
@@ -789,14 +827,18 @@ impl McpServer {
 
         let ctx_guard = self.ctx.lock().await;
         if let Some(ctx) = ctx_guard.as_ref() {
-            if let Err(e) = stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated) {
+            if let Err(e) =
+                stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated)
+            {
                 tracing::warn!("Failed to record call stats: {}", e);
             }
         }
     }
 
     /// Search documents using hybrid search (BM25 + semantic with RRF fusion).
-    #[tool(description = "Search docs+memory (default), code symbols (scope=\"symbols\"), or semantic code (scope=\"code\").")]
+    #[tool(
+        description = "Search docs+memory (default), code symbols (scope=\"symbols\"), or semantic code (scope=\"code\")."
+    )]
     async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
@@ -834,7 +876,8 @@ impl McpServer {
                 }
                 Some("memory") => {
                     let query_embedding = match crate::llm::get_cached_service()
-                        .and_then(|s| s.embed_query(&params.query)) {
+                        .and_then(|s| s.embed_query(&params.query))
+                    {
                         Ok(emb) => Some(emb),
                         Err(e) => {
                             tracing::warn!("Memory search falling back to BM25-only: {e}");
@@ -864,7 +907,8 @@ impl McpServer {
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
                     let query_embedding = match crate::llm::get_cached_service()
-                        .and_then(|s| s.embed_query(&params.query)) {
+                        .and_then(|s| s.embed_query(&params.query))
+                    {
                         Ok(emb) => Some(emb),
                         Err(e) => {
                             tracing::warn!("Memory search falling back to BM25-only: {e}");
@@ -937,7 +981,8 @@ impl McpServer {
 
                             // Apply kind filter
                             if let Some(ref kind_str) = params.kind {
-                                if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
+                                if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>()
+                                {
                                     results.retain(|(s, _)| s.kind == kind);
                                 } else {
                                     return Err(mcp_error(format!(
@@ -951,7 +996,8 @@ impl McpServer {
                                 let tokens = count_tokens(&output);
                                 (output, tokens, 0)
                             } else {
-                                let mut out = format!("Found {} semantic match(es):\n\n", results.len());
+                                let mut out =
+                                    format!("Found {} semantic match(es):\n\n", results.len());
                                 for (sym, score) in &results {
                                     out.push_str(&format_symbol(sym));
                                     out.push_str(&format!("    Similarity: {:.3}\n", score));
@@ -967,7 +1013,8 @@ impl McpServer {
 
                             // Apply kind filter
                             if let Some(ref kind_str) = params.kind {
-                                if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
+                                if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>()
+                                {
                                     symbols.retain(|s| s.kind == kind);
                                 } else {
                                     return Err(mcp_error(format!(
@@ -1008,7 +1055,8 @@ impl McpServer {
         }; // ctx_guard dropped here before record_persistent_call
 
         self.metrics.record_search(tokens, result_count);
-        self.record_persistent_call("search", tokens, result_count, false).await;
+        self.record_persistent_call("search", tokens, result_count, false)
+            .await;
         tracing::debug!("mdkb_search: {} tokens, {} results", tokens, result_count);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -1016,7 +1064,9 @@ impl McpServer {
 
     /// Retrieve a document by ID or path, with optional line range.
     /// Also accepts memory slugs, glob patterns, and comma-separated lists.
-    #[tool(description = "Retrieve a document by ID, path, or memory slug, with optional line range.")]
+    #[tool(
+        description = "Retrieve a document by ID, path, or memory slug, with optional line range."
+    )]
     async fn get(
         &self,
         Parameters(params): Parameters<GetParams>,
@@ -1049,7 +1099,8 @@ impl McpServer {
         // Try numeric ID first
         if let Ok(numeric_id) = id.parse::<i64>() {
             if let Some(doc) = documents::get_document(&ctx.conn, numeric_id)
-                .map_err(|e| mcp_error(format!("Failed to get document: {}", e)))? {
+                .map_err(|e| mcp_error(format!("Failed to get document: {}", e)))?
+            {
                 let output = self.get_document_content(ctx, &doc, &params.lines)?;
                 let tokens = count_tokens(&output);
                 drop(ctx_guard);
@@ -1071,18 +1122,26 @@ impl McpServer {
         if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
             // History format: return revision diffs instead of content
             if params.format.as_deref() == Some("history") {
-                let revisions = memory::get_revisions(&ctx.conn, &entry.id)
-                    .unwrap_or_default();
+                let revisions = memory::get_revisions(&ctx.conn, &entry.id).unwrap_or_default();
                 let output = if revisions.is_empty() {
                     format!("No revision history for '{}'", entry.id)
                 } else {
-                    let mut parts = vec![format!("# Revision history for '{}' ({} revision{})\n",
-                        entry.id, revisions.len(), if revisions.len() == 1 { "" } else { "s" })];
+                    let mut parts = vec![format!(
+                        "# Revision history for '{}' ({} revision{})\n",
+                        entry.id,
+                        revisions.len(),
+                        if revisions.len() == 1 { "" } else { "s" }
+                    )];
                     for (i, rev) in revisions.iter().enumerate() {
                         let date = chrono::DateTime::from_timestamp(rev.created_at, 0)
                             .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
                             .unwrap_or_else(|| "?".to_string());
-                        parts.push(format!("## Revision {} ({})\n```diff\n{}\n```", i + 1, date, rev.diff));
+                        parts.push(format!(
+                            "## Revision {} ({})\n```diff\n{}\n```",
+                            i + 1,
+                            date,
+                            rev.diff
+                        ));
                     }
                     parts.join("\n\n")
                 };
@@ -1095,16 +1154,26 @@ impl McpServer {
             let is_summary = params.format.as_deref() == Some("summary");
             let body = if is_summary {
                 // Summary: first paragraph only
-                entry.content.split("\n\n").next().unwrap_or(&entry.content).to_string()
+                entry
+                    .content
+                    .split("\n\n")
+                    .next()
+                    .unwrap_or(&entry.content)
+                    .to_string()
             } else {
                 entry.content.clone()
             };
             // Confidence breakdown
             let conf = entry.confidence();
-            let last_conf = entry.last_confirmed_at
+            let last_conf = entry
+                .last_confirmed_at
                 .map(|ts| {
                     let days = (chrono::Utc::now().timestamp() - ts) as f64 / 86400.0;
-                    if days < 1.0 { "today".to_string() } else { format!("{}d ago", days as u64) }
+                    if days < 1.0 {
+                        "today".to_string()
+                    } else {
+                        format!("{}d ago", days as u64)
+                    }
                 })
                 .unwrap_or_else(|| "never".to_string());
             let conf_line = format!(
@@ -1115,13 +1184,24 @@ impl McpServer {
             // Revision history summary
             let rev_line = memory::get_revision_summary(&ctx.conn, &entry.id)
                 .map(|s| {
-                    if s.count == 0 { return String::new(); }
-                    let dates: Vec<String> = s.dates.iter().map(|&ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .map(|dt| dt.format("%Y-%m-%d").to_string())
-                            .unwrap_or_else(|| "?".to_string())
-                    }).collect();
-                    format!("\nHistory: {} revision{} ({})", s.count, if s.count == 1 { "" } else { "s" }, dates.join(", "))
+                    if s.count == 0 {
+                        return String::new();
+                    }
+                    let dates: Vec<String> = s
+                        .dates
+                        .iter()
+                        .map(|&ts| {
+                            chrono::DateTime::from_timestamp(ts, 0)
+                                .map(|dt| dt.format("%Y-%m-%d").to_string())
+                                .unwrap_or_else(|| "?".to_string())
+                        })
+                        .collect();
+                    format!(
+                        "\nHistory: {} revision{} ({})",
+                        s.count,
+                        if s.count == 1 { "" } else { "s" },
+                        dates.join(", ")
+                    )
                 })
                 .unwrap_or_default();
 
@@ -1131,7 +1211,11 @@ impl McpServer {
                 entry.id,
                 entry.entry_type,
                 entry.status,
-                if entry.tags.is_empty() { "none".to_string() } else { entry.tags.join(", ") },
+                if entry.tags.is_empty() {
+                    "none".to_string()
+                } else {
+                    entry.tags.join(", ")
+                },
                 entry.access_count,
                 conf_line,
                 rev_line,
@@ -1151,10 +1235,7 @@ impl McpServer {
             return self.finish_get(output, tokens).await;
         }
 
-        Err(mcp_error(format!(
-            "Not found: '{}'.",
-            params.id
-        )))
+        Err(mcp_error(format!("Not found: '{}'.", params.id)))
     }
 
     /// Get index status including documents, collections, and code index.
@@ -1188,9 +1269,14 @@ impl McpServer {
                 output.push_str("No collections configured. Markdown files are indexed via collections (use CLI: `mdkb collection add <name> <path>`).\n");
             } else {
                 for coll in &coll_list {
-                    let doc_count = collections::get_collection_document_count(&ctx.conn, &coll.name)
-                        .unwrap_or(0);
-                    let source_tag = if coll.source == "convention" { "[convention]" } else { "[manual]" };
+                    let doc_count =
+                        collections::get_collection_document_count(&ctx.conn, &coll.name)
+                            .unwrap_or(0);
+                    let source_tag = if coll.source == "convention" {
+                        "[convention]"
+                    } else {
+                        "[manual]"
+                    };
                     output.push_str(&format!(
                         "- {} {} ({}): {} docs, pattern: {}\n",
                         coll.name, source_tag, coll.path, doc_count, coll.pattern
@@ -1212,14 +1298,16 @@ impl McpServer {
                     symbols, files, relationships
                 ));
                 if symbols == 0 {
-                    output.push_str("\nNo symbols indexed yet. Run `update` to index source code.\n");
+                    output
+                        .push_str("\nNo symbols indexed yet. Run `update` to index source code.\n");
                 }
             }
         }
 
         let tokens = count_tokens(&output);
         self.metrics.record_status(tokens);
-        self.record_persistent_call("status", tokens, 1, false).await;
+        self.record_persistent_call("status", tokens, 1, false)
+            .await;
         tracing::debug!("mdkb_status: {} tokens", tokens);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -1257,7 +1345,9 @@ impl McpServer {
                     Ok(stats) => {
                         format!(
                             "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
-                            stats.files_indexed, stats.symbols_indexed, stats.relationships_collected
+                            stats.files_indexed,
+                            stats.symbols_indexed,
+                            stats.relationships_collected
                         )
                     }
                     Err(e) => {
@@ -1272,10 +1362,8 @@ impl McpServer {
 
         // Phase 3: Reindex Claude Code sessions
         let session_output = {
-            let sessions_base = std::path::PathBuf::from(
-                std::env::var("HOME").unwrap_or_default(),
-            )
-            .join(".claude/projects");
+            let sessions_base = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".claude/projects");
             let project_root = handle.root.to_string_lossy().to_string();
 
             let mut ctx_guard = handle.ctx.lock().await;
@@ -1301,14 +1389,17 @@ impl McpServer {
         let output = format!("{}{}{}", doc_output, code_output, session_output);
         let tokens = count_tokens(&output);
         self.metrics.record_update(tokens);
-        self.record_persistent_call("update", tokens, 1, false).await;
+        self.record_persistent_call("update", tokens, 1, false)
+            .await;
         tracing::debug!("mdkb_update: {} tokens", tokens);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     /// Write or update a memory entry.
-    #[tool(description = "Create or update a memory entry. Types: problem, decision, topic. Slug ID, title max 50 chars.")]
+    #[tool(
+        description = "Create or update a memory entry. Types: problem, decision, topic. Slug ID, title max 50 chars."
+    )]
     async fn memory_write(
         &self,
         Parameters(params): Parameters<MemoryWriteParams>,
@@ -1330,10 +1421,10 @@ impl McpServer {
                 .map_err(|e| mcp_error(format!("Failed to check existing entry: {}", e)))?;
 
             // Parse entry type
-            let entry_type: memory::EntryType = params
-                .entry_type
-                .parse()
-                .map_err(|e: String| mcp_error(format!("{e}. Valid types: topic, problem, decision")))?;
+            let entry_type: memory::EntryType =
+                params.entry_type.parse().map_err(|e: String| {
+                    mcp_error(format!("{e}. Valid types: topic, problem, decision"))
+                })?;
 
             // Parse source type
             let source_type: memory::SourceType = params
@@ -1366,10 +1457,12 @@ impl McpServer {
 
                 // Include revision count in response
                 let rev_info = memory::get_revision_summary(&ctx.conn, &params.id)
-                    .map(|s| if s.count > 0 {
-                        format!(" ({} revisions)", s.count)
-                    } else {
-                        String::new()
+                    .map(|s| {
+                        if s.count > 0 {
+                            format!(" ({} revisions)", s.count)
+                        } else {
+                            String::new()
+                        }
                     })
                     .unwrap_or_default();
                 format!("Updated memory entry: {}{}", params.id, rev_info)
@@ -1404,18 +1497,26 @@ impl McpServer {
                 let embed_text = format!("{} {}", params.title, params.content);
                 match service.embed_query(&embed_text) {
                     Ok(embedding) => {
-                        if let Some(rowid) = memory::get_rowid(&ctx.conn, &params.id)
-                            .unwrap_or(None)
+                        if let Some(rowid) =
+                            memory::get_rowid(&ctx.conn, &params.id).unwrap_or(None)
                         {
                             if let Err(e) = crate::store::vectors::store_memory_embedding(
-                                &ctx.conn, rowid, &embedding, crate::llm::embeddings::MODEL_NAME,
+                                &ctx.conn,
+                                rowid,
+                                &embedding,
+                                crate::llm::embeddings::MODEL_NAME,
                             ) {
-                                tracing::warn!("Failed to store memory embedding for '{}': {e}", params.id);
+                                tracing::warn!(
+                                    "Failed to store memory embedding for '{}': {e}",
+                                    params.id
+                                );
                             }
 
                             // Duplicate detection only on new entries
                             if is_new {
-                                let warnings = memory::find_similar_entries(&ctx.conn, &embedding, rowid, &params.id);
+                                let warnings = memory::find_similar_entries(
+                                    &ctx.conn, &embedding, rowid, &params.id,
+                                );
                                 output.push_str(&warnings);
                             }
                         }
@@ -1430,12 +1531,12 @@ impl McpServer {
             (output, tokens)
         }; // ctx_guard dropped here
 
-        self.record_persistent_call("memory_write", tokens, 1, false).await;
+        self.record_persistent_call("memory_write", tokens, 1, false)
+            .await;
         tracing::debug!("mdkb_memory_write: {}", output);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
-
 
     /// Delete a memory entry by ID.
     #[tool(description = "Delete a memory entry by ID.")]
@@ -1463,7 +1564,8 @@ impl McpServer {
             (output, tokens)
         }; // ctx_guard dropped here
 
-        self.record_persistent_call("memory_delete", tokens, 1, false).await;
+        self.record_persistent_call("memory_delete", tokens, 1, false)
+            .await;
         tracing::debug!("mdkb_memory_delete: {}", output);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
@@ -1489,12 +1591,15 @@ impl McpServer {
             (output, tokens)
         };
 
-        self.record_persistent_call("memory_confirm", tokens, 1, false).await;
+        self.record_persistent_call("memory_confirm", tokens, 1, false)
+            .await;
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     /// Correct a memory entry — positive confidence signal.
-    #[tool(description = "Correct a memory entry (boosts confidence, optionally appends correction text).")]
+    #[tool(
+        description = "Correct a memory entry (boosts confidence, optionally appends correction text)."
+    )]
     async fn memory_correct(
         &self,
         Parameters(params): Parameters<MemoryCorrectParams>,
@@ -1513,7 +1618,8 @@ impl McpServer {
             (output, tokens)
         };
 
-        self.record_persistent_call("memory_correct", tokens, 1, false).await;
+        self.record_persistent_call("memory_correct", tokens, 1, false)
+            .await;
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -1525,8 +1631,8 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
 
-        let sort: memory::MemorySortOrder = params.sort.parse()
-            .map_err(|e: String| mcp_error(e))?;
+        let sort: memory::MemorySortOrder =
+            params.sort.parse().map_err(|e: String| mcp_error(e))?;
 
         let (output, tokens, count) = {
             let ctx_guard = handle.ctx.lock().await;
@@ -1549,10 +1655,17 @@ impl McpServer {
             } else {
                 let mut out = format!("Found {} memory entries:\n\n", entries.len());
                 for e in &entries {
-                    let tags = e.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
+                    let tags = e
+                        .tags
+                        .iter()
+                        .map(|t| format!("#{t}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
                     out.push_str(&format!(
                         "- [{}] {} ({}): {} {}\n",
-                        e.entry_type, e.id, e.title,
+                        e.entry_type,
+                        e.id,
+                        e.title,
                         truncate_text(&e.content, 80),
                         tags,
                     ));
@@ -1564,7 +1677,8 @@ impl McpServer {
         }; // ctx_guard dropped here
 
         self.metrics.record_search(tokens, count);
-        self.record_persistent_call("memory_list", tokens, count, false).await;
+        self.record_persistent_call("memory_list", tokens, count, false)
+            .await;
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -1594,77 +1708,93 @@ impl McpServer {
 
             let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
 
-                match params.direction.as_str() {
-                    "calls" => {
-                        let called = facade.get_called_functions(symbol.id);
-                        if called.is_empty() {
-                            format!("{} ({:?}) does not call any indexed functions.", symbol.name, symbol.kind)
-                        } else {
-                            let mut out = format!(
-                                "{} ({:?}) calls {} function(s):\n\n",
-                                symbol.name, symbol.kind, called.len()
-                            );
-                            for sym in &called {
-                                out.push_str(&format_symbol(sym));
-                                out.push('\n');
-                            }
-                            out
+            match params.direction.as_str() {
+                "calls" => {
+                    let called = facade.get_called_functions(symbol.id);
+                    if called.is_empty() {
+                        format!(
+                            "{} ({:?}) does not call any indexed functions.",
+                            symbol.name, symbol.kind
+                        )
+                    } else {
+                        let mut out = format!(
+                            "{} ({:?}) calls {} function(s):\n\n",
+                            symbol.name,
+                            symbol.kind,
+                            called.len()
+                        );
+                        for sym in &called {
+                            out.push_str(&format_symbol(sym));
+                            out.push('\n');
                         }
-                    }
-                    "callers" => {
-                        let callers = facade.get_calling_functions(symbol.id);
-                        if callers.is_empty() {
-                            format!("{} ({:?}) has no indexed callers.", symbol.name, symbol.kind)
-                        } else {
-                            let mut out = format!(
-                                "{} ({:?}) is called by {} function(s):\n\n",
-                                symbol.name, symbol.kind, callers.len()
-                            );
-                            for sym in &callers {
-                                out.push_str(&format_symbol(sym));
-                                out.push('\n');
-                            }
-                            out
-                        }
-                    }
-                    "impact" => {
-                        let impacted_ids = facade.get_impact_radius(symbol.id, params.max_depth);
-                        if impacted_ids.is_empty() {
-                            format!(
-                                "{} ({:?}) has no reachable symbols within {} hop(s).",
-                                symbol.name, symbol.kind, params.max_depth
-                            )
-                        } else {
-                            let mut out = format!(
-                                "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
-                                symbol.name, symbol.kind, impacted_ids.len(), params.max_depth
-                            );
-                            for sid in &impacted_ids {
-                                if let Some(sym) = facade.get_symbol(*sid) {
-                                    out.push_str(&format_symbol(&sym));
-                                    out.push('\n');
-                                } else {
-                                    out.push_str(&format!("  sym#{} (not found in index)\n", sid.value()));
-                                }
-                            }
-                            out
-                        }
-                    }
-                    _ => {
-                        return Err(mcp_error(format!(
-                            "Invalid direction: '{}'. Valid: calls, callers, impact.",
-                            params.direction
-                        )));
+                        out
                     }
                 }
-            }; // idx_guard dropped
+                "callers" => {
+                    let callers = facade.get_calling_functions(symbol.id);
+                    if callers.is_empty() {
+                        format!(
+                            "{} ({:?}) has no indexed callers.",
+                            symbol.name, symbol.kind
+                        )
+                    } else {
+                        let mut out = format!(
+                            "{} ({:?}) is called by {} function(s):\n\n",
+                            symbol.name,
+                            symbol.kind,
+                            callers.len()
+                        );
+                        for sym in &callers {
+                            out.push_str(&format_symbol(sym));
+                            out.push('\n');
+                        }
+                        out
+                    }
+                }
+                "impact" => {
+                    let impacted_ids = facade.get_impact_radius(symbol.id, params.max_depth);
+                    if impacted_ids.is_empty() {
+                        format!(
+                            "{} ({:?}) has no reachable symbols within {} hop(s).",
+                            symbol.name, symbol.kind, params.max_depth
+                        )
+                    } else {
+                        let mut out = format!(
+                            "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
+                            symbol.name,
+                            symbol.kind,
+                            impacted_ids.len(),
+                            params.max_depth
+                        );
+                        for sid in &impacted_ids {
+                            if let Some(sym) = facade.get_symbol(*sid) {
+                                out.push_str(&format_symbol(&sym));
+                                out.push('\n');
+                            } else {
+                                out.push_str(&format!(
+                                    "  sym#{} (not found in index)\n",
+                                    sid.value()
+                                ));
+                            }
+                        }
+                        out
+                    }
+                }
+                _ => {
+                    return Err(mcp_error(format!(
+                        "Invalid direction: '{}'. Valid: calls, callers, impact.",
+                        params.direction
+                    )));
+                }
+            }
+        }; // idx_guard dropped
 
         let tokens = count_tokens(&output);
-        self.record_persistent_call("code_graph", tokens, 1, false).await;
+        self.record_persistent_call("code_graph", tokens, 1, false)
+            .await;
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
-
 }
 
 /// Format a code symbol for MCP output.
@@ -1692,14 +1822,13 @@ fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let path_str = uri.strip_prefix("file://")?;
     let path = PathBuf::from(path_str);
-    if path.is_absolute() {
-        Some(path)
-    } else {
-        None
-    }
+    if path.is_absolute() { Some(path) } else { None }
 }
 
-fn resolve_document(conn: &rusqlite::Connection, path_or_id: &str) -> crate::error::Result<crate::domain::Document> {
+fn resolve_document(
+    conn: &rusqlite::Connection,
+    path_or_id: &str,
+) -> crate::error::Result<crate::domain::Document> {
     // Try to parse as ID first
     if let Ok(id) = path_or_id.parse::<i64>() {
         if let Some(doc) = documents::get_document(conn, id)? {
@@ -1715,9 +1844,11 @@ fn resolve_document(conn: &rusqlite::Connection, path_or_id: &str) -> crate::err
         }
     }
 
-    Err(crate::error::Error::from(crate::error::ErrorKind::DocumentNotFound {
-        id: path_or_id.to_string(),
-    }))
+    Err(crate::error::Error::from(
+        crate::error::ErrorKind::DocumentNotFound {
+            id: path_or_id.to_string(),
+        },
+    ))
 }
 
 #[tool_handler]
@@ -1754,15 +1885,9 @@ pub enum TransportMode {
     /// Standard IO (stdin/stdout) - default for CLI tools.
     Stdio,
     /// HTTP server with optional bearer token auth.
-    Http {
-        bind: String,
-        token: Option<String>,
-    },
+    Http { bind: String, token: Option<String> },
     /// HTTPS server with self-signed cert and optional bearer token auth.
-    Https {
-        bind: String,
-        token: Option<String>,
-    },
+    Https { bind: String, token: Option<String> },
 }
 
 /// Run the MCP server with file watching.
@@ -1792,7 +1917,12 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
     let warmup_limit = full_config.memory.warmup_limit;
     let instructions = load_server_instructions(&root, warmup_limit);
 
-    let server = McpServer::with_warmup(root.clone(), full_config, Some(instructions), code_ignore_patterns);
+    let server = McpServer::with_warmup(
+        root.clone(),
+        full_config,
+        Some(instructions),
+        code_ignore_patterns,
+    );
 
     // Auto-index on startup: initialize context and run initial indexing in background
     {
@@ -1807,7 +1937,9 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
 
             // Take ctx out of the lock for doc/session reindex so tool calls
             // get "initializing, retry shortly" instead of blocking for minutes.
-            startup_server.doc_reindex_active.store(true, Ordering::Relaxed);
+            startup_server
+                .doc_reindex_active
+                .store(true, Ordering::Relaxed);
             let taken_ctx = {
                 let mut ctx_guard = startup_server.ctx.lock().await;
                 ctx_guard.take()
@@ -1819,23 +1951,25 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                         if result.added > 0 || result.updated > 0 || result.removed > 0 {
                             tracing::info!(
                                 "Startup index: {} added, {} updated, {} removed docs",
-                                result.added, result.updated, result.removed
+                                result.added,
+                                result.updated,
+                                result.removed
                             );
                         }
                     }
                     Err(e) => tracing::error!("Startup doc reindex failed: {}", e),
                 }
 
-                let sessions_base = std::path::PathBuf::from(
-                    std::env::var("HOME").unwrap_or_default(),
-                )
-                .join(".claude/projects");
+                let sessions_base =
+                    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                        .join(".claude/projects");
                 let project_root = startup_root.to_string_lossy().to_string();
                 match handle_session_index(&ctx, &sessions_base, &project_root) {
                     Ok(sr) if sr.added > 0 || sr.updated > 0 => {
                         tracing::info!(
                             "Startup session index: {} added, {} updated",
-                            sr.added, sr.updated
+                            sr.added,
+                            sr.updated
                         );
                     }
                     Ok(_) => {}
@@ -1848,14 +1982,18 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                     *ctx_guard = Some(ctx);
                 }
             }
-            startup_server.doc_reindex_active.store(false, Ordering::Relaxed);
+            startup_server
+                .doc_reindex_active
+                .store(false, Ordering::Relaxed);
 
             // Run code reindex (incremental if index already exists).
             // Take the facade out of the lock to avoid blocking tool calls
             // during the (potentially slow) reindex + embedding generation.
             let taken_facade = match startup_server.acquire_code_index().await {
                 Ok(mut guard) => {
-                    startup_server.code_reindex_active.store(true, Ordering::Relaxed);
+                    startup_server
+                        .code_reindex_active
+                        .store(true, Ordering::Relaxed);
                     guard.take()
                 }
                 Err(e) => {
@@ -1868,7 +2006,10 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 let result = if facade.file_count() == 0 {
                     facade.reindex(&startup_root)
                 } else {
-                    let all_files = crate::code::indexing::walker::discover_files(&startup_root, &startup_server.code_ignore_patterns);
+                    let all_files = crate::code::indexing::walker::discover_files(
+                        &startup_root,
+                        &startup_server.code_ignore_patterns,
+                    );
                     facade.reindex_files(&startup_root, &all_files)
                 };
                 crate::llm::release_cached_service();
@@ -1877,7 +2018,8 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                         if stats.symbols_indexed > 0 || stats.files_indexed > 0 {
                             tracing::info!(
                                 "Startup index: {} files, {} symbols",
-                                stats.files_indexed, stats.symbols_indexed
+                                stats.files_indexed,
+                                stats.symbols_indexed
                             );
                         }
                     }
@@ -1888,7 +2030,9 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 let mut idx_guard = startup_server.code_index.lock().await;
                 *idx_guard = Some(facade);
             }
-            startup_server.code_reindex_active.store(false, Ordering::Relaxed);
+            startup_server
+                .code_reindex_active
+                .store(false, Ordering::Relaxed);
         });
     }
 
@@ -1968,7 +2112,9 @@ fn build_code_excludes(root: &Path, patterns: &[String]) -> globset::GlobSet {
         // Prefix with root so they match absolute paths from the watcher.
         let abs_pattern = format!("{}/{pattern}", root.display());
         match globset::Glob::new(&abs_pattern) {
-            Ok(g) => { builder.add(g); }
+            Ok(g) => {
+                builder.add(g);
+            }
             Err(e) => tracing::warn!("Invalid code exclude pattern '{pattern}': {e}"),
         }
     }
@@ -1978,7 +2124,11 @@ fn build_code_excludes(root: &Path, patterns: &[String]) -> globset::GlobSet {
     })
 }
 
-fn classify_change(path: &Path, collection_paths: &[PathBuf], code_excludes: &globset::GlobSet) -> (bool, bool) {
+fn classify_change(
+    path: &Path,
+    collection_paths: &[PathBuf],
+    code_excludes: &globset::GlobSet,
+) -> (bool, bool) {
     use crate::code::parsing::language::Language;
     let is_code = Language::from_path(path).is_some() && !code_excludes.is_match(path);
     let is_doc = collection_paths.iter().any(|cp| path.starts_with(cp));
@@ -2043,7 +2193,11 @@ async fn run_file_watcher(
             if let Err(e) = watcher.watch(&abs_path.to_path_buf()) {
                 tracing::warn!("Failed to watch {}: {}", abs_path.display(), e);
             } else {
-                tracing::info!("Watching external collection '{}' at {}", coll.name, abs_path.display());
+                tracing::info!(
+                    "Watching external collection '{}' at {}",
+                    coll.name,
+                    abs_path.display()
+                );
             }
         }
     }
@@ -2126,11 +2280,7 @@ async fn flush_code_batch(
 }
 
 /// Flush pending document update.
-async fn flush_doc_update(
-    ctx: &Arc<Mutex<Option<Context>>>,
-    root: &Path,
-    needs_update: &mut bool,
-) {
+async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_update: &mut bool) {
     if !*needs_update {
         return;
     }
@@ -2200,15 +2350,18 @@ All tools accept an optional `root` param to target a specific repo. With 1 regi
 /// Add new variants here for A/B testing, then validate with `e2e_search_behaviour` tests.
 fn select_base_instructions() -> &'static str {
     static VARIANT: std::sync::OnceLock<&str> = std::sync::OnceLock::new();
-    *VARIANT.get_or_init(|| {
-        match std::env::var("MDKB_INSTRUCTIONS_VARIANT").as_deref() {
+    *VARIANT.get_or_init(
+        || match std::env::var("MDKB_INSTRUCTIONS_VARIANT").as_deref() {
             Ok("default") | Err(_) => BASE_INSTRUCTIONS,
             Ok(variant) => {
-                tracing::warn!(variant, "Unknown MDKB_INSTRUCTIONS_VARIANT, falling back to default");
+                tracing::warn!(
+                    variant,
+                    "Unknown MDKB_INSTRUCTIONS_VARIANT, falling back to default"
+                );
                 BASE_INSTRUCTIONS
             }
-        }
-    })
+        },
+    )
 }
 
 /// Build server instructions combining base instructions with memory index.
@@ -2283,7 +2436,10 @@ fn format_search_results(results: &[SearchResult], limit: usize) -> String {
     lost_in_middle_reorder(&mut ordered);
 
     let mut output = if ordered.len() >= limit {
-        format!("Showing {} results (limit reached, refine query for more precise results):\n", ordered.len())
+        format!(
+            "Showing {} results (limit reached, refine query for more precise results):\n",
+            ordered.len()
+        )
     } else {
         String::new()
     };
@@ -2387,7 +2543,11 @@ mod tests {
     fn test_format_search_results_empty() {
         let results: Vec<SearchResult> = vec![];
         let output = format_search_results(&results, 10);
-        assert!(output.starts_with("No matching documents"), "Should start with 'No matching documents', got: {}", output);
+        assert!(
+            output.starts_with("No matching documents"),
+            "Should start with 'No matching documents', got: {}",
+            output
+        );
     }
 
     #[test]
@@ -2401,11 +2561,17 @@ mod tests {
             snippets: vec!["...matching text...".to_string()],
             status: None,
             superseded_by: None,
-                repo_root: None,
+            repo_root: None,
         }];
         let output = format_search_results(&results, 10);
-        assert!(output.contains("[1] readme.md"), "Should show path without collection prefix, got: {output}");
-        assert!(!output.contains("docs:"), "Should not contain collection prefix, got: {output}");
+        assert!(
+            output.contains("[1] readme.md"),
+            "Should show path without collection prefix, got: {output}"
+        );
+        assert!(
+            !output.contains("docs:"),
+            "Should not contain collection prefix, got: {output}"
+        );
         assert!(output.contains("README"));
     }
 
@@ -2436,8 +2602,14 @@ mod tests {
             },
         ];
         let output = format_search_results(&results, 10);
-        assert!(output.contains("get(\"10\")"), "Should hint single get, got: {output}");
-        assert!(output.contains("get(\"10,20\")"), "Should hint batch get, got: {output}");
+        assert!(
+            output.contains("get(\"10\")"),
+            "Should hint single get, got: {output}"
+        );
+        assert!(
+            output.contains("get(\"10,20\")"),
+            "Should hint batch get, got: {output}"
+        );
     }
 
     #[test]
@@ -2467,8 +2639,14 @@ mod tests {
             },
         ];
         let output = format_search_results(&results, 10);
-        assert!(output.contains("good.md"), "Should include result with positive score");
-        assert!(!output.contains("zero.md"), "Should filter out result with score 0.00, got: {output}");
+        assert!(
+            output.contains("good.md"),
+            "Should include result with positive score"
+        );
+        assert!(
+            !output.contains("zero.md"),
+            "Should filter out result with score 0.00, got: {output}"
+        );
     }
 
     #[test]
@@ -2526,13 +2704,19 @@ mod tests {
         // 50 entries should be around 1.5K tokens
         let mut index = Vec::new();
         for i in 0..50 {
-            index.push(format!("entry-{i}: Some title for entry number {i} #tag1 #tag2"));
+            index.push(format!(
+                "entry-{i}: Some title for entry number {i} #tag1 #tag2"
+            ));
         }
         let result = build_server_instructions(&index);
         let tokens = count_tokens(&result);
 
         // Should be under 2K tokens for 50 entries
-        assert!(tokens < 2000, "Warmup exceeds token budget: {} tokens", tokens);
+        assert!(
+            tokens < 2000,
+            "Warmup exceeds token budget: {} tokens",
+            tokens
+        );
     }
 
     /// Regression test for deadlock in MCP tool handlers.
@@ -2546,8 +2730,8 @@ mod tests {
     /// completes within a reasonable timeout (doesn't deadlock).
     #[tokio::test]
     async fn test_mcp_tools_no_deadlock() {
-        use std::time::Duration;
         use rmcp::model::EmptyObject;
+        use std::time::Duration;
 
         // Create temp directory and initialize mdkb
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -2563,11 +2747,9 @@ mod tests {
         let timeout_duration = Duration::from_secs(5);
 
         for i in 0..3 {
-            let result = tokio::time::timeout(
-                timeout_duration,
-                server.status(Parameters(EmptyObject {})),
-            )
-            .await;
+            let result =
+                tokio::time::timeout(timeout_duration, server.status(Parameters(EmptyObject {})))
+                    .await;
 
             match result {
                 Ok(Ok(_)) => {} // Success
@@ -2597,12 +2779,25 @@ mod tests {
 
         // First tool call should auto-initialize and succeed
         let result = server.status(Parameters(EmptyObject {})).await;
-        assert!(result.is_ok(), "status() should auto-init and succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "status() should auto-init and succeed, got: {:?}",
+            result.err()
+        );
 
         // Verify .mdkb/ was created
-        assert!(root.join(".mdkb").exists(), ".mdkb/ should have been created");
-        assert!(root.join(".mdkb/index.sqlite").exists(), "database should exist");
-        assert!(root.join(".mdkb/config.toml").exists(), "config should exist");
+        assert!(
+            root.join(".mdkb").exists(),
+            ".mdkb/ should have been created"
+        );
+        assert!(
+            root.join(".mdkb/index.sqlite").exists(),
+            "database should exist"
+        );
+        assert!(
+            root.join(".mdkb/config.toml").exists(),
+            "config should exist"
+        );
     }
 
     #[test]
@@ -2613,29 +2808,45 @@ mod tests {
 
         // Must contain base instructions explaining mdkb purpose
         assert!(result.contains("mdkb"), "Should mention mdkb");
-        assert!(result.contains("Knowledge Base"), "Should explain what mdkb is");
-        assert!(result.contains("search(query)"), "Should mention search tool");
-        assert!(result.contains("memory_write"), "Should mention memory tools");
-        assert!(result.contains("memory_list"), "Should mention memory_list tool");
+        assert!(
+            result.contains("Knowledge Base"),
+            "Should explain what mdkb is"
+        );
+        assert!(
+            result.contains("search(query)"),
+            "Should mention search tool"
+        );
+        assert!(
+            result.contains("memory_write"),
+            "Should mention memory tools"
+        );
+        assert!(
+            result.contains("memory_list"),
+            "Should mention memory_list tool"
+        );
     }
 
     #[test]
     fn test_build_server_instructions_includes_memory_when_present() {
-        let index = vec![
-            "auth-flow: OAuth2 implementation #auth".to_string(),
-        ];
+        let index = vec!["auth-flow: OAuth2 implementation #auth".to_string()];
         let result = build_server_instructions(&index);
 
         // Should contain both base instructions and memory
-        assert!(result.contains("Knowledge Base"), "Should have base instructions");
-        assert!(result.contains("auth-flow"), "Should include memory entries");
+        assert!(
+            result.contains("Knowledge Base"),
+            "Should have base instructions"
+        );
+        assert!(
+            result.contains("auth-flow"),
+            "Should include memory entries"
+        );
     }
 
     /// Test that multiple different tool calls don't deadlock.
     #[tokio::test]
     async fn test_mcp_multiple_tools_no_deadlock() {
-        use std::time::Duration;
         use rmcp::model::EmptyObject;
+        use std::time::Duration;
 
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
@@ -2645,32 +2856,23 @@ mod tests {
         let timeout_duration = Duration::from_secs(5);
 
         // Call status tool multiple times to verify no deadlock
-        let tools_to_test = vec![
-            "status",
-            "status",
-            "status",
-        ];
+        let tools_to_test = vec!["status", "status", "status"];
 
         for (i, tool_name) in tools_to_test.iter().enumerate() {
             let result = match *tool_name {
-                "status" => {
-                    tokio::time::timeout(
-                        timeout_duration,
-                        server.status(Parameters(EmptyObject {})),
-                    )
-                    .await
-                    .map(|r| r.map(|_| ()))
-                }
+                "status" => tokio::time::timeout(
+                    timeout_duration,
+                    server.status(Parameters(EmptyObject {})),
+                )
+                .await
+                .map(|r| r.map(|_| ())),
                 _ => unreachable!(),
             };
 
             match result {
                 Ok(Ok(_)) => {} // Success
                 Ok(Err(e)) => panic!("Tool {} ({}) failed: {:?}", tool_name, i, e),
-                Err(_) => panic!(
-                    "Tool {} ({}) timed out - likely deadlock!",
-                    tool_name, i
-                ),
+                Err(_) => panic!("Tool {} ({}) timed out - likely deadlock!", tool_name, i),
             }
         }
     }
@@ -2697,23 +2899,25 @@ mod tests {
         let server = McpServer::new(root);
 
         // First write a memory entry
-        server.memory_write(Parameters(MemoryWriteParams {
-            id: "test-delete-me".to_string(),
-            title: "Deletable entry".to_string(),
-            content: "This will be deleted.".to_string(),
-            entry_type: "topic".to_string(),
-            tags: vec![],
-            source_type: "user_statement".to_string(),
-            root: None,
-        }))
-        .await
-        .expect("Failed to write memory entry");
+        server
+            .memory_write(Parameters(MemoryWriteParams {
+                id: "test-delete-me".to_string(),
+                title: "Deletable entry".to_string(),
+                content: "This will be deleted.".to_string(),
+                entry_type: "topic".to_string(),
+                tags: vec![],
+                source_type: "user_statement".to_string(),
+                root: None,
+            }))
+            .await
+            .expect("Failed to write memory entry");
 
         // Delete it
         let result = tokio::time::timeout(
             Duration::from_secs(5),
             server.memory_delete(Parameters(MemoryDeleteParams {
-                id: "test-delete-me".to_string(),            root: None,
+                id: "test-delete-me".to_string(),
+                root: None,
             })),
         )
         .await;
@@ -2721,7 +2925,11 @@ mod tests {
         match result {
             Ok(Ok(r)) => {
                 let text = extract_text(&r);
-                assert!(text.contains("Deleted memory entry 'test-delete-me'"), "Got: {}", text);
+                assert!(
+                    text.contains("Deleted memory entry 'test-delete-me'"),
+                    "Got: {}",
+                    text
+                );
             }
             Ok(Err(e)) => panic!("memory_delete failed: {:?}", e),
             Err(_) => panic!("memory_delete timed out - likely deadlock!"),
@@ -2731,15 +2939,21 @@ mod tests {
         let get_result = server
             .get(Parameters(GetParams {
                 id: "test-delete-me".to_string(),
-                lines: None, format: None,            root: None,
+                lines: None,
+                format: None,
+                root: None,
             }))
             .await;
-        assert!(get_result.is_err(), "get should fail for deleted memory entry");
+        assert!(
+            get_result.is_err(),
+            "get should fail for deleted memory entry"
+        );
 
         // Deleting nonexistent entry should report not found
         let result = server
             .memory_delete(Parameters(MemoryDeleteParams {
-                id: "nonexistent".to_string(),            root: None,
+                id: "nonexistent".to_string(),
+                root: None,
             }))
             .await
             .expect("Should not error");
@@ -2750,8 +2964,8 @@ mod tests {
     /// Regression test: new tools don't deadlock when called sequentially.
     #[tokio::test]
     async fn test_mcp_new_tools_no_deadlock() {
-        use std::time::Duration;
         use rmcp::model::EmptyObject;
+        use std::time::Duration;
 
         let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
         let root = temp_dir.path().to_path_buf();
@@ -2762,26 +2976,41 @@ mod tests {
 
         // Sequence: status -> memory_write -> memory_delete -> status
         tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
-            .await.expect("timeout").expect("status failed");
+            .await
+            .expect("timeout")
+            .expect("status failed");
 
-        tokio::time::timeout(timeout, server.memory_write(Parameters(MemoryWriteParams {
-            id: "deadlock-test".to_string(),
-            title: "Test".to_string(),
-            content: "Content".to_string(),
-            entry_type: "topic".to_string(),
-            tags: vec![],
-            source_type: "user_statement".to_string(),
-            root: None,
-        })))
-        .await.expect("timeout").expect("memory_write failed");
+        tokio::time::timeout(
+            timeout,
+            server.memory_write(Parameters(MemoryWriteParams {
+                id: "deadlock-test".to_string(),
+                title: "Test".to_string(),
+                content: "Content".to_string(),
+                entry_type: "topic".to_string(),
+                tags: vec![],
+                source_type: "user_statement".to_string(),
+                root: None,
+            })),
+        )
+        .await
+        .expect("timeout")
+        .expect("memory_write failed");
 
-        tokio::time::timeout(timeout, server.memory_delete(Parameters(MemoryDeleteParams {
-            id: "deadlock-test".to_string(),            root: None,
-        })))
-        .await.expect("timeout").expect("memory_delete failed");
+        tokio::time::timeout(
+            timeout,
+            server.memory_delete(Parameters(MemoryDeleteParams {
+                id: "deadlock-test".to_string(),
+                root: None,
+            })),
+        )
+        .await
+        .expect("timeout")
+        .expect("memory_delete failed");
 
         tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
-            .await.expect("timeout").expect("status failed");
+            .await
+            .expect("timeout")
+            .expect("status failed");
     }
 
     /// Extract the error message from a failed MCP tool result.
@@ -2803,13 +3032,21 @@ mod tests {
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.get(Parameters(GetParams {
-            id: "nonexistent".to_string(),
-            lines: None, format: None,            root: None,
-        })).await;
+        let result = server
+            .get(Parameters(GetParams {
+                id: "nonexistent".to_string(),
+                lines: None,
+                format: None,
+                root: None,
+            }))
+            .await;
 
         let msg = extract_error_msg(result);
-        assert!(msg.contains("Not found"), "Error should indicate not found, got: {}", msg);
+        assert!(
+            msg.contains("Not found"),
+            "Error should indicate not found, got: {}",
+            msg
+        );
     }
 
     #[tokio::test]
@@ -2819,13 +3056,21 @@ mod tests {
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.get(Parameters(GetParams {
-            id: "999999".to_string(),
-            lines: None, format: None,            root: None,
-        })).await;
+        let result = server
+            .get(Parameters(GetParams {
+                id: "999999".to_string(),
+                lines: None,
+                format: None,
+                root: None,
+            }))
+            .await;
 
         let msg = extract_error_msg(result);
-        assert!(msg.contains("Not found"), "Error should indicate not found, got: {}", msg);
+        assert!(
+            msg.contains("Not found"),
+            "Error should indicate not found, got: {}",
+            msg
+        );
     }
 
     #[tokio::test]
@@ -2835,19 +3080,27 @@ mod tests {
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.search(Parameters(SearchParams {
-            query: "zzzznonexistentquery99999".to_string(),
-            limit: 10,
-            collection: None,
-            include_superseded: false,
-            scope: None,
-            kind: None,
-            file: None,
-            threshold: 0.3,            root: None,
-        })).await.expect("search should not error");
+        let result = server
+            .search(Parameters(SearchParams {
+                query: "zzzznonexistentquery99999".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: None,
+                kind: None,
+                file: None,
+                threshold: 0.3,
+                root: None,
+            }))
+            .await
+            .expect("search should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("No results"), "Should indicate no results, got: {}", text);
+        assert!(
+            text.contains("No results"),
+            "Should indicate no results, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2857,13 +3110,22 @@ mod tests {
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.get(Parameters(GetParams {
-            id: "nonexistent/**/*.md".to_string(),
-            lines: None, format: None,            root: None,
-        })).await.expect("get with glob should not error");
+        let result = server
+            .get(Parameters(GetParams {
+                id: "nonexistent/**/*.md".to_string(),
+                lines: None,
+                format: None,
+                root: None,
+            }))
+            .await
+            .expect("get with glob should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("No documents"), "Should indicate no documents, got: {}", text);
+        assert!(
+            text.contains("No documents"),
+            "Should indicate no documents, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2873,19 +3135,27 @@ mod tests {
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.search(Parameters(SearchParams {
-            query: "zzzznonexistentquery99999".to_string(),
-            limit: 10,
-            collection: None,
-            include_superseded: false,
-            scope: Some("memory".to_string()),
-            kind: None,
-            file: None,
-            threshold: 0.3,            root: None,
-        })).await.expect("search with memory scope should not error");
+        let result = server
+            .search(Parameters(SearchParams {
+                query: "zzzznonexistentquery99999".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("memory".to_string()),
+                kind: None,
+                file: None,
+                threshold: 0.3,
+                root: None,
+            }))
+            .await
+            .expect("search with memory scope should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("No matching memory entries"), "Should indicate no memory entries, got: {}", text);
+        assert!(
+            text.contains("No matching memory entries"),
+            "Should indicate no memory entries, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2895,13 +3165,20 @@ mod tests {
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.memory_delete(Parameters(MemoryDeleteParams {
-            id: "nonexistent-entry".to_string(),            root: None,
-        })).await.expect("memory_delete should not error");
+        let result = server
+            .memory_delete(Parameters(MemoryDeleteParams {
+                id: "nonexistent-entry".to_string(),
+                root: None,
+            }))
+            .await
+            .expect("memory_delete should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("not found"),
-            "Should indicate entry not found, got: {}", text);
+        assert!(
+            text.contains("not found"),
+            "Should indicate entry not found, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2911,13 +3188,21 @@ mod tests {
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.memory_list(Parameters(MemoryListParams {
-            limit: 20,
-            sort: "recent".to_string(),            root: None,
-        })).await.expect("memory_list should not error");
+        let result = server
+            .memory_list(Parameters(MemoryListParams {
+                limit: 20,
+                sort: "recent".to_string(),
+                root: None,
+            }))
+            .await
+            .expect("memory_list should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("No memory entries"), "Should indicate no entries, got: {}", text);
+        assert!(
+            text.contains("No memory entries"),
+            "Should indicate no entries, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2928,35 +3213,57 @@ mod tests {
         let server = McpServer::new(root);
 
         // Write two entries
-        server.memory_write(Parameters(MemoryWriteParams {
-            id: "test-a".to_string(),
-            title: "Test A".to_string(),
-            content: "Content A".to_string(),
-            entry_type: "topic".to_string(),
-            tags: vec!["tag1".to_string()],
-            source_type: "user_statement".to_string(),
-            root: None,
-        })).await.expect("write A");
+        server
+            .memory_write(Parameters(MemoryWriteParams {
+                id: "test-a".to_string(),
+                title: "Test A".to_string(),
+                content: "Content A".to_string(),
+                entry_type: "topic".to_string(),
+                tags: vec!["tag1".to_string()],
+                source_type: "user_statement".to_string(),
+                root: None,
+            }))
+            .await
+            .expect("write A");
 
-        server.memory_write(Parameters(MemoryWriteParams {
-            id: "test-b".to_string(),
-            title: "Test B".to_string(),
-            content: "Content B".to_string(),
-            entry_type: "problem".to_string(),
-            tags: vec![],
-            source_type: "user_statement".to_string(),
-            root: None,
-        })).await.expect("write B");
+        server
+            .memory_write(Parameters(MemoryWriteParams {
+                id: "test-b".to_string(),
+                title: "Test B".to_string(),
+                content: "Content B".to_string(),
+                entry_type: "problem".to_string(),
+                tags: vec![],
+                source_type: "user_statement".to_string(),
+                root: None,
+            }))
+            .await
+            .expect("write B");
 
-        let result = server.memory_list(Parameters(MemoryListParams {
-            limit: 20,
-            sort: "newest".to_string(),            root: None,
-        })).await.expect("memory_list should not error");
+        let result = server
+            .memory_list(Parameters(MemoryListParams {
+                limit: 20,
+                sort: "newest".to_string(),
+                root: None,
+            }))
+            .await
+            .expect("memory_list should not error");
 
         let text = extract_text(&result);
-        assert!(text.contains("test-a"), "Should contain test-a, got: {}", text);
-        assert!(text.contains("test-b"), "Should contain test-b, got: {}", text);
-        assert!(text.contains("Found 2"), "Should indicate 2 entries, got: {}", text);
+        assert!(
+            text.contains("test-a"),
+            "Should contain test-a, got: {}",
+            text
+        );
+        assert!(
+            text.contains("test-b"),
+            "Should contain test-b, got: {}",
+            text
+        );
+        assert!(
+            text.contains("Found 2"),
+            "Should indicate 2 entries, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -2966,10 +3273,13 @@ mod tests {
         crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
         let server = McpServer::new(root);
 
-        let result = server.memory_list(Parameters(MemoryListParams {
-            limit: 20,
-            sort: "invalid".to_string(),            root: None,
-        })).await;
+        let result = server
+            .memory_list(Parameters(MemoryListParams {
+                limit: 20,
+                sort: "invalid".to_string(),
+                root: None,
+            }))
+            .await;
 
         assert!(result.is_err(), "Should error on invalid sort");
     }
@@ -2993,7 +3303,9 @@ mod tests {
             let src_dir = root.join("src");
             std::fs::create_dir_all(&src_dir).unwrap();
 
-            std::fs::write(src_dir.join("main.rs"), r#"
+            std::fs::write(
+                src_dir.join("main.rs"),
+                r#"
 /// Entry point for the application.
 fn main() {
     let result = process_data("hello");
@@ -3010,9 +3322,13 @@ fn process_data(input: &str) -> String {
 fn validate(input: &str) -> &str {
     input.trim()
 }
-"#).unwrap();
+"#,
+            )
+            .unwrap();
 
-            std::fs::write(src_dir.join("lib.rs"), r#"
+            std::fs::write(
+                src_dir.join("lib.rs"),
+                r#"
 /// A helper struct for data operations.
 pub struct DataHelper {
     pub name: String,
@@ -3034,13 +3350,15 @@ impl DataHelper {
 pub fn utility() -> i32 {
     42
 }
-"#).unwrap();
+"#,
+            )
+            .unwrap();
 
             // Create code index
             let index_path = root.join(".mdkb/code.sqlite");
-            let mut facade = IndexFacade::create(&index_path)
-                .expect("Failed to create code index");
-            facade.index_directory(&src_dir)
+            let mut facade = IndexFacade::create(&index_path).expect("Failed to create code index");
+            facade
+                .index_directory(&src_dir)
                 .expect("Failed to index source files");
 
             let server = McpServer::new(root);
@@ -3052,17 +3370,23 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "main".to_string(),
-                limit: 10,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: None,
-            file: None,
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout").expect("search scope=symbols failed");
+            let result = tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "main".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: None,
+                    file: None,
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols failed");
 
             let text = extract_text(&result);
             assert!(text.contains("main"), "Should find main: {}", text);
@@ -3074,17 +3398,23 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "nonexistent_symbol_xyz".to_string(),
-                limit: 10,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: None,
-            file: None,
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout").expect("search scope=symbols failed");
+            let result = tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "nonexistent_symbol_xyz".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: None,
+                    file: None,
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols failed");
 
             let text = extract_text(&result);
             assert!(text.contains("No symbols found"), "Got: {}", text);
@@ -3095,20 +3425,30 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "DataHelper".to_string(),
-                limit: 10,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: Some("struct".to_string()),
-                file: None,
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout").expect("search scope=symbols kind=struct failed");
+            let result = tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "DataHelper".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: Some("struct".to_string()),
+                    file: None,
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols kind=struct failed");
 
             let text = extract_text(&result);
-            assert!(text.contains("DataHelper"), "Should find DataHelper: {}", text);
+            assert!(
+                text.contains("DataHelper"),
+                "Should find DataHelper: {}",
+                text
+            );
             assert!(text.contains("Struct"), "Should be a struct: {}", text);
         }
 
@@ -3117,17 +3457,23 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "utility".to_string(),
-                limit: 10,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: None,
-                file: Some("lib.rs".to_string()),
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout").expect("search scope=symbols file=lib.rs failed");
+            let result = tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "utility".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: None,
+                    file: Some("lib.rs".to_string()),
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols file=lib.rs failed");
 
             let text = extract_text(&result);
             assert!(text.contains("utility"), "Should find utility: {}", text);
@@ -3139,17 +3485,22 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "main".to_string(),
-                limit: 10,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: Some("invalid_kind".to_string()),
-                file: None,
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout");
+            let result = tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "main".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: Some("invalid_kind".to_string()),
+                    file: None,
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout");
 
             assert!(result.is_err(), "Should error on invalid kind");
         }
@@ -3159,20 +3510,30 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "process".to_string(),
-                limit: 10,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: None,
-            file: None,
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout").expect("search scope=symbols failed");
+            let result = tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "process".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: None,
+                    file: None,
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols failed");
 
             let text = extract_text(&result);
-            assert!(text.contains("process_data"), "Should find process_data: {}", text);
+            assert!(
+                text.contains("process_data"),
+                "Should find process_data: {}",
+                text
+            );
         }
 
         #[tokio::test]
@@ -3180,13 +3541,19 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
-                name: "process_data".to_string(),
-                direction: "calls".to_string(),
-                symbol_id: None,
-                max_depth: 3,            root: None,
-            })))
-            .await.expect("timeout").expect("code_graph direction=calls failed");
+            let result = tokio::time::timeout(
+                timeout,
+                server.code_graph(Parameters(CodeGraphParams {
+                    name: "process_data".to_string(),
+                    direction: "calls".to_string(),
+                    symbol_id: None,
+                    max_depth: 3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("code_graph direction=calls failed");
 
             let text = extract_text(&result);
             assert!(
@@ -3201,13 +3568,19 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
-                name: "process_data".to_string(),
-                direction: "callers".to_string(),
-                symbol_id: None,
-                max_depth: 3,            root: None,
-            })))
-            .await.expect("timeout").expect("code_graph direction=callers failed");
+            let result = tokio::time::timeout(
+                timeout,
+                server.code_graph(Parameters(CodeGraphParams {
+                    name: "process_data".to_string(),
+                    direction: "callers".to_string(),
+                    symbol_id: None,
+                    max_depth: 3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("code_graph direction=callers failed");
 
             let text = extract_text(&result);
             assert!(
@@ -3222,13 +3595,19 @@ pub fn utility() -> i32 {
             let (_dir, server) = setup_indexed_server();
             let timeout = Duration::from_secs(5);
 
-            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
-                name: "validate".to_string(),
-                direction: "impact".to_string(),
-                symbol_id: None,
-                max_depth: 3,            root: None,
-            })))
-            .await.expect("timeout").expect("code_graph direction=impact failed");
+            let result = tokio::time::timeout(
+                timeout,
+                server.code_graph(Parameters(CodeGraphParams {
+                    name: "validate".to_string(),
+                    direction: "impact".to_string(),
+                    symbol_id: None,
+                    max_depth: 3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("code_graph direction=impact failed");
 
             let text = extract_text(&result);
             assert!(
@@ -3244,26 +3623,42 @@ pub fn utility() -> i32 {
             let timeout = Duration::from_secs(5);
 
             // Ensure code index is populated by doing a symbols search first
-            tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "main".to_string(),
-                limit: 10,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: None,
-            file: None,
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout").expect("search scope=symbols failed");
+            tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "main".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: None,
+                    file: None,
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols failed");
 
             let result = tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
-                .await.expect("timeout").expect("status failed");
+                .await
+                .expect("timeout")
+                .expect("status failed");
 
             let text = extract_text(&result);
-            assert!(text.contains("Code Index"), "Should include code index section: {}", text);
+            assert!(
+                text.contains("Code Index"),
+                "Should include code index section: {}",
+                text
+            );
             assert!(text.contains("Symbols:"), "Should list symbols: {}", text);
             assert!(text.contains("Files:"), "Should list files: {}", text);
-            assert!(text.contains("Relationships:"), "Should list relationships: {}", text);
+            assert!(
+                text.contains("Relationships:"),
+                "Should list relationships: {}",
+                text
+            );
         }
 
         #[tokio::test]
@@ -3273,34 +3668,50 @@ pub fn utility() -> i32 {
 
             // Call multiple code-intel tools in sequence to verify no deadlock
             tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
-                .await.expect("timeout").expect("status failed");
+                .await
+                .expect("timeout")
+                .expect("status failed");
 
-            tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "main".to_string(),
-                limit: 10,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: None,
-            file: None,
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout").expect("search scope=symbols failed");
+            tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "main".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: None,
+                    file: None,
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols failed");
 
-            tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "data".to_string(),
-                limit: 5,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: None,
-            file: None,
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout").expect("search scope=symbols failed (second call)");
+            tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "data".to_string(),
+                    limit: 5,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: None,
+                    file: None,
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols failed (second call)");
 
             tokio::time::timeout(timeout, server.status(Parameters(EmptyObject {})))
-                .await.expect("timeout").expect("status failed (second call)");
+                .await
+                .expect("timeout")
+                .expect("status failed (second call)");
         }
 
         #[tokio::test]
@@ -3309,13 +3720,18 @@ pub fn utility() -> i32 {
             let timeout = Duration::from_secs(5);
 
             // code_graph with nonexistent symbol should return an error
-            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
-                name: "nonexistent_fn".to_string(),
-                direction: "calls".to_string(),
-                symbol_id: None,
-                max_depth: 3,            root: None,
-            })))
-            .await.expect("timeout");
+            let result = tokio::time::timeout(
+                timeout,
+                server.code_graph(Parameters(CodeGraphParams {
+                    name: "nonexistent_fn".to_string(),
+                    direction: "calls".to_string(),
+                    symbol_id: None,
+                    max_depth: 3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout");
 
             assert!(result.is_err(), "Should error for nonexistent symbol");
         }
@@ -3326,17 +3742,23 @@ pub fn utility() -> i32 {
             let timeout = Duration::from_secs(5);
 
             // First find a symbol to get its ID via search scope=symbols
-            let find_result = tokio::time::timeout(timeout, server.search(Parameters(SearchParams {
-                query: "main".to_string(),
-                limit: 10,
-                collection: None,
-                include_superseded: false,
-                scope: Some("symbols".to_string()),
-                kind: None,
-            file: None,
-                threshold: 0.3,            root: None,
-            })))
-            .await.expect("timeout").expect("search scope=symbols failed");
+            let find_result = tokio::time::timeout(
+                timeout,
+                server.search(Parameters(SearchParams {
+                    query: "main".to_string(),
+                    limit: 10,
+                    collection: None,
+                    include_superseded: false,
+                    scope: Some("symbols".to_string()),
+                    kind: None,
+                    file: None,
+                    threshold: 0.3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("search scope=symbols failed");
 
             let text = extract_text(&find_result);
             // Extract symbol ID from "sym#N"
@@ -3348,13 +3770,19 @@ pub fn utility() -> i32 {
                 .expect("Should find sym# in output");
 
             // Now use that ID with code_graph
-            let result = tokio::time::timeout(timeout, server.code_graph(Parameters(CodeGraphParams {
-                name: "main".to_string(),
-                direction: "calls".to_string(),
-                symbol_id: Some(sym_id),
-                max_depth: 3,            root: None,
-            })))
-            .await.expect("timeout").expect("code_graph with ID failed");
+            let result = tokio::time::timeout(
+                timeout,
+                server.code_graph(Parameters(CodeGraphParams {
+                    name: "main".to_string(),
+                    direction: "calls".to_string(),
+                    symbol_id: Some(sym_id),
+                    max_depth: 3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("code_graph with ID failed");
 
             let text = extract_text(&result);
             assert!(
@@ -3370,7 +3798,10 @@ pub fn utility() -> i32 {
         let path = Path::new("/project/src/main.rs");
         let collections = vec![PathBuf::from("/project/docs")];
         let excludes = build_code_excludes(Path::new("/project"), &[]);
-        assert_eq!(classify_change(path, &collections, &excludes), (true, false));
+        assert_eq!(
+            classify_change(path, &collections, &excludes),
+            (true, false)
+        );
     }
 
     #[test]
@@ -3378,7 +3809,10 @@ pub fn utility() -> i32 {
         let path = Path::new("/project/docs/readme.md");
         let collections = vec![PathBuf::from("/project/docs")];
         let excludes = build_code_excludes(Path::new("/project"), &[]);
-        assert_eq!(classify_change(path, &collections, &excludes), (false, true));
+        assert_eq!(
+            classify_change(path, &collections, &excludes),
+            (false, true)
+        );
     }
 
     #[test]
@@ -3394,7 +3828,10 @@ pub fn utility() -> i32 {
         let path = Path::new("/project/data.json");
         let collections = vec![PathBuf::from("/project/docs")];
         let excludes = build_code_excludes(Path::new("/project"), &[]);
-        assert_eq!(classify_change(path, &collections, &excludes), (false, false));
+        assert_eq!(
+            classify_change(path, &collections, &excludes),
+            (false, false)
+        );
     }
 
     #[test]
@@ -3406,11 +3843,17 @@ pub fn utility() -> i32 {
 
         // .js in node_modules should NOT be classified as code
         let path = Path::new("/project/node_modules/lodash/index.js");
-        assert_eq!(classify_change(path, &collections, &excludes), (false, false));
+        assert_eq!(
+            classify_change(path, &collections, &excludes),
+            (false, false)
+        );
 
         // .js outside node_modules should still be code
         let path = Path::new("/project/src/app.js");
-        assert_eq!(classify_change(path, &collections, &excludes), (true, false));
+        assert_eq!(
+            classify_change(path, &collections, &excludes),
+            (true, false)
+        );
     }
 
     #[test]
@@ -3424,10 +3867,34 @@ pub fn utility() -> i32 {
         ];
         let excludes = build_code_excludes(root, &patterns);
 
-        assert_eq!(classify_change(Path::new("/project/node_modules/x/a.js"), &collections, &excludes), (false, false));
-        assert_eq!(classify_change(Path::new("/project/dist/bundle.js"), &collections, &excludes), (false, false));
-        assert_eq!(classify_change(Path::new("/project/target/debug/build.rs"), &collections, &excludes), (false, false));
-        assert_eq!(classify_change(Path::new("/project/src/main.rs"), &collections, &excludes), (true, false));
+        assert_eq!(
+            classify_change(
+                Path::new("/project/node_modules/x/a.js"),
+                &collections,
+                &excludes
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            classify_change(
+                Path::new("/project/dist/bundle.js"),
+                &collections,
+                &excludes
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            classify_change(
+                Path::new("/project/target/debug/build.rs"),
+                &collections,
+                &excludes
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            classify_change(Path::new("/project/src/main.rs"), &collections, &excludes),
+            (true, false)
+        );
     }
 
     #[tokio::test]
@@ -3438,40 +3905,50 @@ pub fn utility() -> i32 {
         let server = McpServer::new(root);
 
         // Create an entry
-        server.memory_write(Parameters(MemoryWriteParams {
-            id: "test-entry".to_string(),
-            title: "Test Entry".to_string(),
-            content: "Initial content".to_string(),
-            entry_type: "topic".to_string(),
-            tags: vec![],
-            source_type: "user_statement".to_string(),
-            root: None,
-        })).await.expect("write should succeed");
+        server
+            .memory_write(Parameters(MemoryWriteParams {
+                id: "test-entry".to_string(),
+                title: "Test Entry".to_string(),
+                content: "Initial content".to_string(),
+                entry_type: "topic".to_string(),
+                tags: vec![],
+                source_type: "user_statement".to_string(),
+                root: None,
+            }))
+            .await
+            .expect("write should succeed");
 
         // Get access_count after creation
         let ctx_guard = server.ctx.lock().await;
         let ctx = ctx_guard.as_ref().unwrap();
-        let entry_after_create = crate::store::memory::get_entry_without_tracking(&ctx.conn, "test-entry")
-            .unwrap().unwrap();
+        let entry_after_create =
+            crate::store::memory::get_entry_without_tracking(&ctx.conn, "test-entry")
+                .unwrap()
+                .unwrap();
         let count_after_create = entry_after_create.access_count;
         drop(ctx_guard);
 
         // Update the entry (this should NOT increment access_count)
-        server.memory_write(Parameters(MemoryWriteParams {
-            id: "test-entry".to_string(),
-            title: "Test Entry".to_string(),
-            content: "Updated content".to_string(),
-            entry_type: "topic".to_string(),
-            tags: vec![],
-            source_type: "user_statement".to_string(),
-            root: None,
-        })).await.expect("update should succeed");
+        server
+            .memory_write(Parameters(MemoryWriteParams {
+                id: "test-entry".to_string(),
+                title: "Test Entry".to_string(),
+                content: "Updated content".to_string(),
+                entry_type: "topic".to_string(),
+                tags: vec![],
+                source_type: "user_statement".to_string(),
+                root: None,
+            }))
+            .await
+            .expect("update should succeed");
 
         // access_count must not have changed
         let ctx_guard = server.ctx.lock().await;
         let ctx = ctx_guard.as_ref().unwrap();
-        let entry_after_update = crate::store::memory::get_entry_without_tracking(&ctx.conn, "test-entry")
-            .unwrap().unwrap();
+        let entry_after_update =
+            crate::store::memory::get_entry_without_tracking(&ctx.conn, "test-entry")
+                .unwrap()
+                .unwrap();
         assert_eq!(
             entry_after_update.access_count, count_after_create,
             "memory_write must not increment access_count (was {}, now {})",
@@ -3488,7 +3965,10 @@ pub fn utility() -> i32 {
         let server = McpServer::new(root);
 
         // Initialize context normally first
-        server.ensure_context().await.expect("initial ensure_context should succeed");
+        server
+            .ensure_context()
+            .await
+            .expect("initial ensure_context should succeed");
 
         // Simulate startup taking ctx for reindex
         server.doc_reindex_active.store(true, Ordering::Relaxed);
@@ -3499,7 +3979,10 @@ pub fn utility() -> i32 {
 
         // ensure_context should return an error, not hang or create a new ctx
         let result = server.ensure_context().await;
-        assert!(result.is_err(), "ensure_context should fail during doc reindex");
+        assert!(
+            result.is_err(),
+            "ensure_context should fail during doc reindex"
+        );
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(
             err_msg.contains("initializing"),
@@ -3509,7 +3992,10 @@ pub fn utility() -> i32 {
 
         // ctx should still be None (no new ctx created)
         let ctx_guard = server.ctx.lock().await;
-        assert!(ctx_guard.is_none(), "ctx should remain None while reindex is active");
+        assert!(
+            ctx_guard.is_none(),
+            "ctx should remain None while reindex is active"
+        );
     }
 
     #[test]
@@ -3554,7 +4040,10 @@ pub fn utility() -> i32 {
         // The handle's ctx and code_index must be the SAME Arcs as the server's
         assert!(Arc::ptr_eq(&handle.ctx, &server.ctx));
         assert!(Arc::ptr_eq(&handle.code_index, &server.code_index));
-        assert!(Arc::ptr_eq(&handle.doc_reindex_active, &server.doc_reindex_active));
+        assert!(Arc::ptr_eq(
+            &handle.doc_reindex_active,
+            &server.doc_reindex_active
+        ));
     }
 
     #[tokio::test]
@@ -3649,19 +4138,24 @@ pub fn utility() -> i32 {
         crate::cli::handlers::handle_init(&root).unwrap();
         let server = McpServer::new(root);
 
-        let result = server.search(Parameters(SearchParams {
-            query: "test".to_string(),
-            root: Some("*".to_string()),
-            limit: 10,
-            collection: None,
-            include_superseded: false,
-            scope: None,
-            kind: None,
-            threshold: 0.5,
-            file: None,
-        })).await;
+        let result = server
+            .search(Parameters(SearchParams {
+                query: "test".to_string(),
+                root: Some("*".to_string()),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: None,
+                kind: None,
+                threshold: 0.5,
+                file: None,
+            }))
+            .await;
 
-        assert!(result.is_err(), "Cross-repo search should fail in standalone mode");
+        assert!(
+            result.is_err(),
+            "Cross-repo search should fail in standalone mode"
+        );
     }
 
     #[tokio::test]
@@ -3682,7 +4176,11 @@ pub fn utility() -> i32 {
             let ctx1 = crate::cli::handlers::Context::open(&root1).unwrap();
             let docs_dir1 = root1.join("docs");
             std::fs::create_dir_all(&docs_dir1).unwrap();
-            std::fs::write(docs_dir1.join("alpha.md"), "# Alpha\n\nAlpha content about widgets").unwrap();
+            std::fs::write(
+                docs_dir1.join("alpha.md"),
+                "# Alpha\n\nAlpha content about widgets",
+            )
+            .unwrap();
             let now = chrono::Utc::now().timestamp();
             let coll1 = crate::domain::Collection {
                 name: "docs".to_string(),
@@ -3699,7 +4197,11 @@ pub fn utility() -> i32 {
             let ctx2 = crate::cli::handlers::Context::open(&root2).unwrap();
             let docs_dir2 = root2.join("docs");
             std::fs::create_dir_all(&docs_dir2).unwrap();
-            std::fs::write(docs_dir2.join("beta.md"), "# Beta\n\nBeta content about widgets").unwrap();
+            std::fs::write(
+                docs_dir2.join("beta.md"),
+                "# Beta\n\nBeta content about widgets",
+            )
+            .unwrap();
             let now = chrono::Utc::now().timestamp();
             let coll2 = crate::domain::Collection {
                 name: "docs".to_string(),
@@ -3740,10 +4242,16 @@ pub fn utility() -> i32 {
 
         let text = extract_text(&result);
         // Should find results from both repos
-        assert!(text.contains("alpha.md") || text.contains("beta.md"),
-            "Should find docs from at least one repo: {}", text);
-        assert!(text.contains("repo:"),
-            "Should include repo provenance: {}", text);
+        assert!(
+            text.contains("alpha.md") || text.contains("beta.md"),
+            "Should find docs from at least one repo: {}",
+            text
+        );
+        assert!(
+            text.contains("repo:"),
+            "Should include repo provenance: {}",
+            text
+        );
     }
 
     /// Backward compatibility: standalone mode (no --global) works exactly as before.
@@ -3759,7 +4267,11 @@ pub fn utility() -> i32 {
         let ctx = crate::cli::handlers::Context::open(&root).unwrap();
         let docs_dir = root.join("docs");
         std::fs::create_dir_all(&docs_dir).unwrap();
-        std::fs::write(docs_dir.join("readme.md"), "# Hello\n\nBackward compat test").unwrap();
+        std::fs::write(
+            docs_dir.join("readme.md"),
+            "# Hello\n\nBackward compat test",
+        )
+        .unwrap();
         let now = chrono::Utc::now().timestamp();
         let coll = crate::domain::Collection {
             name: "docs".to_string(),
@@ -3799,7 +4311,11 @@ pub fn utility() -> i32 {
         .expect("search failed");
 
         let text = extract_text(&result);
-        assert!(text.contains("readme.md"), "Should find doc in standalone mode: {}", text);
+        assert!(
+            text.contains("readme.md"),
+            "Should find doc in standalone mode: {}",
+            text
+        );
     }
 
     /// Global mode with specific root param routes to the right repo.
@@ -3862,6 +4378,10 @@ pub fn utility() -> i32 {
         .expect("search with root failed");
 
         let text = extract_text(&result);
-        assert!(text.contains("unique.md"), "Should find doc in targeted repo: {}", text);
+        assert!(
+            text.contains("unique.md"),
+            "Should find doc in targeted repo: {}",
+            text
+        );
     }
 }

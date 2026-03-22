@@ -450,9 +450,9 @@ pub struct QueryMetricsSummary {
     pub latency_p50: i64,
     pub latency_p95: i64,
     pub latency_p99: i64,
-    pub score_above_80: f64,  // % of queries with top_score > 0.8
-    pub score_50_to_80: f64,  // % with 0.5 <= top_score <= 0.8
-    pub score_below_50: f64,  // % with top_score < 0.5
+    pub score_above_80: f64, // % of queries with top_score > 0.8
+    pub score_50_to_80: f64, // % with 0.5 <= top_score <= 0.8
+    pub score_below_50: f64, // % with top_score < 0.5
 }
 
 /// Get comprehensive query metrics for a period.
@@ -635,10 +635,7 @@ pub fn prune_sessions(conn: &Connection, keep_count: usize) -> Result<usize> {
 
     if let Some(threshold) = threshold {
         // Delete sessions with id <= threshold (including the threshold itself)
-        let deleted = conn.execute(
-            "DELETE FROM sessions WHERE id <= ?1",
-            params![threshold],
-        )?;
+        let deleted = conn.execute("DELETE FROM sessions WHERE id <= ?1", params![threshold])?;
         Ok(deleted)
     } else {
         Ok(0)
@@ -799,12 +796,18 @@ mod tests {
         assert_eq!(search.total_tokens, 250);
 
         // Verify memory_get stats
-        let memory_get = tool_stats.iter().find(|t| t.tool_name == "memory_get").unwrap();
+        let memory_get = tool_stats
+            .iter()
+            .find(|t| t.tool_name == "memory_get")
+            .unwrap();
         assert_eq!(memory_get.call_count, 2);
         assert_eq!(memory_get.total_tokens, 125);
 
         // Verify memory_write stats
-        let memory_write = tool_stats.iter().find(|t| t.tool_name == "memory_write").unwrap();
+        let memory_write = tool_stats
+            .iter()
+            .find(|t| t.tool_name == "memory_write")
+            .unwrap();
         assert_eq!(memory_write.call_count, 1);
         assert_eq!(memory_write.total_tokens, 30);
     }
@@ -919,7 +922,10 @@ impl TryFrom<&str> for ExperimentStatus {
             "running" => Ok(Self::Running),
             "completed" => Ok(Self::Completed),
             "cancelled" => Ok(Self::Cancelled),
-            _ => Err(crate::Error::config(format!("Invalid experiment status: {}", s))),
+            _ => Err(crate::Error::config(format!(
+                "Invalid experiment status: {}",
+                s
+            ))),
         }
     }
 }
@@ -930,21 +936,21 @@ pub struct Experiment {
     pub id: i64,
     pub name: String,
     pub description: Option<String>,
-    pub config_a: String,  // JSON config for variant A
-    pub config_b: String,  // JSON config for variant B
-    pub traffic_split: f64,  // Fraction to variant A (0.0-1.0, default 0.5)
+    pub config_a: String,   // JSON config for variant A
+    pub config_b: String,   // JSON config for variant B
+    pub traffic_split: f64, // Fraction to variant A (0.0-1.0, default 0.5)
     pub status: ExperimentStatus,
-    pub min_sample_size: i64,  // Minimum samples before significance calculation
+    pub min_sample_size: i64, // Minimum samples before significance calculation
     pub created_at: i64,
     pub ended_at: Option<i64>,
-    pub winner: Option<String>,  // "A", "B", or None
+    pub winner: Option<String>, // "A", "B", or None
 }
 
 /// Experiment result for a single query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExperimentResult {
     pub experiment_id: i64,
-    pub variant: String,  // "A" or "B"
+    pub variant: String, // "A" or "B"
     pub query_hash: String,
     pub latency_ms: i64,
     pub score: f64,
@@ -1182,7 +1188,11 @@ pub struct VariantStats {
 
 /// Get statistics for a variant in an experiment.
 /// Uses a single aggregated query for efficiency instead of multiple queries.
-pub fn get_variant_stats(conn: &Connection, experiment_id: i64, variant: &str) -> Result<VariantStats> {
+pub fn get_variant_stats(
+    conn: &Connection,
+    experiment_id: i64,
+    variant: &str,
+) -> Result<VariantStats> {
     // Single query for all aggregate stats (except p95 which needs sorted access)
     let result: std::result::Result<(i64, f64, f64, i64), _> = conn.query_row(
         r#"
@@ -1200,15 +1210,17 @@ pub fn get_variant_stats(conn: &Connection, experiment_id: i64, variant: &str) -
 
     let (sample_count, avg_score, avg_latency, zero_results) = match result {
         Ok(r) => r,
-        Err(_) => return Ok(VariantStats {
-            variant: variant.to_string(),
-            sample_count: 0,
-            avg_score: 0.0,
-            avg_latency_ms: 0.0,
-            p95_latency_ms: 0,
-            zero_result_rate: 0.0,
-            score_variance: 0.0,
-        }),
+        Err(_) => {
+            return Ok(VariantStats {
+                variant: variant.to_string(),
+                sample_count: 0,
+                avg_score: 0.0,
+                avg_latency_ms: 0.0,
+                p95_latency_ms: 0,
+                zero_result_rate: 0.0,
+                score_variance: 0.0,
+            });
+        }
     };
 
     if sample_count == 0 {
@@ -1227,27 +1239,31 @@ pub fn get_variant_stats(conn: &Connection, experiment_id: i64, variant: &str) -
 
     // P95 latency (requires sorted access)
     let p95_idx = ((sample_count as f64 * 0.95).ceil() as i64).max(1) - 1;
-    let p95_latency: i64 = conn.query_row(
-        r#"
+    let p95_latency: i64 = conn
+        .query_row(
+            r#"
         SELECT latency_ms FROM experiment_results
         WHERE experiment_id = ?1 AND variant = ?2
         ORDER BY latency_ms
         LIMIT 1 OFFSET ?3
         "#,
-        params![experiment_id, variant, p95_idx],
-        |row| row.get(0),
-    ).unwrap_or(0);
+            params![experiment_id, variant, p95_idx],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
 
     // Score variance for significance testing
-    let score_variance: f64 = conn.query_row(
-        r#"
+    let score_variance: f64 = conn
+        .query_row(
+            r#"
         SELECT COALESCE(AVG((score - ?1) * (score - ?1)), 0.0)
         FROM experiment_results
         WHERE experiment_id = ?2 AND variant = ?3
         "#,
-        params![avg_score, experiment_id, variant],
-        |row| row.get::<_, f64>(0),
-    ).unwrap_or(0.0);
+            params![avg_score, experiment_id, variant],
+            |row| row.get::<_, f64>(0),
+        )
+        .unwrap_or(0.0);
 
     Ok(VariantStats {
         variant: variant.to_string(),
@@ -1275,14 +1291,17 @@ pub struct ExperimentStatusReport {
 pub struct SignificanceResult {
     pub t_statistic: f64,
     pub p_value: f64,
-    pub confidence_level: f64,  // e.g., 95.0
+    pub confidence_level: f64, // e.g., 95.0
     pub significant: bool,
-    pub winner: Option<String>,  // "A" or "B" if significant
-    pub effect_size: f64,  // Cohen's d
+    pub winner: Option<String>, // "A" or "B" if significant
+    pub effect_size: f64,       // Cohen's d
 }
 
 /// Calculate two-sample t-test for experiment significance.
-pub fn calculate_significance(stats_a: &VariantStats, stats_b: &VariantStats) -> Option<SignificanceResult> {
+pub fn calculate_significance(
+    stats_a: &VariantStats,
+    stats_b: &VariantStats,
+) -> Option<SignificanceResult> {
     if stats_a.sample_count < 2 || stats_b.sample_count < 2 {
         return None;
     }
@@ -1357,7 +1376,10 @@ fn normal_cdf(x: f64) -> f64 {
 }
 
 /// Get full experiment status report.
-pub fn get_experiment_status(conn: &Connection, name: &str) -> Result<Option<ExperimentStatusReport>> {
+pub fn get_experiment_status(
+    conn: &Connection,
+    name: &str,
+) -> Result<Option<ExperimentStatusReport>> {
     let experiment = match get_experiment(conn, name)? {
         Some(e) => e,
         None => return Ok(None),
@@ -1396,19 +1418,23 @@ pub fn end_experiment(conn: &Connection, name: &str, winner: Option<&str>) -> Re
 
     if rows_affected == 0 {
         // Check if experiment exists but isn't running
-        let exists: bool = conn.query_row(
-            "SELECT 1 FROM experiments WHERE name = ?1",
-            params![name],
-            |_| Ok(true),
-        ).unwrap_or(false);
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM experiments WHERE name = ?1",
+                params![name],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
 
         if exists {
             return Err(crate::Error::config(format!(
-                "Experiment '{}' is not running (may already be completed or cancelled)", name
+                "Experiment '{}' is not running (may already be completed or cancelled)",
+                name
             )));
         } else {
             return Err(crate::Error::config(format!(
-                "Experiment '{}' not found", name
+                "Experiment '{}' not found",
+                name
             )));
         }
     }
@@ -1428,19 +1454,23 @@ pub fn cancel_experiment(conn: &Connection, name: &str) -> Result<()> {
 
     if rows_affected == 0 {
         // Check if experiment exists but isn't running
-        let exists: bool = conn.query_row(
-            "SELECT 1 FROM experiments WHERE name = ?1",
-            params![name],
-            |_| Ok(true),
-        ).unwrap_or(false);
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM experiments WHERE name = ?1",
+                params![name],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
 
         if exists {
             return Err(crate::Error::config(format!(
-                "Experiment '{}' is not running (may already be completed or cancelled)", name
+                "Experiment '{}' is not running (may already be completed or cancelled)",
+                name
             )));
         } else {
             return Err(crate::Error::config(format!(
-                "Experiment '{}' not found", name
+                "Experiment '{}' not found",
+                name
             )));
         }
     }
@@ -1509,7 +1539,8 @@ mod experiment_tests {
             r#"{"strategy":"markdown"}"#,
             0.5,
             100,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(exp_id > 0);
 
@@ -1523,15 +1554,7 @@ mod experiment_tests {
     fn test_consistent_variant_assignment() {
         let conn = setup_experiment_db();
 
-        create_experiment(
-            &conn,
-            "test-exp",
-            None,
-            "{}",
-            "{}",
-            0.5,
-            10,
-        ).unwrap();
+        create_experiment(&conn, "test-exp", None, "{}", "{}", 0.5, 10).unwrap();
 
         let exp = get_experiment(&conn, "test-exp").unwrap().unwrap();
 
@@ -1549,15 +1572,7 @@ mod experiment_tests {
     fn test_record_and_stats() {
         let conn = setup_experiment_db();
 
-        let exp_id = create_experiment(
-            &conn,
-            "test-exp",
-            None,
-            "{}",
-            "{}",
-            0.5,
-            5,
-        ).unwrap();
+        let exp_id = create_experiment(&conn, "test-exp", None, "{}", "{}", 0.5, 5).unwrap();
 
         // Record some results for variant A
         for i in 0..10 {
@@ -1648,25 +1663,33 @@ mod experiment_tests {
 
         // Add enough samples for both variants
         for i in 0..6 {
-            record_experiment_result(&conn, &ExperimentResult {
-                experiment_id: exp_id,
-                variant: "A".to_string(),
-                query_hash: format!("a-{i}"),
-                latency_ms: 10,
-                score: 0.7,
-                result_count: 5,
-                created_at: 0,
-            }).unwrap();
+            record_experiment_result(
+                &conn,
+                &ExperimentResult {
+                    experiment_id: exp_id,
+                    variant: "A".to_string(),
+                    query_hash: format!("a-{i}"),
+                    latency_ms: 10,
+                    score: 0.7,
+                    result_count: 5,
+                    created_at: 0,
+                },
+            )
+            .unwrap();
 
-            record_experiment_result(&conn, &ExperimentResult {
-                experiment_id: exp_id,
-                variant: "B".to_string(),
-                query_hash: format!("b-{i}"),
-                latency_ms: 12,
-                score: 0.75,
-                result_count: 5,
-                created_at: 0,
-            }).unwrap();
+            record_experiment_result(
+                &conn,
+                &ExperimentResult {
+                    experiment_id: exp_id,
+                    variant: "B".to_string(),
+                    query_hash: format!("b-{i}"),
+                    latency_ms: 12,
+                    score: 0.75,
+                    result_count: 5,
+                    created_at: 0,
+                },
+            )
+            .unwrap();
         }
 
         let status = get_experiment_status(&conn, "test-exp").unwrap().unwrap();

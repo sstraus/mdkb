@@ -142,11 +142,7 @@ pub struct TruncationResult {
 ///
 /// When truncation occurs, includes a message telling the LLM how to
 /// retrieve the remaining content using line ranges.
-pub fn truncate_with_continuation(
-    text: &str,
-    max_tokens: usize,
-    doc_id: i64,
-) -> TruncationResult {
+pub fn truncate_with_continuation(text: &str, max_tokens: usize, doc_id: i64) -> TruncationResult {
     let total_lines = text.lines().count();
 
     // Reserve tokens for the continuation message
@@ -159,14 +155,18 @@ pub fn truncate_with_continuation(
 
     if max_tokens <= continuation_tokens {
         return TruncationResult {
-            content: format!("[Content too large. Use: mdkb_get(id={}, lines=\"1:100\")]", doc_id),
+            content: format!(
+                "[Content too large. Use: mdkb_get(id={}, lines=\"1:100\")]",
+                doc_id
+            ),
             truncated: true,
             last_line: Some(0),
             total_lines,
         };
     }
 
-    let (truncated_content, was_truncated) = truncate_to_tokens(text, max_tokens - continuation_tokens);
+    let (truncated_content, was_truncated) =
+        truncate_to_tokens(text, max_tokens - continuation_tokens);
 
     if !was_truncated {
         return TruncationResult {
@@ -187,7 +187,11 @@ pub fn truncate_with_continuation(
 
     let continuation_msg = format!(
         "\n\n[Truncated at line {} of {}. To continue: mdkb_get(id={}, lines=\"{}:{}\")]",
-        last_line, total_lines, doc_id, last_line + 1, next_end
+        last_line,
+        total_lines,
+        doc_id,
+        last_line + 1,
+        next_end
     );
 
     TruncationResult {
@@ -236,7 +240,9 @@ mod tests {
         counter.add("hello");
 
         // Long text should exceed limit
-        assert!(counter.would_exceed("This is a very long text that should definitely exceed the token limit we set earlier."));
+        assert!(counter.would_exceed(
+            "This is a very long text that should definitely exceed the token limit we set earlier."
+        ));
     }
 
     #[test]
@@ -291,7 +297,9 @@ mod tests {
 
     #[test]
     fn test_truncate_with_continuation_truncated() {
-        let lines: Vec<String> = (1..=500).map(|i| format!("This is line number {}", i)).collect();
+        let lines: Vec<String> = (1..=500)
+            .map(|i| format!("This is line number {}", i))
+            .collect();
         let text = lines.join("\n");
         let result = truncate_with_continuation(&text, 100, 123);
 

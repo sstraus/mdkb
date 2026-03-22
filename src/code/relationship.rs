@@ -86,7 +86,11 @@ mod tests {
             RelationKind::ReferencedBy,
         ];
         for kind in all {
-            assert_eq!(kind.inverse().inverse(), kind, "inverse of inverse should be identity for {kind:?}");
+            assert_eq!(
+                kind.inverse().inverse(),
+                kind,
+                "inverse of inverse should be identity for {kind:?}"
+            );
         }
     }
 
@@ -94,9 +98,15 @@ mod tests {
     fn test_inverse_pairs() {
         assert_eq!(RelationKind::Calls.inverse(), RelationKind::CalledBy);
         assert_eq!(RelationKind::Extends.inverse(), RelationKind::ExtendedBy);
-        assert_eq!(RelationKind::Implements.inverse(), RelationKind::ImplementedBy);
+        assert_eq!(
+            RelationKind::Implements.inverse(),
+            RelationKind::ImplementedBy
+        );
         assert_eq!(RelationKind::Uses.inverse(), RelationKind::UsedBy);
         assert_eq!(RelationKind::Defines.inverse(), RelationKind::DefinedIn);
-        assert_eq!(RelationKind::References.inverse(), RelationKind::ReferencedBy);
+        assert_eq!(
+            RelationKind::References.inverse(),
+            RelationKind::ReferencedBy
+        );
     }
 }

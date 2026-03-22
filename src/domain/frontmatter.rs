@@ -150,10 +150,7 @@ pub fn extract_evolution_refs(frontmatter: Option<&Value>, field: &str) -> Vec<E
 
     match value {
         // Array of objects or strings
-        Value::Array(arr) => arr
-            .iter()
-            .filter_map(|v| parse_evolution_ref(v))
-            .collect(),
+        Value::Array(arr) => arr.iter().filter_map(|v| parse_evolution_ref(v)).collect(),
         // Single object
         Value::Object(_) => parse_evolution_ref(value).into_iter().collect(),
         // Single string path
@@ -174,7 +171,11 @@ fn parse_evolution_ref(value: &Value) -> Option<EvolutionRef> {
             let path = obj.get("path")?.as_str()?.to_string();
             let scope = obj.get("scope").and_then(|v| v.as_str()).map(String::from);
             let reason = obj.get("reason").and_then(|v| v.as_str()).map(String::from);
-            Some(EvolutionRef { path, scope, reason })
+            Some(EvolutionRef {
+                path,
+                scope,
+                reason,
+            })
         }
         // Simple string path
         Value::String(s) => Some(EvolutionRef {
@@ -351,7 +352,10 @@ Content here.
 
         assert_eq!(parsed.supersedes.len(), 2);
         assert_eq!(parsed.supersedes[0].path, "docs/auth-api-v1.md");
-        assert_eq!(parsed.supersedes[0].reason, Some("Complete redesign with OAuth2".to_string()));
+        assert_eq!(
+            parsed.supersedes[0].reason,
+            Some("Complete redesign with OAuth2".to_string())
+        );
         assert_eq!(parsed.supersedes[1].path, "docs/auth-legacy.md");
     }
 
@@ -404,8 +408,14 @@ Content.
 
         assert_eq!(parsed.updates.len(), 1);
         assert_eq!(parsed.updates[0].path, "docs/security.md");
-        assert_eq!(parsed.updates[0].scope, Some("Token Handling Section".to_string()));
-        assert_eq!(parsed.updates[0].reason, Some("Added JWT support".to_string()));
+        assert_eq!(
+            parsed.updates[0].scope,
+            Some("Token Handling Section".to_string())
+        );
+        assert_eq!(
+            parsed.updates[0].reason,
+            Some("Added JWT support".to_string())
+        );
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //!
 //! Records metrics for each tool invocation to optimize token efficiency.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -68,7 +68,8 @@ impl UsageMetrics {
         if let Ok(mut usage) = self.search.lock() {
             usage.record(tokens, results);
         }
-        self.total_tokens.fetch_add(tokens as u64, Ordering::Relaxed);
+        self.total_tokens
+            .fetch_add(tokens as u64, Ordering::Relaxed);
         self.total_calls.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -77,7 +78,8 @@ impl UsageMetrics {
         if let Ok(mut usage) = self.get.lock() {
             usage.record(tokens, 1);
         }
-        self.total_tokens.fetch_add(tokens as u64, Ordering::Relaxed);
+        self.total_tokens
+            .fetch_add(tokens as u64, Ordering::Relaxed);
         self.total_calls.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -86,7 +88,8 @@ impl UsageMetrics {
         if let Ok(mut usage) = self.multi_get.lock() {
             usage.record(tokens, results);
         }
-        self.total_tokens.fetch_add(tokens as u64, Ordering::Relaxed);
+        self.total_tokens
+            .fetch_add(tokens as u64, Ordering::Relaxed);
         self.total_calls.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -95,7 +98,8 @@ impl UsageMetrics {
         if let Ok(mut usage) = self.status.lock() {
             usage.record(tokens, 1);
         }
-        self.total_tokens.fetch_add(tokens as u64, Ordering::Relaxed);
+        self.total_tokens
+            .fetch_add(tokens as u64, Ordering::Relaxed);
         self.total_calls.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -104,7 +108,8 @@ impl UsageMetrics {
         if let Ok(mut usage) = self.update.lock() {
             usage.record(tokens, 1);
         }
-        self.total_tokens.fetch_add(tokens as u64, Ordering::Relaxed);
+        self.total_tokens
+            .fetch_add(tokens as u64, Ordering::Relaxed);
         self.total_calls.fetch_add(1, Ordering::Relaxed);
     }
 

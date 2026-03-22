@@ -67,9 +67,11 @@ fn index_document_inner(conn: &Connection, doc: &Document, content: &str) -> Res
     let metadata_json = doc
         .metadata
         .as_ref()
-        .map(|m| serde_json::to_string(m).map_err(|e| {
-            crate::error::Error::other(format!("Failed to serialize metadata: {}", e))
-        }))
+        .map(|m| {
+            serde_json::to_string(m).map_err(|e| {
+                crate::error::Error::other(format!("Failed to serialize metadata: {}", e))
+            })
+        })
         .transpose()?;
 
     // Check if document already exists (fetch id + hash in one query)
@@ -82,7 +84,6 @@ fn index_document_inner(conn: &Connection, doc: &Document, content: &str) -> Res
         .optional()?;
 
     if let Some((id, old_hash)) = existing {
-
         // Update existing document
         conn.execute(
             "UPDATE documents SET hash = ?1, title = ?2, metadata = ?3, file_modified_at = ?4, indexed_at = ?5 WHERE id = ?6",
@@ -247,7 +248,8 @@ pub fn get_documents_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<Documen
     );
 
     let mut stmt = conn.prepare(&query)?;
-    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
 
     let rows = stmt.query_map(params.as_slice(), |row| {
         let metadata_str: Option<String> = row.get(5)?;
@@ -273,7 +275,10 @@ pub fn get_documents_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<Documen
 }
 
 /// Get document statuses by ID in a single batch query.
-pub fn get_statuses_batch(conn: &Connection, ids: &[i64]) -> Result<std::collections::HashMap<i64, Option<String>>> {
+pub fn get_statuses_batch(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, Option<String>>> {
     use std::collections::HashMap;
 
     if ids.is_empty() {
@@ -287,7 +292,8 @@ pub fn get_statuses_batch(conn: &Connection, ids: &[i64]) -> Result<std::collect
     );
 
     let mut stmt = conn.prepare(&query)?;
-    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
 
     let rows = stmt.query_map(params.as_slice(), |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
@@ -302,7 +308,10 @@ pub fn get_statuses_batch(conn: &Connection, ids: &[i64]) -> Result<std::collect
 }
 
 /// Get multiple content entries by their hashes in a single query (fixes N+1 query pattern).
-pub fn get_content_batch(conn: &Connection, hashes: &[&str]) -> Result<std::collections::HashMap<String, String>> {
+pub fn get_content_batch(
+    conn: &Connection,
+    hashes: &[&str],
+) -> Result<std::collections::HashMap<String, String>> {
     use std::collections::HashMap;
 
     if hashes.is_empty() {
@@ -317,7 +326,8 @@ pub fn get_content_batch(conn: &Connection, hashes: &[&str]) -> Result<std::coll
     );
 
     let mut stmt = conn.prepare(&query)?;
-    let params: Vec<&dyn rusqlite::ToSql> = hashes.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> =
+        hashes.iter().map(|h| h as &dyn rusqlite::ToSql).collect();
 
     let rows = stmt.query_map(params.as_slice(), |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))

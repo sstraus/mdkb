@@ -1,5 +1,6 @@
 //! Python language parser implementation using tree-sitter-python 0.25.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -8,7 +9,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct PythonParser {
     parser: CachingParser,
@@ -125,7 +125,13 @@ impl PythonParser {
 
                 if let Some(body) = node.child_by_field_name("body") {
                     self.extract_symbols_from_node(
-                        body, code, file_id, counter, symbols, module_path, depth + 1,
+                        body,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
 
@@ -139,8 +145,7 @@ impl PythonParser {
                     .child_by_field_name("name")
                     .map(|n| code[n.byte_range()].to_string());
 
-                if let Some(symbol) =
-                    self.process_class(node, code, file_id, counter, module_path)
+                if let Some(symbol) = self.process_class(node, code, file_id, counter, module_path)
                 {
                     symbols.push(symbol);
                 }
@@ -152,7 +157,13 @@ impl PythonParser {
 
                 if let Some(body) = node.child_by_field_name("body") {
                     self.extract_symbols_from_node(
-                        body, code, file_id, counter, symbols, module_path, depth + 1,
+                        body,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
 
@@ -165,7 +176,13 @@ impl PythonParser {
                 // Process children (may contain assignments)
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -185,7 +202,13 @@ impl PythonParser {
             "decorated_definition" => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -193,7 +216,13 @@ impl PythonParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -890,12 +919,7 @@ fn extract_base_class_names<'a>(
 // ── LanguageParser trait impl ───────────────────────────────────────────
 
 impl LanguageParser for PythonParser {
-    fn parse(
-        &mut self,
-        code: &str,
-        file_id: FileId,
-        counter: &mut SymbolCounter,
-    ) -> Vec<Symbol> {
+    fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
 
@@ -988,16 +1012,28 @@ class MyClass:
         assert!(symbols.iter().any(|s| s.name.as_ref() == "public_function"
             && s.kind == SymbolKind::Function
             && s.visibility == Visibility::Public));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "_private_function"
-            && s.kind == SymbolKind::Function
-            && s.visibility == Visibility::Private));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "MyClass" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "MyClass.__init__"
-            && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "MyClass.greet"
-            && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "_private_function"
+                    && s.kind == SymbolKind::Function
+                    && s.visibility == Visibility::Private)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "MyClass" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "MyClass.__init__" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "MyClass.greet" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -1014,12 +1050,21 @@ regular_var = 42
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "MAX_SIZE"
-            && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "API_KEY"
-            && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "regular_var"
-            && s.kind == SymbolKind::Variable));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "MAX_SIZE" && s.kind == SymbolKind::Constant)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "API_KEY" && s.kind == SymbolKind::Constant)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "regular_var" && s.kind == SymbolKind::Variable)
+        );
     }
 
     #[test]
@@ -1041,8 +1086,11 @@ from pathlib import *
         assert!(imports.iter().any(|i| i.path == "sys"));
         assert!(imports.iter().any(|i| i.path == "typing.List"));
         assert!(imports.iter().any(|i| i.path == "typing.Dict"));
-        assert!(imports.iter().any(|i| i.path == "collections.OrderedDict"
-            && i.alias == Some("OD".to_string())));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.path == "collections.OrderedDict" && i.alias == Some("OD".to_string()))
+        );
         assert!(imports.iter().any(|i| i.path == "pathlib" && i.is_glob));
     }
 
@@ -1064,15 +1112,21 @@ def get_data():
 "#;
 
         let calls = parser.find_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "process"));
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "get_data"));
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "print"));
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "get_data")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "print")
+        );
     }
 
     #[test]
@@ -1091,9 +1145,11 @@ def main():
 "#;
 
         let calls = parser.find_method_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|c| c.caller == "main" && c.method_name == "start"));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.caller == "main" && c.method_name == "start")
+        );
     }
 
     #[test]
@@ -1112,15 +1168,21 @@ class GuideDog(Dog, Trainable):
 "#;
 
         let impls = parser.find_implementations(code);
-        assert!(impls
-            .iter()
-            .any(|(cls, base, _)| *cls == "Dog" && *base == "Animal"));
-        assert!(impls
-            .iter()
-            .any(|(cls, base, _)| *cls == "GuideDog" && *base == "Dog"));
-        assert!(impls
-            .iter()
-            .any(|(cls, base, _)| *cls == "GuideDog" && *base == "Trainable"));
+        assert!(
+            impls
+                .iter()
+                .any(|(cls, base, _)| *cls == "Dog" && *base == "Animal")
+        );
+        assert!(
+            impls
+                .iter()
+                .any(|(cls, base, _)| *cls == "GuideDog" && *base == "Dog")
+        );
+        assert!(
+            impls
+                .iter()
+                .any(|(cls, base, _)| *cls == "GuideDog" && *base == "Trainable")
+        );
     }
 
     #[test]
@@ -1140,12 +1202,16 @@ class Calculator:
         let mut defines = Vec::new();
         parser.find_defines_in_node(&tree.root_node(), code, &mut defines);
 
-        assert!(defines
-            .iter()
-            .any(|(cls, method, _)| *cls == "Calculator" && *method == "add"));
-        assert!(defines
-            .iter()
-            .any(|(cls, method, _)| *cls == "Calculator" && *method == "subtract"));
+        assert!(
+            defines
+                .iter()
+                .any(|(cls, method, _)| *cls == "Calculator" && *method == "add")
+        );
+        assert!(
+            defines
+                .iter()
+                .any(|(cls, method, _)| *cls == "Calculator" && *method == "subtract")
+        );
     }
 
     #[test]
@@ -1174,22 +1240,24 @@ class DataProcessor:
             .find(|s| s.name.as_ref() == "process_data")
             .expect("should find process_data");
         assert!(func.doc_comment.is_some());
-        assert!(func
-            .doc_comment
-            .as_deref()
-            .unwrap()
-            .contains("Process the given data"));
+        assert!(
+            func.doc_comment
+                .as_deref()
+                .unwrap()
+                .contains("Process the given data")
+        );
 
         let cls = symbols
             .iter()
             .find(|s| s.name.as_ref() == "DataProcessor")
             .expect("should find DataProcessor");
         assert!(cls.doc_comment.is_some());
-        assert!(cls
-            .doc_comment
-            .as_deref()
-            .unwrap()
-            .contains("processing data"));
+        assert!(
+            cls.doc_comment
+                .as_deref()
+                .unwrap()
+                .contains("processing data")
+        );
     }
 
     #[test]
@@ -1212,21 +1280,19 @@ def sync_function():
             .iter()
             .find(|s| s.name.as_ref() == "fetch_data")
             .expect("should find fetch_data");
-        assert!(async_fn
-            .signature
-            .as_deref()
-            .unwrap()
-            .starts_with("async def"));
+        assert!(
+            async_fn
+                .signature
+                .as_deref()
+                .unwrap()
+                .starts_with("async def")
+        );
 
         let sync_fn = symbols
             .iter()
             .find(|s| s.name.as_ref() == "sync_function")
             .expect("should find sync_function");
-        assert!(sync_fn
-            .signature
-            .as_deref()
-            .unwrap()
-            .starts_with("def "));
+        assert!(sync_fn.signature.as_deref().unwrap().starts_with("def "));
     }
 
     #[test]
@@ -1248,11 +1314,20 @@ def __dunder_func():
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "public_func"
-            && s.visibility == Visibility::Public));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "_private_func"
-            && s.visibility == Visibility::Private));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "__dunder_func"
-            && s.visibility == Visibility::Private));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "public_func" && s.visibility == Visibility::Public)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "_private_func" && s.visibility == Visibility::Private)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "__dunder_func" && s.visibility == Visibility::Private)
+        );
     }
 }

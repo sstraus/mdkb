@@ -1,5 +1,6 @@
 //! Java language parser implementation using tree-sitter-java 0.23.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -8,7 +9,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct JavaParser {
     parser: CachingParser,
@@ -115,8 +115,7 @@ impl JavaParser {
                     .child_by_field_name("name")
                     .map(|n| code[n.byte_range()].to_string());
 
-                if let Some(symbol) =
-                    self.process_class(node, code, file_id, counter, module_path)
+                if let Some(symbol) = self.process_class(node, code, file_id, counter, module_path)
                 {
                     symbols.push(symbol);
                 }
@@ -128,7 +127,13 @@ impl JavaParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -155,7 +160,13 @@ impl JavaParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -165,9 +176,7 @@ impl JavaParser {
             }
 
             "enum_declaration" => {
-                if let Some(symbol) =
-                    self.process_enum(node, code, file_id, counter, module_path)
-                {
+                if let Some(symbol) = self.process_enum(node, code, file_id, counter, module_path) {
                     symbols.push(symbol);
                 }
             }
@@ -177,8 +186,7 @@ impl JavaParser {
                     .child_by_field_name("name")
                     .map(|n| code[n.byte_range()].to_string());
 
-                if let Some(symbol) =
-                    self.process_method(node, code, file_id, counter, module_path)
+                if let Some(symbol) = self.process_method(node, code, file_id, counter, module_path)
                 {
                     symbols.push(symbol);
                 }
@@ -191,7 +199,13 @@ impl JavaParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -215,7 +229,13 @@ impl JavaParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -823,11 +843,7 @@ fn extract_javadoc(node: &Node, code: &str) -> Option<String> {
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join("\n");
-    if inner.is_empty() {
-        None
-    } else {
-        Some(inner)
-    }
+    if inner.is_empty() { None } else { Some(inner) }
 }
 
 /// Extract type identifiers from a type list (super_interfaces, extends_interfaces).
@@ -857,12 +873,7 @@ fn extract_type_list<'a>(
 // ── LanguageParser trait impl ───────────────────────────────────────────
 
 impl LanguageParser for JavaParser {
-    fn parse(
-        &mut self,
-        code: &str,
-        file_id: FileId,
-        counter: &mut SymbolCounter,
-    ) -> Vec<Symbol> {
+    fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
 
@@ -961,8 +972,11 @@ public class Calculator {
         assert!(symbols.iter().any(|s| s.name.as_ref() == "Calculator.reset"
             && s.kind == SymbolKind::Method
             && s.visibility == Visibility::Private));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Calculator.value"
-            && s.kind == SymbolKind::Field));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Calculator.value" && s.kind == SymbolKind::Field)
+        );
     }
 
     #[test]
@@ -983,10 +997,16 @@ public enum Color {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Serializable"
-            && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Color"
-            && s.kind == SymbolKind::Enum));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Serializable" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum)
+        );
     }
 
     #[test]
@@ -1024,12 +1044,16 @@ public class App {
 "#;
 
         let calls = parser.find_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "process"));
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "println"));
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "println")
+        );
     }
 
     #[test]
@@ -1045,15 +1069,21 @@ class Derived extends Base implements Printable, Serializable {}
 "#;
 
         let impls = parser.find_implementations(code);
-        assert!(impls
-            .iter()
-            .any(|(cls, base, _)| *cls == "Derived" && *base == "Base"));
-        assert!(impls
-            .iter()
-            .any(|(cls, iface, _)| *cls == "Derived" && *iface == "Printable"));
-        assert!(impls
-            .iter()
-            .any(|(cls, iface, _)| *cls == "Derived" && *iface == "Serializable"));
+        assert!(
+            impls
+                .iter()
+                .any(|(cls, base, _)| *cls == "Derived" && *base == "Base")
+        );
+        assert!(
+            impls
+                .iter()
+                .any(|(cls, iface, _)| *cls == "Derived" && *iface == "Printable")
+        );
+        assert!(
+            impls
+                .iter()
+                .any(|(cls, iface, _)| *cls == "Derived" && *iface == "Serializable")
+        );
     }
 
     #[test]
@@ -1076,11 +1106,7 @@ public class DataProcessor {
             .iter()
             .find(|s| s.name.as_ref() == "DataProcessor")
             .expect("should find DataProcessor");
-        assert!(cls
-            .doc_comment
-            .as_deref()
-            .unwrap()
-            .contains("Process data"));
+        assert!(cls.doc_comment.as_deref().unwrap().contains("Process data"));
     }
 
     #[test]
@@ -1098,9 +1124,15 @@ public class Config {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Config.MAX_SIZE"
-            && s.kind == SymbolKind::Constant));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Config.name"
-            && s.kind == SymbolKind::Field));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Config.MAX_SIZE" && s.kind == SymbolKind::Constant)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Config.name" && s.kind == SymbolKind::Field)
+        );
     }
 }

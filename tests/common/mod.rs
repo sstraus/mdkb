@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 
 /// Test harness that spawns an MCP server process and communicates via JSON-RPC.
@@ -185,7 +185,10 @@ impl McpTestHarness {
 
     /// Call an MCP tool and return the result.
     pub fn call_tool(&mut self, name: &str, arguments: Value) -> Value {
-        self.send_request("tools/call", json!({ "name": name, "arguments": arguments }))
+        self.send_request(
+            "tools/call",
+            json!({ "name": name, "arguments": arguments }),
+        )
     }
 
     /// Extract text content from a tool call result.

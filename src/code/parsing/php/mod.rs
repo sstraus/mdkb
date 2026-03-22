@@ -1,5 +1,6 @@
 //! PHP language parser implementation using tree-sitter-php 0.24.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -7,7 +8,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct PhpParser {
     parser: CachingParser,
@@ -156,7 +156,13 @@ impl PhpParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -187,7 +193,13 @@ impl PhpParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -279,7 +291,13 @@ impl PhpParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -554,13 +572,21 @@ class User {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "User" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "User::__construct"
-            && s.kind == SymbolKind::Method));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "User::getName"
-            && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "User" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "User::__construct" && s.kind == SymbolKind::Method)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "User::getName" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -582,10 +608,16 @@ trait Timestampable {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Serializable"
-            && s.kind == SymbolKind::Interface));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Timestampable"
-            && s.kind == SymbolKind::Trait));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Serializable" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Timestampable" && s.kind == SymbolKind::Trait)
+        );
     }
 
     #[test]
@@ -602,8 +634,10 @@ function helper(int $x): int {
 "#;
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "helper" && s.kind == SymbolKind::Function));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "helper" && s.kind == SymbolKind::Function)
+        );
     }
 }

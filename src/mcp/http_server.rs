@@ -28,11 +28,8 @@ pub async fn run_http_server(
 
     let session_manager = Arc::new(LocalSessionManager::default());
 
-    let mcp_service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        session_manager,
-        config,
-    );
+    let mcp_service =
+        StreamableHttpService::new(move || Ok(server.clone()), session_manager, config);
 
     let state = AppState {
         token: token.map(String::from),
@@ -41,7 +38,10 @@ pub async fn run_http_server(
     let router = Router::new()
         .route("/health", axum::routing::get(|| health_handler(false)))
         .nest_service("/mcp", mcp_service)
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind)

@@ -58,8 +58,7 @@ impl TestEnvironment {
 
     /// Add a collection and index its documents.
     fn add_and_index_collection(&self, name: &str, path: &str, pattern: &str) {
-        handle_collection_add(&self.ctx, name, path, pattern)
-            .expect("Failed to add collection");
+        handle_collection_add(&self.ctx, name, path, pattern).expect("Failed to add collection");
         handle_update(&self.ctx, &self.root).expect("Failed to update index");
     }
 }
@@ -89,34 +88,31 @@ impl<'a> McpClient<'a> {
             include_superseded: false,
         };
 
-        search::search(&self.env.ctx.conn, &search_query)
-            .expect("Search failed")
+        search::search(&self.env.ctx.conn, &search_query).expect("Search failed")
     }
 
     /// Simulate calling mdkb_status tool.
     ///
     /// An LLM would call this to understand the current state of the knowledge base.
     fn status(&self) -> mdkb::domain::IndexStatus {
-        search::get_status(&self.env.ctx.conn)
-            .expect("Status failed")
+        search::get_status(&self.env.ctx.conn).expect("Status failed")
     }
 
     /// Simulate calling mdkb_update tool.
     ///
     /// An LLM would call this to trigger a reindex after file changes.
     fn update(&self) -> mdkb::domain::UpdateResult {
-        handle_update(&self.env.ctx, &self.env.root)
-            .expect("Update failed")
+        handle_update(&self.env.ctx, &self.env.root).expect("Update failed")
     }
 
     /// Simulate calling mdkb_get tool.
     ///
     /// An LLM would call this to retrieve a specific document by ID.
     fn get(&self, doc_id: i64) -> Option<(mdkb::domain::Document, String)> {
-        let doc = documents::get_document(&self.env.ctx.conn, doc_id)
-            .expect("Get document failed")?;
-        let content = documents::get_content(&self.env.ctx.conn, &doc.hash)
-            .expect("Get content failed")?;
+        let doc =
+            documents::get_document(&self.env.ctx.conn, doc_id).expect("Get document failed")?;
+        let content =
+            documents::get_content(&self.env.ctx.conn, &doc.hash).expect("Get content failed")?;
         Some((doc, content))
     }
 
@@ -135,15 +131,18 @@ impl<'a> McpClient<'a> {
     /// Simulate calling mdkb_multi_get tool.
     ///
     /// An LLM would call this to retrieve multiple documents matching a pattern.
-    fn multi_get(&self, pattern: &str, collection: Option<&str>) -> Vec<(mdkb::domain::Document, String)> {
+    fn multi_get(
+        &self,
+        pattern: &str,
+        collection: Option<&str>,
+    ) -> Vec<(mdkb::domain::Document, String)> {
         mdkb::cli::handlers::handle_mget(&self.env.ctx, pattern, collection)
             .expect("Multi-get failed")
     }
 
     /// List all collections.
     fn list_collections(&self) -> Vec<mdkb::domain::Collection> {
-        collections::list_collections(&self.env.ctx.conn)
-            .expect("List collections failed")
+        collections::list_collections(&self.env.ctx.conn).expect("List collections failed")
     }
 }
 
@@ -180,7 +179,9 @@ fn scenario_documentation_search() {
     let env = TestEnvironment::new();
 
     // Create a documentation structure
-    env.create_file("docs/getting-started.md", r#"---
+    env.create_file(
+        "docs/getting-started.md",
+        r#"---
 title: Getting Started Guide
 ---
 
@@ -210,9 +211,12 @@ myproject run
 - Read the API documentation
 - Check out the examples
 - Join our community
-"#);
+"#,
+    );
 
-    env.create_file("docs/api/endpoints.md", r#"---
+    env.create_file(
+        "docs/api/endpoints.md",
+        r#"---
 title: API Endpoints
 ---
 
@@ -232,9 +236,12 @@ POST /api/resources - Create a new resource
 GET /api/resources/:id - Get a specific resource
 PUT /api/resources/:id - Update a resource
 DELETE /api/resources/:id - Delete a resource
-"#);
+"#,
+    );
 
-    env.create_file("docs/troubleshooting.md", r#"---
+    env.create_file(
+        "docs/troubleshooting.md",
+        r#"---
 title: Troubleshooting Guide
 ---
 
@@ -261,7 +268,8 @@ Make sure you have the required dependencies installed.
 ### Error: Connection Refused
 
 Check that the server is running and the port is correct.
-"#);
+"#,
+    );
 
     // Add collection and index
     env.add_and_index_collection("docs", "docs", "**/*.md");
@@ -275,20 +283,31 @@ Check that the server is running and the port is correct.
 
     // LLM searches for installation instructions
     let results = client.search("installation", 5, None);
-    assert!(!results.is_empty(), "Should find results for 'installation'");
+    assert!(
+        !results.is_empty(),
+        "Should find results for 'installation'"
+    );
 
     // The getting-started doc should be in results
     let has_getting_started = results.iter().any(|r| r.path.contains("getting-started"));
-    assert!(has_getting_started, "Should find getting-started.md for installation query");
+    assert!(
+        has_getting_started,
+        "Should find getting-started.md for installation query"
+    );
 
     // LLM retrieves the document
     let first_result = &results[0];
-    let (_doc, content) = client.get(first_result.id).expect("Should retrieve document");
+    let (_doc, content) = client
+        .get(first_result.id)
+        .expect("Should retrieve document");
     assert!(content.contains("Getting Started") || content.contains("installation"));
 
     // LLM searches for API information
     let api_results = client.search("API endpoints", 5, None);
-    assert!(!api_results.is_empty(), "Should find results for 'API endpoints'");
+    assert!(
+        !api_results.is_empty(),
+        "Should find results for 'API endpoints'"
+    );
 
     // Verify we can get content with line ranges
     if let Some((_, _)) = client.get(api_results[0].id) {
@@ -308,12 +327,21 @@ fn scenario_multi_collection() {
     let env = TestEnvironment::new();
 
     // Create docs collection
-    env.create_file("docs/readme.md", "# Project Documentation\n\nThis is the main docs.");
+    env.create_file(
+        "docs/readme.md",
+        "# Project Documentation\n\nThis is the main docs.",
+    );
     env.create_file("docs/guide.md", "# User Guide\n\nHow to use the project.");
 
     // Create notes collection
-    env.create_file("notes/ideas.md", "# Ideas\n\nSome project ideas to explore.");
-    env.create_file("notes/meeting.md", "# Meeting Notes\n\nDiscussed project timeline.");
+    env.create_file(
+        "notes/ideas.md",
+        "# Ideas\n\nSome project ideas to explore.",
+    );
+    env.create_file(
+        "notes/meeting.md",
+        "# Meeting Notes\n\nDiscussed project timeline.",
+    );
 
     // Add both collections
     handle_collection_add(&env.ctx, "docs", "docs", "**/*.md").unwrap();
@@ -331,7 +359,10 @@ fn scenario_multi_collection() {
 
     // Search across all collections
     let all_results = client.search("project", 10, None);
-    assert!(all_results.len() >= 2, "Should find results from multiple collections");
+    assert!(
+        all_results.len() >= 2,
+        "Should find results from multiple collections"
+    );
 
     // Search only in docs collection
     let docs_results = client.search("project", 10, Some("docs"));
@@ -375,7 +406,10 @@ fn scenario_dynamic_updates() {
 
     // Simulate file modification (need to wait for mtime change)
     std::thread::sleep(std::time::Duration::from_secs(1));
-    env.create_file("docs/readme.md", "# Version 2\n\nUpdated content with new features.");
+    env.create_file(
+        "docs/readme.md",
+        "# Version 2\n\nUpdated content with new features.",
+    );
 
     // LLM triggers update
     let update_result = client.update();
@@ -386,7 +420,10 @@ fn scenario_dynamic_updates() {
     assert!(!results.is_empty(), "Should find Version 2 after update");
 
     // Add a new document
-    env.create_file("docs/changelog.md", "# Changelog\n\n## v2.0\n- Updated readme");
+    env.create_file(
+        "docs/changelog.md",
+        "# Changelog\n\n## v2.0\n- Updated readme",
+    );
     let update_result = client.update();
     assert_eq!(update_result.added, 1, "Should have 1 added document");
 
@@ -412,7 +449,9 @@ fn scenario_dynamic_updates() {
 fn scenario_complex_search() {
     let env = TestEnvironment::new();
 
-    env.create_file("docs/rust.md", r#"# Rust Programming
+    env.create_file(
+        "docs/rust.md",
+        r#"# Rust Programming
 
 Rust is a systems programming language focused on safety and performance.
 
@@ -425,9 +464,12 @@ Rust is a systems programming language focused on safety and performance.
 ## Getting Started with Rust
 
 Install rustup and start coding!
-"#);
+"#,
+    );
 
-    env.create_file("docs/python.md", r#"# Python Programming
+    env.create_file(
+        "docs/python.md",
+        r#"# Python Programming
 
 Python is a high-level, interpreted programming language.
 
@@ -440,9 +482,12 @@ Python is a high-level, interpreted programming language.
 ## Getting Started with Python
 
 Install Python and run your first script!
-"#);
+"#,
+    );
 
-    env.create_file("docs/javascript.md", r#"# JavaScript Programming
+    env.create_file(
+        "docs/javascript.md",
+        r#"# JavaScript Programming
 
 JavaScript is the language of the web.
 
@@ -455,7 +500,8 @@ JavaScript is the language of the web.
 ## Getting Started with JavaScript
 
 Open your browser console and start coding!
-"#);
+"#,
+    );
 
     env.add_and_index_collection("docs", "docs", "**/*.md");
 
@@ -463,17 +509,29 @@ Open your browser console and start coding!
 
     // Search for memory-related content
     let memory_results = client.search("memory safety", 10, None);
-    assert!(!memory_results.is_empty(), "Should find memory safety content");
-    assert!(memory_results[0].path.contains("rust"), "Rust should be top result for memory safety");
+    assert!(
+        !memory_results.is_empty(),
+        "Should find memory safety content"
+    );
+    assert!(
+        memory_results[0].path.contains("rust"),
+        "Rust should be top result for memory safety"
+    );
 
     // Search for interpreted languages
     let interpreted_results = client.search("interpreted", 10, None);
     assert!(!interpreted_results.is_empty());
-    assert!(interpreted_results[0].path.contains("python"), "Python should be top for interpreted");
+    assert!(
+        interpreted_results[0].path.contains("python"),
+        "Python should be top for interpreted"
+    );
 
     // Search for common term - should find in multiple docs
     let getting_started = client.search("Getting Started", 10, None);
-    assert!(getting_started.len() >= 3, "Should find Getting Started in all docs");
+    assert!(
+        getting_started.len() >= 3,
+        "Should find Getting Started in all docs"
+    );
 
     // Search for something that doesn't exist
     let no_results = client.search("xyzzy_nonexistent_term_12345", 10, None);
@@ -534,12 +592,19 @@ fn scenario_document_retrieval() {
     assert!(line_count <= 6, "Should get approximately 6 lines");
 
     // Get lines at the end
-    let end_lines = client.get_lines(doc_id, 48, 55).expect("Should get end lines");
+    let end_lines = client
+        .get_lines(doc_id, 48, 55)
+        .expect("Should get end lines");
     assert!(!end_lines.is_empty(), "Should get some lines near the end");
 
     // Get lines beyond document
-    let beyond = client.get_lines(doc_id, 100, 110).expect("Should handle out of range");
-    assert!(beyond.is_empty(), "Should return empty for lines beyond document");
+    let beyond = client
+        .get_lines(doc_id, 100, 110)
+        .expect("Should handle out of range");
+    assert!(
+        beyond.is_empty(),
+        "Should return empty for lines beyond document"
+    );
 }
 
 /// Scenario 7: Error handling and edge cases.
@@ -567,7 +632,10 @@ fn scenario_edge_cases() {
 
     // Non-existent collection filter
     let wrong_collection = client.search("test", 10, Some("nonexistent"));
-    assert!(wrong_collection.is_empty(), "Should return empty for wrong collection");
+    assert!(
+        wrong_collection.is_empty(),
+        "Should return empty for wrong collection"
+    );
 
     // Very long query
     let long_query = "word ".repeat(100);
@@ -590,7 +658,9 @@ fn scenario_edge_cases() {
 fn scenario_frontmatter_metadata() {
     let env = TestEnvironment::new();
 
-    env.create_file("docs/with-frontmatter.md", r#"---
+    env.create_file(
+        "docs/with-frontmatter.md",
+        r#"---
 title: My Document Title
 author: Test Author
 date: 2024-01-15
@@ -602,12 +672,16 @@ tags:
 # Content
 
 This document has rich frontmatter metadata.
-"#);
+"#,
+    );
 
-    env.create_file("docs/no-frontmatter.md", r#"# Plain Document
+    env.create_file(
+        "docs/no-frontmatter.md",
+        r#"# Plain Document
 
 This document has no frontmatter.
-"#);
+"#,
+    );
 
     env.add_and_index_collection("docs", "docs", "**/*.md");
 
@@ -685,7 +759,9 @@ fn scenario_llm_conversation() {
     let env = TestEnvironment::new();
 
     // User's knowledge base
-    env.create_file("kb/projects/project-alpha.md", r#"---
+    env.create_file(
+        "kb/projects/project-alpha.md",
+        r#"---
 title: Project Alpha
 status: active
 ---
@@ -708,9 +784,12 @@ Project Alpha is our main product initiative.
 - Q2: Implementation
 - Q3: Testing
 - Q4: Launch
-"#);
+"#,
+    );
 
-    env.create_file("kb/projects/project-beta.md", r#"---
+    env.create_file(
+        "kb/projects/project-beta.md",
+        r#"---
 title: Project Beta
 status: planning
 ---
@@ -726,9 +805,12 @@ Project Beta is a research initiative.
 - Explore new technologies
 - Build prototypes
 - Evaluate feasibility
-"#);
+"#,
+    );
 
-    env.create_file("kb/people/alice.md", r#"---
+    env.create_file(
+        "kb/people/alice.md",
+        r#"---
 title: Alice Johnson
 role: Tech Lead
 ---
@@ -742,9 +824,12 @@ Senior Tech Lead on Project Alpha.
 ## Contact
 
 alice@company.com
-"#);
+"#,
+    );
 
-    env.create_file("kb/meetings/2024-01-15.md", r#"---
+    env.create_file(
+        "kb/meetings/2024-01-15.md",
+        r#"---
 title: Weekly Standup - Jan 15
 date: 2024-01-15
 ---
@@ -761,7 +846,8 @@ date: 2024-01-15
 - Project Alpha is on track
 - Bob completing backend API
 - Need to sync with Carol on frontend
-"#);
+"#,
+    );
 
     env.add_and_index_collection("kb", "kb", "**/*.md");
 
@@ -779,15 +865,21 @@ date: 2024-01-15
     // LLM might retrieve specific project details
     let alpha_search = client.search("Project Alpha timeline", 1, None);
     if !alpha_search.is_empty() {
-        let (_doc, content) = client.get(alpha_search[0].id)
+        let (_doc, content) = client
+            .get(alpha_search[0].id)
             .expect("LLM retrieves project document");
-        assert!(content.contains("Q1") || content.contains("Timeline"),
-            "LLM can read project timeline");
+        assert!(
+            content.contains("Q1") || content.contains("Timeline"),
+            "LLM can read project timeline"
+        );
     }
 
     // User: "Who is Alice?"
     let alice_search = client.search("Alice", 5, None);
-    assert!(!alice_search.is_empty(), "LLM finds information about Alice");
+    assert!(
+        !alice_search.is_empty(),
+        "LLM finds information about Alice"
+    );
 
     // LLM might want to get all people documents
     let people = client.multi_get("people/*.md", None);
@@ -813,12 +905,18 @@ fn test_search_scoring() {
     let env = TestEnvironment::new();
 
     // Create documents with varying relevance to "rust programming"
-    env.create_file("docs/rust-guide.md",
-        "# Complete Rust Programming Guide\n\nLearn Rust programming from scratch. Rust is great.");
-    env.create_file("docs/python.md",
-        "# Python Guide\n\nLearn Python. Also mentions rust once.");
-    env.create_file("docs/unrelated.md",
-        "# Cooking Recipes\n\nHow to make pasta.");
+    env.create_file(
+        "docs/rust-guide.md",
+        "# Complete Rust Programming Guide\n\nLearn Rust programming from scratch. Rust is great.",
+    );
+    env.create_file(
+        "docs/python.md",
+        "# Python Guide\n\nLearn Python. Also mentions rust once.",
+    );
+    env.create_file(
+        "docs/unrelated.md",
+        "# Cooking Recipes\n\nHow to make pasta.",
+    );
 
     env.add_and_index_collection("docs", "docs", "**/*.md");
 
@@ -828,15 +926,21 @@ fn test_search_scoring() {
 
     // Rust guide should be the top result
     assert!(!results.is_empty());
-    assert!(results[0].path.contains("rust-guide"),
-        "Most relevant document should be first");
+    assert!(
+        results[0].path.contains("rust-guide"),
+        "Most relevant document should be first"
+    );
 
     // Cooking should not appear (or be last if it somehow matches)
-    let has_cooking = results.iter().any(|r| r.path.contains("cooking") || r.path.contains("unrelated"));
+    let has_cooking = results
+        .iter()
+        .any(|r| r.path.contains("cooking") || r.path.contains("unrelated"));
     if has_cooking {
         let cooking_pos = results.iter().position(|r| r.path.contains("unrelated"));
-        assert!(cooking_pos == Some(results.len() - 1) || cooking_pos.is_none(),
-            "Unrelated document should be last or absent");
+        assert!(
+            cooking_pos == Some(results.len() - 1) || cooking_pos.is_none(),
+            "Unrelated document should be last or absent"
+        );
     }
 }
 
@@ -876,9 +980,18 @@ fn test_write_index_search_retrieve_consistency() {
 
     // Create documents with unique, identifiable content
     let documents = vec![
-        ("docs/alpha.md", "# Alpha Document\n\nUnique content for alpha: xyz123"),
-        ("docs/beta.md", "# Beta Document\n\nUnique content for beta: abc456"),
-        ("docs/gamma.md", "# Gamma Document\n\nUnique content for gamma: def789"),
+        (
+            "docs/alpha.md",
+            "# Alpha Document\n\nUnique content for alpha: xyz123",
+        ),
+        (
+            "docs/beta.md",
+            "# Beta Document\n\nUnique content for beta: abc456",
+        ),
+        (
+            "docs/gamma.md",
+            "# Gamma Document\n\nUnique content for gamma: def789",
+        ),
     ];
 
     for (path, content) in &documents {
@@ -1020,7 +1133,10 @@ fn test_update_preserves_consistency() {
 
     // Verify V2 is now searchable
     let v2_results = client.search("UPDATED_V2", 10, None);
-    assert!(!v2_results.is_empty(), "V2 should be searchable after update");
+    assert!(
+        !v2_results.is_empty(),
+        "V2 should be searchable after update"
+    );
 
     // Verify V1 marker is no longer searchable
     let old_results = client.search("ORIGINAL_V1", 10, None);
@@ -1045,7 +1161,10 @@ fn test_deletion_removes_from_search() {
 
     // Create two documents
     env.create_file("docs/keep.md", "# Keep\n\nThis document stays: KEEPER_DOC");
-    env.create_file("docs/delete.md", "# Delete\n\nThis document goes: DELETED_DOC");
+    env.create_file(
+        "docs/delete.md",
+        "# Delete\n\nThis document goes: DELETED_DOC",
+    );
     env.add_and_index_collection("docs", "docs", "**/*.md");
 
     let client = McpClient::new(&env);
@@ -1054,7 +1173,10 @@ fn test_deletion_removes_from_search() {
     let keep_results = client.search("KEEPER_DOC", 10, None);
     let delete_results = client.search("DELETED_DOC", 10, None);
     assert!(!keep_results.is_empty(), "Keep doc should be searchable");
-    assert!(!delete_results.is_empty(), "Delete doc should be searchable initially");
+    assert!(
+        !delete_results.is_empty(),
+        "Delete doc should be searchable initially"
+    );
 
     // Delete one document
     fs::remove_file(env.root.join("docs/delete.md")).unwrap();
@@ -1116,13 +1238,19 @@ JavaScript is also covered.
     let results = client.search("rust programming", 10, None);
 
     // Should find at least the first two documents
-    assert!(results.len() >= 2, "Should find documents mentioning rust or programming");
+    assert!(
+        results.len() >= 2,
+        "Should find documents mentioning rust or programming"
+    );
 
     // The rust-focused document should be first (highest relevance)
     assert!(
         results[0].path.contains("rust-focused"),
         "Most relevant document should rank first. Got: {:?}",
-        results.iter().map(|r| (&r.path, r.score)).collect::<Vec<_>>()
+        results
+            .iter()
+            .map(|r| (&r.path, r.score))
+            .collect::<Vec<_>>()
     );
 
     // If the python-only doc appears, it should be last
@@ -1142,7 +1270,8 @@ fn test_all_documents_retrievable() {
 
     // Create 10 documents
     let doc_count = 10;
-    let mut expected_contents: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut expected_contents: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     for i in 0..doc_count {
         let filename = format!("doc{:02}.md", i);
@@ -1157,11 +1286,18 @@ fn test_all_documents_retrievable() {
 
     // Verify count
     let status = client.status();
-    assert_eq!(status.documents, doc_count, "All documents should be indexed");
+    assert_eq!(
+        status.documents, doc_count,
+        "All documents should be indexed"
+    );
 
     // Retrieve all documents and verify content
     let all_docs = client.multi_get("*.md", None);
-    assert_eq!(all_docs.len(), doc_count, "All documents should be retrievable");
+    assert_eq!(
+        all_docs.len(),
+        doc_count,
+        "All documents should be retrievable"
+    );
 
     // Verify each document's content matches
     for (doc, content) in &all_docs {
@@ -1175,11 +1311,7 @@ fn test_all_documents_retrievable() {
             .get(filename)
             .unwrap_or_else(|| panic!("Unexpected file: {}", filename));
 
-        assert_eq!(
-            content, expected,
-            "Content mismatch for {}",
-            filename
-        );
+        assert_eq!(content, expected, "Content mismatch for {}", filename);
     }
 }
 
@@ -1236,12 +1368,18 @@ fn test_memory_complete_workflow() {
     let check1 = memory::get_entry_without_tracking(&env.ctx.conn, "auth-oauth2-pkce")
         .expect("Failed to get entry");
     assert!(check1.is_some(), "OAuth entry should exist in database");
-    assert!(check1.unwrap().content.contains("PKCE"), "Content should contain PKCE");
+    assert!(
+        check1.unwrap().content.contains("PKCE"),
+        "Content should contain PKCE"
+    );
 
     let check2 = memory::get_entry_without_tracking(&env.ctx.conn, "bug-null-email")
         .expect("Failed to get entry");
     assert!(check2.is_some(), "Bug entry should exist in database");
-    assert!(check2.unwrap().content.contains("Panic"), "Content should contain Panic");
+    assert!(
+        check2.unwrap().content.contains("Panic"),
+        "Content should contain Panic"
+    );
 
     // Note: FTS search tested in unit tests with in-memory DB
 
@@ -1249,41 +1387,54 @@ fn test_memory_complete_workflow() {
     let retrieved = memory::get_entry(&env.ctx.conn, "auth-oauth2-pkce")
         .expect("Failed to get entry")
         .expect("Entry should exist");
-    assert_eq!(retrieved.access_count, 1, "Access count should be 1 after get");
-    assert!(retrieved.last_accessed.is_some(), "Last accessed should be set");
+    assert_eq!(
+        retrieved.access_count, 1,
+        "Access count should be 1 after get"
+    );
+    assert!(
+        retrieved.last_accessed.is_some(),
+        "Last accessed should be set"
+    );
 
     // Get again to increment access count
     let retrieved2 = memory::get_entry(&env.ctx.conn, "auth-oauth2-pkce")
         .expect("Failed to get entry")
         .expect("Entry should exist");
-    assert_eq!(retrieved2.access_count, 2, "Access count should be 2 after second get");
+    assert_eq!(
+        retrieved2.access_count, 2,
+        "Access count should be 2 after second get"
+    );
 
     // 5. Check warmup index
-    let warmup = memory::get_warmup_index(&env.ctx.conn, 50)
-        .expect("Failed to get warmup index");
+    let warmup = memory::get_warmup_index(&env.ctx.conn, 50).expect("Failed to get warmup index");
     assert_eq!(warmup.len(), 2, "Should have 2 entries in warmup");
     // Most accessed entry should be first
-    assert!(warmup[0].contains("auth-oauth2-pkce"), "Most accessed should be first");
+    assert!(
+        warmup[0].contains("auth-oauth2-pkce"),
+        "Most accessed should be first"
+    );
 
     // 6. List entries
-    let all = memory::list_entries(&env.ctx.conn, 10, None)
-        .expect("Failed to list entries");
+    let all = memory::list_entries(&env.ctx.conn, 10, None).expect("Failed to list entries");
     assert_eq!(all.len(), 2, "Should list 2 entries");
 
     // 7. Update an entry
     let mut updated_entry = retrieved2.clone();
-    updated_entry.content.push_str("\n\n## Additional Notes\nAlso supports S256.");
-    memory::update_entry(&env.ctx.conn, &updated_entry)
-        .expect("Failed to update entry");
+    updated_entry
+        .content
+        .push_str("\n\n## Additional Notes\nAlso supports S256.");
+    memory::update_entry(&env.ctx.conn, &updated_entry).expect("Failed to update entry");
 
     let after_update = memory::get_entry_without_tracking(&env.ctx.conn, "auth-oauth2-pkce")
         .expect("Failed to get entry")
         .expect("Entry should exist");
-    assert!(after_update.content.contains("S256"), "Content should be updated");
+    assert!(
+        after_update.content.contains("S256"),
+        "Content should be updated"
+    );
 
     // 8. Test prune (nothing should be pruned since entries are recent)
-    let pruned = memory::prune_entries(&env.ctx.conn, 30, true)
-        .expect("Failed to prune");
+    let pruned = memory::prune_entries(&env.ctx.conn, 30, true).expect("Failed to prune");
     assert!(pruned.is_empty(), "Recent entries should not be pruned");
 }
 
@@ -1297,8 +1448,7 @@ fn test_memory_stats_integration() {
     stats::init_stats_schema(&env.ctx.conn).expect("Failed to init stats schema");
 
     // Create a session
-    let session_id = stats::create_session(&env.ctx.conn)
-        .expect("Failed to create session");
+    let session_id = stats::create_session(&env.ctx.conn).expect("Failed to create session");
     assert!(session_id > 0, "Session ID should be positive");
 
     // Add a memory entry
@@ -1314,7 +1464,10 @@ fn test_memory_stats_integration() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+        source_path: None,
+        confirmations: 0,
+        last_confirmed_at: None,
+        source_type: memory::SourceType::UserStatement,
     };
     memory::add_entry(&env.ctx.conn, &entry).expect("Failed to add entry");
 
@@ -1334,13 +1487,13 @@ fn test_memory_stats_integration() {
     assert_eq!(session.total_tokens, 450, "Should have 450 tokens total");
 
     // Check tool usage breakdown
-    let tool_usage = stats::get_tool_usage(&env.ctx.conn, session_id)
-        .expect("Failed to get tool usage");
+    let tool_usage =
+        stats::get_tool_usage(&env.ctx.conn, session_id).expect("Failed to get tool usage");
     assert_eq!(tool_usage.len(), 3, "Should have 3 different tools");
 
     // Check aggregate stats
-    let aggregate = stats::get_aggregate_stats(&env.ctx.conn)
-        .expect("Failed to get aggregate stats");
+    let aggregate =
+        stats::get_aggregate_stats(&env.ctx.conn).expect("Failed to get aggregate stats");
     assert_eq!(aggregate.total_sessions, 1);
     assert_eq!(aggregate.total_calls, 3);
     assert_eq!(aggregate.total_tokens, 450);
@@ -1371,14 +1524,16 @@ fn test_memory_index_persistence() {
             superseded_by: None,
             access_count: i as u64,
             last_accessed: if i > 0 { Some(now) } else { None },
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: memory::SourceType::UserStatement,
         };
         memory::add_entry(&env.ctx.conn, &entry).expect("Failed to add entry");
     }
 
     // Get warmup index (this is what would be persisted to index.json)
-    let index = memory::get_warmup_index(&env.ctx.conn, 50)
-        .expect("Failed to get warmup index");
+    let index = memory::get_warmup_index(&env.ctx.conn, 50).expect("Failed to get warmup index");
     assert_eq!(index.len(), 3, "Should have 3 entries");
 
     // Write index.json manually (simulating what handle_memory_add does)
@@ -1387,15 +1542,20 @@ fn test_memory_index_persistence() {
         "entries": index,
         "updated_at": now,
     });
-    fs::write(&index_path, serde_json::to_string_pretty(&index_content).unwrap())
-        .expect("Failed to write index.json");
+    fs::write(
+        &index_path,
+        serde_json::to_string_pretty(&index_content).unwrap(),
+    )
+    .expect("Failed to write index.json");
 
     // Verify index.json exists and is readable
     assert!(index_path.exists(), "index.json should exist");
     let read_back = fs::read_to_string(&index_path).expect("Failed to read index.json");
-    let parsed: serde_json::Value = serde_json::from_str(&read_back)
-        .expect("Failed to parse index.json");
-    let entries = parsed["entries"].as_array().expect("entries should be array");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&read_back).expect("Failed to parse index.json");
+    let entries = parsed["entries"]
+        .as_array()
+        .expect("entries should be array");
     assert_eq!(entries.len(), 3, "index.json should have 3 entries");
 }
 
@@ -1427,7 +1587,10 @@ fn test_memory_condense_finds_related() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+        source_path: None,
+        confirmations: 0,
+        last_confirmed_at: None,
+        source_type: memory::SourceType::UserStatement,
     };
 
     // Entry 2: auth + jwt
@@ -1443,7 +1606,10 @@ fn test_memory_condense_finds_related() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+        source_path: None,
+        confirmations: 0,
+        last_confirmed_at: None,
+        source_type: memory::SourceType::UserStatement,
     };
 
     // Entry 3: auth + jwt
@@ -1459,7 +1625,10 @@ fn test_memory_condense_finds_related() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+        source_path: None,
+        confirmations: 0,
+        last_confirmed_at: None,
+        source_type: memory::SourceType::UserStatement,
     };
 
     // Entry 4: different tags (should not be grouped)
@@ -1475,7 +1644,10 @@ fn test_memory_condense_finds_related() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+        source_path: None,
+        confirmations: 0,
+        last_confirmed_at: None,
+        source_type: memory::SourceType::UserStatement,
     };
 
     mdkb::store::memory::add_entry(&ctx.conn, &e1).expect("add e1");
@@ -1484,8 +1656,7 @@ fn test_memory_condense_finds_related() {
     mdkb::store::memory::add_entry(&ctx.conn, &e4).expect("add e4");
 
     // Find related entries with min_entries=3
-    let groups = find_related_entries(&ctx, None, 3)
-        .expect("find_related_entries failed");
+    let groups = find_related_entries(&ctx, None, 3).expect("find_related_entries failed");
 
     // Should find exactly one group (the 3 auth+jwt entries)
     assert_eq!(groups.len(), 1, "Should find exactly one group");
@@ -1525,19 +1696,24 @@ fn test_memory_condense_dry_run() {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: memory::SourceType::UserStatement,
         };
         mdkb::store::memory::add_entry(&ctx.conn, &entry).expect("add entry");
     }
 
     // Run condense in dry-run mode
-    let result = handle_memory_condense(&ctx, None, true, 3)
-        .expect("condense failed");
+    let result = handle_memory_condense(&ctx, None, true, 3).expect("condense failed");
 
     // Should find groups but NOT make changes
     assert!(!result.groups.is_empty(), "Should find groups");
     assert_eq!(result.merged_count, 0, "Dry run should not create merges");
-    assert_eq!(result.consolidated_count, 0, "Dry run should not consolidate");
+    assert_eq!(
+        result.consolidated_count, 0,
+        "Dry run should not consolidate"
+    );
 
     // Proposed content should be generated
     assert!(result.groups[0].proposed_title.is_some());
@@ -1547,8 +1723,9 @@ fn test_memory_condense_dry_run() {
     let entries = mdkb::store::memory::list_entries(
         &ctx.conn,
         100,
-        Some(mdkb::store::memory::EntryStatus::Active)
-    ).expect("list entries");
+        Some(mdkb::store::memory::EntryStatus::Active),
+    )
+    .expect("list entries");
     assert_eq!(entries.len(), 4, "All entries should still be active");
 }
 
@@ -1579,14 +1756,16 @@ fn test_memory_condense_creates_merged_entry() {
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: memory::SourceType::UserStatement,
         };
         mdkb::store::memory::add_entry(&ctx.conn, &entry).expect("add entry");
     }
 
     // Run condense (not dry-run)
-    let result = handle_memory_condense(&ctx, None, false, 3)
-        .expect("condense failed");
+    let result = handle_memory_condense(&ctx, None, false, 3).expect("condense failed");
 
     // Should have merged
     assert_eq!(result.merged_count, 1, "Should create one merged entry");
@@ -1596,22 +1775,30 @@ fn test_memory_condense_creates_merged_entry() {
     let superseded = mdkb::store::memory::list_entries(
         &ctx.conn,
         100,
-        Some(mdkb::store::memory::EntryStatus::Superseded)
-    ).expect("list superseded");
+        Some(mdkb::store::memory::EntryStatus::Superseded),
+    )
+    .expect("list superseded");
     assert_eq!(superseded.len(), 3, "3 entries should be superseded");
 
     // Each should have superseded_by pointing to the merged entry
     for entry in &superseded {
         assert!(entry.superseded_by.is_some());
-        assert!(entry.superseded_by.as_ref().unwrap().contains("consolidated"));
+        assert!(
+            entry
+                .superseded_by
+                .as_ref()
+                .unwrap()
+                .contains("consolidated")
+        );
     }
 
     // New active entries should be just 1 (the merged one)
     let active = mdkb::store::memory::list_entries(
         &ctx.conn,
         100,
-        Some(mdkb::store::memory::EntryStatus::Active)
-    ).expect("list active");
+        Some(mdkb::store::memory::EntryStatus::Active),
+    )
+    .expect("list active");
     assert_eq!(active.len(), 1, "Should have 1 active (merged) entry");
     assert!(active[0].id.contains("consolidated"));
 }
@@ -1622,12 +1809,12 @@ fn test_memory_condense_creates_merged_entry() {
 #[test]
 fn test_experiment_lifecycle() {
     use mdkb::cli::handlers::{
-        handle_experiment_create, handle_experiment_status, handle_experiment_end,
-        handle_experiment_list,
+        handle_experiment_create, handle_experiment_end, handle_experiment_list,
+        handle_experiment_status,
     };
     use mdkb::store::stats::{
-        init_experiments_schema, record_experiment_result, ExperimentResult,
-        get_experiment, ExperimentStatus,
+        ExperimentResult, ExperimentStatus, get_experiment, init_experiments_schema,
+        record_experiment_result,
     };
 
     let dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -1645,8 +1832,9 @@ fn test_experiment_lifecycle() {
         r#"{"strategy":"fixed","size":500}"#,
         r#"{"strategy":"markdown"}"#,
         0.5,
-        5,  // Low min_samples for testing
-    ).expect("create experiment");
+        5, // Low min_samples for testing
+    )
+    .expect("create experiment");
 
     assert_eq!(result.name, "test-chunking");
     assert!(result.id > 0);
@@ -1661,28 +1849,38 @@ fn test_experiment_lifecycle() {
     assert_eq!(running.len(), 1);
 
     // Record some results for both variants
-    let exp = get_experiment(&ctx.conn, "test-chunking").expect("get").expect("exp exists");
+    let exp = get_experiment(&ctx.conn, "test-chunking")
+        .expect("get")
+        .expect("exp exists");
 
     for i in 0..6 {
-        record_experiment_result(&ctx.conn, &ExperimentResult {
-            experiment_id: exp.id,
-            variant: "A".to_string(),
-            query_hash: format!("hash-a-{i}"),
-            latency_ms: 20 + i as i64,
-            score: 0.7 + (i as f64 * 0.01),
-            result_count: 5,
-            created_at: 0,
-        }).expect("record A");
+        record_experiment_result(
+            &ctx.conn,
+            &ExperimentResult {
+                experiment_id: exp.id,
+                variant: "A".to_string(),
+                query_hash: format!("hash-a-{i}"),
+                latency_ms: 20 + i as i64,
+                score: 0.7 + (i as f64 * 0.01),
+                result_count: 5,
+                created_at: 0,
+            },
+        )
+        .expect("record A");
 
-        record_experiment_result(&ctx.conn, &ExperimentResult {
-            experiment_id: exp.id,
-            variant: "B".to_string(),
-            query_hash: format!("hash-b-{i}"),
-            latency_ms: 22 + i as i64,
-            score: 0.8 + (i as f64 * 0.01),
-            result_count: 6,
-            created_at: 0,
-        }).expect("record B");
+        record_experiment_result(
+            &ctx.conn,
+            &ExperimentResult {
+                experiment_id: exp.id,
+                variant: "B".to_string(),
+                query_hash: format!("hash-b-{i}"),
+                latency_ms: 22 + i as i64,
+                score: 0.8 + (i as f64 * 0.01),
+                result_count: 6,
+                created_at: 0,
+            },
+        )
+        .expect("record B");
     }
 
     // Check status
@@ -1697,8 +1895,7 @@ fn test_experiment_lifecycle() {
     assert!(status.variant_b.avg_score > status.variant_a.avg_score);
 
     // End the experiment (auto-determine winner)
-    let winner = handle_experiment_end(&ctx, "test-chunking", None)
-        .expect("end");
+    let winner = handle_experiment_end(&ctx, "test-chunking", None).expect("end");
 
     // B should win since it has higher scores
     assert_eq!(winner.as_deref(), Some("B"));
@@ -1718,7 +1915,9 @@ fn test_experiment_lifecycle() {
 /// Test: Consistent variant assignment for same query hash (017-mq8r)
 #[test]
 fn test_experiment_consistent_routing() {
-    use mdkb::store::stats::{init_experiments_schema, create_experiment, get_experiment, get_experiment_variant};
+    use mdkb::store::stats::{
+        create_experiment, get_experiment, get_experiment_variant, init_experiments_schema,
+    };
 
     let dir = tempfile::tempdir().expect("Failed to create temp dir");
     let root = dir.path();
@@ -1727,7 +1926,9 @@ fn test_experiment_consistent_routing() {
     init_experiments_schema(&ctx.conn).expect("init schema");
 
     create_experiment(&ctx.conn, "routing-test", None, "{}", "{}", 0.5, 10).expect("create");
-    let exp = get_experiment(&ctx.conn, "routing-test").expect("get").expect("exists");
+    let exp = get_experiment(&ctx.conn, "routing-test")
+        .expect("get")
+        .expect("exists");
 
     // Same query hash should always get same variant
     let query_hash = "test-query-hash-123";
@@ -1747,8 +1948,10 @@ fn test_experiment_consistent_routing() {
 /// Test: Cancel experiment without winner (017-mq8r)
 #[test]
 fn test_experiment_cancel() {
-    use mdkb::cli::handlers::{handle_experiment_create, handle_experiment_cancel, handle_experiment_list};
-    use mdkb::store::stats::{init_experiments_schema, get_experiment, ExperimentStatus};
+    use mdkb::cli::handlers::{
+        handle_experiment_cancel, handle_experiment_create, handle_experiment_list,
+    };
+    use mdkb::store::stats::{ExperimentStatus, get_experiment, init_experiments_schema};
 
     let dir = tempfile::tempdir().expect("Failed to create temp dir");
     let root = dir.path();
@@ -1762,7 +1965,9 @@ fn test_experiment_cancel() {
     handle_experiment_cancel(&ctx, "cancel-test").expect("cancel");
 
     // Verify it's cancelled
-    let exp = get_experiment(&ctx.conn, "cancel-test").expect("get").expect("exists");
+    let exp = get_experiment(&ctx.conn, "cancel-test")
+        .expect("get")
+        .expect("exists");
     assert_eq!(exp.status, ExperimentStatus::Cancelled);
     assert!(exp.ended_at.is_some());
     assert!(exp.winner.is_none());

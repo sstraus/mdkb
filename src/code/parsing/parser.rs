@@ -18,12 +18,7 @@ use tree_sitter::Node;
 /// trait to extract symbols and relationships from source code.
 pub trait LanguageParser: Send {
     /// Parse source code and extract symbols.
-    fn parse(
-        &mut self,
-        code: &str,
-        file_id: FileId,
-        counter: &mut SymbolCounter,
-    ) -> Vec<Symbol>;
+    fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol>;
 
     /// Which language this parser handles.
     fn language(&self) -> Language;

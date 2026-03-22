@@ -2,6 +2,7 @@
 //!
 //! Uses the TSX grammar to handle both TypeScript and TSX/JSX files.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -10,7 +11,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct TypeScriptParser {
     parser: CachingParser,
@@ -170,8 +170,7 @@ impl TypeScriptParser {
                     .find(|n| n.kind() == "type_identifier")
                     .map(|n| code[n.byte_range()].to_string());
 
-                if let Some(symbol) =
-                    self.process_class(node, code, file_id, counter, module_path)
+                if let Some(symbol) = self.process_class(node, code, file_id, counter, module_path)
                 {
                     symbols.push(symbol);
                     self.context.enter_scope(ScopeType::Class);
@@ -180,7 +179,13 @@ impl TypeScriptParser {
                     self.context.set_current_class(class_name);
 
                     self.extract_class_members(
-                        node, code, file_id, counter, symbols, module_path, depth + 1,
+                        node,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
 
                     self.context.exit_scope();
@@ -206,16 +211,20 @@ impl TypeScriptParser {
             }
 
             "enum_declaration" => {
-                if let Some(symbol) =
-                    self.process_enum(node, code, file_id, counter, module_path)
-                {
+                if let Some(symbol) = self.process_enum(node, code, file_id, counter, module_path) {
                     symbols.push(symbol);
                 }
             }
 
             "lexical_declaration" | "variable_declaration" => {
                 self.process_variable_declaration(
-                    node, code, file_id, counter, symbols, module_path, depth + 1,
+                    node,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    module_path,
+                    depth + 1,
                 );
             }
 
@@ -253,7 +262,13 @@ impl TypeScriptParser {
                 if !is_default {
                     for child in children {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -262,7 +277,13 @@ impl TypeScriptParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -355,12 +376,16 @@ impl TypeScriptParser {
                         if let Some(body) = child.child_by_field_name("body") {
                             self.context
                                 .enter_scope(ScopeType::Function { hoisting: false });
-                            let saved_fn =
-                                self.context.current_function().map(|s| s.to_string());
+                            let saved_fn = self.context.current_function().map(|s| s.to_string());
                             self.context.set_current_function(method_name);
 
                             self.extract_symbols_from_node(
-                                body, code, file_id, counter, symbols, module_path,
+                                body,
+                                code,
+                                file_id,
+                                counter,
+                                symbols,
+                                module_path,
                                 depth + 1,
                             );
 
@@ -564,15 +589,14 @@ impl TypeScriptParser {
 
             // Arrow functions are never hoisted
             if is_arrow_fn {
-                let (parent_name, parent_kind) = if let Some(fn_name) =
-                    self.context.current_function()
-                {
-                    (Some(fn_name.into()), Some(SymbolKind::Function))
-                } else if let Some(cls_name) = self.context.current_class() {
-                    (Some(cls_name.into()), Some(SymbolKind::Class))
-                } else {
-                    (None, None)
-                };
+                let (parent_name, parent_kind) =
+                    if let Some(fn_name) = self.context.current_function() {
+                        (Some(fn_name.into()), Some(SymbolKind::Function))
+                    } else if let Some(cls_name) = self.context.current_class() {
+                        (Some(cls_name.into()), Some(SymbolKind::Class))
+                    } else {
+                        (None, None)
+                    };
                 symbol.scope_context = Some(ScopeContext::Local {
                     hoisted: false,
                     parent_name,
@@ -590,11 +614,16 @@ impl TypeScriptParser {
                         let saved_cls = self.context.current_class().map(|s| s.to_string());
                         self.context
                             .enter_scope(ScopeType::Function { hoisting: false });
-                        self.context
-                            .set_current_function(Some(name.to_string()));
+                        self.context.set_current_function(Some(name.to_string()));
 
                         self.extract_symbols_from_node(
-                            body, code, file_id, counter, symbols, module_path, depth + 1,
+                            body,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
 
                         self.context.exit_scope();
@@ -644,13 +673,7 @@ impl TypeScriptParser {
         imports
     }
 
-    fn collect_imports(
-        &self,
-        node: Node,
-        code: &str,
-        file_id: FileId,
-        imports: &mut Vec<Import>,
-    ) {
+    fn collect_imports(&self, node: Node, code: &str, file_id: FileId, imports: &mut Vec<Import>) {
         match node.kind() {
             "import_statement" => {
                 self.process_import_statement(node, code, file_id, imports);
@@ -819,8 +842,7 @@ impl TypeScriptParser {
             return;
         }
         let fn_ctx = match node.kind() {
-            "function_declaration" | "generator_function_declaration"
-            | "method_declaration" => {
+            "function_declaration" | "generator_function_declaration" | "method_declaration" => {
                 node.child_by_field_name("name")
                     .map(|n| &code[n.byte_range()])
                     .or(current_fn)
@@ -878,8 +900,7 @@ impl TypeScriptParser {
             return;
         }
         let fn_ctx = match node.kind() {
-            "function_declaration" | "generator_function_declaration"
-            | "method_declaration" => {
+            "function_declaration" | "generator_function_declaration" | "method_declaration" => {
                 node.child_by_field_name("name")
                     .map(|n| &code[n.byte_range()])
                     .or(current_fn)
@@ -961,16 +982,10 @@ impl TypeScriptParser {
                             if child.kind() == "extends_type_clause" {
                                 if let Some(type_node) = child.child_by_field_name("type") {
                                     if let Some(base) = extract_ts_type_name(type_node, code) {
-                                        results.push((
-                                            iface_name,
-                                            base,
-                                            node_range(type_node),
-                                        ));
+                                        results.push((iface_name, base, node_range(type_node)));
                                     }
                                 } else {
-                                    self.process_extends_clause(
-                                        child, code, iface_name, results,
-                                    );
+                                    self.process_extends_clause(child, code, iface_name, results);
                                 }
                             }
                         }
@@ -1038,10 +1053,7 @@ impl TypeScriptParser {
         results: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
         for child in node.children(&mut node.walk()) {
-            if matches!(
-                child.kind(),
-                "type_identifier" | "nested_type_identifier"
-            ) {
+            if matches!(child.kind(), "type_identifier" | "nested_type_identifier") {
                 if let Some(base) = extract_ts_type_name(child, code) {
                     results.push((iface_name, base, node_range(child)));
                 }
@@ -1302,8 +1314,18 @@ fn extract_ts_type_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
 
 /// TS primitive types that should be filtered from type uses.
 const TS_PRIMITIVES: &[&str] = &[
-    "string", "number", "boolean", "void", "any", "never", "unknown", "null", "undefined",
-    "object", "symbol", "bigint",
+    "string",
+    "number",
+    "boolean",
+    "void",
+    "any",
+    "never",
+    "unknown",
+    "null",
+    "undefined",
+    "object",
+    "symbol",
+    "bigint",
 ];
 
 fn extract_ts_type_from_annotation<'a>(
@@ -1331,12 +1353,7 @@ fn extract_ts_type_from_annotation<'a>(
 // ── LanguageParser trait impl ───────────────────────────────────────────
 
 impl LanguageParser for TypeScriptParser {
-    fn parse(
-        &mut self,
-        code: &str,
-        file_id: FileId,
-        counter: &mut SymbolCounter,
-    ) -> Vec<Symbol> {
+    fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
     }
 
@@ -1425,14 +1442,21 @@ export class MyClass {
         assert!(symbols.iter().any(|s| s.name.as_ref() == "publicFunction"
             && s.kind == SymbolKind::Function
             && s.visibility == Visibility::Public));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "privateFunction"
-            && s.kind == SymbolKind::Function));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "MyClass" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "greet" && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "privateFunction" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "MyClass" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "greet" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -1457,14 +1481,21 @@ export enum Color {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Serializable"
-            && s.kind == SymbolKind::Interface));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "UserId" && s.kind == SymbolKind::TypeAlias));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Serializable" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "UserId" && s.kind == SymbolKind::TypeAlias)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum)
+        );
     }
 
     #[test]
@@ -1482,12 +1513,22 @@ import './styles.css';
 
         let imports = parser.find_imports(code, file_id);
 
-        assert!(imports.iter().any(|i| i.path == "react"
-            && i.alias == Some("React".to_string())));
-        assert!(imports.iter().any(|i| i.path == "react"
-            && i.alias == Some("useState".to_string())));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.path == "react" && i.alias == Some("React".to_string()))
+        );
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.path == "react" && i.alias == Some("useState".to_string()))
+        );
         assert!(imports.iter().any(|i| i.path == "path" && i.is_glob));
-        assert!(imports.iter().any(|i| i.path == "./config" && i.is_type_only));
+        assert!(
+            imports
+                .iter()
+                .any(|i| i.path == "./config" && i.is_type_only)
+        );
         assert!(imports.iter().any(|i| i.path == "./styles.css"));
     }
 
@@ -1507,12 +1548,16 @@ function getData(): string { return ""; }
 "#;
 
         let calls = parser.find_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "process"));
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "getData"));
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "getData")
+        );
     }
 
     #[test]
@@ -1532,12 +1577,16 @@ function main(): void {
 "#;
 
         let calls = parser.find_method_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|c| c.caller == "main" && c.method_name == "start"));
-        assert!(calls
-            .iter()
-            .any(|c| c.caller == "main" && c.method_name == "log"));
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.caller == "main" && c.method_name == "start")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.caller == "main" && c.method_name == "log")
+        );
     }
 
     #[test]
@@ -1564,16 +1613,23 @@ class Derived extends Base implements Serializable, Printable {
 "#;
 
         let impls = parser.find_implementations(code);
-        assert!(impls.iter().any(|(cls, iface, _)| *cls == "Derived"
-            && *iface == "Serializable"));
-        assert!(impls
-            .iter()
-            .any(|(cls, iface, _)| *cls == "Derived" && *iface == "Printable"));
+        assert!(
+            impls
+                .iter()
+                .any(|(cls, iface, _)| *cls == "Derived" && *iface == "Serializable")
+        );
+        assert!(
+            impls
+                .iter()
+                .any(|(cls, iface, _)| *cls == "Derived" && *iface == "Printable")
+        );
 
         let extends = parser.find_extends(code);
-        assert!(extends
-            .iter()
-            .any(|(cls, base, _)| *cls == "Derived" && *base == "Base"));
+        assert!(
+            extends
+                .iter()
+                .any(|(cls, base, _)| *cls == "Derived" && *base == "Base")
+        );
     }
 
     #[test]
@@ -1591,12 +1647,21 @@ const PRIVATE_CONST = 0;
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "exported"
-            && s.visibility == Visibility::Public));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "notExported"
-            && s.visibility == Visibility::Private));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "EXPORTED_CONST"
-            && s.visibility == Visibility::Public));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "exported" && s.visibility == Visibility::Public)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "notExported" && s.visibility == Visibility::Private)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "EXPORTED_CONST" && s.visibility == Visibility::Public)
+        );
     }
 
     #[test]
@@ -1617,12 +1682,16 @@ export const process = () => {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "greet" && s.kind == SymbolKind::Function));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "process" && s.kind == SymbolKind::Function));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "greet" && s.kind == SymbolKind::Function)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "process" && s.kind == SymbolKind::Function)
+        );
     }
 
     #[test]
@@ -1645,10 +1714,11 @@ function processData(data: string[]): string[] {
             .find(|s| s.name.as_ref() == "processData")
             .expect("should find processData");
         assert!(func.doc_comment.is_some());
-        assert!(func
-            .doc_comment
-            .as_deref()
-            .unwrap()
-            .contains("Process data"));
+        assert!(
+            func.doc_comment
+                .as_deref()
+                .unwrap()
+                .contains("Process data")
+        );
     }
 }

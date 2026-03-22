@@ -24,36 +24,38 @@ pub const MAX_CONTENT_SIZE: usize = 100_000;
 /// Checks ID format, title length, tag count/length, and content size.
 pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &str) -> Result<()> {
     if id.is_empty() || id.len() > MAX_ID_LEN {
-        return Err(ErrorKind::InvalidQuery(
-            format!("ID must be 1-{MAX_ID_LEN} chars"),
-        ).into());
+        return Err(ErrorKind::InvalidQuery(format!("ID must be 1-{MAX_ID_LEN} chars")).into());
     }
-    if !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    {
         return Err(ErrorKind::InvalidQuery(
             "ID must be lowercase alphanumeric with hyphens".to_string(),
-        ).into());
+        )
+        .into());
     }
     if title.is_empty() || title.len() > MAX_TITLE_LEN {
-        return Err(ErrorKind::InvalidQuery(
-            format!("Title must be 1-{MAX_TITLE_LEN} chars"),
-        ).into());
+        return Err(
+            ErrorKind::InvalidQuery(format!("Title must be 1-{MAX_TITLE_LEN} chars")).into(),
+        );
     }
     if tags.len() > MAX_TAGS {
-        return Err(ErrorKind::InvalidQuery(
-            format!("Too many tags (max {MAX_TAGS})"),
-        ).into());
+        return Err(ErrorKind::InvalidQuery(format!("Too many tags (max {MAX_TAGS})")).into());
     }
     for tag in tags {
         if tag.len() > MAX_TAG_LEN {
-            return Err(ErrorKind::InvalidQuery(
-                format!("Tag '{}' exceeds {MAX_TAG_LEN} chars", &tag[..20.min(tag.len())]),
-            ).into());
+            return Err(ErrorKind::InvalidQuery(format!(
+                "Tag '{}' exceeds {MAX_TAG_LEN} chars",
+                &tag[..20.min(tag.len())]
+            ))
+            .into());
         }
     }
     if content.len() > MAX_CONTENT_SIZE {
-        return Err(ErrorKind::InvalidQuery(
-            format!("Content exceeds {MAX_CONTENT_SIZE} bytes"),
-        ).into());
+        return Err(
+            ErrorKind::InvalidQuery(format!("Content exceeds {MAX_CONTENT_SIZE} bytes")).into(),
+        );
     }
     Ok(())
 }
@@ -88,7 +90,9 @@ impl std::str::FromStr for SourceType {
             "user_statement" => Ok(Self::UserStatement),
             "auto_extracted" => Ok(Self::AutoExtracted),
             "inference" => Ok(Self::Inference),
-            _ => Err(format!("Invalid source_type: {s}. Valid: official_docs, user_statement, auto_extracted, inference")),
+            _ => Err(format!(
+                "Invalid source_type: {s}. Valid: official_docs, user_statement, auto_extracted, inference"
+            )),
         }
     }
 }
@@ -237,7 +241,9 @@ impl std::str::FromStr for MemorySortOrder {
             "popular" => Ok(Self::Popular),
             "recent" => Ok(Self::Recent),
             "newest" => Ok(Self::Newest),
-            _ => Err(format!("Invalid sort order: '{s}'. Valid: popular, recent, newest.")),
+            _ => Err(format!(
+                "Invalid sort order: '{s}'. Valid: popular, recent, newest."
+            )),
         }
     }
 }
@@ -321,9 +327,10 @@ pub fn confirm_entry(conn: &Connection, id: &str) -> Result<String> {
         .ok_or_else(|| ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")))?;
 
     if entry.status == EntryStatus::Superseded {
-        return Err(ErrorKind::InvalidQuery(
-            format!("Cannot confirm superseded entry '{id}'. Confirm the replacement instead.")
-        ).into());
+        return Err(ErrorKind::InvalidQuery(format!(
+            "Cannot confirm superseded entry '{id}'. Confirm the replacement instead."
+        ))
+        .into());
     }
 
     let now = Utc::now().timestamp();
@@ -341,7 +348,10 @@ pub fn confirm_entry(conn: &Connection, id: &str) -> Result<String> {
     if entry.status == EntryStatus::Archived {
         Ok(format!("Confirmed and restored to active: {id}"))
     } else {
-        Ok(format!("Confirmed: {id} ({} confirmations)", entry.confirmations + 1))
+        Ok(format!(
+            "Confirmed: {id} ({} confirmations)",
+            entry.confirmations + 1
+        ))
     }
 }
 
@@ -355,15 +365,17 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
         .ok_or_else(|| ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")))?;
 
     if entry.status == EntryStatus::Superseded {
-        return Err(ErrorKind::InvalidQuery(
-            format!("Cannot correct superseded entry '{id}'. Correct the replacement instead.")
-        ).into());
+        return Err(ErrorKind::InvalidQuery(format!(
+            "Cannot correct superseded entry '{id}'. Correct the replacement instead."
+        ))
+        .into());
     }
 
     if entry.status == EntryStatus::Archived {
-        return Err(ErrorKind::InvalidQuery(
-            format!("Cannot correct archived entry '{id}'. Restore it first or correct its replacement.")
-        ).into());
+        return Err(ErrorKind::InvalidQuery(format!(
+            "Cannot correct archived entry '{id}'. Restore it first or correct its replacement."
+        ))
+        .into());
     }
 
     let now = Utc::now().timestamp();
@@ -373,9 +385,10 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
         // Validate correction size before allocating
         const MAX_CORRECTION_LEN: usize = MAX_CONTENT_SIZE / 2;
         if text.len() > MAX_CORRECTION_LEN {
-            return Err(ErrorKind::InvalidQuery(
-                format!("Correction text exceeds {MAX_CORRECTION_LEN} bytes")
-            ).into());
+            return Err(ErrorKind::InvalidQuery(format!(
+                "Correction text exceeds {MAX_CORRECTION_LEN} bytes"
+            ))
+            .into());
         }
         let timestamp = chrono::DateTime::from_timestamp(now, 0)
             .map(|dt| dt.format("%Y-%m-%d").to_string())
@@ -384,16 +397,19 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
         let new_content = format!("{}{}", entry.content, correction_block);
 
         if new_content.len() > MAX_CONTENT_SIZE {
-            return Err(ErrorKind::InvalidQuery(
-                format!("Correction would exceed max content size ({MAX_CONTENT_SIZE} bytes)")
-            ).into());
+            return Err(ErrorKind::InvalidQuery(format!(
+                "Correction would exceed max content size ({MAX_CONTENT_SIZE} bytes)"
+            ))
+            .into());
         }
 
         conn.execute(
             "UPDATE memory_entries SET confirmations = confirmations + 1, last_confirmed_at = ?1, content = ?2, updated_at = ?1 WHERE id = ?3",
             params![now, new_content, id],
         )?;
-        Ok(format!("Corrected: {id} (correction appended, confidence boosted)"))
+        Ok(format!(
+            "Corrected: {id} (correction appended, confidence boosted)"
+        ))
     } else {
         conn.execute(
             "UPDATE memory_entries SET confirmations = confirmations + 1, last_confirmed_at = ?1, updated_at = ?1 WHERE id = ?2",
@@ -471,10 +487,7 @@ pub fn save_revision(
 
     // Compute unified diff
     let text_diff = similar::TextDiff::from_lines(old_content, new_content);
-    let diff = text_diff
-        .unified_diff()
-        .context_radius(2)
-        .to_string();
+    let diff = text_diff.unified_diff().context_radius(2).to_string();
 
     let now = Utc::now().timestamp();
 
@@ -501,17 +514,18 @@ pub fn save_revision(
 pub fn get_revisions(conn: &Connection, memory_id: &str) -> Result<Vec<Revision>> {
     let mut stmt = conn.prepare(
         "SELECT id, memory_id, diff, created_at FROM memory_revisions
-         WHERE memory_id = ?1 ORDER BY created_at ASC, id ASC"
+         WHERE memory_id = ?1 ORDER BY created_at ASC, id ASC",
     )?;
-    let revisions = stmt.query_map(params![memory_id], |row| {
-        Ok(Revision {
-            id: row.get(0)?,
-            memory_id: row.get(1)?,
-            diff: row.get(2)?,
-            created_at: row.get(3)?,
-        })
-    })?
-    .collect::<std::result::Result<Vec<_>, _>>()?;
+    let revisions = stmt
+        .query_map(params![memory_id], |row| {
+            Ok(Revision {
+                id: row.get(0)?,
+                memory_id: row.get(1)?,
+                diff: row.get(2)?,
+                created_at: row.get(3)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(revisions)
 }
@@ -520,12 +534,11 @@ pub fn get_revisions(conn: &Connection, memory_id: &str) -> Result<Vec<Revision>
 pub fn get_revision_summary(conn: &Connection, memory_id: &str) -> Result<RevisionSummary> {
     let mut stmt = conn.prepare(
         "SELECT created_at FROM memory_revisions
-         WHERE memory_id = ?1 ORDER BY created_at ASC"
+         WHERE memory_id = ?1 ORDER BY created_at ASC",
     )?;
-    let dates: Vec<i64> = stmt.query_map(params![memory_id], |row| {
-        row.get(0)
-    })?
-    .collect::<std::result::Result<Vec<_>, _>>()?;
+    let dates: Vec<i64> = stmt
+        .query_map(params![memory_id], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     Ok(RevisionSummary {
         count: dates.len(),
@@ -567,7 +580,11 @@ pub fn delete_entry(conn: &Connection, id: &str) -> Result<bool> {
 /// List memory entries sorted by access count (most popular first).
 ///
 /// This is a convenience wrapper around `list_entries_sorted` with `Popular` sort order.
-pub fn list_entries(conn: &Connection, limit: usize, status_filter: Option<EntryStatus>) -> Result<Vec<MemoryEntry>> {
+pub fn list_entries(
+    conn: &Connection,
+    limit: usize,
+    status_filter: Option<EntryStatus>,
+) -> Result<Vec<MemoryEntry>> {
     list_entries_sorted(conn, limit, MemorySortOrder::Popular, status_filter)
 }
 
@@ -594,7 +611,11 @@ pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Ve
 }
 
 /// BM25 search returning (rowid, entry) pairs for RRF fusion.
-fn bm25_search_with_rowid(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(i64, MemoryEntry)>> {
+fn bm25_search_with_rowid(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<(i64, MemoryEntry)>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
     let mut stmt = conn.prepare(
         "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type
@@ -629,7 +650,12 @@ const CONFIDENCE_WEIGHT: f64 = 0.3;
 /// Find memory entries similar to the given embedding, excluding `exclude_rowid`.
 ///
 /// Returns a formatted warning string for any matches above the similarity threshold.
-pub fn find_similar_entries(conn: &Connection, embedding: &[f32], exclude_rowid: i64, exclude_id: &str) -> String {
+pub fn find_similar_entries(
+    conn: &Connection,
+    embedding: &[f32],
+    exclude_rowid: i64,
+    exclude_id: &str,
+) -> String {
     let mut warnings = String::new();
     if let Ok(similar) = crate::store::vectors::memory_vector_search(conn, embedding, 5) {
         for (sim_rowid, distance) in &similar {
@@ -675,7 +701,8 @@ fn get_entries_by_rowids(conn: &Connection, rowids: &[i64]) -> Result<HashMap<i6
         placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = rowids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> =
+        rowids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
     let rows = stmt.query_map(params.as_slice(), |row| {
         let rowid: i64 = row.get(0)?;
         let entry = row_to_entry_offset(row, 1)?;
@@ -707,7 +734,11 @@ pub fn search_entries_hybrid(
     let query_embedding = match query_embedding {
         Some(emb) => emb,
         None => {
-            return Ok(bm25_results.into_iter().take(limit).map(|(_, e)| e).collect());
+            return Ok(bm25_results
+                .into_iter()
+                .take(limit)
+                .map(|(_, e)| e)
+                .collect());
         }
     };
 
@@ -716,7 +747,11 @@ pub fn search_entries_hybrid(
 
     // If no vector results, fall back to BM25-only
     if vector_results.is_empty() {
-        return Ok(bm25_results.into_iter().take(limit).map(|(_, e)| e).collect());
+        return Ok(bm25_results
+            .into_iter()
+            .take(limit)
+            .map(|(_, e)| e)
+            .collect());
     }
 
     // Build SearchResult wrappers for BM25 (RRF needs SearchResult with i64 id)
@@ -732,7 +767,7 @@ pub fn search_entries_hybrid(
             snippets: vec![],
             status: None,
             superseded_by: None,
-                repo_root: None,
+            repo_root: None,
         })
         .collect();
 
@@ -742,12 +777,11 @@ pub fn search_entries_hybrid(
     hybrid::normalize_scores(&mut fused);
 
     // Build a lookup map from rowid -> MemoryEntry (from BM25 results)
-    let mut entry_map: HashMap<i64, MemoryEntry> = bm25_results
-        .into_iter()
-        .collect();
+    let mut entry_map: HashMap<i64, MemoryEntry> = bm25_results.into_iter().collect();
 
     // Batch-fetch vector-only entries (not in BM25 results) in a single query
-    let vector_only_rowids: Vec<i64> = fused.iter()
+    let vector_only_rowids: Vec<i64> = fused
+        .iter()
         .filter(|(rowid, _)| !entry_map.contains_key(rowid))
         .map(|(rowid, _)| *rowid)
         .collect();
@@ -771,7 +805,11 @@ pub fn search_entries_hybrid(
     // Re-sort by final score descending
     scored_results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    Ok(scored_results.into_iter().take(limit).map(|(e, _)| e).collect())
+    Ok(scored_results
+        .into_iter()
+        .take(limit)
+        .map(|(e, _)| e)
+        .collect())
 }
 
 /// Get rowid for a memory entry by its slug ID.
@@ -794,7 +832,7 @@ pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> 
         "SELECT id, title, entry_type, tags FROM memory_entries
          WHERE status = 'active'
          ORDER BY access_count DESC
-         LIMIT ?1"
+         LIMIT ?1",
     )?;
 
     let index: Vec<String> = stmt
@@ -804,7 +842,11 @@ pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> 
             let entry_type: String = row.get(2)?;
             let tags_json: String = row.get(3)?;
             let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-            let tags_str = tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
+            let tags_str = tags
+                .iter()
+                .map(|t| format!("#{t}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             Ok(format!("[{entry_type}] {id}: {title} {tags_str}"))
         })?
         .filter_map(|r| match r {
@@ -821,11 +863,7 @@ pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> 
 
 /// Get total count of memory entries.
 pub fn count_entries(conn: &Connection) -> Result<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memory_entries",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM memory_entries", [], |row| row.get(0))?;
     Ok(count as usize)
 }
 
@@ -911,7 +949,10 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
         title: row.get(off + 1)?,
         content: row.get(off + 2)?,
         entry_type: entry_type_str.parse().unwrap_or_else(|_| {
-            tracing::warn!("Unknown entry_type '{}', defaulting to Topic", entry_type_str);
+            tracing::warn!(
+                "Unknown entry_type '{}', defaulting to Topic",
+                entry_type_str
+            );
             EntryType::Topic
         }),
         tags,
@@ -928,7 +969,10 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
         confirmations: row.get::<_, Option<i64>>(off + 12)?.unwrap_or(0) as u32,
         last_confirmed_at: row.get(off + 13)?,
         source_type: source_type_str.parse().unwrap_or_else(|_| {
-            tracing::warn!("Unknown source_type '{}', defaulting to UserStatement", source_type_str);
+            tracing::warn!(
+                "Unknown source_type '{}', defaulting to UserStatement",
+                source_type_str
+            );
             SourceType::UserStatement
         }),
     })
@@ -965,7 +1009,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -998,7 +1042,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -1008,7 +1052,9 @@ mod tests {
         entry.tags.push("fixed".to_string());
         update_entry(&conn, &entry).unwrap();
 
-        let retrieved = get_entry_without_tracking(&conn, "bug-fix").unwrap().unwrap();
+        let retrieved = get_entry_without_tracking(&conn, "bug-fix")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.content, "Updated content with solution");
         assert!(retrieved.tags.contains(&"fixed".to_string()));
     }
@@ -1032,16 +1078,24 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
         add_entry(&conn, &entry).unwrap();
-        assert!(get_entry_without_tracking(&conn, "to-delete").unwrap().is_some());
+        assert!(
+            get_entry_without_tracking(&conn, "to-delete")
+                .unwrap()
+                .is_some()
+        );
 
         let deleted = delete_entry(&conn, "to-delete").unwrap();
         assert!(deleted);
-        assert!(get_entry_without_tracking(&conn, "to-delete").unwrap().is_none());
+        assert!(
+            get_entry_without_tracking(&conn, "to-delete")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1063,8 +1117,10 @@ mod tests {
                 superseded_by: None,
                 access_count: count,
                 last_accessed: None,
-            source_path: None,
-            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+                source_path: None,
+                confirmations: 0,
+                last_confirmed_at: None,
+                source_type: SourceType::UserStatement,
             };
             add_entry(&conn, &entry).unwrap();
         }
@@ -1095,7 +1151,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -1113,7 +1169,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -1144,7 +1200,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1174,7 +1230,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
 
@@ -1182,7 +1238,11 @@ mod tests {
 
         let index = get_warmup_index(&conn, 50).unwrap();
         assert_eq!(index.len(), 1);
-        assert!(index[0].starts_with("[problem]"), "Should start with type prefix, got: {}", index[0]);
+        assert!(
+            index[0].starts_with("[problem]"),
+            "Should start with type prefix, got: {}",
+            index[0]
+        );
         assert!(index[0].contains("test-entry"));
         assert!(index[0].contains("Test entry title"));
         assert!(index[0].contains("#bug"));
@@ -1203,14 +1263,20 @@ mod tests {
                 content: "Content".to_string(),
                 entry_type: EntryType::Topic,
                 tags: vec![],
-                status: if i == 2 { EntryStatus::Archived } else { EntryStatus::Active },
+                status: if i == 2 {
+                    EntryStatus::Archived
+                } else {
+                    EntryStatus::Active
+                },
                 created_at: now,
                 updated_at: now,
                 superseded_by: None,
                 access_count: 0,
                 last_accessed: None,
-            source_path: None,
-            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+                source_path: None,
+                confirmations: 0,
+                last_confirmed_at: None,
+                source_type: SourceType::UserStatement,
             };
             add_entry(&conn, &entry).unwrap();
         }
@@ -1239,7 +1305,7 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1249,7 +1315,9 @@ mod tests {
         assert!(pruned.is_empty());
 
         // Entry should still be active
-        let retrieved = get_entry_without_tracking(&conn, "recent").unwrap().unwrap();
+        let retrieved = get_entry_without_tracking(&conn, "recent")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.status, EntryStatus::Active);
     }
 
@@ -1274,7 +1342,7 @@ mod tests {
             last_accessed: Some(old_time),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1310,7 +1378,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1341,7 +1409,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1352,7 +1420,9 @@ mod tests {
         assert_eq!(pruned[0], "stale-dry");
 
         // Entry should still be active (dry run)
-        let retrieved = get_entry_without_tracking(&conn, "stale-dry").unwrap().unwrap();
+        let retrieved = get_entry_without_tracking(&conn, "stale-dry")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.status, EntryStatus::Active);
     }
 
@@ -1377,7 +1447,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1408,7 +1478,7 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &recent).unwrap();
@@ -1428,7 +1498,7 @@ mod tests {
             last_accessed: Some(old_time),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &stale).unwrap();
@@ -1465,7 +1535,7 @@ mod tests {
             last_accessed: Some(now - 200),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         let low = MemoryEntry {
@@ -1482,15 +1552,24 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &low).unwrap();
         add_entry(&conn, &high).unwrap();
 
-        let entries = list_entries_sorted(&conn, 10, MemorySortOrder::Popular, Some(EntryStatus::Active)).unwrap();
+        let entries = list_entries_sorted(
+            &conn,
+            10,
+            MemorySortOrder::Popular,
+            Some(EntryStatus::Active),
+        )
+        .unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, "high", "Popular sort: highest access_count first");
+        assert_eq!(
+            entries[0].id, "high",
+            "Popular sort: highest access_count first"
+        );
         assert_eq!(entries[1].id, "low");
     }
 
@@ -1513,7 +1592,7 @@ mod tests {
             last_accessed: Some(now - 1000),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         let recent = MemoryEntry {
@@ -1530,15 +1609,24 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &old_accessed).unwrap();
         add_entry(&conn, &recent).unwrap();
 
-        let entries = list_entries_sorted(&conn, 10, MemorySortOrder::Recent, Some(EntryStatus::Active)).unwrap();
+        let entries = list_entries_sorted(
+            &conn,
+            10,
+            MemorySortOrder::Recent,
+            Some(EntryStatus::Active),
+        )
+        .unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, "recent", "Recent sort: most recently accessed first");
+        assert_eq!(
+            entries[0].id, "recent",
+            "Recent sort: most recently accessed first"
+        );
         assert_eq!(entries[1].id, "old");
     }
 
@@ -1561,7 +1649,7 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         let newer = MemoryEntry {
@@ -1578,15 +1666,24 @@ mod tests {
             last_accessed: Some(now - 500),
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &older).unwrap();
         add_entry(&conn, &newer).unwrap();
 
-        let entries = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, Some(EntryStatus::Active)).unwrap();
+        let entries = list_entries_sorted(
+            &conn,
+            10,
+            MemorySortOrder::Newest,
+            Some(EntryStatus::Active),
+        )
+        .unwrap();
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].id, "newer", "Newest sort: most recently created first");
+        assert_eq!(
+            entries[0].id, "newer",
+            "Newest sort: most recently created first"
+        );
         assert_eq!(entries[1].id, "older");
     }
 
@@ -1684,7 +1781,7 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-                       last_confirmed_at: None,
+            last_confirmed_at: None,
             source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
@@ -1708,9 +1805,15 @@ mod tests {
             entry_type: EntryType::Topic,
             tags: vec![],
             status: EntryStatus::Active,
-            created_at: 1000, updated_at: 1000,
-            superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            created_at: 1000,
+            updated_at: 1000,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &e1).unwrap();
         let rowid1 = get_rowid(&conn, "auth-basic").unwrap().unwrap();
@@ -1724,9 +1827,15 @@ mod tests {
             entry_type: EntryType::Topic,
             tags: vec![],
             status: EntryStatus::Active,
-            created_at: 1000, updated_at: 1000,
-            superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            created_at: 1000,
+            updated_at: 1000,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &e2).unwrap();
         let rowid2 = get_rowid(&conn, "jwt-refresh").unwrap().unwrap();
@@ -1741,9 +1850,15 @@ mod tests {
             entry_type: EntryType::Topic,
             tags: vec![],
             status: EntryStatus::Active,
-            created_at: 1000, updated_at: 1000,
-            superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            created_at: 1000,
+            updated_at: 1000,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &e3).unwrap();
         let rowid3 = get_rowid(&conn, "db-tuning").unwrap().unwrap();
@@ -1752,13 +1867,20 @@ mod tests {
         // Query: "token expiration" — BM25 matches jwt-refresh, vector matches auth-basic+jwt-refresh
         // Query embedding close to auth entries
         let query_emb = test_embedding(0.105);
-        let results = search_entries_hybrid(&conn, "token expiration", Some(&query_emb), 10).unwrap();
+        let results =
+            search_entries_hybrid(&conn, "token expiration", Some(&query_emb), 10).unwrap();
 
         // jwt-refresh should be found (has both BM25 keyword match and vector similarity)
         let result_ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
-        assert!(result_ids.contains(&"jwt-refresh"), "jwt-refresh should be found via BM25+vector");
+        assert!(
+            result_ids.contains(&"jwt-refresh"),
+            "jwt-refresh should be found via BM25+vector"
+        );
         // auth-basic should be found via vector similarity even without keyword match
-        assert!(result_ids.contains(&"auth-basic"), "auth-basic should be found via vector similarity");
+        assert!(
+            result_ids.contains(&"auth-basic"),
+            "auth-basic should be found via vector similarity"
+        );
     }
 
     #[test]
@@ -1774,17 +1896,25 @@ mod tests {
                 entry_type: EntryType::Topic,
                 tags: vec![],
                 status: EntryStatus::Active,
-                created_at: 1000, updated_at: 1000,
-                superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-                confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+                created_at: 1000,
+                updated_at: 1000,
+                superseded_by: None,
+                access_count: 0,
+                last_accessed: None,
+                source_path: None,
+                confirmations: 0,
+                last_confirmed_at: None,
+                source_type: SourceType::UserStatement,
             };
             add_entry(&conn, &entry).unwrap();
             let rowid = get_rowid(&conn, &format!("entry-{i}")).unwrap().unwrap();
-            vectors::store_memory_embedding(&conn, rowid, &test_embedding(i as f32 * 0.1), "test").unwrap();
+            vectors::store_memory_embedding(&conn, rowid, &test_embedding(i as f32 * 0.1), "test")
+                .unwrap();
         }
 
         let query_emb = test_embedding(0.5);
-        let results = search_entries_hybrid(&conn, "searchable entry", Some(&query_emb), 3).unwrap();
+        let results =
+            search_entries_hybrid(&conn, "searchable entry", Some(&query_emb), 3).unwrap();
         assert_eq!(results.len(), 3, "Should respect limit of 3");
     }
 
@@ -1798,9 +1928,15 @@ mod tests {
             entry_type: EntryType::Topic,
             tags: vec![],
             status: EntryStatus::Active,
-            created_at: 1000, updated_at: 1000,
-            superseded_by: None, access_count: 0, last_accessed: None, source_path: None,
-            confirmations: 0, last_confirmed_at: None, source_type: SourceType::UserStatement,
+            created_at: 1000,
+            updated_at: 1000,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1813,13 +1949,29 @@ mod tests {
 
     // ==================== Confidence Formula Tests ====================
 
-    fn make_entry_at(created: i64, confirmations: u32, access_count: u64, last_confirmed: Option<i64>, source: SourceType) -> MemoryEntry {
+    fn make_entry_at(
+        created: i64,
+        confirmations: u32,
+        access_count: u64,
+        last_confirmed: Option<i64>,
+        source: SourceType,
+    ) -> MemoryEntry {
         MemoryEntry {
-            id: "test".to_string(), title: "Test".to_string(), content: "Content".to_string(),
-            entry_type: EntryType::Topic, tags: vec![], status: EntryStatus::Active,
-            created_at: created, updated_at: created, superseded_by: None,
-            access_count, last_accessed: None, source_path: None,
-            confirmations, last_confirmed_at: last_confirmed, source_type: source,
+            id: "test".to_string(),
+            title: "Test".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: created,
+            updated_at: created,
+            superseded_by: None,
+            access_count,
+            last_accessed: None,
+            source_path: None,
+            confirmations,
+            last_confirmed_at: last_confirmed,
+            source_type: source,
         }
     }
 
@@ -1829,7 +1981,10 @@ mod tests {
         let entry = make_entry_at(now, 0, 0, None, SourceType::UserStatement);
         let conf = entry.confidence_at(now);
         // belief=0.5, decay=1.0, source=0.85 → 0.425
-        assert!((conf - 0.425).abs() < 0.01, "New user_statement should be ~0.425, got {conf}");
+        assert!(
+            (conf - 0.425).abs() < 0.01,
+            "New user_statement should be ~0.425, got {conf}"
+        );
     }
 
     #[test]
@@ -1839,7 +1994,10 @@ mod tests {
         let entry = make_entry_at(created, 0, 0, None, SourceType::UserStatement);
         let conf = entry.confidence_at(now);
         // belief=0.5, decay=e^(-1)≈0.368, source=0.85 → ~0.156
-        assert!((conf - 0.156).abs() < 0.02, "90-day stale should be ~0.156, got {conf}");
+        assert!(
+            (conf - 0.156).abs() < 0.02,
+            "90-day stale should be ~0.156, got {conf}"
+        );
     }
 
     #[test]
@@ -1848,7 +2006,10 @@ mod tests {
         let entry = make_entry_at(now, 5, 0, Some(now), SourceType::OfficialDocs);
         let conf = entry.confidence_at(now);
         // belief=6/7≈0.857, decay=1.0, source=1.0 → ~0.857
-        assert!((conf - 0.857).abs() < 0.01, "Heavily confirmed should be ~0.857, got {conf}");
+        assert!(
+            (conf - 0.857).abs() < 0.01,
+            "Heavily confirmed should be ~0.857, got {conf}"
+        );
     }
 
     #[test]
@@ -1859,7 +2020,10 @@ mod tests {
         let high_access = make_entry_at(created, 0, 10, None, SourceType::UserStatement);
         let conf_no = no_access.confidence_at(now);
         let conf_hi = high_access.confidence_at(now);
-        assert!(conf_hi > conf_no, "High access should slow decay: {conf_hi} > {conf_no}");
+        assert!(
+            conf_hi > conf_no,
+            "High access should slow decay: {conf_hi} > {conf_no}"
+        );
     }
 
     #[test]
@@ -1868,7 +2032,10 @@ mod tests {
         let now = 365 * 5 * 86400; // 5 years
         let entry = make_entry_at(created, 0, 0, None, SourceType::Inference);
         let conf = entry.confidence_at(now);
-        assert!((conf - CONFIDENCE_FLOOR).abs() < 0.001, "Very old entry should hit floor {CONFIDENCE_FLOOR}, got {conf}");
+        assert!(
+            (conf - CONFIDENCE_FLOOR).abs() < 0.001,
+            "Very old entry should hit floor {CONFIDENCE_FLOOR}, got {conf}"
+        );
     }
 
     #[test]
@@ -1876,7 +2043,10 @@ mod tests {
         let now = 1000;
         let user = make_entry_at(now, 0, 0, None, SourceType::UserStatement);
         let infer = make_entry_at(now, 0, 0, None, SourceType::Inference);
-        assert!(user.confidence_at(now) > infer.confidence_at(now), "user_statement should score higher than inference");
+        assert!(
+            user.confidence_at(now) > infer.confidence_at(now),
+            "user_statement should score higher than inference"
+        );
     }
 
     #[test]
@@ -1885,7 +2055,10 @@ mod tests {
         let entry = make_entry_at(now, 0, 0, None, SourceType::AutoExtracted);
         let conf = entry.confidence_at(now);
         // belief=0.5, decay=1.0, source=0.70 → 0.35
-        assert!((conf - 0.35).abs() < 0.01, "New auto_extracted should be ~0.35, got {conf}");
+        assert!(
+            (conf - 0.35).abs() < 0.01,
+            "New auto_extracted should be ~0.35, got {conf}"
+        );
     }
 
     #[test]
@@ -1895,7 +2068,10 @@ mod tests {
         let entry = make_entry_at(created, 0, 0, None, SourceType::AutoExtracted);
         let conf = entry.confidence_at(now);
         // belief=0.5, decay=e^(-1)≈0.368, source=0.70 → ~0.129
-        assert!((conf - 0.129).abs() < 0.02, "90-day auto_extracted should be ~0.129, got {conf}");
+        assert!(
+            (conf - 0.129).abs() < 0.02,
+            "90-day auto_extracted should be ~0.129, got {conf}"
+        );
     }
 
     #[test]
@@ -1904,7 +2080,10 @@ mod tests {
         let entry = make_entry_at(now, 1, 0, Some(now), SourceType::AutoExtracted);
         let conf = entry.confidence_at(now);
         // belief=2/3≈0.667, decay=1.0, source=0.70 → ~0.467
-        assert!((conf - 0.467).abs() < 0.01, "Confirmed auto_extracted should be ~0.467, got {conf}");
+        assert!(
+            (conf - 0.467).abs() < 0.01,
+            "Confirmed auto_extracted should be ~0.467, got {conf}"
+        );
     }
 
     #[test]
@@ -1916,8 +2095,14 @@ mod tests {
         let conf_auto = auto.confidence_at(now);
         let conf_user = user.confidence_at(now);
         let conf_infer = infer.confidence_at(now);
-        assert!(conf_user > conf_auto, "user > auto_extracted: {conf_user} > {conf_auto}");
-        assert!(conf_auto > conf_infer, "auto_extracted > inference: {conf_auto} > {conf_infer}");
+        assert!(
+            conf_user > conf_auto,
+            "user > auto_extracted: {conf_user} > {conf_auto}"
+        );
+        assert!(
+            conf_auto > conf_infer,
+            "auto_extracted > inference: {conf_auto} > {conf_infer}"
+        );
     }
 
     #[test]
@@ -1932,10 +2117,23 @@ mod tests {
     #[test]
     fn test_save_revision_creates_diff() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
-        save_revision(&conn, "test", "Old content", "New content", SourceType::UserStatement).unwrap();
+        save_revision(
+            &conn,
+            "test",
+            "Old content",
+            "New content",
+            SourceType::UserStatement,
+        )
+        .unwrap();
 
         let revisions = get_revisions(&conn, "test").unwrap();
         assert_eq!(revisions.len(), 1);
@@ -1946,13 +2144,22 @@ mod tests {
     #[test]
     fn test_save_revision_skips_auto_extracted() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::AutoExtracted);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::AutoExtracted,
+        );
         add_entry(&conn, &entry).unwrap();
 
         save_revision(&conn, "test", "Old", "New", SourceType::AutoExtracted).unwrap();
 
         let revisions = get_revisions(&conn, "test").unwrap();
-        assert!(revisions.is_empty(), "auto_extracted should not create revisions");
+        assert!(
+            revisions.is_empty(),
+            "auto_extracted should not create revisions"
+        );
     }
 
     #[test]
@@ -1964,13 +2171,22 @@ mod tests {
         save_revision(&conn, "test", "Old", "New", SourceType::Inference).unwrap();
 
         let revisions = get_revisions(&conn, "test").unwrap();
-        assert!(revisions.is_empty(), "inference should not create revisions");
+        assert!(
+            revisions.is_empty(),
+            "inference should not create revisions"
+        );
     }
 
     #[test]
     fn test_save_revision_keeps_max_three() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
         save_revision(&conn, "test", "v0", "v1", SourceType::UserStatement).unwrap();
@@ -1981,17 +2197,36 @@ mod tests {
         let revisions = get_revisions(&conn, "test").unwrap();
         assert_eq!(revisions.len(), 3, "should keep max 3 revisions");
         // Oldest should be v1→v2 (v0→v1 pruned)
-        assert!(revisions[0].diff.contains("v1"), "oldest should reference v1→v2");
-        assert!(revisions[0].diff.contains("v2"), "oldest should reference v1→v2");
+        assert!(
+            revisions[0].diff.contains("v1"),
+            "oldest should reference v1→v2"
+        );
+        assert!(
+            revisions[0].diff.contains("v2"),
+            "oldest should reference v1→v2"
+        );
     }
 
     #[test]
     fn test_save_revision_skips_identical_content() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
-        save_revision(&conn, "test", "Same content", "Same content", SourceType::UserStatement).unwrap();
+        save_revision(
+            &conn,
+            "test",
+            "Same content",
+            "Same content",
+            SourceType::UserStatement,
+        )
+        .unwrap();
 
         let revisions = get_revisions(&conn, "test").unwrap();
         assert!(revisions.is_empty(), "no revision for identical content");
@@ -2000,7 +2235,13 @@ mod tests {
     #[test]
     fn test_revision_summary() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
         save_revision(&conn, "test", "v0", "v1", SourceType::UserStatement).unwrap();
@@ -2014,7 +2255,13 @@ mod tests {
     #[test]
     fn test_revision_summary_empty() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
         let summary = get_revision_summary(&conn, "test").unwrap();
@@ -2025,7 +2272,13 @@ mod tests {
     #[test]
     fn test_revisions_deleted_with_entry() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
         save_revision(&conn, "test", "v0", "v1", SourceType::UserStatement).unwrap();
@@ -2041,7 +2294,13 @@ mod tests {
     #[test]
     fn test_confirm_entry_increments() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
         let result = confirm_entry(&conn, "test").unwrap();
@@ -2055,7 +2314,13 @@ mod tests {
     #[test]
     fn test_confirm_archived_restores() {
         let conn = setup_db();
-        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let mut entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         entry.status = EntryStatus::Archived;
         add_entry(&conn, &entry).unwrap();
 
@@ -2069,7 +2334,13 @@ mod tests {
     #[test]
     fn test_confirm_superseded_blocked() {
         let conn = setup_db();
-        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let mut entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         entry.status = EntryStatus::Superseded;
         add_entry(&conn, &entry).unwrap();
 
@@ -2080,7 +2351,13 @@ mod tests {
     #[test]
     fn test_correct_entry_increments() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
         let result = correct_entry(&conn, "test", None).unwrap();
@@ -2088,41 +2365,76 @@ mod tests {
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
         assert_eq!(updated.confirmations, 1, "correct always boosts confidence");
-
     }
 
     #[test]
     fn test_correct_with_text_appends_and_boosts() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
         correct_entry(&conn, "test", Some("The API changed to v3")).unwrap();
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
-        assert!(updated.content.contains("## Correction"), "Should have correction header");
-        assert!(updated.content.contains("The API changed to v3"), "Should contain correction text");
-        assert_eq!(updated.confirmations, 1, "correction should boost confidence");
-        assert!(updated.last_confirmed_at.is_some(), "should set last_confirmed_at");
+        assert!(
+            updated.content.contains("## Correction"),
+            "Should have correction header"
+        );
+        assert!(
+            updated.content.contains("The API changed to v3"),
+            "Should contain correction text"
+        );
+        assert_eq!(
+            updated.confirmations, 1,
+            "correction should boost confidence"
+        );
+        assert!(
+            updated.last_confirmed_at.is_some(),
+            "should set last_confirmed_at"
+        );
     }
 
     #[test]
     fn test_correct_without_text_boosts() {
         let conn = setup_db();
-        let entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         add_entry(&conn, &entry).unwrap();
 
         correct_entry(&conn, "test", None).unwrap();
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
-        assert_eq!(updated.confirmations, 1, "correction should boost confidence");
-        assert!(updated.last_confirmed_at.is_some(), "should set last_confirmed_at");
+        assert_eq!(
+            updated.confirmations, 1,
+            "correction should boost confidence"
+        );
+        assert!(
+            updated.last_confirmed_at.is_some(),
+            "should set last_confirmed_at"
+        );
     }
 
     #[test]
     fn test_correct_superseded_blocked() {
         let conn = setup_db();
-        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let mut entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         entry.status = EntryStatus::Superseded;
         add_entry(&conn, &entry).unwrap();
 
@@ -2132,7 +2444,13 @@ mod tests {
     #[test]
     fn test_correct_archived_blocked() {
         let conn = setup_db();
-        let mut entry = make_entry_at(Utc::now().timestamp(), 0, 0, None, SourceType::UserStatement);
+        let mut entry = make_entry_at(
+            Utc::now().timestamp(),
+            0,
+            0,
+            None,
+            SourceType::UserStatement,
+        );
         entry.status = EntryStatus::Archived;
         add_entry(&conn, &entry).unwrap();
 

@@ -90,7 +90,6 @@ pub struct SearchConfig {
 
     /// Vector weight in hybrid search.
     pub vector_weight: f64,
-
 }
 
 /// Memory index settings (Phase 6).
@@ -792,7 +791,13 @@ default_limit = 20
         assert_eq!(config.code.indexing.parallelism, 0);
         assert_eq!(config.code.indexing.batch_size, 500);
         assert!(!config.code.indexing.ignore_patterns.is_empty());
-        assert!(config.code.indexing.ignore_patterns.contains(&"**/target/**".to_string()));
+        assert!(
+            config
+                .code
+                .indexing
+                .ignore_patterns
+                .contains(&"**/target/**".to_string())
+        );
         assert!(config.code.semantic_search.enabled);
         assert_eq!(config.code.semantic_search.model, "AllMiniLML6V2");
     }
@@ -808,8 +813,14 @@ default_limit = 20
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.code.enabled, config.code.enabled);
         assert_eq!(parsed.code.index_path, config.code.index_path);
-        assert_eq!(parsed.code.indexing.batch_size, config.code.indexing.batch_size);
-        assert_eq!(parsed.code.semantic_search.threshold, config.code.semantic_search.threshold);
+        assert_eq!(
+            parsed.code.indexing.batch_size,
+            config.code.indexing.batch_size
+        );
+        assert_eq!(
+            parsed.code.semantic_search.threshold,
+            config.code.semantic_search.threshold
+        );
     }
 
     #[test]
@@ -857,11 +868,14 @@ threshold = 0.5
         assert!(result.is_err());
     }
 
-
     #[test]
     fn test_code_config_ignore_patterns_default() {
         let config = CodeIndexingConfig::default();
-        assert!(config.ignore_patterns.contains(&"**/node_modules/**".to_string()));
+        assert!(
+            config
+                .ignore_patterns
+                .contains(&"**/node_modules/**".to_string())
+        );
         assert!(config.ignore_patterns.contains(&"**/.git/**".to_string()));
         assert!(config.ignore_patterns.contains(&"**/vendor/**".to_string()));
     }

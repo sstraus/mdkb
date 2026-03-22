@@ -43,14 +43,16 @@ pub fn get_collection(conn: &Connection, name: &str) -> Result<Option<Collection
 
 /// List all collections.
 pub fn list_collections(conn: &Connection) -> Result<Vec<Collection>> {
-    let mut stmt =
-        conn.prepare("SELECT name, path, pattern, source, created_at, updated_at FROM collections")?;
+    let mut stmt = conn
+        .prepare("SELECT name, path, pattern, source, created_at, updated_at FROM collections")?;
     let rows = stmt.query_map([], |row| {
         Ok(Collection {
             name: row.get(0)?,
             path: row.get(1)?,
             pattern: row.get(2)?,
-            source: row.get::<_, Option<String>>(3)?.unwrap_or_else(|| "manual".to_string()),
+            source: row
+                .get::<_, Option<String>>(3)?
+                .unwrap_or_else(|| "manual".to_string()),
             created_at: row.get(4)?,
             updated_at: row.get(5)?,
         })
@@ -245,11 +247,13 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?1, ?2, ?3)",
             params!["hash1", "body1", now],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?1, ?2, ?3)",
             params!["hash2", "body2", now],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Add some documents
         conn.execute(

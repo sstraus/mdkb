@@ -1,5 +1,6 @@
 //! GDScript language parser implementation using tree-sitter-gdscript 6.1.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -7,7 +8,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct GdscriptParser {
     parser: CachingParser,
@@ -135,7 +135,13 @@ impl GdscriptParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -261,7 +267,13 @@ impl GdscriptParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -445,11 +457,15 @@ func outer_func():
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "InnerClass" && s.kind == SymbolKind::Class));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "outer_func" && s.kind == SymbolKind::Function));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "InnerClass" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "outer_func" && s.kind == SymbolKind::Function)
+        );
     }
 }

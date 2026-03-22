@@ -106,7 +106,8 @@ impl IndexFacade {
             let mut changed = Vec::new();
 
             for path in &discovered {
-                let rel_key = path.strip_prefix(root)
+                let rel_key = path
+                    .strip_prefix(root)
                     .unwrap_or(path)
                     .to_string_lossy()
                     .to_string();
@@ -145,7 +146,9 @@ impl IndexFacade {
         // Only clear semantic if already initialized (don't trigger lazy load for a clear)
         if let Some(ref semantic) = self.semantic {
             if let Err(e) = semantic.clear() {
-                tracing::error!("Failed to clear semantic index: {e}. Impact: old embeddings may persist.");
+                tracing::error!(
+                    "Failed to clear semantic index: {e}. Impact: old embeddings may persist."
+                );
             }
         }
 
@@ -174,7 +177,8 @@ impl IndexFacade {
     /// `file_path` is an absolute path; `root` is used to derive the relative
     /// path key stored in the database.
     pub fn delete_by_file(&mut self, file_path: &Path, root: &Path) -> anyhow::Result<()> {
-        let rel_path = file_path.strip_prefix(root)
+        let rel_path = file_path
+            .strip_prefix(root)
             .unwrap_or(file_path)
             .to_string_lossy()
             .to_string();
@@ -224,7 +228,8 @@ impl IndexFacade {
         let mut deleted: Vec<PathBuf> = Vec::new();
 
         for path in paths {
-            let rel_key = path.strip_prefix(root)
+            let rel_key = path
+                .strip_prefix(root)
                 .unwrap_or(path)
                 .to_string_lossy()
                 .to_string();
@@ -534,7 +539,10 @@ impl IndexFacade {
             })
             .collect();
 
-        tracing::info!("Generating semantic embeddings for {} symbols...", embed_inputs.len());
+        tracing::info!(
+            "Generating semantic embeddings for {} symbols...",
+            embed_inputs.len()
+        );
         if let Err(e) = semantic.generate_embeddings(&embed_inputs) {
             tracing::error!(
                 "Failed to generate semantic embeddings: {e}. Impact: {} symbols will not be searchable via semantic_search().",
@@ -582,8 +590,14 @@ mod tests {
         let facade = IndexFacade::create(dir.path().join("code.sqlite")).unwrap();
 
         // Semantic should NOT be initialized on construction (lazy)
-        assert!(!facade.semantic_initialized, "semantic should not be initialized on create");
-        assert!(facade.semantic.is_none(), "semantic should be None on create");
+        assert!(
+            !facade.semantic_initialized,
+            "semantic should not be initialized on create"
+        );
+        assert!(
+            facade.semantic.is_none(),
+            "semantic should be None on create"
+        );
     }
 
     #[test]
@@ -591,8 +605,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let facade = IndexFacade::open_or_create(dir.path().join("code.sqlite")).unwrap();
 
-        assert!(!facade.semantic_initialized, "semantic should not be initialized on open_or_create");
-        assert!(facade.semantic.is_none(), "semantic should be None on open_or_create");
+        assert!(
+            !facade.semantic_initialized,
+            "semantic should not be initialized on open_or_create"
+        );
+        assert!(
+            facade.semantic.is_none(),
+            "semantic should be None on open_or_create"
+        );
     }
 
     #[test]
@@ -625,7 +645,11 @@ pub fn world() {
     #[test]
     fn test_facade_get_symbol_by_name() {
         let src_dir = tempfile::tempdir().unwrap();
-        fs::write(src_dir.path().join("lib.rs"), "pub fn unique_symbol_name() {}").unwrap();
+        fs::write(
+            src_dir.path().join("lib.rs"),
+            "pub fn unique_symbol_name() {}",
+        )
+        .unwrap();
 
         let db_dir = tempfile::tempdir().unwrap();
         let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
@@ -713,7 +737,10 @@ pub fn world() {
         facade.index_directory(src_dir.path()).unwrap();
 
         let results = facade.search_symbols("calculate", 10);
-        assert!(!results.is_empty(), "expected search results for 'calculate'");
+        assert!(
+            !results.is_empty(),
+            "expected search results for 'calculate'"
+        );
         assert!(results.iter().any(|s| s.as_name() == "calculate_total"));
     }
 
@@ -751,7 +778,10 @@ pub fn world() {
         let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
-        assert!(facade.relationship_count() > 0, "relationships should be persisted");
+        assert!(
+            facade.relationship_count() > 0,
+            "relationships should be persisted"
+        );
     }
 
     #[test]
@@ -766,7 +796,12 @@ pub fn world() {
         facade.index_directory(src_dir.path()).unwrap();
 
         let hashes = facade.get_indexed_file_hashes();
-        assert_eq!(hashes.len(), 3, "expected 3 file entries, got {}", hashes.len());
+        assert_eq!(
+            hashes.len(),
+            3,
+            "expected 3 file entries, got {}",
+            hashes.len()
+        );
 
         // All values should be valid SHA-256 hex strings (64 chars)
         for (_path, hash) in &hashes {
@@ -793,8 +828,14 @@ pub fn world() {
         let remove_path = src_dir.path().join("remove.rs");
         facade.delete_by_file(&remove_path, src_dir.path()).unwrap();
 
-        assert!(facade.get_symbol_by_name("keep_me").is_some(), "keep_me should survive");
-        assert!(facade.get_symbol_by_name("remove_me").is_none(), "remove_me should be deleted");
+        assert!(
+            facade.get_symbol_by_name("keep_me").is_some(),
+            "keep_me should survive"
+        );
+        assert!(
+            facade.get_symbol_by_name("remove_me").is_none(),
+            "remove_me should be deleted"
+        );
         assert_eq!(facade.file_count(), 1);
     }
 
@@ -814,10 +855,19 @@ pub fn world() {
 
         let paths = vec![src_dir.path().join("lib.rs")];
         let stats = facade.reindex_files(src_dir.path(), &paths).unwrap();
-        assert_eq!(stats.files_indexed, 1, "should have reindexed 1 changed file");
+        assert_eq!(
+            stats.files_indexed, 1,
+            "should have reindexed 1 changed file"
+        );
 
-        assert!(facade.get_symbol_by_name("foo").is_none(), "foo should be gone");
-        assert!(facade.get_symbol_by_name("bar").is_some(), "bar should be present");
+        assert!(
+            facade.get_symbol_by_name("foo").is_none(),
+            "foo should be gone"
+        );
+        assert!(
+            facade.get_symbol_by_name("bar").is_some(),
+            "bar should be present"
+        );
     }
 
     #[test]
@@ -831,12 +881,12 @@ pub fn world() {
         facade.index_directory(src_dir.path()).unwrap();
 
         // Reindex without changing anything
-        let paths = vec![
-            src_dir.path().join("a.rs"),
-            src_dir.path().join("b.rs"),
-        ];
+        let paths = vec![src_dir.path().join("a.rs"), src_dir.path().join("b.rs")];
         let stats = facade.reindex_files(src_dir.path(), &paths).unwrap();
-        assert_eq!(stats.files_indexed, 0, "no files should be reindexed when unchanged");
+        assert_eq!(
+            stats.files_indexed, 0,
+            "no files should be reindexed when unchanged"
+        );
 
         // Symbols should still be queryable
         assert!(facade.get_symbol_by_name("aaa").is_some());
@@ -861,15 +911,25 @@ pub fn world() {
         let paths = vec![src_dir.path().join("a.rs")];
         facade.reindex_files(src_dir.path(), &paths).unwrap();
 
-        assert!(facade.get_symbol_by_name("aaa").is_none(), "aaa should be removed");
-        assert!(facade.get_symbol_by_name("bbb").is_some(), "bbb should survive");
+        assert!(
+            facade.get_symbol_by_name("aaa").is_none(),
+            "aaa should be removed"
+        );
+        assert!(
+            facade.get_symbol_by_name("bbb").is_some(),
+            "bbb should survive"
+        );
         assert_eq!(facade.file_count(), 1);
     }
 
     #[test]
     fn test_index_directory_twice_no_duplicates() {
         let src_dir = tempfile::tempdir().unwrap();
-        fs::write(src_dir.path().join("lib.rs"), "pub fn foo() {}\npub fn bar() {}").unwrap();
+        fs::write(
+            src_dir.path().join("lib.rs"),
+            "pub fn foo() {}\npub fn bar() {}",
+        )
+        .unwrap();
 
         let db_dir = tempfile::tempdir().unwrap();
         let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
@@ -881,6 +941,10 @@ pub fn world() {
         let _stats2 = facade.index_directory(src_dir.path()).unwrap();
 
         // Count total symbols
-        assert_eq!(facade.symbol_count(), 2, "Should have exactly 2 symbols after double index");
+        assert_eq!(
+            facade.symbol_count(),
+            2,
+            "Should have exactly 2 symbols after double index"
+        );
     }
 }

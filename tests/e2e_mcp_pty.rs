@@ -39,10 +39,7 @@ fn test_mcp_initialize_handshake() {
         result["capabilities"]["tools"].is_object(),
         "Should have tools capability"
     );
-    assert_eq!(
-        result["serverInfo"]["name"], "mdkb",
-        "Server name mismatch"
-    );
+    assert_eq!(result["serverInfo"]["name"], "mdkb", "Server name mismatch");
 }
 
 /// Test: Server lists all expected tools.
@@ -64,10 +61,7 @@ fn test_mcp_tools_list() {
         "code_graph",
     ];
 
-    let tool_names: Vec<&str> = tools
-        .iter()
-        .filter_map(|t| t["name"].as_str())
-        .collect();
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
     for expected in &expected_tools {
         assert!(
@@ -92,9 +86,18 @@ fn test_mcp_tool_status() {
     let result = harness.call_tool("status", json!({}));
     let text = McpTestHarness::get_text_content(&result);
 
-    assert!(text.contains("## Index Status"), "Should contain Index Status section");
-    assert!(text.contains("Documents:"), "Should contain Documents count");
-    assert!(text.contains("## Collections"), "Should contain Collections section");
+    assert!(
+        text.contains("## Index Status"),
+        "Should contain Index Status section"
+    );
+    assert!(
+        text.contains("Documents:"),
+        "Should contain Documents count"
+    );
+    assert!(
+        text.contains("## Collections"),
+        "Should contain Collections section"
+    );
 }
 
 /// Test: search tool with documents.
@@ -218,9 +221,15 @@ fn test_mcp_tool_status_includes_collections() {
     let result = harness.call_tool("status", json!({}));
     let text = McpTestHarness::get_text_content(&result);
 
-    assert!(text.contains("notes"), "Should list notes collection in status");
-    assert!(text.contains("[manual]") || text.contains("[convention]"),
-        "Should show source tags. Got: {}", text);
+    assert!(
+        text.contains("notes"),
+        "Should list notes collection in status"
+    );
+    assert!(
+        text.contains("[manual]") || text.contains("[convention]"),
+        "Should show source tags. Got: {}",
+        text
+    );
 }
 
 /// Test: update tool triggers reindex and new files become searchable.
@@ -291,12 +300,10 @@ fn test_mcp_get_nonexistent() {
     let result = harness.call_tool("get", json!({"id": "99999"}));
 
     // Error can be in result.isError or in error field (JSON-RPC error)
-    let has_error = result["error"].is_object()
-        || result["result"]["isError"].as_bool().unwrap_or(false);
+    let has_error =
+        result["error"].is_object() || result["result"]["isError"].as_bool().unwrap_or(false);
 
-    let error_msg = result["error"]["message"]
-        .as_str()
-        .unwrap_or("");
+    let error_msg = result["error"]["message"].as_str().unwrap_or("");
 
     assert!(
         has_error && error_msg.to_lowercase().contains("not found"),
@@ -318,11 +325,7 @@ fn test_mcp_rapid_tool_calls() {
     // Make 10 rapid status calls
     for i in 0..10 {
         let result = harness.call_tool("status", json!({}));
-        assert!(
-            result["result"].is_object(),
-            "Call {} should succeed",
-            i
-        );
+        assert!(result["result"].is_object(), "Call {} should succeed", i);
     }
 }
 
@@ -340,7 +343,10 @@ fn test_mcp_tools_after_file_changes() {
     // Verify initial state
     let status1 = harness.call_tool("status", json!({}));
     let text1 = McpTestHarness::get_text_content(&status1);
-    assert!(text1.contains("Documents: 1"), "Should have 1 document initially");
+    assert!(
+        text1.contains("Documents: 1"),
+        "Should have 1 document initially"
+    );
 
     // Modify files while server is running
     harness.create_file("docs/new.md", "# New Document");
@@ -351,7 +357,10 @@ fn test_mcp_tools_after_file_changes() {
     // Verify updated state
     let status2 = harness.call_tool("status", json!({}));
     let text2 = McpTestHarness::get_text_content(&status2);
-    assert!(text2.contains("Documents: 2"), "Should have 2 documents after update");
+    assert!(
+        text2.contains("Documents: 2"),
+        "Should have 2 documents after update"
+    );
 }
 
 // =============================================================================
@@ -438,7 +447,10 @@ fn test_mcp_tool_search_with_collection() {
     );
     let text = McpTestHarness::get_text_content(&result);
 
-    assert!(text.contains("rust.md"), "Should find docs collection result");
+    assert!(
+        text.contains("rust.md"),
+        "Should find docs collection result"
+    );
     // Collection filter should return only one result (docs, not notes)
     let result_lines: Vec<&str> = text.lines().filter(|l| l.starts_with('[')).collect();
     assert_eq!(
@@ -490,7 +502,10 @@ fn test_mcp_tool_search_memory_scope() {
     );
 
     // Search for auth topics using scope="memory"
-    let result = harness.call_tool("search", json!({"query": "authentication", "limit": 10, "scope": "memory"}));
+    let result = harness.call_tool(
+        "search",
+        json!({"query": "authentication", "limit": 10, "scope": "memory"}),
+    );
     let text = McpTestHarness::get_text_content(&result);
 
     assert!(
@@ -509,14 +524,18 @@ fn test_mcp_tool_search_memory_scope() {
 fn test_mcp_tool_get_by_id() {
     let mut harness = McpTestHarness::new();
 
-    harness.create_file("docs/specific.md", "# Specific Document\n\nUnique content here");
+    harness.create_file(
+        "docs/specific.md",
+        "# Specific Document\n\nUnique content here",
+    );
     harness.add_collection("docs", "docs", "**/*.md");
     harness.update_index();
 
     harness.initialize();
 
     // Search to get document ID
-    let search_result = harness.call_tool("search", json!({"query": "Specific Document", "limit": 1}));
+    let search_result =
+        harness.call_tool("search", json!({"query": "Specific Document", "limit": 1}));
     let search_text = McpTestHarness::get_text_content(&search_result);
 
     // Extract ID from search results
@@ -576,7 +595,11 @@ fn test_mcp_memory_update() {
     // Verify updated via unified get
     let get2 = harness.call_tool("get", json!({"id": "update-test"}));
     let text2 = McpTestHarness::get_text_content(&get2);
-    assert!(text2.contains("Updated"), "Should have updated content. Got: {}", text2);
+    assert!(
+        text2.contains("Updated"),
+        "Should have updated content. Got: {}",
+        text2
+    );
 }
 
 /// Test: search handles special characters (FTS5 escape).
@@ -594,10 +617,7 @@ fn test_mcp_search_special_characters() {
     harness.initialize();
 
     // Search with hyphenated term (was causing FTS5 parse error)
-    let result = harness.call_tool(
-        "search",
-        json!({"query": "anti-CSRF tokens", "limit": 10}),
-    );
+    let result = harness.call_tool("search", json!({"query": "anti-CSRF tokens", "limit": 10}));
 
     // Should not error
     assert!(

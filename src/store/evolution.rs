@@ -144,7 +144,10 @@ pub fn add_evolution(
     })();
 
     match result {
-        Ok(id) => { conn.execute("RELEASE add_evolution", [])?; Ok(id) }
+        Ok(id) => {
+            conn.execute("RELEASE add_evolution", [])?;
+            Ok(id)
+        }
         Err(e) => {
             if let Err(rb) = conn.execute("ROLLBACK TO add_evolution", []) {
                 tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
@@ -174,7 +177,7 @@ pub fn get_evolution_chain(conn: &Connection, doc_id: i64) -> Result<Vec<Evoluti
         "SELECT id, source_doc_id, target_doc_id, relationship, scope, reason, created_at
          FROM evolution
          WHERE source_doc_id = ?1
-         ORDER BY created_at DESC"
+         ORDER BY created_at DESC",
     )?;
 
     let rows = stmt.query_map(params![doc_id], |row| {
@@ -204,7 +207,7 @@ pub fn get_superseded_by(conn: &Connection, doc_id: i64) -> Result<Vec<Evolution
         "SELECT id, source_doc_id, target_doc_id, relationship, scope, reason, created_at
          FROM evolution
          WHERE target_doc_id = ?1
-         ORDER BY created_at DESC"
+         ORDER BY created_at DESC",
     )?;
 
     let rows = stmt.query_map(params![doc_id], |row| {
@@ -229,19 +232,24 @@ pub fn get_superseded_by(conn: &Connection, doc_id: i64) -> Result<Vec<Evolution
 }
 
 /// Get document status.
-pub fn get_document_status(conn: &Connection, doc_id: i64) -> Result<Option<(DocumentStatus, Option<String>)>> {
-    let result = conn.query_row(
-        "SELECT status, status_reason FROM documents WHERE id = ?1",
-        params![doc_id],
-        |row| {
-            let status_str: Option<String> = row.get(0)?;
-            let reason: Option<String> = row.get(1)?;
-            let status = status_str
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DocumentStatus::Current);
-            Ok((status, reason))
-        },
-    ).ok();
+pub fn get_document_status(
+    conn: &Connection,
+    doc_id: i64,
+) -> Result<Option<(DocumentStatus, Option<String>)>> {
+    let result = conn
+        .query_row(
+            "SELECT status, status_reason FROM documents WHERE id = ?1",
+            params![doc_id],
+            |row| {
+                let status_str: Option<String> = row.get(0)?;
+                let reason: Option<String> = row.get(1)?;
+                let status = status_str
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(DocumentStatus::Current);
+                Ok((status, reason))
+            },
+        )
+        .ok();
 
     Ok(result)
 }
@@ -275,11 +283,13 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["hash1", "# Doc 1", "1706700000"],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["hash2", "# Doc 2", "1706700000"],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Create documents
         conn.execute(
@@ -311,7 +321,8 @@ mod tests {
             RelationshipType::Supersedes,
             None,
             Some("New implementation"),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(evo_id > 0);
 
@@ -333,7 +344,8 @@ mod tests {
             RelationshipType::Updates,
             Some("section:api"),
             Some("API changes"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Target document should still be current
         let (status, _) = get_document_status(&conn, old_id).unwrap().unwrap();
@@ -352,7 +364,8 @@ mod tests {
             RelationshipType::Retracts,
             None,
             Some("Information was incorrect"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Check target document status changed to retracted
         let (status, _) = get_document_status(&conn, old_id).unwrap().unwrap();
@@ -364,7 +377,15 @@ mod tests {
         let conn = setup_db();
         let (old_id, new_id) = insert_test_docs(&conn);
 
-        add_evolution(&conn, new_id, old_id, RelationshipType::Supersedes, None, None).unwrap();
+        add_evolution(
+            &conn,
+            new_id,
+            old_id,
+            RelationshipType::Supersedes,
+            None,
+            None,
+        )
+        .unwrap();
 
         let chain = get_evolution_chain(&conn, new_id).unwrap();
         assert_eq!(chain.len(), 1);
@@ -378,7 +399,15 @@ mod tests {
         let conn = setup_db();
         let (old_id, new_id) = insert_test_docs(&conn);
 
-        add_evolution(&conn, new_id, old_id, RelationshipType::Supersedes, None, None).unwrap();
+        add_evolution(
+            &conn,
+            new_id,
+            old_id,
+            RelationshipType::Supersedes,
+            None,
+            None,
+        )
+        .unwrap();
 
         let superseded_by = get_superseded_by(&conn, old_id).unwrap();
         assert_eq!(superseded_by.len(), 1);
@@ -390,7 +419,8 @@ mod tests {
         let conn = setup_db();
         let (old_id, new_id) = insert_test_docs(&conn);
 
-        let evo_id = add_evolution(&conn, new_id, old_id, RelationshipType::Updates, None, None).unwrap();
+        let evo_id =
+            add_evolution(&conn, new_id, old_id, RelationshipType::Updates, None, None).unwrap();
 
         let deleted = delete_evolution(&conn, evo_id).unwrap();
         assert!(deleted);
@@ -401,19 +431,43 @@ mod tests {
 
     #[test]
     fn test_relationship_type_parsing() {
-        assert_eq!("supersedes".parse::<RelationshipType>().unwrap(), RelationshipType::Supersedes);
-        assert_eq!("updates".parse::<RelationshipType>().unwrap(), RelationshipType::Updates);
-        assert_eq!("corrects".parse::<RelationshipType>().unwrap(), RelationshipType::Corrects);
-        assert_eq!("retracts".parse::<RelationshipType>().unwrap(), RelationshipType::Retracts);
-        assert_eq!("extends".parse::<RelationshipType>().unwrap(), RelationshipType::Extends);
+        assert_eq!(
+            "supersedes".parse::<RelationshipType>().unwrap(),
+            RelationshipType::Supersedes
+        );
+        assert_eq!(
+            "updates".parse::<RelationshipType>().unwrap(),
+            RelationshipType::Updates
+        );
+        assert_eq!(
+            "corrects".parse::<RelationshipType>().unwrap(),
+            RelationshipType::Corrects
+        );
+        assert_eq!(
+            "retracts".parse::<RelationshipType>().unwrap(),
+            RelationshipType::Retracts
+        );
+        assert_eq!(
+            "extends".parse::<RelationshipType>().unwrap(),
+            RelationshipType::Extends
+        );
         assert!("invalid".parse::<RelationshipType>().is_err());
     }
 
     #[test]
     fn test_document_status_parsing() {
-        assert_eq!("current".parse::<DocumentStatus>().unwrap(), DocumentStatus::Current);
-        assert_eq!("superseded".parse::<DocumentStatus>().unwrap(), DocumentStatus::Superseded);
-        assert_eq!("retracted".parse::<DocumentStatus>().unwrap(), DocumentStatus::Retracted);
+        assert_eq!(
+            "current".parse::<DocumentStatus>().unwrap(),
+            DocumentStatus::Current
+        );
+        assert_eq!(
+            "superseded".parse::<DocumentStatus>().unwrap(),
+            DocumentStatus::Superseded
+        );
+        assert_eq!(
+            "retracted".parse::<DocumentStatus>().unwrap(),
+            DocumentStatus::Retracted
+        );
         assert!("invalid".parse::<DocumentStatus>().is_err());
     }
 }

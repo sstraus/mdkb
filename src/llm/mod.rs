@@ -20,9 +20,9 @@ static CACHED_SERVICE: Mutex<Option<Arc<EmbeddingService>>> = Mutex::new(None);
 ///
 /// Returns a shared reference via `Arc`. Thread-safe.
 pub fn get_cached_service() -> crate::error::Result<Arc<EmbeddingService>> {
-    let guard = CACHED_SERVICE.lock().map_err(|_| {
-        crate::error::Error::other("Embedding service cache lock poisoned")
-    })?;
+    let guard = CACHED_SERVICE
+        .lock()
+        .map_err(|_| crate::error::Error::other("Embedding service cache lock poisoned"))?;
     if let Some(service) = guard.as_ref() {
         return Ok(Arc::clone(service));
     }
@@ -31,9 +31,9 @@ pub fn get_cached_service() -> crate::error::Result<Arc<EmbeddingService>> {
     // Initialize outside the lock to avoid holding it during model download
     let service = Arc::new(EmbeddingService::new()?);
 
-    let mut guard = CACHED_SERVICE.lock().map_err(|_| {
-        crate::error::Error::other("Embedding service cache lock poisoned")
-    })?;
+    let mut guard = CACHED_SERVICE
+        .lock()
+        .map_err(|_| crate::error::Error::other("Embedding service cache lock poisoned"))?;
     // Double-check after re-acquiring lock
     if let Some(existing) = guard.as_ref() {
         return Ok(Arc::clone(existing));

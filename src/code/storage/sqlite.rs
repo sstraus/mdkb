@@ -265,11 +265,9 @@ impl CodeDb {
                 .replace('%', "\\%")
                 .replace('_', "\\_");
             let pattern = format!("%{escaped}%");
-            let mut stmt = self.conn.prepare_cached(
-                &format!(
-                    "{SYMBOL_COLUMNS} FROM code_symbols WHERE name LIKE ?1 ESCAPE '\\' LIMIT ?2"
-                ),
-            )?;
+            let mut stmt = self.conn.prepare_cached(&format!(
+                "{SYMBOL_COLUMNS} FROM code_symbols WHERE name LIKE ?1 ESCAPE '\\' LIMIT ?2"
+            ))?;
             let rows = stmt.query_map(params![pattern, limit as i64], |row| row_to_symbol(row))?;
             return rows.collect();
         }
@@ -316,8 +314,10 @@ impl CodeDb {
             placeholders.join(",")
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let sql_params: Vec<&dyn rusqlite::types::ToSql> =
-            ids.iter().map(|id| id as &dyn rusqlite::types::ToSql).collect();
+        let sql_params: Vec<&dyn rusqlite::types::ToSql> = ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::types::ToSql)
+            .collect();
         let rows = stmt.query_map(sql_params.as_slice(), |row| {
             let sym = row_to_symbol(row)?;
             let id: i64 = row.get(0)?;
@@ -335,28 +335,24 @@ impl CodeDb {
 
     /// Get symbols called by the given symbol.
     pub fn get_called_functions(&self, symbol_id: i64) -> rusqlite::Result<Vec<Symbol>> {
-        let mut stmt = self.conn.prepare_cached(
-            &format!(
-                "{SYMBOL_COLUMNS_PREFIXED} \
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "{SYMBOL_COLUMNS_PREFIXED} \
                  FROM code_relationships r \
                  JOIN code_symbols s ON s.name = r.to_name \
                  WHERE r.from_symbol_id = ?1 AND r.kind = 'Calls'"
-            ),
-        )?;
+        ))?;
         let rows = stmt.query_map([symbol_id], |row| row_to_symbol(row))?;
         rows.collect()
     }
 
     /// Get symbols that call the given symbol name.
     pub fn get_calling_functions(&self, symbol_name: &str) -> rusqlite::Result<Vec<Symbol>> {
-        let mut stmt = self.conn.prepare_cached(
-            &format!(
-                "{SYMBOL_COLUMNS_PREFIXED} \
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "{SYMBOL_COLUMNS_PREFIXED} \
                  FROM code_relationships r \
                  JOIN code_symbols s ON s.id = r.from_symbol_id \
                  WHERE r.to_name = ?1 AND r.kind = 'Calls'"
-            ),
-        )?;
+        ))?;
         let rows = stmt.query_map([symbol_name], |row| row_to_symbol(row))?;
         rows.collect()
     }
@@ -368,9 +364,8 @@ impl CodeDb {
         symbol_name: &str,
         max_depth: u32,
     ) -> rusqlite::Result<Vec<Symbol>> {
-        let mut stmt = self.conn.prepare_cached(
-            &format!(
-                "WITH RECURSIVE impact(sym_id, depth) AS ( \
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "WITH RECURSIVE impact(sym_id, depth) AS ( \
                      SELECT r.from_symbol_id, 0 FROM code_relationships r WHERE r.to_name = ?1 \
                      UNION \
                      SELECT r.from_symbol_id, i.depth + 1 \
@@ -382,8 +377,7 @@ impl CodeDb {
                  SELECT DISTINCT {SYMBOL_COLUMNS_BARE} \
                  FROM impact i \
                  JOIN code_symbols s ON s.id = i.sym_id"
-            ),
-        )?;
+        ))?;
         let rows = stmt.query_map(params![symbol_name, max_depth], |row| row_to_symbol(row))?;
         rows.collect()
     }
@@ -404,32 +398,26 @@ impl CodeDb {
 // --- SQL fragments ---
 
 /// Standard 14-column SELECT list for symbol queries (no table prefix).
-const SYMBOL_COLUMNS: &str =
-    "SELECT id, name, kind, file_id, file_path, line_start, col_start, \
+const SYMBOL_COLUMNS: &str = "SELECT id, name, kind, file_id, file_path, line_start, col_start, \
      line_end, col_end, visibility, signature, doc_comment, module_path, scope_context";
 
 /// Standard 14-column SELECT list with `s.` table prefix for JOINs.
-const SYMBOL_COLUMNS_PREFIXED: &str =
-    "SELECT s.id, s.name, s.kind, s.file_id, s.file_path, s.line_start, s.col_start, \
+const SYMBOL_COLUMNS_PREFIXED: &str = "SELECT s.id, s.name, s.kind, s.file_id, s.file_path, s.line_start, s.col_start, \
      s.line_end, s.col_end, s.visibility, s.signature, s.doc_comment, s.module_path, s.scope_context";
 
 /// Bare column list with `s.` prefix (no SELECT keyword) for use in format strings with DISTINCT.
-const SYMBOL_COLUMNS_BARE: &str =
-    "s.id, s.name, s.kind, s.file_id, s.file_path, s.line_start, s.col_start, \
+const SYMBOL_COLUMNS_BARE: &str = "s.id, s.name, s.kind, s.file_id, s.file_path, s.line_start, s.col_start, \
      s.line_end, s.col_end, s.visibility, s.signature, s.doc_comment, s.module_path, s.scope_context";
 
-const SYMBOL_SELECT_BY_ID: &str =
-    "SELECT id, name, kind, file_id, file_path, line_start, col_start, \
+const SYMBOL_SELECT_BY_ID: &str = "SELECT id, name, kind, file_id, file_path, line_start, col_start, \
      line_end, col_end, visibility, signature, doc_comment, module_path, scope_context \
      FROM code_symbols WHERE id = ?1";
 
-const SYMBOL_SELECT_BY_NAME: &str =
-    "SELECT id, name, kind, file_id, file_path, line_start, col_start, \
+const SYMBOL_SELECT_BY_NAME: &str = "SELECT id, name, kind, file_id, file_path, line_start, col_start, \
      line_end, col_end, visibility, signature, doc_comment, module_path, scope_context \
      FROM code_symbols WHERE name = ?1";
 
-const SYMBOL_SELECT_FTS: &str =
-    "SELECT s.id, s.name, s.kind, s.file_id, s.file_path, s.line_start, s.col_start, \
+const SYMBOL_SELECT_FTS: &str = "SELECT s.id, s.name, s.kind, s.file_id, s.file_path, s.line_start, s.col_start, \
      s.line_end, s.col_end, s.visibility, s.signature, s.doc_comment, s.module_path, s.scope_context \
      FROM code_symbols_fts f \
      JOIN code_symbols s ON s.id = f.rowid \
@@ -456,9 +444,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let symbol_id = u32::try_from(id)
         .ok()
         .and_then(SymbolId::new)
-        .ok_or_else(|| {
-            rusqlite::Error::IntegralValueOutOfRange(0, id)
-        })?;
+        .ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(0, id))?;
     let kind = kind_str.parse::<SymbolKind>().map_err(|_| {
         rusqlite::Error::FromSqlConversionFailure(
             2,
@@ -469,9 +455,7 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
     let fid = u32::try_from(file_id)
         .ok()
         .and_then(FileId::new)
-        .ok_or_else(|| {
-            rusqlite::Error::IntegralValueOutOfRange(3, file_id)
-        })?;
+        .ok_or_else(|| rusqlite::Error::IntegralValueOutOfRange(3, file_id))?;
     let range = Range::new(
         line_start,
         col_start.map_or(0, |v| v as u16),
@@ -485,10 +469,12 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         _ => Visibility::Private,
     };
     let scope_context = scope_context_str.and_then(|s| {
-        serde_json::from_str(&s).map_err(|e| {
-            tracing::warn!("Malformed scope_context JSON for symbol {id}: {e}");
-            e
-        }).ok()
+        serde_json::from_str(&s)
+            .map_err(|e| {
+                tracing::warn!("Malformed scope_context JSON for symbol {id}: {e}");
+                e
+            })
+            .ok()
     });
 
     let mut sym = Symbol::new(symbol_id, &*name, kind, fid, range)
@@ -618,8 +604,11 @@ mod tests {
     fn test_delete_by_file() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("my_fn", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None)
-            .unwrap();
+        db.insert_symbol(
+            "my_fn", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
         assert_eq!(db.symbol_count().unwrap(), 1);
 
         let deleted = db.delete_by_file("test.rs").unwrap();
@@ -658,10 +647,21 @@ mod tests {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
         let sym_id = db
-            .insert_symbol("caller", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None)
+            .insert_symbol(
+                "caller", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None,
+                None,
+            )
             .unwrap();
         let rel_id = db
-            .insert_relationship(Some(sym_id), "caller", "callee", "Calls", file_id, Some(5), Some(10))
+            .insert_relationship(
+                Some(sym_id),
+                "caller",
+                "callee",
+                "Calls",
+                file_id,
+                Some(5),
+                Some(10),
+            )
             .unwrap();
         assert!(rel_id > 0);
         assert_eq!(db.relationship_count().unwrap(), 1);
@@ -709,9 +709,21 @@ mod tests {
     fn test_find_symbols_by_name() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("process", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("process", "Method", file_id, "test.rs", 20, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("other", "Function", file_id, "test.rs", 40, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "process", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "process", "Method", file_id, "test.rs", 20, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "other", "Function", file_id, "test.rs", 40, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
 
         let results = db.find_symbols_by_name("process").unwrap();
         assert_eq!(results.len(), 2);
@@ -721,9 +733,54 @@ mod tests {
     fn test_search_symbols_trigram() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("ArchiveAppService", "Struct", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("UserService", "Struct", file_id, "test.rs", 20, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("LogHandler", "Function", file_id, "test.rs", 40, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "ArchiveAppService",
+            "Struct",
+            file_id,
+            "test.rs",
+            1,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "UserService",
+            "Struct",
+            file_id,
+            "test.rs",
+            20,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "LogHandler",
+            "Function",
+            file_id,
+            "test.rs",
+            40,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Substring "Archive" should match only ArchiveAppService
         let results = db.search_symbols("Archive", 10).unwrap();
@@ -739,8 +796,15 @@ mod tests {
     fn test_search_symbols_short_query_fallback() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("go", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("gopher", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "go", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "gopher", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
 
         // "go" is < 3 chars, should fall back to LIKE
         let results = db.search_symbols("go", 10).unwrap();
@@ -751,8 +815,14 @@ mod tests {
     fn test_all_symbols() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("b", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "b", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None,
+        )
+        .unwrap();
 
         let all = db.all_symbols().unwrap();
         assert_eq!(all.len(), 2);
@@ -762,9 +832,21 @@ mod tests {
     fn test_get_symbols_batch() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        let id1 = db.insert_symbol("a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        let id2 = db.insert_symbol("b", "Struct", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
-        let _id3 = db.insert_symbol("c", "Enum", file_id, "test.rs", 20, None, None, None, 0, None, None, None, None).unwrap();
+        let id1 = db
+            .insert_symbol(
+                "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
+            )
+            .unwrap();
+        let id2 = db
+            .insert_symbol(
+                "b", "Struct", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None,
+            )
+            .unwrap();
+        let _id3 = db
+            .insert_symbol(
+                "c", "Enum", file_id, "test.rs", 20, None, None, None, 0, None, None, None, None,
+            )
+            .unwrap();
 
         let batch = db.get_symbols_batch(&[id1, id2]).unwrap();
         assert_eq!(batch.len(), 2);
@@ -783,11 +865,42 @@ mod tests {
     fn test_get_called_functions() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        let caller_id = db.insert_symbol("caller", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("callee_a", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("callee_b", "Function", file_id, "test.rs", 20, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_relationship(Some(caller_id), "caller", "callee_a", "Calls", file_id, None, None).unwrap();
-        db.insert_relationship(Some(caller_id), "caller", "callee_b", "Calls", file_id, None, None).unwrap();
+        let caller_id = db
+            .insert_symbol(
+                "caller", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
+        db.insert_symbol(
+            "callee_a", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "callee_b", "Function", file_id, "test.rs", 20, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
+        db.insert_relationship(
+            Some(caller_id),
+            "caller",
+            "callee_a",
+            "Calls",
+            file_id,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_relationship(
+            Some(caller_id),
+            "caller",
+            "callee_b",
+            "Calls",
+            file_id,
+            None,
+            None,
+        )
+        .unwrap();
 
         let called = db.get_called_functions(caller_id).unwrap();
         assert_eq!(called.len(), 2);
@@ -800,9 +913,27 @@ mod tests {
     fn test_get_calling_functions() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        let caller_id = db.insert_symbol("caller", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("callee", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_relationship(Some(caller_id), "caller", "callee", "Calls", file_id, None, None).unwrap();
+        let caller_id = db
+            .insert_symbol(
+                "caller", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
+        db.insert_symbol(
+            "callee", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
+        db.insert_relationship(
+            Some(caller_id),
+            "caller",
+            "callee",
+            "Calls",
+            file_id,
+            None,
+            None,
+        )
+        .unwrap();
 
         let callers = db.get_calling_functions("callee").unwrap();
         assert_eq!(callers.len(), 1);
@@ -815,12 +946,28 @@ mod tests {
         let file_id = insert_test_file(&db);
 
         // Chain: c -> b -> a (c calls b, b calls a)
-        let _a_id = db.insert_symbol("a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        let b_id = db.insert_symbol("b", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
-        let c_id = db.insert_symbol("c", "Function", file_id, "test.rs", 20, None, None, None, 0, None, None, None, None).unwrap();
+        let _a_id = db
+            .insert_symbol(
+                "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
+            )
+            .unwrap();
+        let b_id = db
+            .insert_symbol(
+                "b", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
+        let c_id = db
+            .insert_symbol(
+                "c", "Function", file_id, "test.rs", 20, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
 
-        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, None, None).unwrap();
-        db.insert_relationship(Some(c_id), "c", "b", "Calls", file_id, None, None).unwrap();
+        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, None, None)
+            .unwrap();
+        db.insert_relationship(Some(c_id), "c", "b", "Calls", file_id, None, None)
+            .unwrap();
 
         // Impact of "a" with depth 0: just "b" (direct caller)
         let impact = db.get_impact_radius("a", 0).unwrap();
@@ -839,8 +986,12 @@ mod tests {
     fn test_clear() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_relationship(None, "a", "b", "Calls", file_id, None, None).unwrap();
+        db.insert_symbol(
+            "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
+        )
+        .unwrap();
+        db.insert_relationship(None, "a", "b", "Calls", file_id, None, None)
+            .unwrap();
 
         db.clear().unwrap();
         assert_eq!(db.file_count().unwrap(), 0);
@@ -852,8 +1003,14 @@ mod tests {
     fn test_cascade_delete_with_relationships() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        let sym_id = db.insert_symbol("fn1", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_relationship(Some(sym_id), "fn1", "fn2", "Calls", file_id, None, None).unwrap();
+        let sym_id = db
+            .insert_symbol(
+                "fn1", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
+        db.insert_relationship(Some(sym_id), "fn1", "fn2", "Calls", file_id, None, None)
+            .unwrap();
 
         assert_eq!(db.symbol_count().unwrap(), 1);
         assert_eq!(db.relationship_count().unwrap(), 1);
@@ -873,10 +1030,14 @@ mod tests {
         let file_id = insert_test_file(&db);
         assert_eq!(db.file_count().unwrap(), 1);
 
-        db.insert_symbol("a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
+        )
+        .unwrap();
         assert_eq!(db.symbol_count().unwrap(), 1);
 
-        db.insert_relationship(None, "a", "b", "Calls", file_id, None, None).unwrap();
+        db.insert_relationship(None, "a", "b", "Calls", file_id, None, None)
+            .unwrap();
         assert_eq!(db.relationship_count().unwrap(), 1);
     }
 
@@ -898,7 +1059,22 @@ mod tests {
         // Verifies FTS5 index stays in sync when symbols are deleted
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("ArchiveService", "Struct", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "ArchiveService",
+            "Struct",
+            file_id,
+            "test.rs",
+            1,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // FTS5 should find it
         let results = db.search_symbols("Archive", 10).unwrap();
@@ -917,7 +1093,22 @@ mod tests {
         // FTS5 query with double-quotes should not cause SQL errors
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("MyService", "Struct", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "MyService",
+            "Struct",
+            file_id,
+            "test.rs",
+            1,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         // Query containing quotes should not panic or error
         let results = db.search_symbols(r#"My"Service"#, 10).unwrap();
@@ -930,8 +1121,14 @@ mod tests {
         // LIKE metacharacters should be treated as literals
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("go", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("gx", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "go", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "gx", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None,
+        )
+        .unwrap();
 
         // "g%" would match both if unescaped; should match neither as literal "g%"
         let results = db.search_symbols("g%", 10).unwrap();
@@ -944,11 +1141,13 @@ mod tests {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
         // Insert directly with an invalid kind string
-        db.conn.execute(
-            "INSERT INTO code_symbols (name, kind, file_id, file_path, line_start, visibility) \
+        db.conn
+            .execute(
+                "INSERT INTO code_symbols (name, kind, file_id, file_path, line_start, visibility) \
              VALUES ('bad', 'Unicorn', ?1, 'test.rs', 1, 0)",
-            [file_id],
-        ).unwrap();
+                [file_id],
+            )
+            .unwrap();
 
         // get_symbol should return an error, not silently default
         let result = db.get_symbol(1);
@@ -959,12 +1158,19 @@ mod tests {
     fn test_insert_file_upsert_preserves_symbols() {
         // ON CONFLICT DO UPDATE should not cascade-delete symbols
         let (_dir, db) = temp_db();
-        let file_id = db.insert_file("main.rs", "main.rs", "hash1", Some("Rust"), None).unwrap();
-        db.insert_symbol("my_fn", "Function", file_id, "main.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
+        let file_id = db
+            .insert_file("main.rs", "main.rs", "hash1", Some("Rust"), None)
+            .unwrap();
+        db.insert_symbol(
+            "my_fn", "Function", file_id, "main.rs", 10, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
         assert_eq!(db.symbol_count().unwrap(), 1);
 
         // Upsert the same file with a new hash
-        db.insert_file("main.rs", "main.rs", "hash2", Some("Rust"), None).unwrap();
+        db.insert_file("main.rs", "main.rs", "hash2", Some("Rust"), None)
+            .unwrap();
 
         // Symbol should still exist (not cascade-deleted by INSERT OR REPLACE)
         assert_eq!(db.symbol_count().unwrap(), 1);
@@ -981,7 +1187,11 @@ mod tests {
     fn test_get_impact_radius_no_callers() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol("orphan", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "orphan", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None,
+            None,
+        )
+        .unwrap();
 
         let impact = db.get_impact_radius("orphan", 5).unwrap();
         assert!(impact.is_empty());
@@ -992,10 +1202,21 @@ mod tests {
         // a calls b, b calls a — should not infinite-loop
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        let a_id = db.insert_symbol("a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None).unwrap();
-        let b_id = db.insert_symbol("b", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None, None).unwrap();
-        db.insert_relationship(Some(a_id), "a", "b", "Calls", file_id, None, None).unwrap();
-        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, None, None).unwrap();
+        let a_id = db
+            .insert_symbol(
+                "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
+            )
+            .unwrap();
+        let b_id = db
+            .insert_symbol(
+                "b", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
+        db.insert_relationship(Some(a_id), "a", "b", "Calls", file_id, None, None)
+            .unwrap();
+        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, None, None)
+            .unwrap();
 
         // UNION in the CTE deduplicates, so this should terminate
         let impact = db.get_impact_radius("a", 10).unwrap();

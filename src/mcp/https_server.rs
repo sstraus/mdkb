@@ -31,11 +31,8 @@ pub async fn run_https_server(
 
     let session_manager = Arc::new(LocalSessionManager::default());
 
-    let mcp_service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        session_manager,
-        config,
-    );
+    let mcp_service =
+        StreamableHttpService::new(move || Ok(server.clone()), session_manager, config);
 
     let state = AppState {
         token: token.map(String::from),
@@ -44,7 +41,10 @@ pub async fn run_https_server(
     let router = Router::new()
         .route("/health", axum::routing::get(|| health_handler(true)))
         .nest_service("/mcp", mcp_service)
-        .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state);
 
     // Generate or load self-signed certificate
@@ -124,11 +124,8 @@ fn ensure_self_signed_cert() -> crate::error::Result<(PathBuf, PathBuf)> {
     // Valid for 365 days from now
     let now = chrono::Utc::now();
     let expiry = now + chrono::Duration::days(365);
-    params.not_after = rcgen::date_time_ymd(
-        expiry.year(),
-        expiry.month() as u8,
-        expiry.day() as u8,
-    );
+    params.not_after =
+        rcgen::date_time_ymd(expiry.year(), expiry.month() as u8, expiry.day() as u8);
 
     let key_pair = rcgen::KeyPair::generate()
         .map_err(|e| crate::error::Error::mcp(format!("Failed to generate key pair: {e}")))?;
@@ -155,7 +152,10 @@ fn ensure_self_signed_cert() -> crate::error::Result<(PathBuf, PathBuf)> {
             .map_err(|e| crate::error::Error::mcp(format!("Failed to set key permissions: {e}")))?;
     }
 
-    tracing::info!("Self-signed certificate generated at {}", cert_dir.display());
+    tracing::info!(
+        "Self-signed certificate generated at {}",
+        cert_dir.display()
+    );
 
     Ok((cert_path, key_path))
 }

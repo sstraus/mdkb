@@ -1,5 +1,6 @@
 //! C language parser implementation using tree-sitter-c 0.24.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -7,7 +8,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct CParser {
     parser: CachingParser,
@@ -16,9 +16,7 @@ pub struct CParser {
 
 impl std::fmt::Debug for CParser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CParser")
-            .field("language", &"C")
-            .finish()
+        f.debug_struct("CParser").field("language", &"C").finish()
     }
 }
 
@@ -115,7 +113,13 @@ impl CParser {
                     if let Some(body) = node.child_by_field_name("body") {
                         for child in body.children(&mut body.walk()) {
                             self.extract_symbols_from_node(
-                                child, code, file_id, counter, symbols, module_path, depth + 1,
+                                child,
+                                code,
+                                file_id,
+                                counter,
+                                symbols,
+                                module_path,
+                                depth + 1,
                             );
                         }
                     }
@@ -125,17 +129,14 @@ impl CParser {
             }
 
             "struct_specifier" => {
-                if let Some(symbol) =
-                    self.process_struct(node, code, file_id, counter, module_path)
+                if let Some(symbol) = self.process_struct(node, code, file_id, counter, module_path)
                 {
                     symbols.push(symbol);
                 }
             }
 
             "enum_specifier" => {
-                if let Some(symbol) =
-                    self.process_enum(node, code, file_id, counter, module_path)
-                {
+                if let Some(symbol) = self.process_enum(node, code, file_id, counter, module_path) {
                     symbols.push(symbol);
                 }
             }
@@ -158,7 +159,13 @@ impl CParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -180,7 +187,11 @@ impl CParser {
         // Build signature from return type + declarator
         let type_node = node.child_by_field_name("type");
         let sig = match type_node {
-            Some(t) => format!("{} {}", &code[t.byte_range()], &code[declarator.byte_range()]),
+            Some(t) => format!(
+                "{} {}",
+                &code[t.byte_range()],
+                &code[declarator.byte_range()]
+            ),
             None => code[declarator.byte_range()].to_string(),
         };
 
@@ -266,17 +277,25 @@ impl CParser {
         let name = extract_declarator_name(declarator, code)?;
         let doc = extract_c_doc(&node, code);
 
-        Some(self.create_symbol(
-            counter.next_id(),
-            name.to_string(),
-            SymbolKind::TypeAlias,
-            file_id,
-            node_range(node),
-            Some(code[node.byte_range()].lines().next().unwrap_or("").to_string()),
-            doc,
-            module_path,
-            Visibility::Public,
-        ))
+        Some(
+            self.create_symbol(
+                counter.next_id(),
+                name.to_string(),
+                SymbolKind::TypeAlias,
+                file_id,
+                node_range(node),
+                Some(
+                    code[node.byte_range()]
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_string(),
+                ),
+                doc,
+                module_path,
+                Visibility::Public,
+            ),
+        )
     }
 
     fn process_declaration(
@@ -316,7 +335,12 @@ impl CParser {
                     kind,
                     file_id,
                     node_range(node),
-                    Some(code[node.byte_range()].trim_end_matches(';').trim().to_string()),
+                    Some(
+                        code[node.byte_range()]
+                            .trim_end_matches(';')
+                            .trim()
+                            .to_string(),
+                    ),
                     None,
                     module_path,
                     Visibility::Public,
@@ -408,14 +432,12 @@ fn node_range(node: Node) -> Range {
 fn extract_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
         "identifier" => Some(&code[node.byte_range()]),
-        "pointer_declarator" | "array_declarator" | "parenthesized_declarator" => {
-            node.child_by_field_name("declarator")
-                .and_then(|d| extract_declarator_name(d, code))
-        }
-        "function_declarator" => {
-            node.child_by_field_name("declarator")
-                .and_then(|d| extract_declarator_name(d, code))
-        }
+        "pointer_declarator" | "array_declarator" | "parenthesized_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(|d| extract_declarator_name(d, code)),
+        "function_declarator" => node
+            .child_by_field_name("declarator")
+            .and_then(|d| extract_declarator_name(d, code)),
         _ => None,
     }
 }
@@ -439,7 +461,11 @@ fn extract_c_doc(node: &Node, code: &str) -> Option<String> {
         if inner.is_empty() { None } else { Some(inner) }
     } else if text.starts_with("///") {
         let inner = text.trim_start_matches("///").trim();
-        if inner.is_empty() { None } else { Some(inner.to_string()) }
+        if inner.is_empty() {
+            None
+        } else {
+            Some(inner.to_string())
+        }
     } else {
         None
     }
@@ -510,17 +536,25 @@ void _internal_helper() {}
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Point" && s.kind == SymbolKind::Struct));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Point" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum)
+        );
         assert!(symbols.iter().any(|s| s.name.as_ref() == "add"
             && s.kind == SymbolKind::Function
             && s.visibility == Visibility::Public));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "_internal_helper"
-            && s.visibility == Visibility::Private));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "_internal_helper"
+                    && s.visibility == Visibility::Private)
+        );
     }
 
     #[test]
@@ -553,12 +587,16 @@ int main() {
 "#;
 
         let calls = parser.find_calls_impl(code);
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "process"));
-        assert!(calls
-            .iter()
-            .any(|(caller, target, _)| *caller == "main" && *target == "printf"));
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "process")
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "main" && *target == "printf")
+        );
     }
 
     #[test]
@@ -579,10 +617,11 @@ int sum(int a, int b) {
             .iter()
             .find(|s| s.name.as_ref() == "sum")
             .expect("should find sum");
-        assert!(func
-            .doc_comment
-            .as_deref()
-            .unwrap()
-            .contains("Compute the sum"));
+        assert!(
+            func.doc_comment
+                .as_deref()
+                .unwrap()
+                .contains("Compute the sum")
+        );
     }
 }

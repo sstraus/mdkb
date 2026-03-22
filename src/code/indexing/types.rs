@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use crate::code::parsing::language::Language;
 use crate::code::relationship::RelationKind;
-use crate::code::symbol::{Symbol, Visibility, ScopeContext};
+use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{CompactString, FileId, Range, SymbolId, SymbolKind};
 
 // ---------------------------------------------------------------------------

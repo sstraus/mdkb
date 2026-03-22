@@ -216,7 +216,10 @@ pub fn store_embedding(
         )?;
 
         // sqlite-vec virtual tables don't support INSERT OR REPLACE
-        conn.execute("DELETE FROM vec_documents WHERE document_id = ?1", params![document_id])?;
+        conn.execute(
+            "DELETE FROM vec_documents WHERE document_id = ?1",
+            params![document_id],
+        )?;
         conn.execute(
             "INSERT INTO vec_documents (document_id, embedding) VALUES (?1, ?2)",
             params![document_id, embedding_bytes],
@@ -225,7 +228,10 @@ pub fn store_embedding(
     })();
 
     match result {
-        Ok(()) => { conn.execute("RELEASE store_embedding", [])?; Ok(()) }
+        Ok(()) => {
+            conn.execute("RELEASE store_embedding", [])?;
+            Ok(())
+        }
         Err(e) => {
             if let Err(rb) = conn.execute("ROLLBACK TO store_embedding", []) {
                 tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
@@ -328,9 +334,12 @@ pub fn store_chunk_embeddings(
     model: &str,
 ) -> Result<()> {
     if chunks.len() != embeddings.len() {
-        return Err(crate::error::ErrorKind::InvalidQuery(
-            format!("chunks/embeddings length mismatch: {} vs {}", chunks.len(), embeddings.len())
-        ).into());
+        return Err(crate::error::ErrorKind::InvalidQuery(format!(
+            "chunks/embeddings length mismatch: {} vs {}",
+            chunks.len(),
+            embeddings.len()
+        ))
+        .into());
     }
     let now = chrono::Utc::now().timestamp();
 
@@ -360,7 +369,10 @@ pub fn store_chunk_embeddings(
                 "INSERT OR REPLACE INTO embeddings (document_id, embedding, model, created_at) VALUES (?1, ?2, ?3, ?4)",
                 params![document_id, embedding_bytes, model, now],
             )?;
-            conn.execute("DELETE FROM vec_documents WHERE document_id = ?1", params![document_id])?;
+            conn.execute(
+                "DELETE FROM vec_documents WHERE document_id = ?1",
+                params![document_id],
+            )?;
             conn.execute(
                 "INSERT INTO vec_documents (document_id, embedding) VALUES (?1, ?2)",
                 params![document_id, embedding_bytes],
@@ -370,8 +382,14 @@ pub fn store_chunk_embeddings(
     })();
 
     match result {
-        Ok(()) => { conn.execute("COMMIT", [])?; Ok(()) }
-        Err(e) => { let _ = conn.execute("ROLLBACK", []); Err(e) }
+        Ok(()) => {
+            conn.execute("COMMIT", [])?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
     }
 }
 
@@ -423,12 +441,19 @@ pub fn chunk_vector_search(
 /// The `chunks_delete_vec` trigger automatically cleans up `vec_chunks`
 /// when `document_chunks` rows are deleted.
 pub fn delete_chunk_embeddings(conn: &Connection, document_id: i64) -> Result<()> {
-    conn.execute("DELETE FROM document_chunks WHERE document_id = ?1", params![document_id])?;
+    conn.execute(
+        "DELETE FROM document_chunks WHERE document_id = ?1",
+        params![document_id],
+    )?;
     Ok(())
 }
 
 /// Search vec_chunks, returning (document_id, distance) aggregated by best chunk per doc.
-fn search_vec_chunks_by_doc(conn: &Connection, embedding_bytes: &[u8], limit: usize) -> Vec<(i64, f32)> {
+fn search_vec_chunks_by_doc(
+    conn: &Connection,
+    embedding_bytes: &[u8],
+    limit: usize,
+) -> Vec<(i64, f32)> {
     // Phase 1: vector search for chunk IDs + distances
     let chunk_hits: Vec<(i64, f32)> = match conn.prepare(
         "SELECT chunk_id, distance FROM vec_chunks WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
@@ -462,7 +487,11 @@ fn search_vec_chunks_by_doc(conn: &Connection, embedding_bytes: &[u8], limit: us
     }
 
     // Phase 2: batch resolve chunk_id → document_id in single query
-    let placeholders: String = chunk_hits.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(",");
+    let placeholders: String = chunk_hits
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!("SELECT id, document_id FROM document_chunks WHERE id IN ({placeholders})");
     let chunk_to_doc: std::collections::HashMap<i64, i64> = conn
         .prepare(&sql)
@@ -523,7 +552,10 @@ pub fn store_memory_embedding(
         )?;
 
         // sqlite-vec doesn't support INSERT OR REPLACE
-        conn.execute("DELETE FROM vec_memory WHERE memory_rowid = ?1", params![memory_rowid])?;
+        conn.execute(
+            "DELETE FROM vec_memory WHERE memory_rowid = ?1",
+            params![memory_rowid],
+        )?;
         conn.execute(
             "INSERT INTO vec_memory (memory_rowid, embedding) VALUES (?1, ?2)",
             params![memory_rowid, embedding_bytes],
@@ -532,7 +564,10 @@ pub fn store_memory_embedding(
     })();
 
     match result {
-        Ok(()) => { conn.execute("RELEASE store_memory_embedding", [])?; Ok(()) }
+        Ok(()) => {
+            conn.execute("RELEASE store_memory_embedding", [])?;
+            Ok(())
+        }
         Err(e) => {
             if let Err(rb) = conn.execute("ROLLBACK TO store_memory_embedding", []) {
                 tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
@@ -686,7 +721,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES ('abc', 'test', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', 'test.md', 'abc', 0, 0)",
             [],
@@ -717,11 +753,13 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES ('abc', 'test1', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES ('def', 'test2', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', 'test1.md', 'abc', 0, 0)",
             [],
@@ -754,7 +792,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO content (hash, body, created_at) VALUES (?1, ?2, 0)",
                 params![format!("hash{}", i), format!("content{}", i)],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', ?1, ?2, 0, 0)",
                 params![format!("doc{}.md", i), format!("hash{}", i)],
@@ -789,7 +828,8 @@ mod tests {
             conn.execute(
                 "INSERT INTO content (hash, body, created_at) VALUES (?1, ?2, 0)",
                 params![format!("hash{}", i), format!("content{}", i)],
-            ).unwrap();
+            )
+            .unwrap();
             conn.execute(
                 "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', ?1, ?2, 0, 0)",
                 params![format!("doc{}.md", i), format!("hash{}", i)],
@@ -826,7 +866,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES ('abc', 'test', 0)",
             [],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at) VALUES ('test', 'test.md', 'abc', 0, 0)",
             [],
@@ -864,9 +905,24 @@ mod tests {
     fn test_store_and_search_memory_embedding() {
         let conn = setup_db();
 
-        let rowid1 = insert_memory_entry(&conn, "auth-flow", "OAuth PKCE Flow", "How we handle authentication with PKCE");
-        let rowid2 = insert_memory_entry(&conn, "db-perf", "Database Performance", "SQLite tuning and WAL mode configuration");
-        let rowid3 = insert_memory_entry(&conn, "jwt-refresh", "JWT Refresh Strategy", "Token expiration and refresh flow design");
+        let rowid1 = insert_memory_entry(
+            &conn,
+            "auth-flow",
+            "OAuth PKCE Flow",
+            "How we handle authentication with PKCE",
+        );
+        let rowid2 = insert_memory_entry(
+            &conn,
+            "db-perf",
+            "Database Performance",
+            "SQLite tuning and WAL mode configuration",
+        );
+        let rowid3 = insert_memory_entry(
+            &conn,
+            "jwt-refresh",
+            "JWT Refresh Strategy",
+            "Token expiration and refresh flow design",
+        );
 
         // Embeddings: auth entries (1,3) get similar vectors, db entry (2) gets different
         let auth_embedding = test_embedding(0.1);
@@ -884,8 +940,14 @@ mod tests {
         assert_eq!(results.len(), 3);
         // Auth entries should be closest
         let top_2_rowids: Vec<i64> = results.iter().take(2).map(|(id, _)| *id).collect();
-        assert!(top_2_rowids.contains(&rowid1), "auth-flow should be in top 2");
-        assert!(top_2_rowids.contains(&rowid3), "jwt-refresh should be in top 2");
+        assert!(
+            top_2_rowids.contains(&rowid1),
+            "auth-flow should be in top 2"
+        );
+        assert!(
+            top_2_rowids.contains(&rowid3),
+            "jwt-refresh should be in top 2"
+        );
     }
 
     #[test]
@@ -931,7 +993,8 @@ mod tests {
         conn.execute(
             "INSERT OR IGNORE INTO content (hash, body, created_at) VALUES (?1, ?2, 0)",
             params![format!("hash{id}"), format!("content for {path}")],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (id, collection, relative_path, hash, file_modified_at, indexed_at) VALUES (?1, 'test', ?2, ?3, 0, 0)",
             params![id, path, format!("hash{id}")],
@@ -946,14 +1009,26 @@ mod tests {
 
         // Doc 1 has 3 chunks with different embeddings
         let chunks = vec![
-            crate::store::chunks::Chunk { index: 0, content: "Introduction section".into(), heading_path: Some("Introduction".into()) },
-            crate::store::chunks::Chunk { index: 1, content: "Auth section about tokens".into(), heading_path: Some("Authentication".into()) },
-            crate::store::chunks::Chunk { index: 2, content: "Database section".into(), heading_path: Some("Database".into()) },
+            crate::store::chunks::Chunk {
+                index: 0,
+                content: "Introduction section".into(),
+                heading_path: Some("Introduction".into()),
+            },
+            crate::store::chunks::Chunk {
+                index: 1,
+                content: "Auth section about tokens".into(),
+                heading_path: Some("Authentication".into()),
+            },
+            crate::store::chunks::Chunk {
+                index: 2,
+                content: "Database section".into(),
+                heading_path: Some("Database".into()),
+            },
         ];
         let embeddings = vec![
-            test_embedding(0.1),  // intro
-            test_embedding(0.5),  // auth (distinct)
-            test_embedding(0.9),  // database (distinct)
+            test_embedding(0.1), // intro
+            test_embedding(0.5), // auth (distinct)
+            test_embedding(0.9), // database (distinct)
         ];
         store_chunk_embeddings(&conn, 1, &chunks, &embeddings, "test").unwrap();
 
@@ -964,12 +1039,22 @@ mod tests {
         let query = test_embedding(0.49);
         let results = chunk_vector_search(&conn, &query, 10).unwrap();
 
-        assert!(results.len() >= 2, "Should find both docs, got {}", results.len());
+        assert!(
+            results.len() >= 2,
+            "Should find both docs, got {}",
+            results.len()
+        );
 
         // Doc 1 should be found because chunk 1 (auth, 0.5) is close to query (0.49)
-        assert!(results.iter().any(|(id, _)| *id == 1), "Doc 1 should be found via chunk match");
+        assert!(
+            results.iter().any(|(id, _)| *id == 1),
+            "Doc 1 should be found via chunk match"
+        );
         // Doc 2 also close (0.51)
-        assert!(results.iter().any(|(id, _)| *id == 2), "Doc 2 should be found via whole-doc");
+        assert!(
+            results.iter().any(|(id, _)| *id == 2),
+            "Doc 2 should be found via whole-doc"
+        );
     }
 
     #[test]
@@ -979,11 +1064,27 @@ mod tests {
 
         // 3 chunks, all for doc 1
         let chunks = vec![
-            crate::store::chunks::Chunk { index: 0, content: "A".into(), heading_path: None },
-            crate::store::chunks::Chunk { index: 1, content: "B".into(), heading_path: None },
-            crate::store::chunks::Chunk { index: 2, content: "C".into(), heading_path: None },
+            crate::store::chunks::Chunk {
+                index: 0,
+                content: "A".into(),
+                heading_path: None,
+            },
+            crate::store::chunks::Chunk {
+                index: 1,
+                content: "B".into(),
+                heading_path: None,
+            },
+            crate::store::chunks::Chunk {
+                index: 2,
+                content: "C".into(),
+                heading_path: None,
+            },
         ];
-        let embeddings = vec![test_embedding(0.1), test_embedding(0.2), test_embedding(0.3)];
+        let embeddings = vec![
+            test_embedding(0.1),
+            test_embedding(0.2),
+            test_embedding(0.3),
+        ];
         store_chunk_embeddings(&conn, 1, &chunks, &embeddings, "test").unwrap();
 
         let query = test_embedding(0.15);
@@ -1000,8 +1101,16 @@ mod tests {
         setup_doc(&conn, 1, "doc.md");
 
         let chunks = vec![
-            crate::store::chunks::Chunk { index: 0, content: "A".into(), heading_path: None },
-            crate::store::chunks::Chunk { index: 1, content: "B".into(), heading_path: None },
+            crate::store::chunks::Chunk {
+                index: 0,
+                content: "A".into(),
+                heading_path: None,
+            },
+            crate::store::chunks::Chunk {
+                index: 1,
+                content: "B".into(),
+                heading_path: None,
+            },
         ];
         let embeddings = vec![test_embedding(0.1), test_embedding(0.2)];
         store_chunk_embeddings(&conn, 1, &chunks, &embeddings, "test").unwrap();
@@ -1045,12 +1154,16 @@ mod tests {
         assert_eq!(count, 1, "vec_documents should have 1 entry");
 
         // Delete the document — should cascade to vec_documents
-        conn.execute("DELETE FROM documents WHERE id = 1", []).unwrap();
+        conn.execute("DELETE FROM documents WHERE id = 1", [])
+            .unwrap();
 
         let count: i64 = conn
             .query_row("SELECT count(*) FROM vec_documents", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 0, "vec_documents should be empty after document delete");
+        assert_eq!(
+            count, 0,
+            "vec_documents should be empty after document delete"
+        );
     }
 
     #[test]
@@ -1059,8 +1172,16 @@ mod tests {
         setup_doc(&conn, 1, "doc.md");
 
         let chunks = vec![
-            crate::store::chunks::Chunk { index: 0, content: "A".into(), heading_path: None },
-            crate::store::chunks::Chunk { index: 1, content: "B".into(), heading_path: None },
+            crate::store::chunks::Chunk {
+                index: 0,
+                content: "A".into(),
+                heading_path: None,
+            },
+            crate::store::chunks::Chunk {
+                index: 1,
+                content: "B".into(),
+                heading_path: None,
+            },
         ];
         let embeddings = vec![test_embedding(0.1), test_embedding(0.2)];
         store_chunk_embeddings(&conn, 1, &chunks, &embeddings, "test").unwrap();
@@ -1072,7 +1193,8 @@ mod tests {
         assert_eq!(count, 2, "vec_chunks should have 2 entries");
 
         // Delete the document — should cascade to vec_chunks via document_chunks
-        conn.execute("DELETE FROM documents WHERE id = 1", []).unwrap();
+        conn.execute("DELETE FROM documents WHERE id = 1", [])
+            .unwrap();
 
         let count: i64 = conn
             .query_row("SELECT count(*) FROM vec_chunks", [], |r| r.get(0))

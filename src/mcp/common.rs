@@ -83,16 +83,15 @@ mod tests {
         Router::new()
             .route("/health", axum::routing::get(|| health_handler(false)))
             .route("/mcp", axum::routing::get(|| async { StatusCode::OK }))
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
             .with_state(state)
     }
 
     /// Send a request to the router and return the response status.
-    async fn send_request(
-        router: Router,
-        uri: &str,
-        auth_header: Option<&str>,
-    ) -> StatusCode {
+    async fn send_request(router: Router, uri: &str, auth_header: Option<&str>) -> StatusCode {
         let mut req_builder = Request::builder().uri(uri).method("GET");
         if let Some(auth) = auth_header {
             req_builder = req_builder.header(header::AUTHORIZATION, auth);

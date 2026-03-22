@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use crate::domain::{Collection, COLLECTION_SOURCE_CONVENTION};
+use crate::domain::{COLLECTION_SOURCE_CONVENTION, Collection};
 
 /// A proposed collection detected by convention rules.
 #[derive(Debug, Clone)]
@@ -30,8 +30,10 @@ pub fn detect_conventions(
     root: &Path,
     existing_collections: &[Collection],
 ) -> Vec<ProposedCollection> {
-    let existing_names: std::collections::HashSet<&str> =
-        existing_collections.iter().map(|c| c.name.as_str()).collect();
+    let existing_names: std::collections::HashSet<&str> = existing_collections
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect();
 
     let mut proposals = Vec::new();
 
@@ -79,12 +81,10 @@ fn has_root_markdown_files(root: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(root) else {
         return false;
     };
-    entries
-        .filter_map(|e| e.ok())
-        .any(|e| {
-            e.path().extension().is_some_and(|ext| ext == "md")
-                && e.file_type().is_ok_and(|ft| ft.is_file())
-        })
+    entries.filter_map(|e| e.ok()).any(|e| {
+        e.path().extension().is_some_and(|ext| ext == "md")
+            && e.file_type().is_ok_and(|ft| ft.is_file())
+    })
 }
 
 #[cfg(test)]

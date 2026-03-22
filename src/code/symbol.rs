@@ -6,9 +6,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-use super::types::{CompactString, FileId, Range, SymbolId, SymbolKind};
 #[cfg(test)]
 use super::types::compact_string;
+use super::types::{CompactString, FileId, Range, SymbolId, SymbolKind};
 
 /// Visibility of a symbol.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,9 +31,7 @@ pub enum ScopeContext {
     /// Parameter of function/method.
     Parameter,
     /// Class/struct/trait member.
-    ClassMember {
-        class_name: Option<CompactString>,
-    },
+    ClassMember { class_name: Option<CompactString> },
     /// Module/file level definition.
     #[default]
     Module,
@@ -127,7 +125,6 @@ impl Symbol {
     pub fn as_module_path(&self) -> Option<&str> {
         self.module_path.as_deref()
     }
-
 }
 
 impl fmt::Display for Symbol {
@@ -229,7 +226,12 @@ mod tests {
             parent_name: Some(compact_string("main")),
             parent_kind: Some(SymbolKind::Function),
         };
-        if let ScopeContext::Local { hoisted, parent_name, parent_kind } = &scope {
+        if let ScopeContext::Local {
+            hoisted,
+            parent_name,
+            parent_kind,
+        } = &scope
+        {
             assert!(hoisted);
             assert_eq!(parent_name.as_deref(), Some("main"));
             assert_eq!(*parent_kind, Some(SymbolKind::Function));

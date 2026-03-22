@@ -214,8 +214,12 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
     conn.execute("BEGIN IMMEDIATE", [])?;
     let result = migrate_schema_inner(conn, from_version);
     match &result {
-        Ok(()) => { conn.execute("COMMIT", [])?; }
-        Err(_) => { let _ = conn.execute("ROLLBACK", []); }
+        Ok(()) => {
+            conn.execute("COMMIT", [])?;
+        }
+        Err(_) => {
+            let _ = conn.execute("ROLLBACK", []);
+        }
     }
     result
 }
@@ -257,10 +261,7 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
             .unwrap_or(false);
 
         if !has_source_path {
-            conn.execute(
-                "ALTER TABLE memory_entries ADD COLUMN source_path TEXT",
-                [],
-            )?;
+            conn.execute("ALTER TABLE memory_entries ADD COLUMN source_path TEXT", [])?;
         }
     }
 
@@ -378,10 +379,7 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     }
 
     // Update schema version
-    conn.execute(
-        "UPDATE schema_version SET version = ?",
-        [SCHEMA_VERSION],
-    )?;
+    conn.execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION])?;
 
     Ok(())
 }
@@ -994,7 +992,10 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(has_reason, "documents table should have status_reason column");
+        assert!(
+            has_reason,
+            "documents table should have status_reason column"
+        );
 
         // Check version column exists
         let has_version: bool = conn
@@ -1020,7 +1021,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["hash123", "# Test", "1706700000"],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Insert document without specifying status
         conn.execute(
@@ -1046,7 +1048,10 @@ mod tests {
         init_schema(&conn).expect("init_schema failed");
 
         let version = get_schema_version(&conn).unwrap().unwrap();
-        assert_eq!(version, SCHEMA_VERSION, "schema version should match SCHEMA_VERSION");
+        assert_eq!(
+            version, SCHEMA_VERSION,
+            "schema version should match SCHEMA_VERSION"
+        );
     }
 
     // ==================== Migration Tests ====================
@@ -1203,7 +1208,10 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(has_source_path, "should have source_path column after migration");
+        assert!(
+            has_source_path,
+            "should have source_path column after migration"
+        );
 
         // v4 migration: collections should have source
         let has_source: bool = conn
@@ -1229,7 +1237,8 @@ mod tests {
         conn.execute(
             "INSERT INTO content (hash, body, created_at) VALUES (?, ?, ?)",
             ["h1", "body text", "1000"],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO documents (collection, relative_path, hash, title, file_modified_at, indexed_at)
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -1246,23 +1255,39 @@ mod tests {
 
         // Data should survive
         let title: String = conn
-            .query_row("SELECT title FROM documents WHERE relative_path = 'readme.md'", [], |row| row.get(0))
+            .query_row(
+                "SELECT title FROM documents WHERE relative_path = 'readme.md'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(title, "Readme");
 
         let mem_title: String = conn
-            .query_row("SELECT title FROM memory_entries WHERE id = 'test-entry'", [], |row| row.get(0))
+            .query_row(
+                "SELECT title FROM memory_entries WHERE id = 'test-entry'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(mem_title, "Test");
 
         // New columns should have defaults
         let status: String = conn
-            .query_row("SELECT status FROM documents WHERE relative_path = 'readme.md'", [], |row| row.get(0))
+            .query_row(
+                "SELECT status FROM documents WHERE relative_path = 'readme.md'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(status, "current");
 
         let source: String = conn
-            .query_row("SELECT source FROM collections WHERE name = 'docs'", [], |row| row.get(0))
+            .query_row(
+                "SELECT source FROM collections WHERE name = 'docs'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(source, "manual");
     }
@@ -1280,7 +1305,8 @@ mod tests {
             ALTER TABLE memory_entries ADD COLUMN source_path TEXT;
             UPDATE schema_version SET version = 3;
             "#,
-        ).unwrap();
+        )
+        .unwrap();
 
         // v3 should NOT have source on collections
         let has_source: bool = conn
@@ -1304,7 +1330,10 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(has_source, "should have source column after v3→v4 migration");
+        assert!(
+            has_source,
+            "should have source column after v3→v4 migration"
+        );
     }
 
     #[test]
@@ -1325,6 +1354,10 @@ mod tests {
             .expect("get_entry should not error")
             .expect("entry should exist");
 
-        assert!(entry.tags.is_empty(), "malformed tags_json should result in empty tags vec, got: {:?}", entry.tags);
+        assert!(
+            entry.tags.is_empty(),
+            "malformed tags_json should result in empty tags vec, got: {:?}",
+            entry.tags
+        );
     }
 }

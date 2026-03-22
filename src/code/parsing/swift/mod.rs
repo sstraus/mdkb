@@ -1,5 +1,6 @@
 //! Swift language parser implementation using tree-sitter-swift 0.7.
 
+use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
@@ -7,7 +8,6 @@ use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
-use crate::code::parsing::caching_parser::CachingParser;
 
 pub struct SwiftParser {
     parser: CachingParser,
@@ -154,7 +154,13 @@ impl SwiftParser {
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         self.extract_symbols_from_node(
-                            child, code, file_id, counter, symbols, module_path, depth + 1,
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            module_path,
+                            depth + 1,
                         );
                     }
                 }
@@ -281,7 +287,13 @@ impl SwiftParser {
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
-                        child, code, file_id, counter, symbols, module_path, depth + 1,
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                        depth + 1,
                     );
                 }
             }
@@ -469,14 +481,21 @@ public class Calculator {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Point" && s.kind == SymbolKind::Struct));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Calculator" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Calculator.add"
-            && s.kind == SymbolKind::Method));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Point" && s.kind == SymbolKind::Struct)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Calculator" && s.kind == SymbolKind::Class)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Calculator.add" && s.kind == SymbolKind::Method)
+        );
     }
 
     #[test]
@@ -497,11 +516,16 @@ enum Color {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        assert!(symbols.iter().any(|s| s.name.as_ref() == "Serializable"
-            && s.kind == SymbolKind::Interface));
-        assert!(symbols
-            .iter()
-            .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum));
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Serializable" && s.kind == SymbolKind::Interface)
+        );
+        assert!(
+            symbols
+                .iter()
+                .any(|s| s.name.as_ref() == "Color" && s.kind == SymbolKind::Enum)
+        );
     }
 
     #[test]
@@ -518,5 +542,4 @@ import UIKit
         assert!(imports.iter().any(|i| i.path == "Foundation"));
         assert!(imports.iter().any(|i| i.path == "UIKit"));
     }
-
 }

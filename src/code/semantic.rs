@@ -115,9 +115,9 @@ impl VectorStore {
         let expected_data_size = count
             .checked_mul(entry_sz)
             .and_then(|s| s.checked_add(HEADER_SIZE))
-            .ok_or_else(|| anyhow::anyhow!(
-                "Vector store count overflow: {count} entries * {entry_sz} bytes"
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Vector store count overflow: {count} entries * {entry_sz} bytes")
+            })?;
 
         ensure!(
             data.len() == expected_data_size,
@@ -136,7 +136,10 @@ impl VectorStore {
             let mut embedding = Vec::with_capacity(EMBEDDING_DIM);
             for _ in 0..EMBEDDING_DIM {
                 let val = f32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
-                ensure!(val.is_finite(), "Non-finite float in vector store at offset {offset}");
+                ensure!(
+                    val.is_finite(),
+                    "Non-finite float in vector store at offset {offset}"
+                );
                 embedding.push(val);
                 offset += 4;
             }
@@ -233,7 +236,10 @@ fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
 /// Validate a 16-byte header.
 fn validate_header(header: &[u8]) -> anyhow::Result<()> {
     ensure!(header.len() >= HEADER_SIZE, "Header too small");
-    ensure!(&header[0..4] == MAGIC, "Invalid magic bytes in vector store");
+    ensure!(
+        &header[0..4] == MAGIC,
+        "Invalid magic bytes in vector store"
+    );
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
     ensure!(
         version == FORMAT_VERSION,
@@ -277,7 +283,12 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Format a symbol's metadata into a text string suitable for embedding.
 ///
 /// Format: `"{kind} {name}\n{signature}\n{doc_comment}"` (truncated to 500 chars).
-pub fn format_symbol_text(kind: SymbolKind, name: &str, signature: Option<&str>, doc_comment: Option<&str>) -> String {
+pub fn format_symbol_text(
+    kind: SymbolKind,
+    name: &str,
+    signature: Option<&str>,
+    doc_comment: Option<&str>,
+) -> String {
     let mut text = format!("{kind} {name}");
     if let Some(sig) = signature {
         text.push('\n');
@@ -324,7 +335,11 @@ pub struct SemanticSearch {
 
 impl std::fmt::Debug for SemanticSearch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let cached = self.cache.lock().map(|g| g.as_ref().map(|c| c.len())).unwrap_or(None);
+        let cached = self
+            .cache
+            .lock()
+            .map(|g| g.as_ref().map(|c| c.len()))
+            .unwrap_or(None);
         f.debug_struct("SemanticSearch")
             .field("store", &self.store)
             .field("cached_entries", &cached)
@@ -459,8 +474,13 @@ impl SemanticSearch {
 
         // Load stored embeddings (cached after first read)
         self.ensure_cache()?;
-        let cache_guard = self.cache.lock().map_err(|e| anyhow::anyhow!("Cache lock poisoned: {e}"))?;
-        let entries = cache_guard.as_ref().expect("cache populated by ensure_cache");
+        let cache_guard = self
+            .cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Cache lock poisoned: {e}"))?;
+        let entries = cache_guard
+            .as_ref()
+            .expect("cache populated by ensure_cache");
 
         // Brute-force cosine similarity
         let mut scored: Vec<SemanticMatch> = entries
@@ -472,7 +492,11 @@ impl SemanticSearch {
             .filter(|m| m.score >= threshold)
             .collect();
 
-        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        scored.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         scored.truncate(limit);
 
         Ok(scored)
@@ -490,7 +514,10 @@ impl SemanticSearch {
 
     /// Ensure the embedding cache is populated from disk.
     fn ensure_cache(&self) -> anyhow::Result<()> {
-        let mut cache = self.cache.lock().map_err(|e| anyhow::anyhow!("Cache lock poisoned: {e}"))?;
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Cache lock poisoned: {e}"))?;
         if cache.is_none() {
             let entries = self.store.load()?;
             tracing::debug!("Cached {} embeddings from disk", entries.len());
@@ -663,7 +690,10 @@ mod tests {
         let result = store.load();
         assert!(result.is_err(), "Should reject NaN values");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("Non-finite"), "Expected non-finite error, got: {err}");
+        assert!(
+            err.contains("Non-finite"),
+            "Expected non-finite error, got: {err}"
+        );
     }
 
     #[test]
@@ -698,7 +728,10 @@ mod tests {
 
         // Verify no temp file left behind
         let tmp_path = dir.path().join(".atomic.bin.tmp");
-        assert!(!tmp_path.exists(), "Temp file should be cleaned up after rename");
+        assert!(
+            !tmp_path.exists(),
+            "Temp file should be cleaned up after rename"
+        );
 
         // Verify data is correct
         let loaded = store.load().unwrap();
@@ -724,7 +757,10 @@ mod tests {
         let result = store.load();
         assert!(result.is_err(), "Should fail on size mismatch");
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("mismatch"), "Expected size mismatch error, got: {err}");
+        assert!(
+            err.contains("mismatch"),
+            "Expected size mismatch error, got: {err}"
+        );
     }
 
     #[test]
@@ -831,7 +867,10 @@ mod tests {
     fn test_semantic_search_remove_embeddings_empty_set() {
         let dir = tempfile::tempdir().unwrap();
         let search = SemanticSearch::new(dir.path().join("vectors.bin")).unwrap();
-        search.store.write_all(&[(1, vec![0.5; EMBEDDING_DIM])]).unwrap();
+        search
+            .store
+            .write_all(&[(1, vec![0.5; EMBEDDING_DIM])])
+            .unwrap();
 
         let empty: HashSet<u32> = HashSet::new();
         let removed = search.remove_embeddings(&empty).unwrap();
@@ -846,7 +885,10 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![1.0, 2.0, 3.0];
         let sim = cosine_similarity(&a, &b);
-        assert!((sim - 1.0).abs() < 1e-5, "Identical vectors should have similarity ~1.0, got {sim}");
+        assert!(
+            (sim - 1.0).abs() < 1e-5,
+            "Identical vectors should have similarity ~1.0, got {sim}"
+        );
     }
 
     #[test]
@@ -854,7 +896,10 @@ mod tests {
         let a = vec![1.0, 0.0, 0.0];
         let b = vec![0.0, 1.0, 0.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(sim.abs() < 1e-5, "Orthogonal vectors should have similarity ~0.0, got {sim}");
+        assert!(
+            sim.abs() < 1e-5,
+            "Orthogonal vectors should have similarity ~0.0, got {sim}"
+        );
     }
 
     #[test]
@@ -862,7 +907,10 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![-1.0, -2.0, -3.0];
         let sim = cosine_similarity(&a, &b);
-        assert!((sim - (-1.0)).abs() < 1e-5, "Opposite vectors should have similarity ~-1.0, got {sim}");
+        assert!(
+            (sim - (-1.0)).abs() < 1e-5,
+            "Opposite vectors should have similarity ~-1.0, got {sim}"
+        );
     }
 
     #[test]
@@ -870,7 +918,10 @@ mod tests {
         let a = vec![1.0, 2.0, 3.0];
         let b = vec![0.0, 0.0, 0.0];
         let sim = cosine_similarity(&a, &b);
-        assert!(sim.abs() < 1e-5, "Zero vector should have similarity 0.0, got {sim}");
+        assert!(
+            sim.abs() < 1e-5,
+            "Zero vector should have similarity 0.0, got {sim}"
+        );
     }
 
     // --- format_symbol_text tests ---
@@ -902,7 +953,10 @@ mod tests {
             Some("fn connect(&self, url: &str) -> Connection"),
             None,
         );
-        assert_eq!(text, "Method connect\nfn connect(&self, url: &str) -> Connection");
+        assert_eq!(
+            text,
+            "Method connect\nfn connect(&self, url: &str) -> Connection"
+        );
     }
 
     #[test]
@@ -918,7 +972,10 @@ mod tests {
         let long_doc = "é".repeat(300); // 600 bytes, 300 chars
         let text = format_symbol_text(SymbolKind::Function, "f", None, Some(&long_doc));
         assert!(text.len() <= MAX_EMBED_TEXT_LEN);
-        assert!(text.is_char_boundary(text.len()), "Must truncate at a char boundary");
+        assert!(
+            text.is_char_boundary(text.len()),
+            "Must truncate at a char boundary"
+        );
     }
 
     // --- Integration tests (require model download) ---
@@ -954,9 +1011,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let search = SemanticSearch::new(dir.path().join("vectors.bin")).unwrap();
 
-        let symbols = vec![
-            (1, "Function hello\nfn hello()\nPrints a greeting.".to_string()),
-        ];
+        let symbols = vec![(
+            1,
+            "Function hello\nfn hello()\nPrints a greeting.".to_string(),
+        )];
 
         search.generate_embeddings(&symbols).unwrap();
 

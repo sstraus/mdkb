@@ -1,9 +1,9 @@
 //! FTS5 search operations.
 
-use std::collections::HashMap;
 use crate::domain::{IndexStatus, SearchQuery, SearchResult};
 use crate::error::Result;
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 
 /// Escape a query string for safe use with FTS5 MATCH.
 ///
@@ -58,7 +58,11 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
         Some(c) => ("AND d.collection = ?2", Some(c.as_str())),
         None => ("", None),
     };
-    let limit_param_idx = if collection_param.is_some() { "?3" } else { "?2" };
+    let limit_param_idx = if collection_param.is_some() {
+        "?3"
+    } else {
+        "?2"
+    };
 
     let sql = format!(
         r#"
@@ -84,7 +88,7 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
             snippets: vec![],
             status: row.get(5)?,
             superseded_by: None,
-                repo_root: None,
+            repo_root: None,
         })
     };
 
@@ -108,7 +112,8 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
 
 /// Populate the superseded_by field for search results.
 fn populate_superseded_by(conn: &Connection, results: &mut [SearchResult]) -> Result<()> {
-    let superseded_ids: Vec<i64> = results.iter()
+    let superseded_ids: Vec<i64> = results
+        .iter()
         .filter(|r| r.status.as_deref() == Some("superseded"))
         .map(|r| r.id)
         .collect();
@@ -118,7 +123,9 @@ fn populate_superseded_by(conn: &Connection, results: &mut [SearchResult]) -> Re
     }
 
     // Batch fetch: for each superseded doc, find the superseding doc's path
-    let placeholders: Vec<String> = (1..=superseded_ids.len()).map(|i| format!("?{i}")).collect();
+    let placeholders: Vec<String> = (1..=superseded_ids.len())
+        .map(|i| format!("?{i}"))
+        .collect();
     let sql = format!(
         r#"SELECT e.target_doc_id, d.relative_path
            FROM evolution e
@@ -129,7 +136,10 @@ fn populate_superseded_by(conn: &Connection, results: &mut [SearchResult]) -> Re
     );
 
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::ToSql> = superseded_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> = superseded_ids
+        .iter()
+        .map(|id| id as &dyn rusqlite::ToSql)
+        .collect();
     let rows = stmt.query_map(params.as_slice(), |row| {
         Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -208,13 +218,19 @@ mod tests {
     #[test]
     fn test_escape_fts5_with_quotes() {
         // Internal quotes should be doubled
-        assert_eq!(escape_fts5_query("say \"hello\""), "\"say\" \"\"\"hello\"\"\"");
+        assert_eq!(
+            escape_fts5_query("say \"hello\""),
+            "\"say\" \"\"\"hello\"\"\""
+        );
     }
 
     #[test]
     fn test_escape_fts5_operators() {
         // FTS5 operators should be quoted
-        assert_eq!(escape_fts5_query("cats AND dogs"), "\"cats\" \"AND\" \"dogs\"");
+        assert_eq!(
+            escape_fts5_query("cats AND dogs"),
+            "\"cats\" \"AND\" \"dogs\""
+        );
         assert_eq!(escape_fts5_query("NOT found"), "\"NOT\" \"found\"");
     }
 
@@ -484,7 +500,8 @@ mod tests {
         conn.execute(
             "UPDATE documents SET status = 'superseded' WHERE relative_path = 'rust-old.md'",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Search without include_superseded (default)
         let query = SearchQuery {
@@ -499,7 +516,10 @@ mod tests {
 
         // Should only find the non-superseded docs (2 from setup)
         let paths: Vec<_> = results.iter().map(|r| r.path.as_str()).collect();
-        assert!(!paths.contains(&"rust-old.md"), "superseded doc should be excluded");
+        assert!(
+            !paths.contains(&"rust-old.md"),
+            "superseded doc should be excluded"
+        );
         assert_eq!(results.len(), 2);
     }
 
@@ -526,7 +546,8 @@ mod tests {
         conn.execute(
             "UPDATE documents SET status = 'superseded' WHERE relative_path = 'rust-old.md'",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Search with include_superseded
         let query = SearchQuery {
@@ -541,7 +562,10 @@ mod tests {
 
         // Should find all rust docs including superseded
         let paths: Vec<_> = results.iter().map(|r| r.path.as_str()).collect();
-        assert!(paths.contains(&"rust-old.md"), "superseded doc should be included");
+        assert!(
+            paths.contains(&"rust-old.md"),
+            "superseded doc should be included"
+        );
         assert_eq!(results.len(), 3); // 2 from setup + 1 superseded
     }
 
@@ -567,7 +591,8 @@ mod tests {
         conn.execute(
             "UPDATE documents SET status = 'superseded' WHERE relative_path = 'rust-old.md'",
             [],
-        ).unwrap();
+        )
+        .unwrap();
 
         // Search with include_superseded
         let query = SearchQuery {
