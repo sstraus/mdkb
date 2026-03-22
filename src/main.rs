@@ -14,22 +14,27 @@ use tracing::Level;
 use tracing_subscriber::EnvFilter;
 
 use mdkb::Result;
+use mdkb::cli::CodeCommand;
 use mdkb::cli::handlers::{
     Context, EmbedResult, EvolutionHistoryEntry, StatsResult, handle_collection_add,
-    handle_collection_remove, handle_collection_rename, handle_current, handle_embed, handle_evolve_corrects,
-    handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
-    handle_experiment_cancel, handle_experiment_create, handle_experiment_end, handle_experiment_list,
-    handle_experiment_status, handle_get, handle_history, handle_hybrid_search, handle_init, handle_memory_add,
-    handle_memory_import, handle_memory_list, handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show,
-    handle_memory_warmup, handle_metrics_export, handle_metrics_latency, handle_metrics_show,
-    handle_mget, handle_session_index, handle_stats, handle_status, handle_superseded_by, handle_update,
+    handle_collection_remove, handle_collection_rename, handle_current, handle_embed,
+    handle_evolve_corrects, handle_evolve_extends, handle_evolve_retracts,
+    handle_evolve_supersedes, handle_evolve_updates, handle_experiment_cancel,
+    handle_experiment_create, handle_experiment_end, handle_experiment_list,
+    handle_experiment_status, handle_get, handle_history, handle_hybrid_search, handle_init,
+    handle_memory_add, handle_memory_import, handle_memory_list, handle_memory_prune,
+    handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
+    handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
+    handle_session_index, handle_stats, handle_status, handle_superseded_by, handle_update,
 };
-use mdkb::cli::{Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SessionCommand, SetupCommand, SetupMcpCommand};
-use mdkb::cli::CodeCommand;
 use mdkb::cli::journal::JournalImportResult;
+use mdkb::cli::{
+    Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand,
+    MemoryCommand, MetricsCommand, OutputFormat, SessionCommand, SetupCommand, SetupMcpCommand,
+};
+use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
-use mdkb::mcp::server::run_server;
 use rmcp::ServiceExt;
 
 #[tokio::main]
@@ -95,7 +100,13 @@ async fn main() -> Result<()> {
             let ctx = Context::open(&cwd)?;
             match scope.as_deref() {
                 Some("docs") => {
-                    let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref(), include_superseded)?;
+                    let results = handle_hybrid_search(
+                        &ctx,
+                        &query,
+                        limit,
+                        collection.as_deref(),
+                        include_superseded,
+                    )?;
                     format_search_results(&results, cli.format);
                 }
                 Some("memory") => {
@@ -104,7 +115,13 @@ async fn main() -> Result<()> {
                 }
                 None => {
                     // Default: search docs + memory
-                    let results = handle_hybrid_search(&ctx, &query, limit, collection.as_deref(), include_superseded)?;
+                    let results = handle_hybrid_search(
+                        &ctx,
+                        &query,
+                        limit,
+                        collection.as_deref(),
+                        include_superseded,
+                    )?;
                     let entries = handle_memory_search(&ctx, &query, limit)?;
                     if !results.is_empty() {
                         println!("## Documents\n");
@@ -137,7 +154,10 @@ async fn main() -> Result<()> {
                     format_code_symbols(&symbols, cli.format);
                 }
                 Some(invalid) => {
-                    eprintln!("Invalid scope: '{}'. Valid values: docs, memory, code, symbols. Omit for docs+memory.", invalid);
+                    eprintln!(
+                        "Invalid scope: '{}'. Valid values: docs, memory, code, symbols. Omit for docs+memory.",
+                        invalid
+                    );
                     std::process::exit(1);
                 }
             }
@@ -211,10 +231,8 @@ async fn main() -> Result<()> {
             }
 
             // Also reindex Claude Code sessions
-            let sessions_base = std::path::PathBuf::from(
-                std::env::var("HOME").unwrap_or_default(),
-            )
-            .join(".claude/projects");
+            let sessions_base = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".claude/projects");
             let project_root = cwd.to_string_lossy().to_string();
             match handle_session_index(&ctx, &sessions_base, &project_root) {
                 Ok(sr) if sr.added > 0 || sr.updated > 0 => {
@@ -234,15 +252,19 @@ async fn main() -> Result<()> {
             let result = handle_embed(&ctx)?;
             format_embed_result(&result, cli.format);
         }
-        Command::Serve { http, https, bind, token, global } => {
+        Command::Serve {
+            http,
+            https,
+            bind,
+            token,
+            global,
+        } => {
             if global {
                 // Global mode: single process serving multiple repos via MCP roots
-                let daemon_config = mdkb::DaemonConfig::load_or_default(
-                    &mdkb::DaemonConfig::config_path(),
-                )?;
-                let registry = std::sync::Arc::new(
-                    mdkb::daemon::registry::RepoRegistry::new(daemon_config),
-                );
+                let daemon_config =
+                    mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())?;
+                let registry =
+                    std::sync::Arc::new(mdkb::daemon::registry::RepoRegistry::new(daemon_config));
                 let server = mdkb::mcp::server::McpServer::global(registry);
 
                 tracing::info!("Starting mdkb MCP server in global mode (stdio)...");
@@ -269,14 +291,19 @@ async fn main() -> Result<()> {
                     }
                 } else {
                     if bind.is_some() || token.is_some() {
-                        eprintln!("Warning: --bind and --token are only used with --http or --https");
+                        eprintln!(
+                            "Warning: --bind and --token are only used with --http or --https"
+                        );
                     }
                     mdkb::mcp::server::TransportMode::Stdio
                 };
                 run_server(cwd, transport).await?;
             }
         }
-        Command::Stats { sessions, aggregate } => {
+        Command::Stats {
+            sessions,
+            aggregate,
+        } => {
             let ctx = Context::open(&cwd)?;
             let result = handle_stats(&ctx, sessions, aggregate)?;
             format_stats_result(&result, cli.format);
@@ -356,17 +383,26 @@ async fn main() -> Result<()> {
                     if revisions.is_empty() {
                         println!("No revision history for '{id}'");
                     } else {
-                        println!("Revision history for '{}' ({} revision{}):\n",
-                            id, revisions.len(), if revisions.len() == 1 { "" } else { "s" });
+                        println!(
+                            "Revision history for '{}' ({} revision{}):\n",
+                            id,
+                            revisions.len(),
+                            if revisions.len() == 1 { "" } else { "s" }
+                        );
                         for (i, rev) in revisions.iter().enumerate() {
-                            let date = chrono::DateTime::<chrono::Utc>::from_timestamp(rev.created_at, 0)
-                                .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-                                .unwrap_or_else(|| "?".to_string());
+                            let date =
+                                chrono::DateTime::<chrono::Utc>::from_timestamp(rev.created_at, 0)
+                                    .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                                    .unwrap_or_else(|| "?".to_string());
                             println!("--- Revision {} ({}) ---\n{}\n", i + 1, date, rev.diff);
                         }
                     }
                 }
-                MemoryCommand::Import { path, dry_run, skip_duplicates } => {
+                MemoryCommand::Import {
+                    path,
+                    dry_run,
+                    skip_duplicates,
+                } => {
                     let result = handle_memory_import(&ctx, &path, dry_run, skip_duplicates)?;
                     if dry_run {
                         println!("Dry run: would import {} entries", result.imported);
@@ -385,7 +421,12 @@ async fn main() -> Result<()> {
                     format_prune_result(&pruned, days, dry_run, cli.format);
                 }
                 #[cfg(feature = "llm")]
-                MemoryCommand::Condense { tag, dry_run, interactive: _, min_entries } => {
+                MemoryCommand::Condense {
+                    tag,
+                    dry_run,
+                    interactive: _,
+                    min_entries,
+                } => {
                     let result = mdkb::cli::handlers::handle_memory_condense(
                         &ctx,
                         tag.as_deref(),
@@ -403,8 +444,19 @@ async fn main() -> Result<()> {
                     let id = handle_evolve_supersedes(&ctx, &new, &old, reason.as_deref())?;
                     println!("Created evolution relationship #{id}: {new} supersedes {old}");
                 }
-                EvolveCommand::Updates { new, old, scope, reason } => {
-                    let id = handle_evolve_updates(&ctx, &new, &old, scope.as_deref(), reason.as_deref())?;
+                EvolveCommand::Updates {
+                    new,
+                    old,
+                    scope,
+                    reason,
+                } => {
+                    let id = handle_evolve_updates(
+                        &ctx,
+                        &new,
+                        &old,
+                        scope.as_deref(),
+                        reason.as_deref(),
+                    )?;
                     println!("Created evolution relationship #{id}: {new} updates {old}");
                 }
                 EvolveCommand::Corrects { new, old, reason } => {
@@ -497,7 +549,11 @@ async fn main() -> Result<()> {
                     )?;
                     format_journal_import_result(&result, dry_run, cli.format);
                 }
-                JournalCommand::ImportAll { dir, dry_run, skip_existing } => {
+                JournalCommand::ImportAll {
+                    dir,
+                    dry_run,
+                    skip_existing,
+                } => {
                     let journal_dir = dir.unwrap_or_else(|| ".claude/journal".to_string());
                     let results = mdkb::cli::handlers::handle_journal_import_all(
                         &ctx,
@@ -509,106 +565,95 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Command::Code(cmd) => {
-            match cmd {
-                CodeCommand::Init => {
-                    mdkb::cli::handlers::handle_code_init(&cwd)?;
-                    println!("Initialized code index at .mdkb/code.sqlite");
-                }
-                CodeCommand::Index { paths, force } => {
-                    let stats = if force {
-                        mdkb::cli::handlers::handle_code_reindex(&cwd, &paths)?
-                    } else {
-                        mdkb::cli::handlers::handle_code_index(&cwd, &paths)?
-                    };
-                    format_code_index_stats(&stats, cli.format);
-                }
-                CodeCommand::Search { query, limit, kind } => {
-                    let symbols = mdkb::cli::handlers::handle_code_search(
-                        &cwd,
-                        &query,
-                        limit,
-                        kind.as_deref(),
-                    )?;
-                    format_code_symbols(&symbols, cli.format);
-                }
-                CodeCommand::Find { name, kind, file } => {
-                    let symbols = mdkb::cli::handlers::handle_code_find(
-                        &cwd,
-                        &name,
-                        kind.as_deref(),
-                        file.as_deref(),
-                    )?;
-                    format_code_symbols(&symbols, cli.format);
-                }
-                CodeCommand::Calls { name } => {
-                    let (source, callees) =
-                        mdkb::cli::handlers::handle_code_calls(&cwd, &name)?;
-                    format_code_graph("Calls", &source, &callees, cli.format);
-                }
-                CodeCommand::Callers { name } => {
-                    let (target, callers) =
-                        mdkb::cli::handlers::handle_code_callers(&cwd, &name)?;
-                    format_code_graph("Called by", &target, &callers, cli.format);
-                }
-                CodeCommand::Impact { name, depth } => {
-                    let (source, impacted) =
-                        mdkb::cli::handlers::handle_code_impact(&cwd, &name, depth)?;
-                    format_code_graph("Impact radius", &source, &impacted, cli.format);
-                }
-                CodeCommand::Info => {
-                    let info = mdkb::cli::handlers::handle_code_info(&cwd)?;
-                    format_code_info(&info, cli.format);
-                }
-                CodeCommand::Parse { file } => {
-                    let symbols = mdkb::cli::handlers::handle_code_parse(
-                        std::path::Path::new(&file),
-                    )?;
-                    format_code_parse(&symbols, &file, cli.format);
-                }
+        Command::Code(cmd) => match cmd {
+            CodeCommand::Init => {
+                mdkb::cli::handlers::handle_code_init(&cwd)?;
+                println!("Initialized code index at .mdkb/code.sqlite");
             }
-        }
-        Command::Setup(cmd) => {
-            match cmd {
-                SetupCommand::Mcp(mcp_cmd) => {
-                    match mcp_cmd {
-                        SetupMcpCommand::Claude { scope, yes } => {
-                            let global = scope == "user";
-                            if scope != "local" && scope != "user" && scope != "project" {
-                                eprintln!("Error: Invalid scope '{}'. Must be 'local', 'user', or 'project'.", scope);
-                                std::process::exit(1);
-                            }
-                            let result = mdkb::cli::setup::handle_setup_mcp_claude(&cwd, global, yes)?;
-                            if result.success {
-                                println!("{}", result.message);
-                                println!();
-                                println!("Restart Claude Code to activate the mdkb MCP server.");
-                            } else {
-                                println!("{}", result.message);
-                            }
-                        }
+            CodeCommand::Index { paths, force } => {
+                let stats = if force {
+                    mdkb::cli::handlers::handle_code_reindex(&cwd, &paths)?
+                } else {
+                    mdkb::cli::handlers::handle_code_index(&cwd, &paths)?
+                };
+                format_code_index_stats(&stats, cli.format);
+            }
+            CodeCommand::Search { query, limit, kind } => {
+                let symbols =
+                    mdkb::cli::handlers::handle_code_search(&cwd, &query, limit, kind.as_deref())?;
+                format_code_symbols(&symbols, cli.format);
+            }
+            CodeCommand::Find { name, kind, file } => {
+                let symbols = mdkb::cli::handlers::handle_code_find(
+                    &cwd,
+                    &name,
+                    kind.as_deref(),
+                    file.as_deref(),
+                )?;
+                format_code_symbols(&symbols, cli.format);
+            }
+            CodeCommand::Calls { name } => {
+                let (source, callees) = mdkb::cli::handlers::handle_code_calls(&cwd, &name)?;
+                format_code_graph("Calls", &source, &callees, cli.format);
+            }
+            CodeCommand::Callers { name } => {
+                let (target, callers) = mdkb::cli::handlers::handle_code_callers(&cwd, &name)?;
+                format_code_graph("Called by", &target, &callers, cli.format);
+            }
+            CodeCommand::Impact { name, depth } => {
+                let (source, impacted) =
+                    mdkb::cli::handlers::handle_code_impact(&cwd, &name, depth)?;
+                format_code_graph("Impact radius", &source, &impacted, cli.format);
+            }
+            CodeCommand::Info => {
+                let info = mdkb::cli::handlers::handle_code_info(&cwd)?;
+                format_code_info(&info, cli.format);
+            }
+            CodeCommand::Parse { file } => {
+                let symbols = mdkb::cli::handlers::handle_code_parse(std::path::Path::new(&file))?;
+                format_code_parse(&symbols, &file, cli.format);
+            }
+        },
+        Command::Setup(cmd) => match cmd {
+            SetupCommand::Mcp(mcp_cmd) => match mcp_cmd {
+                SetupMcpCommand::Claude { scope, yes } => {
+                    let global = scope == "user";
+                    if scope != "local" && scope != "user" && scope != "project" {
+                        eprintln!(
+                            "Error: Invalid scope '{}'. Must be 'local', 'user', or 'project'.",
+                            scope
+                        );
+                        std::process::exit(1);
+                    }
+                    let result = mdkb::cli::setup::handle_setup_mcp_claude(&cwd, global, yes)?;
+                    if result.success {
+                        println!("{}", result.message);
+                        println!();
+                        println!("Restart Claude Code to activate the mdkb MCP server.");
+                    } else {
+                        println!("{}", result.message);
                     }
                 }
-            }
-        }
-        Command::Session(cmd) => {
-            match cmd {
-                SessionCommand::Index { sessions_path, project_root } => {
-                    let ctx = Context::open(&cwd)?;
-                    let sessions_base = sessions_path
+            },
+        },
+        Command::Session(cmd) => match cmd {
+            SessionCommand::Index {
+                sessions_path,
+                project_root,
+            } => {
+                let ctx = Context::open(&cwd)?;
+                let sessions_base =
+                    sessions_path
                         .map(std::path::PathBuf::from)
                         .unwrap_or_else(|| {
-                            std::path::PathBuf::from(
-                                std::env::var("HOME").unwrap_or_default(),
-                            )
-                            .join(".claude/projects")
+                            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                                .join(".claude/projects")
                         });
-                    let root = project_root.unwrap_or_else(|| cwd.to_string_lossy().to_string());
-                    let result = handle_session_index(&ctx, &sessions_base, &root)?;
-                    format_update_result(&result, cli.format);
-                }
+                let root = project_root.unwrap_or_else(|| cwd.to_string_lossy().to_string());
+                let result = handle_session_index(&ctx, &sessions_base, &root)?;
+                format_update_result(&result, cli.format);
             }
-        }
+        },
     }
 
     Ok(())
@@ -652,7 +697,10 @@ fn format_search_results(results: &[mdkb::domain::SearchResult], format: OutputF
             } else {
                 for r in results {
                     let title = r.title.as_deref().unwrap_or("(untitled)");
-                    println!("[{}] {}:{} - {} (score: {:.2})", r.id, r.collection, r.path, title, r.score);
+                    println!(
+                        "[{}] {}:{} - {} (score: {:.2})",
+                        r.id, r.collection, r.path, title, r.score
+                    );
                 }
             }
         }
@@ -709,8 +757,15 @@ fn format_status(result: &mdkb::cli::handlers::StatusResult, format: OutputForma
                 println!("  (none)");
             } else {
                 for c in &result.collections {
-                    let tag = if c.source == "convention" { "[convention]" } else { "[manual]" };
-                    println!("  - {} {} ({}): {} docs, pattern: {}", c.name, tag, c.path, c.doc_count, c.pattern);
+                    let tag = if c.source == "convention" {
+                        "[convention]"
+                    } else {
+                        "[manual]"
+                    };
+                    println!(
+                        "  - {} {} ({}): {} docs, pattern: {}",
+                        c.name, tag, c.path, c.doc_count, c.pattern
+                    );
                 }
             }
         }
@@ -850,7 +905,15 @@ fn format_memory_entry(entry: &MemoryEntry, format: OutputFormat) {
             println!("# {}\n", entry.title);
             println!("**ID:** {}", entry.id);
             println!("**Type:** {}", entry.entry_type);
-            println!("**Tags:** {}", entry.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
+            println!(
+                "**Tags:** {}",
+                entry
+                    .tags
+                    .iter()
+                    .map(|t| format!("#{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
             println!("**Access count:** {}\n", entry.access_count);
             println!("---\n");
             println!("{}", entry.content);
@@ -858,7 +921,15 @@ fn format_memory_entry(entry: &MemoryEntry, format: OutputFormat) {
         OutputFormat::Text => {
             println!("[{}] {} ({})", entry.id, entry.title, entry.entry_type);
             if !entry.tags.is_empty() {
-                println!("Tags: {}", entry.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" "));
+                println!(
+                    "Tags: {}",
+                    entry
+                        .tags
+                        .iter()
+                        .map(|t| format!("#{t}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
             }
             println!("Access count: {}", entry.access_count);
             println!("\n{}", entry.content);
@@ -889,8 +960,16 @@ fn format_memory_list(entries: &[MemoryEntry], format: OutputFormat) {
             println!("| ID | Title | Type | Tags | Access |");
             println!("|----|-------|------|------|--------|");
             for e in entries {
-                let tags = e.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
-                println!("| {} | {} | {} | {} | {} |", e.id, e.title, e.entry_type, tags, e.access_count);
+                let tags = e
+                    .tags
+                    .iter()
+                    .map(|t| format!("#{t}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                println!(
+                    "| {} | {} | {} | {} | {} |",
+                    e.id, e.title, e.entry_type, tags, e.access_count
+                );
             }
         }
         OutputFormat::Text => {
@@ -898,8 +977,16 @@ fn format_memory_list(entries: &[MemoryEntry], format: OutputFormat) {
                 println!("No memory entries found.");
             } else {
                 for e in entries {
-                    let tags = e.tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ");
-                    println!("[{}] {} ({}) {} - {} accesses", e.id, e.title, e.entry_type, tags, e.access_count);
+                    let tags = e
+                        .tags
+                        .iter()
+                        .map(|t| format!("#{t}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!(
+                        "[{}] {} ({}) {} - {} accesses",
+                        e.id, e.title, e.entry_type, tags, e.access_count
+                    );
                 }
             }
         }
@@ -953,14 +1040,25 @@ fn format_prune_result(pruned: &[String], days: u32, dry_run: bool, format: Outp
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             if pruned.is_empty() {
-                println!("No entries to prune (all entries accessed within {} days).", days);
+                println!(
+                    "No entries to prune (all entries accessed within {} days).",
+                    days
+                );
             } else if dry_run {
-                println!("Would archive {} entries not accessed in {} days:", pruned.len(), days);
+                println!(
+                    "Would archive {} entries not accessed in {} days:",
+                    pruned.len(),
+                    days
+                );
                 for id in pruned {
                     println!("  - {}", id);
                 }
             } else {
-                println!("Archived {} entries not accessed in {} days:", pruned.len(), days);
+                println!(
+                    "Archived {} entries not accessed in {} days:",
+                    pruned.len(),
+                    days
+                );
                 for id in pruned {
                     println!("  - {}", id);
                 }
@@ -970,7 +1068,11 @@ fn format_prune_result(pruned: &[String], days: u32, dry_run: bool, format: Outp
 }
 
 #[cfg(feature = "llm")]
-fn format_condense_result(result: &mdkb::cli::handlers::CondenseResult, dry_run: bool, format: OutputFormat) {
+fn format_condense_result(
+    result: &mdkb::cli::handlers::CondenseResult,
+    dry_run: bool,
+    format: OutputFormat,
+) {
     match format {
         OutputFormat::Json => {
             let output = serde_json::json!({
@@ -991,7 +1093,8 @@ fn format_condense_result(result: &mdkb::cli::handlers::CondenseResult, dry_run:
         OutputFormat::Csv => {
             println!("proposed_id,entry_ids,common_tags");
             for g in &result.groups {
-                println!("{},{},{}",
+                println!(
+                    "{},{},{}",
                     g.proposed_id,
                     g.entry_ids.join(";"),
                     g.common_tags.join(";")
@@ -1011,7 +1114,12 @@ fn format_condense_result(result: &mdkb::cli::handlers::CondenseResult, dry_run:
             }
 
             for (i, g) in result.groups.iter().enumerate() {
-                println!("Group {}: {} entries -> {}", i + 1, g.entry_ids.len(), g.proposed_id);
+                println!(
+                    "Group {}: {} entries -> {}",
+                    i + 1,
+                    g.entry_ids.len(),
+                    g.proposed_id
+                );
                 println!("  Tags: {}", g.common_tags.join(", "));
                 println!("  Entries:");
                 for id in &g.entry_ids {
@@ -1024,8 +1132,10 @@ fn format_condense_result(result: &mdkb::cli::handlers::CondenseResult, dry_run:
             }
 
             if !dry_run {
-                println!("Consolidated {} entries into {} merged entries.",
-                    result.consolidated_count, result.merged_count);
+                println!(
+                    "Consolidated {} entries into {} merged entries.",
+                    result.consolidated_count, result.merged_count
+                );
             }
         }
     }
@@ -1109,7 +1219,10 @@ fn format_current_document(doc: &mdkb::domain::Document, format: OutputFormat) {
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             let title = doc.title.as_deref().unwrap_or("(untitled)");
-            println!("Current version: [{}] {}:{} - {}", doc.id, doc.collection, doc.relative_path, title);
+            println!(
+                "Current version: [{}] {}:{} - {}",
+                doc.id, doc.collection, doc.relative_path, title
+            );
         }
     }
 }
@@ -1157,7 +1270,9 @@ fn format_stats_result(result: &StatsResult, format: OutputFormat) {
             println!("{}", serde_json::to_string_pretty(result).unwrap());
         }
         OutputFormat::Csv => {
-            println!("total_sessions,total_calls,total_tokens,total_truncations,avg_tokens_per_call");
+            println!(
+                "total_sessions,total_calls,total_tokens,total_truncations,avg_tokens_per_call"
+            );
             println!(
                 "{},{},{},{},{:.1}",
                 result.aggregate.total_sessions,
@@ -1190,10 +1305,7 @@ fn format_stats_result(result: &StatsResult, format: OutputFormat) {
                     let started = chrono::DateTime::from_timestamp(session.started_at, 0)
                         .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
                         .unwrap_or_else(|| "unknown".to_string());
-                    println!(
-                        "\nSession {} - {} ({}):",
-                        session.id, started, status
-                    );
+                    println!("\nSession {} - {} ({}):", session.id, started, status);
                     println!("  Calls:       {}", session.total_calls);
                     println!("  Tokens:      {}", session.total_tokens);
                     println!("  Truncations: {}", session.truncation_count);
@@ -1213,32 +1325,66 @@ fn format_stats_result(result: &StatsResult, format: OutputFormat) {
     }
 }
 
-fn format_metrics_summary(metrics: &mdkb::store::stats::QueryMetricsSummary, period: u32, format: OutputFormat) {
+fn format_metrics_summary(
+    metrics: &mdkb::store::stats::QueryMetricsSummary,
+    period: u32,
+    format: OutputFormat,
+) {
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(metrics).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(metrics).unwrap_or_default()
+            );
         }
         OutputFormat::Csv => {
-            println!("total_queries,zero_result_rate,re_search_rate,latency_p50,latency_p95,latency_p99");
+            println!(
+                "total_queries,zero_result_rate,re_search_rate,latency_p50,latency_p95,latency_p99"
+            );
             println!(
                 "{},{:.1},{:.1},{},{},{}",
-                metrics.total_queries, metrics.zero_result_rate, metrics.re_search_rate,
-                metrics.latency_p50, metrics.latency_p95, metrics.latency_p99
+                metrics.total_queries,
+                metrics.zero_result_rate,
+                metrics.re_search_rate,
+                metrics.latency_p50,
+                metrics.latency_p95,
+                metrics.latency_p99
             );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             println!("=== Query Metrics (last {} days) ===\n", period);
             println!("Total queries: {}", metrics.total_queries);
-            println!("Zero-result rate: {:.1}%{}", metrics.zero_result_rate,
-                if metrics.zero_result_rate > 10.0 { " ⚠️ High - queries not finding results" } else { "" });
-            println!("Re-search rate: {:.1}%{}", metrics.re_search_rate,
-                if metrics.re_search_rate > 15.0 { " ⚠️ High - initial results may be poor" } else { "" });
+            println!(
+                "Zero-result rate: {:.1}%{}",
+                metrics.zero_result_rate,
+                if metrics.zero_result_rate > 10.0 {
+                    " ⚠️ High - queries not finding results"
+                } else {
+                    ""
+                }
+            );
+            println!(
+                "Re-search rate: {:.1}%{}",
+                metrics.re_search_rate,
+                if metrics.re_search_rate > 15.0 {
+                    " ⚠️ High - initial results may be poor"
+                } else {
+                    ""
+                }
+            );
             println!();
             println!("Latency:");
             println!("  p50: {}ms", metrics.latency_p50);
             println!("  p95: {}ms", metrics.latency_p95);
-            println!("  p99: {}ms{}", metrics.latency_p99,
-                if metrics.latency_p99 > 500 { " ⚠️ Slow - performance issue" } else { "" });
+            println!(
+                "  p99: {}ms{}",
+                metrics.latency_p99,
+                if metrics.latency_p99 > 500 {
+                    " ⚠️ Slow - performance issue"
+                } else {
+                    ""
+                }
+            );
             println!();
             println!("Score distribution:");
             println!("  > 0.8: {:.1}%", metrics.score_above_80);
@@ -1248,10 +1394,17 @@ fn format_metrics_summary(metrics: &mdkb::store::stats::QueryMetricsSummary, per
     }
 }
 
-fn format_latency_stats(stats: &[mdkb::store::stats::QueryLatencyStats], period: u32, format: OutputFormat) {
+fn format_latency_stats(
+    stats: &[mdkb::store::stats::QueryLatencyStats],
+    period: u32,
+    format: OutputFormat,
+) {
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(stats).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(stats).unwrap_or_default()
+            );
         }
         OutputFormat::Csv => {
             println!("search_type,count,avg_latency_ms,max_latency_ms,zero_result_count");
@@ -1272,9 +1425,15 @@ fn format_latency_stats(stats: &[mdkb::store::stats::QueryLatencyStats], period:
                     println!("  Total queries: {}", s.count);
                     println!("  Avg latency: {:.1}ms", s.avg_latency_ms);
                     println!("  Max latency: {}ms", s.max_latency_ms);
-                    println!("  Zero results: {} ({:.1}%)",
+                    println!(
+                        "  Zero results: {} ({:.1}%)",
                         s.zero_result_count,
-                        if s.count > 0 { (s.zero_result_count as f64 / s.count as f64) * 100.0 } else { 0.0 });
+                        if s.count > 0 {
+                            (s.zero_result_count as f64 / s.count as f64) * 100.0
+                        } else {
+                            0.0
+                        }
+                    );
                     println!();
                 }
             }
@@ -1282,7 +1441,11 @@ fn format_latency_stats(stats: &[mdkb::store::stats::QueryLatencyStats], period:
     }
 }
 
-fn format_quality_metrics(metrics: &mdkb::store::stats::QueryMetricsSummary, period: u32, format: OutputFormat) {
+fn format_quality_metrics(
+    metrics: &mdkb::store::stats::QueryMetricsSummary,
+    period: u32,
+    format: OutputFormat,
+) {
     match format {
         OutputFormat::Json => {
             let quality = serde_json::json!({
@@ -1296,13 +1459,25 @@ fn format_quality_metrics(metrics: &mdkb::store::stats::QueryMetricsSummary, per
                     "below_50": metrics.score_below_50
                 }
             });
-            println!("{}", serde_json::to_string_pretty(&quality).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&quality).unwrap_or_default()
+            );
         }
         OutputFormat::Csv => {
-            println!("period_days,total_queries,zero_result_rate,re_search_rate,score_above_80,score_50_to_80,score_below_50");
-            println!("{},{},{:.1},{:.1},{:.1},{:.1},{:.1}",
-                period, metrics.total_queries, metrics.zero_result_rate, metrics.re_search_rate,
-                metrics.score_above_80, metrics.score_50_to_80, metrics.score_below_50);
+            println!(
+                "period_days,total_queries,zero_result_rate,re_search_rate,score_above_80,score_50_to_80,score_below_50"
+            );
+            println!(
+                "{},{},{:.1},{:.1},{:.1},{:.1},{:.1}",
+                period,
+                metrics.total_queries,
+                metrics.zero_result_rate,
+                metrics.re_search_rate,
+                metrics.score_above_80,
+                metrics.score_50_to_80,
+                metrics.score_below_50
+            );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             println!("=== Search Quality Analysis (last {} days) ===\n", period);
@@ -1344,56 +1519,82 @@ fn format_quality_metrics(metrics: &mdkb::store::stats::QueryMetricsSummary, per
 fn format_metrics_export(events: &[mdkb::store::stats::QueryEvent], format: OutputFormat) {
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(events).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(events).unwrap_or_default()
+            );
         }
         OutputFormat::Csv => {
             println!("query_hash,query_text,search_type,result_count,latency_ms,top_score");
             for e in events {
-                println!("{},{},{},{},{},{}",
+                println!(
+                    "{},{},{},{},{},{}",
                     e.query_hash,
                     e.query_text.replace(',', ";"),
                     e.search_type,
                     e.result_count,
                     e.latency_ms,
-                    e.top_score.map(|s| format!("{:.3}", s)).unwrap_or_default());
+                    e.top_score.map(|s| format!("{:.3}", s)).unwrap_or_default()
+                );
             }
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             println!("Query events ({} total):\n", events.len());
             for (i, e) in events.iter().take(20).enumerate() {
                 println!("{}. \"{}\"", i + 1, e.query_text);
-                println!("   Type: {} | Results: {} | Latency: {}ms | Score: {}",
-                    e.search_type, e.result_count, e.latency_ms,
-                    e.top_score.map(|s| format!("{:.2}", s)).unwrap_or_else(|| "N/A".to_string()));
+                println!(
+                    "   Type: {} | Results: {} | Latency: {}ms | Score: {}",
+                    e.search_type,
+                    e.result_count,
+                    e.latency_ms,
+                    e.top_score
+                        .map(|s| format!("{:.2}", s))
+                        .unwrap_or_else(|| "N/A".to_string())
+                );
             }
             if events.len() > 20 {
-                println!("\n... and {} more events (use --json or --csv for full export)", events.len() - 20);
+                println!(
+                    "\n... and {} more events (use --json or --csv for full export)",
+                    events.len() - 20
+                );
             }
         }
     }
 }
 
-fn format_experiment_status(status: &mdkb::store::stats::ExperimentStatusReport, format: OutputFormat) {
+fn format_experiment_status(
+    status: &mdkb::store::stats::ExperimentStatusReport,
+    format: OutputFormat,
+) {
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(status).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(status).unwrap_or_default()
+            );
         }
         OutputFormat::Csv => {
-            println!("experiment,variant,sample_count,avg_score,avg_latency_ms,p95_latency_ms,zero_result_rate");
-            println!("{},A,{},{:.3},{:.1},{},{}",
+            println!(
+                "experiment,variant,sample_count,avg_score,avg_latency_ms,p95_latency_ms,zero_result_rate"
+            );
+            println!(
+                "{},A,{},{:.3},{:.1},{},{}",
                 status.experiment.name,
                 status.variant_a.sample_count,
                 status.variant_a.avg_score,
                 status.variant_a.avg_latency_ms,
                 status.variant_a.p95_latency_ms,
-                status.variant_a.zero_result_rate);
-            println!("{},B,{},{:.3},{:.1},{},{}",
+                status.variant_a.zero_result_rate
+            );
+            println!(
+                "{},B,{},{:.3},{:.1},{},{}",
                 status.experiment.name,
                 status.variant_b.sample_count,
                 status.variant_b.avg_score,
                 status.variant_b.avg_latency_ms,
                 status.variant_b.p95_latency_ms,
-                status.variant_b.zero_result_rate);
+                status.variant_b.zero_result_rate
+            );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             let exp = &status.experiment;
@@ -1401,7 +1602,10 @@ fn format_experiment_status(status: &mdkb::store::stats::ExperimentStatusReport,
                 .map(|dt| dt.format("%Y-%m-%d").to_string())
                 .unwrap_or_else(|| "unknown".to_string());
 
-            println!("Experiment: {} ({} since {})", exp.name, exp.status, started);
+            println!(
+                "Experiment: {} ({} since {})",
+                exp.name, exp.status, started
+            );
             if let Some(desc) = &exp.description {
                 println!("Description: {desc}");
             }
@@ -1409,30 +1613,42 @@ fn format_experiment_status(status: &mdkb::store::stats::ExperimentStatusReport,
 
             // Variant A
             let a = &status.variant_a;
-            println!("Variant A: avg score {:.3}, p95 latency {}ms, n={}",
-                a.avg_score, a.p95_latency_ms, a.sample_count);
+            println!(
+                "Variant A: avg score {:.3}, p95 latency {}ms, n={}",
+                a.avg_score, a.p95_latency_ms, a.sample_count
+            );
             println!("  Config: {}", exp.config_a);
 
             // Variant B
             let b = &status.variant_b;
-            println!("Variant B: avg score {:.3}, p95 latency {}ms, n={}",
-                b.avg_score, b.p95_latency_ms, b.sample_count);
+            println!(
+                "Variant B: avg score {:.3}, p95 latency {}ms, n={}",
+                b.avg_score, b.p95_latency_ms, b.sample_count
+            );
             println!("  Config: {}", exp.config_b);
             println!();
 
             // Significance
             if !status.has_min_samples {
                 let needed = exp.min_sample_size - a.sample_count.min(b.sample_count);
-                println!("Significance: Need {} more samples before statistical analysis", needed.max(0));
+                println!(
+                    "Significance: Need {} more samples before statistical analysis",
+                    needed.max(0)
+                );
             } else if let Some(sig) = &status.significance {
                 if sig.significant {
-                    println!("Significance: {:.0}% confidence {} has better quality (p={:.4}, effect size={:.2})",
+                    println!(
+                        "Significance: {:.0}% confidence {} has better quality (p={:.4}, effect size={:.2})",
                         sig.confidence_level,
                         sig.winner.as_deref().unwrap_or("?"),
                         sig.p_value,
-                        sig.effect_size);
+                        sig.effect_size
+                    );
                 } else {
-                    println!("Significance: No significant difference detected (p={:.4})", sig.p_value);
+                    println!(
+                        "Significance: No significant difference detected (p={:.4})",
+                        sig.p_value
+                    );
                 }
             }
         }
@@ -1442,30 +1658,37 @@ fn format_experiment_status(status: &mdkb::store::stats::ExperimentStatusReport,
 fn format_experiment_list(experiments: &[mdkb::store::stats::Experiment], format: OutputFormat) {
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(experiments).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(experiments).unwrap_or_default()
+            );
         }
         OutputFormat::Csv => {
             println!("name,status,traffic_split,min_samples,created_at,winner");
             for exp in experiments {
-                println!("{},{},{},{},{},{}",
+                println!(
+                    "{},{},{},{},{},{}",
                     exp.name,
                     exp.status,
                     exp.traffic_split,
                     exp.min_sample_size,
                     exp.created_at,
-                    exp.winner.as_deref().unwrap_or(""));
+                    exp.winner.as_deref().unwrap_or("")
+                );
             }
         }
         OutputFormat::Markdown => {
             println!("| Name | Status | Split | Min Samples | Winner |");
             println!("|------|--------|-------|-------------|--------|");
             for exp in experiments {
-                println!("| {} | {} | {:.0}% | {} | {} |",
+                println!(
+                    "| {} | {} | {:.0}% | {} | {} |",
                     exp.name,
                     exp.status,
                     exp.traffic_split * 100.0,
                     exp.min_sample_size,
-                    exp.winner.as_deref().unwrap_or("-"));
+                    exp.winner.as_deref().unwrap_or("-")
+                );
             }
         }
         OutputFormat::Text => {
@@ -1476,10 +1699,15 @@ fn format_experiment_list(experiments: &[mdkb::store::stats::Experiment], format
                     let started = chrono::DateTime::from_timestamp(exp.created_at, 0)
                         .map(|dt| dt.format("%Y-%m-%d").to_string())
                         .unwrap_or_else(|| "unknown".to_string());
-                    let winner_str = exp.winner.as_ref()
+                    let winner_str = exp
+                        .winner
+                        .as_ref()
                         .map(|w| format!(" -> Winner: {w}"))
                         .unwrap_or_default();
-                    println!("{}: {} (started {}){}", exp.name, exp.status, started, winner_str);
+                    println!(
+                        "{}: {} (started {}){}",
+                        exp.name, exp.status, started, winner_str
+                    );
                 }
             }
         }
@@ -1493,7 +1721,12 @@ fn format_journal_import_result(result: &JournalImportResult, dry_run: bool, for
         }
         OutputFormat::Csv => {
             println!("source,created,skipped");
-            println!("{},{},{}", result.source_path, result.created.len(), result.skipped.len());
+            println!(
+                "{},{},{}",
+                result.source_path,
+                result.created.len(),
+                result.skipped.len()
+            );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             let prefix = if dry_run { "[DRY RUN] " } else { "" };
@@ -1514,7 +1747,11 @@ fn format_journal_import_result(result: &JournalImportResult, dry_run: bool, for
     }
 }
 
-fn format_journal_import_all_results(results: &[JournalImportResult], dry_run: bool, format: OutputFormat) {
+fn format_journal_import_all_results(
+    results: &[JournalImportResult],
+    dry_run: bool,
+    format: OutputFormat,
+) {
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(results).unwrap());
@@ -1522,7 +1759,12 @@ fn format_journal_import_all_results(results: &[JournalImportResult], dry_run: b
         OutputFormat::Csv => {
             println!("source,created,skipped");
             for result in results {
-                println!("{},{},{}", result.source_path, result.created.len(), result.skipped.len());
+                println!(
+                    "{},{},{}",
+                    result.source_path,
+                    result.created.len(),
+                    result.skipped.len()
+                );
             }
         }
         OutputFormat::Markdown | OutputFormat::Text => {
@@ -1544,8 +1786,13 @@ fn format_journal_import_all_results(results: &[JournalImportResult], dry_run: b
                 }
             }
 
-            let errors: Vec<_> = results.iter()
-                .flat_map(|r| r.skipped.iter().filter(|(reason, _)| reason.starts_with("Error")))
+            let errors: Vec<_> = results
+                .iter()
+                .flat_map(|r| {
+                    r.skipped
+                        .iter()
+                        .filter(|(reason, _)| reason.starts_with("Error"))
+                })
                 .collect();
 
             if !errors.is_empty() {
@@ -1668,23 +1915,14 @@ fn format_code_graph(
             for t in related {
                 println!(
                     "{},{},{},{},{},{}",
-                    source.name,
-                    label,
-                    t.name,
-                    t.kind,
-                    t.file_path,
-                    t.range.start_line,
+                    source.name, label, t.name, t.kind, t.file_path, t.range.start_line,
                 );
             }
         }
         OutputFormat::Markdown | OutputFormat::Text => {
             println!(
                 "{} for {} {} ({}:{})",
-                label,
-                source.kind,
-                source.name,
-                source.file_path,
-                source.range.start_line,
+                label, source.kind, source.name, source.file_path, source.range.start_line,
             );
             if related.is_empty() {
                 println!("  (none)");
@@ -1745,11 +1983,7 @@ fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format:
             for s in symbols {
                 println!(
                     "{},{},{},{},{:?}",
-                    s.name,
-                    s.kind,
-                    s.range.start_line,
-                    s.range.end_line,
-                    s.visibility,
+                    s.name, s.kind, s.range.start_line, s.range.end_line, s.visibility,
                 );
             }
         }

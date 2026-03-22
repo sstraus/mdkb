@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
-use crate::domain::frontmatter::{parse_frontmatter, ParsedDocument};
+use crate::domain::frontmatter::{ParsedDocument, parse_frontmatter};
 use crate::domain::{Collection, Document, SearchQuery, SearchResult, UpdateResult};
 use crate::error::{Error, ErrorKind, Result};
 use crate::store::collections;
@@ -210,7 +210,11 @@ pub fn handle_vsearch(
     let query_embedding = service.embed_query(query_text)?;
 
     // Perform vector search - get more results to account for collection filtering
-    let fetch_limit = if collection.is_some() { limit * 2 } else { limit };
+    let fetch_limit = if collection.is_some() {
+        limit * 2
+    } else {
+        limit
+    };
     let vector_results = vectors::vector_search(&ctx.conn, &query_embedding, fetch_limit)?;
 
     if vector_results.is_empty() {
@@ -281,15 +285,16 @@ pub fn handle_hybrid_search(
     let bm25_results = search::search(&ctx.conn, &bm25_query)?;
 
     // Vector search — falls back to BM25-only if embedding service is unavailable
-    let vector_results = match crate::llm::get_cached_service()
-        .and_then(|s| s.embed_query(query_text))
-    {
-        Ok(query_embedding) => vectors::chunk_vector_search(&ctx.conn, &query_embedding, limit * 2)?,
-        Err(e) => {
-            tracing::debug!("Hybrid search falling back to BM25-only: {e}");
-            Vec::new()
-        }
-    };
+    let vector_results =
+        match crate::llm::get_cached_service().and_then(|s| s.embed_query(query_text)) {
+            Ok(query_embedding) => {
+                vectors::chunk_vector_search(&ctx.conn, &query_embedding, limit * 2)?
+            }
+            Err(e) => {
+                tracing::debug!("Hybrid search falling back to BM25-only: {e}");
+                Vec::new()
+            }
+        };
 
     // Fuse results using RRF
     let config = hybrid::HybridConfig::default();
@@ -382,8 +387,8 @@ pub fn handle_status(ctx: &Context) -> Result<StatusResult> {
     let collections = coll_list
         .iter()
         .map(|c| {
-            let doc_count = collections::get_collection_document_count(&ctx.conn, &c.name)
-                .unwrap_or(0);
+            let doc_count =
+                collections::get_collection_document_count(&ctx.conn, &c.name).unwrap_or(0);
             CollectionInfo {
                 name: c.name.clone(),
                 path: c.path.clone(),
@@ -408,11 +413,7 @@ pub enum GetResult {
 /// Handle `mdkb get` command.
 ///
 /// Resolution order: numeric ID → file path → memory slug → fallback.
-pub fn handle_get(
-    ctx: &Context,
-    id_or_path: &str,
-    lines: Option<&str>,
-) -> Result<GetResult> {
+pub fn handle_get(ctx: &Context, id_or_path: &str, lines: Option<&str>) -> Result<GetResult> {
     // Try numeric ID first
     if let Ok(id) = id_or_path.parse::<i64>() {
         if let Some(doc) = documents::get_document(&ctx.conn, id)? {
@@ -452,7 +453,11 @@ pub fn handle_get(
 }
 
 /// Get document content, applying optional line range.
-fn get_document_content(ctx: &Context, doc: &crate::domain::Document, lines: Option<&str>) -> Result<String> {
+fn get_document_content(
+    ctx: &Context,
+    doc: &crate::domain::Document,
+    lines: Option<&str>,
+) -> Result<String> {
     let content = documents::get_content(&ctx.conn, &doc.hash)?.ok_or_else(|| {
         Error::from(ErrorKind::DocumentNotFound {
             id: doc.id.to_string(),
@@ -601,9 +606,9 @@ fn update_collection(
     // Validate path stays within root to prevent path traversal (fixes P2-SEC-001).
     // System-managed collections (e.g. claude_sessions) are allowed outside root.
     if collection.source != crate::domain::COLLECTION_SOURCE_SESSIONS {
-        let canonical_root = root.canonicalize().map_err(|e| {
-            Error::other(format!("Failed to canonicalize root path: {}", e))
-        })?;
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|e| Error::other(format!("Failed to canonicalize root path: {}", e)))?;
         let canonical_base = base_path.canonicalize().map_err(|e| {
             Error::other(format!(
                 "Failed to canonicalize collection path '{}': {}",
@@ -646,8 +651,15 @@ fn update_collection(
                 let name = e.file_name().to_string_lossy();
                 !matches!(
                     name.as_ref(),
-                    "target" | "node_modules" | ".git" | "vendor" | "dist"
-                    | "build" | "__pycache__" | ".tox" | ".venv"
+                    "target"
+                        | "node_modules"
+                        | ".git"
+                        | "vendor"
+                        | "dist"
+                        | "build"
+                        | "__pycache__"
+                        | ".tox"
+                        | ".venv"
                 )
             } else {
                 true
@@ -741,12 +753,7 @@ fn update_collection(
 
                 // Process evolution references from frontmatter
                 if has_evolution_refs(&parsed) {
-                    process_frontmatter_evolution(
-                        &ctx.conn,
-                        doc_id,
-                        &collection.name,
-                        &parsed,
-                    );
+                    process_frontmatter_evolution(&ctx.conn, doc_id, &collection.name, &parsed);
                 }
             }
             Err(e) => {
@@ -810,7 +817,10 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
         }
 
         // Batch retrieve all content in a single query (fixes N+1 query pattern)
-        let hashes: Vec<&str> = docs_needing_embedding.iter().map(|d| d.hash.as_str()).collect();
+        let hashes: Vec<&str> = docs_needing_embedding
+            .iter()
+            .map(|d| d.hash.as_str())
+            .collect();
         let content_map = documents::get_content_batch(&ctx.conn, &hashes)?;
 
         for doc in docs_needing_embedding {
@@ -859,7 +869,10 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
                     Err(e) => {
                         result.errors.push(format!(
                             "Failed to embed doc {} ({}, {} chunks): {}",
-                            doc.id, doc.relative_path, chunks.len(), e
+                            doc.id,
+                            doc.relative_path,
+                            chunks.len(),
+                            e
                         ));
                     }
                 }
@@ -1012,8 +1025,8 @@ fn apply_line_range(content: &str, range: &str) -> Result<String> {
 
 // ==================== Memory Handlers ====================
 
-use crate::store::memory::{self, EntryStatus, EntryType, MemoryEntry};
 use crate::store::evolution::{self, Evolution, RelationshipType};
+use crate::store::memory::{self, EntryStatus, EntryType, MemoryEntry};
 
 /// Memory index.json structure.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1053,7 +1066,10 @@ pub fn load_memory_index(ctx: &Context) -> Result<Option<MemoryIndex>> {
 
 /// Save a memory entry to disk as markdown (for backup).
 fn save_entry_to_disk(ctx: &Context, entry: &MemoryEntry) -> Result<()> {
-    let entry_path = ctx.memory_dir().join("entries").join(format!("{}.md", entry.id));
+    let entry_path = ctx
+        .memory_dir()
+        .join("entries")
+        .join(format!("{}.md", entry.id));
 
     let mut content = String::new();
     content.push_str("---\n");
@@ -1224,8 +1240,12 @@ struct ImportEntry {
     updated_at: Option<i64>,
 }
 
-fn default_import_entry_type() -> String { "topic".to_string() }
-fn default_import_source_type() -> String { "user_statement".to_string() }
+fn default_import_entry_type() -> String {
+    "topic".to_string()
+}
+fn default_import_source_type() -> String {
+    "user_statement".to_string()
+}
 
 /// Result of a memory import operation.
 #[derive(Debug)]
@@ -1242,18 +1262,24 @@ pub fn handle_memory_import(
     dry_run: bool,
     skip_duplicates: bool,
 ) -> Result<ImportResult> {
-    let file_content = std::fs::read_to_string(path)
-        .map_err(|e| Error::from(ErrorKind::Io {
+    let file_content = std::fs::read_to_string(path).map_err(|e| {
+        Error::from(ErrorKind::Io {
             path: std::path::PathBuf::from(path),
             operation: format!("read: {e}"),
-        }))?;
+        })
+    })?;
 
-    let import_file: ImportFile = serde_json::from_str(&file_content)
-        .map_err(|e| Error::from(ErrorKind::InvalidQuery(
-            format!("Failed to parse {path}: {e}")
-        )))?;
+    let import_file: ImportFile = serde_json::from_str(&file_content).map_err(|e| {
+        Error::from(ErrorKind::InvalidQuery(format!(
+            "Failed to parse {path}: {e}"
+        )))
+    })?;
 
-    let mut result = ImportResult { imported: 0, skipped: 0, errors: Vec::new() };
+    let mut result = ImportResult {
+        imported: 0,
+        skipped: 0,
+        errors: Vec::new(),
+    };
     let now = chrono::Utc::now().timestamp();
 
     for raw in &import_file.entries {
@@ -1288,7 +1314,10 @@ pub fn handle_memory_import(
                     result.skipped += 1;
                     continue;
                 }
-                result.errors.push(format!("{}: already exists (use --skip-duplicates to ignore)", raw.id));
+                result.errors.push(format!(
+                    "{}: already exists (use --skip-duplicates to ignore)",
+                    raw.id
+                ));
                 continue;
             }
             None => {}
@@ -1313,7 +1342,7 @@ pub fn handle_memory_import(
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-    
+
             last_confirmed_at: None,
             source_type,
         };
@@ -1468,9 +1497,7 @@ fn find_common_tags(entries: &[&memory::MemoryEntry]) -> Vec<String> {
 /// Currently uses heuristic-based concatenation.
 /// TODO: When llama-cpp-rs is integrated, use LLM for smarter consolidation.
 #[cfg(feature = "llm")]
-pub fn generate_consolidated_content(
-    entries: &[memory::MemoryEntry],
-) -> Result<(String, String)> {
+pub fn generate_consolidated_content(entries: &[memory::MemoryEntry]) -> Result<(String, String)> {
     // Generate title from common elements
     let title = if entries.len() == 1 {
         entries[0].title.clone()
@@ -1507,7 +1534,12 @@ pub fn generate_consolidated_content(
     for entry in entries {
         content.push_str(&format!("## From: {}\n\n", entry.title));
         // Skip the first line if it's a title
-        let entry_content = entry.content.lines().skip_while(|l| l.starts_with('#')).collect::<Vec<_>>().join("\n");
+        let entry_content = entry
+            .content
+            .lines()
+            .skip_while(|l| l.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
         content.push_str(&entry_content);
         content.push_str("\n\n");
     }
@@ -1541,7 +1573,11 @@ pub fn handle_memory_condense(
         let entries: Vec<memory::MemoryEntry> = group
             .entry_ids
             .iter()
-            .filter_map(|id| memory::get_entry_without_tracking(&ctx.conn, id).ok().flatten())
+            .filter_map(|id| {
+                memory::get_entry_without_tracking(&ctx.conn, id)
+                    .ok()
+                    .flatten()
+            })
             .collect();
 
         if entries.len() < min_entries {
@@ -1561,7 +1597,8 @@ pub fn handle_memory_condense(
                 id: group.proposed_id.clone(),
                 title,
                 content,
-                entry_type: entries.first()
+                entry_type: entries
+                    .first()
                     .map(|e| e.entry_type)
                     .unwrap_or(memory::EntryType::Topic),
                 tags: group.common_tags.clone(),
@@ -1572,6 +1609,9 @@ pub fn handle_memory_condense(
                 access_count: 0,
                 last_accessed: None,
                 source_path: None,
+                confirmations: 0,
+                last_confirmed_at: None,
+                source_type: memory::SourceType::AutoExtracted,
             };
 
             // Use transaction to ensure atomicity - either all changes succeed or none
@@ -1933,9 +1973,9 @@ pub fn handle_current(ctx: &Context, path_or_id: &str) -> Result<Option<Document
         let superseded_by = evolution::get_superseded_by(&ctx.conn, current_id)?;
 
         // Find a supersedes relationship (not just updates/corrects)
-        let supersession = superseded_by.iter().find(|e| {
-            e.relationship == RelationshipType::Supersedes
-        });
+        let supersession = superseded_by
+            .iter()
+            .find(|e| e.relationship == RelationshipType::Supersedes);
 
         if let Some(evo) = supersession {
             current_id = evo.source_doc_id;
@@ -2022,7 +2062,8 @@ mod tests {
             "topic",
             Some("test,example"),
             "# Test content\n\nThis is test content.",
-        ).expect("add memory should succeed");
+        )
+        .expect("add memory should succeed");
 
         // index.json should be created
         let index_path = temp.path().join(".mdkb/memory/index.json");
@@ -2104,7 +2145,8 @@ mod tests {
         {
             let db_path = temp.path().join(".mdkb/index.sqlite");
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("DROP TABLE IF EXISTS vec_memory").unwrap();
+            conn.execute_batch("DROP TABLE IF EXISTS vec_memory")
+                .unwrap();
 
             // Verify it's gone
             let exists: bool = conn
@@ -2425,7 +2467,11 @@ mod tests {
         // Create stories/ dir with content, then gitignore it
         let stories_dir = temp.path().join("stories");
         std::fs::create_dir(&stories_dir).unwrap();
-        std::fs::write(stories_dir.join("001-done.md"), "# Story 1\n\nCompleted work").unwrap();
+        std::fs::write(
+            stories_dir.join("001-done.md"),
+            "# Story 1\n\nCompleted work",
+        )
+        .unwrap();
         std::fs::write(stories_dir.join("002-done.md"), "# Story 2\n\nMore work").unwrap();
         std::fs::write(temp.path().join(".gitignore"), "stories/\n").unwrap();
 
@@ -2436,7 +2482,10 @@ mod tests {
 
         // Update should index both files despite gitignore
         let result = handle_update(&ctx, temp.path()).expect("update should succeed");
-        assert_eq!(result.added, 2, "gitignored directory should still be indexed by collection walker");
+        assert_eq!(
+            result.added, 2,
+            "gitignored directory should still be indexed by collection walker"
+        );
     }
 
     // ==================== Mget Tests ====================
@@ -2648,7 +2697,10 @@ mod tests {
 
         // Should not fail, just warn
         let result = handle_update(&ctx, temp.path());
-        assert!(result.is_ok(), "update should succeed even with invalid reference");
+        assert!(
+            result.is_ok(),
+            "update should succeed even with invalid reference"
+        );
 
         // Document should be indexed
         let doc = documents::get_document_by_path(&ctx.conn, "docs", "new.md")
@@ -2670,7 +2722,11 @@ mod tests {
         std::fs::create_dir(&docs_dir).unwrap();
 
         // Create old document
-        std::fs::write(docs_dir.join("old.md"), "---\ntitle: Old\n---\n\nOld content.").unwrap();
+        std::fs::write(
+            docs_dir.join("old.md"),
+            "---\ntitle: Old\n---\n\nOld content.",
+        )
+        .unwrap();
 
         handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
         handle_update(&ctx, temp.path()).unwrap();
@@ -2719,9 +2775,7 @@ mod tests {
 
         // Build fake session directory matching encode_project_path for temp path
         let sessions_base = temp.path().join("sessions");
-        let encoded = crate::domain::sessions::encode_project_path(
-            &temp.path().to_string_lossy(),
-        );
+        let encoded = crate::domain::sessions::encode_project_path(&temp.path().to_string_lossy());
         let session_dir = sessions_base.join(&encoded);
         std::fs::create_dir_all(&session_dir).unwrap();
 
@@ -2732,22 +2786,21 @@ mod tests {
         )
         .unwrap();
 
-        let result = handle_session_index(
-            &ctx,
-            &sessions_base,
-            &temp.path().to_string_lossy(),
-        )
-        .unwrap();
+        let result =
+            handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
 
         assert!(result.added > 0);
         assert_eq!(result.errors.len(), 0);
 
         // Collection should exist
-        let coll = collections::get_collection(&ctx.conn, crate::domain::COLLECTION_CLAUDE_SESSIONS).unwrap();
+        let coll =
+            collections::get_collection(&ctx.conn, crate::domain::COLLECTION_CLAUDE_SESSIONS)
+                .unwrap();
         assert!(coll.is_some());
 
         // Document should be searchable
-        let docs = documents::list_documents(&ctx.conn, crate::domain::COLLECTION_CLAUDE_SESSIONS).unwrap();
+        let docs = documents::list_documents(&ctx.conn, crate::domain::COLLECTION_CLAUDE_SESSIONS)
+            .unwrap();
         assert!(!docs.is_empty());
     }
 
@@ -2758,9 +2811,7 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
 
         let sessions_base = temp.path().join("sessions");
-        let encoded = crate::domain::sessions::encode_project_path(
-            &temp.path().to_string_lossy(),
-        );
+        let encoded = crate::domain::sessions::encode_project_path(&temp.path().to_string_lossy());
         let session_dir = sessions_base.join(&encoded);
         std::fs::create_dir_all(&session_dir).unwrap();
 
@@ -2771,12 +2822,8 @@ mod tests {
         )
         .unwrap();
 
-        let result = handle_session_index(
-            &ctx,
-            &sessions_base,
-            &temp.path().to_string_lossy(),
-        )
-        .unwrap();
+        let result =
+            handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
 
         assert_eq!(result.added, 0);
         assert_eq!(result.updated, 0);
@@ -2789,9 +2836,7 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
 
         let sessions_base = temp.path().join("sessions");
-        let encoded = crate::domain::sessions::encode_project_path(
-            &temp.path().to_string_lossy(),
-        );
+        let encoded = crate::domain::sessions::encode_project_path(&temp.path().to_string_lossy());
         let session_dir = sessions_base.join(&encoded);
         std::fs::create_dir_all(&session_dir).unwrap();
 
@@ -2802,21 +2847,13 @@ mod tests {
         .unwrap();
 
         // First index
-        let r1 = handle_session_index(
-            &ctx,
-            &sessions_base,
-            &temp.path().to_string_lossy(),
-        )
-        .unwrap();
+        let r1 =
+            handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
         assert!(r1.added > 0);
 
         // Second index without modification — should skip via mtime
-        let r2 = handle_session_index(
-            &ctx,
-            &sessions_base,
-            &temp.path().to_string_lossy(),
-        )
-        .unwrap();
+        let r2 =
+            handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
         assert_eq!(r2.added, 0);
         assert!(r2.unchanged > 0);
     }
@@ -2830,12 +2867,8 @@ mod tests {
         let sessions_base = temp.path().join("sessions");
         std::fs::create_dir_all(&sessions_base).unwrap();
 
-        let result = handle_session_index(
-            &ctx,
-            &sessions_base,
-            "/nonexistent/project/path",
-        )
-        .unwrap();
+        let result =
+            handle_session_index(&ctx, &sessions_base, "/nonexistent/project/path").unwrap();
 
         assert_eq!(result.added, 0);
         assert_eq!(result.updated, 0);
@@ -3021,26 +3054,33 @@ pub fn handle_experiment_create(
 ) -> Result<ExperimentCreateResult> {
     // Validate name length and format
     if name.is_empty() || name.len() > MAX_NAME_LENGTH {
-        return Err(Error::from(ErrorKind::Config(
-            format!("Experiment name must be 1-{} characters", MAX_NAME_LENGTH)
-        )));
+        return Err(Error::from(ErrorKind::Config(format!(
+            "Experiment name must be 1-{} characters",
+            MAX_NAME_LENGTH
+        ))));
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
         return Err(Error::from(ErrorKind::Config(
-            "Experiment name must contain only alphanumeric characters, hyphens, and underscores".to_string()
+            "Experiment name must contain only alphanumeric characters, hyphens, and underscores"
+                .to_string(),
         )));
     }
 
     // Validate config sizes before parsing
     if config_a.len() > MAX_CONFIG_SIZE {
-        return Err(Error::from(ErrorKind::Config(
-            format!("config-a exceeds maximum size of {} bytes", MAX_CONFIG_SIZE)
-        )));
+        return Err(Error::from(ErrorKind::Config(format!(
+            "config-a exceeds maximum size of {} bytes",
+            MAX_CONFIG_SIZE
+        ))));
     }
     if config_b.len() > MAX_CONFIG_SIZE {
-        return Err(Error::from(ErrorKind::Config(
-            format!("config-b exceeds maximum size of {} bytes", MAX_CONFIG_SIZE)
-        )));
+        return Err(Error::from(ErrorKind::Config(format!(
+            "config-b exceeds maximum size of {} bytes",
+            MAX_CONFIG_SIZE
+        ))));
     }
 
     // Validate JSON configs
@@ -3052,14 +3092,14 @@ pub fn handle_experiment_create(
     // Validate split
     if !(0.0..=1.0).contains(&split) {
         return Err(Error::from(ErrorKind::Config(
-            "Traffic split must be between 0.0 and 1.0".to_string()
+            "Traffic split must be between 0.0 and 1.0".to_string(),
         )));
     }
 
     // Validate min_samples
     if min_samples < 1 || min_samples > 10_000 {
         return Err(Error::from(ErrorKind::Config(
-            "min_samples must be between 1 and 10,000".to_string()
+            "min_samples must be between 1 and 10,000".to_string(),
         )));
     }
 
@@ -3112,7 +3152,11 @@ pub fn handle_experiment_end(
                     None
                 }
             }
-            None => return Err(Error::from(ErrorKind::Config(format!("Experiment '{name}' not found")))),
+            None => {
+                return Err(Error::from(ErrorKind::Config(format!(
+                    "Experiment '{name}' not found"
+                ))));
+            }
         }
     };
 
@@ -3151,8 +3195,7 @@ pub fn handle_journal_import(
     dry_run: bool,
 ) -> Result<JournalImportResult> {
     // Read journal file
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| Error::from(ErrorKind::IoError(e)))?;
+    let content = std::fs::read_to_string(path).map_err(|e| Error::from(ErrorKind::IoError(e)))?;
 
     // Parse journal
     let parsed = journal::parse_journal(&content);
@@ -3169,7 +3212,9 @@ pub fn handle_journal_import(
     };
 
     if entries.is_empty() {
-        result.skipped.push(("No content".to_string(), "entire file".to_string()));
+        result
+            .skipped
+            .push(("No content".to_string(), "entire file".to_string()));
         return Ok(result);
     }
 
@@ -3179,7 +3224,9 @@ pub fn handle_journal_import(
         } else {
             // Check if entry with this ID already exists
             if memory::get_entry_without_tracking(&ctx.conn, &entry.id)?.is_some() {
-                result.skipped.push(("Already exists".to_string(), entry.id));
+                result
+                    .skipped
+                    .push(("Already exists".to_string(), entry.id));
                 continue;
             }
 
@@ -3260,7 +3307,7 @@ pub fn handle_session_index(
     sessions_path: &Path,
     project_root: &str,
 ) -> Result<UpdateResult> {
-    use crate::domain::sessions::{find_session_dir, parse_session_file, SessionParseConfig};
+    use crate::domain::sessions::{SessionParseConfig, find_session_dir, parse_session_file};
 
     let session_dir = match find_session_dir(sessions_path, project_root) {
         Some(dir) => dir,
@@ -3283,7 +3330,10 @@ pub fn handle_session_index(
             updated_at: now,
         };
         collections::add_collection(&ctx.conn, &coll)?;
-        tracing::info!("Created claude_sessions collection at {}", session_dir.display());
+        tracing::info!(
+            "Created claude_sessions collection at {}",
+            session_dir.display()
+        );
     }
 
     let config = SessionParseConfig::default();
@@ -3440,13 +3490,16 @@ pub fn handle_code_reindex(
         root.to_path_buf()
     } else {
         let candidate = root.join(&paths[0]);
-        let canonical = candidate.canonicalize()
+        let canonical = candidate
+            .canonicalize()
             .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", paths[0])))?;
-        let root_canonical = root.canonicalize()
+        let root_canonical = root
+            .canonicalize()
             .map_err(|e| Error::other(format!("Cannot resolve root: {e}")))?;
         if !canonical.starts_with(&root_canonical) {
             return Err(Error::other(format!(
-                "Path '{}' escapes project root", paths[0]
+                "Path '{}' escapes project root",
+                paths[0]
             )));
         }
         canonical
@@ -3514,7 +3567,10 @@ pub fn handle_code_find(
 pub fn handle_code_calls(
     root: &Path,
     name: &str,
-) -> Result<(crate::code::symbol::Symbol, Vec<crate::code::symbol::Symbol>)> {
+) -> Result<(
+    crate::code::symbol::Symbol,
+    Vec<crate::code::symbol::Symbol>,
+)> {
     let index_path = root.join(".mdkb/code.sqlite");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
@@ -3531,7 +3587,10 @@ pub fn handle_code_calls(
 pub fn handle_code_callers(
     root: &Path,
     name: &str,
-) -> Result<(crate::code::symbol::Symbol, Vec<crate::code::symbol::Symbol>)> {
+) -> Result<(
+    crate::code::symbol::Symbol,
+    Vec<crate::code::symbol::Symbol>,
+)> {
     let index_path = root.join(".mdkb/code.sqlite");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
@@ -3549,7 +3608,10 @@ pub fn handle_code_impact(
     root: &Path,
     name: &str,
     depth: usize,
-) -> Result<(crate::code::symbol::Symbol, Vec<crate::code::symbol::Symbol>)> {
+) -> Result<(
+    crate::code::symbol::Symbol,
+    Vec<crate::code::symbol::Symbol>,
+)> {
     let index_path = root.join(".mdkb/code.sqlite");
     let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
@@ -3586,8 +3648,9 @@ pub fn handle_code_parse(file: &Path) -> Result<Vec<crate::code::symbol::Symbol>
     use crate::code::parsing::parser::LanguageParser;
     use crate::code::types::{FileId, SymbolCounter};
 
-    let language = Language::from_path(file)
-        .ok_or_else(|| Error::other(format!("Unsupported language for file: {}", file.display())))?;
+    let language = Language::from_path(file).ok_or_else(|| {
+        Error::other(format!("Unsupported language for file: {}", file.display()))
+    })?;
 
     let code = std::fs::read_to_string(file)
         .map_err(|e| Error::other(format!("Failed to read '{}': {}", file.display(), e)))?;
@@ -3596,34 +3659,58 @@ pub fn handle_code_parse(file: &Path) -> Result<Vec<crate::code::symbol::Symbol>
     let mut counter = SymbolCounter::new();
 
     let mut parser: Box<dyn LanguageParser> = match language {
-        Language::Rust => Box::new(crate::code::parsing::rust::RustParser::new()
-            .map_err(|e| Error::other(format!("Failed to create Rust parser: {}", e)))?),
-        Language::Go => Box::new(crate::code::parsing::go::GoParser::new()
-            .map_err(|e| Error::other(format!("Failed to create Go parser: {}", e)))?),
-        Language::TypeScript | Language::JavaScript => {
-            Box::new(crate::code::parsing::typescript::TypeScriptParser::new()
-                .map_err(|e| Error::other(format!("Failed to create TypeScript parser: {}", e)))?)
-        }
-        Language::Python => Box::new(crate::code::parsing::python::PythonParser::new()
-            .map_err(|e| Error::other(format!("Failed to create Python parser: {}", e)))?),
-        Language::Java => Box::new(crate::code::parsing::java::JavaParser::new()
-            .map_err(|e| Error::other(format!("Failed to create Java parser: {}", e)))?),
-        Language::C => Box::new(crate::code::parsing::c_lang::CParser::new()
-            .map_err(|e| Error::other(format!("Failed to create C parser: {}", e)))?),
-        Language::Cpp => Box::new(crate::code::parsing::cpp::CppParser::new()
-            .map_err(|e| Error::other(format!("Failed to create C++ parser: {}", e)))?),
-        Language::CSharp => Box::new(crate::code::parsing::csharp::CSharpParser::new()
-            .map_err(|e| Error::other(format!("Failed to create C# parser: {}", e)))?),
-        Language::Php => Box::new(crate::code::parsing::php::PhpParser::new()
-            .map_err(|e| Error::other(format!("Failed to create PHP parser: {}", e)))?),
-        Language::Swift => Box::new(crate::code::parsing::swift::SwiftParser::new()
-            .map_err(|e| Error::other(format!("Failed to create Swift parser: {}", e)))?),
-        Language::Lua => Box::new(crate::code::parsing::lua::LuaParser::new()
-            .map_err(|e| Error::other(format!("Failed to create Lua parser: {}", e)))?),
-        Language::Gdscript => Box::new(crate::code::parsing::gdscript::GdscriptParser::new()
-            .map_err(|e| Error::other(format!("Failed to create GDScript parser: {}", e)))?),
-        Language::Kotlin => Box::new(crate::code::parsing::kotlin::KotlinParser::new()
-            .map_err(|e| Error::other(format!("Failed to create Kotlin parser: {}", e)))?),
+        Language::Rust => Box::new(
+            crate::code::parsing::rust::RustParser::new()
+                .map_err(|e| Error::other(format!("Failed to create Rust parser: {}", e)))?,
+        ),
+        Language::Go => Box::new(
+            crate::code::parsing::go::GoParser::new()
+                .map_err(|e| Error::other(format!("Failed to create Go parser: {}", e)))?,
+        ),
+        Language::TypeScript | Language::JavaScript => Box::new(
+            crate::code::parsing::typescript::TypeScriptParser::new()
+                .map_err(|e| Error::other(format!("Failed to create TypeScript parser: {}", e)))?,
+        ),
+        Language::Python => Box::new(
+            crate::code::parsing::python::PythonParser::new()
+                .map_err(|e| Error::other(format!("Failed to create Python parser: {}", e)))?,
+        ),
+        Language::Java => Box::new(
+            crate::code::parsing::java::JavaParser::new()
+                .map_err(|e| Error::other(format!("Failed to create Java parser: {}", e)))?,
+        ),
+        Language::C => Box::new(
+            crate::code::parsing::c_lang::CParser::new()
+                .map_err(|e| Error::other(format!("Failed to create C parser: {}", e)))?,
+        ),
+        Language::Cpp => Box::new(
+            crate::code::parsing::cpp::CppParser::new()
+                .map_err(|e| Error::other(format!("Failed to create C++ parser: {}", e)))?,
+        ),
+        Language::CSharp => Box::new(
+            crate::code::parsing::csharp::CSharpParser::new()
+                .map_err(|e| Error::other(format!("Failed to create C# parser: {}", e)))?,
+        ),
+        Language::Php => Box::new(
+            crate::code::parsing::php::PhpParser::new()
+                .map_err(|e| Error::other(format!("Failed to create PHP parser: {}", e)))?,
+        ),
+        Language::Swift => Box::new(
+            crate::code::parsing::swift::SwiftParser::new()
+                .map_err(|e| Error::other(format!("Failed to create Swift parser: {}", e)))?,
+        ),
+        Language::Lua => Box::new(
+            crate::code::parsing::lua::LuaParser::new()
+                .map_err(|e| Error::other(format!("Failed to create Lua parser: {}", e)))?,
+        ),
+        Language::Gdscript => Box::new(
+            crate::code::parsing::gdscript::GdscriptParser::new()
+                .map_err(|e| Error::other(format!("Failed to create GDScript parser: {}", e)))?,
+        ),
+        Language::Kotlin => Box::new(
+            crate::code::parsing::kotlin::KotlinParser::new()
+                .map_err(|e| Error::other(format!("Failed to create Kotlin parser: {}", e)))?,
+        ),
     };
 
     let symbols = parser.parse(&code, file_id, &mut counter);
