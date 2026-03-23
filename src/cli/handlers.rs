@@ -682,86 +682,18 @@ fn update_collection(
         // Remove from existing set (to track deletions)
         existing_paths.remove(&relative);
 
-        // Get file modification time
-        let metadata = match std::fs::metadata(path) {
-            Ok(m) => m,
-            Err(e) => {
-                result.errors.push(format!(
-                    "Failed to read metadata for {}: {}",
-                    path.display(),
-                    e
-                ));
-                continue;
-            }
-        };
-
-        let file_mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-
-        // Check if document exists and compare mtime (from prefetched map)
+        // Check if document exists (from prefetched map)
         let existing_doc = existing_by_path.remove(&relative);
 
-        let needs_index = match &existing_doc {
-            Some(doc) => file_mtime > doc.indexed_at,
-            None => true,
-        };
-
-        if !needs_index {
-            result.unchanged += 1;
-            continue;
-        }
-
-        // Read and index the file
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                result
-                    .errors
-                    .push(format!("Failed to read {}: {}", path.display(), e));
-                continue;
-            }
-        };
-
-        // Parse frontmatter for title and evolution
-        let parsed = parse_frontmatter(&content);
-        let now = chrono::Utc::now().timestamp();
-
-        let doc = Document {
-            id: existing_doc.as_ref().map(|d| d.id).unwrap_or(0),
-            collection: collection.name.clone(),
-            relative_path: relative,
-            hash: String::new(), // Will be computed by index_document
-            title: parsed.title.clone(),
-            metadata: parsed.frontmatter.clone(),
-            file_modified_at: file_mtime,
-            indexed_at: now,
-            status: None,
-        };
-
-        // Use in-transaction version since we're inside a transaction
-        match documents::index_document_in_tx(&ctx.conn, &doc, &content) {
-            Ok(doc_id) => {
-                if existing_doc.is_some() {
-                    result.updated += 1;
-                } else {
-                    result.added += 1;
-                }
-
-                // Process evolution references from frontmatter
-                if has_evolution_refs(&parsed) {
-                    process_frontmatter_evolution(&ctx.conn, doc_id, &collection.name, &parsed);
-                }
-            }
-            Err(e) => {
-                result
-                    .errors
-                    .push(format!("Failed to index {}: {}", path.display(), e));
-            }
-        }
+        index_single_file(
+            ctx,
+            &collection.name,
+            path,
+            relative,
+            existing_doc.as_ref(),
+            &path.display().to_string(),
+            result,
+        );
     }
 
     // Remove documents for deleted files (remaining in prefetched map)
@@ -782,6 +714,103 @@ fn update_collection(
     Ok(())
 }
 
+/// Index a single file within a transaction. Shared by `update_collection` and
+/// `handle_update_files` to avoid duplicating the mtime/read/index/evolution pipeline.
+///
+/// `existing_doc` is the previously indexed version (if any). Pass `None` for new files.
+/// All errors are soft — pushed to `result.errors` and the caller continues.
+fn index_single_file(
+    ctx: &Context,
+    collection_name: &str,
+    abs_path: &Path,
+    relative: String,
+    existing_doc: Option<&Document>,
+    display_name: &str,
+    result: &mut UpdateResult,
+) {
+    // Read file metadata for mtime
+    let metadata = match std::fs::metadata(abs_path) {
+        Ok(m) => m,
+        Err(e) => {
+            result
+                .errors
+                .push(format!("Failed to read metadata for {}: {}", display_name, e));
+            return;
+        }
+    };
+
+    let file_mtime = match metadata.modified() {
+        Ok(t) => t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        Err(e) => {
+            tracing::warn!(
+                file = %display_name,
+                error = %e,
+                "Cannot read mtime; forcing reindex"
+            );
+            i64::MAX // force reindex when mtime is unreadable
+        }
+    };
+
+    // Check if document needs reindexing based on mtime
+    let needs_index = match existing_doc {
+        Some(doc) => file_mtime > doc.indexed_at,
+        None => true,
+    };
+
+    if !needs_index {
+        result.unchanged += 1;
+        return;
+    }
+
+    // Read and index the file
+    let content = match std::fs::read_to_string(abs_path) {
+        Ok(c) => c,
+        Err(e) => {
+            result
+                .errors
+                .push(format!("Failed to read {}: {}", display_name, e));
+            return;
+        }
+    };
+
+    let parsed = parse_frontmatter(&content);
+    let now = chrono::Utc::now().timestamp();
+
+    let doc = Document {
+        id: existing_doc.map(|d| d.id).unwrap_or(0),
+        collection: collection_name.to_string(),
+        relative_path: relative,
+        hash: String::new(), // Will be computed by index_document
+        title: parsed.title.clone(),
+        metadata: parsed.frontmatter.clone(),
+        file_modified_at: file_mtime,
+        indexed_at: now,
+        status: None,
+    };
+
+    match documents::index_document_in_tx(&ctx.conn, &doc, &content) {
+        Ok(doc_id) => {
+            if existing_doc.is_some() {
+                result.updated += 1;
+            } else {
+                result.added += 1;
+            }
+
+            if has_evolution_refs(&parsed) {
+                process_frontmatter_evolution(&ctx.conn, doc_id, collection_name, &parsed);
+            }
+        }
+        Err(e) => {
+            result
+                .errors
+                .push(format!("Failed to index {}: {}", display_name, e));
+        }
+    }
+}
+
 /// Handle `mdkb update --files <paths>` — reindex only the specified files.
 ///
 /// Resolves each path (absolute or relative to root) against registered collections.
@@ -799,131 +828,42 @@ pub fn handle_update_files(
         return Ok(result);
     }
 
-    // Build glob matchers for each collection
-    let matchers: Vec<(&Collection, globset::GlobMatcher)> = collections
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| Error::other(format!("Failed to canonicalize root: {}", e)))?;
+
+    // Build glob matchers with pre-computed canonical bases.
+    // Filter out sessions collections (they live outside root and should not
+    // be reachable via user-supplied file paths).
+    let matchers: Vec<(&Collection, globset::GlobMatcher, PathBuf)> = collections
         .iter()
+        .filter(|c| c.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
         .filter_map(|coll| {
-            Glob::new(&coll.pattern)
-                .ok()
-                .map(|g| (coll, g.compile_matcher()))
+            match Glob::new(&coll.pattern) {
+                Ok(g) => {
+                    let canonical_base = root.join(&coll.path).canonicalize().ok()?;
+                    Some((coll, g.compile_matcher(), canonical_base))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        collection = %coll.name,
+                        pattern = %coll.pattern,
+                        error = %e,
+                        "Skipping collection: invalid glob pattern"
+                    );
+                    result.errors.push(format!(
+                        "Invalid glob pattern '{}' for collection '{}': {}",
+                        coll.pattern, coll.name, e
+                    ));
+                    None
+                }
+            }
         })
         .collect();
 
     documents::begin_transaction(&ctx.conn)?;
 
-    let tx_result = (|| -> Result<()> {
-        for file_arg in files {
-            let file_path = PathBuf::from(file_arg);
-
-            // Resolve to absolute path
-            let abs_path = if file_path.is_absolute() {
-                file_path
-            } else {
-                root.join(&file_path)
-            };
-
-            if !abs_path.exists() {
-                result
-                    .errors
-                    .push(format!("File not found: {}", file_arg));
-                continue;
-            }
-
-            // Find which collection this file belongs to
-            let matched = matchers.iter().find_map(|(coll, matcher)| {
-                let base_path = root.join(&coll.path);
-                let canonical_base = base_path.canonicalize().ok()?;
-                let canonical_file = abs_path.canonicalize().ok()?;
-
-                // File must be under the collection's base path
-                let relative = canonical_file
-                    .strip_prefix(&canonical_base)
-                    .ok()?
-                    .to_string_lossy()
-                    .to_string();
-
-                // File must match the collection's glob pattern
-                if matcher.is_match(&relative) {
-                    Some((coll, relative))
-                } else {
-                    None
-                }
-            });
-
-            let (collection, relative) = match matched {
-                Some(m) => m,
-                None => continue, // silently skip files outside collections
-            };
-
-            // Read file metadata for mtime
-            let metadata = std::fs::metadata(&abs_path).map_err(|e| {
-                Error::other(format!("Failed to read metadata for {}: {}", file_arg, e))
-            })?;
-            let file_mtime = metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-
-            // Check existing document
-            let existing_doc =
-                documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
-
-            let needs_index = match &existing_doc {
-                Some(doc) => file_mtime > doc.indexed_at,
-                None => true,
-            };
-
-            if !needs_index {
-                result.unchanged += 1;
-                continue;
-            }
-
-            let content = std::fs::read_to_string(&abs_path).map_err(|e| {
-                Error::other(format!("Failed to read {}: {}", file_arg, e))
-            })?;
-
-            let parsed = parse_frontmatter(&content);
-            let now = chrono::Utc::now().timestamp();
-
-            let doc = Document {
-                id: existing_doc.as_ref().map(|d| d.id).unwrap_or(0),
-                collection: collection.name.clone(),
-                relative_path: relative,
-                hash: String::new(),
-                title: parsed.title.clone(),
-                metadata: parsed.frontmatter.clone(),
-                file_modified_at: file_mtime,
-                indexed_at: now,
-                status: None,
-            };
-
-            match documents::index_document_in_tx(&ctx.conn, &doc, &content) {
-                Ok(doc_id) => {
-                    if existing_doc.is_some() {
-                        result.updated += 1;
-                    } else {
-                        result.added += 1;
-                    }
-                    if has_evolution_refs(&parsed) {
-                        process_frontmatter_evolution(
-                            &ctx.conn,
-                            doc_id,
-                            &collection.name,
-                            &parsed,
-                        );
-                    }
-                }
-                Err(e) => {
-                    result
-                        .errors
-                        .push(format!("Failed to index {}: {}", file_arg, e));
-                }
-            }
-        }
-        Ok(())
-    })();
+    let tx_result = index_specified_files(ctx, &canonical_root, &matchers, files, &mut result);
 
     match tx_result {
         Ok(()) => {
@@ -931,10 +871,91 @@ pub fn handle_update_files(
             Ok(result)
         }
         Err(e) => {
-            let _ = documents::rollback_transaction(&ctx.conn);
+            if let Err(rb_err) = documents::rollback_transaction(&ctx.conn) {
+                tracing::error!(
+                    rollback_error = %rb_err,
+                    original_error = %e,
+                    "ROLLBACK failed after transaction error"
+                );
+            }
             Err(e)
         }
     }
+}
+
+/// Process each user-supplied file path within a transaction.
+fn index_specified_files(
+    ctx: &Context,
+    canonical_root: &Path,
+    matchers: &[(&Collection, globset::GlobMatcher, PathBuf)],
+    files: &[String],
+    result: &mut UpdateResult,
+) -> Result<()> {
+    for file_arg in files {
+        let file_path = PathBuf::from(file_arg);
+
+        // Resolve to absolute path
+        let abs_path = if file_path.is_absolute() {
+            file_path
+        } else {
+            canonical_root.join(&file_path)
+        };
+
+        // Canonicalize once per file for security check + collection matching
+        let canonical_file = match abs_path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                result
+                    .errors
+                    .push(format!("File not found: {}", file_arg));
+                continue;
+            }
+        };
+
+        // Guard: file must resolve within root (path traversal protection, P2-SEC-001)
+        if !canonical_file.starts_with(canonical_root) {
+            result.errors.push(format!(
+                "File '{}' escapes root directory (path traversal blocked)",
+                file_arg
+            ));
+            continue;
+        }
+
+        // Find which collection this file belongs to
+        let matched = matchers.iter().find_map(|(coll, matcher, canonical_base)| {
+            let relative = canonical_file
+                .strip_prefix(canonical_base)
+                .ok()?
+                .to_string_lossy()
+                .to_string();
+
+            if matcher.is_match(&relative) {
+                Some((*coll, relative))
+            } else {
+                None
+            }
+        });
+
+        let (collection, relative) = match matched {
+            Some(m) => m,
+            None => continue, // file not in any collection — skip
+        };
+
+        // Look up existing document for mtime comparison
+        let existing_doc =
+            documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
+
+        index_single_file(
+            ctx,
+            &collection.name,
+            &canonical_file,
+            relative,
+            existing_doc.as_ref(),
+            file_arg,
+            result,
+        );
+    }
+    Ok(())
 }
 
 /// Generate embeddings for all documents that don't have them.
@@ -2753,6 +2774,148 @@ mod tests {
         )
         .expect("update_files should succeed");
         assert_eq!(result.added, 1, "should index file via relative path");
+
+        // Verify stored path is the canonical relative form
+        let doc =
+            documents::get_document_by_path(&ctx.conn, "docs", "readme.md").unwrap();
+        assert!(doc.is_some(), "should be retrievable by canonical relative path");
+    }
+
+    #[test]
+    fn test_handle_update_files_file_not_found() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &["/tmp/does_not_exist_xyz_12345.md".to_string()],
+        )
+        .expect("should succeed overall");
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].contains("File not found"));
+        assert_eq!(result.added, 0);
+    }
+
+    #[test]
+    fn test_handle_update_files_continues_after_bad_path() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("good.md"), "# Good\n\nContent").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+
+        // First path is bad, second is good — both should be processed
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &[
+                "/tmp/nonexistent_xyz.md".to_string(),
+                docs_dir.join("good.md").to_string_lossy().to_string(),
+            ],
+        )
+        .expect("should succeed overall");
+        assert_eq!(result.errors.len(), 1, "bad path should produce one error");
+        assert_eq!(result.added, 1, "good path should still be indexed");
+    }
+
+    #[test]
+    fn test_handle_update_files_skips_unchanged() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        let file_path = docs_dir.join("readme.md");
+        std::fs::write(&file_path, "# Test\n\nContent").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+
+        // Index once
+        let r1 = handle_update_files(
+            &ctx,
+            temp.path(),
+            &[file_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        assert_eq!(r1.added, 1);
+
+        // Call again immediately — mtime hasn't changed
+        let r2 = handle_update_files(
+            &ctx,
+            temp.path(),
+            &[file_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        assert_eq!(r2.unchanged, 1);
+        assert_eq!(r2.updated, 0);
+        assert_eq!(r2.added, 0);
+    }
+
+    #[test]
+    fn test_handle_update_files_blocks_path_traversal() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+
+        // Try to index a file outside the project root
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &["/etc/hosts".to_string()],
+        )
+        .expect("should succeed overall");
+        assert_eq!(result.added, 0, "file outside root should not be indexed");
+        assert!(
+            result.errors.iter().any(|e| e.contains("path traversal")),
+            "should report path traversal error"
+        );
+    }
+
+    #[test]
+    fn test_handle_update_files_updates_verifies_content() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        let file_path = docs_dir.join("readme.md");
+        std::fs::write(&file_path, "# Old Title\n\nOld content").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update_files(
+            &ctx,
+            temp.path(),
+            &[file_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::write(&file_path, "# New Title\n\nNew content").unwrap();
+
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &[file_path.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        assert_eq!(result.updated, 1);
+
+        // Verify stored content was actually updated
+        let doc =
+            documents::get_document_by_path(&ctx.conn, "docs", "readme.md")
+                .unwrap()
+                .expect("doc should exist");
+        assert_eq!(doc.title, Some("New Title".to_string()));
     }
 
     // ==================== Mget Tests ====================
