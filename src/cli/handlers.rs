@@ -19,6 +19,28 @@ use rusqlite::Connection;
 use serde::Deserialize;
 use walkdir::WalkDir;
 
+/// Run `body` inside a BEGIN IMMEDIATE / COMMIT transaction.
+/// On error, ROLLBACK is attempted and logged if it also fails.
+fn with_transaction<T>(conn: &Connection, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    documents::begin_transaction(conn)?;
+    match body() {
+        Ok(val) => {
+            documents::commit_transaction(conn)?;
+            Ok(val)
+        }
+        Err(e) => {
+            if let Err(rb_err) = documents::rollback_transaction(conn) {
+                tracing::error!(
+                    rollback_error = %rb_err,
+                    original_error = %e,
+                    "ROLLBACK failed after transaction error"
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Context for CLI operations.
 pub struct Context {
     /// Database connection.
@@ -537,20 +559,11 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult::default();
 
-    // Begin transaction for all updates
-    documents::begin_transaction(&ctx.conn)?;
-
-    match update_all_collections(ctx, root, &collections, &mut result) {
-        Ok(()) => {
-            documents::commit_transaction(&ctx.conn)?;
-            Ok(result)
-        }
-        Err(e) => {
-            // Rollback on error
-            let _ = documents::rollback_transaction(&ctx.conn);
-            Err(e)
-        }
-    }
+    with_transaction(&ctx.conn, || {
+        update_all_collections(ctx, root, &collections, &mut result)?;
+        Ok(())
+    })?;
+    Ok(result)
 }
 
 /// Detect and register convention-based collections.
@@ -742,15 +755,18 @@ fn index_single_file(
     let file_mtime = match metadata.modified() {
         Ok(t) => t
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or_else(|_| {
+                tracing::warn!(file = %display_name, "mtime before epoch; forcing reindex");
+                i64::MAX
+            }),
         Err(e) => {
             tracing::warn!(
                 file = %display_name,
                 error = %e,
                 "Cannot read mtime; forcing reindex"
             );
-            i64::MAX // force reindex when mtime is unreadable
+            i64::MAX
         }
     };
 
@@ -841,8 +857,22 @@ pub fn handle_update_files(
         .filter_map(|coll| {
             match Glob::new(&coll.pattern) {
                 Ok(g) => {
-                    let canonical_base = root.join(&coll.path).canonicalize().ok()?;
-                    Some((coll, g.compile_matcher(), canonical_base))
+                    match root.join(&coll.path).canonicalize() {
+                        Ok(canonical_base) => Some((coll, g.compile_matcher(), canonical_base)),
+                        Err(e) => {
+                            tracing::warn!(
+                                collection = %coll.name,
+                                path = %coll.path,
+                                error = %e,
+                                "Skipping collection: base path cannot be resolved"
+                            );
+                            result.errors.push(format!(
+                                "Cannot resolve base path for collection '{}': {}",
+                                coll.name, e
+                            ));
+                            None
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -861,26 +891,10 @@ pub fn handle_update_files(
         })
         .collect();
 
-    documents::begin_transaction(&ctx.conn)?;
-
-    let tx_result = index_specified_files(ctx, &canonical_root, &matchers, files, &mut result);
-
-    match tx_result {
-        Ok(()) => {
-            documents::commit_transaction(&ctx.conn)?;
-            Ok(result)
-        }
-        Err(e) => {
-            if let Err(rb_err) = documents::rollback_transaction(&ctx.conn) {
-                tracing::error!(
-                    rollback_error = %rb_err,
-                    original_error = %e,
-                    "ROLLBACK failed after transaction error"
-                );
-            }
-            Err(e)
-        }
-    }
+    with_transaction(&ctx.conn, || {
+        index_specified_files(ctx, &canonical_root, &matchers, files, &mut result)
+    })?;
+    Ok(result)
 }
 
 /// Process each user-supplied file path within a transaction.
@@ -904,10 +918,10 @@ fn index_specified_files(
         // Canonicalize once per file for security check + collection matching
         let canonical_file = match abs_path.canonicalize() {
             Ok(p) => p,
-            Err(_) => {
+            Err(e) => {
                 result
                     .errors
-                    .push(format!("File not found: {}", file_arg));
+                    .push(format!("Cannot resolve '{}': {}", file_arg, e));
                 continue;
             }
         };
@@ -1791,8 +1805,7 @@ pub fn handle_memory_condense(
             };
 
             // Use transaction to ensure atomicity - either all changes succeed or none
-            documents::begin_transaction(&ctx.conn)?;
-            match (|| -> Result<()> {
+            with_transaction(&ctx.conn, || {
                 memory::add_entry(&ctx.conn, &merged_entry)?;
 
                 // Mark original entries as superseded
@@ -1803,17 +1816,9 @@ pub fn handle_memory_condense(
                     memory::update_entry(&ctx.conn, &updated)?;
                 }
                 Ok(())
-            })() {
-                Ok(()) => {
-                    documents::commit_transaction(&ctx.conn)?;
-                    result.merged_count += 1;
-                    result.consolidated_count += entries.len();
-                }
-                Err(e) => {
-                    let _ = documents::rollback_transaction(&ctx.conn);
-                    return Err(e);
-                }
-            }
+            })?;
+            result.merged_count += 1;
+            result.consolidated_count += entries.len();
         }
 
         result.groups.push(group);
@@ -2786,16 +2791,21 @@ mod tests {
         let temp = setup_temp_dir();
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+
         handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
 
+        let nonexistent = docs_dir.join("does_not_exist.md");
         let result = handle_update_files(
             &ctx,
             temp.path(),
-            &["/tmp/does_not_exist_xyz_12345.md".to_string()],
+            &[nonexistent.to_string_lossy().to_string()],
         )
         .expect("should succeed overall");
         assert_eq!(result.errors.len(), 1);
-        assert!(result.errors[0].contains("File not found"));
+        assert!(result.errors[0].contains("Cannot resolve"));
         assert_eq!(result.added, 0);
     }
 
@@ -3890,11 +3900,23 @@ pub fn handle_code_index(
             .index_directory(root)
             .map_err(|e| Error::other(format!("Indexing failed: {}", e)))
     } else {
+        let root_canonical = root
+            .canonicalize()
+            .map_err(|e| Error::other(format!("Cannot resolve root: {e}")))?;
         let mut total = crate::code::indexing::types::IndexStats::default();
         for p in paths {
-            let target = root.join(p);
+            let candidate = root.join(p);
+            let canonical = candidate.canonicalize().map_err(|e| {
+                Error::other(format!("Cannot resolve path '{}': {e}", p))
+            })?;
+            if !canonical.starts_with(&root_canonical) {
+                return Err(Error::other(format!(
+                    "Path '{}' escapes project root",
+                    p
+                )));
+            }
             let stats = facade
-                .index_directory(&target)
+                .index_directory(&canonical)
                 .map_err(|e| Error::other(format!("Indexing '{}' failed: {}", p, e)))?;
             total.files_discovered += stats.files_discovered;
             total.files_indexed += stats.files_indexed;
@@ -3919,20 +3941,26 @@ pub fn handle_code_reindex(
     let target = if paths.is_empty() {
         root.to_path_buf()
     } else {
-        let candidate = root.join(&paths[0]);
-        let canonical = candidate
-            .canonicalize()
-            .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", paths[0])))?;
         let root_canonical = root
             .canonicalize()
             .map_err(|e| Error::other(format!("Cannot resolve root: {e}")))?;
-        if !canonical.starts_with(&root_canonical) {
-            return Err(Error::other(format!(
-                "Path '{}' escapes project root",
-                paths[0]
-            )));
+        // Validate all paths, use first (reindex clears DB so multiple passes don't combine)
+        for p in paths {
+            let candidate = root.join(p);
+            let canonical = candidate
+                .canonicalize()
+                .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", p)))?;
+            if !canonical.starts_with(&root_canonical) {
+                return Err(Error::other(format!(
+                    "Path '{}' escapes project root",
+                    p
+                )));
+            }
         }
-        canonical
+        // Use first path as reindex target (reindex is a full rebuild)
+        root.join(&paths[0])
+            .canonicalize()
+            .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", paths[0])))?
     };
 
     let result = facade
