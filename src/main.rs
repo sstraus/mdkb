@@ -26,6 +26,7 @@ use mdkb::cli::handlers::{
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
     handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
     handle_session_index, handle_stats, handle_status, handle_superseded_by, handle_update,
+    handle_update_files,
 };
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
@@ -213,37 +214,58 @@ async fn main() -> Result<()> {
             let result = handle_status(&ctx)?;
             format_status(&result, cli.format);
         }
-        Command::Update => {
+        Command::Update { files } => {
             let ctx = Context::open(&cwd)?;
-            let result = handle_update(&ctx, &cwd)?;
-            format_update_result(&result, cli.format);
 
-            // Also reindex code (matching MCP update behavior)
-            match mdkb::cli::handlers::handle_code_index(&cwd, &[]) {
-                Ok(stats) => {
-                    println!("\nCode index:");
-                    format_code_index_stats(&stats, cli.format);
-                }
-                Err(e) => {
-                    tracing::warn!("Code reindexing failed: {:?}", e);
-                    eprintln!("Warning: code reindexing failed: {}", e);
-                }
-            }
+            if files.is_empty() {
+                // Full reindex
+                let result = handle_update(&ctx, &cwd)?;
+                format_update_result(&result, cli.format);
 
-            // Also reindex Claude Code sessions
-            let sessions_base = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".claude/projects");
-            let project_root = cwd.to_string_lossy().to_string();
-            match handle_session_index(&ctx, &sessions_base, &project_root) {
-                Ok(sr) if sr.added > 0 || sr.updated > 0 => {
-                    println!(
-                        "\nSessions: {} added, {} updated, {} unchanged",
-                        sr.added, sr.updated, sr.unchanged
-                    );
+                // Also reindex code (matching MCP update behavior)
+                match mdkb::cli::handlers::handle_code_index(&cwd, &[]) {
+                    Ok(stats) => {
+                        println!("\nCode index:");
+                        format_code_index_stats(&stats, cli.format);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Code reindexing failed: {:?}", e);
+                        eprintln!("Warning: code reindexing failed: {}", e);
+                    }
                 }
-                Ok(_) => {} // no sessions or nothing changed — silent
-                Err(e) => {
-                    tracing::warn!("Session indexing failed: {:?}", e);
+
+                // Also reindex Claude Code sessions
+                let sessions_base =
+                    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                        .join(".claude/projects");
+                let project_root = cwd.to_string_lossy().to_string();
+                match handle_session_index(&ctx, &sessions_base, &project_root) {
+                    Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+                        println!(
+                            "\nSessions: {} added, {} updated, {} unchanged",
+                            sr.added, sr.updated, sr.unchanged
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Session indexing failed: {:?}", e);
+                    }
+                }
+            } else {
+                // Targeted file reindex (docs only — code index handles its own incremental)
+                let result = handle_update_files(&ctx, &cwd, &files)?;
+                format_update_result(&result, cli.format);
+
+                // Also reindex code for the specified files
+                match mdkb::cli::handlers::handle_code_index(&cwd, &files) {
+                    Ok(stats) if stats.files_indexed > 0 => {
+                        println!("\nCode index:");
+                        format_code_index_stats(&stats, cli.format);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("Code reindexing failed: {:?}", e);
+                    }
                 }
             }
         }

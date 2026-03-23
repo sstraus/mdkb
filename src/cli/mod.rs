@@ -96,8 +96,12 @@ pub enum Command {
     /// Show index status
     Status,
 
-    /// Reindex everything (documents and source code)
-    Update,
+    /// Reindex everything (documents and source code), or specific files with --files
+    Update {
+        /// Only reindex specific files (absolute or relative paths)
+        #[arg(long, num_args = 1..)]
+        files: Vec<String>,
+    },
 
     /// Generate embeddings for documents
     Embed,

@@ -782,6 +782,161 @@ fn update_collection(
     Ok(())
 }
 
+/// Handle `mdkb update --files <paths>` — reindex only the specified files.
+///
+/// Resolves each path (absolute or relative to root) against registered collections.
+/// Files that don't belong to any collection are silently skipped.
+pub fn handle_update_files(
+    ctx: &Context,
+    root: impl AsRef<Path>,
+    files: &[String],
+) -> Result<UpdateResult> {
+    let root = root.as_ref();
+    let collections = collections::list_collections(&ctx.conn)?;
+    let mut result = UpdateResult::default();
+
+    if collections.is_empty() || files.is_empty() {
+        return Ok(result);
+    }
+
+    // Build glob matchers for each collection
+    let matchers: Vec<(&Collection, globset::GlobMatcher)> = collections
+        .iter()
+        .filter_map(|coll| {
+            Glob::new(&coll.pattern)
+                .ok()
+                .map(|g| (coll, g.compile_matcher()))
+        })
+        .collect();
+
+    documents::begin_transaction(&ctx.conn)?;
+
+    let tx_result = (|| -> Result<()> {
+        for file_arg in files {
+            let file_path = PathBuf::from(file_arg);
+
+            // Resolve to absolute path
+            let abs_path = if file_path.is_absolute() {
+                file_path
+            } else {
+                root.join(&file_path)
+            };
+
+            if !abs_path.exists() {
+                result
+                    .errors
+                    .push(format!("File not found: {}", file_arg));
+                continue;
+            }
+
+            // Find which collection this file belongs to
+            let matched = matchers.iter().find_map(|(coll, matcher)| {
+                let base_path = root.join(&coll.path);
+                let canonical_base = base_path.canonicalize().ok()?;
+                let canonical_file = abs_path.canonicalize().ok()?;
+
+                // File must be under the collection's base path
+                let relative = canonical_file
+                    .strip_prefix(&canonical_base)
+                    .ok()?
+                    .to_string_lossy()
+                    .to_string();
+
+                // File must match the collection's glob pattern
+                if matcher.is_match(&relative) {
+                    Some((coll, relative))
+                } else {
+                    None
+                }
+            });
+
+            let (collection, relative) = match matched {
+                Some(m) => m,
+                None => continue, // silently skip files outside collections
+            };
+
+            // Read file metadata for mtime
+            let metadata = std::fs::metadata(&abs_path).map_err(|e| {
+                Error::other(format!("Failed to read metadata for {}: {}", file_arg, e))
+            })?;
+            let file_mtime = metadata
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+
+            // Check existing document
+            let existing_doc =
+                documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
+
+            let needs_index = match &existing_doc {
+                Some(doc) => file_mtime > doc.indexed_at,
+                None => true,
+            };
+
+            if !needs_index {
+                result.unchanged += 1;
+                continue;
+            }
+
+            let content = std::fs::read_to_string(&abs_path).map_err(|e| {
+                Error::other(format!("Failed to read {}: {}", file_arg, e))
+            })?;
+
+            let parsed = parse_frontmatter(&content);
+            let now = chrono::Utc::now().timestamp();
+
+            let doc = Document {
+                id: existing_doc.as_ref().map(|d| d.id).unwrap_or(0),
+                collection: collection.name.clone(),
+                relative_path: relative,
+                hash: String::new(),
+                title: parsed.title.clone(),
+                metadata: parsed.frontmatter.clone(),
+                file_modified_at: file_mtime,
+                indexed_at: now,
+                status: None,
+            };
+
+            match documents::index_document_in_tx(&ctx.conn, &doc, &content) {
+                Ok(doc_id) => {
+                    if existing_doc.is_some() {
+                        result.updated += 1;
+                    } else {
+                        result.added += 1;
+                    }
+                    if has_evolution_refs(&parsed) {
+                        process_frontmatter_evolution(
+                            &ctx.conn,
+                            doc_id,
+                            &collection.name,
+                            &parsed,
+                        );
+                    }
+                }
+                Err(e) => {
+                    result
+                        .errors
+                        .push(format!("Failed to index {}: {}", file_arg, e));
+                }
+            }
+        }
+        Ok(())
+    })();
+
+    match tx_result {
+        Ok(()) => {
+            documents::commit_transaction(&ctx.conn)?;
+            Ok(result)
+        }
+        Err(e) => {
+            let _ = documents::rollback_transaction(&ctx.conn);
+            Err(e)
+        }
+    }
+}
+
 /// Generate embeddings for all documents that don't have them.
 /// This is a separate operation that can be run after update.
 ///
@@ -2486,6 +2641,118 @@ mod tests {
             result.added, 2,
             "gitignored directory should still be indexed by collection walker"
         );
+    }
+
+    // ==================== Update Files Tests ====================
+
+    #[test]
+    fn test_handle_update_files_indexes_specific_file() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create docs directory with two markdown files
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("a.md"), "# File A\n\nContent A").unwrap();
+        std::fs::write(docs_dir.join("b.md"), "# File B\n\nContent B").unwrap();
+
+        // Add collection
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+
+        // Update only file A
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &[docs_dir.join("a.md").to_string_lossy().to_string()],
+        )
+        .expect("update_files should succeed");
+        assert_eq!(result.added, 1, "should index only file A");
+        assert_eq!(result.updated, 0);
+
+        // File B should not be indexed
+        let doc_b =
+            documents::get_document_by_path(&ctx.conn, "docs", "b.md").unwrap();
+        assert!(doc_b.is_none(), "file B should not be in index");
+    }
+
+    #[test]
+    fn test_handle_update_files_updates_existing() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        let file_path = docs_dir.join("readme.md");
+        std::fs::write(&file_path, "# Old\n\nOld content").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        // Wait for mtime granularity
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        // Modify file
+        std::fs::write(&file_path, "# New\n\nNew content").unwrap();
+
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &[file_path.to_string_lossy().to_string()],
+        )
+        .expect("update_files should succeed");
+        assert_eq!(result.updated, 1, "should update modified file");
+        assert_eq!(result.added, 0);
+    }
+
+    #[test]
+    fn test_handle_update_files_skips_file_outside_collections() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# Test").unwrap();
+
+        // Add collection for docs/
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+
+        // Try to update a file outside any collection
+        let other = temp.path().join("other.md");
+        std::fs::write(&other, "# Other").unwrap();
+
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &[other.to_string_lossy().to_string()],
+        )
+        .expect("update_files should succeed");
+        assert_eq!(result.added, 0, "file outside collections should be skipped");
+        assert_eq!(result.errors.len(), 0, "not an error, just skipped");
+    }
+
+    #[test]
+    fn test_handle_update_files_with_relative_paths() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# Test\n\nContent").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+
+        // Use relative path
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &["docs/readme.md".to_string()],
+        )
+        .expect("update_files should succeed");
+        assert_eq!(result.added, 1, "should index file via relative path");
     }
 
     // ==================== Mget Tests ====================
