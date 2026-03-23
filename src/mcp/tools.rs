@@ -102,6 +102,42 @@ fn default_source_type() -> String {
     "user_statement".to_string()
 }
 
+/// A single memory entry within a batch write.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryWriteBatchEntry {
+    /// Entry ID (slug, e.g., "auth-oauth2-flow").
+    pub id: String,
+
+    /// Concise title (max 50 chars).
+    pub title: String,
+
+    /// Full content.
+    pub content: String,
+
+    /// Entry type: topic, problem, or decision.
+    #[serde(default = "default_entry_type")]
+    pub entry_type: String,
+
+    /// Tags for categorization.
+    #[serde(default)]
+    pub tags: Vec<String>,
+
+    /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
+    #[serde(default = "default_source_type")]
+    pub source_type: String,
+}
+
+/// Parameters for batch memory write.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryWriteBatchParams {
+    /// Memory entries to write (max 20).
+    pub entries: Vec<MemoryWriteBatchEntry>,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
 /// Parameters for the memory_confirm tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct MemoryConfirmParams {
