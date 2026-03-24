@@ -33,8 +33,8 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    CodeGraphParams, GetParams, MemoryConfirmParams, MemoryCorrectParams, MemoryDeleteParams,
-    MemoryListParams, MemoryWriteBatchParams, MemoryWriteParams, SearchParams,
+    CodeGraphParams, GetParams, MemoryDeleteParams, MemoryListParams, MemoryWriteBatchParams,
+    MemoryWriteParams, SearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -1627,58 +1627,6 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
-    /// Confirm a memory entry — positive confidence signal.
-    #[tool(description = "Confirm a memory entry is still accurate (boosts confidence score).")]
-    async fn memory_confirm(
-        &self,
-        Parameters(params): Parameters<MemoryConfirmParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let handle = self.resolve_handle(params.root.as_deref()).await?;
-
-        let (output, tokens) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let output = memory::confirm_entry(&ctx.conn, &params.id)
-                .map_err(|e| mcp_error(e.to_string()))?;
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        };
-
-        self.record_persistent_call("memory_confirm", tokens, 1, false)
-            .await;
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Correct a memory entry — positive confidence signal.
-    #[tool(
-        description = "Correct a memory entry (boosts confidence, optionally appends correction text)."
-    )]
-    async fn memory_correct(
-        &self,
-        Parameters(params): Parameters<MemoryCorrectParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let handle = self.resolve_handle(params.root.as_deref()).await?;
-
-        let (output, tokens) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let output = memory::correct_entry(&ctx.conn, &params.id, params.correction.as_deref())
-                .map_err(|e| mcp_error(e.to_string()))?;
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        };
-
-        self.record_persistent_call("memory_correct", tokens, 1, false)
-            .await;
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
     /// List memory entries with configurable sort order.
     #[tool(description = "List memory entries sorted by recency, popularity, or creation date.")]
     async fn memory_list(
@@ -2386,13 +2334,11 @@ const BASE_INSTRUCTIONS: &str = "\
 | Exact text pattern (last resort) | Grep |
 | Browse memories | `memory_list()` |
 | Write multiple memories at once | `memory_write_batch(entries=[...])` |
-| Validate knowledge still correct | `memory_confirm(id)` |
-| Correct and improve knowledge | `memory_correct(id, correction)` |
 | View revision history | `get(id, format=\"history\")` |
 
 Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after finding a symbol to trace callers or impact.
 
-Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Both `memory_confirm` and `memory_correct` boost confidence. Use `memory_delete` to remove bad entries.
+Memory entries have confidence scores (0-1) based on age and source type. Use `memory_delete` to remove bad entries.
 
 When `get` shows \"History: N revisions (dates)\", use `get(id, format=\"history\")` to see diffs. Only manual entries (user_statement, official_docs) track revisions.
 

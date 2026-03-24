@@ -82,10 +82,9 @@ The `cwd` must point to a directory with `.mdkb/` initialized.
 | `status` | Index health, collections, and code index stats |
 | `update` | Differential reindex of all collections and source code |
 | `memory_write` | Create or update a memory entry (with duplicate detection) |
+| `memory_write_batch` | Create or update multiple memory entries at once (max 20) |
 | `memory_delete` | Delete a memory entry |
 | `memory_list` | List memory entries sorted by recency, popularity, or creation date |
-| `memory_confirm` | Confirm a memory entry is still accurate (increases confidence) |
-| `memory_correct` | Flag a memory entry as incorrect with a correction note |
 
 ### Search Scopes
 
@@ -105,7 +104,7 @@ Memory entries persist AI knowledge across sessions — decisions, patterns, sol
 - **On demand**: AI calls `get(slug)` for full content
 - **Learning**: AI calls `memory_write` to persist new knowledge (with duplicate detection)
 - **Search**: AI calls `search(query, scope="memory")` for hybrid BM25+vector results
-- **Confidence**: Entries have confidence scores (0-1) based on age, confirmations, and corrections. Use `memory_confirm` to validate entries, `memory_correct` to flag errors.
+- **Confidence**: Entries have confidence scores (0-1) based on age and source type.
 
 Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices).
 

@@ -138,32 +138,6 @@ pub struct MemoryWriteBatchParams {
     pub root: Option<String>,
 }
 
-/// Parameters for the memory_confirm tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct MemoryConfirmParams {
-    /// Memory entry ID.
-    pub id: String,
-
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
-    #[serde(default)]
-    pub root: Option<String>,
-}
-
-/// Parameters for the memory_correct tool.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct MemoryCorrectParams {
-    /// Memory entry ID.
-    pub id: String,
-
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
-    #[serde(default)]
-    pub root: Option<String>,
-
-    /// Optional correction text (appended under ## Correction header).
-    #[serde(default)]
-    pub correction: Option<String>,
-}
-
 /// Parameters for the memory_delete tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct MemoryDeleteParams {
