@@ -73,6 +73,33 @@ fn write_single_memory(
     let now = chrono::Utc::now().timestamp();
     let is_new = existing.is_none();
 
+    // Pre-write duplicate check: reject if a near-identical entry exists (new entries only).
+    // L2 distance < 0.32 ≈ cosine similarity > 0.95 — very high bar, minimizes false positives.
+    if is_new {
+        if let Ok(service) = crate::llm::get_cached_service() {
+            let embed_text = format!("{title} {content}");
+            if let Ok(embedding) = service.embed_query(&embed_text) {
+                if let Ok(similar) =
+                    crate::store::vectors::memory_vector_search(conn, &embedding, 3)
+                {
+                    for (rowid, distance) in &similar {
+                        if *distance < 0.32 {
+                            if let Ok(Some(dup)) = memory::get_entry_by_rowid(conn, *rowid) {
+                                let similarity =
+                                    1.0 - (*distance as f64 * *distance as f64 / 2.0);
+                                return Err(mcp_error(format!(
+                                    "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
+                                     Update that entry instead, or use a more distinct title/content.",
+                                    dup.title, dup.id, similarity * 100.0
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let mut output = if let Some(mut existing_entry) = existing {
         if let Err(e) = memory::save_revision(
             conn,

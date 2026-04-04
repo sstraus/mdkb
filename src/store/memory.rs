@@ -677,7 +677,7 @@ pub fn find_similar_entries(
 }
 
 /// Get memory entry by rowid (internal, for hybrid search).
-fn get_entry_by_rowid(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
+pub fn get_entry_by_rowid(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
     let entry = conn
         .query_row(
             "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
