@@ -1,0 +1,25 @@
+src/mcp/server.rs
+  2f358885d8ba62fd 76-102
+src/store/memory.rs
+  2f358885d8ba62fd 680
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "ae8b1b0d535213be467705767220bbe1ff708390",
+  "prompts": {
+    "2f358885d8ba62fd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a7685d0-2196-44af-90b4-d3fd607a0f0e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus",
+      "messages": [],
+      "total_additions": 28,
+      "total_deletions": 1,
+      "accepted_lines": 28,
+      "overriden_lines": 0
+    }
+  }
+}
