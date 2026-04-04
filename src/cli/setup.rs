@@ -250,13 +250,280 @@ fn find_mdkb_binary() -> Result<String> {
     }))
 }
 
+/// Target agent framework for rules setup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RulesTarget {
+    /// Claude Code — references via CLAUDE.md
+    Claude,
+    /// Generic agents — references via AGENTS.md
+    Agents,
+    /// OpenAI Codex — references via CODEX.md
+    Codex,
+}
+
+impl RulesTarget {
+    /// The config filename for this target.
+    pub fn config_filename(&self) -> &'static str {
+        match self {
+            Self::Claude => "CLAUDE.md",
+            Self::Agents => "AGENTS.md",
+            Self::Codex => "CODEX.md",
+        }
+    }
+}
+
+/// Result of rules setup operation.
+#[derive(Debug)]
+pub struct RulesSetupResult {
+    /// Whether the setup was successful.
+    pub success: bool,
+    /// Path to the generated MDKB.md.
+    pub mdkb_md_path: std::path::PathBuf,
+    /// Path to the target config file that was updated.
+    pub config_path: std::path::PathBuf,
+    /// Descriptive message.
+    pub message: String,
+}
+
+/// The MDKB.md content — usage rules for AI agents.
+const MDKB_MD_CONTENT: &str = "\
+# mdkb — Project Knowledge Base
+
+mdkb indexes this project's docs, code, symbols, and persistent memory.
+
+## Rules
+
+1. **Search before explore.** Before using Grep, Glob, or reading files to understand \
+the codebase, call `search(query)`. mdkb already indexed the code and docs — manual \
+exploration is the fallback, not the default.
+
+2. **Save what you learned.** After solving a non-trivial problem, finding a non-obvious \
+pattern, or making an architectural decision, write it to memory: \
+`memory_write(id, title, content)`. Search memory first to avoid duplicates.
+
+3. **Use code intelligence.** To find a function, struct, or type: \
+`search(query, scope=\"symbols\")`. To trace callers or impact: `code_graph(name)`. \
+These are faster and more complete than grepping.
+
+4. **Memory types matter.** Use `entry_type`:
+   - `problem` — bugs, gotchas, failure modes
+   - `decision` — architectural choices with rationale
+   - `topic` — patterns, conventions, domain knowledge
+
+5. **Check memory on complex tasks.** Before starting multi-step work, search memory \
+for prior context: `search(query, scope=\"memory\")`. Past sessions may have solved \
+related problems.
+";
+
+/// Handle `mdkb setup claude|agents|codex` commands.
+///
+/// Generates `.mdkb/MDKB.md` if it doesn't exist, then adds a reference
+/// (`@.mdkb/MDKB.md`) to the target config file (CLAUDE.md, AGENTS.md, or CODEX.md).
+/// Both operations are idempotent.
+pub fn handle_setup_rules(root: &Path, target: RulesTarget) -> Result<RulesSetupResult> {
+    let mdkb_dir = root.join(".mdkb");
+    if !mdkb_dir.exists() {
+        return Err(Error::other(
+            "mdkb not initialized. Run `mdkb init` first.",
+        ));
+    }
+
+    let mdkb_md_path = mdkb_dir.join("MDKB.md");
+    let config_path = root.join(target.config_filename());
+    let reference = "@.mdkb/MDKB.md";
+
+    // Step 1: Generate MDKB.md if missing
+    let generated = if !mdkb_md_path.exists() {
+        std::fs::write(&mdkb_md_path, MDKB_MD_CONTENT).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: mdkb_md_path.clone(),
+                operation: format!("write MDKB.md: {}", e),
+            })
+        })?;
+        true
+    } else {
+        false
+    };
+
+    // Step 2: Add reference to target config file if not already present
+    let config_content = if config_path.exists() {
+        std::fs::read_to_string(&config_path).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: config_path.clone(),
+                operation: format!("read {}: {}", target.config_filename(), e),
+            })
+        })?
+    } else {
+        String::new()
+    };
+
+    let already_referenced = config_content.contains(reference);
+    if !already_referenced {
+        let new_content = if config_content.is_empty() {
+            format!("{}\n", reference)
+        } else if config_content.ends_with('\n') {
+            format!("{}{}\n", config_content, reference)
+        } else {
+            format!("{}\n{}\n", config_content, reference)
+        };
+        std::fs::write(&config_path, new_content).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: config_path.clone(),
+                operation: format!("write {}: {}", target.config_filename(), e),
+            })
+        })?;
+    }
+
+    let message = match (generated, already_referenced) {
+        (true, false) => format!(
+            "Created .mdkb/MDKB.md and added reference to {}",
+            target.config_filename()
+        ),
+        (true, true) => "Created .mdkb/MDKB.md (reference already present)".to_string(),
+        (false, false) => format!(
+            "Added reference to {} (MDKB.md already existed)",
+            target.config_filename()
+        ),
+        (false, true) => "Already set up (nothing to do)".to_string(),
+    };
+
+    Ok(RulesSetupResult {
+        success: true,
+        mdkb_md_path,
+        config_path,
+        message,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
+    fn setup_initialized_dir() -> TempDir {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join(".mdkb")).unwrap();
+        temp
+    }
 
     #[test]
     fn test_mcp_scope_display() {
         assert_eq!(format!("{}", McpScope::Global), "global");
         assert_eq!(format!("{}", McpScope::Local), "local");
+    }
+
+    #[test]
+    fn test_rules_target_config_filename() {
+        assert_eq!(RulesTarget::Claude.config_filename(), "CLAUDE.md");
+        assert_eq!(RulesTarget::Agents.config_filename(), "AGENTS.md");
+        assert_eq!(RulesTarget::Codex.config_filename(), "CODEX.md");
+    }
+
+    #[test]
+    fn test_setup_rules_fails_if_not_initialized() {
+        let temp = tempfile::tempdir().unwrap();
+        let result = handle_setup_rules(temp.path(), RulesTarget::Claude);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("mdkb init"));
+    }
+
+    #[test]
+    fn test_setup_rules_creates_mdkb_md() {
+        let temp = setup_initialized_dir();
+        handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        assert!(temp.path().join(".mdkb/MDKB.md").exists());
+    }
+
+    #[test]
+    fn test_setup_rules_mdkb_md_content() {
+        let temp = setup_initialized_dir();
+        handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        let content = std::fs::read_to_string(temp.path().join(".mdkb/MDKB.md")).unwrap();
+        assert!(content.contains("Search before explore"));
+        assert!(content.contains("Save what you learned"));
+        assert!(content.contains("code intelligence"));
+        assert!(content.contains("Memory types matter"));
+        assert!(content.contains("Check memory on complex tasks"));
+    }
+
+    #[test]
+    fn test_setup_rules_creates_target_file_if_missing() {
+        let temp = setup_initialized_dir();
+        handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        let claude_md = temp.path().join("CLAUDE.md");
+        assert!(claude_md.exists());
+        let content = std::fs::read_to_string(&claude_md).unwrap();
+        assert!(content.contains("@.mdkb/MDKB.md"));
+    }
+
+    #[test]
+    fn test_setup_rules_agents_target() {
+        let temp = setup_initialized_dir();
+        handle_setup_rules(temp.path(), RulesTarget::Agents).unwrap();
+        let agents_md = temp.path().join("AGENTS.md");
+        assert!(agents_md.exists());
+        let content = std::fs::read_to_string(&agents_md).unwrap();
+        assert!(content.contains("@.mdkb/MDKB.md"));
+    }
+
+    #[test]
+    fn test_setup_rules_codex_target() {
+        let temp = setup_initialized_dir();
+        handle_setup_rules(temp.path(), RulesTarget::Codex).unwrap();
+        let codex_md = temp.path().join("CODEX.md");
+        assert!(codex_md.exists());
+        let content = std::fs::read_to_string(&codex_md).unwrap();
+        assert!(content.contains("@.mdkb/MDKB.md"));
+    }
+
+    #[test]
+    fn test_setup_rules_appends_to_existing_file() {
+        let temp = setup_initialized_dir();
+        let claude_md = temp.path().join("CLAUDE.md");
+        std::fs::write(&claude_md, "# My Project\n\nExisting content.\n").unwrap();
+
+        handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+
+        let content = std::fs::read_to_string(&claude_md).unwrap();
+        assert!(content.contains("# My Project"));
+        assert!(content.contains("Existing content."));
+        assert!(content.contains("@.mdkb/MDKB.md"));
+    }
+
+    #[test]
+    fn test_setup_rules_idempotent_mdkb_md() {
+        let temp = setup_initialized_dir();
+        handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        // Write custom content to MDKB.md — should not be overwritten
+        let mdkb_md = temp.path().join(".mdkb/MDKB.md");
+        std::fs::write(&mdkb_md, "# Custom content\n").unwrap();
+        handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        let content = std::fs::read_to_string(&mdkb_md).unwrap();
+        assert_eq!(content, "# Custom content\n");
+    }
+
+    #[test]
+    fn test_setup_rules_idempotent_reference() {
+        let temp = setup_initialized_dir();
+        handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        let content = std::fs::read_to_string(temp.path().join("CLAUDE.md")).unwrap();
+        // Reference must appear exactly once
+        assert_eq!(content.matches("@.mdkb/MDKB.md").count(), 1);
+    }
+
+    #[test]
+    fn test_setup_rules_message_all_new() {
+        let temp = setup_initialized_dir();
+        let result = handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        assert!(result.message.contains("Created") && result.message.contains("CLAUDE.md"));
+    }
+
+    #[test]
+    fn test_setup_rules_message_already_done() {
+        let temp = setup_initialized_dir();
+        handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        let result = handle_setup_rules(temp.path(), RulesTarget::Claude).unwrap();
+        assert!(result.message.contains("nothing to do"));
     }
 }

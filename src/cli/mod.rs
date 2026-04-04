@@ -555,6 +555,15 @@ pub enum SetupCommand {
     /// Register mdkb as an MCP server
     #[command(subcommand)]
     Mcp(SetupMcpCommand),
+
+    /// Generate .mdkb/MDKB.md and add reference to CLAUDE.md
+    Claude,
+
+    /// Generate .mdkb/MDKB.md and add reference to AGENTS.md
+    Agents,
+
+    /// Generate .mdkb/MDKB.md and add reference to CODEX.md
+    Codex,
 }
 
 /// MCP setup subcommands.
