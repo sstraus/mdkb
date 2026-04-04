@@ -1,0 +1,27 @@
+src/cli/setup.rs
+  2f358885d8ba62fd 253-397,401-407,414-527
+src/main.rs
+  2f358885d8ba62fd 660-680
+src/cli/mod.rs
+  2f358885d8ba62fd 558-566
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "292c87d2faa4fb5d6574d73e271a6fd29633bd6a",
+  "prompts": {
+    "2f358885d8ba62fd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "5a7685d0-2196-44af-90b4-d3fd607a0f0e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus",
+      "messages": [],
+      "total_additions": 303,
+      "total_deletions": 6,
+      "accepted_lines": 297,
+      "overriden_lines": 0
+    }
+  }
+}
