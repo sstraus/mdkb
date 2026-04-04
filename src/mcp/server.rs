@@ -981,7 +981,11 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-                    let output = format_search_results(&results, limit);
+                    let top_score = results.first().map(|r| r.score);
+                    let mut output = format_search_results(&results, limit);
+                    if let Some(hint) = ood_hint(results.len(), top_score) {
+                        output.push_str(hint);
+                    }
                     let tokens = count_tokens(&output);
                     (output, tokens, results.len())
                 }
@@ -1003,7 +1007,10 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
-                    let output = format_memory_search_results(&entries);
+                    let mut output = format_memory_search_results(&entries);
+                    if let Some(hint) = ood_hint(entries.len(), None) {
+                        output.push_str(hint);
+                    }
                     let tokens = count_tokens(&output);
                     (output, tokens, entries.len())
                 }
@@ -1035,28 +1042,30 @@ impl McpServer {
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
                     let total = doc_results.len() + mem_entries.len();
+                    let top_score = doc_results.first().map(|r| r.score);
 
-                    if total == 0 {
-                        let output = "No results. Try broader terms.".to_string();
-                        let tokens = count_tokens(&output);
-                        (output, tokens, 0)
+                    let mut output = if total == 0 {
+                        String::new()
                     } else {
-                        let mut output = String::new();
-
+                        let mut s = String::new();
                         if !doc_results.is_empty() {
-                            output.push_str(&format_search_results(&doc_results, limit));
+                            s.push_str(&format_search_results(&doc_results, limit));
                         }
-
                         if !mem_entries.is_empty() {
                             if !doc_results.is_empty() {
-                                output.push_str("\n## Memory\n\n");
+                                s.push_str("\n## Memory\n\n");
                             }
-                            output.push_str(&format_memory_search_results(&mem_entries));
+                            s.push_str(&format_memory_search_results(&mem_entries));
                         }
+                        s
+                    };
 
-                        let tokens = count_tokens(&output);
-                        (output, tokens, total)
+                    if let Some(hint) = ood_hint(total, top_score) {
+                        output.push_str(hint);
                     }
+
+                    let tokens = count_tokens(&output);
+                    (output, tokens, total)
                 }
                 Some("code") | Some("symbols") => {
                     // Drop ctx_guard before acquiring code_index lock
@@ -2425,6 +2434,30 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 }
 
 /// Format search results for output.
+/// OOD (out-of-domain) threshold — normalized scores below this suggest weak relevance.
+const OOD_SCORE_THRESHOLD: f64 = 0.3;
+
+/// Returns an OOD hint when search results appear outside the indexed knowledge.
+///
+/// Returns `None` when results are strong enough to be useful.
+/// Returns a hint string when results are absent or weak — to be appended to output.
+fn ood_hint(result_count: usize, top_score: Option<f64>) -> Option<&'static str> {
+    if result_count == 0 {
+        return Some(
+            "\n> No relevant knowledge found. \
+             This query appears outside the scope of indexed content — \
+             consider broadening terms or using Grep as fallback.",
+        );
+    }
+    if top_score.is_some_and(|s| s < OOD_SCORE_THRESHOLD) {
+        return Some(
+            "\n> Low-confidence results — top match score is below threshold. \
+             Indexed knowledge may not cover this topic well.",
+        );
+    }
+    None
+}
+
 fn format_search_results(results: &[SearchResult], limit: usize) -> String {
     use crate::store::hybrid::lost_in_middle_reorder;
 
@@ -2541,6 +2574,55 @@ fn apply_line_range(content: &str, range: &str) -> Result<String, McpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- OOD detection tests ---
+
+    #[test]
+    fn test_ood_hint_zero_results() {
+        let hint = ood_hint(0, None);
+        assert!(hint.is_some());
+        assert!(hint.unwrap().contains("No relevant knowledge found"));
+    }
+
+    #[test]
+    fn test_ood_hint_zero_results_with_score() {
+        // score is irrelevant when count is 0
+        let hint = ood_hint(0, Some(0.9));
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn test_ood_hint_low_score() {
+        let hint = ood_hint(3, Some(0.1));
+        assert!(hint.is_some());
+        assert!(hint.unwrap().contains("Low-confidence"));
+    }
+
+    #[test]
+    fn test_ood_hint_score_at_threshold_is_low() {
+        // score exactly at threshold (< 0.3) → hint
+        let hint = ood_hint(1, Some(0.29));
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn test_ood_hint_score_above_threshold_no_hint() {
+        let hint = ood_hint(3, Some(0.5));
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn test_ood_hint_good_results_no_hint() {
+        let hint = ood_hint(5, Some(0.85));
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn test_ood_hint_results_no_score_no_hint() {
+        // memory search passes None score — only triggers on zero count
+        let hint = ood_hint(2, None);
+        assert!(hint.is_none());
+    }
 
     #[test]
     fn test_format_search_results_empty() {
@@ -3100,8 +3182,8 @@ mod tests {
 
         let text = extract_text(&result);
         assert!(
-            text.contains("No results"),
-            "Should indicate no results, got: {}",
+            text.contains("No relevant knowledge found"),
+            "Should indicate no relevant knowledge (OOD), got: {}",
             text
         );
     }
