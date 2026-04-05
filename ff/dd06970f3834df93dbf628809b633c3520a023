@@ -1,0 +1,31 @@
+README.md
+  e69cdd9f23477e9f 3,5,7,9,11-14,32,53,100,102-104,119,131,133,141,149,152-154,157,160-164,167,174,204
+Cargo.toml
+  e69cdd9f23477e9f 3
+src/watcher/mod.rs
+  e69cdd9f23477e9f 140-141,161,167-168
+src/mcp/server.rs
+  e69cdd9f23477e9f 2356-2360,2366-2369,2372-2373,2375,2377,2379
+tests/e2e_search_behaviour.rs
+  e69cdd9f23477e9f 42,185-186
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "ffdd06970f3834df93dbf628809b633c3520a023",
+  "prompts": {
+    "e69cdd9f23477e9f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fbab4b9-d588-4618-869f-8427ae54d520",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus",
+      "messages": [],
+      "total_additions": 64,
+      "total_deletions": 439,
+      "accepted_lines": 58,
+      "overriden_lines": 0
+    }
+  }
+}
