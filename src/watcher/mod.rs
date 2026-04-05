@@ -137,14 +137,12 @@ mod tests {
             .watch(&temp.path().to_path_buf())
             .expect("watch should succeed");
 
-        // Give FSEvents time to register the watch (macOS is async)
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // FSEvents on macOS registers watches asynchronously
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
-        // Create a file
         let file_path = temp.path().join("test.md");
         fs::write(&file_path, "# Test").expect("write should succeed");
 
-        // FSEvents on macOS can be slow under load
         let result = timeout(Duration::from_secs(5), watcher.recv()).await;
         assert!(result.is_ok(), "Should receive event within timeout");
         let event = result.unwrap();
@@ -157,19 +155,17 @@ mod tests {
         let config = WatcherConfig { debounce_ms: 50 };
         let mut watcher = FileWatcher::new(config).expect("watcher creation should succeed");
 
-        // Create file before watching to avoid catching the create event
         let file_path = temp.path().join("test.md");
         fs::write(&file_path, "# Original").expect("write should succeed");
 
-        // Small delay so FS timestamps differ
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
 
         watcher
             .watch(&temp.path().to_path_buf())
             .expect("watch should succeed");
 
-        // Give FSEvents time to register the watch
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // FSEvents on macOS registers watches asynchronously
+        tokio::time::sleep(Duration::from_millis(300)).await;
 
         fs::write(&file_path, "# Modified").expect("write should succeed");
 

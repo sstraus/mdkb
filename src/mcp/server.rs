@@ -1702,10 +1702,11 @@ impl McpServer {
                         .collect::<Vec<_>>()
                         .join(" ");
                     out.push_str(&format!(
-                        "- [{}] {} ({}): {} {}\n",
+                        "- [{}] {} ({}, {}): {} {}\n",
                         e.entry_type,
                         e.id,
                         e.title,
+                        relative_time_ago(e.updated_at),
                         truncate_text(&e.content, 80),
                         tags,
                     ));
@@ -2348,39 +2349,33 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
 /// These are always included in server instructions, regardless of whether
 /// memory entries exist. They tell the LLM what mdkb does and how to interact.
 const BASE_INSTRUCTIONS: &str = "\
-# mdkb — Project Knowledge Base
+# mdkb
 
-## Workflow
+## Rules
 
-**Use mdkb `search` for ALL searches instead of native tools (Grep/Glob) or filesystem reads.** mdkb indexes docs, code, symbols, and memory — it replaces manual file exploration.
+1. `search(query)` before Grep/Glob. Always. No results? Broaden query before falling back.
+2. Search returns IDs. Use `get(id)` to read full content.
+3. Before multi-step tasks, `search(query, scope=\"memory\")`.
+4. After solving problems, `search(query, scope=\"memory\")` for duplicates, then `memory_write`. Batch 2+ with `memory_write_batch`.
 
-1. `search(query)` — ALWAYS start here. Searches docs AND memory together.
-2. Only add a scope param if step 1 returned too many irrelevant results.
-3. No results? Broaden query, then fall back to Grep/Glob only as last resort.
-4. After solving problems: `memory_write` — but first `search(query, scope=\"memory\")` to check for duplicates. Update existing entries instead of creating new ones. Use `memory_write_batch` when writing 2+ entries.
+Memory entry_type: `problem`, `decision`, `topic`.
 
 ## Tools
 
 | Need | Tool |
 |---|---|
-| Any search (docs, memory, bugs, decisions) | `search(query)` |
-| Find symbol by name/kind | `search(query, scope=\"symbols\")` |
-| Semantic code search (requires embeddings) | `search(query, scope=\"code\")` |
-| Call graph / impact analysis | `code_graph(name)` |
-| Exact text pattern (last resort) | Grep |
+| Search docs + memory | `search(query)` |
+| Find symbols | `search(query, scope=\"symbols\")` |
+| Semantic code search | `search(query, scope=\"code\")` |
+| Read full content | `get(id)` |
+| Trace callers / impact | `code_graph(name)` |
 | Browse memories | `memory_list()` |
-| Write multiple memories at once | `memory_write_batch(entries=[...])` |
-| View revision history | `get(id, format=\"history\")` |
+| Write memory entry | `memory_write(id, title, content)` |
+| Batch write memories | `memory_write_batch(entries=[...])` |
+| Remove bad entries | `memory_delete(id)` |
+| Revision diffs | `get(id, format=\"history\")` |
 
-Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after finding a symbol to trace callers or impact.
-
-Memory entries have confidence scores (0-1) based on age and source type. Use `memory_delete` to remove bad entries.
-
-When `get` shows \"History: N revisions (dates)\", use `get(id, format=\"history\")` to see diffs. Only manual entries (user_statement, official_docs) track revisions.
-
-## Multi-repo (global mode)
-
-All tools accept an optional `root` param to target a specific repo. With 1 registered repo, `root` is auto-selected. With multiple repos and no `root`, an error lists available roots. Use `root=\"*\"` on `search` for cross-repo results.
+Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
@@ -2444,6 +2439,28 @@ fn load_server_instructions(root: &std::path::Path, limit: usize) -> String {
     let tokens = count_tokens(&instructions);
     tracing::info!("Server instructions: ~{} tokens", tokens);
     instructions
+}
+
+/// Format a Unix timestamp as a compact relative time string (e.g., "3d ago", "2mo ago").
+fn relative_time_ago(unix_ts: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let secs = (now - unix_ts).max(0);
+
+    if secs < 60 {
+        "just now".into()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else if secs < 7 * 86400 {
+        format!("{}d ago", secs / 86400)
+    } else if secs < 30 * 86400 {
+        format!("{}w ago", secs / (7 * 86400))
+    } else if secs < 365 * 86400 {
+        format!("{}mo ago", secs / (30 * 86400))
+    } else {
+        format!("{}y ago", secs / (365 * 86400))
+    }
 }
 
 /// Truncate text to a maximum length with ellipsis.
@@ -2555,11 +2572,12 @@ fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
     for entry in &ordered {
         out.push_str(&format!(
-            "- [{}] {} ({}, conf:{:.2}): {}\n",
+            "- [{}] {} ({}, conf:{:.2}, {}): {}\n",
             entry.id,
             entry.title,
             entry.entry_type,
             entry.confidence(),
+            relative_time_ago(entry.updated_at),
             truncate_text(&entry.content, 100)
         ));
     }
@@ -2787,7 +2805,7 @@ mod tests {
 
         // Base instructions always present
         assert!(result.contains("mdkb"));
-        assert!(result.contains("Knowledge Base"));
+        assert!(result.contains("# mdkb"));
         assert!(result.contains("search"));
         assert!(!result.contains("Available Memories"));
     }
@@ -2801,7 +2819,7 @@ mod tests {
         let result = build_server_instructions(&index);
 
         // Check base instructions present
-        assert!(result.contains("Knowledge Base"));
+        assert!(result.contains("# mdkb"));
         assert!(result.contains("memory_write"));
         assert!(result.contains("search(query)"));
 
@@ -2921,7 +2939,7 @@ mod tests {
         // Must contain base instructions explaining mdkb purpose
         assert!(result.contains("mdkb"), "Should mention mdkb");
         assert!(
-            result.contains("Knowledge Base"),
+            result.contains("# mdkb"),
             "Should explain what mdkb is"
         );
         assert!(
@@ -2945,7 +2963,7 @@ mod tests {
 
         // Should contain both base instructions and memory
         assert!(
-            result.contains("Knowledge Base"),
+            result.contains("# mdkb"),
             "Should have base instructions"
         );
         assert!(
@@ -4594,5 +4612,66 @@ pub fn utility() -> i32 {
             .await;
 
         assert!(result.is_err(), "over-limit batch should fail");
+    }
+
+    // --- relative_time_ago tests ---
+
+    #[test]
+    fn test_relative_time_ago_seconds() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 30), "just now");
+        assert_eq!(relative_time_ago(now), "just now");
+        assert_eq!(relative_time_ago(now - 59), "just now");
+    }
+
+    #[test]
+    fn test_relative_time_ago_minutes() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 120), "2m ago");
+        assert_eq!(relative_time_ago(now - 3500), "58m ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_hours() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 3600), "1h ago");
+        assert_eq!(relative_time_ago(now - 7200), "2h ago");
+        assert_eq!(relative_time_ago(now - 23 * 3600), "23h ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_days() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 86400), "1d ago");
+        assert_eq!(relative_time_ago(now - 6 * 86400), "6d ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_weeks() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 14 * 86400), "2w ago");
+        assert_eq!(relative_time_ago(now - 27 * 86400), "3w ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_months() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 45 * 86400), "1mo ago");
+        assert_eq!(relative_time_ago(now - 180 * 86400), "6mo ago");
+        assert_eq!(relative_time_ago(now - 364 * 86400), "12mo ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_years() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 366 * 86400), "1y ago");
+        assert_eq!(relative_time_ago(now - 730 * 86400), "2y ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_future() {
+        let now = chrono::Utc::now().timestamp();
+        // Future timestamps should still say "just now"
+        assert_eq!(relative_time_ago(now + 1000), "just now");
     }
 }

@@ -657,27 +657,6 @@ async fn main() -> Result<()> {
                     }
                 }
             },
-            SetupCommand::Claude => {
-                let result = mdkb::cli::setup::handle_setup_rules(
-                    &cwd,
-                    mdkb::cli::setup::RulesTarget::Claude,
-                )?;
-                println!("{}", result.message);
-            }
-            SetupCommand::Agents => {
-                let result = mdkb::cli::setup::handle_setup_rules(
-                    &cwd,
-                    mdkb::cli::setup::RulesTarget::Agents,
-                )?;
-                println!("{}", result.message);
-            }
-            SetupCommand::Codex => {
-                let result = mdkb::cli::setup::handle_setup_rules(
-                    &cwd,
-                    mdkb::cli::setup::RulesTarget::Codex,
-                )?;
-                println!("{}", result.message);
-            }
         },
         Command::Session(cmd) => match cmd {
             SessionCommand::Index {
