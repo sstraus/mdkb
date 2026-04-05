@@ -1,0 +1,25 @@
+src/mcp/server.rs
+  e69cdd9f23477e9f 2356-2361,2363,2373,2377,2381
+tests/e2e_search_behaviour.rs
+  e69cdd9f23477e9f 42
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "29a161740fad37b1911d0b4bdab791d3be5cd818",
+  "prompts": {
+    "e69cdd9f23477e9f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "3fbab4b9-d588-4618-869f-8427ae54d520",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus",
+      "messages": [],
+      "total_additions": 12,
+      "total_deletions": 12,
+      "accepted_lines": 12,
+      "overriden_lines": 0
+    }
+  }
+}
