@@ -1,12 +1,17 @@
 # mdkb
 
-Local knowledge base with hybrid search for AI coding assistants.
+**Give your AI coding assistant a memory and a search engine.**
 
-**mdkb** gives Claude Code (or any MCP client) searchable access to your project's documentation, source code symbols, and persistent memory — all running locally, no cloud API needed.
+mdkb indexes your project's docs, source code, and persistent knowledge into a local hybrid search engine — then exposes it to Claude Code (or any MCP client) so the AI finds what it needs instead of guessing.
 
-## Why mdkb?
+No cloud APIs. No token-heavy context dumps. Just fast, local, relevant retrieval.
 
-AI assistants can't read your entire codebase. mdkb solves this by indexing your markdown docs and source code locally, then exposing hybrid search (BM25 + semantic vectors) through MCP. The AI queries what it needs, when it needs it.
+## What it does
+
+- **Hybrid search** — BM25 + semantic vectors over your markdown docs
+- **Code intelligence** — tree-sitter parsing for 13 languages, call graphs, symbol search
+- **Persistent memory** — AI-created knowledge entries that survive across sessions
+- **Zero config serving** — auto-indexes on startup, watches for file changes
 
 ## Installation
 
@@ -24,20 +29,14 @@ cargo install --path .
 
 ### Pre-built binaries
 
-Download from [Releases](https://github.com/sstraus/mdkb/releases) — available for macOS (arm64/x64), Linux (arm64/x64), and Windows (x64).
+Download from [Releases](https://github.com/sstraus/mdkb/releases) — macOS (arm64/x64), Linux (arm64/x64), Windows (x64).
 
 ## Quick Start
 
 ```bash
-# Initialize in your project
 cd your-project
 mdkb init
-
-# Add documentation collections
 mdkb collection add docs ./docs
-mdkb collection add wiki ./wiki --pattern "**/*.md"
-
-# Index everything and start serving
 mdkb update
 ```
 
@@ -51,7 +50,7 @@ mdkb setup mcp claude --scope local
 mdkb setup mcp claude --scope user
 ```
 
-Restart Claude Code after setup. The MCP server auto-indexes on startup and watches for file changes — no manual `update` needed after initial setup.
+Restart Claude Code after setup. The MCP server auto-indexes on startup and watches for file changes.
 
 ### Manual MCP Setup
 
@@ -82,10 +81,9 @@ The `cwd` must point to a directory with `.mdkb/` initialized.
 | `status` | Index health, collections, and code index stats |
 | `update` | Differential reindex of all collections and source code |
 | `memory_write` | Create or update a memory entry (with duplicate detection) |
+| `memory_write_batch` | Create or update multiple memory entries at once (max 20) |
 | `memory_delete` | Delete a memory entry |
 | `memory_list` | List memory entries sorted by recency, popularity, or creation date |
-| `memory_confirm` | Confirm a memory entry is still accurate (increases confidence) |
-| `memory_correct` | Flag a memory entry as incorrect with a correction note |
 
 ### Search Scopes
 
@@ -99,13 +97,11 @@ The `cwd` must point to a directory with `.mdkb/` initialized.
 
 ### Memory
 
-Memory entries persist AI knowledge across sessions — decisions, patterns, solved problems:
+Persistent AI knowledge that survives across sessions — decisions, patterns, solved problems:
 
-- **Session start**: Top 50 entries loaded in server instructions (~1.5K tokens)
-- **On demand**: AI calls `get(slug)` for full content
-- **Learning**: AI calls `memory_write` to persist new knowledge (with duplicate detection)
-- **Search**: AI calls `search(query, scope="memory")` for hybrid BM25+vector results
-- **Confidence**: Entries have confidence scores (0-1) based on age, confirmations, and corrections. Use `memory_confirm` to validate entries, `memory_correct` to flag errors.
+- **Confidence scoring** — entries decay over time unless re-confirmed (0-1 score based on age, access count, source type)
+- **Duplicate detection** — near-duplicate entries are rejected before writing
+- **Revision tracking** — manual entries track up to 3 revision diffs
 
 Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices).
 
@@ -118,19 +114,13 @@ Source types control confidence weighting:
 | `auto_extracted` | 0.70 | Automated knowledge capture |
 | `inference` | 0.65 | AI-inferred knowledge |
 
-### Revision History
-
-Manual entries (`user_statement`, `official_docs`) track up to 3 revision diffs. When `get(id)` shows "History: N revisions (dates)", use `get(id, format="history")` to view diffs.
-
 ## Code Intelligence
 
-mdkb indexes source code with tree-sitter parsers for **13 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, and GDScript.
+Tree-sitter parsing for **13 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, and GDScript.
 
-The code index supports:
 - **Substring search** — find symbols by partial name (FTS5 trigram, works from 3 characters)
 - **Semantic code search** — find conceptually similar code using embeddings
 - **Persistent call graph** — function calls, callers, and transitive impact radius survive restarts
-- **Duplicate prevention** — UNIQUE constraints guarantee one entry per symbol per location
 
 Generate semantic embeddings (downloads ~30MB ONNX model on first run):
 
@@ -138,26 +128,17 @@ Generate semantic embeddings (downloads ~30MB ONNX model on first run):
 mdkb embed
 ```
 
-## Search (CLI)
+## CLI Reference
+
+### Search
 
 ```bash
-# Document search (hybrid BM25 + semantic)
 mdkb search "authentication flow"
-mdkb search "error handling" -c docs
-
-# Symbol search
 mdkb search "handler" --scope symbols --kind function
-mdkb search "Config" --scope symbols --kind struct --file main.rs
-
-# Semantic code search
 mdkb search "auth handler" --scope code
 ```
 
-Output: `[id] collection:path - title (score: 0.85)`
-
-Use `mdkb get <id>` to retrieve full document content.
-
-## Collections
+### Collections
 
 ```bash
 mdkb collection add <name> <path> [--pattern <glob>]
@@ -165,63 +146,34 @@ mdkb collection remove <name>
 mdkb collection rename <old> <new>
 ```
 
-Pattern defaults to `**/*.md`. Use `-c <name>` on search to filter by collection.
-
-## Document Retrieval
+### Document Retrieval
 
 ```bash
-mdkb get <id|path|slug>          # By ID, path, or memory slug
-mdkb get 42 --lines 10:50        # Specific line range
-mdkb get "docs/*.md"             # By glob pattern
-mdkb get 42,43,44                # Comma-separated IDs
+mdkb get <id|path|slug>
+mdkb get 42 --lines 10:50
+mdkb get "docs/*.md"
 ```
 
-## Code Commands (CLI)
+### Code Commands
 
 ```bash
-mdkb code index                         # Build/rebuild code index
-mdkb code search "handler" --kind fn    # Fuzzy symbol search
-mdkb code find "Config" --kind struct   # Exact symbol lookup
-mdkb code calls main                    # What does main() call?
-mdkb code callers handle_get            # What calls handle_get()?
-mdkb code impact init --depth 5         # Transitive dependency graph
-mdkb code info                          # Index statistics
+mdkb code index
+mdkb code search "handler" --kind fn
+mdkb code calls main
+mdkb code callers handle_get
+mdkb code impact init --depth 5
 ```
 
-## Memory (CLI)
+### Memory
 
 ```bash
 mdkb memory add auth-patterns -t "OAuth2 PKCE Flow" -T topic --tags auth,security \
   -c "Always use PKCE for public clients..."
-mdkb memory show auth-patterns
 mdkb memory list
 mdkb memory search "authentication"
-mdkb memory warmup                # Compact index for session start
-mdkb memory history auth-patterns # View revision diffs
-mdkb memory import entries.json   # Import from JSON file
+mdkb memory history auth-patterns
 mdkb memory import entries.json --dry-run --skip-duplicates
 ```
-
-### Memory Import
-
-Bulk-import entries from a JSON file:
-
-```json
-{
-  "entries": [
-    {
-      "id": "use-postgresql",
-      "title": "Use PostgreSQL for sessions",
-      "content": "Context: needed session storage...",
-      "entryType": "decision",
-      "tags": ["database"],
-      "sourceType": "auto_extracted"
-    }
-  ]
-}
-```
-
-Fields `createdAt`/`updatedAt` are optional (default: now). Use `--dry-run` to preview, `--skip-duplicates` to skip existing IDs silently.
 
 ## Configuration
 
@@ -249,35 +201,13 @@ All data stays local in `.mdkb/`:
 .mdkb/
 ├── config.toml
 ├── index.sqlite      # FTS5 + document metadata
-├── code.sqlite       # SQLite index for source code
+├── code.sqlite       # Source code symbols + call graph
 └── memory/           # Memory entries (markdown files)
 ```
 
 The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded on first use and cached locally.
 
 Add `.mdkb/` to `.gitignore` — it can be regenerated with `mdkb update && mdkb embed`.
-
-### Default Code Exclusions
-
-These paths are excluded from code indexing:
-
-```
-**/target/**        **/.git/**         **/dist/**
-**/node_modules/**  **/vendor/**       **/build/**
-**/__pycache__/**   **/.venv/**
-```
-
-Configurable via `[code.indexing] ignore_patterns` in `config.toml`.
-
-### Incremental Indexing
-
-The MCP server watches your project for file changes and reindexes automatically:
-
-- **Documents** — on change, the server reconciles each collection against the filesystem. New files are added, modified files re-parsed, and files deleted from disk are removed from the index.
-- **Code** — changed files are batched (30s idle window) and reindexed incrementally. Content hashes skip unchanged files; deleted files are purged from both SQLite and the vector store.
-- **Startup** — if an index already exists, the server performs an incremental reindex (hash-based diff). A fresh index triggers a full reindex.
-
-The file watcher uses OS-native notifications (`notify` crate) with 100ms debounce. Code exclusion patterns (e.g. `node_modules`) apply to both full and incremental reindexing.
 
 ## License
 

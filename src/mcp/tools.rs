@@ -102,30 +102,40 @@ fn default_source_type() -> String {
     "user_statement".to_string()
 }
 
-/// Parameters for the memory_confirm tool.
+/// A single memory entry within a batch write.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct MemoryConfirmParams {
-    /// Memory entry ID.
+pub struct MemoryWriteBatchEntry {
+    /// Entry ID (slug, e.g., "auth-oauth2-flow").
     pub id: String,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    /// Concise title (max 50 chars).
+    pub title: String,
+
+    /// Full content.
+    pub content: String,
+
+    /// Entry type: topic, problem, or decision.
+    #[serde(default = "default_entry_type")]
+    pub entry_type: String,
+
+    /// Tags for categorization.
     #[serde(default)]
-    pub root: Option<String>,
+    pub tags: Vec<String>,
+
+    /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
+    #[serde(default = "default_source_type")]
+    pub source_type: String,
 }
 
-/// Parameters for the memory_correct tool.
+/// Parameters for batch memory write.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-pub struct MemoryCorrectParams {
-    /// Memory entry ID.
-    pub id: String,
+pub struct MemoryWriteBatchParams {
+    /// Memory entries to write (max 20).
+    pub entries: Vec<MemoryWriteBatchEntry>,
 
     /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
-
-    /// Optional correction text (appended under ## Correction header).
-    #[serde(default)]
-    pub correction: Option<String>,
 }
 
 /// Parameters for the memory_delete tool.

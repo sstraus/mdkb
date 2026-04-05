@@ -33,8 +33,8 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    CodeGraphParams, GetParams, MemoryConfirmParams, MemoryCorrectParams, MemoryDeleteParams,
-    MemoryListParams, MemoryWriteParams, SearchParams,
+    CodeGraphParams, GetParams, MemoryDeleteParams, MemoryListParams, MemoryWriteBatchParams,
+    MemoryWriteParams, SearchParams,
 };
 
 /// Create an MCP error from a message.
@@ -44,6 +44,144 @@ fn mcp_error(message: impl Into<Cow<'static, str>>) -> McpError {
         message: message.into(),
         data: None,
     }
+}
+
+/// Core logic for writing a single memory entry. Used by both `memory_write` and `memory_write_batch`.
+fn write_single_memory(
+    conn: &rusqlite::Connection,
+    id: &str,
+    title: &str,
+    content: &str,
+    entry_type_str: &str,
+    source_type_str: &str,
+    tags: &[String],
+) -> Result<String, McpError> {
+    memory::validate_entry_input(id, title, tags, content)
+        .map_err(|e| mcp_error(e.to_string()))?;
+
+    let existing = memory::get_entry_without_tracking(conn, id)
+        .map_err(|e| mcp_error(format!("Failed to check existing entry: {e}")))?;
+
+    let entry_type: memory::EntryType = entry_type_str
+        .parse()
+        .map_err(|e: String| mcp_error(format!("{e}. Valid types: topic, problem, decision")))?;
+
+    let source_type: memory::SourceType = source_type_str
+        .parse()
+        .map_err(|e: String| mcp_error(e))?;
+
+    let now = chrono::Utc::now().timestamp();
+    let is_new = existing.is_none();
+
+    // Pre-write duplicate check: reject if a near-identical entry exists (new entries only).
+    // L2 distance < 0.32 ≈ cosine similarity > 0.95 — very high bar, minimizes false positives.
+    if is_new {
+        if let Ok(service) = crate::llm::get_cached_service() {
+            let embed_text = format!("{title} {content}");
+            if let Ok(embedding) = service.embed_query(&embed_text) {
+                if let Ok(similar) =
+                    crate::store::vectors::memory_vector_search(conn, &embedding, 3)
+                {
+                    for (rowid, distance) in &similar {
+                        if *distance < 0.32 {
+                            if let Ok(Some(dup)) = memory::get_entry_by_rowid(conn, *rowid) {
+                                let similarity =
+                                    1.0 - (*distance as f64 * *distance as f64 / 2.0);
+                                return Err(mcp_error(format!(
+                                    "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
+                                     Update that entry instead, or use a more distinct title/content.",
+                                    dup.title, dup.id, similarity * 100.0
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut output = if let Some(mut existing_entry) = existing {
+        if let Err(e) = memory::save_revision(
+            conn,
+            id,
+            &existing_entry.content,
+            content,
+            existing_entry.source_type,
+        ) {
+            tracing::warn!("Failed to save revision for {id}: {e}");
+        }
+
+        existing_entry.title = title.to_string();
+        existing_entry.content = content.to_string();
+        existing_entry.entry_type = entry_type;
+        existing_entry.tags = tags.to_vec();
+        memory::update_entry(conn, &existing_entry)
+            .map_err(|e| mcp_error(format!("Failed to update memory entry: {e}")))?;
+
+        let rev_info = memory::get_revision_summary(conn, id)
+            .map(|s| {
+                if s.count > 0 {
+                    format!(" ({} revisions)", s.count)
+                } else {
+                    String::new()
+                }
+            })
+            .unwrap_or_default();
+        format!("Updated memory entry: {id}{rev_info}")
+    } else {
+        let entry = memory::MemoryEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            entry_type,
+            tags: tags.to_vec(),
+            status: memory::EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type,
+        };
+        memory::add_entry(conn, &entry)
+            .map_err(|e| mcp_error(format!("Failed to create memory entry: {e}")))?;
+        format!("Created memory entry: {id}")
+    };
+
+    // Generate embedding for hybrid search + duplicate detection
+    if let Ok(service) = crate::llm::get_cached_service() {
+        let embed_text = format!("{title} {content}");
+        match service.embed_query(&embed_text) {
+            Ok(embedding) => {
+                if let Some(rowid) = memory::get_rowid(conn, id).unwrap_or(None) {
+                    if let Err(e) = crate::store::vectors::store_memory_embedding(
+                        conn,
+                        rowid,
+                        &embedding,
+                        crate::llm::embeddings::MODEL_NAME,
+                    ) {
+                        tracing::warn!(
+                            "Failed to store memory embedding for '{id}': {e}"
+                        );
+                    }
+
+                    if is_new {
+                        let warnings =
+                            memory::find_similar_entries(conn, &embedding, rowid, id);
+                        output.push_str(&warnings);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to embed memory entry '{id}': {e}");
+            }
+        }
+    }
+
+    Ok(output)
 }
 
 /// MCP server for mdkb.
@@ -870,7 +1008,11 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
 
-                    let output = format_search_results(&results, limit);
+                    let top_score = results.first().map(|r| r.score);
+                    let mut output = format_search_results(&results, limit);
+                    if let Some(hint) = ood_hint(results.len(), top_score) {
+                        output.push_str(hint);
+                    }
                     let tokens = count_tokens(&output);
                     (output, tokens, results.len())
                 }
@@ -892,7 +1034,10 @@ impl McpServer {
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
-                    let output = format_memory_search_results(&entries);
+                    let mut output = format_memory_search_results(&entries);
+                    if let Some(hint) = ood_hint(entries.len(), None) {
+                        output.push_str(hint);
+                    }
                     let tokens = count_tokens(&output);
                     (output, tokens, entries.len())
                 }
@@ -924,28 +1069,30 @@ impl McpServer {
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
 
                     let total = doc_results.len() + mem_entries.len();
+                    let top_score = doc_results.first().map(|r| r.score);
 
-                    if total == 0 {
-                        let output = "No results. Try broader terms.".to_string();
-                        let tokens = count_tokens(&output);
-                        (output, tokens, 0)
+                    let mut output = if total == 0 {
+                        String::new()
                     } else {
-                        let mut output = String::new();
-
+                        let mut s = String::new();
                         if !doc_results.is_empty() {
-                            output.push_str(&format_search_results(&doc_results, limit));
+                            s.push_str(&format_search_results(&doc_results, limit));
                         }
-
                         if !mem_entries.is_empty() {
                             if !doc_results.is_empty() {
-                                output.push_str("\n## Memory\n\n");
+                                s.push_str("\n## Memory\n\n");
                             }
-                            output.push_str(&format_memory_search_results(&mem_entries));
+                            s.push_str(&format_memory_search_results(&mem_entries));
                         }
+                        s
+                    };
 
-                        let tokens = count_tokens(&output);
-                        (output, tokens, total)
+                    if let Some(hint) = ood_hint(total, top_score) {
+                        output.push_str(hint);
                     }
+
+                    let tokens = count_tokens(&output);
+                    (output, tokens, total)
                 }
                 Some("code") | Some("symbols") => {
                     // Drop ctx_guard before acquiring code_index lock
@@ -1412,120 +1559,15 @@ impl McpServer {
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
 
-            // Validate input
-            memory::validate_entry_input(&params.id, &params.title, &params.tags, &params.content)
-                .map_err(|e| mcp_error(e.to_string()))?;
-
-            // Check if entry exists (without tracking — must not corrupt access_count)
-            let existing = memory::get_entry_without_tracking(&ctx.conn, &params.id)
-                .map_err(|e| mcp_error(format!("Failed to check existing entry: {}", e)))?;
-
-            // Parse entry type
-            let entry_type: memory::EntryType =
-                params.entry_type.parse().map_err(|e: String| {
-                    mcp_error(format!("{e}. Valid types: topic, problem, decision"))
-                })?;
-
-            // Parse source type
-            let source_type: memory::SourceType = params
-                .source_type
-                .parse()
-                .map_err(|e: String| mcp_error(e))?;
-
-            let now = chrono::Utc::now().timestamp();
-            let existing_was_none = existing.is_none();
-
-            let output = if let Some(mut existing_entry) = existing {
-                // Save revision diff before updating (only for manual entries)
-                if let Err(e) = memory::save_revision(
-                    &ctx.conn,
-                    &params.id,
-                    &existing_entry.content,
-                    &params.content,
-                    existing_entry.source_type,
-                ) {
-                    tracing::warn!("Failed to save revision for {}: {e}", params.id);
-                }
-
-                // Update existing entry — does NOT reset confidence counters
-                existing_entry.title = params.title.clone();
-                existing_entry.content = params.content.clone();
-                existing_entry.entry_type = entry_type;
-                existing_entry.tags = params.tags.clone();
-                memory::update_entry(&ctx.conn, &existing_entry)
-                    .map_err(|e| mcp_error(format!("Failed to update memory entry: {}", e)))?;
-
-                // Include revision count in response
-                let rev_info = memory::get_revision_summary(&ctx.conn, &params.id)
-                    .map(|s| {
-                        if s.count > 0 {
-                            format!(" ({} revisions)", s.count)
-                        } else {
-                            String::new()
-                        }
-                    })
-                    .unwrap_or_default();
-                format!("Updated memory entry: {}{}", params.id, rev_info)
-            } else {
-                // Create new entry
-                let entry = memory::MemoryEntry {
-                    id: params.id.clone(),
-                    title: params.title.clone(),
-                    content: params.content.clone(),
-                    entry_type,
-                    tags: params.tags.clone(),
-                    status: memory::EntryStatus::Active,
-                    created_at: now,
-                    updated_at: now,
-                    superseded_by: None,
-                    access_count: 0,
-                    last_accessed: None,
-                    source_path: None,
-                    confirmations: 0,
-                    last_confirmed_at: None,
-                    source_type,
-                };
-                memory::add_entry(&ctx.conn, &entry)
-                    .map_err(|e| mcp_error(format!("Failed to create memory entry: {}", e)))?;
-                format!("Created memory entry: {}", params.id)
-            };
-
-            // Generate embedding for hybrid search
-            let mut output = output;
-            let is_new = existing_was_none;
-            if let Ok(service) = crate::llm::get_cached_service() {
-                let embed_text = format!("{} {}", params.title, params.content);
-                match service.embed_query(&embed_text) {
-                    Ok(embedding) => {
-                        if let Some(rowid) =
-                            memory::get_rowid(&ctx.conn, &params.id).unwrap_or(None)
-                        {
-                            if let Err(e) = crate::store::vectors::store_memory_embedding(
-                                &ctx.conn,
-                                rowid,
-                                &embedding,
-                                crate::llm::embeddings::MODEL_NAME,
-                            ) {
-                                tracing::warn!(
-                                    "Failed to store memory embedding for '{}': {e}",
-                                    params.id
-                                );
-                            }
-
-                            // Duplicate detection only on new entries
-                            if is_new {
-                                let warnings = memory::find_similar_entries(
-                                    &ctx.conn, &embedding, rowid, &params.id,
-                                );
-                                output.push_str(&warnings);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to embed memory entry '{}': {e}", params.id);
-                    }
-                }
-            }
+            let output = write_single_memory(
+                &ctx.conn,
+                &params.id,
+                &params.title,
+                &params.content,
+                &params.entry_type,
+                &params.source_type,
+                &params.tags,
+            )?;
 
             let tokens = count_tokens(&output);
             (output, tokens)
@@ -1534,6 +1576,56 @@ impl McpServer {
         self.record_persistent_call("memory_write", tokens, 1, false)
             .await;
         tracing::debug!("mdkb_memory_write: {}", output);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Write multiple memory entries in one call.
+    #[tool(
+        description = "Create or update multiple memory entries at once. Same semantics as memory_write, batched. Max 20 entries."
+    )]
+    async fn memory_write_batch(
+        &self,
+        Parameters(params): Parameters<MemoryWriteBatchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.entries.is_empty() {
+            return Err(mcp_error("entries array must not be empty"));
+        }
+        if params.entries.len() > 20 {
+            return Err(mcp_error("max 20 entries per batch"));
+        }
+
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
+
+        let (output, tokens, count) = {
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let mut results = Vec::with_capacity(params.entries.len());
+            for entry in &params.entries {
+                let result = write_single_memory(
+                    &ctx.conn,
+                    &entry.id,
+                    &entry.title,
+                    &entry.content,
+                    &entry.entry_type,
+                    &entry.source_type,
+                    &entry.tags,
+                )?;
+                results.push(result);
+            }
+
+            let output = results.join("\n");
+            let tokens = count_tokens(&output);
+            let count = results.len();
+            (output, tokens, count)
+        }; // ctx_guard dropped here
+
+        self.record_persistent_call("memory_write_batch", tokens, count, false)
+            .await;
+        tracing::debug!("mdkb_memory_write_batch: {} entries", count);
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -1568,58 +1660,6 @@ impl McpServer {
             .await;
         tracing::debug!("mdkb_memory_delete: {}", output);
 
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Confirm a memory entry — positive confidence signal.
-    #[tool(description = "Confirm a memory entry is still accurate (boosts confidence score).")]
-    async fn memory_confirm(
-        &self,
-        Parameters(params): Parameters<MemoryConfirmParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let handle = self.resolve_handle(params.root.as_deref()).await?;
-
-        let (output, tokens) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let output = memory::confirm_entry(&ctx.conn, &params.id)
-                .map_err(|e| mcp_error(e.to_string()))?;
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        };
-
-        self.record_persistent_call("memory_confirm", tokens, 1, false)
-            .await;
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Correct a memory entry — positive confidence signal.
-    #[tool(
-        description = "Correct a memory entry (boosts confidence, optionally appends correction text)."
-    )]
-    async fn memory_correct(
-        &self,
-        Parameters(params): Parameters<MemoryCorrectParams>,
-    ) -> Result<CallToolResult, McpError> {
-        let handle = self.resolve_handle(params.root.as_deref()).await?;
-
-        let (output, tokens) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let output = memory::correct_entry(&ctx.conn, &params.id, params.correction.as_deref())
-                .map_err(|e| mcp_error(e.to_string()))?;
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        };
-
-        self.record_persistent_call("memory_correct", tokens, 1, false)
-            .await;
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
@@ -1662,10 +1702,11 @@ impl McpServer {
                         .collect::<Vec<_>>()
                         .join(" ");
                     out.push_str(&format!(
-                        "- [{}] {} ({}): {} {}\n",
+                        "- [{}] {} ({}, {}): {} {}\n",
                         e.entry_type,
                         e.id,
                         e.title,
+                        relative_time_ago(e.updated_at),
                         truncate_text(&e.content, 80),
                         tags,
                     ));
@@ -2308,40 +2349,33 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
 /// These are always included in server instructions, regardless of whether
 /// memory entries exist. They tell the LLM what mdkb does and how to interact.
 const BASE_INSTRUCTIONS: &str = "\
-# mdkb — Project Knowledge Base
+# mdkb
 
-## Workflow
+## Rules
 
-**Use mdkb `search` for ALL searches instead of native tools (Grep/Glob) or filesystem reads.** mdkb indexes docs, code, symbols, and memory — it replaces manual file exploration.
+1. `search(query)` before Grep/Glob. Always. No results? Broaden query before falling back.
+2. Search returns IDs. Use `get(id)` to read full content.
+3. Before multi-step tasks, `search(query, scope=\"memory\")`.
+4. After solving problems, `search(query, scope=\"memory\")` for duplicates, then `memory_write`. Batch 2+ with `memory_write_batch`.
 
-1. `search(query)` — ALWAYS start here. Searches docs AND memory together.
-2. Only add a scope param if step 1 returned too many irrelevant results.
-3. No results? Broaden query, then fall back to Grep/Glob only as last resort.
-4. After solving problems: `memory_write` — but first `search(query, scope=\"memory\")` to check for duplicates. Update existing entries instead of creating new ones.
+Memory entry_type: `problem`, `decision`, `topic`.
 
 ## Tools
 
 | Need | Tool |
 |---|---|
-| Any search (docs, memory, bugs, decisions) | `search(query)` |
-| Find symbol by name/kind | `search(query, scope=\"symbols\")` |
-| Semantic code search (requires embeddings) | `search(query, scope=\"code\")` |
-| Call graph / impact analysis | `code_graph(name)` |
-| Exact text pattern (last resort) | Grep |
+| Search docs + memory | `search(query)` |
+| Find symbols | `search(query, scope=\"symbols\")` |
+| Semantic code search | `search(query, scope=\"code\")` |
+| Read full content | `get(id)` |
+| Trace callers / impact | `code_graph(name)` |
 | Browse memories | `memory_list()` |
-| Validate knowledge still correct | `memory_confirm(id)` |
-| Correct and improve knowledge | `memory_correct(id, correction)` |
-| View revision history | `get(id, format=\"history\")` |
+| Write memory entry | `memory_write(id, title, content)` |
+| Batch write memories | `memory_write_batch(entries=[...])` |
+| Remove bad entries | `memory_delete(id)` |
+| Revision diffs | `get(id, format=\"history\")` |
 
-Use `scope=\"symbols\"` to find functions/structs/types. Use `code_graph` after finding a symbol to trace callers or impact.
-
-Memory entries have confidence scores (0-1) based on confirmations, age, and source type. Both `memory_confirm` and `memory_correct` boost confidence. Use `memory_delete` to remove bad entries.
-
-When `get` shows \"History: N revisions (dates)\", use `get(id, format=\"history\")` to see diffs. Only manual entries (user_statement, official_docs) track revisions.
-
-## Multi-repo (global mode)
-
-All tools accept an optional `root` param to target a specific repo. With 1 registered repo, `root` is auto-selected. With multiple repos and no `root`, an error lists available roots. Use `root=\"*\"` on `search` for cross-repo results.
+Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
@@ -2407,6 +2441,28 @@ fn load_server_instructions(root: &std::path::Path, limit: usize) -> String {
     instructions
 }
 
+/// Format a Unix timestamp as a compact relative time string (e.g., "3d ago", "2mo ago").
+fn relative_time_ago(unix_ts: i64) -> String {
+    let now = chrono::Utc::now().timestamp();
+    let secs = (now - unix_ts).max(0);
+
+    if secs < 60 {
+        "just now".into()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else if secs < 7 * 86400 {
+        format!("{}d ago", secs / 86400)
+    } else if secs < 30 * 86400 {
+        format!("{}w ago", secs / (7 * 86400))
+    } else if secs < 365 * 86400 {
+        format!("{}mo ago", secs / (30 * 86400))
+    } else {
+        format!("{}y ago", secs / (365 * 86400))
+    }
+}
+
 /// Truncate text to a maximum length with ellipsis.
 fn truncate_text(text: &str, max_len: usize) -> String {
     let text = text.replace('\n', " ");
@@ -2422,6 +2478,30 @@ fn truncate_text(text: &str, max_len: usize) -> String {
 }
 
 /// Format search results for output.
+/// OOD (out-of-domain) threshold — normalized scores below this suggest weak relevance.
+const OOD_SCORE_THRESHOLD: f64 = 0.3;
+
+/// Returns an OOD hint when search results appear outside the indexed knowledge.
+///
+/// Returns `None` when results are strong enough to be useful.
+/// Returns a hint string when results are absent or weak — to be appended to output.
+fn ood_hint(result_count: usize, top_score: Option<f64>) -> Option<&'static str> {
+    if result_count == 0 {
+        return Some(
+            "\n> No relevant knowledge found. \
+             This query appears outside the scope of indexed content — \
+             consider broadening terms or using Grep as fallback.",
+        );
+    }
+    if top_score.is_some_and(|s| s < OOD_SCORE_THRESHOLD) {
+        return Some(
+            "\n> Low-confidence results — top match score is below threshold. \
+             Indexed knowledge may not cover this topic well.",
+        );
+    }
+    None
+}
+
 fn format_search_results(results: &[SearchResult], limit: usize) -> String {
     use crate::store::hybrid::lost_in_middle_reorder;
 
@@ -2492,11 +2572,12 @@ fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
     for entry in &ordered {
         out.push_str(&format!(
-            "- [{}] {} ({}, conf:{:.2}): {}\n",
+            "- [{}] {} ({}, conf:{:.2}, {}): {}\n",
             entry.id,
             entry.title,
             entry.entry_type,
             entry.confidence(),
+            relative_time_ago(entry.updated_at),
             truncate_text(&entry.content, 100)
         ));
     }
@@ -2538,6 +2619,55 @@ fn apply_line_range(content: &str, range: &str) -> Result<String, McpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- OOD detection tests ---
+
+    #[test]
+    fn test_ood_hint_zero_results() {
+        let hint = ood_hint(0, None);
+        assert!(hint.is_some());
+        assert!(hint.unwrap().contains("No relevant knowledge found"));
+    }
+
+    #[test]
+    fn test_ood_hint_zero_results_with_score() {
+        // score is irrelevant when count is 0
+        let hint = ood_hint(0, Some(0.9));
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn test_ood_hint_low_score() {
+        let hint = ood_hint(3, Some(0.1));
+        assert!(hint.is_some());
+        assert!(hint.unwrap().contains("Low-confidence"));
+    }
+
+    #[test]
+    fn test_ood_hint_score_at_threshold_is_low() {
+        // score exactly at threshold (< 0.3) → hint
+        let hint = ood_hint(1, Some(0.29));
+        assert!(hint.is_some());
+    }
+
+    #[test]
+    fn test_ood_hint_score_above_threshold_no_hint() {
+        let hint = ood_hint(3, Some(0.5));
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn test_ood_hint_good_results_no_hint() {
+        let hint = ood_hint(5, Some(0.85));
+        assert!(hint.is_none());
+    }
+
+    #[test]
+    fn test_ood_hint_results_no_score_no_hint() {
+        // memory search passes None score — only triggers on zero count
+        let hint = ood_hint(2, None);
+        assert!(hint.is_none());
+    }
 
     #[test]
     fn test_format_search_results_empty() {
@@ -2675,7 +2805,7 @@ mod tests {
 
         // Base instructions always present
         assert!(result.contains("mdkb"));
-        assert!(result.contains("Knowledge Base"));
+        assert!(result.contains("# mdkb"));
         assert!(result.contains("search"));
         assert!(!result.contains("Available Memories"));
     }
@@ -2689,7 +2819,7 @@ mod tests {
         let result = build_server_instructions(&index);
 
         // Check base instructions present
-        assert!(result.contains("Knowledge Base"));
+        assert!(result.contains("# mdkb"));
         assert!(result.contains("memory_write"));
         assert!(result.contains("search(query)"));
 
@@ -2809,7 +2939,7 @@ mod tests {
         // Must contain base instructions explaining mdkb purpose
         assert!(result.contains("mdkb"), "Should mention mdkb");
         assert!(
-            result.contains("Knowledge Base"),
+            result.contains("# mdkb"),
             "Should explain what mdkb is"
         );
         assert!(
@@ -2833,7 +2963,7 @@ mod tests {
 
         // Should contain both base instructions and memory
         assert!(
-            result.contains("Knowledge Base"),
+            result.contains("# mdkb"),
             "Should have base instructions"
         );
         assert!(
@@ -3097,8 +3227,8 @@ mod tests {
 
         let text = extract_text(&result);
         assert!(
-            text.contains("No results"),
-            "Should indicate no results, got: {}",
+            text.contains("No relevant knowledge found"),
+            "Should indicate no relevant knowledge (OOD), got: {}",
             text
         );
     }
@@ -4383,5 +4513,165 @@ pub fn utility() -> i32 {
             "Should find doc in targeted repo: {}",
             text
         );
+    }
+
+    #[tokio::test]
+    async fn test_memory_write_batch_creates_multiple_entries() {
+        use super::super::tools::MemoryWriteBatchEntry;
+
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server
+            .memory_write_batch(Parameters(MemoryWriteBatchParams {
+                entries: vec![
+                    MemoryWriteBatchEntry {
+                        id: "batch-a".to_string(),
+                        title: "Batch A".to_string(),
+                        content: "Content A".to_string(),
+                        entry_type: "topic".to_string(),
+                        tags: vec!["test".to_string()],
+                        source_type: "user_statement".to_string(),
+                    },
+                    MemoryWriteBatchEntry {
+                        id: "batch-b".to_string(),
+                        title: "Batch B".to_string(),
+                        content: "Content B".to_string(),
+                        entry_type: "decision".to_string(),
+                        tags: vec![],
+                        source_type: "user_statement".to_string(),
+                    },
+                ],
+                root: None,
+            }))
+            .await
+            .expect("batch write should succeed");
+
+        let text = extract_text(&result);
+        assert!(text.contains("Created memory entry: batch-a"), "Should contain batch-a: {text}");
+        assert!(text.contains("Created memory entry: batch-b"), "Should contain batch-b: {text}");
+
+        // Verify entries exist in DB
+        let ctx_guard = server.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let a = crate::store::memory::get_entry_without_tracking(&ctx.conn, "batch-a")
+            .unwrap()
+            .expect("batch-a should exist");
+        let b = crate::store::memory::get_entry_without_tracking(&ctx.conn, "batch-b")
+            .unwrap()
+            .expect("batch-b should exist");
+        assert_eq!(a.title, "Batch A");
+        assert_eq!(b.title, "Batch B");
+        assert_eq!(b.entry_type, crate::store::memory::EntryType::Decision);
+    }
+
+    #[tokio::test]
+    async fn test_memory_write_batch_empty_fails() {
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let result = server
+            .memory_write_batch(Parameters(MemoryWriteBatchParams {
+                entries: vec![],
+                root: None,
+            }))
+            .await;
+
+        assert!(result.is_err(), "empty batch should fail");
+    }
+
+    #[tokio::test]
+    async fn test_memory_write_batch_over_limit_fails() {
+        use super::super::tools::MemoryWriteBatchEntry;
+
+        let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
+        let root = temp_dir.path().to_path_buf();
+        crate::cli::handlers::handle_init(&root).expect("Failed to init mdkb");
+        let server = McpServer::new(root);
+
+        let entries: Vec<MemoryWriteBatchEntry> = (0..21)
+            .map(|i| MemoryWriteBatchEntry {
+                id: format!("over-{i}"),
+                title: format!("Over {i}"),
+                content: format!("Content {i}"),
+                entry_type: "topic".to_string(),
+                tags: vec![],
+                source_type: "user_statement".to_string(),
+            })
+            .collect();
+
+        let result = server
+            .memory_write_batch(Parameters(MemoryWriteBatchParams {
+                entries,
+                root: None,
+            }))
+            .await;
+
+        assert!(result.is_err(), "over-limit batch should fail");
+    }
+
+    // --- relative_time_ago tests ---
+
+    #[test]
+    fn test_relative_time_ago_seconds() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 30), "just now");
+        assert_eq!(relative_time_ago(now), "just now");
+        assert_eq!(relative_time_ago(now - 59), "just now");
+    }
+
+    #[test]
+    fn test_relative_time_ago_minutes() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 120), "2m ago");
+        assert_eq!(relative_time_ago(now - 3500), "58m ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_hours() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 3600), "1h ago");
+        assert_eq!(relative_time_ago(now - 7200), "2h ago");
+        assert_eq!(relative_time_ago(now - 23 * 3600), "23h ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_days() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 86400), "1d ago");
+        assert_eq!(relative_time_ago(now - 6 * 86400), "6d ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_weeks() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 14 * 86400), "2w ago");
+        assert_eq!(relative_time_ago(now - 27 * 86400), "3w ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_months() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 45 * 86400), "1mo ago");
+        assert_eq!(relative_time_ago(now - 180 * 86400), "6mo ago");
+        assert_eq!(relative_time_ago(now - 364 * 86400), "12mo ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_years() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(relative_time_ago(now - 366 * 86400), "1y ago");
+        assert_eq!(relative_time_ago(now - 730 * 86400), "2y ago");
+    }
+
+    #[test]
+    fn test_relative_time_ago_future() {
+        let now = chrono::Utc::now().timestamp();
+        // Future timestamps should still say "just now"
+        assert_eq!(relative_time_ago(now + 1000), "just now");
     }
 }

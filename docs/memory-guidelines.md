@@ -194,7 +194,7 @@ CLI equivalent: `mdkb memory history <id>`
 
 - **Warmup index** (`memory_list`): Top 50 entries by usage. Check this first.
 - **Search** (`search(query, scope="memory")`): Hybrid BM25+vector search for specific entries.
-- **Confidence**: Each entry has a confidence score (0-1) based on temporal decay, confirmations, and corrections. Use `memory_confirm(id)` when you verify knowledge is still accurate. Use `memory_correct(id, correction)` when you find errors.
+- **Confidence**: Each entry has a confidence score (0-1) based on temporal decay and source type.
 
 The warmup index auto-loads at session start. Use `get(id)` to retrieve full content.
 
