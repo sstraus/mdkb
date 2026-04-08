@@ -926,28 +926,45 @@ impl McpServer {
 
         let matches = facade.find_symbols_by_name(name);
         match matches.len() {
-            0 => Err(mcp_error(format!(
-                "No symbol found with name '{name}'. Try `search(query, scope=\"symbols\")` for fuzzy matching."
-            ))),
-            1 => Ok(matches.into_iter().next().unwrap()),
-            _ => {
-                let mut msg = format!(
-                    "Multiple symbols found for '{}'. Use symbol_id to disambiguate:\n",
-                    name
-                );
-                for sym in &matches {
-                    msg.push_str(&format!(
-                        "  sym#{} - {:?} {} in {} ({})\n",
-                        sym.id.value(),
-                        sym.kind,
-                        sym.name,
-                        sym.file_path,
-                        sym.range,
-                    ));
+            0 => {
+                // Fuzzy fallback: try FTS trigram search (needs >= 3 chars)
+                if name.len() >= 3 {
+                    let fuzzy = facade.search_symbols(name, 10);
+                    match fuzzy.len() {
+                        0 => {}
+                        1 => return Ok(fuzzy.into_iter().next().unwrap()),
+                        _ => return Err(Self::disambiguation_error(name, &fuzzy)),
+                    }
                 }
-                Err(mcp_error(msg))
+                Err(mcp_error(format!(
+                    "No symbol found: '{name}'."
+                )))
             }
+            1 => Ok(matches.into_iter().next().unwrap()),
+            _ => Err(Self::disambiguation_error(name, &matches)),
         }
+    }
+
+    /// Build a disambiguation error listing candidate symbols.
+    fn disambiguation_error(
+        name: &str,
+        candidates: &[crate::code::symbol::Symbol],
+    ) -> McpError {
+        let mut msg = format!(
+            "Multiple symbols match '{}'. Pass symbol_id:\n",
+            name
+        );
+        for sym in candidates {
+            msg.push_str(&format!(
+                "  sym#{} - {:?} {} in {} ({})\n",
+                sym.id.value(),
+                sym.kind,
+                sym.name,
+                sym.file_path,
+                sym.range,
+            ));
+        }
+        mcp_error(msg)
     }
 
     /// Record a tool call to persistent stats.
@@ -1735,7 +1752,7 @@ impl McpServer {
     // -----------------------------------------------------------------------
 
     /// Query the code call graph: outgoing calls, incoming callers, or impact radius.
-    #[tool(description = "Query code call graph. Directions: calls (default), callers, impact.")]
+    #[tool(description = "Query code call graph. Resolves fuzzy/partial names. Directions: calls (default), callers, impact.")]
     async fn code_graph(
         &self,
         Parameters(params): Parameters<CodeGraphParams>,
@@ -2360,7 +2377,7 @@ const BASE_INSTRUCTIONS: &str = "\
 ## When to use mdkb vs Grep/Glob
 
 Use Grep/Glob for exact string/pattern matching. Use mdkb for everything else:
-- **Understanding code flow**: `search(scope=\"symbols\")` to find entry point → `code_graph(name)` to trace all callers/callees. This replaces iterative grep-read-grep chains.
+- **Understanding code flow**: `code_graph(name)` — resolves fuzzy names automatically, traces callers/callees. Replaces grep-read-grep chains.
 - **Semantic code queries**: `search(query, scope=\"code\")` for natural language (\"where is auth handled?\")
 - **Docs + decisions**: `search(query)` searches docs and memory together.
 - **Impact analysis**: `code_graph(name, direction=\"callers\")` before modifying any function.
@@ -2368,9 +2385,10 @@ Use Grep/Glob for exact string/pattern matching. Use mdkb for everything else:
 ## Workflow
 
 1. Before multi-step tasks: `search(query, scope=\"memory\")` for prior decisions.
-2. To understand a function: `search(name, scope=\"symbols\")` → `code_graph(name)` for full call tree.
-3. After solving problems: check duplicates, then `memory_write`. Batch 2+ with `memory_write_batch`.
-4. Search returns IDs. Use `get(id)` for full content.
+2. To understand a function: `code_graph(name)` — accepts partial/fuzzy names, disambiguates if needed.
+3. To list symbols in a file: `search(\"*\", scope=\"symbols\", file=\"path\")`.
+4. After solving problems: check duplicates, then `memory_write`. Batch 2+ with `memory_write_batch`.
+5. Search returns IDs. Use `get(id)` for full content.
 
 Memory entry_type: `problem`, `decision`, `topic`.
 
@@ -2378,10 +2396,10 @@ Memory entry_type: `problem`, `decision`, `topic`.
 
 | Need | Tool |
 |---|---|
+| **Trace call tree / impact** | **`code_graph(name)`** — fuzzy name resolution built-in |
 | Docs + memory search | `search(query)` |
 | Semantic code search | `search(query, scope=\"code\")` |
-| Find symbols by name | `search(query, scope=\"symbols\")` |
-| **Trace call tree / impact** | **`code_graph(name)`** |
+| Find symbols by name/file | `search(query, scope=\"symbols\")` |
 | Read full content | `get(id)` |
 | Browse memories | `memory_list()` |
 | Write memory | `memory_write(id, title, content)` |
@@ -3933,6 +3951,96 @@ pub fn utility() -> i32 {
                 text.contains("main") || text.contains("does not call"),
                 "Should work with symbol_id: {}",
                 text
+            );
+        }
+
+        #[tokio::test]
+        async fn test_resolve_symbol_fuzzy_fallback() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            // "process_data" exists as exact name. But "process" alone should
+            // fuzzy-match and return a result (not an error) since there's only
+            // one symbol containing "process".
+            let result = tokio::time::timeout(
+                timeout,
+                server.code_graph(Parameters(CodeGraphParams {
+                    name: "process_data".to_string(),
+                    direction: "calls".to_string(),
+                    symbol_id: None,
+                    max_depth: 3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("code_graph should succeed with exact name");
+
+            let text = extract_text(&result);
+            assert!(
+                text.contains("process_data"),
+                "Should resolve process_data: {}",
+                text
+            );
+        }
+
+        #[tokio::test]
+        async fn test_resolve_symbol_fuzzy_partial_name() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            // "validate" exists. Passing "validat" (partial) should fuzzy-resolve
+            // to a single match and succeed.
+            let result = tokio::time::timeout(
+                timeout,
+                server.code_graph(Parameters(CodeGraphParams {
+                    name: "validat".to_string(),
+                    direction: "callers".to_string(),
+                    symbol_id: None,
+                    max_depth: 3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("code_graph should fuzzy-resolve 'validat' to 'validate'");
+
+            let text = extract_text(&result);
+            assert!(
+                text.contains("validate"),
+                "Should resolve to validate: {}",
+                text
+            );
+        }
+
+        #[tokio::test]
+        async fn test_resolve_symbol_fuzzy_multiple_candidates() {
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
+
+            // "new" and "transform" both exist in DataHelper.
+            // Searching "data" should match multiple symbols (DataHelper, process_data)
+            // and return a disambiguation list, not an error.
+            let result = tokio::time::timeout(
+                timeout,
+                server.code_graph(Parameters(CodeGraphParams {
+                    name: "data".to_string(),
+                    direction: "calls".to_string(),
+                    symbol_id: None,
+                    max_depth: 3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout");
+
+            // Should be an error with disambiguation list
+            assert!(result.is_err(), "Multiple fuzzy matches should require disambiguation");
+            let err_msg = format!("{}", result.unwrap_err());
+            assert!(
+                err_msg.contains("sym#"),
+                "Error should list candidates with sym# IDs: {}",
+                err_msg
             );
         }
     }
