@@ -2349,14 +2349,22 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
 /// These are always included in server instructions, regardless of whether
 /// memory entries exist. They tell the LLM what mdkb does and how to interact.
 const BASE_INSTRUCTIONS: &str = "\
-# mdkb
+# mdkb — Project Knowledge Base
 
-## Rules
+## When to use mdkb vs Grep/Glob
 
-1. `search(query)` before Grep/Glob. Always. No results? Broaden query before falling back.
-2. Search returns IDs. Use `get(id)` to read full content.
-3. Before multi-step tasks, `search(query, scope=\"memory\")`.
-4. After solving problems, `search(query, scope=\"memory\")` for duplicates, then `memory_write`. Batch 2+ with `memory_write_batch`.
+Use Grep/Glob for exact string/pattern matching. Use mdkb for everything else:
+- **Understanding code flow**: `search(scope=\"symbols\")` to find entry point → `code_graph(name)` to trace all callers/callees. This replaces iterative grep-read-grep chains.
+- **Semantic code queries**: `search(query, scope=\"code\")` for natural language (\"where is auth handled?\")
+- **Docs + decisions**: `search(query)` searches docs and memory together.
+- **Impact analysis**: `code_graph(name, direction=\"callers\")` before modifying any function.
+
+## Workflow
+
+1. Before multi-step tasks: `search(query, scope=\"memory\")` for prior decisions.
+2. To understand a function: `search(name, scope=\"symbols\")` → `code_graph(name)` for full call tree.
+3. After solving problems: check duplicates, then `memory_write`. Batch 2+ with `memory_write_batch`.
+4. Search returns IDs. Use `get(id)` for full content.
 
 Memory entry_type: `problem`, `decision`, `topic`.
 
@@ -2364,15 +2372,15 @@ Memory entry_type: `problem`, `decision`, `topic`.
 
 | Need | Tool |
 |---|---|
-| Search docs + memory | `search(query)` |
-| Find symbols | `search(query, scope=\"symbols\")` |
+| Docs + memory search | `search(query)` |
 | Semantic code search | `search(query, scope=\"code\")` |
+| Find symbols by name | `search(query, scope=\"symbols\")` |
+| **Trace call tree / impact** | **`code_graph(name)`** |
 | Read full content | `get(id)` |
-| Trace callers / impact | `code_graph(name)` |
 | Browse memories | `memory_list()` |
-| Write memory entry | `memory_write(id, title, content)` |
-| Batch write memories | `memory_write_batch(entries=[...])` |
-| Remove bad entries | `memory_delete(id)` |
+| Write memory | `memory_write(id, title, content)` |
+| Batch write | `memory_write_batch(entries=[...])` |
+| Remove entries | `memory_delete(id)` |
 | Revision diffs | `get(id, format=\"history\")` |
 
 Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.

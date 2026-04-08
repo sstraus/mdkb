@@ -240,7 +240,7 @@ mod tests {
     }
 
     #[test]
-    fn test_schema_unique_constraint_on_symbols() {
+    fn test_schema_duplicate_symbol_replaced() {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
 
@@ -252,17 +252,27 @@ mod tests {
         let file_id = conn.last_insert_rowid();
 
         conn.execute(
-            "INSERT INTO code_symbols (name, kind, file_id, file_path, line_start) VALUES ('foo', 'Function', ?1, 'a', 10)",
+            "INSERT OR REPLACE INTO code_symbols (name, kind, file_id, file_path, line_start, doc_comment) VALUES ('foo', 'Function', ?1, 'a', 10, 'old')",
             [file_id],
         )
         .unwrap();
 
-        // Same name + file + line should fail
-        let result = conn.execute(
-            "INSERT INTO code_symbols (name, kind, file_id, file_path, line_start) VALUES ('foo', 'Function', ?1, 'a', 10)",
+        // Same name + file + line should replace, not fail
+        conn.execute(
+            "INSERT OR REPLACE INTO code_symbols (name, kind, file_id, file_path, line_start, doc_comment) VALUES ('foo', 'Function', ?1, 'a', 10, 'new')",
             [file_id],
-        );
-        assert!(result.is_err(), "duplicate symbol should be rejected");
+        )
+        .unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_symbols WHERE name = 'foo'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "duplicate should be replaced, not added");
+
+        let doc: String = conn
+            .query_row("SELECT doc_comment FROM code_symbols WHERE name = 'foo'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(doc, "new", "last insert should win");
     }
 
     #[test]

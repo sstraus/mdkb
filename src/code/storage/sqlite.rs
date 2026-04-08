@@ -162,7 +162,7 @@ impl CodeDb {
         scope_context: Option<&str>,
     ) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO code_symbols \
+            "INSERT OR REPLACE INTO code_symbols \
              (name, kind, file_id, file_path, line_start, col_start, line_end, col_end, \
               visibility, signature, doc_comment, module_path, scope_context) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",

@@ -19,6 +19,14 @@ pub struct CachingParser {
     cached: Option<(u64, Tree)>,
 }
 
+impl std::fmt::Debug for CachingParser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachingParser")
+            .field("cached_hash", &self.cached.as_ref().map(|(h, _)| h))
+            .finish()
+    }
+}
+
 // SAFETY: `CachingParser` contains a raw pointer inside `tree_sitter::Tree`
 // which makes it `!Send`. Parsers are created in `create_parser` and moved
 // into the parse thread's local HashMap. After that, they are only used from

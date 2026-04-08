@@ -39,8 +39,8 @@ fn test_instructions_content() {
         &instructions[..instructions.len().min(200)]
     );
     assert!(
-        instructions.to_lowercase().contains("always"),
-        "Instructions must tell model to always start with search. Got: {}",
+        instructions.contains("code_graph"),
+        "Instructions must mention code_graph for call tree tracing. Got: {}",
         &instructions[..instructions.len().min(200)]
     );
     assert!(
