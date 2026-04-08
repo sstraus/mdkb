@@ -482,7 +482,7 @@ impl CSharpParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, None, &mut calls);
+        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
         calls
     }
 

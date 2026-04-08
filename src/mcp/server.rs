@@ -3524,6 +3524,24 @@ pub fn utility() -> i32 {
             )
             .unwrap();
 
+            // Create a JS file with top-level calls (CommonJS hook pattern)
+            std::fs::write(
+                src_dir.join("hook.js"),
+                r#"
+const { validate } = require('./lib/utils');
+
+function processHook(data) {
+    return validate(data);
+}
+
+if (require.main === module) {
+    processHook('test');
+    validate('direct');
+}
+"#,
+            )
+            .unwrap();
+
             // Create code index
             let index_path = root.join(".mdkb/code.sqlite");
             let mut facade = IndexFacade::create(&index_path).expect("Failed to create code index");
@@ -4050,6 +4068,36 @@ pub fn utility() -> i32 {
                 "Error should list candidates with sym# IDs: {}",
                 err_msg
             );
+        }
+
+        #[tokio::test]
+        async fn test_code_graph_top_level_callers() {
+        let (_dir, server) = setup_indexed_server();
+        let timeout = Duration::from_secs(5);
+
+        // "processHook" is called at top-level in hook.js via
+        // `if (require.main === module) { processHook('test'); }`
+        // The <module> synthetic symbol should appear as a caller.
+        let result = tokio::time::timeout(
+            timeout,
+            server.code_graph(Parameters(CodeGraphParams {
+                name: "processHook".to_string(),
+                direction: "callers".to_string(),
+                symbol_id: None,
+                max_depth: 3,
+                root: None,
+            })),
+        )
+        .await
+        .expect("timeout")
+        .expect("code_graph callers for processHook failed");
+
+        let text = extract_text(&result);
+        assert!(
+            text.contains("<module>"),
+            "Top-level caller should show as <module>: {}",
+            text
+        );
         }
     }
 

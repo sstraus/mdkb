@@ -1203,7 +1203,7 @@ impl GoParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.extract_calls_recursive(&tree.root_node(), code, None, &mut calls, 0);
+        self.extract_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
         calls
     }
 
@@ -1264,7 +1264,7 @@ impl GoParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.extract_method_calls_recursive(&tree.root_node(), code, None, &mut calls, 0);
+        self.extract_method_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
         calls
     }
 

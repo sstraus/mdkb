@@ -881,7 +881,7 @@ impl TypeScriptParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.extract_calls_recursive(&tree.root_node(), code, None, &mut calls, 0);
+        self.extract_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
         calls
     }
 
@@ -946,7 +946,7 @@ impl TypeScriptParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.extract_method_calls_recursive(&tree.root_node(), code, None, &mut calls, 0);
+        self.extract_method_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
         calls
     }
 
@@ -1557,6 +1557,39 @@ function getData(): string { return ""; }
             calls
                 .iter()
                 .any(|(caller, target, _)| *caller == "main" && *target == "getData")
+        );
+    }
+
+    #[test]
+    fn test_find_calls_top_level() {
+        let mut parser = TypeScriptParser::new().unwrap();
+
+        // CommonJS pattern: require + top-level call (e.g., hook entry points)
+        let code = r#"
+const { setupHookBoilerplate } = require('./lib/auto-memory-utils');
+
+function getStories() { return []; }
+
+if (require.main === module) {
+    setupHookBoilerplate('compact-guard');
+    getStories();
+}
+"#;
+
+        let calls = parser.find_calls_impl(code);
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "<module>" && *target == "setupHookBoilerplate"),
+            "Top-level call to setupHookBoilerplate should have <module> as caller: {:?}",
+            calls
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "<module>" && *target == "getStories"),
+            "Top-level call to getStories should have <module> as caller: {:?}",
+            calls
         );
     }
 

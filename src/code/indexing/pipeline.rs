@@ -21,6 +21,8 @@ use crate::code::indexing::types::{
     CollectedRelationship, FileContent, FileRegistration, IndexBatch, IndexStats, ParsedFile,
     RawRelationship, RawSymbol,
 };
+use crate::code::symbol::Visibility;
+use crate::code::types::{Range, SymbolKind};
 use crate::code::indexing::walker;
 use crate::code::parsing::c_lang::CParser;
 use crate::code::parsing::cpp::CppParser;
@@ -467,6 +469,38 @@ fn stage_collect(
                 scope_context: raw.scope_context,
             };
 
+            batch.symbols.push((symbol, parsed.path.clone()));
+        }
+
+        // Create synthetic <module> symbol if any relationship uses it as caller
+        let module_key: Box<str> = "<module>".into();
+        if !name_in_file.contains_key(&(module_key.clone(), file_id.value()))
+            && parsed
+                .raw_relationships
+                .iter()
+                .any(|r| &*r.from_name == "<module>")
+        {
+            let sym_id = symbol_counter.next_id();
+            name_in_file.insert((module_key, file_id.value()), sym_id);
+
+            let symbol = Symbol {
+                id: sym_id,
+                name: "<module>".into(),
+                kind: SymbolKind::Module,
+                file_id,
+                range: Range {
+                    start_line: 0,
+                    start_column: 0,
+                    end_line: 0,
+                    end_column: 0,
+                },
+                file_path: file_path_str.clone(),
+                signature: None,
+                doc_comment: None,
+                module_path: None,
+                visibility: Visibility::Private,
+                scope_context: None,
+            };
             batch.symbols.push((symbol, parsed.path.clone()));
         }
 
