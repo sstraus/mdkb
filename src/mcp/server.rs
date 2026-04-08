@@ -2374,21 +2374,32 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
 const BASE_INSTRUCTIONS: &str = "\
 # mdkb — Project Knowledge Base
 
-## When to use mdkb vs Grep/Glob
+## Grep/Glob vs mdkb
 
-Use Grep/Glob for exact string/pattern matching. Use mdkb for everything else:
-- **Understanding code flow**: `code_graph(name)` — resolves fuzzy names automatically, traces callers/callees. Replaces grep-read-grep chains.
-- **Semantic code queries**: `search(query, scope=\"code\")` for natural language (\"where is auth handled?\")
-- **Docs + decisions**: `search(query)` searches docs and memory together.
-- **Impact analysis**: `code_graph(name, direction=\"callers\")` before modifying any function.
+Use Grep/Glob for exact string/pattern matching (literals, regex, inline guards).
+Use mdkb for structured queries: call graphs, symbol lookup, docs, memory, semantic code search.
+
+## Tool selection
+
+- Know the function name? → `code_graph(name)` FIRST. Fuzzy matching built-in.
+- Know a keyword but not the function? → `search(query, scope=\"symbols\")`
+- Don't know what to search for? → `search(query, scope=\"code\")` for semantic match
+- Need callers/callees? → `code_graph(name, direction=\"callers\")` — ALWAYS beats search for this
+- DON'T use `search(scope=\"code\")` to find callers or when you know the symbol name
+
+## Fallback chain
+
+1. `code_graph(\"exactName\")` — exact match
+2. `code_graph(\"partialName\")` — fuzzy resolution (\"setupHook\" → \"setupHookBoilerplate\")
+3. `search(\"name\", scope=\"symbols\")` — broader symbol search
+4. `search(\"what it does\", scope=\"code\")` — semantic, last resort
 
 ## Workflow
 
 1. Before multi-step tasks: `search(query, scope=\"memory\")` for prior decisions.
-2. To understand a function: `code_graph(name)` — accepts partial/fuzzy names, disambiguates if needed.
-3. To list symbols in a file: `search(\"*\", scope=\"symbols\", file=\"path\")`.
-4. After solving problems: check duplicates, then `memory_write`. Batch 2+ with `memory_write_batch`.
-5. Search returns IDs. Use `get(id)` for full content.
+2. List symbols in a file: `search(\"*\", scope=\"symbols\", file=\"path\")`.
+3. After solving problems: check duplicates, then `memory_write`. Batch 2+ with `memory_write_batch`.
+4. `search` returns IDs. Use `get(id)` for full content.
 
 Memory entry_type: `problem`, `decision`, `topic`.
 
@@ -2396,15 +2407,12 @@ Memory entry_type: `problem`, `decision`, `topic`.
 
 | Need | Tool |
 |---|---|
-| **Trace call tree / impact** | **`code_graph(name)`** — fuzzy name resolution built-in |
-| Docs + memory search | `search(query)` |
-| Semantic code search | `search(query, scope=\"code\")` |
-| Find symbols by name/file | `search(query, scope=\"symbols\")` |
-| Read full content | `get(id)` |
-| Browse memories | `memory_list()` |
-| Write memory | `memory_write(id, title, content)` |
-| Batch write | `memory_write_batch(entries=[...])` |
-| Remove entries | `memory_delete(id)` |
+| **Call tree / impact** | **`code_graph(name)`** — fuzzy resolution built-in |
+| Docs + memory | `search(query)` |
+| Semantic code | `search(query, scope=\"code\")` |
+| Symbols by name/file | `search(query, scope=\"symbols\")` |
+| Full content | `get(id)` |
+| Memories | `memory_list()` / `memory_write` / `memory_write_batch` / `memory_delete` |
 | Revision diffs | `get(id, format=\"history\")` |
 
 Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
