@@ -320,6 +320,14 @@ impl IndexFacade {
             .collect()
     }
 
+    /// Find all symbols in files matching a path substring.
+    pub fn find_symbols_by_file(&self, file_pattern: &str, limit: usize) -> Vec<Symbol> {
+        self.db.find_symbols_by_file(file_pattern, limit).unwrap_or_else(|e| {
+            tracing::error!("DB error in find_symbols_by_file('{file_pattern}'): {e}");
+            Vec::new()
+        })
+    }
+
     /// Find all symbols matching a name (may return multiple across files).
     pub fn find_symbols_by_name(&self, name: &str) -> Vec<Symbol> {
         self.db.find_symbols_by_name(name).unwrap_or_else(|e| {

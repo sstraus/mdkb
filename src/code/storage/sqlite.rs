@@ -280,6 +280,16 @@ impl CodeDb {
         rows.collect()
     }
 
+    /// Find all symbols in files matching a path substring.
+    pub fn find_symbols_by_file(&self, file_pattern: &str, limit: usize) -> rusqlite::Result<Vec<Symbol>> {
+        let pattern = format!("%{file_pattern}%");
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "{SYMBOL_COLUMNS} FROM code_symbols WHERE file_path LIKE ?1 ESCAPE '\\' ORDER BY file_path, line_start LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| row_to_symbol(row))?;
+        rows.collect()
+    }
+
     /// Get symbol IDs for all symbols belonging to a file (by relative path).
     pub fn get_symbol_ids_for_file(&self, rel_path: &str) -> rusqlite::Result<Vec<u32>> {
         let mut stmt = self.conn.prepare_cached(

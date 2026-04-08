@@ -1155,8 +1155,19 @@ impl McpServer {
                                 (out, tokens, result_count)
                             }
                         } else {
-                            // symbols scope: fuzzy text match
-                            let mut symbols = facade.search_symbols(&params.query, params.limit);
+                            // symbols scope: file-first or text search
+                            let mut symbols = if let Some(ref file_pattern) = params.file {
+                                // File filter present → query by file path directly
+                                let mut results = facade.find_symbols_by_file(file_pattern, params.limit * 2);
+                                // If query is non-trivial, further filter by name
+                                if !params.query.is_empty() && params.query != "*" {
+                                    let q = params.query.to_lowercase();
+                                    results.retain(|s| s.name.to_lowercase().contains(&q));
+                                }
+                                results
+                            } else {
+                                facade.search_symbols(&params.query, params.limit)
+                            };
 
                             // Apply kind filter
                             if let Some(ref kind_str) = params.kind {
@@ -1168,11 +1179,6 @@ impl McpServer {
                                         "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro"
                                     )));
                                 }
-                            }
-
-                            // Apply file filter (substring match)
-                            if let Some(ref file_pattern) = params.file {
-                                symbols.retain(|s| s.file_path.contains(file_pattern.as_str()));
                             }
 
                             if symbols.is_empty() {
