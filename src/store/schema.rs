@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 8;
+pub const SCHEMA_VERSION: i32 = 9;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     confirmations INTEGER DEFAULT 0,  -- Positive confidence signals
     corrections INTEGER DEFAULT 0,    -- Negative confidence signals
     last_confirmed_at INTEGER,        -- Timestamp of last confirmation
-    source_type TEXT DEFAULT 'user_statement'  -- official_docs, user_statement, inference
+    source_type TEXT DEFAULT 'user_statement',  -- official_docs, user_statement, inference
+    expires_at INTEGER                         -- Unix timestamp; NULL = permanent
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
@@ -376,6 +377,21 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 ON memory_revisions(memory_id);
             "#,
         )?;
+    }
+
+    // Migration from v8 to v9: add expires_at column to memory_entries for TTL support
+    if from_version < 9 {
+        let has_expires_at: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'expires_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !has_expires_at {
+            conn.execute_batch("ALTER TABLE memory_entries ADD COLUMN expires_at INTEGER;")?;
+        }
     }
 
     // Update schema version
@@ -1358,6 +1374,112 @@ mod tests {
             entry.tags.is_empty(),
             "malformed tags_json should result in empty tags vec, got: {:?}",
             entry.tags
+        );
+    }
+
+    #[test]
+    fn test_migrate_v8_to_v9_adds_expires_at() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Create fresh schema at v8 by init + roll back version
+        init_schema(&conn).unwrap();
+
+        // Verify expires_at does NOT exist yet at v8
+        // (It will exist because init_schema creates latest DDL. So we simulate
+        // a v8 database by dropping the column — but SQLite doesn't support DROP COLUMN
+        // before 3.35. Instead, we test the migration path directly.)
+
+        // Create a v8-like database from v1 + migrations up to v7
+        let conn2 = Connection::open_in_memory().unwrap();
+        create_v1_schema(&conn2);
+        // Apply migrations up through v7 manually
+        conn2
+            .execute_batch(
+                r#"
+                ALTER TABLE documents ADD COLUMN status TEXT DEFAULT 'current';
+                ALTER TABLE documents ADD COLUMN status_reason TEXT;
+                ALTER TABLE documents ADD COLUMN version TEXT;
+                ALTER TABLE memory_entries ADD COLUMN source_path TEXT;
+                ALTER TABLE collections ADD COLUMN source TEXT DEFAULT 'manual';
+                CREATE TABLE IF NOT EXISTS document_evolution (
+                    id INTEGER PRIMARY KEY,
+                    document_path TEXT NOT NULL,
+                    from_version TEXT,
+                    to_version TEXT NOT NULL,
+                    change_type TEXT NOT NULL,
+                    diff TEXT,
+                    created_at INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_evolution_path ON document_evolution(document_path);
+                ALTER TABLE memory_entries ADD COLUMN confirmations INTEGER DEFAULT 0;
+                ALTER TABLE memory_entries ADD COLUMN corrections INTEGER DEFAULT 0;
+                ALTER TABLE memory_entries ADD COLUMN last_confirmed_at INTEGER;
+                ALTER TABLE memory_entries ADD COLUMN source_type TEXT DEFAULT 'user_statement';
+                CREATE TABLE IF NOT EXISTS memory_revisions (
+                    id INTEGER PRIMARY KEY,
+                    memory_id TEXT NOT NULL,
+                    diff TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (memory_id) REFERENCES memory_entries(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_id
+                    ON memory_revisions(memory_id);
+                UPDATE schema_version SET version = 8;
+                "#,
+            )
+            .unwrap();
+
+        assert_eq!(get_schema_version(&conn2).unwrap(), Some(8));
+
+        // Verify expires_at does NOT exist at v8
+        let has_expires_at: bool = conn2
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'expires_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(
+            !has_expires_at,
+            "v8 should not have expires_at column"
+        );
+
+        // Run migration
+        migrate_schema(&conn2, 8).unwrap();
+
+        assert_eq!(get_schema_version(&conn2).unwrap(), Some(SCHEMA_VERSION));
+
+        // Verify expires_at exists after migration
+        let has_expires_at: bool = conn2
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'expires_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(
+            has_expires_at,
+            "should have expires_at column after v8→v9 migration"
+        );
+
+        // Verify existing entries have NULL expires_at
+        conn2
+            .execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+                 VALUES ('test', 'Test', 'Content', 'topic', '[]', 1000, 1000)",
+                [],
+            )
+            .unwrap();
+
+        let expires_at: Option<i64> = conn2
+            .query_row(
+                "SELECT expires_at FROM memory_entries WHERE id = 'test'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            expires_at.is_none(),
+            "existing entries should have NULL expires_at"
         );
     }
 }
