@@ -2420,6 +2420,7 @@ const BASE_INSTRUCTIONS: &str = "\
 3. `memory_delete` — remove stale entries
 
 Memory entry_type: `problem`, `decision`, `topic`.
+TTL: pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Omit for permanent.
 `search` returns IDs. Use `get(id)` for full content.
 Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
 ";
