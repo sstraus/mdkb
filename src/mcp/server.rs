@@ -783,9 +783,10 @@ impl McpServer {
 
             // Try memory slug
             if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+                let ttl = format_ttl_info(entry.expires_at);
                 output.push_str(&format!(
-                    "=== [MEM] {} - {} ===\n{}\n\n",
-                    entry.id, entry.title, entry.content
+                    "=== [MEM] {} - {}{} ===\n{}\n\n",
+                    entry.id, entry.title, ttl, entry.content
                 ));
                 found += 1;
                 continue;
@@ -1379,9 +1380,24 @@ impl McpServer {
                 })
                 .unwrap_or_default();
 
+            let now = chrono::Utc::now().timestamp();
+            let expired_marker = match entry.expires_at {
+                Some(ts) if ts <= now => " [EXPIRED]",
+                _ => "",
+            };
+            let ttl_line = match entry.expires_at {
+                Some(ts) => {
+                    let dt = chrono::DateTime::from_timestamp(ts, 0)
+                        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| ts.to_string());
+                    format!("\nExpires: {dt}")
+                }
+                None => String::new(),
+            };
             let output = format!(
-                "# {} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}{}\n\n{}",
+                "# {}{} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}{}{}\n\n{}",
                 entry.title,
+                expired_marker,
                 entry.id,
                 entry.entry_type,
                 entry.status,
@@ -1393,6 +1409,7 @@ impl McpServer {
                 entry.access_count,
                 conf_line,
                 rev_line,
+                ttl_line,
                 body
             );
             let tokens = count_tokens(&output);
@@ -1730,12 +1747,14 @@ impl McpServer {
                         .map(|t| format!("#{t}"))
                         .collect::<Vec<_>>()
                         .join(" ");
+                    let ttl_info = format_ttl_info(e.expires_at);
                     out.push_str(&format!(
-                        "- [{}] {} ({}, {}): {} {}\n",
+                        "- [{}] {} ({}, {}{}): {} {}\n",
                         e.entry_type,
                         e.id,
                         e.title,
                         relative_time_ago(e.updated_at),
+                        ttl_info,
                         truncate_text(&e.content, 80),
                         tags,
                     ));
@@ -2598,17 +2617,37 @@ fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
 
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
     for entry in &ordered {
+        let ttl_info = format_ttl_info(entry.expires_at);
         out.push_str(&format!(
-            "- [{}] {} ({}, conf:{:.2}, {}): {}\n",
+            "- [{}] {} ({}, conf:{:.2}, {}{}): {}\n",
             entry.id,
             entry.title,
             entry.entry_type,
             entry.confidence(),
             relative_time_ago(entry.updated_at),
+            ttl_info,
             truncate_text(&entry.content, 100)
         ));
     }
     out
+}
+
+/// Format TTL info for display. Returns empty string for permanent entries.
+fn format_ttl_info(expires_at: Option<i64>) -> String {
+    match expires_at {
+        Some(ts) => {
+            let now = chrono::Utc::now().timestamp();
+            if ts <= now {
+                ", EXPIRED".to_string()
+            } else {
+                let dt = chrono::DateTime::from_timestamp(ts, 0)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| ts.to_string());
+                format!(", expires:{dt}")
+            }
+        }
+        None => String::new(),
+    }
 }
 
 /// Apply line range to content.
