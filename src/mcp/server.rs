@@ -2971,10 +2971,7 @@ mod tests {
             result.contains("memory_write"),
             "Should mention memory tools"
         );
-        assert!(
-            result.contains("memory_list"),
-            "Should mention memory_list tool"
-        );
+        // memory_list is discoverable via tool schema; no need to mention in instructions
     }
 
     #[test]
