@@ -92,6 +92,10 @@ pub struct MemoryWriteParams {
     /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
     #[serde(default = "default_source_type")]
     pub source_type: String,
+
+    /// TTL in seconds. Entry expires after this duration. Omit for permanent.
+    #[serde(default)]
+    pub ttl: Option<u64>,
 }
 
 fn default_entry_type() -> String {
@@ -125,6 +129,10 @@ pub struct MemoryWriteBatchEntry {
     /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
     #[serde(default = "default_source_type")]
     pub source_type: String,
+
+    /// TTL in seconds. Entry expires after this duration. Omit for permanent.
+    #[serde(default)]
+    pub ttl: Option<u64>,
 }
 
 /// Parameters for batch memory write.

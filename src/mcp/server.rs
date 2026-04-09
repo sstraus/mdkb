@@ -55,6 +55,7 @@ fn write_single_memory(
     entry_type_str: &str,
     source_type_str: &str,
     tags: &[String],
+    ttl: Option<u64>,
 ) -> Result<String, McpError> {
     memory::validate_entry_input(id, title, tags, content)
         .map_err(|e| mcp_error(e.to_string()))?;
@@ -71,6 +72,7 @@ fn write_single_memory(
         .map_err(|e: String| mcp_error(e))?;
 
     let now = chrono::Utc::now().timestamp();
+    let expires_at = ttl.map(|s| now + s as i64);
     let is_new = existing.is_none();
 
     // Pre-write duplicate check: reject if a near-identical entry exists (new entries only).
@@ -115,6 +117,7 @@ fn write_single_memory(
         existing_entry.content = content.to_string();
         existing_entry.entry_type = entry_type;
         existing_entry.tags = tags.to_vec();
+        existing_entry.expires_at = expires_at;
         memory::update_entry(conn, &existing_entry)
             .map_err(|e| mcp_error(format!("Failed to update memory entry: {e}")))?;
 
@@ -145,7 +148,7 @@ fn write_single_memory(
             confirmations: 0,
             last_confirmed_at: None,
             source_type,
-            expires_at: None,
+            expires_at,
         };
         memory::add_entry(conn, &entry)
             .map_err(|e| mcp_error(format!("Failed to create memory entry: {e}")))?;
@@ -1591,6 +1594,7 @@ impl McpServer {
                 &params.entry_type,
                 &params.source_type,
                 &params.tags,
+                params.ttl,
             )?;
 
             let tokens = count_tokens(&output);
@@ -1637,6 +1641,7 @@ impl McpServer {
                     &entry.entry_type,
                     &entry.source_type,
                     &entry.tags,
+                    entry.ttl,
                 )?;
                 results.push(result);
             }
@@ -3056,6 +3061,7 @@ mod tests {
                 entry_type: "topic".to_string(),
                 tags: vec![],
                 source_type: "user_statement".to_string(),
+                ttl: None,
                 root: None,
             }))
             .await
@@ -3138,6 +3144,7 @@ mod tests {
                 entry_type: "topic".to_string(),
                 tags: vec![],
                 source_type: "user_statement".to_string(),
+                ttl: None,
                 root: None,
             })),
         )
@@ -3370,6 +3377,7 @@ mod tests {
                 entry_type: "topic".to_string(),
                 tags: vec!["tag1".to_string()],
                 source_type: "user_statement".to_string(),
+                ttl: None,
                 root: None,
             }))
             .await
@@ -3383,6 +3391,7 @@ mod tests {
                 entry_type: "problem".to_string(),
                 tags: vec![],
                 source_type: "user_statement".to_string(),
+                ttl: None,
                 root: None,
             }))
             .await
@@ -4200,6 +4209,7 @@ if (require.main === module) {
                 entry_type: "topic".to_string(),
                 tags: vec![],
                 source_type: "user_statement".to_string(),
+                ttl: None,
                 root: None,
             }))
             .await
@@ -4224,6 +4234,7 @@ if (require.main === module) {
                 entry_type: "topic".to_string(),
                 tags: vec![],
                 source_type: "user_statement".to_string(),
+                ttl: None,
                 root: None,
             }))
             .await
@@ -4691,6 +4702,7 @@ if (require.main === module) {
                         entry_type: "topic".to_string(),
                         tags: vec!["test".to_string()],
                         source_type: "user_statement".to_string(),
+                        ttl: None,
                     },
                     MemoryWriteBatchEntry {
                         id: "batch-b".to_string(),
@@ -4699,6 +4711,7 @@ if (require.main === module) {
                         entry_type: "decision".to_string(),
                         tags: vec![],
                         source_type: "user_statement".to_string(),
+                        ttl: None,
                     },
                 ],
                 root: None,
@@ -4758,6 +4771,7 @@ if (require.main === module) {
                 entry_type: "topic".to_string(),
                 tags: vec![],
                 source_type: "user_statement".to_string(),
+                ttl: None,
             })
             .collect();
 
