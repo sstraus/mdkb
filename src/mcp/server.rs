@@ -145,6 +145,7 @@ fn write_single_memory(
             confirmations: 0,
             last_confirmed_at: None,
             source_type,
+            expires_at: None,
         };
         memory::add_entry(conn, &entry)
             .map_err(|e| mcp_error(format!("Failed to create memory entry: {e}")))?;

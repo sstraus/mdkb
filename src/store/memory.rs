@@ -122,6 +122,9 @@ pub struct MemoryEntry {
     pub last_confirmed_at: Option<i64>,
     #[serde(default)]
     pub source_type: SourceType,
+    /// Unix timestamp when this entry expires. `None` = permanent.
+    #[serde(default)]
+    pub expires_at: Option<i64>,
 }
 
 impl MemoryEntry {
@@ -263,12 +266,12 @@ pub fn list_entries_sorted(
 
     let sql = if status_filter.is_some() {
         format!(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at
              FROM memory_entries WHERE status = ?1 {order_clause} LIMIT ?2"
         )
     } else {
         format!(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at
              FROM memory_entries {order_clause} LIMIT ?1"
         )
     };
@@ -294,8 +297,8 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
     let tags_json = serde_json::to_string(&entry.tags)?;
 
     conn.execute(
-        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             entry.id,
             entry.title,
@@ -311,6 +314,7 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
             entry.confirmations,
             entry.last_confirmed_at,
             entry.source_type.to_string(),
+            entry.expires_at,
         ],
     )?;
 
@@ -426,8 +430,8 @@ pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
 
     conn.execute(
         "UPDATE memory_entries
-         SET title = ?1, content = ?2, entry_type = ?3, tags = ?4, status = ?5, updated_at = ?6, superseded_by = ?7
-         WHERE id = ?8",
+         SET title = ?1, content = ?2, entry_type = ?3, tags = ?4, status = ?5, updated_at = ?6, superseded_by = ?7, expires_at = ?8
+         WHERE id = ?9",
         params![
             entry.title,
             entry.content,
@@ -436,6 +440,7 @@ pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
             entry.status.to_string(),
             now,
             entry.superseded_by,
+            entry.expires_at,
             entry.id,
         ],
     )?;
@@ -562,7 +567,7 @@ pub fn get_entry(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
 /// Get a memory entry by ID without incrementing access count.
 pub fn get_entry_without_tracking(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at
          FROM memory_entries WHERE id = ?1"
     )?;
 
@@ -592,7 +597,7 @@ pub fn list_entries(
 pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type
+        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -618,7 +623,7 @@ fn bm25_search_with_rowid(
 ) -> Result<Vec<(i64, MemoryEntry)>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
     let mut stmt = conn.prepare(
-        "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type
+        "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -680,7 +685,7 @@ pub fn find_similar_entries(
 pub fn get_entry_by_rowid(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
     let entry = conn
         .query_row(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at
              FROM memory_entries WHERE rowid = ?1",
             params![rowid],
             row_to_entry,
@@ -696,7 +701,7 @@ fn get_entries_by_rowids(conn: &Connection, rowids: &[i64]) -> Result<HashMap<i6
     }
     let placeholders: Vec<String> = (1..=rowids.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
-        "SELECT rowid, id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type
+        "SELECT rowid, id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at
          FROM memory_entries WHERE rowid IN ({})",
         placeholders.join(", ")
     );
@@ -975,6 +980,7 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
             );
             SourceType::UserStatement
         }),
+        expires_at: row.get(off + 15)?,
     })
 }
 
@@ -1011,6 +1017,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
 
         add_entry(&conn, &entry).unwrap();
@@ -1021,6 +1028,46 @@ mod tests {
         assert_eq!(retrieved.entry_type, EntryType::Topic);
         assert_eq!(retrieved.tags, vec!["auth", "security"]);
         assert_eq!(retrieved.access_count, 1); // Incremented by get_entry
+        assert_eq!(retrieved.expires_at, None); // No TTL
+    }
+
+    #[test]
+    fn test_add_entry_with_expires_at() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let expires = now + 3600; // 1 hour from now
+
+        let entry = MemoryEntry {
+            id: "temp-note".to_string(),
+            title: "Temporary note".to_string(),
+            content: "This will expire".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: Some(expires),
+        };
+
+        add_entry(&conn, &entry).unwrap();
+
+        let retrieved = get_entry(&conn, "temp-note").unwrap().unwrap();
+        assert_eq!(retrieved.expires_at, Some(expires));
+
+        // Update to clear TTL
+        let mut updated = retrieved;
+        updated.expires_at = None;
+        update_entry(&conn, &updated).unwrap();
+
+        let retrieved2 = get_entry_without_tracking(&conn, "temp-note").unwrap().unwrap();
+        assert_eq!(retrieved2.expires_at, None);
     }
 
     #[test]
@@ -1044,6 +1091,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
 
         add_entry(&conn, &entry).unwrap();
@@ -1080,6 +1128,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
 
         add_entry(&conn, &entry).unwrap();
@@ -1121,6 +1170,7 @@ mod tests {
                 confirmations: 0,
                 last_confirmed_at: None,
                 source_type: SourceType::UserStatement,
+                expires_at: None,
             };
             add_entry(&conn, &entry).unwrap();
         }
@@ -1153,6 +1203,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
 
         let entry2 = MemoryEntry {
@@ -1171,6 +1222,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
 
         add_entry(&conn, &entry1).unwrap();
@@ -1202,6 +1254,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1232,6 +1285,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
 
         add_entry(&conn, &entry).unwrap();
@@ -1277,6 +1331,7 @@ mod tests {
                 confirmations: 0,
                 last_confirmed_at: None,
                 source_type: SourceType::UserStatement,
+                expires_at: None,
             };
             add_entry(&conn, &entry).unwrap();
         }
@@ -1307,6 +1362,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1344,6 +1400,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1380,6 +1437,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1411,6 +1469,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1449,6 +1508,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1480,6 +1540,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &recent).unwrap();
 
@@ -1500,6 +1561,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &stale).unwrap();
 
@@ -1537,6 +1599,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         let low = MemoryEntry {
             id: "low".to_string(),
@@ -1554,6 +1617,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &low).unwrap();
         add_entry(&conn, &high).unwrap();
@@ -1594,6 +1658,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         let recent = MemoryEntry {
             id: "recent".to_string(),
@@ -1611,6 +1676,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &old_accessed).unwrap();
         add_entry(&conn, &recent).unwrap();
@@ -1651,6 +1717,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         let newer = MemoryEntry {
             id: "newer".to_string(),
@@ -1668,6 +1735,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &older).unwrap();
         add_entry(&conn, &newer).unwrap();
@@ -1783,6 +1851,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1814,6 +1883,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &e1).unwrap();
         let rowid1 = get_rowid(&conn, "auth-basic").unwrap().unwrap();
@@ -1836,6 +1906,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &e2).unwrap();
         let rowid2 = get_rowid(&conn, "jwt-refresh").unwrap().unwrap();
@@ -1859,6 +1930,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &e3).unwrap();
         let rowid3 = get_rowid(&conn, "db-tuning").unwrap().unwrap();
@@ -1905,6 +1977,7 @@ mod tests {
                 confirmations: 0,
                 last_confirmed_at: None,
                 source_type: SourceType::UserStatement,
+                expires_at: None,
             };
             add_entry(&conn, &entry).unwrap();
             let rowid = get_rowid(&conn, &format!("entry-{i}")).unwrap().unwrap();
@@ -1937,6 +2010,7 @@ mod tests {
             confirmations: 0,
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
+            expires_at: None,
         };
         add_entry(&conn, &entry).unwrap();
 
@@ -1972,6 +2046,7 @@ mod tests {
             confirmations,
             last_confirmed_at: last_confirmed,
             source_type: source,
+            expires_at: None,
         }
     }
 
