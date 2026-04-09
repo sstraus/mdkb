@@ -900,9 +900,9 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
     let cutoff = now - (days as i64 * 24 * 60 * 60);
 
     // Find entries to prune:
-    // - status is 'active'
-    // - last_accessed is NULL (never accessed) and created_at < cutoff, OR
-    // - last_accessed is not NULL and last_accessed < cutoff
+    // - status is 'active' AND one of:
+    //   - stale: never accessed and created before cutoff, or last accessed before cutoff
+    //   - expired: expires_at is set and in the past
     let mut stmt = conn.prepare(
         r#"
         SELECT id FROM memory_entries
@@ -910,12 +910,13 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
         AND (
             (last_accessed IS NULL AND created_at < ?1)
             OR (last_accessed IS NOT NULL AND last_accessed < ?1)
+            OR (expires_at IS NOT NULL AND expires_at < ?2)
         )
         "#,
     )?;
 
     let ids: Vec<String> = stmt
-        .query_map(params![cutoff], |row| row.get(0))?
+        .query_map(params![cutoff, now], |row| row.get(0))?
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
@@ -935,9 +936,10 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
             AND (
                 (last_accessed IS NULL AND created_at < ?2)
                 OR (last_accessed IS NOT NULL AND last_accessed < ?2)
+                OR (expires_at IS NOT NULL AND expires_at < ?3)
             )
             "#,
-            params![now, cutoff],
+            params![now, cutoff, now],
         )?;
     }
 
@@ -1660,6 +1662,64 @@ mod tests {
         let warmup = get_warmup_index(&conn, 50).unwrap();
         assert_eq!(warmup.len(), 1);
         assert!(warmup[0].contains("recent"));
+    }
+
+    #[test]
+    fn test_prune_archives_expired_entries() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+
+        // Recently created but expired entry (should be pruned by TTL, not by age)
+        let expired = MemoryEntry {
+            id: "ttl-expired".to_string(),
+            title: "TTL expired".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,       // Just created
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: Some(now),
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: Some(now - 60), // Expired 1 minute ago
+        };
+
+        // Active entry with no TTL (should NOT be pruned)
+        let active = MemoryEntry {
+            id: "still-active".to_string(),
+            title: "Still active".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: Some(now),
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+        };
+
+        add_entry(&conn, &expired).unwrap();
+        add_entry(&conn, &active).unwrap();
+
+        // Prune with 30-day cutoff — expired should be pruned even though recently created
+        let pruned = prune_entries(&conn, 30, false).unwrap();
+        assert!(pruned.contains(&"ttl-expired".to_string()), "expired TTL entry should be pruned");
+        assert!(!pruned.contains(&"still-active".to_string()), "active entry should NOT be pruned");
+
+        // Verify archived status
+        let entry = get_entry_without_tracking(&conn, "ttl-expired").unwrap().unwrap();
+        assert_eq!(entry.status, EntryStatus::Archived);
     }
 
     #[test]
