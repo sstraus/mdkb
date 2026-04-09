@@ -264,24 +264,27 @@ pub fn list_entries_sorted(
         MemorySortOrder::Newest => "ORDER BY created_at DESC",
     };
 
+    let now = Utc::now().timestamp();
+    let ttl_filter = "AND (expires_at IS NULL OR expires_at > ?";
+
     let sql = if status_filter.is_some() {
         format!(
             "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at
-             FROM memory_entries WHERE status = ?1 {order_clause} LIMIT ?2"
+             FROM memory_entries WHERE status = ?1 {ttl_filter}2) {order_clause} LIMIT ?3"
         )
     } else {
         format!(
             "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at
-             FROM memory_entries {order_clause} LIMIT ?1"
+             FROM memory_entries WHERE (expires_at IS NULL OR expires_at > ?1) {order_clause} LIMIT ?2"
         )
     };
 
     let mut stmt = conn.prepare(&sql)?;
 
     let rows = if let Some(status) = status_filter {
-        stmt.query_map(params![status.to_string(), limit as i64], row_to_entry)?
+        stmt.query_map(params![status.to_string(), now, limit as i64], row_to_entry)?
     } else {
-        stmt.query_map(params![limit as i64], row_to_entry)?
+        stmt.query_map(params![now, limit as i64], row_to_entry)?
     };
 
     let mut entries = Vec::new();
@@ -596,16 +599,18 @@ pub fn list_entries(
 /// Search memory entries using full-text search.
 pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
+    let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
         "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
+         AND (m.expires_at IS NULL OR m.expires_at > ?3)
          ORDER BY bm25(memory_fts)
          LIMIT ?2"
     )?;
 
-    let rows = stmt.query_map(params![fts_query, limit as i64], row_to_entry)?;
+    let rows = stmt.query_map(params![fts_query, limit as i64, now], row_to_entry)?;
 
     let mut entries = Vec::new();
     for row in rows {
@@ -622,16 +627,18 @@ fn bm25_search_with_rowid(
     limit: usize,
 ) -> Result<Vec<(i64, MemoryEntry)>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
+    let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
         "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
+         AND (m.expires_at IS NULL OR m.expires_at > ?3)
          ORDER BY bm25(memory_fts)
          LIMIT ?2"
     )?;
 
-    let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+    let rows = stmt.query_map(params![fts_query, limit as i64, now], |row| {
         let rowid: i64 = row.get(0)?;
         let entry = row_to_entry_offset(row, 1)?;
         Ok((rowid, entry))
@@ -833,15 +840,17 @@ pub fn get_rowid(conn: &Connection, id: &str) -> Result<Option<i64>> {
 ///
 /// Uses a targeted query selecting only needed columns (no content).
 pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> {
+    let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
         "SELECT id, title, entry_type, tags FROM memory_entries
          WHERE status = 'active'
+         AND (expires_at IS NULL OR expires_at > ?2)
          ORDER BY access_count DESC
          LIMIT ?1",
     )?;
 
     let index: Vec<String> = stmt
-        .query_map(params![limit as i64], |row| {
+        .query_map(params![limit as i64, now], |row| {
             let id: String = row.get(0)?;
             let title: String = row.get(1)?;
             let entry_type: String = row.get(2)?;
@@ -874,9 +883,10 @@ pub fn count_entries(conn: &Connection) -> Result<usize> {
 
 /// Get count of active memory entries.
 pub fn count_active_entries(conn: &Connection) -> Result<usize> {
+    let now = Utc::now().timestamp();
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memory_entries WHERE status = 'active'",
-        [],
+        "SELECT COUNT(*) FROM memory_entries WHERE status = 'active' AND (expires_at IS NULL OR expires_at > ?1)",
+        params![now],
         |row| row.get(0),
     )?;
     Ok(count as usize)
@@ -1068,6 +1078,80 @@ mod tests {
 
         let retrieved2 = get_entry_without_tracking(&conn, "temp-note").unwrap().unwrap();
         assert_eq!(retrieved2.expires_at, None);
+    }
+
+    #[test]
+    fn test_expired_entries_excluded_from_list_and_search() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+
+        // Active entry (no TTL)
+        let active = MemoryEntry {
+            id: "active-entry".to_string(),
+            title: "Active searchable entry".to_string(),
+            content: "This is searchable content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+        };
+
+        // Expired entry
+        let expired = MemoryEntry {
+            id: "expired-entry".to_string(),
+            title: "Expired searchable entry".to_string(),
+            content: "This is also searchable content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now - 7200,
+            updated_at: now - 7200,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: Some(now - 3600), // Expired 1 hour ago
+        };
+
+        add_entry(&conn, &active).unwrap();
+        add_entry(&conn, &expired).unwrap();
+
+        // list_entries_sorted should exclude expired
+        let listed = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, Some(EntryStatus::Active)).unwrap();
+        let listed_ids: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
+        assert!(listed_ids.contains(&"active-entry"), "active should be listed");
+        assert!(!listed_ids.contains(&"expired-entry"), "expired should NOT be listed");
+
+        // search_entries should exclude expired
+        let searched = search_entries(&conn, "searchable", 10).unwrap();
+        let searched_ids: Vec<&str> = searched.iter().map(|e| e.id.as_str()).collect();
+        assert!(searched_ids.contains(&"active-entry"), "active should be searchable");
+        assert!(!searched_ids.contains(&"expired-entry"), "expired should NOT be searchable");
+
+        // get_warmup_index should exclude expired
+        let warmup = get_warmup_index(&conn, 50).unwrap();
+        let warmup_has_expired = warmup.iter().any(|line| line.contains("expired-entry"));
+        assert!(!warmup_has_expired, "expired should NOT be in warmup index");
+
+        // count_active_entries should exclude expired
+        let count = count_active_entries(&conn).unwrap();
+        assert_eq!(count, 1, "only 1 active non-expired entry");
+
+        // get_entry should still return expired entries
+        let retrieved = get_entry(&conn, "expired-entry").unwrap();
+        assert!(retrieved.is_some(), "get_entry should return expired entries");
     }
 
     #[test]
