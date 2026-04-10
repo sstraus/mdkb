@@ -190,6 +190,36 @@ To view the actual diffs, use `get(id, format="history")`. This returns compact 
 
 CLI equivalent: `mdkb memory history <id>`
 
+## TTL (Time-to-Live)
+
+Memory entries can auto-expire. Pass `ttl` (in seconds) to `memory_write` or `memory_write_batch`:
+
+```
+memory_write(
+  id: "investigation-flaky-test-ci",
+  title: "Flaky test investigation notes",
+  type: "topic",
+  content: "...",
+  ttl: 604800  // 7 days
+)
+```
+
+**Behavior:**
+- Expired entries are **filtered out** of `memory_list`, `search(scope="memory")`, and the warmup index.
+- Expired entries **remain accessible** via `get(id)` — the output is prefixed with `[EXPIRED]` so you can inspect or renew them.
+- Expiry is **soft**: the entry is archived, not deleted. `memory write` on the same `id` without `ttl` renews it as permanent; with a new `ttl` resets the expiry window.
+- `prune` removes expired entries alongside stale ones.
+
+**When to use TTL:**
+- Short-lived investigation notes (flaky test runs, one-off debugging context)
+- Time-boxed decisions ("use workaround X until library Y ships v2.0")
+- Session or sprint-scoped context that shouldn't pollute long-term memory
+
+**When NOT to use TTL:**
+- Architectural decisions — these belong in permanent memory
+- Solved problems worth preserving — no TTL
+- If in doubt, omit `ttl` and rely on confidence decay instead
+
 ## Memory Search vs Memory Index
 
 - **Warmup index** (`memory_list`): Top 50 entries by usage. Check this first.

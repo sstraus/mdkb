@@ -102,6 +102,7 @@ Persistent AI knowledge that survives across sessions — decisions, patterns, s
 - **Confidence scoring** — entries decay over time unless re-confirmed (0-1 score based on age, access count, source type)
 - **Duplicate detection** — near-duplicate entries are rejected before writing
 - **Revision tracking** — manual entries track up to 3 revision diffs
+- **TTL (time-to-live)** — pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Expired entries are filtered from searches and listings but remain accessible via `get(id)` with an `[EXPIRED]` marker, so they can be inspected or renewed. Omit `ttl` for permanent entries.
 
 Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices).
 
