@@ -960,13 +960,37 @@ impl McpServer {
             name
         );
         for sym in candidates {
+            let scope = match &sym.scope_context {
+                Some(crate::code::symbol::ScopeContext::ClassMember {
+                    class_name: Some(cn),
+                }) => format!(" [in {cn}]"),
+                Some(crate::code::symbol::ScopeContext::Local {
+                    parent_name: Some(pn),
+                    ..
+                }) => format!(" [in {pn}]"),
+                _ => String::new(),
+            };
+            let sig = sym
+                .signature
+                .as_ref()
+                .map(|s| {
+                    let s = s.trim();
+                    if s.len() > 60 {
+                        format!(" `{}…`", &s[..57])
+                    } else {
+                        format!(" `{s}`")
+                    }
+                })
+                .unwrap_or_default();
             msg.push_str(&format!(
-                "  sym#{} - {:?} {} in {} ({})\n",
+                "  sym#{} - {:?} {} in {} ({}){}{}\n",
                 sym.id.value(),
                 sym.kind,
                 sym.name,
                 sym.file_path,
                 sym.range,
+                scope,
+                sig,
             ));
         }
         mcp_error(msg)
