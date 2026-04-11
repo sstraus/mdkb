@@ -53,6 +53,13 @@ pub struct IndexingConfig {
 
     /// Index heading structure.
     pub index_headings: bool,
+
+    /// When true, the document/collection walker honors `.gitignore`,
+    /// `.git/info/exclude` and the global gitignore. When false (default),
+    /// gitignore is ignored and `.mdkbignore` is read instead — preserving
+    /// the historical behavior where gitignored directories like `stories/`
+    /// and `plans/` remain indexed.
+    pub respect_gitignore: bool,
 }
 
 /// Chunking settings (Phase 3).
@@ -183,6 +190,12 @@ pub struct CodeIndexingConfig {
 
     /// Batch size for pipeline commits.
     pub batch_size: usize,
+
+    /// When true (default), the code walker honors `.gitignore`,
+    /// `.git/info/exclude` and the global gitignore. The `# mdkb:index`
+    /// annotation remains active in this mode. When false, gitignore is
+    /// ignored and `.mdkbignore` is read instead.
+    pub respect_gitignore: bool,
 }
 
 /// Semantic code search settings.
@@ -219,6 +232,7 @@ impl Default for CodeIndexingConfig {
                 .map(|s| (*s).to_string())
                 .collect(),
             batch_size: DEFAULT_CODE_BATCH_SIZE,
+            respect_gitignore: true,
         }
     }
 }
@@ -262,6 +276,7 @@ impl Default for IndexingConfig {
             parse_frontmatter: true,
             parse_wikilinks: true,
             index_headings: true,
+            respect_gitignore: false,
         }
     }
 }

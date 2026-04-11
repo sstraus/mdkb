@@ -538,13 +538,12 @@ impl McpServer {
             let index_path = handle.root.join(".mdkb/code.sqlite");
             let mut facade = IndexFacade::open_or_create(&index_path)
                 .map_err(|e| mcp_error(format!("Failed to open code index: {e}")))?;
-            if !handle.code_ignore_patterns.is_empty() {
-                let config = crate::code::indexing::pipeline::PipelineConfig {
-                    ignore_patterns: handle.code_ignore_patterns.clone(),
-                    ..Default::default()
-                };
-                facade = facade.with_config(config);
-            }
+            let pipeline_config = crate::code::indexing::pipeline::PipelineConfig {
+                ignore_patterns: handle.code_ignore_patterns.clone(),
+                respect_gitignore: handle.config.code.indexing.respect_gitignore,
+                ..Default::default()
+            };
+            facade = facade.with_config(pipeline_config);
             *idx_guard = Some(facade);
         }
         Ok(idx_guard)
@@ -899,13 +898,12 @@ impl McpServer {
             let index_path = self.root.join(".mdkb/code.sqlite");
             let mut facade = IndexFacade::open_or_create(&index_path)
                 .map_err(|e| mcp_error(format!("Failed to open code index: {}", e)))?;
-            if !self.code_ignore_patterns.is_empty() {
-                let config = crate::code::indexing::pipeline::PipelineConfig {
-                    ignore_patterns: self.code_ignore_patterns.clone(),
-                    ..Default::default()
-                };
-                facade = facade.with_config(config);
-            }
+            let pipeline_config = crate::code::indexing::pipeline::PipelineConfig {
+                ignore_patterns: self.code_ignore_patterns.clone(),
+                respect_gitignore: self.full_config.code.indexing.respect_gitignore,
+                ..Default::default()
+            };
+            facade = facade.with_config(pipeline_config);
             *idx_guard = Some(facade);
         }
         Ok(idx_guard)
@@ -2122,6 +2120,11 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                     let all_files = crate::code::indexing::walker::discover_files(
                         &startup_root,
                         &startup_server.code_ignore_patterns,
+                        startup_server
+                            .full_config
+                            .code
+                            .indexing
+                            .respect_gitignore,
                     );
                     facade.reindex_files(&startup_root, &all_files)
                 };

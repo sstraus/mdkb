@@ -102,7 +102,11 @@ impl IndexFacade {
         } else {
             // Incremental — discover files, filter by mtime, delete stale, re-index.
             // Uses mtime comparison (filesystem metadata) to avoid reading file contents.
-            let discovered = walker::discover_files(root, &self.config.ignore_patterns);
+            let discovered = walker::discover_files(
+                root,
+                &self.config.ignore_patterns,
+                self.config.respect_gitignore,
+            );
             let mut changed = Vec::new();
 
             for path in &discovered {

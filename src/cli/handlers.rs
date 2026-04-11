@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::code::indexing::walker::{WalkOptions, walk_files};
 use crate::config::Config;
 use crate::domain::frontmatter::{ParsedDocument, parse_frontmatter};
 use crate::domain::{Collection, Document, SearchQuery, SearchResult, UpdateResult};
@@ -18,6 +19,21 @@ use globset::Glob;
 use rusqlite::Connection;
 use serde::Deserialize;
 use walkdir::WalkDir;
+
+/// Build/dependency directories pruned by the document walker by default.
+/// Applied as glob excludes through the unified walker; callers can extend
+/// this via a `.mdkbignore` (when `respect_gitignore=false`) or `.gitignore`.
+const DOC_WALKER_DEFAULT_EXCLUDES: &[&str] = &[
+    "**/target/**",
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/vendor/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/__pycache__/**",
+    "**/.tox/**",
+    "**/.venv/**",
+];
 
 /// Run `body` inside a BEGIN IMMEDIATE / COMMIT transaction.
 /// On error, ROLLBACK is attempted and logged if it also fails.
@@ -556,11 +572,12 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
     // Detect and register convention-based collections before processing
     apply_conventions(ctx, root)?;
 
+    let config = Config::load_or_default(&ctx.config_path);
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult::default();
 
     with_transaction(&ctx.conn, || {
-        update_all_collections(ctx, root, &collections, &mut result)?;
+        update_all_collections(ctx, root, &config, &collections, &mut result)?;
         Ok(())
     })?;
     Ok(result)
@@ -589,11 +606,12 @@ fn apply_conventions(ctx: &Context, root: &Path) -> Result<()> {
 fn update_all_collections(
     ctx: &Context,
     root: &Path,
+    config: &Config,
     collections: &[Collection],
     result: &mut UpdateResult,
 ) -> Result<()> {
     for coll in collections {
-        update_collection(ctx, root, coll, result)?;
+        update_collection(ctx, root, config, coll, result)?;
     }
     Ok(())
 }
@@ -602,6 +620,7 @@ fn update_all_collections(
 fn update_collection(
     ctx: &Context,
     root: &Path,
+    config: &Config,
     collection: &Collection,
     result: &mut UpdateResult,
 ) -> Result<()> {
@@ -656,41 +675,35 @@ fn update_collection(
         .collect();
     let mut existing_paths: HashSet<String> = existing_by_path.keys().cloned().collect();
 
-    // Walk directory and process files, pruning build/dependency directories
-    for entry in WalkDir::new(&base_path)
-        .into_iter()
-        .filter_entry(|e| {
-            if e.file_type().is_dir() {
-                let name = e.file_name().to_string_lossy();
-                !matches!(
-                    name.as_ref(),
-                    "target"
-                        | "node_modules"
-                        | ".git"
-                        | "vendor"
-                        | "dist"
-                        | "build"
-                        | "__pycache__"
-                        | ".tox"
-                        | ".venv"
-                )
-            } else {
-                true
+    // Walk directory through the unified walker. When
+    // `indexing.respect_gitignore` is false (the historical default), stories/,
+    // plans/ and other gitignored collections keep being indexed and
+    // `.mdkbignore` acts as the opt-in exclusion file.
+    let ignore_patterns: Vec<String> = DOC_WALKER_DEFAULT_EXCLUDES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let discovered = walk_files(
+        WalkOptions {
+            root: &base_path,
+            ignore_patterns: &ignore_patterns,
+            respect_gitignore: config.indexing.respect_gitignore,
+        },
+        |path| {
+            // Accept any file whose path relative to base_path matches the
+            // collection's glob pattern.
+            match path.strip_prefix(&base_path) {
+                Ok(rel) => glob.is_match(rel),
+                Err(_) => false,
             }
-        })
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_type().is_file())
-    {
-        let path = entry.path();
+        },
+    );
+
+    for path in discovered {
         let relative = match path.strip_prefix(&base_path) {
             Ok(rel) => rel.to_string_lossy().to_string(),
             Err(_) => continue,
         };
-
-        // Check if file matches glob pattern
-        if !glob.is_match(&relative) {
-            continue;
-        }
 
         // Remove from existing set (to track deletions)
         existing_paths.remove(&relative);
@@ -701,7 +714,7 @@ fn update_collection(
         index_single_file(
             ctx,
             &collection.name,
-            path,
+            &path,
             relative,
             existing_doc.as_ref(),
             &path.display().to_string(),
@@ -2669,6 +2682,59 @@ mod tests {
         assert_eq!(
             result.added, 2,
             "gitignored directory should still be indexed by collection walker"
+        );
+    }
+
+    #[test]
+    fn test_handle_update_respects_gitignore_when_opted_in() {
+        let temp = setup_temp_dir();
+
+        // Use a non-conventional directory name so apply_conventions won't
+        // auto-register it and clash with our explicit collection add.
+        let dir = temp.path().join("knowledge");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("keep.md"), "# keep").unwrap();
+        std::fs::write(dir.join("drop.md"), "# drop").unwrap();
+        std::fs::write(temp.path().join(".gitignore"), "knowledge/drop.md\n").unwrap();
+
+        handle_init(temp.path()).unwrap();
+
+        // Opt into gitignore for document indexing
+        let config_path = temp.path().join(".mdkb/config.toml");
+        let toml = "[indexing]\nrespect_gitignore = true\n";
+        std::fs::write(&config_path, toml).unwrap();
+
+        let ctx = Context::open(temp.path()).unwrap();
+        handle_collection_add(&ctx, "knowledge", "knowledge", "**/*.md").unwrap();
+
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(
+            result.added, 1,
+            "knowledge/drop.md should be excluded when respect_gitignore=true"
+        );
+    }
+
+    #[test]
+    fn test_handle_update_mdkbignore_excludes_collection_files() {
+        let temp = setup_temp_dir();
+
+        let dir = temp.path().join("knowledge");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("keep.md"), "# keep").unwrap();
+        std::fs::write(dir.join("draft.md"), "# draft").unwrap();
+
+        // .mdkbignore excludes draft.md; collection glob still matches *.md.
+        // Default respect_gitignore=false makes the doc walker read .mdkbignore.
+        std::fs::write(temp.path().join(".mdkbignore"), "knowledge/draft.md\n").unwrap();
+
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+        handle_collection_add(&ctx, "knowledge", "knowledge", "**/*.md").unwrap();
+
+        let result = handle_update(&ctx, temp.path()).expect("update should succeed");
+        assert_eq!(
+            result.added, 1,
+            ".mdkbignore entry should exclude draft.md"
         );
     }
 

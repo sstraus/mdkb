@@ -186,6 +186,14 @@ default_limit = 10
 
 [indexing]
 debounce_ms = 100
+# When true, the doc/collection walker honors .gitignore.
+# When false (default), it reads .mdkbignore instead.
+respect_gitignore = false
+
+[code.indexing]
+# When true (default), the code walker honors .gitignore.
+# When false, it reads .mdkbignore instead.
+respect_gitignore = true
 
 [mcp]
 max_response_tokens = 50000
@@ -193,6 +201,36 @@ max_document_tokens = 10000
 ```
 
 Environment overrides: `MDKB_SEARCH_DEFAULT_LIMIT=20`, `MDKB_INDEXING_DEBOUNCE_MS=200`.
+
+### Controlling what gets indexed
+
+Both the document walker (`mdkb update`) and the code walker (`mdkb code index`) share a unified ignore system:
+
+| Mode                       | Files honored                                  | Use when                                                               |
+| -------------------------- | ----------------------------------------------- | ---------------------------------------------------------------------- |
+| `respect_gitignore = true` | `.gitignore` (+ `# mdkb:index` force-include)  | Your ignore rules are already correct for indexing.                    |
+| `respect_gitignore = false`| `.mdkbignore` only                              | You want to index content that `.gitignore` excludes (e.g. `stories/`, generated sources), or you need a different ignore scope from git. |
+
+**Defaults:**
+- Code indexing: `respect_gitignore = true` — source trees usually want `.gitignore` honored (skip `target/`, `node_modules/`, etc.).
+- Document indexing: `respect_gitignore = false` — project knowledge often lives in gitignored folders (plans, stories, drafts).
+
+**`# mdkb:index` annotation** (only active when `respect_gitignore = true`):
+
+Force-include a gitignored path by prefixing it with a `# mdkb:index` comment line in `.gitignore`:
+
+```gitignore
+# mdkb:index
+generated/
+# mdkb:index
+docs/api/*.md
+```
+
+Blank lines between the annotation and the pattern are tolerated. The annotation is case-insensitive.
+
+**`.mdkbignore`** (only active when `respect_gitignore = false`):
+
+Uses the same syntax as `.gitignore`, including `!pattern` for re-inclusion. Place one at the repo root.
 
 ## Storage
 

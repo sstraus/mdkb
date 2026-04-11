@@ -64,6 +64,9 @@ pub struct PipelineConfig {
     pub batch_size: usize,
     pub read_threads: usize,
     pub ignore_patterns: Vec<String>,
+    /// When true, honor `.gitignore` (and `# mdkb:index`); when false, read
+    /// `.mdkbignore` instead.
+    pub respect_gitignore: bool,
 }
 
 impl Default for PipelineConfig {
@@ -73,6 +76,7 @@ impl Default for PipelineConfig {
             batch_size: BATCH_SIZE,
             read_threads: READ_THREADS,
             ignore_patterns: Vec::new(),
+            respect_gitignore: true,
         }
     }
 }
@@ -148,7 +152,15 @@ fn spawn_pipeline_stages(
     } else {
         let discover_root = root.clone();
         let discover_patterns = config.ignore_patterns.clone();
-        thread::spawn(move || stage_discover(&discover_root, &discover_patterns, &path_tx));
+        let discover_respect_gitignore = config.respect_gitignore;
+        thread::spawn(move || {
+            stage_discover(
+                &discover_root,
+                &discover_patterns,
+                discover_respect_gitignore,
+                &path_tx,
+            )
+        });
     }
 
     // READ stage (multiple I/O threads)
@@ -179,8 +191,13 @@ fn spawn_pipeline_stages(
 // ---------------------------------------------------------------------------
 
 /// Walk the filesystem and send discovered file paths to the channel.
-fn stage_discover(root: &Path, ignore_patterns: &[String], tx: &Sender<PathBuf>) -> u32 {
-    let paths = walker::discover_files(root, ignore_patterns);
+fn stage_discover(
+    root: &Path,
+    ignore_patterns: &[String],
+    respect_gitignore: bool,
+    tx: &Sender<PathBuf>,
+) -> u32 {
+    let paths = walker::discover_files(root, ignore_patterns, respect_gitignore);
     let count = paths.len() as u32;
     for path in paths {
         if tx.send(path).is_err() {
@@ -668,6 +685,7 @@ mod tests {
             batch_size: 100,
             read_threads: 2,
             ignore_patterns: Vec::new(),
+            respect_gitignore: true,
         }
     }
 
