@@ -1,0 +1,25 @@
+Cargo.toml
+  dde28c7b8956c5a7 3
+src/mcp/server.rs
+  dde28c7b8956c5a7 963-984,986,992-993
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "5f22fee9193c32c77acbf689d56ffce18288863f",
+  "prompts": {
+    "dde28c7b8956c5a7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4b983384-feed-4d7e-b149-b9cd498ffa78",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Stefano Straus",
+      "messages": [],
+      "total_additions": 26,
+      "total_deletions": 2,
+      "accepted_lines": 26,
+      "overriden_lines": 0
+    }
+  }
+}
