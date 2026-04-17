@@ -2454,10 +2454,23 @@ const BASE_INSTRUCTIONS: &str = "\
 2. `memory_write` / `memory_write_batch` — after solving problems
 3. `memory_delete` — remove stale entries
 
-Memory entry_type: `problem`, `decision`, `topic`.
+Memory entry_type: `problem`, `decision`, `topic`, `reminder`.
 TTL: pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Omit for permanent.
 `search` returns IDs. Use `get(id)` for full content.
 Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
+
+### Reminders
+
+`entry_type=\"reminder\"` with `due_in` (seconds from now): surfaces at SessionStart when due.
+
+When you see `[reminder:DUE] {id}: {title}` in \"Available Memories\":
+1. Show the reminder to the user and ASK if it is done.
+2. Wait for an explicit affirmative (\"si\", \"yes\", \"done\", \"fatto\", \"completato\"). Ambiguous replies (\"ok\", \"hm\") are NOT confirmation — ask again.
+3. On confirmation: call `memory_delete(id)`.
+4. On \"not yet\" / \"snooze\": call `memory_write(id, ..., due_in=<new_seconds>)` to reschedule.
+5. If the user ignores it: do nothing — it resurfaces next SessionStart.
+
+Never auto-delete a reminder without explicit user confirmation.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
