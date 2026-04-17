@@ -382,6 +382,14 @@ pub enum MemoryCommand {
         /// Content (if not provided, reads from stdin)
         #[arg(short, long)]
         content: Option<String>,
+
+        /// TTL in seconds. Entry expires after this duration.
+        #[arg(long)]
+        ttl: Option<u64>,
+
+        /// Reminder due time in seconds from now. Use with --entry-type reminder.
+        #[arg(long)]
+        due_in: Option<u64>,
     },
 
     /// Show a memory entry

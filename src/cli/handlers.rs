@@ -1307,6 +1307,8 @@ pub fn handle_memory_add(
     entry_type: &str,
     tags: Option<&str>,
     content: &str,
+    ttl: Option<u64>,
+    due_in: Option<u64>,
 ) -> Result<()> {
     let entry_type: EntryType = entry_type
         .parse()
@@ -1319,6 +1321,8 @@ pub fn handle_memory_add(
     memory::validate_entry_input(id, title, &tags, content)?;
 
     let now = chrono::Utc::now().timestamp();
+    let expires_at = ttl.map(|s| now + s as i64);
+    let due_at = due_in.map(|s| now + s as i64);
 
     let entry = MemoryEntry {
         id: id.to_string(),
@@ -1334,11 +1338,10 @@ pub fn handle_memory_add(
         last_accessed: None,
         source_path: None,
         confirmations: 0,
-
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
-        expires_at: None,
-        due_at: None,
+        expires_at,
+        due_at,
     };
 
     memory::add_entry(&ctx.conn, &entry)?;
@@ -2262,6 +2265,8 @@ mod tests {
             "topic",
             Some("test,example"),
             "# Test content\n\nThis is test content.",
+            None,
+            None,
         )
         .expect("add memory should succeed");
 
@@ -2288,7 +2293,7 @@ mod tests {
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         // Add an entry
-        handle_memory_add(&ctx, "to-delete", "To Delete", "topic", None, "Content").unwrap();
+        handle_memory_add(&ctx, "to-delete", "To Delete", "topic", None, "Content", None, None).unwrap();
 
         // Verify it exists
         let index = load_memory_index(&ctx).unwrap().unwrap();
@@ -3442,7 +3447,7 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
 
         // Add an entry first
-        handle_memory_add(&ctx, "existing", "Existing", "topic", None, "Content").unwrap();
+        handle_memory_add(&ctx, "existing", "Existing", "topic", None, "Content", None, None).unwrap();
 
         let json = r#"{"entries": [
             {"id": "existing", "title": "Duplicate", "content": "Content"},
@@ -3462,7 +3467,7 @@ mod tests {
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
-        handle_memory_add(&ctx, "existing", "Existing", "topic", None, "Content").unwrap();
+        handle_memory_add(&ctx, "existing", "Existing", "topic", None, "Content", None, None).unwrap();
 
         let json = r#"{"entries": [
             {"id": "existing", "title": "Duplicate", "content": "Content"}

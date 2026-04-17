@@ -360,6 +360,8 @@ async fn main() -> Result<()> {
                     entry_type,
                     tags,
                     content,
+                    ttl,
+                    due_in,
                 } => {
                     const MAX_STDIN_SIZE: u64 = 100_000; // 100KB limit
                     let content = content.unwrap_or_else(|| {
@@ -371,7 +373,7 @@ async fn main() -> Result<()> {
                             .unwrap_or_default();
                         buf
                     });
-                    handle_memory_add(&ctx, &id, &title, &entry_type, tags.as_deref(), &content)?;
+                    handle_memory_add(&ctx, &id, &title, &entry_type, tags.as_deref(), &content, ttl, due_in)?;
                     println!("Added memory entry '{id}'");
                 }
                 MemoryCommand::Show { id } => {
