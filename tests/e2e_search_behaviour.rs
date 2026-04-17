@@ -182,7 +182,9 @@ fn test_search_no_results_message() {
     let text = McpTestHarness::get_text_content(&result);
 
     assert!(
-        text.contains("No results") || text.contains("No relevant knowledge found") || text.contains("No matching"),
+        text.contains("No results")
+            || text.contains("No relevant knowledge found")
+            || text.contains("No matching"),
         "Empty search should indicate no results. Got: {}",
         text
     );

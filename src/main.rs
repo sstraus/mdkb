@@ -373,7 +373,16 @@ async fn main() -> Result<()> {
                             .unwrap_or_default();
                         buf
                     });
-                    handle_memory_add(&ctx, &id, &title, &entry_type, tags.as_deref(), &content, ttl, due_in)?;
+                    handle_memory_add(
+                        &ctx,
+                        &id,
+                        &title,
+                        &entry_type,
+                        tags.as_deref(),
+                        &content,
+                        ttl,
+                        due_in,
+                    )?;
                     println!("Added memory entry '{id}'");
                 }
                 MemoryCommand::Show { id } => {

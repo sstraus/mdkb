@@ -40,7 +40,10 @@ pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &st
             ErrorKind::InvalidQuery(format!("Title must be 1-{MAX_TITLE_LEN} chars")).into(),
         );
     }
-    if title.chars().any(|c| c == '\n' || c == '\r' || c.is_control()) {
+    if title
+        .chars()
+        .any(|c| c == '\n' || c == '\r' || c.is_control())
+    {
         return Err(ErrorKind::InvalidQuery(
             "Title must not contain newlines or control characters".to_string(),
         )
@@ -57,7 +60,10 @@ pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &st
             ))
             .into());
         }
-        if tag.chars().any(|c| c == '\n' || c == '\r' || c.is_control()) {
+        if tag
+            .chars()
+            .any(|c| c == '\n' || c == '\r' || c.is_control())
+        {
             return Err(ErrorKind::InvalidQuery(
                 "Tag must not contain newlines or control characters".to_string(),
             )
@@ -1123,8 +1129,14 @@ mod tests {
 
     #[test]
     fn test_entry_type_reminder_parsing() {
-        assert_eq!("reminder".parse::<EntryType>().unwrap(), EntryType::Reminder);
-        assert_eq!("Reminder".parse::<EntryType>().unwrap(), EntryType::Reminder);
+        assert_eq!(
+            "reminder".parse::<EntryType>().unwrap(),
+            EntryType::Reminder
+        );
+        assert_eq!(
+            "Reminder".parse::<EntryType>().unwrap(),
+            EntryType::Reminder
+        );
         assert_eq!(EntryType::Reminder.to_string(), "reminder");
 
         let json = serde_json::to_string(&EntryType::Reminder).unwrap();
@@ -1169,11 +1181,19 @@ mod tests {
         updated.due_at = None;
         update_entry(&conn, &updated).unwrap();
 
-        let retrieved2 = get_entry_without_tracking(&conn, "remind-me").unwrap().unwrap();
+        let retrieved2 = get_entry_without_tracking(&conn, "remind-me")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved2.due_at, None);
     }
 
-    fn make_reminder(id: &str, title: &str, content: &str, due_at: Option<i64>, now: i64) -> MemoryEntry {
+    fn make_reminder(
+        id: &str,
+        title: &str,
+        content: &str,
+        due_at: Option<i64>,
+        now: i64,
+    ) -> MemoryEntry {
         MemoryEntry {
             id: id.to_string(),
             title: title.to_string(),
@@ -1199,15 +1219,31 @@ mod tests {
     fn test_reminder_future_hidden_from_list() {
         let conn = setup_db();
         let now = Utc::now().timestamp();
-        add_entry(&conn, &make_reminder("future-rem", "future", "payload", Some(now + 3600), now)).unwrap();
+        add_entry(
+            &conn,
+            &make_reminder("future-rem", "future", "payload", Some(now + 3600), now),
+        )
+        .unwrap();
 
         let listed = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, None).unwrap();
         let ids: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
-        assert!(!ids.contains(&"future-rem"), "future reminder should be hidden from list");
+        assert!(
+            !ids.contains(&"future-rem"),
+            "future reminder should be hidden from list"
+        );
 
-        let listed_active = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, Some(EntryStatus::Active)).unwrap();
+        let listed_active = list_entries_sorted(
+            &conn,
+            10,
+            MemorySortOrder::Newest,
+            Some(EntryStatus::Active),
+        )
+        .unwrap();
         let ids_active: Vec<&str> = listed_active.iter().map(|e| e.id.as_str()).collect();
-        assert!(!ids_active.contains(&"future-rem"), "future reminder should be hidden from status-filtered list");
+        assert!(
+            !ids_active.contains(&"future-rem"),
+            "future reminder should be hidden from status-filtered list"
+        );
 
         let count = count_active_entries(&conn).unwrap();
         assert_eq!(count, 0, "future reminder should not count as active");
@@ -1217,11 +1253,18 @@ mod tests {
     fn test_reminder_due_visible_in_list() {
         let conn = setup_db();
         let now = Utc::now().timestamp();
-        add_entry(&conn, &make_reminder("due-rem", "due", "payload", Some(now - 3600), now)).unwrap();
+        add_entry(
+            &conn,
+            &make_reminder("due-rem", "due", "payload", Some(now - 3600), now),
+        )
+        .unwrap();
 
         let listed = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, None).unwrap();
         let ids: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
-        assert!(ids.contains(&"due-rem"), "due reminder should appear in list");
+        assert!(
+            ids.contains(&"due-rem"),
+            "due reminder should appear in list"
+        );
 
         let count = count_active_entries(&conn).unwrap();
         assert_eq!(count, 1, "due reminder should count as active");
@@ -1231,11 +1274,24 @@ mod tests {
     fn test_reminder_future_hidden_from_search() {
         let conn = setup_db();
         let now = Utc::now().timestamp();
-        add_entry(&conn, &make_reminder("future-rem", "future reminder", "searchable payload", Some(now + 3600), now)).unwrap();
+        add_entry(
+            &conn,
+            &make_reminder(
+                "future-rem",
+                "future reminder",
+                "searchable payload",
+                Some(now + 3600),
+                now,
+            ),
+        )
+        .unwrap();
 
         let results = search_entries(&conn, "searchable", 10).unwrap();
         let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
-        assert!(!ids.contains(&"future-rem"), "future reminder should be hidden from search");
+        assert!(
+            !ids.contains(&"future-rem"),
+            "future reminder should be hidden from search"
+        );
     }
 
     #[test]
@@ -1263,15 +1319,36 @@ mod tests {
             due_at: None,
         };
         add_entry(&conn, &topic).unwrap();
-        add_entry(&conn, &make_reminder("rem-due", "Due thing", "body", Some(now - 60), now)).unwrap();
-        add_entry(&conn, &make_reminder("rem-future", "Later thing", "body", Some(now + 3600), now)).unwrap();
+        add_entry(
+            &conn,
+            &make_reminder("rem-due", "Due thing", "body", Some(now - 60), now),
+        )
+        .unwrap();
+        add_entry(
+            &conn,
+            &make_reminder("rem-future", "Later thing", "body", Some(now + 3600), now),
+        )
+        .unwrap();
 
         let warmup = get_warmup_index(&conn, 50).unwrap();
 
-        assert!(warmup[0].starts_with("[reminder:DUE] rem-due:"), "due reminder must lead: {:?}", warmup);
-        assert!(!warmup.iter().any(|l| l.contains("rem-future")), "future reminder must not appear");
-        assert!(warmup.iter().any(|l| l.starts_with("[topic] topic-one:")), "regular topic must follow");
-        assert!(!warmup.iter().any(|l| l.starts_with("[reminder] rem-due")), "reminder must not render as plain entry_type");
+        assert!(
+            warmup[0].starts_with("[reminder:DUE] rem-due:"),
+            "due reminder must lead: {:?}",
+            warmup
+        );
+        assert!(
+            !warmup.iter().any(|l| l.contains("rem-future")),
+            "future reminder must not appear"
+        );
+        assert!(
+            warmup.iter().any(|l| l.starts_with("[topic] topic-one:")),
+            "regular topic must follow"
+        );
+        assert!(
+            !warmup.iter().any(|l| l.starts_with("[reminder] rem-due")),
+            "reminder must not render as plain entry_type"
+        );
     }
 
     #[test]
@@ -1282,15 +1359,28 @@ mod tests {
         for i in 0..12 {
             add_entry(
                 &conn,
-                &make_reminder(&format!("rem-{i:02}"), &format!("Due {i}"), "body", Some(now - 1000 + i as i64), now),
+                &make_reminder(
+                    &format!("rem-{i:02}"),
+                    &format!("Due {i}"),
+                    "body",
+                    Some(now - 1000 + i as i64),
+                    now,
+                ),
             )
             .unwrap();
         }
 
         let warmup = get_warmup_index(&conn, 50).unwrap();
 
-        let due_lines: Vec<&String> = warmup.iter().filter(|l| l.starts_with("[reminder:DUE]")).collect();
-        assert_eq!(due_lines.len(), DUE_REMINDER_CAP + 1, "10 entries + 1 summary");
+        let due_lines: Vec<&String> = warmup
+            .iter()
+            .filter(|l| l.starts_with("[reminder:DUE]"))
+            .collect();
+        assert_eq!(
+            due_lines.len(),
+            DUE_REMINDER_CAP + 1,
+            "10 entries + 1 summary"
+        );
         assert!(due_lines.last().unwrap().contains("...and 2 more overdue"));
     }
 
@@ -1298,11 +1388,24 @@ mod tests {
     fn test_reminder_due_visible_in_search() {
         let conn = setup_db();
         let now = Utc::now().timestamp();
-        add_entry(&conn, &make_reminder("due-rem", "due reminder", "searchable payload", Some(now - 3600), now)).unwrap();
+        add_entry(
+            &conn,
+            &make_reminder(
+                "due-rem",
+                "due reminder",
+                "searchable payload",
+                Some(now - 3600),
+                now,
+            ),
+        )
+        .unwrap();
 
         let results = search_entries(&conn, "searchable", 10).unwrap();
         let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
-        assert!(ids.contains(&"due-rem"), "due reminder should appear in search");
+        assert!(
+            ids.contains(&"due-rem"),
+            "due reminder should appear in search"
+        );
     }
 
     #[test]
@@ -1341,7 +1444,9 @@ mod tests {
         updated.expires_at = None;
         update_entry(&conn, &updated).unwrap();
 
-        let retrieved2 = get_entry_without_tracking(&conn, "temp-note").unwrap().unwrap();
+        let retrieved2 = get_entry_without_tracking(&conn, "temp-note")
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved2.expires_at, None);
     }
 
@@ -1396,16 +1501,34 @@ mod tests {
         add_entry(&conn, &expired).unwrap();
 
         // list_entries_sorted should exclude expired
-        let listed = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, Some(EntryStatus::Active)).unwrap();
+        let listed = list_entries_sorted(
+            &conn,
+            10,
+            MemorySortOrder::Newest,
+            Some(EntryStatus::Active),
+        )
+        .unwrap();
         let listed_ids: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
-        assert!(listed_ids.contains(&"active-entry"), "active should be listed");
-        assert!(!listed_ids.contains(&"expired-entry"), "expired should NOT be listed");
+        assert!(
+            listed_ids.contains(&"active-entry"),
+            "active should be listed"
+        );
+        assert!(
+            !listed_ids.contains(&"expired-entry"),
+            "expired should NOT be listed"
+        );
 
         // search_entries should exclude expired
         let searched = search_entries(&conn, "searchable", 10).unwrap();
         let searched_ids: Vec<&str> = searched.iter().map(|e| e.id.as_str()).collect();
-        assert!(searched_ids.contains(&"active-entry"), "active should be searchable");
-        assert!(!searched_ids.contains(&"expired-entry"), "expired should NOT be searchable");
+        assert!(
+            searched_ids.contains(&"active-entry"),
+            "active should be searchable"
+        );
+        assert!(
+            !searched_ids.contains(&"expired-entry"),
+            "expired should NOT be searchable"
+        );
 
         // get_warmup_index should exclude expired
         let warmup = get_warmup_index(&conn, 50).unwrap();
@@ -1418,7 +1541,10 @@ mod tests {
 
         // get_entry should still return expired entries
         let retrieved = get_entry(&conn, "expired-entry").unwrap();
-        assert!(retrieved.is_some(), "get_entry should return expired entries");
+        assert!(
+            retrieved.is_some(),
+            "get_entry should return expired entries"
+        );
     }
 
     #[test]
@@ -1957,7 +2083,7 @@ mod tests {
             entry_type: EntryType::Topic,
             tags: vec![],
             status: EntryStatus::Active,
-            created_at: now,       // Just created
+            created_at: now, // Just created
             updated_at: now,
             superseded_by: None,
             access_count: 0,
@@ -1996,11 +2122,19 @@ mod tests {
 
         // Prune with 30-day cutoff — expired should be pruned even though recently created
         let pruned = prune_entries(&conn, 30, false).unwrap();
-        assert!(pruned.contains(&"ttl-expired".to_string()), "expired TTL entry should be pruned");
-        assert!(!pruned.contains(&"still-active".to_string()), "active entry should NOT be pruned");
+        assert!(
+            pruned.contains(&"ttl-expired".to_string()),
+            "expired TTL entry should be pruned"
+        );
+        assert!(
+            !pruned.contains(&"still-active".to_string()),
+            "active entry should NOT be pruned"
+        );
 
         // Verify archived status
-        let entry = get_entry_without_tracking(&conn, "ttl-expired").unwrap().unwrap();
+        let entry = get_entry_without_tracking(&conn, "ttl-expired")
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.status, EntryStatus::Archived);
     }
 

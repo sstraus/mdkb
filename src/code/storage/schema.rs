@@ -265,12 +265,20 @@ mod tests {
         .unwrap();
 
         let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM code_symbols WHERE name = 'foo'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM code_symbols WHERE name = 'foo'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1, "duplicate should be replaced, not added");
 
         let doc: String = conn
-            .query_row("SELECT doc_comment FROM code_symbols WHERE name = 'foo'", [], |r| r.get(0))
+            .query_row(
+                "SELECT doc_comment FROM code_symbols WHERE name = 'foo'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(doc, "new", "last insert should win");
     }

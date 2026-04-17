@@ -281,7 +281,11 @@ impl CodeDb {
     }
 
     /// Find all symbols in files matching a path substring.
-    pub fn find_symbols_by_file(&self, file_pattern: &str, limit: usize) -> rusqlite::Result<Vec<Symbol>> {
+    pub fn find_symbols_by_file(
+        &self,
+        file_pattern: &str,
+        limit: usize,
+    ) -> rusqlite::Result<Vec<Symbol>> {
         let pattern = format!("%{file_pattern}%");
         let mut stmt = self.conn.prepare_cached(&format!(
             "{SYMBOL_COLUMNS} FROM code_symbols WHERE file_path LIKE ?1 ESCAPE '\\' ORDER BY file_path, line_start LIMIT ?2"

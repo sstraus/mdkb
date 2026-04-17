@@ -946,7 +946,13 @@ impl TypeScriptParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.extract_method_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
+        self.extract_method_calls_recursive(
+            &tree.root_node(),
+            code,
+            Some("<module>"),
+            &mut calls,
+            0,
+        );
         calls
     }
 
@@ -1580,7 +1586,8 @@ if (require.main === module) {
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "<module>" && *target == "setupHookBoilerplate"),
+                .any(|(caller, target, _)| *caller == "<module>"
+                    && *target == "setupHookBoilerplate"),
             "Top-level call to setupHookBoilerplate should have <module> as caller: {:?}",
             calls
         );

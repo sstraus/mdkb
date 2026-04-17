@@ -499,11 +499,7 @@ mod tests {
         let root = dir.path();
 
         // Users often separate the comment from the pattern with a blank line.
-        fs::write(
-            root.join(".gitignore"),
-            "# mdkb:index\n\ngenerated.rs\n",
-        )
-        .unwrap();
+        fs::write(root.join(".gitignore"), "# mdkb:index\n\ngenerated.rs\n").unwrap();
         fs::write(root.join("generated.rs"), "fn gen() {}").unwrap();
         fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 

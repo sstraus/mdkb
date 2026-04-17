@@ -758,9 +758,10 @@ fn index_single_file(
     let metadata = match std::fs::metadata(abs_path) {
         Ok(m) => m,
         Err(e) => {
-            result
-                .errors
-                .push(format!("Failed to read metadata for {}: {}", display_name, e));
+            result.errors.push(format!(
+                "Failed to read metadata for {}: {}",
+                display_name, e
+            ));
             return;
         }
     };
@@ -867,39 +868,35 @@ pub fn handle_update_files(
     let matchers: Vec<(&Collection, globset::GlobMatcher, PathBuf)> = collections
         .iter()
         .filter(|c| c.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
-        .filter_map(|coll| {
-            match Glob::new(&coll.pattern) {
-                Ok(g) => {
-                    match root.join(&coll.path).canonicalize() {
-                        Ok(canonical_base) => Some((coll, g.compile_matcher(), canonical_base)),
-                        Err(e) => {
-                            tracing::warn!(
-                                collection = %coll.name,
-                                path = %coll.path,
-                                error = %e,
-                                "Skipping collection: base path cannot be resolved"
-                            );
-                            result.errors.push(format!(
-                                "Cannot resolve base path for collection '{}': {}",
-                                coll.name, e
-                            ));
-                            None
-                        }
-                    }
-                }
+        .filter_map(|coll| match Glob::new(&coll.pattern) {
+            Ok(g) => match root.join(&coll.path).canonicalize() {
+                Ok(canonical_base) => Some((coll, g.compile_matcher(), canonical_base)),
                 Err(e) => {
                     tracing::warn!(
                         collection = %coll.name,
-                        pattern = %coll.pattern,
+                        path = %coll.path,
                         error = %e,
-                        "Skipping collection: invalid glob pattern"
+                        "Skipping collection: base path cannot be resolved"
                     );
                     result.errors.push(format!(
-                        "Invalid glob pattern '{}' for collection '{}': {}",
-                        coll.pattern, coll.name, e
+                        "Cannot resolve base path for collection '{}': {}",
+                        coll.name, e
                     ));
                     None
                 }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    collection = %coll.name,
+                    pattern = %coll.pattern,
+                    error = %e,
+                    "Skipping collection: invalid glob pattern"
+                );
+                result.errors.push(format!(
+                    "Invalid glob pattern '{}' for collection '{}': {}",
+                    coll.pattern, coll.name, e
+                ));
+                None
             }
         })
         .collect();
@@ -969,8 +966,7 @@ fn index_specified_files(
         };
 
         // Look up existing document for mtime comparison
-        let existing_doc =
-            documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
+        let existing_doc = documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
 
         index_single_file(
             ctx,
@@ -2293,7 +2289,17 @@ mod tests {
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         // Add an entry
-        handle_memory_add(&ctx, "to-delete", "To Delete", "topic", None, "Content", None, None).unwrap();
+        handle_memory_add(
+            &ctx,
+            "to-delete",
+            "To Delete",
+            "topic",
+            None,
+            "Content",
+            None,
+            None,
+        )
+        .unwrap();
 
         // Verify it exists
         let index = load_memory_index(&ctx).unwrap().unwrap();
@@ -2740,10 +2746,7 @@ mod tests {
         handle_collection_add(&ctx, "knowledge", "knowledge", "**/*.md").unwrap();
 
         let result = handle_update(&ctx, temp.path()).expect("update should succeed");
-        assert_eq!(
-            result.added, 1,
-            ".mdkbignore entry should exclude draft.md"
-        );
+        assert_eq!(result.added, 1, ".mdkbignore entry should exclude draft.md");
     }
 
     // ==================== Update Files Tests ====================
@@ -2774,8 +2777,7 @@ mod tests {
         assert_eq!(result.updated, 0);
 
         // File B should not be indexed
-        let doc_b =
-            documents::get_document_by_path(&ctx.conn, "docs", "b.md").unwrap();
+        let doc_b = documents::get_document_by_path(&ctx.conn, "docs", "b.md").unwrap();
         assert!(doc_b.is_none(), "file B should not be in index");
     }
 
@@ -2826,13 +2828,12 @@ mod tests {
         let other = temp.path().join("other.md");
         std::fs::write(&other, "# Other").unwrap();
 
-        let result = handle_update_files(
-            &ctx,
-            temp.path(),
-            &[other.to_string_lossy().to_string()],
-        )
-        .expect("update_files should succeed");
-        assert_eq!(result.added, 0, "file outside collections should be skipped");
+        let result = handle_update_files(&ctx, temp.path(), &[other.to_string_lossy().to_string()])
+            .expect("update_files should succeed");
+        assert_eq!(
+            result.added, 0,
+            "file outside collections should be skipped"
+        );
         assert_eq!(result.errors.len(), 0, "not an error, just skipped");
     }
 
@@ -2849,18 +2850,16 @@ mod tests {
         handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
 
         // Use relative path
-        let result = handle_update_files(
-            &ctx,
-            temp.path(),
-            &["docs/readme.md".to_string()],
-        )
-        .expect("update_files should succeed");
+        let result = handle_update_files(&ctx, temp.path(), &["docs/readme.md".to_string()])
+            .expect("update_files should succeed");
         assert_eq!(result.added, 1, "should index file via relative path");
 
         // Verify stored path is the canonical relative form
-        let doc =
-            documents::get_document_by_path(&ctx.conn, "docs", "readme.md").unwrap();
-        assert!(doc.is_some(), "should be retrievable by canonical relative path");
+        let doc = documents::get_document_by_path(&ctx.conn, "docs", "readme.md").unwrap();
+        assert!(
+            doc.is_some(),
+            "should be retrievable by canonical relative path"
+        );
     }
 
     #[test]
@@ -2954,12 +2953,8 @@ mod tests {
         handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
 
         // Try to index a file outside the project root
-        let result = handle_update_files(
-            &ctx,
-            temp.path(),
-            &["/etc/hosts".to_string()],
-        )
-        .expect("should succeed overall");
+        let result = handle_update_files(&ctx, temp.path(), &["/etc/hosts".to_string()])
+            .expect("should succeed overall");
         assert_eq!(result.added, 0, "file outside root should not be indexed");
         assert!(
             result.errors.iter().any(|e| e.contains("path traversal")),
@@ -2998,10 +2993,9 @@ mod tests {
         assert_eq!(result.updated, 1);
 
         // Verify stored content was actually updated
-        let doc =
-            documents::get_document_by_path(&ctx.conn, "docs", "readme.md")
-                .unwrap()
-                .expect("doc should exist");
+        let doc = documents::get_document_by_path(&ctx.conn, "docs", "readme.md")
+            .unwrap()
+            .expect("doc should exist");
         assert_eq!(doc.title, Some("New Title".to_string()));
     }
 
@@ -3447,7 +3441,10 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
 
         // Add an entry first
-        handle_memory_add(&ctx, "existing", "Existing", "topic", None, "Content", None, None).unwrap();
+        handle_memory_add(
+            &ctx, "existing", "Existing", "topic", None, "Content", None, None,
+        )
+        .unwrap();
 
         let json = r#"{"entries": [
             {"id": "existing", "title": "Duplicate", "content": "Content"},
@@ -3467,7 +3464,10 @@ mod tests {
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
-        handle_memory_add(&ctx, "existing", "Existing", "topic", None, "Content", None, None).unwrap();
+        handle_memory_add(
+            &ctx, "existing", "Existing", "topic", None, "Content", None, None,
+        )
+        .unwrap();
 
         let json = r#"{"entries": [
             {"id": "existing", "title": "Duplicate", "content": "Content"}
@@ -3983,14 +3983,11 @@ pub fn handle_code_index(
         let mut total = crate::code::indexing::types::IndexStats::default();
         for p in paths {
             let candidate = root.join(p);
-            let canonical = candidate.canonicalize().map_err(|e| {
-                Error::other(format!("Cannot resolve path '{}': {e}", p))
-            })?;
+            let canonical = candidate
+                .canonicalize()
+                .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", p)))?;
             if !canonical.starts_with(&root_canonical) {
-                return Err(Error::other(format!(
-                    "Path '{}' escapes project root",
-                    p
-                )));
+                return Err(Error::other(format!("Path '{}' escapes project root", p)));
             }
             let stats = facade
                 .index_directory(&canonical)
@@ -4028,10 +4025,7 @@ pub fn handle_code_reindex(
                 .canonicalize()
                 .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", p)))?;
             if !canonical.starts_with(&root_canonical) {
-                return Err(Error::other(format!(
-                    "Path '{}' escapes project root",
-                    p
-                )));
+                return Err(Error::other(format!("Path '{}' escapes project root", p)));
             }
         }
         // Use first path as reindex target (reindex is a full rebuild)

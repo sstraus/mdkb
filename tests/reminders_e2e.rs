@@ -2,8 +2,7 @@
 
 use mdkb::cli::handlers::{Context, handle_init};
 use mdkb::store::memory::{
-    EntryStatus, EntryType, MemoryEntry, SourceType, add_entry, delete_entry,
-    get_warmup_index,
+    EntryStatus, EntryType, MemoryEntry, SourceType, add_entry, delete_entry, get_warmup_index,
 };
 use tempfile::TempDir;
 
@@ -49,7 +48,9 @@ fn test_reminder_appears_in_warmup_when_due() {
 
     let warmup = get_warmup_index(&ctx.conn, 50).unwrap();
     assert!(
-        warmup.iter().any(|l| l.starts_with("[reminder:DUE] overdue-rem:")),
+        warmup
+            .iter()
+            .any(|l| l.starts_with("[reminder:DUE] overdue-rem:")),
         "overdue reminder must appear with [reminder:DUE] prefix, got: {:?}",
         warmup
     );
@@ -78,7 +79,10 @@ fn test_reminder_gone_from_warmup_after_delete() {
     add_entry(&ctx.conn, &make_reminder("del-rem", Some(now - 1))).unwrap();
 
     let before = get_warmup_index(&ctx.conn, 50).unwrap();
-    assert!(before.iter().any(|l| l.contains("del-rem")), "must be present before delete");
+    assert!(
+        before.iter().any(|l| l.contains("del-rem")),
+        "must be present before delete"
+    );
 
     delete_entry(&ctx.conn, "del-rem").unwrap();
 

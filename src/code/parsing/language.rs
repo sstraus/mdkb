@@ -66,10 +66,7 @@ impl Language {
         let mut file = std::fs::File::open(path).ok()?;
         let mut buf = [0u8; 256];
         let n = file.read(&mut buf).ok()?;
-        let line = std::str::from_utf8(&buf[..n])
-            .ok()?
-            .lines()
-            .next()?;
+        let line = std::str::from_utf8(&buf[..n]).ok()?.lines().next()?;
         if !line.starts_with("#!") {
             return None;
         }

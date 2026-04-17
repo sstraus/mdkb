@@ -58,19 +58,19 @@ fn write_single_memory(
     ttl: Option<u64>,
     due_in: Option<u64>,
 ) -> Result<String, McpError> {
-    memory::validate_entry_input(id, title, tags, content)
-        .map_err(|e| mcp_error(e.to_string()))?;
+    memory::validate_entry_input(id, title, tags, content).map_err(|e| mcp_error(e.to_string()))?;
 
     let existing = memory::get_entry_without_tracking(conn, id)
         .map_err(|e| mcp_error(format!("Failed to check existing entry: {e}")))?;
 
-    let entry_type: memory::EntryType = entry_type_str
-        .parse()
-        .map_err(|e: String| mcp_error(format!("{e}. Valid types: topic, problem, decision, reminder")))?;
+    let entry_type: memory::EntryType = entry_type_str.parse().map_err(|e: String| {
+        mcp_error(format!(
+            "{e}. Valid types: topic, problem, decision, reminder"
+        ))
+    })?;
 
-    let source_type: memory::SourceType = source_type_str
-        .parse()
-        .map_err(|e: String| mcp_error(e))?;
+    let source_type: memory::SourceType =
+        source_type_str.parse().map_err(|e: String| mcp_error(e))?;
 
     let now = chrono::Utc::now().timestamp();
     let expires_at = ttl.map(|s| now + s as i64);
@@ -89,12 +89,13 @@ fn write_single_memory(
                     for (rowid, distance) in &similar {
                         if *distance < 0.32 {
                             if let Ok(Some(dup)) = memory::get_entry_by_rowid(conn, *rowid) {
-                                let similarity =
-                                    1.0 - (*distance as f64 * *distance as f64 / 2.0);
+                                let similarity = 1.0 - (*distance as f64 * *distance as f64 / 2.0);
                                 return Err(mcp_error(format!(
                                     "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
                                      Update that entry instead, or use a more distinct title/content.",
-                                    dup.title, dup.id, similarity * 100.0
+                                    dup.title,
+                                    dup.id,
+                                    similarity * 100.0
                                 )));
                             }
                         }
@@ -173,14 +174,11 @@ fn write_single_memory(
                         &embedding,
                         crate::llm::embeddings::MODEL_NAME,
                     ) {
-                        tracing::warn!(
-                            "Failed to store memory embedding for '{id}': {e}"
-                        );
+                        tracing::warn!("Failed to store memory embedding for '{id}': {e}");
                     }
 
                     if is_new {
-                        let warnings =
-                            memory::find_similar_entries(conn, &embedding, rowid, id);
+                        let warnings = memory::find_similar_entries(conn, &embedding, rowid, id);
                         output.push_str(&warnings);
                     }
                 }
@@ -945,9 +943,7 @@ impl McpServer {
                         _ => return Err(Self::disambiguation_error(name, &fuzzy)),
                     }
                 }
-                Err(mcp_error(format!(
-                    "No symbol found: '{name}'."
-                )))
+                Err(mcp_error(format!("No symbol found: '{name}'.")))
             }
             1 => Ok(matches.into_iter().next().unwrap()),
             _ => Err(Self::disambiguation_error(name, &matches)),
@@ -955,14 +951,8 @@ impl McpServer {
     }
 
     /// Build a disambiguation error listing candidate symbols.
-    fn disambiguation_error(
-        name: &str,
-        candidates: &[crate::code::symbol::Symbol],
-    ) -> McpError {
-        let mut msg = format!(
-            "Multiple symbols match '{}'. Pass symbol_id:\n",
-            name
-        );
+    fn disambiguation_error(name: &str, candidates: &[crate::code::symbol::Symbol]) -> McpError {
+        let mut msg = format!("Multiple symbols match '{}'. Pass symbol_id:\n", name);
         for sym in candidates {
             let scope = match &sym.scope_context {
                 Some(crate::code::symbol::ScopeContext::ClassMember {
@@ -1208,7 +1198,8 @@ impl McpServer {
                             // symbols scope: file-first or text search
                             let mut symbols = if let Some(ref file_pattern) = params.file {
                                 // File filter present → query by file path directly
-                                let mut results = facade.find_symbols_by_file(file_pattern, params.limit * 2);
+                                let mut results =
+                                    facade.find_symbols_by_file(file_pattern, params.limit * 2);
                                 // If query is non-trivial, further filter by name
                                 if !params.query.is_empty() && params.query != "*" {
                                     let q = params.query.to_lowercase();
@@ -1807,7 +1798,9 @@ impl McpServer {
     // -----------------------------------------------------------------------
 
     /// Query the code call graph: outgoing calls, incoming callers, or impact radius.
-    #[tool(description = "Query code call graph. Resolves fuzzy/partial names. Directions: calls (default), callers, impact.")]
+    #[tool(
+        description = "Query code call graph. Resolves fuzzy/partial names. Directions: calls (default), callers, impact."
+    )]
     async fn code_graph(
         &self,
         Parameters(params): Parameters<CodeGraphParams>,
@@ -2128,11 +2121,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                     let all_files = crate::code::indexing::walker::discover_files(
                         &startup_root,
                         &startup_server.code_ignore_patterns,
-                        startup_server
-                            .full_config
-                            .code
-                            .indexing
-                            .respect_gitignore,
+                        startup_server.full_config.code.indexing.respect_gitignore,
                     );
                     facade.reindex_files(&startup_root, &all_files)
                 };
@@ -3092,10 +3081,7 @@ mod tests {
 
         // Must contain base instructions explaining mdkb purpose
         assert!(result.contains("mdkb"), "Should mention mdkb");
-        assert!(
-            result.contains("# mdkb"),
-            "Should explain what mdkb is"
-        );
+        assert!(result.contains("# mdkb"), "Should explain what mdkb is");
         assert!(
             result.contains("search(query)"),
             "Should mention search tool"
@@ -3113,10 +3099,7 @@ mod tests {
         let result = build_server_instructions(&index);
 
         // Should contain both base instructions and memory
-        assert!(
-            result.contains("# mdkb"),
-            "Should have base instructions"
-        );
+        assert!(result.contains("# mdkb"), "Should have base instructions");
         assert!(
             result.contains("auth-flow"),
             "Should include memory entries"
@@ -4180,7 +4163,10 @@ if (require.main === module) {
             .expect("timeout");
 
             // Should be an error with disambiguation list
-            assert!(result.is_err(), "Multiple fuzzy matches should require disambiguation");
+            assert!(
+                result.is_err(),
+                "Multiple fuzzy matches should require disambiguation"
+            );
             let err_msg = format!("{}", result.unwrap_err());
             assert!(
                 err_msg.contains("sym#"),
@@ -4191,32 +4177,32 @@ if (require.main === module) {
 
         #[tokio::test]
         async fn test_code_graph_top_level_callers() {
-        let (_dir, server) = setup_indexed_server();
-        let timeout = Duration::from_secs(5);
+            let (_dir, server) = setup_indexed_server();
+            let timeout = Duration::from_secs(5);
 
-        // "processHook" is called at top-level in hook.js via
-        // `if (require.main === module) { processHook('test'); }`
-        // The <module> synthetic symbol should appear as a caller.
-        let result = tokio::time::timeout(
-            timeout,
-            server.code_graph(Parameters(CodeGraphParams {
-                name: "processHook".to_string(),
-                direction: "callers".to_string(),
-                symbol_id: None,
-                max_depth: 3,
-                root: None,
-            })),
-        )
-        .await
-        .expect("timeout")
-        .expect("code_graph callers for processHook failed");
+            // "processHook" is called at top-level in hook.js via
+            // `if (require.main === module) { processHook('test'); }`
+            // The <module> synthetic symbol should appear as a caller.
+            let result = tokio::time::timeout(
+                timeout,
+                server.code_graph(Parameters(CodeGraphParams {
+                    name: "processHook".to_string(),
+                    direction: "callers".to_string(),
+                    symbol_id: None,
+                    max_depth: 3,
+                    root: None,
+                })),
+            )
+            .await
+            .expect("timeout")
+            .expect("code_graph callers for processHook failed");
 
-        let text = extract_text(&result);
-        assert!(
-            text.contains("<module>"),
-            "Top-level caller should show as <module>: {}",
-            text
-        );
+            let text = extract_text(&result);
+            assert!(
+                text.contains("<module>"),
+                "Top-level caller should show as <module>: {}",
+                text
+            );
         }
     }
 
@@ -4855,8 +4841,14 @@ if (require.main === module) {
             .expect("batch write should succeed");
 
         let text = extract_text(&result);
-        assert!(text.contains("Created memory entry: batch-a"), "Should contain batch-a: {text}");
-        assert!(text.contains("Created memory entry: batch-b"), "Should contain batch-b: {text}");
+        assert!(
+            text.contains("Created memory entry: batch-a"),
+            "Should contain batch-a: {text}"
+        );
+        assert!(
+            text.contains("Created memory entry: batch-b"),
+            "Should contain batch-b: {text}"
+        );
 
         // Verify entries exist in DB
         let ctx_guard = server.ctx.lock().await;

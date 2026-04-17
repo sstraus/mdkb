@@ -21,8 +21,6 @@ use crate::code::indexing::types::{
     CollectedRelationship, FileContent, FileRegistration, IndexBatch, IndexStats, ParsedFile,
     RawRelationship, RawSymbol,
 };
-use crate::code::symbol::Visibility;
-use crate::code::types::{Range, SymbolKind};
 use crate::code::indexing::walker;
 use crate::code::parsing::c_lang::CParser;
 use crate::code::parsing::cpp::CppParser;
@@ -42,7 +40,9 @@ use crate::code::parsing::typescript::TypeScriptParser;
 use crate::code::relationship::RelationKind;
 use crate::code::storage::CodeDb;
 use crate::code::symbol::Symbol;
+use crate::code::symbol::Visibility;
 use crate::code::types::{FileId, SymbolCounter, SymbolId};
+use crate::code::types::{Range, SymbolKind};
 
 /// Default channel buffer size for inter-stage communication.
 const CHANNEL_SIZE: usize = 256;

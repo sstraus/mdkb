@@ -1454,10 +1454,7 @@ mod tests {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        assert!(
-            !has_expires_at,
-            "v8 should not have expires_at column"
-        );
+        assert!(!has_expires_at, "v8 should not have expires_at column");
 
         // Run migration
         migrate_schema(&conn2, 8).unwrap();
