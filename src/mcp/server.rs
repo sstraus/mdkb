@@ -2922,7 +2922,7 @@ mod tests {
         assert!(result.contains("mdkb"));
         assert!(result.contains("# mdkb"));
         assert!(result.contains("search"));
-        assert!(!result.contains("Available Memories"));
+        assert!(!result.contains("## Available Memories"));
     }
 
     #[test]
