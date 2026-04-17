@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 9;
+pub const SCHEMA_VERSION: i32 = 10;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -100,7 +100,8 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     corrections INTEGER DEFAULT 0,    -- Negative confidence signals
     last_confirmed_at INTEGER,        -- Timestamp of last confirmation
     source_type TEXT DEFAULT 'user_statement',  -- official_docs, user_statement, inference
-    expires_at INTEGER                         -- Unix timestamp; NULL = permanent
+    expires_at INTEGER,                        -- Unix timestamp; NULL = permanent
+    due_at INTEGER                             -- Unix timestamp; surfaces reminders at/after this time
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
@@ -391,6 +392,21 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
 
         if !has_expires_at {
             conn.execute_batch("ALTER TABLE memory_entries ADD COLUMN expires_at INTEGER;")?;
+        }
+    }
+
+    // Migration from v9 to v10: add due_at column to memory_entries for reminder support
+    if from_version < 10 {
+        let has_due_at: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'due_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !has_due_at {
+            conn.execute_batch("ALTER TABLE memory_entries ADD COLUMN due_at INTEGER;")?;
         }
     }
 
@@ -1480,6 +1496,89 @@ mod tests {
         assert!(
             expires_at.is_none(),
             "existing entries should have NULL expires_at"
+        );
+    }
+
+    #[test]
+    fn test_migrate_v9_to_v10_adds_due_at() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_v1_schema(&conn);
+        // Apply migrations up through v9 manually to simulate a v9 database.
+        conn.execute_batch(
+            r#"
+            ALTER TABLE documents ADD COLUMN status TEXT DEFAULT 'current';
+            ALTER TABLE documents ADD COLUMN status_reason TEXT;
+            ALTER TABLE documents ADD COLUMN version TEXT;
+            ALTER TABLE memory_entries ADD COLUMN source_path TEXT;
+            ALTER TABLE collections ADD COLUMN source TEXT DEFAULT 'manual';
+            ALTER TABLE memory_entries ADD COLUMN confirmations INTEGER DEFAULT 0;
+            ALTER TABLE memory_entries ADD COLUMN corrections INTEGER DEFAULT 0;
+            ALTER TABLE memory_entries ADD COLUMN last_confirmed_at INTEGER;
+            ALTER TABLE memory_entries ADD COLUMN source_type TEXT DEFAULT 'user_statement';
+            ALTER TABLE memory_entries ADD COLUMN expires_at INTEGER;
+            CREATE TABLE IF NOT EXISTS memory_revisions (
+                id INTEGER PRIMARY KEY,
+                memory_id TEXT NOT NULL,
+                diff TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY (memory_id) REFERENCES memory_entries(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_memory_revisions_memory_id
+                ON memory_revisions(memory_id);
+            UPDATE schema_version SET version = 9;
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(9));
+
+        // Insert an entry at v9 to verify data preservation.
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('pre-migration', 'Pre', 'Content', 'topic', '[]', 1000, 1000)",
+            [],
+        )
+        .unwrap();
+
+        // Verify due_at does NOT exist at v9.
+        let has_due_at: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'due_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(!has_due_at, "v9 should not have due_at column");
+
+        // Run migration v9 → current.
+        migrate_schema(&conn, 9).unwrap();
+
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        // Verify due_at exists after migration.
+        let has_due_at: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'due_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(
+            has_due_at,
+            "should have due_at column after v9→v10 migration"
+        );
+
+        // Pre-existing entry should survive with NULL due_at.
+        let due_at: Option<i64> = conn
+            .query_row(
+                "SELECT due_at FROM memory_entries WHERE id = 'pre-migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            due_at.is_none(),
+            "existing entries should have NULL due_at after migration"
         );
     }
 }
