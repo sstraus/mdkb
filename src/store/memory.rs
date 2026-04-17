@@ -271,17 +271,19 @@ pub fn list_entries_sorted(
     };
 
     let now = Utc::now().timestamp();
-    let ttl_filter = "AND (expires_at IS NULL OR expires_at > ?";
 
     let sql = if status_filter.is_some() {
         format!(
             "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
-            FROM memory_entries WHERE status = ?1 {ttl_filter}2) {order_clause} LIMIT ?3"
+            FROM memory_entries WHERE status = ?1
+            AND (expires_at IS NULL OR expires_at > ?2)
+            AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?2)) {order_clause} LIMIT ?3"
         )
     } else {
         format!(
             "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
-            FROM memory_entries WHERE (expires_at IS NULL OR expires_at > ?1) {order_clause} LIMIT ?2"
+            FROM memory_entries WHERE (expires_at IS NULL OR expires_at > ?1)
+            AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?1)) {order_clause} LIMIT ?2"
         )
     };
 
@@ -614,6 +616,7 @@ pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Ve
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
          AND (m.expires_at IS NULL OR m.expires_at > ?3)
+         AND NOT (m.entry_type = 'reminder' AND (m.due_at IS NULL OR m.due_at > ?3))
          ORDER BY bm25(memory_fts)
          LIMIT ?2"
     )?;
@@ -642,6 +645,7 @@ fn bm25_search_with_rowid(
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
          AND (m.expires_at IS NULL OR m.expires_at > ?3)
+         AND NOT (m.entry_type = 'reminder' AND (m.due_at IS NULL OR m.due_at > ?3))
          ORDER BY bm25(memory_fts)
          LIMIT ?2"
     )?;
@@ -893,7 +897,9 @@ pub fn count_entries(conn: &Connection) -> Result<usize> {
 pub fn count_active_entries(conn: &Connection) -> Result<usize> {
     let now = Utc::now().timestamp();
     let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM memory_entries WHERE status = 'active' AND (expires_at IS NULL OR expires_at > ?1)",
+        "SELECT COUNT(*) FROM memory_entries WHERE status = 'active'
+         AND (expires_at IS NULL OR expires_at > ?1)
+         AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?1))",
         params![now],
         |row| row.get(0),
     )?;
@@ -1103,6 +1109,82 @@ mod tests {
 
         let retrieved2 = get_entry_without_tracking(&conn, "remind-me").unwrap().unwrap();
         assert_eq!(retrieved2.due_at, None);
+    }
+
+    fn make_reminder(id: &str, title: &str, content: &str, due_at: Option<i64>, now: i64) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            entry_type: EntryType::Reminder,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at,
+        }
+    }
+
+    #[test]
+    fn test_reminder_future_hidden_from_list() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        add_entry(&conn, &make_reminder("future-rem", "future", "payload", Some(now + 3600), now)).unwrap();
+
+        let listed = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, None).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
+        assert!(!ids.contains(&"future-rem"), "future reminder should be hidden from list");
+
+        let listed_active = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, Some(EntryStatus::Active)).unwrap();
+        let ids_active: Vec<&str> = listed_active.iter().map(|e| e.id.as_str()).collect();
+        assert!(!ids_active.contains(&"future-rem"), "future reminder should be hidden from status-filtered list");
+
+        let count = count_active_entries(&conn).unwrap();
+        assert_eq!(count, 0, "future reminder should not count as active");
+    }
+
+    #[test]
+    fn test_reminder_due_visible_in_list() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        add_entry(&conn, &make_reminder("due-rem", "due", "payload", Some(now - 3600), now)).unwrap();
+
+        let listed = list_entries_sorted(&conn, 10, MemorySortOrder::Newest, None).unwrap();
+        let ids: Vec<&str> = listed.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"due-rem"), "due reminder should appear in list");
+
+        let count = count_active_entries(&conn).unwrap();
+        assert_eq!(count, 1, "due reminder should count as active");
+    }
+
+    #[test]
+    fn test_reminder_future_hidden_from_search() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        add_entry(&conn, &make_reminder("future-rem", "future reminder", "searchable payload", Some(now + 3600), now)).unwrap();
+
+        let results = search_entries(&conn, "searchable", 10).unwrap();
+        let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
+        assert!(!ids.contains(&"future-rem"), "future reminder should be hidden from search");
+    }
+
+    #[test]
+    fn test_reminder_due_visible_in_search() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        add_entry(&conn, &make_reminder("due-rem", "due reminder", "searchable payload", Some(now - 3600), now)).unwrap();
+
+        let results = search_entries(&conn, "searchable", 10).unwrap();
+        let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"due-rem"), "due reminder should appear in search");
     }
 
     #[test]
