@@ -1341,6 +1341,7 @@ fn test_memory_complete_workflow() {
         last_accessed: None,
             source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
         expires_at: None,
+        due_at: None,
     };
 
     let entry2 = memory::MemoryEntry {
@@ -1357,6 +1358,7 @@ fn test_memory_complete_workflow() {
         last_accessed: None,
             source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
         expires_at: None,
+        due_at: None,
     };
 
     memory::add_entry(&env.ctx.conn, &entry1).expect("Failed to add entry1");
@@ -1471,6 +1473,7 @@ fn test_memory_stats_integration() {
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
+        due_at: None,
     };
     memory::add_entry(&env.ctx.conn, &entry).expect("Failed to add entry");
 
@@ -1532,6 +1535,7 @@ fn test_memory_index_persistence() {
             last_confirmed_at: None,
             source_type: memory::SourceType::UserStatement,
             expires_at: None,
+            due_at: None,
         };
         memory::add_entry(&env.ctx.conn, &entry).expect("Failed to add entry");
     }
@@ -1596,6 +1600,7 @@ fn test_memory_condense_finds_related() {
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
+        due_at: None,
     };
 
     // Entry 2: auth + jwt
@@ -1616,6 +1621,7 @@ fn test_memory_condense_finds_related() {
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
+        due_at: None,
     };
 
     // Entry 3: auth + jwt
@@ -1636,6 +1642,7 @@ fn test_memory_condense_finds_related() {
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
+        due_at: None,
     };
 
     // Entry 4: different tags (should not be grouped)
@@ -1656,6 +1663,7 @@ fn test_memory_condense_finds_related() {
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
+        due_at: None,
     };
 
     mdkb::store::memory::add_entry(&ctx.conn, &e1).expect("add e1");
@@ -1709,6 +1717,7 @@ fn test_memory_condense_dry_run() {
             last_confirmed_at: None,
             source_type: memory::SourceType::UserStatement,
             expires_at: None,
+            due_at: None,
         };
         mdkb::store::memory::add_entry(&ctx.conn, &entry).expect("add entry");
     }
@@ -1770,6 +1779,7 @@ fn test_memory_condense_creates_merged_entry() {
             last_confirmed_at: None,
             source_type: memory::SourceType::UserStatement,
             expires_at: None,
+            due_at: None,
         };
         mdkb::store::memory::add_entry(&ctx.conn, &entry).expect("add entry");
     }
