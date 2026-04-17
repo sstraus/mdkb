@@ -2460,14 +2460,13 @@ Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
 ### Reminders
 
 Create: `memory_write(id, title, content, entry_type=\"reminder\", due_in=<seconds>)`.
-Due reminders appear in the \"Available Memories\" list above as `[reminder:DUE] {id}: {title}` once `due_in` elapses.
+A due reminder appears at the top of these instructions as `[reminder:DUE] {id}: {title}` once `due_in` elapses.
 
 When you see one:
-1. Show it to the user and ask if it is done.
-2. Wait for explicit yes (\"yes\"/\"done\"/\"confirmed\"). Vague replies (\"ok\", \"hm\", \"sure\") = ambiguous — re-ask.
-3. Confirmed → `memory_delete(id)`.
-4. Snooze / \"not yet\" → `memory_write(id, title, content, entry_type=\"reminder\", due_in=<new_seconds>)` (same `id` updates the existing record).
-5. User ignores → do nothing; it resurfaces next time these instructions are loaded.
+1. Ask the user if it is done. End your turn — do NOT call `memory_delete` yet.
+2. Wait for the user's next message. Delete only on an unambiguous affirmative whose primary intent is confirming this reminder. Ambiguous replies or incidental mentions of the topic = re-ask.
+3. Confirmed → `memory_delete(id)`. If response is \"not found\", tell the user it was already removed.
+4. Snooze → first `get(id)` for the content, then `memory_write(id, title, <content>, entry_type=\"reminder\", due_in=<new_seconds>)` (same `id` updates the record).
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
@@ -2959,6 +2958,49 @@ mod tests {
             "Warmup exceeds token budget: {} tokens",
             tokens
         );
+    }
+
+    #[test]
+    fn test_base_instructions_token_budget() {
+        // Base instructions are sent on every MCP session — guard against prose bloat.
+        let result = build_server_instructions(&[]);
+        let tokens = count_tokens(&result);
+        assert!(
+            tokens < 600,
+            "BASE_INSTRUCTIONS exceeds 600-token budget: {} tokens",
+            tokens
+        );
+    }
+
+    #[test]
+    fn test_base_instructions_contains_reminder_protocol() {
+        // Guard against accidental removal of the Reminders confirmation flow.
+        // If someone deletes the Reminders section, this fails fast.
+        let result = build_server_instructions(&[]);
+        assert!(
+            result.contains("[reminder:DUE]"),
+            "Reminder format marker missing from instructions"
+        );
+        assert!(
+            result.contains("### Reminders"),
+            "Reminders section heading missing"
+        );
+        assert!(
+            result.contains("memory_delete"),
+            "Reminder deletion step missing"
+        );
+        assert!(
+            result.contains("get(id)"),
+            "Snooze must instruct to fetch content via get(id) before rewrite"
+        );
+        // Numbered confirmation-flow steps (1. through 4.)
+        for step in ["1.", "2.", "3.", "4."] {
+            assert!(
+                result.contains(step),
+                "Reminder flow step `{}` missing",
+                step
+            );
+        }
     }
 
     /// Regression test for deadlock in MCP tool handlers.
