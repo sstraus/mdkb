@@ -236,6 +236,7 @@ pub fn journal_to_memory_entries(
                 last_confirmed_at: None,
                 source_type: SourceType::UserStatement,
                 expires_at: None,
+                due_at: None,
             });
         }
     }
@@ -266,6 +267,7 @@ pub fn journal_to_memory_entries(
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
+            due_at: None,
         });
     }
 
@@ -295,6 +297,7 @@ pub fn journal_to_memory_entries(
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
+            due_at: None,
         });
     }
 
@@ -332,6 +335,7 @@ pub fn journal_to_memory_entries(
             last_confirmed_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
+            due_at: None,
         });
     }
 

@@ -1338,6 +1338,7 @@ pub fn handle_memory_add(
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
+        due_at: None,
     };
 
     memory::add_entry(&ctx.conn, &entry)?;
@@ -1550,6 +1551,7 @@ pub fn handle_memory_import(
             last_confirmed_at: None,
             source_type,
             expires_at: None,
+            due_at: None,
         };
 
         memory::add_entry(&ctx.conn, &entry)?;
@@ -1818,6 +1820,7 @@ pub fn handle_memory_condense(
                 last_confirmed_at: None,
                 source_type: memory::SourceType::AutoExtracted,
                 expires_at: None,
+                due_at: None,
             };
 
             // Use transaction to ensure atomicity - either all changes succeed or none
