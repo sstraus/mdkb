@@ -56,6 +56,7 @@ fn write_single_memory(
     source_type_str: &str,
     tags: &[String],
     ttl: Option<u64>,
+    due_in: Option<u64>,
 ) -> Result<String, McpError> {
     memory::validate_entry_input(id, title, tags, content)
         .map_err(|e| mcp_error(e.to_string()))?;
@@ -65,7 +66,7 @@ fn write_single_memory(
 
     let entry_type: memory::EntryType = entry_type_str
         .parse()
-        .map_err(|e: String| mcp_error(format!("{e}. Valid types: topic, problem, decision")))?;
+        .map_err(|e: String| mcp_error(format!("{e}. Valid types: topic, problem, decision, reminder")))?;
 
     let source_type: memory::SourceType = source_type_str
         .parse()
@@ -73,6 +74,7 @@ fn write_single_memory(
 
     let now = chrono::Utc::now().timestamp();
     let expires_at = ttl.map(|s| now + s as i64);
+    let due_at = due_in.map(|s| now + s as i64);
     let is_new = existing.is_none();
 
     // Pre-write duplicate check: reject if a near-identical entry exists (new entries only).
@@ -118,6 +120,9 @@ fn write_single_memory(
         existing_entry.entry_type = entry_type;
         existing_entry.tags = tags.to_vec();
         existing_entry.expires_at = expires_at;
+        if due_in.is_some() {
+            existing_entry.due_at = due_at;
+        }
         memory::update_entry(conn, &existing_entry)
             .map_err(|e| mcp_error(format!("Failed to update memory entry: {e}")))?;
 
@@ -149,7 +154,7 @@ fn write_single_memory(
             last_confirmed_at: None,
             source_type,
             expires_at,
-            due_at: None,
+            due_at,
         };
         memory::add_entry(conn, &entry)
             .map_err(|e| mcp_error(format!("Failed to create memory entry: {e}")))?;
@@ -1635,6 +1640,7 @@ impl McpServer {
                 &params.source_type,
                 &params.tags,
                 params.ttl,
+                params.due_in,
             )?;
 
             let tokens = count_tokens(&output);
@@ -1682,6 +1688,7 @@ impl McpServer {
                     &entry.source_type,
                     &entry.tags,
                     entry.ttl,
+                    entry.due_in,
                 )?;
                 results.push(result);
             }
@@ -3130,6 +3137,7 @@ mod tests {
                 tags: vec![],
                 source_type: "user_statement".to_string(),
                 ttl: None,
+                due_in: None,
                 root: None,
             }))
             .await
@@ -3213,6 +3221,7 @@ mod tests {
                 tags: vec![],
                 source_type: "user_statement".to_string(),
                 ttl: None,
+                due_in: None,
                 root: None,
             })),
         )
@@ -3446,6 +3455,7 @@ mod tests {
                 tags: vec!["tag1".to_string()],
                 source_type: "user_statement".to_string(),
                 ttl: None,
+                due_in: None,
                 root: None,
             }))
             .await
@@ -3460,6 +3470,7 @@ mod tests {
                 tags: vec![],
                 source_type: "user_statement".to_string(),
                 ttl: None,
+                due_in: None,
                 root: None,
             }))
             .await
@@ -4278,6 +4289,7 @@ if (require.main === module) {
                 tags: vec![],
                 source_type: "user_statement".to_string(),
                 ttl: None,
+                due_in: None,
                 root: None,
             }))
             .await
@@ -4303,6 +4315,7 @@ if (require.main === module) {
                 tags: vec![],
                 source_type: "user_statement".to_string(),
                 ttl: None,
+                due_in: None,
                 root: None,
             }))
             .await
@@ -4771,6 +4784,7 @@ if (require.main === module) {
                         tags: vec!["test".to_string()],
                         source_type: "user_statement".to_string(),
                         ttl: None,
+                        due_in: None,
                     },
                     MemoryWriteBatchEntry {
                         id: "batch-b".to_string(),
@@ -4780,6 +4794,7 @@ if (require.main === module) {
                         tags: vec![],
                         source_type: "user_statement".to_string(),
                         ttl: None,
+                        due_in: None,
                     },
                 ],
                 root: None,
@@ -4840,6 +4855,7 @@ if (require.main === module) {
                 tags: vec![],
                 source_type: "user_statement".to_string(),
                 ttl: None,
+                due_in: None,
             })
             .collect();
 

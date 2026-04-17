@@ -96,6 +96,10 @@ pub struct MemoryWriteParams {
     /// TTL in seconds. Entry expires after this duration. Omit for permanent.
     #[serde(default)]
     pub ttl: Option<u64>,
+
+    /// Reminder due time in seconds from now. Use with entry_type="reminder". Omit for non-reminders.
+    #[serde(default)]
+    pub due_in: Option<u64>,
 }
 
 fn default_entry_type() -> String {
@@ -133,6 +137,10 @@ pub struct MemoryWriteBatchEntry {
     /// TTL in seconds. Entry expires after this duration. Omit for permanent.
     #[serde(default)]
     pub ttl: Option<u64>,
+
+    /// Reminder due time in seconds from now. Use with entry_type="reminder". Omit for non-reminders.
+    #[serde(default)]
+    pub due_in: Option<u64>,
 }
 
 /// Parameters for batch memory write.
