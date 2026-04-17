@@ -848,20 +848,69 @@ pub fn get_rowid(conn: &Connection, id: &str) -> Result<Option<i64>> {
     Ok(rowid)
 }
 
+/// Max due reminders shown inline before collapsing into a summary line.
+const DUE_REMINDER_CAP: usize = 10;
+
 /// Get warmup index - compact list of top entries by access count.
 ///
-/// Uses a targeted query selecting only needed columns (no content).
+/// Due reminders (entry_type='reminder' AND due_at <= now) are surfaced first,
+/// sorted oldest-first, capped at DUE_REMINDER_CAP with an overflow summary line.
+/// Standard entries follow, excluding reminders entirely (future reminders are
+/// silent, surfaced reminders are already rendered above).
 pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> {
     let now = Utc::now().timestamp();
+
+    let mut due_stmt = conn.prepare(
+        "SELECT id, title, tags FROM memory_entries
+         WHERE status = 'active'
+         AND entry_type = 'reminder'
+         AND due_at IS NOT NULL AND due_at <= ?1
+         ORDER BY due_at ASC",
+    )?;
+
+    let mut due_lines: Vec<String> = Vec::new();
+    let mut due_total: usize = 0;
+    let due_rows = due_stmt.query_map(params![now], |row| {
+        let id: String = row.get(0)?;
+        let title: String = row.get(1)?;
+        let tags_json: String = row.get(2)?;
+        let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
+        let tags_str = tags
+            .iter()
+            .map(|t| format!("#{t}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(format!("[reminder:DUE] {id}: {title} {tags_str}"))
+    })?;
+    for r in due_rows {
+        match r {
+            Ok(line) => {
+                due_total += 1;
+                if due_lines.len() < DUE_REMINDER_CAP {
+                    due_lines.push(line);
+                }
+            }
+            Err(e) => tracing::warn!("Failed to read due reminder: {e}"),
+        }
+    }
+    if due_total > DUE_REMINDER_CAP {
+        let extra = due_total - DUE_REMINDER_CAP;
+        due_lines.push(format!(
+            "[reminder:DUE] ...and {extra} more overdue — use memory_list to see all"
+        ));
+    }
+
     let mut stmt = conn.prepare(
         "SELECT id, title, entry_type, tags FROM memory_entries
          WHERE status = 'active'
+         AND entry_type != 'reminder'
          AND (expires_at IS NULL OR expires_at > ?2)
          ORDER BY access_count DESC
          LIMIT ?1",
     )?;
 
-    let index: Vec<String> = stmt
+    let mut index: Vec<String> = due_lines;
+    let standard: Vec<String> = stmt
         .query_map(params![limit as i64, now], |row| {
             let id: String = row.get(0)?;
             let title: String = row.get(1)?;
@@ -883,6 +932,7 @@ pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> 
             }
         })
         .collect();
+    index.extend(standard);
 
     Ok(index)
 }
@@ -1174,6 +1224,62 @@ mod tests {
         let results = search_entries(&conn, "searchable", 10).unwrap();
         let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
         assert!(!ids.contains(&"future-rem"), "future reminder should be hidden from search");
+    }
+
+    #[test]
+    fn test_warmup_prepends_due_reminders() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+
+        let topic = MemoryEntry {
+            id: "topic-one".to_string(),
+            title: "Regular topic".to_string(),
+            content: "body".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec!["sample".to_string()],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 5,
+            last_accessed: Some(now),
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        add_entry(&conn, &topic).unwrap();
+        add_entry(&conn, &make_reminder("rem-due", "Due thing", "body", Some(now - 60), now)).unwrap();
+        add_entry(&conn, &make_reminder("rem-future", "Later thing", "body", Some(now + 3600), now)).unwrap();
+
+        let warmup = get_warmup_index(&conn, 50).unwrap();
+
+        assert!(warmup[0].starts_with("[reminder:DUE] rem-due:"), "due reminder must lead: {:?}", warmup);
+        assert!(!warmup.iter().any(|l| l.contains("rem-future")), "future reminder must not appear");
+        assert!(warmup.iter().any(|l| l.starts_with("[topic] topic-one:")), "regular topic must follow");
+        assert!(!warmup.iter().any(|l| l.starts_with("[reminder] rem-due")), "reminder must not render as plain entry_type");
+    }
+
+    #[test]
+    fn test_warmup_summary_line_when_over_cap() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+
+        for i in 0..12 {
+            add_entry(
+                &conn,
+                &make_reminder(&format!("rem-{i:02}"), &format!("Due {i}"), "body", Some(now - 1000 + i as i64), now),
+            )
+            .unwrap();
+        }
+
+        let warmup = get_warmup_index(&conn, 50).unwrap();
+
+        let due_lines: Vec<&String> = warmup.iter().filter(|l| l.starts_with("[reminder:DUE]")).collect();
+        assert_eq!(due_lines.len(), DUE_REMINDER_CAP + 1, "10 entries + 1 summary");
+        assert!(due_lines.last().unwrap().contains("...and 2 more overdue"));
     }
 
     #[test]
