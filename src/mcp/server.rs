@@ -2434,7 +2434,7 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
 const BASE_INSTRUCTIONS: &str = "\
 # mdkb — Project Knowledge Base
 
-## Code Search (prefer over Grep for architecture queries)
+## Code Search
 
 | Need | Flow | Calls |
 |---|---|---|
@@ -2445,32 +2445,29 @@ const BASE_INSTRUCTIONS: &str = "\
 | Semantic code query | `search(query, scope=\"code\")` | 1 |
 | Architecture/decisions | `search(query)` → `get(id)` | 2 |
 
-**Grep when:** regex, literal string, inline guards, file content unknown to index.
-**mdkb when:** call graph, function lookup, impact analysis, architectural context.
+**Grep for:** regex, literal strings, files not in index. **mdkb for:** call graphs, symbol lookup, impact analysis, semantic/architectural queries.
 
 ## Memory
 
-1. `search(query, scope=\"memory\")` — check before writing duplicates
-2. `memory_write` / `memory_write_batch` — after solving problems
-3. `memory_delete` — remove stale entries
+- `search(query, scope=\"memory\")` — check before writing duplicates.
+- `memory_write` / `memory_write_batch` — persist after solving problems.
+- `memory_delete` — remove stale entries.
 
-Memory entry_type: `problem`, `decision`, `topic`, `reminder`.
-TTL: pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Omit for permanent.
-`search` returns IDs. Use `get(id)` for full content.
+`entry_type`: `problem`, `decision`, `topic`, `reminder` (time-bound follow-up; requires `due_in`).
+`ttl` (seconds): auto-expire. Omit = permanent. `search` returns IDs → `get(id)` for full content.
 Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
 
 ### Reminders
 
-`entry_type=\"reminder\"` with `due_in` (seconds from now): surfaces at SessionStart when due.
+Create: `memory_write(id, title, content, entry_type=\"reminder\", due_in=<seconds>)`.
+Due reminders appear in the \"Available Memories\" list above as `[reminder:DUE] {id}: {title}` once `due_in` elapses.
 
-When you see `[reminder:DUE] {id}: {title}` in \"Available Memories\":
-1. Show the reminder to the user and ASK if it is done.
-2. Wait for an explicit affirmative (\"si\", \"yes\", \"done\", \"fatto\", \"completato\"). Ambiguous replies (\"ok\", \"hm\") are NOT confirmation — ask again.
-3. On confirmation: call `memory_delete(id)`.
-4. On \"not yet\" / \"snooze\": call `memory_write(id, ..., due_in=<new_seconds>)` to reschedule.
-5. If the user ignores it: do nothing — it resurfaces next SessionStart.
-
-Never auto-delete a reminder without explicit user confirmation.
+When you see one:
+1. Show it to the user and ask if it is done.
+2. Wait for explicit yes (\"yes\"/\"done\"/\"confirmed\"). Vague replies (\"ok\", \"hm\", \"sure\") = ambiguous — re-ask.
+3. Confirmed → `memory_delete(id)`.
+4. Snooze / \"not yet\" → `memory_write(id, title, content, entry_type=\"reminder\", due_in=<new_seconds>)` (same `id` updates the existing record).
+5. User ignores → do nothing; it resurfaces next time these instructions are loaded.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.
