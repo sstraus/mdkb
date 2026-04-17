@@ -104,7 +104,11 @@ Persistent AI knowledge that survives across sessions — decisions, patterns, s
 - **Revision tracking** — manual entries track up to 3 revision diffs
 - **TTL (time-to-live)** — pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Expired entries are filtered from searches and listings but remain accessible via `get(id)` with an `[EXPIRED]` marker, so they can be inspected or renewed. Omit `ttl` for permanent entries.
 
-Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices).
+Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices), `reminder` (time-bound — see below).
+
+#### Reminders
+
+Create with `memory_write(id, title, content, entry_type="reminder", due_in=<seconds>)` (or `mdkb memory add --entry-type reminder --due-in N`). While `due_at > now` the reminder is hidden from searches and listings. Once due, it appears in the session warmup index prefixed `[reminder:DUE] {id}: {title}` so the MCP client sees it on the next turn. The AI is instructed to ask for confirmation before deleting and to snooze via `memory_write` with a new `due_in` (same `id` updates the record).
 
 Source types control confidence weighting:
 
@@ -170,6 +174,8 @@ mdkb code impact init --depth 5
 ```bash
 mdkb memory add auth-patterns -t "OAuth2 PKCE Flow" -T topic --tags auth,security \
   -c "Always use PKCE for public clients..."
+mdkb memory add pay-bill -t "Pay electricity bill" -T reminder --due-in 86400 \
+  -c "Monthly utility payment"
 mdkb memory list
 mdkb memory search "authentication"
 mdkb memory history auth-patterns
