@@ -5,3 +5,6 @@
 
 #[path = "hooks/dispatch_test.rs"]
 mod dispatch_test;
+
+#[path = "hooks/session_start_test.rs"]
+mod session_start_test;
