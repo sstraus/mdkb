@@ -52,6 +52,18 @@ mdkb setup mcp claude --scope user
 
 Restart Claude Code after setup. The MCP server auto-indexes on startup and watches for file changes.
 
+### Hooks (optional, recommended)
+
+MCP gives the assistant tools; hooks make it use them. Register the lifecycle dispatcher so Claude gets a memory warmup at session start and relevant context on every prompt — without having to call `search` first:
+
+```bash
+mdkb setup hooks claude --scope local
+# or, for Codex CLI:
+mdkb setup hooks codex
+```
+
+Restart the host CLI after setup. Full contract, config, and opt-out in [docs/hooks.md](docs/hooks.md).
+
 ### Manual MCP Setup
 
 Add to your Claude Code MCP config (`.claude/mcp.json` or `~/.claude/mcp.json`):

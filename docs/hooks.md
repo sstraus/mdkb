@@ -1,0 +1,214 @@
+# Hooks
+
+mdkb ships a hook dispatcher (`mdkb hook <event>`) that plugs into Claude
+Code and Codex CLI lifecycle events. When registered, it injects relevant
+memory into context automatically — no tool call required — and keeps the
+code index fresh after edits.
+
+## Why hooks
+
+Without hooks, the assistant may ignore `mcp__mdkb__search` and answer
+from stale training data. Hooks make recall proactive:
+
+- **SessionStart** — inject a warmup block listing recently-accessed
+  memory entries as soon as a session opens.
+- **UserPromptSubmit** — match the user's prompt against the memory FTS
+  index and inject the top-N entries before the assistant replies.
+- **PostToolUse** — when `Edit` / `Write` / `MultiEdit` / `NotebookEdit`
+  touches a file, append it to `.mdkb/reindex-queue.jsonl` so the next
+  `mdkb update` pass picks it up.
+
+All hooks are fire-and-forget: internal errors are logged to stderr and
+swallowed — the host CLI is never blocked by mdkb.
+
+## Install
+
+```bash
+# Claude Code, project-scoped (writes .claude/settings.local.json)
+mdkb setup hooks claude --scope local
+
+# Claude Code, user-scoped (writes ~/.claude/settings.json)
+mdkb setup hooks claude --scope user
+
+# Codex CLI (writes ~/.codex/hooks.json)
+mdkb setup hooks codex
+```
+
+Restart the host CLI after setup. Re-running is idempotent: existing
+hook entries are replaced, unrelated settings are preserved.
+
+### Disable individual events at install time
+
+```bash
+mdkb setup hooks claude --disable post-tool-use
+mdkb setup hooks claude --disable user-prompt-submit,post-tool-use
+```
+
+Valid values: `session-start`, `user-prompt-submit`, `post-tool-use`.
+
+### Dry run
+
+```bash
+mdkb setup hooks claude --dry-run
+```
+
+Prints the merged settings JSON to stdout without writing.
+
+## Event contracts
+
+Every handler reads the event JSON from stdin and writes a JSON object
+to stdout. Exit code is always 0. When a hook has nothing to contribute,
+it returns `{}` (empty object).
+
+### SessionStart
+
+Input: any JSON (ignored).
+
+Output (when memory is non-empty):
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart",
+    "additionalContext": "## mdkb memory warmup\n\n- [topic] …\n- [decision] …\n"
+  }
+}
+```
+
+### UserPromptSubmit
+
+Input:
+
+```json
+{ "prompt": "how does the hook dispatcher work?" }
+```
+
+Empty or wrap-up prompts (`/clear`, `/compact`, `/exit`, `/quit`,
+`/wrapup`) are skipped. The handler tokenizes the prompt, strips
+stopwords and sub-3-char fragments, and runs an FTS5 OR query against
+the memory index.
+
+Output (when matches are found):
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": "## mdkb: relevant context\n\n- [hooks-topic] Hook dispatcher architecture — The mdkb hook dispatcher reads stdin and writes JSON to stdout …\n"
+  }
+}
+```
+
+### PostToolUse
+
+Input:
+
+```json
+{
+  "tool_name": "Edit",
+  "tool_input": { "file_path": "/abs/path/to/file.rs" }
+}
+```
+
+Only `Edit`, `Write`, `MultiEdit`, `NotebookEdit` are tracked. For
+notebooks the handler also reads `tool_input.notebook_path`.
+
+Effect: appends a JSON line to `.mdkb/reindex-queue.jsonl`:
+
+```json
+{"path":"/abs/path/to/file.rs","tool":"Edit","at":1713398400}
+```
+
+Output: `{}` (PostToolUse must never return `additionalContext`).
+
+## Configuration
+
+All toggles live under `[hooks]` in `.mdkb/config.toml`:
+
+```toml
+[hooks]
+session_start_enabled = true
+user_prompt_submit_enabled = true
+post_tool_use_enabled = true
+
+# Max recall results injected on UserPromptSubmit.
+recall_limit = 5
+
+# Latency budget in milliseconds. If a hook exceeds this,
+# the overrun is appended to .mdkb/hook-slow.jsonl and the
+# output may be truncated with a notice.
+latency_budget_ms = 200
+
+# Minimum hybrid score for a recall result to be injected.
+min_recall_score = 0.3
+```
+
+Defaults are safe for interactive use; tune `recall_limit` higher if
+you want more context, lower if the assistant is getting too much
+noise on every prompt.
+
+## Opt out
+
+Three ways, in order of granularity:
+
+1. **Per-project file marker** — create an empty `.mdkbignore-hooks`
+   file at the repo root. All three hooks return `{}` immediately for
+   any working directory under that marker. Useful for one-off repos
+   where you do not want mdkb to participate even if hooks are
+   globally installed.
+2. **Per-event config toggle** — set
+   `session_start_enabled = false` (or the other two) in
+   `.mdkb/config.toml`.
+3. **Uninstall** — remove the hook entries from the host CLI's
+   settings file (`.claude/settings.local.json`, `~/.claude/settings.json`,
+   or `~/.codex/hooks.json`).
+
+The `.mdkbignore-hooks` marker is looked up by walking ancestor
+directories up to `$HOME`; it is never searched above the user home
+directory.
+
+## Troubleshooting
+
+### Hooks aren't firing
+
+1. Restart the host CLI after `mdkb setup hooks …`.
+2. Verify the settings file contains an `mdkb hook <event>` entry for
+   the relevant event.
+3. Run the dispatcher manually:
+
+   ```bash
+   echo '{}' | mdkb hook session-start
+   echo '{"prompt":"test"}' | mdkb hook user-prompt-submit
+   ```
+
+   Both should print a JSON object to stdout and exit 0.
+
+### Recall is empty
+
+- `search_entries_fts` requires at least one indexed memory entry. Run
+  `mdkb memory list` and confirm the DB is populated.
+- Conversational prompts with only stopwords (e.g. "what is this?")
+  produce no tokens and are skipped by design.
+
+### Slow hooks
+
+Any hook that exceeds `latency_budget_ms` logs a line to
+`.mdkb/hook-slow.jsonl`:
+
+```json
+{"event":"session-start","elapsed_ms":412,"budget_ms":200,"ts":…}
+```
+
+Use this to tune the budget or diagnose cold-start issues.
+
+### Reindex queue growing unbounded
+
+`mdkb update` drains `.mdkb/reindex-queue.jsonl` on each run. If it
+grows between runs that is expected — trigger a manual `mdkb update`
+or wait for the next watcher pass.
+
+## Automated verification
+
+The hook contract is covered end-to-end by `tests/e2e_hooks.rs`,
+which spawns the real `mdkb` binary and asserts that warmup, recall,
+and reindex-queue output matches the spec.
