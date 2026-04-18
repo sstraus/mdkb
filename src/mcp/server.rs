@@ -34,7 +34,7 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
     CodeGraphParams, GetParams, MemoryDeleteParams, MemoryListParams, MemoryWriteBatchParams,
-    MemoryWriteParams, SearchParams,
+    MemoryWriteParams, SearchParams, UsageParams,
 };
 
 /// Create an MCP error from a message.
@@ -1017,7 +1017,7 @@ impl McpServer {
     #[tool(
         description = "Search docs+memory (default), code symbols (scope=\"symbols\"), or semantic code (scope=\"code\")."
     )]
-    async fn search(
+    pub async fn search(
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -1450,7 +1450,7 @@ impl McpServer {
 
     /// Get index status including documents, collections, and code index.
     #[tool(description = "Get index status: collections, documents, code index stats.")]
-    async fn status(
+    pub async fn status(
         &self,
         Parameters(_): Parameters<EmptyObject>,
     ) -> Result<CallToolResult, McpError> {
@@ -1610,7 +1610,7 @@ impl McpServer {
     #[tool(
         description = "Create or update a memory entry. Types: problem, decision, topic. Slug ID, title max 50 chars."
     )]
-    async fn memory_write(
+    pub async fn memory_write(
         &self,
         Parameters(params): Parameters<MemoryWriteParams>,
     ) -> Result<CallToolResult, McpError> {
@@ -1904,6 +1904,128 @@ impl McpServer {
         let tokens = count_tokens(&output);
         self.record_persistent_call("code_graph", tokens, 1, false)
             .await;
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Audit token economy: session/lifetime token counts, per-tool usage, top-5 most-called.
+    #[tool(
+        description = "Audit token economy: session tokens, per-tool counts, top-5 most-called, lifetime totals."
+    )]
+    pub async fn usage(
+        &self,
+        Parameters(params): Parameters<UsageParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
+
+        let output = {
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let session_id = self.session_id.load(Ordering::Relaxed);
+            let session = if session_id > 0 {
+                stats::get_session(&ctx.conn, session_id)
+                    .map_err(|e| mcp_error(format!("Failed to read session: {e}")))?
+            } else {
+                None
+            };
+            let session_tool_usage = if session_id > 0 {
+                stats::get_tool_usage(&ctx.conn, session_id)
+                    .map_err(|e| mcp_error(format!("Failed to read tool usage: {e}")))?
+            } else {
+                Vec::new()
+            };
+
+            let lifetime = if !params.session_only {
+                Some(
+                    stats::get_aggregate_stats(&ctx.conn)
+                        .map_err(|e| mcp_error(format!("Failed to read lifetime stats: {e}")))?,
+                )
+            } else {
+                None
+            };
+            let lifetime_tool_usage = if !params.session_only {
+                stats::get_aggregate_tool_usage(&ctx.conn)
+                    .map_err(|e| mcp_error(format!("Failed to read lifetime tool usage: {e}")))?
+            } else {
+                Vec::new()
+            };
+
+            let primary_tools = if params.session_only {
+                &session_tool_usage
+            } else {
+                &lifetime_tool_usage
+            };
+            let mut top_sorted: Vec<&stats::ToolUsageRecord> = primary_tools.iter().collect();
+            top_sorted.sort_by_key(|r| std::cmp::Reverse(r.call_count));
+            let top_5_most_called: Vec<serde_json::Value> = top_sorted
+                .iter()
+                .take(5)
+                .map(|r| {
+                    serde_json::json!({
+                        "tool_name": r.tool_name,
+                        "call_count": r.call_count,
+                    })
+                })
+                .collect();
+
+            let per_tool: Vec<serde_json::Value> = session_tool_usage
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "tool_name": r.tool_name,
+                        "call_count": r.call_count,
+                        "total_tokens": r.total_tokens,
+                        "total_results": r.total_results,
+                    })
+                })
+                .collect();
+
+            let session_json = session.as_ref().map(|s| {
+                serde_json::json!({
+                    "id": s.id,
+                    "total_calls": s.total_calls,
+                    "total_tokens": s.total_tokens,
+                    "truncations": s.truncation_count,
+                })
+            });
+
+            let mut out = serde_json::json!({
+                "session": session_json,
+                "per_tool": per_tool,
+                "top_5_most_called": top_5_most_called,
+            });
+
+            if let Some(l) = lifetime {
+                out["lifetime"] = serde_json::json!({
+                    "total_sessions": l.total_sessions,
+                    "total_calls": l.total_calls,
+                    "total_tokens": l.total_tokens,
+                    "truncations": l.total_truncations,
+                    "avg_tokens_per_call": l.avg_tokens_per_call,
+                });
+                let lifetime_per_tool: Vec<serde_json::Value> = lifetime_tool_usage
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "tool_name": r.tool_name,
+                            "call_count": r.call_count,
+                            "total_tokens": r.total_tokens,
+                            "total_results": r.total_results,
+                        })
+                    })
+                    .collect();
+                out["lifetime_per_tool"] = serde_json::Value::Array(lifetime_per_tool);
+            }
+
+            serde_json::to_string_pretty(&out)
+                .map_err(|e| mcp_error(format!("Failed to serialize usage: {e}")))?
+        };
+
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("usage", tokens, 1, false).await;
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -2441,6 +2563,7 @@ const BASE_INSTRUCTIONS: &str = "\
 - `search(query, scope=\"memory\")` — check before writing duplicates.
 - `memory_write` / `memory_write_batch` — persist after solving problems.
 - `memory_delete` — remove stale entries.
+- `usage` — audit token economy when output feels expensive.
 
 `entry_type`: `problem`, `decision`, `topic`, `reminder` (time-bound follow-up; requires `due_in`).
 `ttl` (seconds): auto-expire. Omit = permanent. `search` returns IDs → `get(id)` for full content.

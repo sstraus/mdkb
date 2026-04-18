@@ -228,6 +228,22 @@ fn default_threshold() -> f32 {
     0.5
 }
 
+/// Parameters for the usage tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct UsageParams {
+    /// Limit totals to current session (default: true). Set false to include lifetime aggregates across all sessions.
+    #[serde(default = "default_session_only")]
+    pub session_only: bool,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+fn default_session_only() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
