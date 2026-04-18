@@ -669,6 +669,15 @@ async fn main() -> Result<()> {
                         println!("{}", result.message);
                     }
                 }
+                SetupMcpCommand::Codex { yes: _, dry_run } => {
+                    let result = mdkb::cli::setup::handle_setup_mcp_codex(dry_run)?;
+                    if !result.dry_run {
+                        println!("{}", result.message);
+                        println!("Wrote: {}", result.config_path.display());
+                        println!();
+                        println!("Restart Codex CLI to activate the mdkb MCP server.");
+                    }
+                }
             },
             SetupCommand::Hooks(hooks_cmd) => match hooks_cmd {
                 SetupHooksCommand::Claude {

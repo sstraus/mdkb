@@ -665,6 +665,124 @@ pub fn handle_setup_hooks_codex(disable: &str, dry_run: bool) -> Result<HooksSet
     })
 }
 
+/// Result of `mdkb setup mcp codex`.
+#[derive(Debug)]
+pub struct McpCodexSetupResult {
+    pub success: bool,
+    pub dry_run: bool,
+    pub config_path: std::path::PathBuf,
+    pub binary_path: String,
+    pub merged_toml: String,
+    pub message: String,
+}
+
+/// Resolve the Codex CLI config.toml path: `$HOME/.codex/config.toml`.
+pub fn codex_config_path() -> Result<std::path::PathBuf> {
+    let home = env::var_os("HOME").ok_or_else(|| {
+        Error::from(ErrorKind::Command {
+            command: "setup mcp codex".to_string(),
+            message: "HOME environment variable not set".to_string(),
+        })
+    })?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".codex")
+        .join("config.toml"))
+}
+
+/// Register mdkb as an MCP server in Codex CLI's `~/.codex/config.toml`.
+///
+/// Idempotent: re-runs replace only the `[mcp_servers.mdkb]` table, preserving
+/// other servers, top-level keys, and comments (via `toml_edit`).
+/// Errors if `~/.codex` does not exist (Codex CLI not installed).
+pub fn handle_setup_mcp_codex(dry_run: bool) -> Result<McpCodexSetupResult> {
+    let config_path = codex_config_path()?;
+
+    // Codex-not-installed check: parent dir must exist.
+    let parent = config_path.parent().ok_or_else(|| {
+        Error::from(ErrorKind::Command {
+            command: "setup mcp codex".to_string(),
+            message: "cannot resolve parent of config.toml".to_string(),
+        })
+    })?;
+    if !parent.exists() {
+        return Err(Error::from(ErrorKind::Command {
+            command: "setup mcp codex".to_string(),
+            message: format!(
+                "{} does not exist — Codex CLI is not installed. Install Codex first: https://github.com/openai/codex",
+                parent.display()
+            ),
+        }));
+    }
+
+    let binary_path = find_mdkb_binary()?;
+
+    let mut doc: toml_edit::DocumentMut = if config_path.exists() {
+        let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: config_path.clone(),
+                operation: format!("read config.toml: {e}"),
+            })
+        })?;
+        raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+            Error::from(ErrorKind::Command {
+                command: "setup mcp codex".to_string(),
+                message: format!("failed to parse {}: {e}", config_path.display()),
+            })
+        })?
+    } else {
+        toml_edit::DocumentMut::new()
+    };
+
+    // Ensure [mcp_servers] exists as a table.
+    if !doc.contains_key("mcp_servers") {
+        doc["mcp_servers"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let servers = doc["mcp_servers"].as_table_mut().ok_or_else(|| {
+        Error::from(ErrorKind::Command {
+            command: "setup mcp codex".to_string(),
+            message: "`mcp_servers` must be a TOML table".to_string(),
+        })
+    })?;
+
+    // Overwrite [mcp_servers.mdkb] — idempotent replace of our managed entry.
+    let mut mdkb = toml_edit::Table::new();
+    mdkb.insert("command", toml_edit::value(binary_path.clone()));
+    let mut args = toml_edit::Array::new();
+    args.push("serve");
+    mdkb.insert("args", toml_edit::value(args));
+    servers.insert("mdkb", toml_edit::Item::Table(mdkb));
+
+    let merged_toml = doc.to_string();
+
+    if dry_run {
+        println!("{merged_toml}");
+        return Ok(McpCodexSetupResult {
+            success: true,
+            dry_run: true,
+            config_path,
+            binary_path,
+            merged_toml,
+            message: "Dry run: no changes written".to_string(),
+        });
+    }
+
+    std::fs::write(&config_path, &merged_toml).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: config_path.clone(),
+            operation: format!("write config.toml: {e}"),
+        })
+    })?;
+
+    Ok(McpCodexSetupResult {
+        success: true,
+        dry_run: false,
+        config_path,
+        binary_path,
+        merged_toml,
+        message: "mdkb MCP server registered in ~/.codex/config.toml".to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

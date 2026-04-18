@@ -600,6 +600,17 @@ pub enum SetupMcpCommand {
         #[arg(short, long)]
         yes: bool,
     },
+
+    /// Register mdkb with Codex CLI (writes ~/.codex/config.toml)
+    Codex {
+        /// Skip confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+
+        /// Print the merged config.toml to stdout without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Hooks setup subcommands.
