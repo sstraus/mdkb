@@ -1,6 +1,7 @@
 //! CLI layer - command parsing and execution with clap.
 
 pub mod handlers;
+pub mod hooks;
 pub mod journal;
 pub mod setup;
 
@@ -190,6 +191,23 @@ pub enum Command {
     /// Claude Code session indexing
     #[command(subcommand)]
     Session(SessionCommand),
+
+    /// Dispatch a lifecycle hook event (invoked by Claude Code / Codex).
+    ///
+    /// Reads event JSON from stdin, writes response JSON to stdout, always exits 0.
+    /// Host CLIs must never be blocked by mdkb — failures are logged, not propagated.
+    Hook {
+        /// Hook event name.
+        event: HookEvent,
+    },
+}
+
+/// Lifecycle hook events supported by mdkb.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum HookEvent {
+    SessionStart,
+    UserPromptSubmit,
+    PostToolUse,
 }
 
 /// Session indexing subcommands.

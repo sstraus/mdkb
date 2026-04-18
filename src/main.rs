@@ -28,6 +28,7 @@ use mdkb::cli::handlers::{
     handle_session_index, handle_stats, handle_status, handle_superseded_by, handle_update,
     handle_update_files,
 };
+use mdkb::cli::hooks;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
     Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand,
@@ -687,6 +688,9 @@ async fn main() -> Result<()> {
                 format_update_result(&result, cli.format);
             }
         },
+        Command::Hook { event } => {
+            hooks::dispatch(event);
+        }
     }
 
     Ok(())

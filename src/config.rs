@@ -33,6 +33,9 @@ pub struct Config {
 
     /// Code intelligence configuration.
     pub code: CodeConfig,
+
+    /// Claude Code / Codex lifecycle hooks.
+    pub hooks: HooksConfig,
 }
 
 /// Indexing settings.
@@ -258,6 +261,42 @@ impl Default for Config {
             mcp: McpConfig::default(),
             conventions: ConventionsConfig::default(),
             code: CodeConfig::default(),
+            hooks: HooksConfig::default(),
+        }
+    }
+}
+
+/// Lifecycle hook settings for Claude Code / Codex integration.
+///
+/// Hooks are fire-and-forget: any internal error must still return exit code 0
+/// so the host CLI is never blocked. These toggles let users disable individual
+/// events per-project via `.mdkb/config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    pub session_start_enabled: bool,
+    pub user_prompt_submit_enabled: bool,
+    pub post_tool_use_enabled: bool,
+
+    /// Maximum number of recall results injected on UserPromptSubmit.
+    pub recall_limit: usize,
+
+    /// Latency budget in milliseconds; hook truncates output if exceeded.
+    pub latency_budget_ms: u64,
+
+    /// Minimum hybrid score for a recall result to be injected.
+    pub min_recall_score: f64,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            session_start_enabled: true,
+            user_prompt_submit_enabled: true,
+            post_tool_use_enabled: true,
+            recall_limit: 5,
+            latency_budget_ms: 200,
+            min_recall_score: 0.3,
         }
     }
 }
