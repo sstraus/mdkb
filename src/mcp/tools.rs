@@ -40,6 +40,10 @@ pub struct SearchParams {
     /// Filter by file path (substring match) when scope is "symbols".
     #[serde(default)]
     pub file: Option<String>,
+
+    /// Minimum confidence threshold 0.0-1.0 when scope is "memory". Entries below this are excluded. Omit or 0.0 = no filter.
+    #[serde(default)]
+    pub min_confidence: Option<f64>,
 }
 
 fn default_limit() -> usize {

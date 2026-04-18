@@ -402,6 +402,7 @@ impl McpServer {
                         limit,
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed on {}: {e}", repo_tag)))?;
+                    let entries = apply_min_confidence(entries, params.min_confidence);
 
                     // Memory results are formatted separately, return early per-repo
                     // For simplicity, collect and merge textually
@@ -1073,6 +1074,7 @@ impl McpServer {
                         limit,
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
+                    let entries = apply_min_confidence(entries, params.min_confidence);
 
                     let mut output = format_memory_search_results(&entries);
                     if let Some(hint) = ood_hint(entries.len(), None) {
@@ -1107,6 +1109,7 @@ impl McpServer {
                         limit,
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
+                    let mem_entries = apply_min_confidence(mem_entries, params.min_confidence);
 
                     let total = doc_results.len() + mem_entries.len();
                     let top_score = doc_results.first().map(|r| r.score);
@@ -2801,6 +2804,21 @@ fn format_confirmed_info(last_confirmed_at: Option<i64>) -> String {
     }
 }
 
+/// Drop memory entries whose confidence() falls below `min`.
+/// Omitted filter or `0.0` is a no-op (current behavior).
+fn apply_min_confidence(
+    entries: Vec<memory::MemoryEntry>,
+    min: Option<f64>,
+) -> Vec<memory::MemoryEntry> {
+    match min {
+        Some(threshold) if threshold > 0.0 => entries
+            .into_iter()
+            .filter(|e| e.confidence() >= threshold)
+            .collect(),
+        _ => entries,
+    }
+}
+
 /// Format TTL info for display. Returns empty string for permanent entries.
 fn format_ttl_info(expires_at: Option<i64>) -> String {
     match expires_at {
@@ -3492,6 +3510,7 @@ mod tests {
                 scope: None,
                 kind: None,
                 file: None,
+                min_confidence: None,
                 threshold: 0.3,
                 root: None,
             }))
@@ -3547,6 +3566,7 @@ mod tests {
                 scope: Some("memory".to_string()),
                 kind: None,
                 file: None,
+                min_confidence: None,
                 threshold: 0.3,
                 root: None,
             }))
@@ -3805,6 +3825,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: None,
                     file: None,
+                    min_confidence: None,
                     threshold: 0.3,
                     root: None,
                 })),
@@ -3833,6 +3854,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: None,
                     file: None,
+                    min_confidence: None,
                     threshold: 0.3,
                     root: None,
                 })),
@@ -3860,6 +3882,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: Some("struct".to_string()),
                     file: None,
+                    min_confidence: None,
                     threshold: 0.3,
                     root: None,
                 })),
@@ -3894,6 +3917,7 @@ if (require.main === module) {
                     file: Some("lib.rs".to_string()),
                     threshold: 0.3,
                     root: None,
+                    min_confidence: None,
                 })),
             )
             .await
@@ -3920,6 +3944,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: Some("invalid_kind".to_string()),
                     file: None,
+                    min_confidence: None,
                     threshold: 0.3,
                     root: None,
                 })),
@@ -3945,6 +3970,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: None,
                     file: None,
+                    min_confidence: None,
                     threshold: 0.3,
                     root: None,
                 })),
@@ -4058,6 +4084,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: None,
                     file: None,
+                    min_confidence: None,
                     threshold: 0.3,
                     root: None,
                 })),
@@ -4107,6 +4134,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: None,
                     file: None,
+                    min_confidence: None,
                     threshold: 0.3,
                     root: None,
                 })),
@@ -4125,6 +4153,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: None,
                     file: None,
+                    min_confidence: None,
                     threshold: 0.3,
                     root: None,
                 })),
@@ -4177,6 +4206,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: None,
                     file: None,
+                    min_confidence: None,
                     threshold: 0.3,
                     root: None,
                 })),
@@ -4701,6 +4731,7 @@ if (require.main === module) {
                 kind: None,
                 threshold: 0.5,
                 file: None,
+                min_confidence: None,
             }))
             .await;
 
@@ -4786,6 +4817,7 @@ if (require.main === module) {
                 kind: None,
                 threshold: 0.5,
                 file: None,
+                min_confidence: None,
             })),
         )
         .await
@@ -4856,6 +4888,7 @@ if (require.main === module) {
                 kind: None,
                 threshold: 0.5,
                 file: None,
+                min_confidence: None,
             })),
         )
         .await
@@ -4923,6 +4956,7 @@ if (require.main === module) {
                 kind: None,
                 threshold: 0.5,
                 file: None,
+                min_confidence: None,
             })),
         )
         .await

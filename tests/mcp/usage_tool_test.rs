@@ -56,6 +56,7 @@ async fn server_with_activity() -> (tempfile::TempDir, McpServer) {
             kind: None,
             threshold: 0.5,
             file: None,
+            min_confidence: None,
         }))
         .await
         .expect("search");
