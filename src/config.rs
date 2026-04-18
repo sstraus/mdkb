@@ -103,6 +103,33 @@ pub struct SearchConfig {
 
     /// Vector weight in hybrid search.
     pub vector_weight: f64,
+
+    /// Memory-scope search tuning.
+    pub memory: SearchMemoryConfig,
+}
+
+/// Memory-scope search tuning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SearchMemoryConfig {
+    /// RRF weight for the access-count × recency signal.
+    ///
+    /// Ranks memories higher when they have been `get`'d frequently and
+    /// recently. `0.0` disables the signal. The get path is the only writer:
+    /// `search` must NOT bump `access_count`, preserving SELECT idempotency.
+    pub access_recency_weight: f64,
+
+    /// Half-life for recency decay in seconds (default ~30 days).
+    pub recency_half_life_secs: i64,
+}
+
+impl Default for SearchMemoryConfig {
+    fn default() -> Self {
+        Self {
+            access_recency_weight: 0.2,
+            recency_half_life_secs: 30 * 24 * 60 * 60,
+        }
+    }
 }
 
 /// Memory index settings (Phase 6).
@@ -359,6 +386,7 @@ impl Default for SearchConfig {
             rrf_k: DEFAULT_RRF_K,
             bm25_weight: DEFAULT_BM25_WEIGHT,
             vector_weight: DEFAULT_VECTOR_WEIGHT,
+            memory: SearchMemoryConfig::default(),
         }
     }
 }

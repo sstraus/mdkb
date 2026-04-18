@@ -772,7 +772,39 @@ fn get_entries_by_rowids(conn: &Connection, rowids: &[i64]) -> Result<HashMap<i6
     Ok(map)
 }
 
+/// Compute the access-count × recency signal used as the third RRF input
+/// for memory hybrid search.
+///
+/// `log(1 + access_count) * recency_decay(last_accessed)`, where
+/// `recency_decay = 0.5 ^ (age_secs / half_life_secs)` — exponential with the
+/// configured half-life. Returns `0.0` when the entry has never been accessed.
+pub fn access_recency_score(
+    access_count: u64,
+    last_accessed: Option<i64>,
+    now: i64,
+    half_life_secs: i64,
+) -> f64 {
+    if access_count == 0 || half_life_secs <= 0 {
+        return 0.0;
+    }
+    let Some(last) = last_accessed else {
+        return 0.0;
+    };
+    let age = (now - last).max(0) as f64;
+    let decay = 0.5_f64.powf(age / half_life_secs as f64);
+    (1.0 + access_count as f64).ln() * decay
+}
+
 /// Hybrid search for memory entries: BM25 + vector with RRF fusion.
+///
+/// Adds a third RRF signal — `log(1 + access_count) * recency_decay` — so
+/// memories that are frequently `get`'d recently float to the top. The weight
+/// is configurable via `[search.memory] access_recency_weight` (default 0.2);
+/// pass `0.0` to disable.
+///
+/// **Invariant:** only the `get` path feeds this signal. `search_entries_fts`
+/// and this function MUST NOT mutate `access_count` / `last_accessed` —
+/// otherwise search becomes a positive-feedback loop on itself.
 ///
 /// Falls back to BM25-only if no embeddings exist or embedding service is unavailable.
 pub fn search_entries_hybrid(
@@ -780,6 +812,8 @@ pub fn search_entries_hybrid(
     query: &str,
     query_embedding: Option<&[f32]>,
     limit: usize,
+    access_recency_weight: f64,
+    recency_half_life_secs: i64,
 ) -> Result<Vec<MemoryEntry>> {
     use crate::store::{hybrid, vectors};
 
@@ -830,7 +864,6 @@ pub fn search_entries_hybrid(
     // RRF fusion
     let config = hybrid::HybridConfig::default();
     let mut fused = hybrid::rrf_fusion(&bm25_for_rrf, &vector_results, &config);
-    hybrid::normalize_scores(&mut fused);
 
     // Build a lookup map from rowid -> MemoryEntry (from BM25 results)
     let mut entry_map: HashMap<i64, MemoryEntry> = bm25_results.into_iter().collect();
@@ -841,7 +874,43 @@ pub fn search_entries_hybrid(
         .filter(|(rowid, _)| !entry_map.contains_key(rowid))
         .map(|(rowid, _)| *rowid)
         .collect();
-    let mut vector_entries = get_entries_by_rowids(conn, &vector_only_rowids)?;
+    let vector_entries = get_entries_by_rowids(conn, &vector_only_rowids)?;
+
+    // Third RRF signal: access-count × recency (get-path only). Rank every
+    // candidate rowid by its access_recency_score descending, then fold the
+    // reciprocal-rank contribution back into `fused`. Entries with zero signal
+    // are skipped so they don't displace never-accessed memories.
+    if access_recency_weight > 0.0 {
+        let now = Utc::now().timestamp();
+        let mut ar_ranked: Vec<(i64, f64)> = fused
+            .iter()
+            .filter_map(|(rowid, _)| {
+                let entry = entry_map.get(rowid).or_else(|| vector_entries.get(rowid))?;
+                let score = access_recency_score(
+                    entry.access_count,
+                    entry.last_accessed,
+                    now,
+                    recency_half_life_secs,
+                );
+                if score > 0.0 {
+                    Some((*rowid, score))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        ar_ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (rank, (rowid, _)) in ar_ranked.iter().enumerate() {
+            let bonus = access_recency_weight / (config.rrf_k + rank as f64 + 1.0);
+            if let Some(entry) = fused.iter_mut().find(|(id, _)| id == rowid) {
+                entry.1 += bonus;
+            }
+        }
+    }
+
+    hybrid::normalize_scores(&mut fused);
+
+    let mut vector_entries = vector_entries;
 
     // Resolve fused results to MemoryEntry
     // Apply confidence-weighted re-ranking: final = rrf_norm * 0.7 + confidence * 0.3
@@ -2462,7 +2531,7 @@ mod tests {
         add_entry(&conn, &entry).unwrap();
 
         // Search without embedding — should fall back to BM25
-        let results = search_entries_hybrid(&conn, "OAuth PKCE", None, 10).unwrap();
+        let results = search_entries_hybrid(&conn, "OAuth PKCE", None, 10, 0.2, 2_592_000).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "test-entry");
     }
@@ -2548,8 +2617,15 @@ mod tests {
         // Query: "token expiration" — BM25 matches jwt-refresh, vector matches auth-basic+jwt-refresh
         // Query embedding close to auth entries
         let query_emb = test_embedding(0.105);
-        let results =
-            search_entries_hybrid(&conn, "token expiration", Some(&query_emb), 10).unwrap();
+        let results = search_entries_hybrid(
+            &conn,
+            "token expiration",
+            Some(&query_emb),
+            10,
+            0.2,
+            2_592_000,
+        )
+        .unwrap();
 
         // jwt-refresh should be found (has both BM25 keyword match and vector similarity)
         let result_ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
@@ -2596,8 +2672,15 @@ mod tests {
         }
 
         let query_emb = test_embedding(0.5);
-        let results =
-            search_entries_hybrid(&conn, "searchable entry", Some(&query_emb), 3).unwrap();
+        let results = search_entries_hybrid(
+            &conn,
+            "searchable entry",
+            Some(&query_emb),
+            3,
+            0.2,
+            2_592_000,
+        )
+        .unwrap();
         assert_eq!(results.len(), 3, "Should respect limit of 3");
     }
 
@@ -3142,5 +3225,175 @@ mod tests {
         add_entry(&conn, &entry).unwrap();
 
         assert!(correct_entry(&conn, "test", None).is_err());
+    }
+
+    #[test]
+    fn test_search_entries_fts_does_not_bump_access_count() {
+        // Invariant: search MUST NOT feed its own ranking signal.
+        // Only the get path mutates access_count / last_accessed.
+        let conn = setup_db();
+        let entry = MemoryEntry {
+            id: "invariant".to_string(),
+            title: "Invariant Test".to_string(),
+            content: "searchable invariant content".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: 1000,
+            updated_at: 1000,
+            superseded_by: None,
+            access_count: 7,
+            last_accessed: Some(1000),
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        for _ in 0..5 {
+            let hits = search_entries(&conn, "invariant", 10).unwrap();
+            assert_eq!(hits.len(), 1);
+        }
+
+        let after = get_entry_without_tracking(&conn, "invariant")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.access_count, 7,
+            "search_entries_fts must not bump access_count"
+        );
+        assert_eq!(
+            after.last_accessed,
+            Some(1000),
+            "search_entries_fts must not touch last_accessed"
+        );
+    }
+
+    #[test]
+    fn test_hybrid_search_boosts_frequent_recent_access() {
+        // Two entries with identical BM25 signal; the one with higher
+        // access_count and recent last_accessed must rank first when the
+        // access_recency_weight is positive.
+        let conn = setup_db_with_vectors();
+        let now = Utc::now().timestamp();
+
+        let hot = MemoryEntry {
+            id: "hot".to_string(),
+            title: "Hot popular topic".to_string(),
+            content: "popular topic about shared-content signal".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now - 86_400,
+            updated_at: now - 86_400,
+            superseded_by: None,
+            access_count: 25,
+            last_accessed: Some(now - 60),
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        let cold = MemoryEntry {
+            id: "cold".to_string(),
+            title: "Cold popular topic".to_string(),
+            content: "popular topic about shared-content signal".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: now - 86_400,
+            updated_at: now - 86_400,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        add_entry(&conn, &hot).unwrap();
+        add_entry(&conn, &cold).unwrap();
+
+        // Weight = 0 → ordering is BM25 ties; both present, order not guaranteed
+        // but we only care that the boost changes ranking when enabled.
+        let with_boost =
+            search_entries_hybrid(&conn, "popular topic", None, 10, 0.5, 2_592_000).unwrap();
+        assert_eq!(with_boost.len(), 2);
+        assert_eq!(
+            with_boost[0].id, "hot",
+            "hot entry must rank first under access_recency boost"
+        );
+
+        // Invariant: hybrid search must not mutate access_count either.
+        let after = get_entry_without_tracking(&conn, "hot").unwrap().unwrap();
+        assert_eq!(after.access_count, 25);
+    }
+
+    #[test]
+    fn test_hybrid_search_ranking_is_deterministic() {
+        let conn = setup_db_with_vectors();
+        let now = Utc::now().timestamp();
+
+        for i in 0..5 {
+            let entry = MemoryEntry {
+                id: format!("e{i}"),
+                title: format!("Entry {i}"),
+                content: format!("deterministic shared content {i}"),
+                entry_type: EntryType::Topic,
+                tags: vec![],
+                status: EntryStatus::Active,
+                created_at: now,
+                updated_at: now,
+                superseded_by: None,
+                access_count: i as u64,
+                last_accessed: if i == 0 { None } else { Some(now - 30) },
+                source_path: None,
+                confirmations: 0,
+                last_confirmed_at: None,
+                source_type: SourceType::UserStatement,
+                expires_at: None,
+                due_at: None,
+            };
+            add_entry(&conn, &entry).unwrap();
+        }
+
+        let run_a = search_entries_hybrid(&conn, "deterministic", None, 10, 0.3, 2_592_000)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>();
+        let run_b = search_entries_hybrid(&conn, "deterministic", None, 10, 0.3, 2_592_000)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect::<Vec<_>>();
+        assert_eq!(run_a, run_b, "ranking must be deterministic across calls");
+    }
+
+    #[test]
+    fn test_access_recency_score_zero_when_never_accessed() {
+        assert_eq!(access_recency_score(0, None, 1_000, 2_592_000), 0.0);
+        assert_eq!(access_recency_score(5, None, 1_000, 2_592_000), 0.0);
+        assert_eq!(access_recency_score(0, Some(900), 1_000, 2_592_000), 0.0);
+    }
+
+    #[test]
+    fn test_access_recency_score_decays_with_age() {
+        let now = 1_000_000;
+        let half_life = 1_000; // 1000-second half-life
+        let fresh = access_recency_score(10, Some(now), now, half_life);
+        let one_hl = access_recency_score(10, Some(now - 1_000), now, half_life);
+        let two_hl = access_recency_score(10, Some(now - 2_000), now, half_life);
+        assert!(fresh > one_hl);
+        assert!(one_hl > two_hl);
+        // 1 half-life → ~ half of fresh
+        assert!((one_hl / fresh - 0.5).abs() < 1e-6);
     }
 }

@@ -405,6 +405,8 @@ impl McpServer {
                         &params.query,
                         query_embedding.as_deref(),
                         limit,
+                        self.full_config.search.memory.access_recency_weight,
+                        self.full_config.search.memory.recency_half_life_secs,
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed on {}: {e}", repo_tag)))?;
                     let entries = apply_min_confidence(entries, params.min_confidence);
@@ -1085,6 +1087,8 @@ impl McpServer {
                         &params.query,
                         query_embedding.as_deref(),
                         limit,
+                        self.full_config.search.memory.access_recency_weight,
+                        self.full_config.search.memory.recency_half_life_secs,
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
                     let entries = apply_min_confidence(entries, params.min_confidence);
@@ -1120,6 +1124,8 @@ impl McpServer {
                         &params.query,
                         query_embedding.as_deref(),
                         limit,
+                        self.full_config.search.memory.access_recency_weight,
+                        self.full_config.search.memory.recency_half_life_secs,
                     )
                     .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
                     let mem_entries = apply_min_confidence(mem_entries, params.min_confidence);
@@ -1277,7 +1283,7 @@ impl McpServer {
     #[tool(
         description = "Retrieve a document by ID, path, or memory slug, with optional line range."
     )]
-    async fn get(
+    pub async fn get(
         &self,
         Parameters(params): Parameters<GetParams>,
     ) -> Result<CallToolResult, McpError> {

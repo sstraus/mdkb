@@ -2073,3 +2073,121 @@ async fn test_memory_confirm_increments_and_refutes_floor_at_zero() {
         after_refute.confirmations
     );
 }
+
+#[tokio::test]
+async fn test_memory_search_repeated_get_ranks_above_untouched() {
+    // End-to-end rank re-scoring via the get path:
+    // 1. Seed two memories with identical BM25 content.
+    // 2. Call `get` on A three times — only the get path bumps access_count.
+    // 3. Subsequent search(scope="memory") must rank A above B.
+    // 4. Invariant: the search call itself must NOT bump access_count.
+    use mdkb::mcp::server::McpServer;
+    use mdkb::mcp::tools::{GetParams, SearchParams};
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let env = TestEnvironment::new();
+    let now = chrono::Utc::now().timestamp();
+
+    let mut a = memory::MemoryEntry {
+        id: "rank-a".to_string(),
+        title: "Ranking A".to_string(),
+        content: "identical ranking signal content".to_string(),
+        entry_type: memory::EntryType::Topic,
+        tags: vec![],
+        status: memory::EntryStatus::Active,
+        created_at: now - 86_400,
+        updated_at: now - 86_400,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+        source_path: None,
+        confirmations: 0,
+        last_confirmed_at: None,
+        source_type: memory::SourceType::UserStatement,
+        expires_at: None,
+        due_at: None,
+    };
+    let mut b = a.clone();
+    b.id = "rank-b".to_string();
+    b.title = "Ranking B".to_string();
+
+    // Persist without touching access_count.
+    memory::add_entry(&env.ctx.conn, &a).expect("add a");
+    memory::add_entry(&env.ctx.conn, &b).expect("add b");
+    a.access_count = 0;
+    b.access_count = 0;
+
+    let server = McpServer::new(env.root.clone());
+
+    // Bump A via the get path — the only legitimate writer of the signal.
+    for _ in 0..3 {
+        server
+            .get(Parameters(GetParams {
+                id: "rank-a".to_string(),
+                root: None,
+                lines: None,
+                format: None,
+            }))
+            .await
+            .expect("get rank-a");
+    }
+
+    let a_after_get = memory::get_entry_without_tracking(&env.ctx.conn, "rank-a")
+        .expect("fetch a")
+        .expect("a exists");
+    let b_after_get = memory::get_entry_without_tracking(&env.ctx.conn, "rank-b")
+        .expect("fetch b")
+        .expect("b exists");
+    assert_eq!(a_after_get.access_count, 3, "get must bump A");
+    assert_eq!(b_after_get.access_count, 0, "B must stay untouched");
+
+    // Search via the MCP layer with scope="memory".
+    let search_result = server
+        .search(Parameters(SearchParams {
+            query: "ranking signal".to_string(),
+            root: None,
+            limit: 10,
+            collection: None,
+            include_superseded: false,
+            scope: Some("memory".to_string()),
+            kind: None,
+            threshold: 0.5,
+            file: None,
+            min_confidence: None,
+        }))
+        .await
+        .expect("search scope=memory");
+
+    let text = search_result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            rmcp::model::RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let pos_a = text.find("rank-a").expect("search must mention rank-a");
+    let pos_b = text.find("rank-b").expect("search must mention rank-b");
+    assert!(
+        pos_a < pos_b,
+        "rank-a (access_count=3) must appear before rank-b (untouched) — got A@{pos_a} B@{pos_b}\ntext:\n{text}"
+    );
+
+    // Invariant: search must not mutate access_count.
+    let a_after_search = memory::get_entry_without_tracking(&env.ctx.conn, "rank-a")
+        .expect("fetch a after search")
+        .expect("a exists");
+    let b_after_search = memory::get_entry_without_tracking(&env.ctx.conn, "rank-b")
+        .expect("fetch b after search")
+        .expect("b exists");
+    assert_eq!(
+        a_after_search.access_count, 3,
+        "search must not bump access_count (A)"
+    );
+    assert_eq!(
+        b_after_search.access_count, 0,
+        "search must not bump access_count (B)"
+    );
+}
