@@ -569,6 +569,12 @@ pub fn handle_mget(
 pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResult> {
     let root = root.as_ref();
 
+    // Drain the PostToolUse hook queue (best-effort: logs on failure but never
+    // aborts the update). Currently the differential reindex picks up mtime
+    // changes on its own; consuming the queue here clears stale entries and
+    // logs the observed paths for diagnostics.
+    drain_reindex_queue(root);
+
     // Detect and register convention-based collections before processing
     apply_conventions(ctx, root)?;
 
@@ -581,6 +587,35 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
         Ok(())
     })?;
     Ok(result)
+}
+
+/// Drain `.mdkb/reindex-queue.jsonl` populated by the PostToolUse hook.
+/// Best-effort: missing file is silent, parse/IO errors are logged.
+fn drain_reindex_queue(root: &Path) {
+    let queue_path = root.join(".mdkb").join("reindex-queue.jsonl");
+    if !queue_path.exists() {
+        return;
+    }
+
+    match std::fs::read_to_string(&queue_path) {
+        Ok(content) => {
+            let count = content.lines().filter(|l| !l.trim().is_empty()).count();
+            if count > 0 {
+                tracing::info!("Drained {count} entries from reindex queue");
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to read reindex queue: {e}");
+            return;
+        }
+    }
+
+    if let Err(e) = std::fs::remove_file(&queue_path) {
+        tracing::warn!(
+            "Failed to clear reindex queue {}: {e}",
+            queue_path.display()
+        );
+    }
 }
 
 /// Detect and register convention-based collections.

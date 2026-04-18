@@ -11,3 +11,6 @@ mod session_start_test;
 
 #[path = "hooks/user_prompt_submit_test.rs"]
 mod user_prompt_submit_test;
+
+#[path = "hooks/post_tool_use_test.rs"]
+mod post_tool_use_test;

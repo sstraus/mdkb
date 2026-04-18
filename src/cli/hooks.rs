@@ -303,6 +303,75 @@ fn handle_user_prompt_submit(event: Value) -> Value {
     })
 }
 
-fn handle_post_tool_use(_event: Value) -> Value {
+/// Tool names whose output may modify on-disk files we want to reindex.
+const REINDEX_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit", "MultiEdit"];
+
+/// Extract a file path from a tool_input blob. Handles the common cases:
+/// - `file_path` (Edit/Write/MultiEdit)
+/// - `notebook_path` (NotebookEdit)
+fn tool_input_path(tool_input: &Value) -> Option<String> {
+    for key in &["file_path", "notebook_path"] {
+        if let Some(s) = tool_input.get(*key).and_then(|v| v.as_str()) {
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn handle_post_tool_use(event: Value) -> Value {
+    let cwd: PathBuf = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => return json!({}),
+    };
+
+    if mdkbignore_hooks_present(&cwd) {
+        return json!({});
+    }
+
+    let mdkb_dir = cwd.join(".mdkb");
+    if !mdkb_dir.is_dir() {
+        return json!({});
+    }
+
+    let cfg = hooks_config(&cwd);
+    if !cfg.post_tool_use_enabled {
+        return json!({});
+    }
+
+    let tool_name = match event.get("tool_name").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return json!({}),
+    };
+    if !REINDEX_TOOLS.contains(&tool_name) {
+        return json!({});
+    }
+
+    let path = match event.get("tool_input").and_then(tool_input_path) {
+        Some(p) => p,
+        None => return json!({}),
+    };
+
+    let queue_path = mdkb_dir.join("reindex-queue.jsonl");
+    let line = json!({
+        "path": path,
+        "tool": tool_name,
+        "at": chrono::Utc::now().timestamp(),
+    });
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&queue_path)
+    {
+        let _ = writeln!(f, "{}", line);
+    } else {
+        tracing::warn!(
+            "post-tool-use hook: failed to open reindex queue {}",
+            queue_path.display()
+        );
+    }
+
     json!({})
 }
