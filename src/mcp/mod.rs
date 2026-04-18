@@ -6,6 +6,7 @@
 //! - `mdkb_status` - Index status
 //! - `mdkb_update` - Trigger reindex
 
+pub mod dispatch;
 pub mod server;
 pub mod tools;
 

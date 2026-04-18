@@ -29,7 +29,7 @@ use crate::domain::SearchResult;
 use crate::metrics::{
     UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
 };
-use crate::store::{collections, documents, evolution, memory, search, stats};
+use crate::store::{collections, documents, evolution, memory, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
@@ -1487,64 +1487,7 @@ impl McpServer {
         Parameters(_): Parameters<EmptyObject>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(None).await?;
-
-        let mut output = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let index_status = search::get_status(&ctx.conn)
-                .map_err(|e| mcp_error(format!("Failed to get status: {}", e)))?;
-
-            let mut output = format!(
-                "## Index Status\n\nDocuments: {}\nStale: {}\nDB Size: {} bytes\n",
-                index_status.documents, index_status.stale_documents, index_status.db_size_bytes
-            );
-
-            // Collection listing with source tags
-            let coll_list = collections::list_collections(&ctx.conn)
-                .map_err(|e| mcp_error(format!("Failed to list collections: {}", e)))?;
-
-            output.push_str(&format!("\n## Collections ({})\n\n", coll_list.len()));
-            if coll_list.is_empty() {
-                output.push_str("No collections configured. Markdown files are indexed via collections (use CLI: `mdkb collection add <name> <path>`).\n");
-            } else {
-                for coll in &coll_list {
-                    let doc_count =
-                        collections::get_collection_document_count(&ctx.conn, &coll.name)
-                            .unwrap_or(0);
-                    let source_tag = if coll.source == "convention" {
-                        "[convention]"
-                    } else {
-                        "[manual]"
-                    };
-                    output.push_str(&format!(
-                        "- {} {} ({}): {} docs, pattern: {}\n",
-                        coll.name, source_tag, coll.path, doc_count, coll.pattern
-                    ));
-                }
-            }
-
-            output
-        }; // ctx_guard dropped here
-
-        // Always show code index stats (initialize if needed)
-        if let Ok(idx_guard) = Self::acquire_handle_code_index(&handle).await {
-            if let Some(facade) = idx_guard.as_ref() {
-                let symbols = facade.symbol_count();
-                let files = facade.file_count();
-                let relationships = facade.relationship_count();
-                output.push_str(&format!(
-                    "\n## Code Index\n\nSymbols: {}\nFiles: {}\nRelationships: {}\n",
-                    symbols, files, relationships
-                ));
-                if symbols == 0 {
-                    output
-                        .push_str("\nNo symbols indexed yet. Run `update` to index source code.\n");
-                }
-            }
-        }
+        let output = super::dispatch::status_impl(&handle).await?;
 
         let tokens = count_tokens(&output);
         self.metrics.record_status(tokens);
