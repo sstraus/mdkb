@@ -356,7 +356,7 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
 /// Increments confirmations counter, updates last_confirmed_at.
 /// Auto-restores archived entries to active (strong relevance signal).
 /// Returns error if entry is superseded.
-pub fn confirm_entry(conn: &Connection, id: &str) -> Result<String> {
+pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> {
     let entry = get_entry_without_tracking(conn, id)?
         .ok_or_else(|| ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")))?;
 
@@ -368,24 +368,24 @@ pub fn confirm_entry(conn: &Connection, id: &str) -> Result<String> {
     }
 
     let now = Utc::now().timestamp();
-    let new_status = if entry.status == EntryStatus::Archived {
+    let new_status = if entry.status == EntryStatus::Archived && delta > 0 {
         "active".to_string()
     } else {
         entry.status.to_string()
     };
 
     conn.execute(
-        "UPDATE memory_entries SET confirmations = confirmations + 1, last_confirmed_at = ?1, status = ?2, updated_at = ?1 WHERE id = ?3",
-        params![now, new_status, id],
+        "UPDATE memory_entries SET confirmations = MAX(0, CAST(confirmations AS INTEGER) + ?1), last_confirmed_at = ?2, status = ?3, updated_at = ?2 WHERE id = ?4",
+        params![delta, now, new_status, id],
     )?;
 
-    if entry.status == EntryStatus::Archived {
+    let new_count = (entry.confirmations as i64 + delta as i64).max(0) as u32;
+    if entry.status == EntryStatus::Archived && delta > 0 {
         Ok(format!("Confirmed and restored to active: {id}"))
+    } else if delta >= 0 {
+        Ok(format!("Confirmed: {id} ({new_count} confirmations)"))
     } else {
-        Ok(format!(
-            "Confirmed: {id} ({} confirmations)",
-            entry.confirmations + 1
-        ))
+        Ok(format!("Refuted: {id} ({new_count} confirmations)"))
     }
 }
 
@@ -2990,7 +2990,7 @@ mod tests {
         );
         add_entry(&conn, &entry).unwrap();
 
-        let result = confirm_entry(&conn, "test").unwrap();
+        let result = confirm_entry(&conn, "test", 1).unwrap();
         assert!(result.contains("Confirmed"), "{result}");
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
@@ -3011,7 +3011,7 @@ mod tests {
         entry.status = EntryStatus::Archived;
         add_entry(&conn, &entry).unwrap();
 
-        let result = confirm_entry(&conn, "test").unwrap();
+        let result = confirm_entry(&conn, "test", 1).unwrap();
         assert!(result.contains("restored"), "{result}");
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
@@ -3031,7 +3031,7 @@ mod tests {
         entry.status = EntryStatus::Superseded;
         add_entry(&conn, &entry).unwrap();
 
-        let result = confirm_entry(&conn, "test");
+        let result = confirm_entry(&conn, "test", 1);
         assert!(result.is_err(), "Should block confirm on superseded");
     }
 

@@ -169,6 +169,20 @@ pub struct MemoryDeleteParams {
     pub root: Option<String>,
 }
 
+/// Parameters for the memory_confirm tool.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct MemoryConfirmParams {
+    /// Memory entry ID.
+    pub id: String,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
+
+    /// Outcome signal: "confirmed" increments confirmations; "refuted" decrements (floor 0).
+    pub outcome: String,
+}
+
 /// Parameters for the memory_list tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct MemoryListParams {

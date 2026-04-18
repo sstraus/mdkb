@@ -1996,3 +1996,80 @@ fn test_experiment_cancel() {
     let running = handle_experiment_list(&ctx, true).expect("list running");
     assert_eq!(running.len(), 0);
 }
+
+#[tokio::test]
+async fn test_memory_confirm_increments_and_refutes_floor_at_zero() {
+    use mdkb::mcp::server::McpServer;
+    use mdkb::mcp::tools::MemoryConfirmParams;
+    use rmcp::handler::server::wrapper::Parameters;
+
+    let env = TestEnvironment::new();
+    let now = chrono::Utc::now().timestamp();
+
+    let entry = memory::MemoryEntry {
+        id: "confirm-target".to_string(),
+        title: "Entry to confirm/refute".to_string(),
+        content: "Bayesian signal target.".to_string(),
+        entry_type: memory::EntryType::Decision,
+        tags: vec![],
+        status: memory::EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 0,
+        last_accessed: None,
+        source_path: None,
+        confirmations: 0,
+        last_confirmed_at: None,
+        source_type: memory::SourceType::UserStatement,
+        expires_at: None,
+        due_at: None,
+    };
+    memory::add_entry(&env.ctx.conn, &entry).expect("add entry");
+
+    let server = McpServer::new(env.root.clone());
+
+    for _ in 0..3 {
+        server
+            .memory_confirm(Parameters(MemoryConfirmParams {
+                id: "confirm-target".to_string(),
+                root: None,
+                outcome: "confirmed".to_string(),
+            }))
+            .await
+            .expect("memory_confirm confirmed");
+    }
+
+    let after_confirm = memory::get_entry_without_tracking(&env.ctx.conn, "confirm-target")
+        .expect("get after confirm")
+        .expect("entry present");
+    assert_eq!(
+        after_confirm.confirmations, 3,
+        "3x confirmed must yield confirmations=3"
+    );
+    assert!(
+        after_confirm.last_confirmed_at.is_some(),
+        "last_confirmed_at must be set"
+    );
+
+    // 5x refuted when confirmations=3 → floor at 0, never negative.
+    for _ in 0..5 {
+        server
+            .memory_confirm(Parameters(MemoryConfirmParams {
+                id: "confirm-target".to_string(),
+                root: None,
+                outcome: "refuted".to_string(),
+            }))
+            .await
+            .expect("memory_confirm refuted");
+    }
+
+    let after_refute = memory::get_entry_without_tracking(&env.ctx.conn, "confirm-target")
+        .expect("get after refute")
+        .expect("entry present");
+    assert_eq!(
+        after_refute.confirmations, 0,
+        "refute must floor confirmations at 0, got {}",
+        after_refute.confirmations
+    );
+}

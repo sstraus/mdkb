@@ -33,8 +33,8 @@ use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    CodeGraphParams, GetParams, MemoryDeleteParams, MemoryListParams, MemoryWriteBatchParams,
-    MemoryWriteParams, SearchParams, UsageParams,
+    CodeGraphParams, GetParams, MemoryConfirmParams, MemoryDeleteParams, MemoryListParams,
+    MemoryWriteBatchParams, MemoryWriteParams, SearchParams, UsageParams,
 };
 
 /// Create an MCP error from a message.
@@ -1733,6 +1733,45 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
+    /// Record a Bayesian confirmation signal for a memory entry.
+    #[tool(
+        description = "Record outcome=\"confirmed\"|\"refuted\" against a memory entry. Atomic: increments or decrements confirmations (floor 0) and advances last_confirmed_at."
+    )]
+    pub async fn memory_confirm(
+        &self,
+        Parameters(params): Parameters<MemoryConfirmParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let delta: i32 = match params.outcome.as_str() {
+            "confirmed" => 1,
+            "refuted" => -1,
+            other => {
+                return Err(mcp_error(format!(
+                    "Invalid outcome '{other}'. Expected \"confirmed\" or \"refuted\"."
+                )));
+            }
+        };
+
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
+
+        let (output, tokens) = {
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+            let output = memory::confirm_entry(&ctx.conn, &params.id, delta)
+                .map_err(|e| mcp_error(format!("Failed to confirm memory entry: {}", e)))?;
+            let tokens = count_tokens(&output);
+            (output, tokens)
+        };
+
+        self.record_persistent_call("memory_confirm", tokens, 1, false)
+            .await;
+        tracing::debug!("mdkb_memory_confirm: {}", output);
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
     /// List memory entries with configurable sort order.
     #[tool(description = "List memory entries sorted by recency, popularity, or creation date.")]
     async fn memory_list(
@@ -2565,6 +2604,7 @@ const BASE_INSTRUCTIONS: &str = "\
 
 - `search(query, scope=\"memory\")` — check before writing duplicates.
 - `memory_write` / `memory_write_batch` — persist after solving problems.
+- `memory_confirm(id, outcome=\"confirmed\"|\"refuted\")` — Bayesian signal: atomic confirmations +/-1 (floor 0) + last_confirmed_at. Use instead of memory_write when only adjusting belief.
 - `memory_delete` — remove stale entries.
 - `usage` — audit token economy when output feels expensive.
 
