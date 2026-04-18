@@ -36,6 +36,9 @@ pub struct Config {
 
     /// Claude Code / Codex lifecycle hooks.
     pub hooks: HooksConfig,
+
+    /// Database maintenance.
+    pub db: DbConfig,
 }
 
 /// Indexing settings.
@@ -262,6 +265,23 @@ impl Default for Config {
             conventions: ConventionsConfig::default(),
             code: CodeConfig::default(),
             hooks: HooksConfig::default(),
+            db: DbConfig::default(),
+        }
+    }
+}
+
+/// Database maintenance settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DbConfig {
+    /// Trigger `PRAGMA optimize` every N persistent tool calls. `0` disables runtime optimize.
+    pub optimize_interval_calls: u64,
+}
+
+impl Default for DbConfig {
+    fn default() -> Self {
+        Self {
+            optimize_interval_calls: 200,
         }
     }
 }

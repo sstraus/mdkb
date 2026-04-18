@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 use rmcp::ServiceExt;
 use rmcp::handler::server::ServerHandler;
@@ -223,6 +223,8 @@ pub struct McpServer {
     registry: Option<Arc<RepoRegistry>>,
     /// Cached standalone handle (wraps self's Arcs). None in global mode.
     standalone_handle: Option<Arc<RepoHandle>>,
+    /// Persistent tool call counter — drives drift-gated `PRAGMA optimize`.
+    persistent_call_count: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -271,6 +273,7 @@ impl McpServer {
             doc_reindex_active,
             registry: None,
             standalone_handle: Some(standalone_handle),
+            persistent_call_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -310,6 +313,7 @@ impl McpServer {
             doc_reindex_active,
             registry: None,
             standalone_handle: Some(standalone_handle),
+            persistent_call_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -331,6 +335,7 @@ impl McpServer {
             doc_reindex_active: Arc::new(AtomicBool::new(false)),
             registry: Some(registry),
             standalone_handle: None, // global mode uses registry instead
+            persistent_call_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1010,6 +1015,14 @@ impl McpServer {
                 stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated)
             {
                 tracing::warn!("Failed to record call stats: {}", e);
+            }
+
+            let call_count = self.persistent_call_count.fetch_add(1, Ordering::Relaxed) + 1;
+            let interval = self.full_config.db.optimize_interval_calls;
+            if crate::store::maintenance::should_optimize(call_count, interval) {
+                if let Err(e) = crate::store::maintenance::run_optimize(&ctx.conn) {
+                    tracing::warn!("PRAGMA optimize failed: {}", e);
+                }
             }
         }
     }

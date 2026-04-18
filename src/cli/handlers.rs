@@ -11,6 +11,7 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::store::collections;
 use crate::store::documents;
 use crate::store::hybrid;
+use crate::store::maintenance;
 use crate::store::schema;
 use crate::store::search;
 use crate::store::stats;
@@ -102,6 +103,7 @@ impl Context {
         // exist even on databases created by older versions.
         schema::init_schema(&conn)?;
         vectors::init_vector_schema(&conn)?;
+        maintenance::run_startup_vacuum_if_needed(&conn)?;
 
         Ok(Self {
             conn,
@@ -140,6 +142,7 @@ impl Context {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::init_schema(&conn)?;
         vectors::init_vector_schema(&conn)?;
+        maintenance::run_startup_vacuum_if_needed(&conn)?;
 
         Ok(Self {
             conn,

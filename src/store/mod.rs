@@ -5,6 +5,7 @@ pub mod collections;
 pub mod documents;
 pub mod evolution;
 pub mod hybrid;
+pub mod maintenance;
 pub mod memory;
 pub mod schema;
 pub mod search;
