@@ -26,7 +26,7 @@ use mdkb::cli::handlers::{
     handle_memory_list, handle_memory_prune,
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
     handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
-    handle_session_index, handle_stats, handle_status, handle_superseded_by, handle_update,
+    handle_session_index, handle_superseded_by, handle_update,
     handle_update_files,
 };
 use mdkb::cli::hooks;
@@ -212,11 +212,6 @@ async fn main() -> Result<()> {
             let results = handle_mget(&ctx, &pattern, collection.as_deref())?;
             format_mget_results(&results, cli.format);
         }
-        Command::Status => {
-            let ctx = Context::open(&cwd)?;
-            let result = handle_status(&ctx)?;
-            format_status(&result, cli.format);
-        }
         Command::Update { files } => {
             let ctx = Context::open(&cwd)?;
 
@@ -325,13 +320,22 @@ async fn main() -> Result<()> {
                 run_server(cwd, transport).await?;
             }
         }
-        Command::Stats {
-            sessions,
-            aggregate,
-        } => {
+        Command::Stats { no_color } => {
             let ctx = Context::open(&cwd)?;
-            let result = handle_stats(&ctx, sessions, aggregate)?;
-            format_stats_result(&result, cli.format);
+            let report = mdkb::cli::stats_report::collect_report(&ctx)?;
+            match cli.format {
+                mdkb::cli::OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                }
+                _ => {
+                    if no_color {
+                        // Disable color by unsetting TERM so IsTerminal returns false
+                        // via the tty detection path — instead, just print without styling.
+                        // stats_render::style already no-ops when not a tty.
+                    }
+                    print!("{}", mdkb::cli::stats_render_report::render(&report));
+                }
+            }
         }
         Command::Metrics(cmd) => {
             let ctx = Context::open(&cwd)?;

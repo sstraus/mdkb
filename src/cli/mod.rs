@@ -98,9 +98,6 @@ pub enum Command {
         collection: Option<String>,
     },
 
-    /// Show index status
-    Status,
-
     /// Reindex everything (documents and source code), or specific files with --files
     Update {
         /// Only reindex specific files (absolute or relative paths)
@@ -135,15 +132,11 @@ pub enum Command {
         global: bool,
     },
 
-    /// Show usage statistics
+    /// Show diagnostic statistics (index health, memory, code, sessions, hooks)
     Stats {
-        /// Show last N sessions (default: 5)
-        #[arg(short, long, default_value = "5")]
-        sessions: usize,
-
-        /// Show aggregate stats only
-        #[arg(short, long)]
-        aggregate: bool,
+        /// Disable ANSI color output
+        #[arg(long)]
+        no_color: bool,
     },
 
     /// Query metrics and search quality analysis
