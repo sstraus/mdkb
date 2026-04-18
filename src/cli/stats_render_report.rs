@@ -5,7 +5,7 @@
 
 use std::fmt::Write as FmtWrite;
 
-use crate::cli::stats_render::{bar, frame, sparkline};
+use crate::cli::stats_render::{bar, frame};
 use crate::cli::stats_report::{
     CodeSummary, CollectionsSummary, HeaderInfo, HooksSummary, IndexHealth, MemorySummary,
     SessionsSummary, StatsReport,
@@ -15,8 +15,9 @@ const WIDTH: usize = 72;
 
 /// Render a full `StatsReport` to a UTF-8 string.
 ///
-/// Color is only emitted when stdout is a tty (handled by `stats_render::style`).
-pub fn render(report: &StatsReport) -> String {
+/// Pass `color = true` to emit ANSI escape sequences; callers decide based
+/// on tty detection and the `--no-color` flag.
+pub fn render(report: &StatsReport, _color: bool) -> String {
     let mut out = String::with_capacity(4096);
     render_header(&mut out, &report.header);
     render_index(&mut out, &report.index);
@@ -140,13 +141,9 @@ fn render_sessions(out: &mut String, s: &SessionsSummary) {
 }
 
 fn render_hooks(out: &mut String, h: &HooksSummary) {
-    let spark = {
-        // Placeholder sparkline — actual per-hour data not tracked yet.
-        sparkline(&[0u32; 24])
-    };
     let body = format!(
-        "  slow events (7d)  {:>4}\n  reindex pending   {:>4}\n  call/h (24h) {}",
-        h.slow_events_7d, h.reindex_queue_pending, spark
+        "  slow events (7d)  {:>4}\n  reindex pending   {:>4}",
+        h.slow_events_7d, h.reindex_queue_pending
     );
     out.push_str(&frame("Hooks", &body, WIDTH));
 }
@@ -222,7 +219,7 @@ mod tests {
 
     #[test]
     fn render_contains_all_section_titles() {
-        let out = render(&fixture_report());
+        let out = render(&fixture_report(), false);
         for title in &["mdkb", "Index Health", "Collections", "Memory", "Code Index", "Sessions", "Hooks"] {
             assert!(out.contains(title), "missing section '{title}'");
         }
@@ -230,14 +227,14 @@ mod tests {
 
     #[test]
     fn render_header_shows_repo_and_version() {
-        let out = render(&fixture_report());
+        let out = render(&fixture_report(), false);
         assert!(out.contains("my-project"));
         assert!(out.contains("2.0.0"));
     }
 
     #[test]
     fn render_memory_shows_entry_types() {
-        let out = render(&fixture_report());
+        let out = render(&fixture_report(), false);
         assert!(out.contains("topic"));
         assert!(out.contains("decision"));
         assert!(out.contains("reminders DUE"));
@@ -245,30 +242,30 @@ mod tests {
 
     #[test]
     fn render_code_shows_languages() {
-        let out = render(&fixture_report());
+        let out = render(&fixture_report(), false);
         assert!(out.contains("rust"));
         assert!(out.contains("typescript"));
     }
 
     #[test]
     fn render_sessions_shows_totals() {
-        let out = render(&fixture_report());
-        assert!(out.contains("5"));   // sessions
+        let out = render(&fixture_report(), false);
+        assert!(out.contains('5'));   // sessions
         assert!(out.contains("200")); // calls
         assert!(out.contains("search"));
     }
 
     #[test]
     fn render_hooks_shows_slow_count() {
-        let out = render(&fixture_report());
-        assert!(out.contains("3")); // slow_events_7d
+        let out = render(&fixture_report(), false);
+        assert!(out.contains('3')); // slow_events_7d
     }
 
     #[test]
     fn render_empty_collections_shows_none() {
         let mut r = fixture_report();
         r.collections.collections.clear();
-        let out = render(&r);
+        let out = render(&r, false);
         assert!(out.contains("(none)"));
     }
 
@@ -277,13 +274,13 @@ mod tests {
         let mut r = fixture_report();
         r.code.symbols_by_language.clear();
         r.code.top_files_by_tokens.clear();
-        let out = render(&r);
+        let out = render(&r, false);
         assert!(out.contains("(not indexed)"));
     }
 
     #[test]
     fn render_lines_all_fit_width() {
-        let out = render(&fixture_report());
+        let out = render(&fixture_report(), false);
         for line in out.lines() {
             let len = line.chars().count();
             assert!(

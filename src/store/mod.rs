@@ -7,6 +7,7 @@ pub mod evolution;
 pub mod hybrid;
 pub mod maintenance;
 pub mod memory;
+pub mod memory_file;
 pub mod schema;
 pub mod search;
 pub mod stats;

@@ -9,6 +9,7 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::cli::handlers::Context;
+use crate::domain::IndexStatus;
 use crate::error::Result;
 use crate::store::{collections, memory, search, stats};
 
@@ -111,10 +112,11 @@ pub struct HooksSummary {
 pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
     let mdkb_dir = ctx.db_path.parent().expect("db_path has parent");
     let root = mdkb_dir.parent().expect("mdkb_dir has parent");
+    let status = search::get_status(&ctx.conn)?;
 
     Ok(StatsReport {
-        header: collect_header(ctx, root)?,
-        index: collect_index_health(ctx)?,
+        header: collect_header(ctx, root, &status),
+        index: collect_index_health(ctx, &status)?,
         collections: collect_collections(ctx)?,
         memory: collect_memory(ctx)?,
         code: collect_code(mdkb_dir),
@@ -123,7 +125,7 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
     })
 }
 
-fn collect_header(ctx: &Context, root: &Path) -> Result<HeaderInfo> {
+fn collect_header(ctx: &Context, root: &Path, status: &IndexStatus) -> HeaderInfo {
     let repo = root
         .file_name()
         .and_then(|s| s.to_str())
@@ -131,13 +133,11 @@ fn collect_header(ctx: &Context, root: &Path) -> Result<HeaderInfo> {
         .to_string();
     let version = env!("CARGO_PKG_VERSION").to_string();
     let db_size_bytes = ctx.db_path.metadata().map(|m| m.len()).unwrap_or(0);
-    let index = search::get_status(&ctx.conn)?;
-    Ok(HeaderInfo { repo, version, db_size_bytes, last_updated: index.last_updated })
+    HeaderInfo { repo, version, db_size_bytes, last_updated: status.last_updated }
 }
 
-fn collect_index_health(ctx: &Context) -> Result<IndexHealth> {
-    let index = search::get_status(&ctx.conn)?;
-    let document_count = index.documents;
+fn collect_index_health(ctx: &Context, status: &IndexStatus) -> Result<IndexHealth> {
+    let document_count = status.documents;
     let memory_count = memory::count_active_entries(&ctx.conn)?;
 
     let (free_pages, total_pages): (i64, i64) = ctx.conn.query_row(
@@ -156,17 +156,25 @@ fn collect_index_health(ctx: &Context) -> Result<IndexHealth> {
 
 fn collect_collections(ctx: &Context) -> Result<CollectionsSummary> {
     let coll_list = collections::list_collections(&ctx.conn)?;
+
+    // Single GROUP BY roll-up instead of one query per collection (PERF).
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    let mut stmt = ctx
+        .conn
+        .prepare("SELECT collection, COUNT(*) FROM documents GROUP BY collection")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (name, count) = row?;
+        counts.insert(name, count);
+    }
+
     let rows = coll_list
         .iter()
-        .map(|c| {
-            let doc_count = collections::get_collection_document_count(&ctx.conn, &c.name)
-                .unwrap_or(0);
-            CollectionRow {
-                name: c.name.clone(),
-                path: c.path.clone(),
-                pattern: c.pattern.clone(),
-                doc_count,
-            }
+        .map(|c| CollectionRow {
+            name: c.name.clone(),
+            path: c.path.clone(),
+            pattern: c.pattern.clone(),
+            doc_count: counts.get(&c.name).copied().unwrap_or(0),
         })
         .collect();
     Ok(CollectionsSummary { collections: rows })
@@ -174,29 +182,41 @@ fn collect_collections(ctx: &Context) -> Result<CollectionsSummary> {
 
 fn collect_memory(ctx: &Context) -> Result<MemorySummary> {
     let now = chrono::Utc::now().timestamp();
+    let week = now + 7 * 86_400;
     let active_count = memory::count_active_entries(&ctx.conn)?;
 
+    // SQL GROUP BY is O(N) server-side; no need to hydrate every row (PERF).
     let mut counts_by_type: HashMap<String, usize> = HashMap::new();
-    let mut reminders_due = 0usize;
-    let mut reminders_upcoming_7d = 0usize;
-    let week = now + 7 * 86_400;
-
-    // Count all entries (including expired/future) by type; track reminder timing.
-    let all = memory::list_entries_all(&ctx.conn)?;
-    for entry in &all {
-        *counts_by_type.entry(entry.entry_type.to_string()).or_insert(0) += 1;
-        if entry.entry_type == memory::EntryType::Reminder {
-            if let Some(due) = entry.due_at {
-                if due <= now {
-                    reminders_due += 1;
-                } else if due <= week {
-                    reminders_upcoming_7d += 1;
-                }
-            }
-        }
+    let mut stmt = ctx
+        .conn
+        .prepare("SELECT entry_type, COUNT(*) FROM memory_entries GROUP BY entry_type")?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (ty, count) = row?;
+        counts_by_type.insert(ty, count as usize);
     }
 
-    Ok(MemorySummary { active_count, counts_by_type, reminders_due, reminders_upcoming_7d })
+    let reminders_due: i64 = ctx.conn.query_row(
+        "SELECT COUNT(*) FROM memory_entries
+         WHERE entry_type = 'reminder' AND due_at IS NOT NULL AND due_at <= ?1",
+        [now],
+        |r| r.get(0),
+    ).unwrap_or(0);
+
+    let reminders_upcoming_7d: i64 = ctx.conn.query_row(
+        "SELECT COUNT(*) FROM memory_entries
+         WHERE entry_type = 'reminder' AND due_at IS NOT NULL
+           AND due_at > ?1 AND due_at <= ?2",
+        [now, week],
+        |r| r.get(0),
+    ).unwrap_or(0);
+
+    Ok(MemorySummary {
+        active_count,
+        counts_by_type,
+        reminders_due: reminders_due as usize,
+        reminders_upcoming_7d: reminders_upcoming_7d as usize,
+    })
 }
 
 fn collect_code(mdkb_dir: &Path) -> CodeSummary {
@@ -216,29 +236,45 @@ fn collect_code(mdkb_dir: &Path) -> CodeSummary {
     };
 
     let mut symbols_by_language: HashMap<String, usize> = HashMap::new();
-    if let Ok(mut stmt) = conn.prepare(
+    match conn.prepare(
         "SELECT language, COUNT(*) FROM symbols GROUP BY language ORDER BY COUNT(*) DESC",
     ) {
-        let _ = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?))
-        })
-        .map(|rows| {
-            for row in rows.flatten() {
-                symbols_by_language.insert(row.0, row.1);
+        Ok(mut stmt) => match stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?)))
+        {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok((lang, count)) => {
+                            symbols_by_language.insert(lang, count);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "code.sqlite symbols row"),
+                    }
+                }
             }
-        });
+            Err(e) => tracing::warn!(error = %e, "code.sqlite symbols query"),
+        },
+        Err(e) => tracing::warn!(error = %e, "code.sqlite symbols prepare"),
     }
 
     let mut top_files_by_tokens: Vec<FileTokenRow> = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
+    match conn.prepare(
         "SELECT path, token_count FROM files WHERE token_count IS NOT NULL ORDER BY token_count DESC LIMIT 10",
     ) {
-        let _ = stmt.query_map([], |row| {
+        Ok(mut stmt) => match stmt.query_map([], |row| {
             Ok(FileTokenRow { path: row.get(0)?, token_count: row.get(1)? })
-        })
-        .map(|rows| {
-            top_files_by_tokens = rows.flatten().collect();
-        });
+        }) {
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok(file) => top_files_by_tokens.push(file),
+                        Err(e) => tracing::warn!(error = %e, "code.sqlite files row"),
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "code.sqlite files query"),
+        },
+        Err(e) => tracing::warn!(error = %e, "code.sqlite files prepare"),
     }
 
     CodeSummary { symbols_by_language, top_files_by_tokens }
@@ -275,15 +311,13 @@ fn count_slow_events(mdkb_dir: &Path, since_ts: i64) -> usize {
     content
         .lines()
         .filter(|line| {
-            // Fast path: look for `"ts":` field
-            if let Some(pos) = line.find("\"ts\":") {
-                let rest = &line[pos + 5..].trim_start();
-                let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-                if let Ok(ts) = rest[..end].parse::<i64>() {
-                    return ts >= since_ts;
-                }
-            }
-            false
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                return false;
+            };
+            value
+                .get("ts")
+                .and_then(|v| v.as_i64())
+                .is_some_and(|ts| ts >= since_ts)
         })
         .count()
 }
@@ -407,6 +441,69 @@ mod tests {
 
         let report = collect_report(&env.ctx).expect("collect");
         assert_eq!(report.hooks.slow_events_7d, 1, "only recent event counted");
+    }
+
+    #[test]
+    fn count_slow_events_handles_malformed_and_missing_ts() {
+        let dir = tempfile::tempdir().unwrap();
+        let cutoff = 100;
+        let content = [
+            "not json",                            // parse error → skipped
+            "{\"event\":\"x\"}",                   // missing ts → skipped
+            "{\"ts\":50}",                         // below cutoff → skipped
+            "{\"ts\":100}",                        // at cutoff → counted
+            "{\"ts\":200}",                        // above cutoff → counted
+            "{\"ts\":\"string\"}",                 // non-integer ts → skipped
+        ]
+        .join("\n");
+        std::fs::write(dir.path().join("hook-slow.jsonl"), content).unwrap();
+
+        assert_eq!(super::count_slow_events(dir.path(), cutoff), 2);
+    }
+
+    #[test]
+    fn render_memory_empty_shows_placeholder() {
+        use crate::cli::stats_render_report::render;
+        let mut r = make_empty_report();
+        r.memory.counts_by_type.clear();
+        let out = render(&r, false);
+        assert!(out.contains("(no entries)"), "empty memory must render placeholder");
+    }
+
+    #[test]
+    fn report_is_json_serializable() {
+        let env = Env::new();
+        let report = collect_report(&env.ctx).expect("collect");
+        let json = serde_json::to_string(&report).expect("serialize");
+        assert!(json.starts_with('{'));
+        // Round-trip via Value to confirm schema stability.
+        let _v: serde_json::Value = serde_json::from_str(&json).expect("parse json");
+    }
+
+    fn make_empty_report() -> StatsReport {
+        StatsReport {
+            header: HeaderInfo {
+                repo: "t".into(), version: "0.0.0".into(), db_size_bytes: 0, last_updated: None,
+            },
+            index: IndexHealth { document_count: 0, memory_count: 0, free_page_ratio: 0.0 },
+            collections: CollectionsSummary { collections: vec![] },
+            memory: MemorySummary {
+                active_count: 0,
+                counts_by_type: HashMap::new(),
+                reminders_due: 0,
+                reminders_upcoming_7d: 0,
+            },
+            code: CodeSummary {
+                symbols_by_language: HashMap::new(),
+                top_files_by_tokens: vec![],
+            },
+            sessions: SessionsSummary {
+                total_sessions: 0,
+                total_calls: 0,
+                top_tools: vec![],
+            },
+            hooks: HooksSummary { slow_events_7d: 0, reindex_queue_pending: 0 },
+        }
     }
 
     #[test]

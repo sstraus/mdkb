@@ -139,16 +139,10 @@ fn pad_or_truncate(s: &str, width: usize) -> String {
 // ── ANSI style ───────────────────────────────────────────────────────────────
 
 pub mod style {
-    use std::io::IsTerminal;
-
-    fn color_enabled() -> bool {
-        std::io::stdout().is_terminal()
-    }
-
     macro_rules! ansi_wrap {
         ($name:ident, $code:literal, $reset:literal) => {
-            pub fn $name(s: &str) -> String {
-                if color_enabled() {
+            pub fn $name(s: &str, color: bool) -> String {
+                if color {
                     format!(concat!("\x1b[", $code, "m{}\x1b[", $reset, "m"), s)
                 } else {
                     s.to_string()

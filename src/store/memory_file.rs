@@ -8,6 +8,8 @@
 //! Parsing delegates to `gray_matter` (already used elsewhere in the
 //! codebase) and maps the raw JSON value onto [`MemoryFileMeta`].
 
+use std::borrow::Cow;
+
 use gray_matter::{Matter, engine::YAML};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -57,10 +59,12 @@ pub struct MemoryFile {
 }
 
 impl MemoryFile {
-    /// Convert this file back into a full [`MemoryEntry`].
+    /// Convert this file back into a full [`MemoryEntry`], preserving any
+    /// derived counters that happened to be in the frontmatter.
     ///
-    /// Derived counters default to zero / `None` when absent: the DB
-    /// owns their truth, so a re-imported entry starts fresh.
+    /// Callers performing a user-facing import should prefer
+    /// [`Self::into_fresh_entry`]: the DB owns counter truth, and imported
+    /// entries must start fresh to avoid forging `access_count` from disk.
     pub fn into_entry(self) -> MemoryEntry {
         let now = chrono::Utc::now().timestamp();
         let Self { meta, content } = self;
@@ -82,6 +86,21 @@ impl MemoryFile {
             source_type: meta.source_type,
             expires_at: meta.expires_at,
             due_at: meta.due_at,
+        }
+    }
+
+    /// Convert into a [`MemoryEntry`] with derived counters reset.
+    ///
+    /// Used by `mdkb memory import <dir>` — counters on disk are a snapshot,
+    /// not a source of truth, so a re-imported entry always starts with
+    /// `access_count = 0`, no `last_accessed`, `confirmations = 0`.
+    pub fn into_fresh_entry(self) -> MemoryEntry {
+        MemoryEntry {
+            access_count: 0,
+            last_accessed: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            ..self.into_entry()
         }
     }
 }
@@ -162,12 +181,11 @@ fn write_scalar(out: &mut String, key: &str, value: &str) {
     out.push('\n');
 }
 
+/// Omit the key entirely when `value` is `None` — cleaner YAML than
+/// `key: null`, and parsing defaults back to `None` anyway.
 fn write_opt_scalar(out: &mut String, key: &str, value: Option<&str>) {
     if let Some(v) = value {
         write_scalar(out, key, v);
-    } else {
-        out.push_str(key);
-        out.push_str(": null\n");
     }
 }
 
@@ -188,9 +206,6 @@ fn write_u64(out: &mut String, key: &str, value: u64) {
 fn write_opt_i64(out: &mut String, key: &str, value: Option<i64>) {
     if let Some(v) = value {
         write_i64(out, key, v);
-    } else {
-        out.push_str(key);
-        out.push_str(": null\n");
     }
 }
 
@@ -217,18 +232,18 @@ fn write_string_array(out: &mut String, key: &str, values: &[String]) {
 /// and strings containing `:` `#` `,` `[` `]` `{` `}` `"` `'` `\` `\n`
 /// or leading `-`/`?`/`!`/`&`/`*`/`>`/`|` get double-quoted with JSON
 /// string escaping.
-fn quote_if_needed(value: &str) -> String {
+fn quote_if_needed(value: &str) -> Cow<'_, str> {
     if needs_quoting(value) {
-        quote_double(value)
+        Cow::Owned(quote_double(value))
     } else {
-        value.to_string()
+        Cow::Borrowed(value)
     }
 }
 
 fn needs_quoting(value: &str) -> bool {
-    if value.is_empty() {
-        return true;
-    }
+    let Some(first) = value.chars().next() else {
+        return true; // empty → must quote
+    };
     // Reserved word → must quote to preserve string type.
     const RESERVED: &[&str] = &[
         "true", "false", "null", "yes", "no", "on", "off", "True", "False", "Null", "YES", "NO",
@@ -241,7 +256,6 @@ fn needs_quoting(value: &str) -> bool {
     if value.parse::<f64>().is_ok() {
         return true;
     }
-    let first = value.chars().next().unwrap();
     if matches!(first, '-' | '?' | '!' | '&' | '*' | '>' | '|' | '%' | '@' | '`') {
         return true;
     }

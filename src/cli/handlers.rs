@@ -402,46 +402,6 @@ pub fn handle_hybrid_search(
     Ok(results)
 }
 
-/// Status result including index status and collection listing.
-#[derive(Debug)]
-pub struct StatusResult {
-    /// Index status (documents, stale, db size).
-    pub index: crate::domain::IndexStatus,
-    /// Collection details (name, path, pattern, source, doc_count).
-    pub collections: Vec<CollectionInfo>,
-}
-
-/// Info about a single collection for status display.
-#[derive(Debug)]
-pub struct CollectionInfo {
-    pub name: String,
-    pub path: String,
-    pub pattern: String,
-    pub source: String,
-    pub doc_count: i64,
-}
-
-/// Handle `mdkb status` command.
-pub fn handle_status(ctx: &Context) -> Result<StatusResult> {
-    let index = search::get_status(&ctx.conn)?;
-    let coll_list = collections::list_collections(&ctx.conn)?;
-    let collections = coll_list
-        .iter()
-        .map(|c| {
-            let doc_count =
-                collections::get_collection_document_count(&ctx.conn, &c.name).unwrap_or(0);
-            CollectionInfo {
-                name: c.name.clone(),
-                path: c.path.clone(),
-                pattern: c.pattern.clone(),
-                source: c.source.clone(),
-                doc_count,
-            }
-        })
-        .collect();
-    Ok(StatusResult { index, collections })
-}
-
 /// Result of a `get` command: document or memory entry.
 #[derive(Debug)]
 pub enum GetResult {
@@ -1131,97 +1091,6 @@ pub struct EmbedResult {
     pub errors: Vec<String>,
 }
 
-/// Stats result from handle_stats.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct StatsResult {
-    /// Aggregate stats across all sessions.
-    pub aggregate: AggregateStats,
-    /// Recent sessions.
-    pub sessions: Vec<SessionStats>,
-}
-
-/// Aggregate stats.
-#[derive(Debug, Clone, Default, serde::Serialize)]
-pub struct AggregateStats {
-    pub total_sessions: i64,
-    pub total_calls: i64,
-    pub total_tokens: i64,
-    pub total_truncations: i64,
-    pub avg_tokens_per_call: f64,
-}
-
-/// Session stats.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SessionStats {
-    pub id: i64,
-    pub started_at: i64,
-    pub ended_at: Option<i64>,
-    pub total_calls: i64,
-    pub total_tokens: i64,
-    pub truncation_count: i64,
-    pub tool_usage: Vec<ToolUsageStats>,
-}
-
-/// Tool usage within a session.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ToolUsageStats {
-    pub tool_name: String,
-    pub call_count: i64,
-    pub total_tokens: i64,
-    pub total_results: i64,
-}
-
-/// Handle stats command.
-pub fn handle_stats(ctx: &Context, sessions: usize, aggregate_only: bool) -> Result<StatsResult> {
-    // Initialize schema if needed
-    stats::init_stats_schema(&ctx.conn)?;
-
-    let agg = stats::get_aggregate_stats(&ctx.conn)?;
-    let aggregate = AggregateStats {
-        total_sessions: agg.total_sessions,
-        total_calls: agg.total_calls,
-        total_tokens: agg.total_tokens,
-        total_truncations: agg.total_truncations,
-        avg_tokens_per_call: agg.avg_tokens_per_call,
-    };
-
-    let sessions_list = if aggregate_only {
-        vec![]
-    } else {
-        let recent = stats::get_recent_sessions(&ctx.conn, sessions)?;
-        recent
-            .into_iter()
-            .map(|s| {
-                let tool_usage = stats::get_tool_usage(&ctx.conn, s.id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|t| ToolUsageStats {
-                        tool_name: t.tool_name,
-                        call_count: t.call_count,
-                        total_tokens: t.total_tokens,
-                        total_results: t.total_results,
-                    })
-                    .collect();
-
-                SessionStats {
-                    id: s.id,
-                    started_at: s.started_at,
-                    ended_at: s.ended_at,
-                    total_calls: s.total_calls,
-                    total_tokens: s.total_tokens,
-                    truncation_count: s.truncation_count,
-                    tool_usage,
-                }
-            })
-            .collect()
-    };
-
-    Ok(StatsResult {
-        aggregate,
-        sessions: sessions_list,
-    })
-}
-
 /// Apply line range (e.g., "10:50") to content.
 fn apply_line_range(content: &str, range: &str) -> Result<String> {
     let parts: Vec<&str> = range.split(':').collect();
@@ -1302,22 +1171,17 @@ pub fn load_memory_index(ctx: &Context) -> Result<Option<MemoryIndex>> {
 }
 
 /// Save a memory entry to disk as markdown (for backup).
+///
+/// Delegates to the shared YAML frontmatter serializer so export and per-add
+/// backups stay byte-identical — otherwise a re-import would lose the fields
+/// the hand-rolled version omitted (`source_type`, `created_at`, timestamps,
+/// reminder `due_at`, etc.).
 fn save_entry_to_disk(ctx: &Context, entry: &MemoryEntry) -> Result<()> {
     let entry_path = ctx
         .memory_dir()
         .join("entries")
         .join(format!("{}.md", entry.id));
-
-    let mut content = String::new();
-    content.push_str("---\n");
-    content.push_str(&format!("id: {}\n", entry.id));
-    content.push_str(&format!("title: {}\n", entry.title));
-    content.push_str(&format!("type: {}\n", entry.entry_type));
-    content.push_str(&format!("tags: [{}]\n", entry.tags.join(", ")));
-    content.push_str(&format!("status: {}\n", entry.status));
-    content.push_str("---\n\n");
-    content.push_str(&entry.content);
-
+    let content = crate::store::memory_file::to_markdown(entry);
     std::fs::write(entry_path, content)?;
     Ok(())
 }
@@ -1505,6 +1369,24 @@ pub struct ExportResult {
     pub errors: Vec<String>,
 }
 
+/// Reject entry IDs that would escape the export directory or hide dotfiles.
+///
+/// Accepts the same character class enforced by [`memory::validate_entry_input`]
+/// (alphanumerics, `-`, `_`, `.`, `/`), then adds filename-level guards:
+/// no empty string, no path separators, no `..`, no leading `.`.
+fn sanitize_export_id(id: &str) -> std::result::Result<(), String> {
+    if id.is_empty() {
+        return Err("empty id".to_string());
+    }
+    if id.contains('/') || id.contains('\\') {
+        return Err(format!("path separator in id: {id:?}"));
+    }
+    if id == "." || id == ".." || id.starts_with('.') {
+        return Err(format!("dot-prefixed id: {id:?}"));
+    }
+    Ok(())
+}
+
 /// Export all memory entries to `<dir>/<id>.md` files with YAML frontmatter.
 pub fn handle_memory_export(
     ctx: &Context,
@@ -1532,6 +1414,11 @@ pub fn handle_memory_export(
             continue;
         }
 
+        if let Err(msg) = sanitize_export_id(&entry.id) {
+            result.errors.push(format!("{}: {msg}", entry.id));
+            continue;
+        }
+
         let dest = dir.join(format!("{}.md", entry.id));
 
         if !overwrite && dest.exists() {
@@ -1544,12 +1431,15 @@ pub fn handle_memory_export(
             continue;
         }
 
-        let text = crate::cli::memory_file::to_markdown(entry);
-        std::fs::write(&dest, text).map_err(|e| ErrorKind::Io {
-            path: dest.clone(),
-            operation: format!("write: {e}"),
-        })?;
-        result.exported += 1;
+        let text = crate::store::memory_file::to_markdown(entry);
+        match std::fs::write(&dest, text) {
+            Ok(()) => result.exported += 1,
+            Err(e) => {
+                result
+                    .errors
+                    .push(format!("{}: write failed: {e}", dest.display()));
+            }
+        }
     }
 
     Ok(result)
@@ -1569,11 +1459,22 @@ pub fn handle_memory_import_dir(
         operation: format!("read_dir: {e}"),
     })?;
 
-    let mut paths: Vec<std::path::PathBuf> = read_dir
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
-        .collect();
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for entry_res in read_dir {
+        match entry_res {
+            Ok(entry) => {
+                let path = entry.path();
+                if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    paths.push(path);
+                }
+            }
+            Err(e) => {
+                result
+                    .errors
+                    .push(format!("{}: read_dir entry error: {e}", dir.display()));
+            }
+        }
+    }
     paths.sort();
 
     for path in &paths {
@@ -1585,7 +1486,7 @@ pub fn handle_memory_import_dir(
             }
         };
 
-        let mf = match crate::cli::memory_file::from_markdown(&text) {
+        let mf = match crate::store::memory_file::from_markdown(&text) {
             Ok(mf) => mf,
             Err(e) => {
                 result.errors.push(format!("{}: parse error: {e}", path.display()));
@@ -1614,28 +1515,8 @@ pub fn handle_memory_import_dir(
             continue;
         }
 
-        // Build entry, resetting derived counters.
-        let now = chrono::Utc::now().timestamp();
-        let entry = MemoryEntry {
-            id: mf.meta.id.clone(),
-            title: mf.meta.title.clone(),
-            content: mf.content.clone(),
-            entry_type: mf.meta.entry_type,
-            tags: mf.meta.tags.clone(),
-            status: mf.meta.status,
-            created_at: mf.meta.created_at.unwrap_or(now),
-            updated_at: mf.meta.updated_at.unwrap_or(now),
-            superseded_by: mf.meta.superseded_by.clone(),
-            source_path: mf.meta.source_path.clone(),
-            source_type: mf.meta.source_type,
-            expires_at: mf.meta.expires_at,
-            due_at: mf.meta.due_at,
-            // Derived counters reset on import.
-            access_count: 0,
-            last_accessed: None,
-            confirmations: 0,
-            last_confirmed_at: None,
-        };
+        // Derived counters (access_count etc.) are DB-owned; fresh entry starts at 0.
+        let entry = mf.into_fresh_entry();
 
         memory::add_entry(&ctx.conn, &entry)?;
         if let Err(e) = save_entry_to_disk(ctx, &entry) {
@@ -2662,20 +2543,6 @@ mod tests {
 
         let results = handle_search(&ctx, "test", 10, None).unwrap();
         assert!(results.is_empty());
-    }
-
-    // ==================== Status Tests ====================
-
-    #[test]
-    fn test_handle_status() {
-        let temp = setup_temp_dir();
-        handle_init(temp.path()).unwrap();
-        let ctx = Context::open(temp.path()).unwrap();
-
-        let status = handle_status(&ctx).expect("status should succeed");
-        assert_eq!(status.index.collections, 0);
-        assert_eq!(status.index.documents, 0);
-        assert!(status.collections.is_empty());
     }
 
     // ==================== Line Range Tests ====================

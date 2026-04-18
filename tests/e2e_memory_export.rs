@@ -3,8 +3,7 @@
 use std::path::PathBuf;
 
 use mdkb::cli::handlers::{
-    Context, ExportResult, handle_init, handle_memory_export, handle_memory_import,
-    handle_memory_import_dir,
+    Context, handle_init, handle_memory_export, handle_memory_import, handle_memory_import_dir,
 };
 use mdkb::store::memory::{self, EntryStatus, EntryType, MemoryEntry, SourceType};
 use tempfile::TempDir;
@@ -82,7 +81,7 @@ fn export_writes_one_file_per_entry() {
         assert!(file.exists(), "{id}.md should exist");
 
         let text = std::fs::read_to_string(&file).expect("read file");
-        let parsed = mdkb::cli::memory_file::from_markdown(&text).expect("parse");
+        let parsed = mdkb::store::memory_file::from_markdown(&text).expect("parse");
         assert_eq!(parsed.meta.id, *id);
     }
 }
@@ -270,6 +269,48 @@ fn import_dir_dry_run_does_not_write() {
 
     let check = memory::get_entry_without_tracking(&env.ctx.conn, "dry-import").expect("get");
     assert!(check.is_none(), "dry_run must not write to DB");
+}
+
+#[test]
+fn import_dir_missing_directory_returns_io_error() {
+    let env = Env::new();
+    let missing = env.root.join("does-not-exist");
+    let err = handle_memory_import_dir(&env.ctx, &missing, false, false)
+        .expect_err("missing dir must return Err");
+    let msg = format!("{err}");
+    assert!(msg.contains("read_dir"), "error should mention read_dir: {msg}");
+}
+
+#[test]
+fn import_dir_malformed_markdown_recorded_in_errors() {
+    let env = Env::new();
+    let bad_dir = env.root.join("bad");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    // No frontmatter → parse error
+    std::fs::write(bad_dir.join("broken.md"), "not valid frontmatter").unwrap();
+
+    let result = handle_memory_import_dir(&env.ctx, &bad_dir, false, false).expect("call ok");
+    assert_eq!(result.imported, 0);
+    assert_eq!(result.errors.len(), 1, "one parse error expected");
+    assert!(
+        result.errors[0].contains("broken.md"),
+        "error must reference file: {:?}",
+        result.errors[0]
+    );
+}
+
+#[test]
+fn import_dir_validation_failure_recorded() {
+    let env = Env::new();
+    let bad_dir = env.root.join("invalid-id");
+    std::fs::create_dir_all(&bad_dir).unwrap();
+    // Valid YAML frontmatter but id contains forbidden characters.
+    let text = "---\nid: \"bad id with spaces\"\ntitle: \"T\"\nentry_type: topic\ntags: []\nsource_type: user_statement\ncreated_at: 1700000000\nupdated_at: 1700000000\n---\nbody\n";
+    std::fs::write(bad_dir.join("invalid.md"), text).unwrap();
+
+    let result = handle_memory_import_dir(&env.ctx, &bad_dir, false, false).expect("call ok");
+    assert_eq!(result.imported, 0);
+    assert_eq!(result.errors.len(), 1);
 }
 
 #[test]

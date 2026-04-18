@@ -16,7 +16,7 @@ use tracing_subscriber::EnvFilter;
 use mdkb::Result;
 use mdkb::cli::CodeCommand;
 use mdkb::cli::handlers::{
-    Context, EmbedResult, EvolutionHistoryEntry, StatsResult, handle_collection_add,
+    Context, EmbedResult, EvolutionHistoryEntry, handle_collection_add,
     handle_collection_remove, handle_collection_rename, handle_current, handle_embed,
     handle_evolve_corrects, handle_evolve_extends, handle_evolve_retracts,
     handle_evolve_supersedes, handle_evolve_updates, handle_experiment_cancel,
@@ -328,12 +328,9 @@ async fn main() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&report)?);
                 }
                 _ => {
-                    if no_color {
-                        // Disable color by unsetting TERM so IsTerminal returns false
-                        // via the tty detection path — instead, just print without styling.
-                        // stats_render::style already no-ops when not a tty.
-                    }
-                    print!("{}", mdkb::cli::stats_render_report::render(&report));
+                    use std::io::IsTerminal;
+                    let color = !no_color && std::io::stdout().is_terminal();
+                    print!("{}", mdkb::cli::stats_render_report::render(&report, color));
                 }
             }
         }
@@ -846,56 +843,6 @@ fn format_document(doc: &mdkb::domain::Document, content: &str, format: OutputFo
     }
 }
 
-fn format_status(result: &mdkb::cli::handlers::StatusResult, format: OutputFormat) {
-    let status = &result.index;
-    match format {
-        OutputFormat::Json => {
-            let output = serde_json::json!({
-                "index": status,
-                "collections": result.collections.iter().map(|c| serde_json::json!({
-                    "name": c.name,
-                    "path": c.path,
-                    "pattern": c.pattern,
-                    "source": c.source,
-                    "doc_count": c.doc_count,
-                })).collect::<Vec<_>>(),
-            });
-            println!("{}", serde_json::to_string_pretty(&output).unwrap());
-        }
-        OutputFormat::Csv => {
-            println!("collections,documents,stale,db_size_bytes");
-            println!(
-                "{},{},{},{}",
-                status.collections, status.documents, status.stale_documents, status.db_size_bytes
-            );
-        }
-        OutputFormat::Markdown | OutputFormat::Text => {
-            println!("Documents:   {}", status.documents);
-            println!("Stale:       {}", status.stale_documents);
-            println!("DB Size:     {} bytes", status.db_size_bytes);
-            if let Some(ts) = status.last_updated {
-                println!("Last Update: {}", ts);
-            }
-            println!("\nCollections ({}):", result.collections.len());
-            if result.collections.is_empty() {
-                println!("  (none)");
-            } else {
-                for c in &result.collections {
-                    let tag = if c.source == "convention" {
-                        "[convention]"
-                    } else {
-                        "[manual]"
-                    };
-                    println!(
-                        "  - {} {} ({}): {} docs, pattern: {}",
-                        c.name, tag, c.path, c.doc_count, c.pattern
-                    );
-                }
-            }
-        }
-    }
-}
-
 fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputFormat) {
     match format {
         OutputFormat::Json => {
@@ -1381,67 +1328,6 @@ fn format_superseded_by(evolutions: &[Evolution], format: OutputFormat) {
                     }
                     if let Some(reason) = &e.reason {
                         println!("    Reason: {}", reason);
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn format_stats_result(result: &StatsResult, format: OutputFormat) {
-    match format {
-        OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(result).unwrap());
-        }
-        OutputFormat::Csv => {
-            println!(
-                "total_sessions,total_calls,total_tokens,total_truncations,avg_tokens_per_call"
-            );
-            println!(
-                "{},{},{},{},{:.1}",
-                result.aggregate.total_sessions,
-                result.aggregate.total_calls,
-                result.aggregate.total_tokens,
-                result.aggregate.total_truncations,
-                result.aggregate.avg_tokens_per_call,
-            );
-        }
-        OutputFormat::Markdown | OutputFormat::Text => {
-            println!("=== Aggregate Stats ===");
-            println!("Total sessions:    {}", result.aggregate.total_sessions);
-            println!("Total calls:       {}", result.aggregate.total_calls);
-            println!("Total tokens:      {}", result.aggregate.total_tokens);
-            println!("Total truncations: {}", result.aggregate.total_truncations);
-            println!(
-                "Avg tokens/call:   {:.1}",
-                result.aggregate.avg_tokens_per_call
-            );
-
-            if !result.sessions.is_empty() {
-                println!("\n=== Recent Sessions ===");
-                for session in &result.sessions {
-                    let status = if session.ended_at.is_some() {
-                        "ended"
-                    } else {
-                        "active"
-                    };
-                    // Format timestamp as human-readable
-                    let started = chrono::DateTime::from_timestamp(session.started_at, 0)
-                        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    println!("\nSession {} - {} ({}):", session.id, started, status);
-                    println!("  Calls:       {}", session.total_calls);
-                    println!("  Tokens:      {}", session.total_tokens);
-                    println!("  Truncations: {}", session.truncation_count);
-
-                    if !session.tool_usage.is_empty() {
-                        println!("  Tools:");
-                        for tool in &session.tool_usage {
-                            println!(
-                                "    - {}: {} calls, {} tokens",
-                                tool.tool_name, tool.call_count, tool.total_tokens
-                            );
-                        }
                     }
                 }
             }
