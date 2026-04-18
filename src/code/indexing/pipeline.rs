@@ -225,11 +225,14 @@ fn stage_read(rx: &Receiver<PathBuf>, tx: &Sender<FileContent>) {
             }
         };
         let hash = hasher::content_hash(&content);
+        let token_estimate =
+            crate::metrics::tokens::count_tokens(&content).min(u32::MAX as usize) as u32;
         if tx
             .send(FileContent {
                 path,
                 content,
                 hash,
+                token_estimate,
             })
             .is_err()
         {
@@ -397,6 +400,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
             path: fc.path,
             content_hash: fc.hash,
             language,
+            token_estimate: fc.token_estimate,
             raw_symbols,
             raw_relationships,
         };
@@ -458,6 +462,7 @@ fn stage_collect(
             content_hash: parsed.content_hash,
             language: parsed.language,
             mtime,
+            token_estimate: parsed.token_estimate,
         });
 
         // Convert raw symbols to Symbol with real IDs
@@ -608,6 +613,7 @@ fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyho
             &reg.content_hash,
             Some(reg.language.config_key()),
             Some(reg.mtime as i64),
+            Some(i64::from(reg.token_estimate)),
         )?;
         file_id_map.insert(reg.file_id.value(), real_id);
         stats.files_discovered += 1;

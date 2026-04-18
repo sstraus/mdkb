@@ -350,6 +350,16 @@ impl IndexFacade {
         })
     }
 
+    /// Look up file token estimates for a set of relative paths.
+    pub fn get_file_token_estimates(&self, rel_paths: &[String]) -> HashMap<String, u32> {
+        self.db
+            .get_file_token_estimates(rel_paths)
+            .unwrap_or_else(|e| {
+                tracing::error!("DB error in get_file_token_estimates: {e}");
+                HashMap::new()
+            })
+    }
+
     /// Get functions/methods called by the given symbol.
     pub fn get_called_functions(&self, symbol_id: SymbolId) -> Vec<Symbol> {
         self.db

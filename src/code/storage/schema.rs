@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS code_files (
     hash TEXT NOT NULL,
     language TEXT,
     mtime INTEGER,
-    indexed_at INTEGER NOT NULL DEFAULT (unixepoch())
+    indexed_at INTEGER NOT NULL DEFAULT (unixepoch()),
+    token_estimate INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS code_symbols (
@@ -93,6 +94,16 @@ END;
 pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     conn.execute_batch(CREATE_TABLES)?;
+
+    // Additive migration: ensure token_estimate column exists on pre-existing DBs.
+    let has_token_estimate: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('code_files') WHERE name='token_estimate')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_token_estimate {
+        conn.execute_batch("ALTER TABLE code_files ADD COLUMN token_estimate INTEGER")?;
+    }
 
     // Triggers don't support IF NOT EXISTS — check before creating.
     let trigger_exists: bool = conn.query_row(

@@ -1249,9 +1249,19 @@ impl McpServer {
                                 let tokens = count_tokens(&output);
                                 (output, tokens, 0)
                             } else {
+                                let rel_paths: Vec<String> = symbols
+                                    .iter()
+                                    .map(|s| s.file_path.to_string())
+                                    .collect::<std::collections::HashSet<_>>()
+                                    .into_iter()
+                                    .collect();
+                                let token_map = facade.get_file_token_estimates(&rel_paths);
                                 let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
                                 for sym in &symbols {
-                                    out.push_str(&format_symbol(sym));
+                                    out.push_str(&format_symbol_with_file_tokens(
+                                        sym,
+                                        token_map.get(sym.file_path.as_ref()).copied(),
+                                    ));
                                     out.push('\n');
                                 }
                                 let result_count = symbols.len();
@@ -2094,13 +2104,26 @@ impl McpServer {
 
 /// Format a code symbol for MCP output.
 fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
+    format_symbol_with_file_tokens(sym, None)
+}
+
+/// Format a code symbol, optionally annotating the containing file's token estimate.
+fn format_symbol_with_file_tokens(
+    sym: &crate::code::symbol::Symbol,
+    file_tokens: Option<u32>,
+) -> String {
+    let suffix = match file_tokens {
+        Some(n) => format!(" (file: ~{}tok)", n),
+        None => String::new(),
+    };
     let mut out = format!(
-        "  sym#{} {:?} {} in {}:{}\n",
+        "  sym#{} {:?} {} in {}:{}{}\n",
         sym.id.value(),
         sym.kind,
         sym.name,
         sym.file_path,
         sym.range.start_line,
+        suffix,
     );
     if let Some(ref sig) = sym.signature {
         out.push_str(&format!("    Signature: {}\n", sig));

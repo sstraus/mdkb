@@ -20,6 +20,8 @@ pub struct FileContent {
     pub path: PathBuf,
     pub content: String,
     pub hash: String,
+    /// Approximate LLM token count (cl100k_base) for the file's text.
+    pub token_estimate: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -54,6 +56,7 @@ pub struct ParsedFile {
     pub path: PathBuf,
     pub content_hash: String,
     pub language: Language,
+    pub token_estimate: u32,
     pub raw_symbols: Vec<RawSymbol>,
     pub raw_relationships: Vec<RawRelationship>,
 }
@@ -72,6 +75,8 @@ pub struct FileRegistration {
     pub content_hash: String,
     pub language: Language,
     pub mtime: u64,
+    /// Approximate LLM token count (cl100k_base) for the file's text.
+    pub token_estimate: u32,
 }
 
 /// A relationship where the source symbol may be resolved but the target

@@ -85,15 +85,16 @@ impl CodeDb {
         hash: &str,
         language: Option<&str>,
         mtime: Option<i64>,
+        token_estimate: Option<i64>,
     ) -> rusqlite::Result<i64> {
         self.conn.execute(
-            "INSERT INTO code_files (path, rel_path, hash, language, mtime, indexed_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch()) \
+            "INSERT INTO code_files (path, rel_path, hash, language, mtime, indexed_at, token_estimate) \
+             VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6) \
              ON CONFLICT(path) DO UPDATE SET \
              rel_path=excluded.rel_path, hash=excluded.hash, \
              language=excluded.language, mtime=excluded.mtime, \
-             indexed_at=unixepoch()",
-            params![path, rel_path, hash, language, mtime],
+             indexed_at=unixepoch(), token_estimate=excluded.token_estimate",
+            params![path, rel_path, hash, language, mtime, token_estimate],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -137,6 +138,40 @@ impl CodeDb {
         for row in rows {
             let (path, mtime) = row?;
             map.insert(path, mtime);
+        }
+        Ok(map)
+    }
+
+    /// Look up file token estimates for a set of relative paths.
+    ///
+    /// Returns a map containing only paths with a known (non-NULL) estimate.
+    pub fn get_file_token_estimates(
+        &self,
+        rel_paths: &[String],
+    ) -> rusqlite::Result<HashMap<String, u32>> {
+        if rel_paths.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders: Vec<String> = (1..=rel_paths.len()).map(|i| format!("?{i}")).collect();
+        let sql = format!(
+            "SELECT rel_path, token_estimate FROM code_files \
+             WHERE token_estimate IS NOT NULL AND rel_path IN ({})",
+            placeholders.join(",")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let sql_params: Vec<&dyn rusqlite::types::ToSql> = rel_paths
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
+        let rows = stmt.query_map(sql_params.as_slice(), |row| {
+            let path: String = row.get(0)?;
+            let est: i64 = row.get(1)?;
+            Ok((path, est.max(0) as u32))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (p, e) = row?;
+            map.insert(p, e);
         }
         Ok(map)
     }
@@ -532,7 +567,7 @@ mod tests {
 
     /// Insert a test file and return its rowid.
     fn insert_test_file(db: &CodeDb) -> i64 {
-        db.insert_file("test.rs", "test.rs", "hash123", Some("Rust"), None)
+        db.insert_file("test.rs", "test.rs", "hash123", Some("Rust"), None, None)
             .unwrap()
     }
 
@@ -574,7 +609,7 @@ mod tests {
         let path = dir.path().join("code.sqlite");
         {
             let db = CodeDb::create(&path).unwrap();
-            db.insert_file("a", "a", "h", None, None).unwrap();
+            db.insert_file("a", "a", "h", None, None, None).unwrap();
         }
         let db = CodeDb::open_or_create(&path).unwrap();
         assert_eq!(db.file_count().unwrap(), 1);
@@ -584,7 +619,14 @@ mod tests {
     fn test_insert_file() {
         let (_dir, db) = temp_db();
         let id = db
-            .insert_file("main.rs", "main.rs", "abc", Some("Rust"), Some(12345))
+            .insert_file(
+                "main.rs",
+                "main.rs",
+                "abc",
+                Some("Rust"),
+                Some(12345),
+                Some(42),
+            )
             .unwrap();
         assert!(id > 0);
         assert_eq!(db.file_count().unwrap(), 1);
@@ -593,9 +635,9 @@ mod tests {
     #[test]
     fn test_insert_file_replaces_on_conflict() {
         let (_dir, db) = temp_db();
-        db.insert_file("main.rs", "main.rs", "hash1", None, None)
+        db.insert_file("main.rs", "main.rs", "hash1", None, None, None)
             .unwrap();
-        db.insert_file("main.rs", "main.rs", "hash2", None, None)
+        db.insert_file("main.rs", "main.rs", "hash2", None, None, None)
             .unwrap();
         assert_eq!(db.file_count().unwrap(), 1);
         let hashes = db.get_file_hashes().unwrap();
@@ -605,8 +647,8 @@ mod tests {
     #[test]
     fn test_get_file_hashes() {
         let (_dir, db) = temp_db();
-        db.insert_file("a", "a", "h1", None, None).unwrap();
-        db.insert_file("b", "b", "h2", None, None).unwrap();
+        db.insert_file("a", "a", "h1", None, None, None).unwrap();
+        db.insert_file("b", "b", "h2", None, None, None).unwrap();
 
         let hashes = db.get_file_hashes().unwrap();
         assert_eq!(hashes.len(), 2);
@@ -1058,9 +1100,11 @@ mod tests {
     #[test]
     fn test_get_file_mtimes() {
         let (_dir, db) = temp_db();
-        db.insert_file("a", "a", "h1", None, Some(1000)).unwrap();
-        db.insert_file("b", "b", "h2", None, Some(2000)).unwrap();
-        db.insert_file("c", "c", "h3", None, None).unwrap();
+        db.insert_file("a", "a", "h1", None, Some(1000), None)
+            .unwrap();
+        db.insert_file("b", "b", "h2", None, Some(2000), None)
+            .unwrap();
+        db.insert_file("c", "c", "h3", None, None, None).unwrap();
 
         let mtimes = db.get_file_mtimes().unwrap();
         assert_eq!(mtimes.len(), 2); // "c" excluded (NULL mtime)
@@ -1173,7 +1217,7 @@ mod tests {
         // ON CONFLICT DO UPDATE should not cascade-delete symbols
         let (_dir, db) = temp_db();
         let file_id = db
-            .insert_file("main.rs", "main.rs", "hash1", Some("Rust"), None)
+            .insert_file("main.rs", "main.rs", "hash1", Some("Rust"), None, None)
             .unwrap();
         db.insert_symbol(
             "my_fn", "Function", file_id, "main.rs", 10, None, None, None, 0, None, None, None,
@@ -1183,7 +1227,7 @@ mod tests {
         assert_eq!(db.symbol_count().unwrap(), 1);
 
         // Upsert the same file with a new hash
-        db.insert_file("main.rs", "main.rs", "hash2", Some("Rust"), None)
+        db.insert_file("main.rs", "main.rs", "hash2", Some("Rust"), None, None)
             .unwrap();
 
         // Symbol should still exist (not cascade-deleted by INSERT OR REPLACE)
