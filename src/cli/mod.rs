@@ -3,6 +3,7 @@
 pub mod handlers;
 pub mod hooks;
 pub mod journal;
+pub mod memory_file;
 pub mod setup;
 
 use clap::{Parser, Subcommand};
