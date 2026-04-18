@@ -2775,18 +2775,30 @@ fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
     let mut out = format!("Found {} memory entries:\n\n", entries.len());
     for entry in &ordered {
         let ttl_info = format_ttl_info(entry.expires_at);
+        let confirmed_info = format_confirmed_info(entry.last_confirmed_at);
         out.push_str(&format!(
-            "- [{}] {} ({}, conf:{:.2}, {}{}): {}\n",
+            "- [{}] {} ({}, conf:{:.2}, confirms:{}, access:{}{}, {}{}): {}\n",
             entry.id,
             entry.title,
             entry.entry_type,
             entry.confidence(),
+            entry.confirmations,
+            entry.access_count,
+            confirmed_info,
             relative_time_ago(entry.updated_at),
             ttl_info,
             truncate_text(&entry.content, 100)
         ));
     }
     out
+}
+
+/// Format last_confirmed_at for display. Returns empty string when never confirmed.
+fn format_confirmed_info(last_confirmed_at: Option<i64>) -> String {
+    match last_confirmed_at {
+        Some(ts) => format!(", confirmed:{}", relative_time_ago(ts)),
+        None => String::new(),
+    }
 }
 
 /// Format TTL info for display. Returns empty string for permanent entries.
