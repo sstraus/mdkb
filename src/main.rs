@@ -690,6 +690,25 @@ async fn main() -> Result<()> {
                         println!("Opt out per-directory with .mdkbignore-hooks");
                     }
                 }
+                SetupHooksCommand::Codex { disable, dry_run } => {
+                    let result = mdkb::cli::setup::handle_setup_hooks_codex(&disable, dry_run)?;
+                    if !result.dry_run {
+                        if !result.events_registered.is_empty() {
+                            println!("Registered hooks: {}", result.events_registered.join(", "));
+                        }
+                        if !result.events_skipped.is_empty() {
+                            println!("Skipped: {}", result.events_skipped.join(", "));
+                        }
+                        println!("Wrote: {}", result.settings_path.display());
+                        if !result.codex_hooks_flag_present {
+                            eprintln!(
+                                "Warning: `codex_hooks = true` not found in ~/.codex/config.toml \
+                                 — Codex CLI will not invoke these hooks until the flag is set."
+                            );
+                        }
+                        println!("Opt out per-directory with .mdkbignore-hooks");
+                    }
+                }
             },
         },
         Command::Session(cmd) => match cmd {

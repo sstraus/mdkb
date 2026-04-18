@@ -1,22 +1,26 @@
 //! Integration tests for `mdkb setup hooks claude` — settings.json writer.
 
 use std::fs;
+use std::sync::MutexGuard;
 
 use mdkb::cli::setup::{HOOK_EVENTS, handle_setup_hooks_claude};
 use tempfile::TempDir;
 
+use super::common::env_lock;
+
 /// Build a fresh temp project root with $HOME pointed at a sibling dir so that
-/// `user`-scope tests don't touch the real ~/.claude. Returns (project_root, home_dir).
-fn isolated_project() -> (TempDir, TempDir) {
+/// `user`-scope tests don't touch the real ~/.claude. The guard serializes
+/// HOME-mutating tests across this binary.
+fn isolated_project() -> (MutexGuard<'static, ()>, TempDir, TempDir) {
+    let guard = env_lock();
     let project = tempfile::tempdir().expect("tempdir project");
     let home = tempfile::tempdir().expect("tempdir home");
-    // SAFETY: tests are single-threaded per binary wrt env mutation here, and we
-    // always overwrite HOME before each call so earlier state is irrelevant.
+    // SAFETY: env mutation serialized by `guard`; HOME is overwritten per test.
     unsafe {
         std::env::set_var("HOME", home.path());
         std::env::set_var("MDKB_BINARY_OVERRIDE", env!("CARGO_BIN_EXE_mdkb"));
     }
-    (project, home)
+    (guard, project, home)
 }
 
 fn local_settings_path(project: &std::path::Path) -> std::path::PathBuf {
@@ -43,7 +47,7 @@ fn mdkb_entries<'a>(value: &'a serde_json::Value, event: &str) -> Vec<&'a serde_
 
 #[test]
 fn fresh_settings_gets_three_managed_hook_entries() {
-    let (project, _home) = isolated_project();
+    let (_guard, project, _home) = isolated_project();
 
     let result =
         handle_setup_hooks_claude(project.path(), "local", "", false).expect("setup hooks ok");
@@ -79,7 +83,7 @@ fn fresh_settings_gets_three_managed_hook_entries() {
 
 #[test]
 fn rerunning_is_idempotent_no_duplicates() {
-    let (project, _home) = isolated_project();
+    let (_guard, project, _home) = isolated_project();
 
     handle_setup_hooks_claude(project.path(), "local", "", false).expect("first run");
     handle_setup_hooks_claude(project.path(), "local", "", false).expect("second run");
@@ -98,7 +102,7 @@ fn rerunning_is_idempotent_no_duplicates() {
 
 #[test]
 fn disable_skips_named_events() {
-    let (project, _home) = isolated_project();
+    let (_guard, project, _home) = isolated_project();
 
     let result = handle_setup_hooks_claude(
         project.path(),
@@ -120,7 +124,7 @@ fn disable_skips_named_events() {
 
 #[test]
 fn dry_run_does_not_write_file() {
-    let (project, _home) = isolated_project();
+    let (_guard, project, _home) = isolated_project();
 
     let result = handle_setup_hooks_claude(project.path(), "local", "", true).expect("dry run ok");
     assert!(result.dry_run);
@@ -137,7 +141,7 @@ fn dry_run_does_not_write_file() {
 
 #[test]
 fn preserves_non_mdkb_hook_entries() {
-    let (project, _home) = isolated_project();
+    let (_guard, project, _home) = isolated_project();
 
     let settings_path = local_settings_path(project.path());
     fs::create_dir_all(settings_path.parent().unwrap()).unwrap();

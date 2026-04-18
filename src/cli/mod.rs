@@ -619,6 +619,17 @@ pub enum SetupHooksCommand {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Register lifecycle hooks with Codex CLI (writes ~/.codex/hooks.json)
+    Codex {
+        /// Comma-separated list of events to skip (session-start, user-prompt-submit, post-tool-use)
+        #[arg(long, default_value = "")]
+        disable: String,
+
+        /// Print the merged hooks.json to stdout without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Code intelligence subcommands.

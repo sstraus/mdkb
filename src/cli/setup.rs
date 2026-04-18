@@ -269,6 +269,9 @@ pub struct HooksSetupResult {
     pub dry_run: bool,
     pub merged_json: serde_json::Value,
     pub message: String,
+    /// True when the Codex `codex_hooks = true` flag was detected in config.toml.
+    /// Always false for the Claude variant (Claude has no analogous flag).
+    pub codex_hooks_flag_present: bool,
 }
 
 /// Three events currently emitted by `mdkb hook`.
@@ -428,6 +431,7 @@ pub fn handle_setup_hooks_claude(
             dry_run: true,
             merged_json,
             message: "Dry run: no changes written".to_string(),
+            codex_hooks_flag_present: false,
         });
     }
 
@@ -461,6 +465,203 @@ pub fn handle_setup_hooks_claude(
         dry_run: false,
         merged_json,
         message: "Hooks registered".to_string(),
+        codex_hooks_flag_present: false,
+    })
+}
+
+/// Resolve the Codex hooks file path: `$HOME/.codex/hooks.json`.
+pub fn codex_hooks_path() -> Result<std::path::PathBuf> {
+    let home = env::var_os("HOME").ok_or_else(|| {
+        Error::from(ErrorKind::Command {
+            command: "setup hooks codex".to_string(),
+            message: "HOME environment variable not set".to_string(),
+        })
+    })?;
+    Ok(std::path::PathBuf::from(home)
+        .join(".codex")
+        .join("hooks.json"))
+}
+
+/// Best-effort probe for `codex_hooks = true` in `$HOME/.codex/config.toml`.
+/// Missing file or missing flag both return `false`. Parse errors return `false`.
+fn probe_codex_hooks_flag() -> bool {
+    let Some(home) = env::var_os("HOME") else {
+        return false;
+    };
+    let cfg = std::path::PathBuf::from(home)
+        .join(".codex")
+        .join("config.toml");
+    let Ok(raw) = std::fs::read_to_string(&cfg) else {
+        return false;
+    };
+    // Minimal TOML-aware scan: avoid pulling in a full parser.
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rhs) = trimmed.strip_prefix("codex_hooks") {
+            let rhs = rhs.trim_start();
+            if let Some(val) = rhs.strip_prefix('=') {
+                let v = val
+                    .trim()
+                    .trim_end_matches(|c: char| c == ',' || c.is_whitespace());
+                if v.eq_ignore_ascii_case("true") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Register Codex CLI lifecycle hooks idempotently into `$HOME/.codex/hooks.json`.
+///
+/// Reuses `HOOK_EVENTS` from the Claude variant so the surface stays identical.
+/// UserPromptSubmit and SessionStart are attempted optimistically; if Codex
+/// rejects them at runtime it surfaces in Codex's own logs, not here.
+/// The `codex_hooks = true` flag in `~/.codex/config.toml` is probed and
+/// reported; the caller decides whether to warn the user.
+pub fn handle_setup_hooks_codex(disable: &str, dry_run: bool) -> Result<HooksSetupResult> {
+    let settings_path = codex_hooks_path()?;
+    let binary_path = find_mdkb_binary()?;
+    let disabled = parse_disabled_events(disable);
+    let codex_hooks_flag_present = probe_codex_hooks_flag();
+
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let raw = std::fs::read_to_string(&settings_path).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: settings_path.clone(),
+                operation: format!("read hooks.json: {e}"),
+            })
+        })?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw).map_err(|e| {
+                Error::from(ErrorKind::Command {
+                    command: "setup hooks codex".to_string(),
+                    message: format!("failed to parse {}: {e}", settings_path.display()),
+                })
+            })?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if !settings.is_object() {
+        return Err(Error::from(ErrorKind::Command {
+            command: "setup hooks codex".to_string(),
+            message: "hooks.json root must be a JSON object".to_string(),
+        }));
+    }
+
+    let hooks_root = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks_root.is_object() {
+        *hooks_root = serde_json::json!({});
+    }
+
+    let mut registered = Vec::new();
+    let mut skipped = Vec::new();
+
+    for (event_name, cli_event) in HOOK_EVENTS {
+        if disabled.contains(*event_name) {
+            skipped.push((*event_name).to_string());
+            continue;
+        }
+
+        let command = format!("{} hook {}", binary_path, cli_event);
+        let mdkb_entry = serde_json::json!({
+            "_managedBy": "mdkb",
+            "hooks": [{
+                "type": "command",
+                "command": command,
+            }]
+        });
+
+        let entry_list = hooks_root
+            .as_object_mut()
+            .unwrap()
+            .entry((*event_name).to_string())
+            .or_insert_with(|| serde_json::json!([]));
+
+        let arr = match entry_list.as_array_mut() {
+            Some(a) => a,
+            None => {
+                *entry_list = serde_json::json!([]);
+                entry_list.as_array_mut().unwrap()
+            }
+        };
+
+        arr.retain(|item| {
+            item.get("_managedBy")
+                .and_then(|v| v.as_str())
+                .map(|s| s != "mdkb")
+                .unwrap_or(true)
+        });
+        arr.push(mdkb_entry);
+
+        registered.push((*event_name).to_string());
+    }
+
+    let merged_json = settings.clone();
+
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&settings).unwrap_or_default()
+        );
+        return Ok(HooksSetupResult {
+            success: true,
+            settings_path,
+            events_registered: registered,
+            events_skipped: skipped,
+            dry_run: true,
+            merged_json,
+            message: "Dry run: no changes written".to_string(),
+            codex_hooks_flag_present,
+        });
+    }
+
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: parent.to_path_buf(),
+                operation: format!("create parent dir: {e}"),
+            })
+        })?;
+    }
+
+    let serialized = serde_json::to_string_pretty(&settings).map_err(|e| {
+        Error::from(ErrorKind::Command {
+            command: "setup hooks codex".to_string(),
+            message: format!("serialize hooks.json: {e}"),
+        })
+    })?;
+    std::fs::write(&settings_path, serialized).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: settings_path.clone(),
+            operation: format!("write hooks.json: {e}"),
+        })
+    })?;
+
+    Ok(HooksSetupResult {
+        success: true,
+        settings_path,
+        events_registered: registered,
+        events_skipped: skipped,
+        dry_run: false,
+        merged_json,
+        message: if codex_hooks_flag_present {
+            "Hooks registered".to_string()
+        } else {
+            "Hooks registered. Warning: `codex_hooks = true` not found in ~/.codex/config.toml — Codex CLI will not invoke these hooks until the flag is set.".to_string()
+        },
+        codex_hooks_flag_present,
     })
 }
 
