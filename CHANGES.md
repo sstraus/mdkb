@@ -1,5 +1,45 @@
 # Changelog
 
+## 2.0.0 (2026-04-18)
+
+### Breaking Changes
+
+- **`mdkb status` removed** — use `mdkb stats` instead. The old command
+  prints an "unknown command" error from clap. No alias is provided.
+- **`mdkb stats` signature changed** — `--sessions` / `--aggregate` flags
+  removed. The command now accepts `--no-color` and `--format json|text`.
+
+### Added
+
+- **`mdkb memory export`** — dumps all memory entries to a folder of
+  per-entry `.md` files with YAML frontmatter. Options: `--dir`,
+  `--include-expired`, `--overwrite`, `--dry-run`. Default directory:
+  `.mdkb/memory/entries/`.
+- **`mdkb memory import` (directory mode)** — auto-detects whether the
+  path argument is a directory; if so, scans `*.md` files and imports
+  via the new `memory_file` YAML parser. JSON file path unchanged.
+- **`mdkb stats` unified ASCII dashboard** — replaces both `mdkb status`
+  and the old session-only `mdkb stats`. Sections: index health
+  (document/memory counts, free-page ratio), collections table, memory
+  bar-by-type with reminder due/upcoming counts, code symbols per language
+  (when code.sqlite is present), session totals with top-tools bar chart,
+  hooks slow events and reindex-queue pending count. Uses box-drawing
+  characters and block-element bar charts. `--format json` serializes
+  the full `StatsReport` struct.
+
+### Internals
+
+- `src/cli/memory_file.rs` — hand-written YAML frontmatter serializer
+  and `gray_matter`-based parser for `MemoryEntry`. Round-trip preserves
+  all authored fields; derived counters (`access_count`, `last_accessed`,
+  `confirmations`) are reset on import.
+- `src/cli/stats_render.rs` — `bar`, `sparkline`, `frame` ASCII primitives
+  and a hand-rolled ANSI `style` module (no `owo-colors` dependency).
+- `src/cli/stats_report.rs` — `collect_report` aggregator.
+- `src/cli/stats_render_report.rs` — ASCII renderer for `StatsReport`.
+- `src/store/memory.rs` — added `list_entries_all` (no expiry filter,
+  used by export to include expired entries when requested).
+
 ## 1.5.0 (2026-04-18)
 
 ### Added

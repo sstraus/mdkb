@@ -191,7 +191,27 @@ mdkb memory add pay-bill -t "Pay electricity bill" -T reminder --due-in 86400 \
 mdkb memory list
 mdkb memory search "authentication"
 mdkb memory history auth-patterns
+
+# Export all entries to .mdkb/memory/entries/ (one .md file per entry)
+mdkb memory export
+mdkb memory export --dir ./memories --include-expired --overwrite
+
+# Import from a markdown folder (auto-detected) or legacy JSON file
+mdkb memory import .mdkb/memory/entries --skip-duplicates
 mdkb memory import entries.json --dry-run --skip-duplicates
+```
+
+### Stats
+
+```bash
+# Unified ASCII diagnostic dashboard
+mdkb stats
+
+# Machine-readable JSON output
+mdkb stats --format json
+
+# Plain text (no ANSI color)
+mdkb stats --no-color
 ```
 
 ## Configuration
