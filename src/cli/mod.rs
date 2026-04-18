@@ -5,6 +5,7 @@ pub mod hooks;
 pub mod journal;
 pub mod memory_file;
 pub mod setup;
+pub mod stats_render;
 
 use clap::{Parser, Subcommand};
 
