@@ -26,7 +26,7 @@ fn second_acquire_returns_already_held() {
 
     match err {
         AcquireError::AlreadyHeld => {}
-        other => panic!("expected AlreadyHeld, got {other:?}"),
+        AcquireError::Io(e) => panic!("expected AlreadyHeld, got Io({e})"),
     }
 }
 

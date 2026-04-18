@@ -2008,6 +2008,7 @@ dependencies = [
  "globset",
  "gray_matter",
  "ignore",
+ "libc",
  "libmimalloc-sys",
  "mimalloc",
  "notify",

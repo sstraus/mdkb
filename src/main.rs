@@ -2022,13 +2022,18 @@ fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format:
 
 /// Run the mdkb daemon as a singleton.
 ///
-/// Acquires an exclusive advisory lock on `~/.mdkb/daemon.pid` (see
-/// [`mdkb::daemon::singleton`]). If another daemon already holds the lock
-/// this exits 0 with a message on stderr — the user's intent ("daemon is
-/// running") is already satisfied. On success it writes its pid and blocks
-/// on Ctrl-C. Later stories wire sockets, watcher, and registry.
+/// 1. Acquires `flock(LOCK_EX|LOCK_NB)` on `~/.mdkb/daemon.pid`. On contention,
+///    exits 0 with a message on stderr — the user's goal (daemon running) is met.
+/// 2. Writes pid into the lock file.
+/// 3. Starts IPC listeners (MCP + hook unix sockets) under `~/.mdkb/`.
+/// 4. Waits for SIGINT/SIGTERM, then signals the IPC server to unlink sockets
+///    and drops the lock guard. Watcher + registry wire-up arrives in Story 7.
 async fn run_daemon() -> Result<()> {
-    use mdkb::daemon::singleton::{AcquireError, acquire_singleton_lock, default_lock_path, read_pid};
+    use mdkb::daemon::ipc_server;
+    use mdkb::daemon::singleton::{
+        AcquireError, acquire_singleton_lock, default_lock_path, read_pid,
+    };
+    use tokio_util::sync::CancellationToken;
 
     let lock_path = default_lock_path();
 
@@ -2038,7 +2043,10 @@ async fn run_daemon() -> Result<()> {
             let pid = read_pid(&lock_path)
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "?".to_string());
-            eprintln!("mdkb daemon already running at pid {pid} ({})", lock_path.display());
+            eprintln!(
+                "mdkb daemon already running at pid {pid} ({})",
+                lock_path.display()
+            );
             return Ok(());
         }
         Err(e) => return Err(mdkb::Error::other(format!("daemon lock: {e}"))),
@@ -2048,14 +2056,58 @@ async fn run_daemon() -> Result<()> {
     guard
         .write_pid(pid)
         .map_err(|e| mdkb::Error::other(format!("daemon pid write: {e}")))?;
-    tracing::info!("mdkb daemon started (pid {pid}, lock {})", lock_path.display());
 
-    // Later stories replace this with socket listeners + watcher.
-    tokio::signal::ctrl_c()
-        .await
-        .map_err(|e| mdkb::Error::other(format!("signal handler: {e}")))?;
+    let base_dir = lock_path
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
 
-    tracing::info!("mdkb daemon received SIGINT, shutting down");
+    tracing::info!(
+        "mdkb daemon started (pid {pid}, base {})",
+        base_dir.display()
+    );
+
+    let shutdown = CancellationToken::new();
+    let ipc_shutdown = shutdown.clone();
+    let ipc_base = base_dir.clone();
+    let ipc_task = tokio::spawn(async move { ipc_server::serve(&ipc_base, ipc_shutdown).await });
+
+    // Wait for SIGINT or SIGTERM, whichever arrives first.
+    wait_for_shutdown_signal().await?;
+    tracing::info!("mdkb daemon received shutdown signal");
+
+    shutdown.cancel();
+    match ipc_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!("ipc server shutdown error: {e}"),
+        Err(e) => tracing::warn!("ipc server join error: {e}"),
+    }
+
     drop(guard);
     Ok(())
+}
+
+/// Wait for the first of SIGINT or SIGTERM. On platforms without SIGTERM
+/// (none, in practice) we fall back to SIGINT only.
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())
+            .map_err(|e| mdkb::Error::other(format!("sigterm handler: {e}")))?;
+        let mut int = signal(SignalKind::interrupt())
+            .map_err(|e| mdkb::Error::other(format!("sigint handler: {e}")))?;
+        tokio::select! {
+            _ = term.recv() => {},
+            _ = int.recv() => {},
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c()
+            .await
+            .map_err(|e| mdkb::Error::other(format!("signal handler: {e}")))
+    }
 }
