@@ -627,6 +627,20 @@ pub fn list_entries(
 /// Search memory entries using full-text search.
 pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
     let fts_query = crate::store::search::escape_fts5_query(query);
+    search_entries_fts(conn, &fts_query, limit)
+}
+
+/// Search memory entries using a pre-built FTS5 query expression.
+///
+/// Callers are responsible for producing a valid FTS5 query (including OR /
+/// NEAR / phrase operators). Use this when `escape_fts5_query`'s implicit-AND
+/// tokenization is too strict — e.g. for conversational prompts where any
+/// keyword match is acceptable.
+pub fn search_entries_fts(
+    conn: &Connection,
+    fts_query: &str,
+    limit: usize,
+) -> Result<Vec<MemoryEntry>> {
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
         "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at, m.due_at

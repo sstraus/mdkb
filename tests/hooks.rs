@@ -8,3 +8,6 @@ mod dispatch_test;
 
 #[path = "hooks/session_start_test.rs"]
 mod session_start_test;
+
+#[path = "hooks/user_prompt_submit_test.rs"]
+mod user_prompt_submit_test;

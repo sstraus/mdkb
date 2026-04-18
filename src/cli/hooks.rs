@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::cli::HookEvent;
 use crate::cli::handlers::Context;
 use crate::config::{Config, HooksConfig};
-use crate::store::memory::get_warmup_index;
+use crate::store::memory::{get_warmup_index, search_entries_fts};
 
 /// Entry point for `mdkb hook <event>`.
 ///
@@ -165,8 +165,142 @@ fn handle_session_start(_event: Value) -> Value {
     })
 }
 
-fn handle_user_prompt_submit(_event: Value) -> Value {
-    json!({})
+/// Markers that indicate the user is wrapping up / clearing context.
+/// Recall injection would be wasteful and disruptive at these points.
+const WRAPUP_MARKERS: &[&str] = &["/wrapup", "/clear", "/compact", "/exit", "/quit"];
+
+fn prompt_is_wrapup(prompt: &str) -> bool {
+    let trimmed = prompt.trim_start();
+    WRAPUP_MARKERS
+        .iter()
+        .any(|m| trimmed.starts_with(m) || trimmed.eq_ignore_ascii_case(m.trim_start_matches('/')))
+}
+
+/// Common English/Italian stopwords stripped before FTS matching.
+/// Conversational prompts contain many of these; leaving them in breaks
+/// AND-based FTS match because content/title entries don't include them.
+const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "or", "but", "the", "of", "to", "in", "on", "at", "by", "for", "with", "as",
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "can", "shall", "we", "you", "i", "he",
+    "she", "it", "they", "them", "us", "my", "your", "our", "their", "this", "that", "these",
+    "those", "how", "what", "why", "when", "where", "who", "which", "so", "if", "then", "than",
+    "about", "into", "from", "up", "down", "out", "over", "under", "not", "no", "yes", "il", "la",
+    "le", "lo", "gli", "un", "uno", "una", "di", "da", "del", "della", "che", "e", "o", "ma", "se",
+    "ci", "si", "mi", "ti", "per", "con", "su", "come", "quando", "perche", "cosa", "dove", "chi",
+    "quale", "non", "sono", "era", "stato",
+];
+
+/// Build an FTS5 query string from a natural-language prompt by stripping
+/// stopwords and keeping alphanumeric tokens ≥ 3 chars. Returns None when
+/// the filtered query would be empty or too narrow to produce useful recall.
+fn build_recall_query(prompt: &str) -> Option<String> {
+    let tokens: Vec<String> = prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter_map(|tok| {
+            let t = tok.to_lowercase();
+            if t.len() < 3 {
+                return None;
+            }
+            if STOPWORDS.contains(&t.as_str()) {
+                return None;
+            }
+            Some(t)
+        })
+        .collect();
+
+    if tokens.is_empty() {
+        return None;
+    }
+
+    // Join with OR so a conversational prompt matches on any keyword.
+    // Wrap each token in quotes to neutralize FTS operators inside.
+    let query = tokens
+        .iter()
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    Some(query)
+}
+
+fn handle_user_prompt_submit(event: Value) -> Value {
+    let start = Instant::now();
+    let cwd: PathBuf = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(_) => return json!({}),
+    };
+
+    let prompt = match event.get("prompt").and_then(|v| v.as_str()) {
+        Some(p) if !p.trim().is_empty() => p.to_string(),
+        _ => return json!({}),
+    };
+
+    if prompt_is_wrapup(&prompt) {
+        return json!({});
+    }
+
+    if mdkbignore_hooks_present(&cwd) {
+        return json!({});
+    }
+
+    if !cwd.join(".mdkb").is_dir() {
+        return json!({});
+    }
+
+    let cfg = hooks_config(&cwd);
+    if !cfg.user_prompt_submit_enabled {
+        return json!({});
+    }
+
+    let ctx = match Context::open(&cwd) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("user-prompt-submit hook: Context::open failed: {e}");
+            return json!({});
+        }
+    };
+
+    let fts_query = match build_recall_query(&prompt) {
+        Some(q) => q,
+        None => return json!({}),
+    };
+
+    let limit = cfg.recall_limit.max(1);
+    let results = match search_entries_fts(&ctx.conn, &fts_query, limit) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("user-prompt-submit hook: search_entries_fts failed: {e}");
+            return json!({});
+        }
+    };
+
+    if results.is_empty() {
+        return json!({});
+    }
+
+    let mut body = String::from("## mdkb: relevant context\n\n");
+    for entry in &results {
+        let snippet_raw = entry.content.trim().replace('\n', " ");
+        let snippet: String = snippet_raw.chars().take(160).collect();
+        body.push_str(&format!("- [{}] {} — {}\n", entry.id, entry.title, snippet));
+    }
+
+    let elapsed_ms = start.elapsed().as_millis();
+    if elapsed_ms > cfg.latency_budget_ms as u128 {
+        log_slow_hook(
+            &cwd,
+            "user-prompt-submit",
+            elapsed_ms,
+            cfg.latency_budget_ms,
+        );
+    }
+
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": body,
+        }
+    })
 }
 
 fn handle_post_tool_use(_event: Value) -> Value {
