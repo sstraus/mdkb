@@ -624,6 +624,22 @@ pub fn list_entries(
     list_entries_sorted(conn, limit, MemorySortOrder::Popular, status_filter)
 }
 
+/// List all entries including expired ones. Used by the export handler.
+pub fn list_entries_all(conn: &Connection) -> Result<Vec<MemoryEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at,
+                superseded_by, access_count, last_accessed, source_path, confirmations,
+                last_confirmed_at, source_type, expires_at, due_at
+         FROM memory_entries ORDER BY id",
+    )?;
+    let rows = stmt.query_map([], row_to_entry)?;
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+    Ok(entries)
+}
+
 /// Search memory entries using full-text search.
 pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
     let fts_query = crate::store::search::escape_fts5_query(query);

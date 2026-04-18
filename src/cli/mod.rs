@@ -457,9 +457,28 @@ pub enum MemoryCommand {
         id: String,
     },
 
-    /// Import memory entries from JSON file
+    /// Export memory entries to a folder of markdown files
+    Export {
+        /// Output directory (default: .mdkb/memory/entries)
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+
+        /// Include expired entries
+        #[arg(long)]
+        include_expired: bool,
+
+        /// Overwrite existing files
+        #[arg(long)]
+        overwrite: bool,
+
+        /// Show what would be exported without writing
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Import memory entries from a JSON file or markdown folder
     Import {
-        /// Path to JSON file
+        /// Path to JSON file or markdown directory
         path: String,
 
         /// Show what would be imported without saving

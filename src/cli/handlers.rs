@@ -1497,6 +1497,162 @@ pub struct ImportResult {
     pub errors: Vec<String>,
 }
 
+/// Result of a memory export operation.
+#[derive(Debug)]
+pub struct ExportResult {
+    pub exported: usize,
+    pub skipped: usize,
+    pub errors: Vec<String>,
+}
+
+/// Export all memory entries to `<dir>/<id>.md` files with YAML frontmatter.
+pub fn handle_memory_export(
+    ctx: &Context,
+    dir: &Path,
+    include_expired: bool,
+    overwrite: bool,
+    dry_run: bool,
+) -> Result<ExportResult> {
+    let now = chrono::Utc::now().timestamp();
+    let entries = memory::list_entries_all(&ctx.conn)?;
+
+    let mut result = ExportResult { exported: 0, skipped: 0, errors: Vec::new() };
+
+    if !dry_run {
+        std::fs::create_dir_all(dir).map_err(|e| ErrorKind::Io {
+            path: dir.to_path_buf(),
+            operation: format!("create_dir_all: {e}"),
+        })?;
+    }
+
+    for entry in &entries {
+        let is_expired = entry.expires_at.map(|t| t <= now).unwrap_or(false);
+        if is_expired && !include_expired {
+            result.skipped += 1;
+            continue;
+        }
+
+        let dest = dir.join(format!("{}.md", entry.id));
+
+        if !overwrite && dest.exists() {
+            result.skipped += 1;
+            continue;
+        }
+
+        if dry_run {
+            result.exported += 1;
+            continue;
+        }
+
+        let text = crate::cli::memory_file::to_markdown(entry);
+        std::fs::write(&dest, text).map_err(|e| ErrorKind::Io {
+            path: dest.clone(),
+            operation: format!("write: {e}"),
+        })?;
+        result.exported += 1;
+    }
+
+    Ok(result)
+}
+
+/// Import memory entries from a directory of `.md` files with YAML frontmatter.
+pub fn handle_memory_import_dir(
+    ctx: &Context,
+    dir: &Path,
+    dry_run: bool,
+    skip_duplicates: bool,
+) -> Result<ImportResult> {
+    let mut result = ImportResult { imported: 0, skipped: 0, errors: Vec::new() };
+
+    let read_dir = std::fs::read_dir(dir).map_err(|e| ErrorKind::Io {
+        path: dir.to_path_buf(),
+        operation: format!("read_dir: {e}"),
+    })?;
+
+    let mut paths: Vec<std::path::PathBuf> = read_dir
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("md"))
+        .collect();
+    paths.sort();
+
+    for path in &paths {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) => {
+                result.errors.push(format!("{}: read error: {e}", path.display()));
+                continue;
+            }
+        };
+
+        let mf = match crate::cli::memory_file::from_markdown(&text) {
+            Ok(mf) => mf,
+            Err(e) => {
+                result.errors.push(format!("{}: parse error: {e}", path.display()));
+                continue;
+            }
+        };
+
+        let id = mf.meta.id.clone();
+
+        if let Err(e) = memory::validate_entry_input(&mf.meta.id, &mf.meta.title, &mf.meta.tags, &mf.content) {
+            result.errors.push(format!("{id}: {e}"));
+            continue;
+        }
+
+        if memory::get_entry_without_tracking(&ctx.conn, &id)?.is_some() {
+            if skip_duplicates {
+                result.skipped += 1;
+            } else {
+                result.errors.push(format!("{id}: already exists (use --skip-duplicates to ignore)"));
+            }
+            continue;
+        }
+
+        if dry_run {
+            result.imported += 1;
+            continue;
+        }
+
+        // Build entry, resetting derived counters.
+        let now = chrono::Utc::now().timestamp();
+        let entry = MemoryEntry {
+            id: mf.meta.id.clone(),
+            title: mf.meta.title.clone(),
+            content: mf.content.clone(),
+            entry_type: mf.meta.entry_type,
+            tags: mf.meta.tags.clone(),
+            status: mf.meta.status,
+            created_at: mf.meta.created_at.unwrap_or(now),
+            updated_at: mf.meta.updated_at.unwrap_or(now),
+            superseded_by: mf.meta.superseded_by.clone(),
+            source_path: mf.meta.source_path.clone(),
+            source_type: mf.meta.source_type,
+            expires_at: mf.meta.expires_at,
+            due_at: mf.meta.due_at,
+            // Derived counters reset on import.
+            access_count: 0,
+            last_accessed: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+        };
+
+        memory::add_entry(&ctx.conn, &entry)?;
+        if let Err(e) = save_entry_to_disk(ctx, &entry) {
+            tracing::warn!("Failed to save imported entry {id} to disk: {e}");
+        }
+        result.imported += 1;
+    }
+
+    if !dry_run && result.imported > 0 {
+        if let Err(e) = generate_memory_index(ctx) {
+            tracing::warn!("Failed to regenerate memory index: {e}");
+        }
+    }
+
+    Ok(result)
+}
+
 /// Handle `mdkb memory import` command.
 pub fn handle_memory_import(
     ctx: &Context,

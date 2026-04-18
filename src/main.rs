@@ -22,7 +22,8 @@ use mdkb::cli::handlers::{
     handle_evolve_supersedes, handle_evolve_updates, handle_experiment_cancel,
     handle_experiment_create, handle_experiment_end, handle_experiment_list,
     handle_experiment_status, handle_get, handle_history, handle_hybrid_search, handle_init,
-    handle_memory_add, handle_memory_import, handle_memory_list, handle_memory_prune,
+    handle_memory_add, handle_memory_export, handle_memory_import, handle_memory_import_dir,
+    handle_memory_list, handle_memory_prune,
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
     handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
     handle_session_index, handle_stats, handle_status, handle_superseded_by, handle_update,
@@ -433,12 +434,44 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                MemoryCommand::Export {
+                    dir,
+                    include_expired,
+                    overwrite,
+                    dry_run,
+                } => {
+                    let mdkb_dir = ctx.db_path.parent().expect("db_path has parent");
+                    let out_dir = dir.unwrap_or_else(|| mdkb_dir.join("memory/entries"));
+                    let result = handle_memory_export(
+                        &ctx,
+                        &out_dir,
+                        include_expired,
+                        overwrite,
+                        dry_run,
+                    )?;
+                    if dry_run {
+                        println!("Dry run: would export {} entries", result.exported);
+                    } else {
+                        println!("Exported {}", result.exported);
+                    }
+                    if result.skipped > 0 {
+                        println!("Skipped {} (already exist)", result.skipped);
+                    }
+                    for err in &result.errors {
+                        eprintln!("Error: {err}");
+                    }
+                }
                 MemoryCommand::Import {
                     path,
                     dry_run,
                     skip_duplicates,
                 } => {
-                    let result = handle_memory_import(&ctx, &path, dry_run, skip_duplicates)?;
+                    let p = std::path::Path::new(&path);
+                    let result = if p.is_dir() {
+                        handle_memory_import_dir(&ctx, p, dry_run, skip_duplicates)?
+                    } else {
+                        handle_memory_import(&ctx, &path, dry_run, skip_duplicates)?
+                    };
                     if dry_run {
                         println!("Dry run: would import {} entries", result.imported);
                     } else {
