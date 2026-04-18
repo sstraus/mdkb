@@ -129,6 +129,12 @@ pub enum Command {
         /// Config loaded from ~/.mdkb/daemon.toml (whitelist, max_active_repos).
         #[arg(long)]
         global: bool,
+
+        /// Run as persistent singleton daemon. Acquires an exclusive advisory
+        /// lock on ~/.mdkb/daemon.pid so only one instance runs at a time.
+        /// A second invocation exits 0 with a message on stderr.
+        #[arg(long)]
+        daemon: bool,
     },
 
     /// Show diagnostic statistics (index health, memory, code, sessions, hooks)

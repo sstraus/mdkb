@@ -278,8 +278,11 @@ async fn main() -> Result<()> {
             bind,
             token,
             global,
+            daemon,
         } => {
-            if global {
+            if daemon {
+                run_daemon().await?;
+            } else if global {
                 // Global mode: single process serving multiple repos via MCP roots
                 let daemon_config =
                     mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())?;
@@ -2015,4 +2018,44 @@ fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format:
             }
         }
     }
+}
+
+/// Run the mdkb daemon as a singleton.
+///
+/// Acquires an exclusive advisory lock on `~/.mdkb/daemon.pid` (see
+/// [`mdkb::daemon::singleton`]). If another daemon already holds the lock
+/// this exits 0 with a message on stderr — the user's intent ("daemon is
+/// running") is already satisfied. On success it writes its pid and blocks
+/// on Ctrl-C. Later stories wire sockets, watcher, and registry.
+async fn run_daemon() -> Result<()> {
+    use mdkb::daemon::singleton::{AcquireError, acquire_singleton_lock, default_lock_path, read_pid};
+
+    let lock_path = default_lock_path();
+
+    let mut guard = match acquire_singleton_lock(&lock_path) {
+        Ok(g) => g,
+        Err(AcquireError::AlreadyHeld) => {
+            let pid = read_pid(&lock_path)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".to_string());
+            eprintln!("mdkb daemon already running at pid {pid} ({})", lock_path.display());
+            return Ok(());
+        }
+        Err(e) => return Err(mdkb::Error::other(format!("daemon lock: {e}"))),
+    };
+
+    let pid = std::process::id();
+    guard
+        .write_pid(pid)
+        .map_err(|e| mdkb::Error::other(format!("daemon pid write: {e}")))?;
+    tracing::info!("mdkb daemon started (pid {pid}, lock {})", lock_path.display());
+
+    // Later stories replace this with socket listeners + watcher.
+    tokio::signal::ctrl_c()
+        .await
+        .map_err(|e| mdkb::Error::other(format!("signal handler: {e}")))?;
+
+    tracing::info!("mdkb daemon received SIGINT, shutting down");
+    drop(guard);
+    Ok(())
 }

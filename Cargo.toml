@@ -39,6 +39,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # Concurrent collections
 dashmap = "6"
 
+# Advisory file locking (daemon singleton)
+fs4 = "0.12"
+
 # MCP protocol
 rmcp = { version = "0.14", features = ["server", "transport-io"] }
 
