@@ -581,6 +581,10 @@ pub enum SetupCommand {
     /// Register mdkb as an MCP server
     #[command(subcommand)]
     Mcp(SetupMcpCommand),
+
+    /// Register mdkb lifecycle hooks
+    #[command(subcommand)]
+    Hooks(SetupHooksCommand),
 }
 
 /// MCP setup subcommands.
@@ -595,6 +599,25 @@ pub enum SetupMcpCommand {
         /// Skip confirmation prompt
         #[arg(short, long)]
         yes: bool,
+    },
+}
+
+/// Hooks setup subcommands.
+#[derive(Subcommand, Debug)]
+pub enum SetupHooksCommand {
+    /// Register lifecycle hooks with Claude Code
+    Claude {
+        /// Scope: local writes .claude/settings.local.json; user writes ~/.claude/settings.json
+        #[arg(short, long, default_value = "local")]
+        scope: String,
+
+        /// Comma-separated list of events to skip (session-start, user-prompt-submit, post-tool-use)
+        #[arg(long, default_value = "")]
+        disable: String,
+
+        /// Print the merged settings to stdout without writing
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

@@ -210,6 +210,15 @@ pub fn handle_setup_mcp_claude(
 /// 1. Current executable path (if running from cargo or installed binary)
 /// 2. PATH lookup
 fn find_mdkb_binary() -> Result<String> {
+    // Test / CI override — lets integration tests point at the built `mdkb`
+    // bin under target/debug without polluting PATH.
+    if let Some(override_path) = env::var_os("MDKB_BINARY_OVERRIDE") {
+        let s = override_path.to_string_lossy().to_string();
+        if !s.is_empty() {
+            return Ok(s);
+        }
+    }
+
     // Try current executable first
     if let Ok(exe) = env::current_exe() {
         let exe_name = exe.file_name().map(|n| n.to_string_lossy().to_string());
@@ -250,6 +259,211 @@ fn find_mdkb_binary() -> Result<String> {
     }))
 }
 
+/// Result of hooks setup operation.
+#[derive(Debug)]
+pub struct HooksSetupResult {
+    pub success: bool,
+    pub settings_path: std::path::PathBuf,
+    pub events_registered: Vec<String>,
+    pub events_skipped: Vec<String>,
+    pub dry_run: bool,
+    pub merged_json: serde_json::Value,
+    pub message: String,
+}
+
+/// Three events currently emitted by `mdkb hook`.
+pub const HOOK_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "user-prompt-submit"),
+    ("PostToolUse", "post-tool-use"),
+];
+
+/// Resolve the Claude Code settings path for the given scope.
+/// - `local`: `<cwd>/.claude/settings.local.json`
+/// - `user`:  `$HOME/.claude/settings.json`
+pub fn claude_settings_path(cwd: &Path, scope: &str) -> Result<std::path::PathBuf> {
+    match scope {
+        "local" | "project" => Ok(cwd.join(".claude").join("settings.local.json")),
+        "user" | "global" => {
+            let home = env::var_os("HOME").ok_or_else(|| {
+                Error::from(ErrorKind::Command {
+                    command: "setup hooks claude".to_string(),
+                    message: "HOME environment variable not set".to_string(),
+                })
+            })?;
+            Ok(std::path::PathBuf::from(home)
+                .join(".claude")
+                .join("settings.json"))
+        }
+        other => Err(Error::from(ErrorKind::Command {
+            command: "setup hooks claude".to_string(),
+            message: format!("Invalid scope '{other}'. Must be 'local' or 'user'."),
+        })),
+    }
+}
+
+/// Parse the comma-separated --disable flag into a normalized set of event names.
+/// Accepts both canonical ("SessionStart") and kebab-case ("session-start").
+pub fn parse_disabled_events(raw: &str) -> std::collections::HashSet<String> {
+    raw.split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| match s.to_ascii_lowercase().as_str() {
+            "sessionstart" | "session-start" => "SessionStart".to_string(),
+            "userpromptsubmit" | "user-prompt-submit" => "UserPromptSubmit".to_string(),
+            "posttooluse" | "post-tool-use" => "PostToolUse".to_string(),
+            other => other.to_string(),
+        })
+        .collect()
+}
+
+/// Register Claude Code lifecycle hooks idempotently.
+///
+/// Writes into `.claude/settings.local.json` (local scope) or
+/// `~/.claude/settings.json` (user scope). Existing non-mdkb hooks are
+/// preserved; entries tagged `_managedBy: "mdkb"` are replaced rather than
+/// duplicated so repeated invocation is safe.
+pub fn handle_setup_hooks_claude(
+    cwd: &Path,
+    scope: &str,
+    disable: &str,
+    dry_run: bool,
+) -> Result<HooksSetupResult> {
+    let settings_path = claude_settings_path(cwd, scope)?;
+    let binary_path = find_mdkb_binary()?;
+    let disabled = parse_disabled_events(disable);
+
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let raw = std::fs::read_to_string(&settings_path).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: settings_path.clone(),
+                operation: format!("read settings: {e}"),
+            })
+        })?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw).map_err(|e| {
+                Error::from(ErrorKind::Command {
+                    command: "setup hooks claude".to_string(),
+                    message: format!("failed to parse {}: {e}", settings_path.display()),
+                })
+            })?
+        }
+    } else {
+        serde_json::json!({})
+    };
+
+    if !settings.is_object() {
+        return Err(Error::from(ErrorKind::Command {
+            command: "setup hooks claude".to_string(),
+            message: "settings file root must be a JSON object".to_string(),
+        }));
+    }
+
+    let hooks_root = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    if !hooks_root.is_object() {
+        *hooks_root = serde_json::json!({});
+    }
+
+    let mut registered = Vec::new();
+    let mut skipped = Vec::new();
+
+    for (event_name, cli_event) in HOOK_EVENTS {
+        if disabled.contains(*event_name) {
+            skipped.push((*event_name).to_string());
+            continue;
+        }
+
+        let command = format!("{} hook {}", binary_path, cli_event);
+        let mdkb_entry = serde_json::json!({
+            "_managedBy": "mdkb",
+            "hooks": [{
+                "type": "command",
+                "command": command,
+            }]
+        });
+
+        let entry_list = hooks_root
+            .as_object_mut()
+            .unwrap()
+            .entry((*event_name).to_string())
+            .or_insert_with(|| serde_json::json!([]));
+
+        let arr = match entry_list.as_array_mut() {
+            Some(a) => a,
+            None => {
+                *entry_list = serde_json::json!([]);
+                entry_list.as_array_mut().unwrap()
+            }
+        };
+
+        arr.retain(|item| {
+            item.get("_managedBy")
+                .and_then(|v| v.as_str())
+                .map(|s| s != "mdkb")
+                .unwrap_or(true)
+        });
+        arr.push(mdkb_entry);
+
+        registered.push((*event_name).to_string());
+    }
+
+    let merged_json = settings.clone();
+
+    if dry_run {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&settings).unwrap_or_default()
+        );
+        return Ok(HooksSetupResult {
+            success: true,
+            settings_path,
+            events_registered: registered,
+            events_skipped: skipped,
+            dry_run: true,
+            merged_json,
+            message: "Dry run: no changes written".to_string(),
+        });
+    }
+
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: parent.to_path_buf(),
+                operation: format!("create parent dir: {e}"),
+            })
+        })?;
+    }
+
+    let serialized = serde_json::to_string_pretty(&settings).map_err(|e| {
+        Error::from(ErrorKind::Command {
+            command: "setup hooks claude".to_string(),
+            message: format!("serialize settings: {e}"),
+        })
+    })?;
+    std::fs::write(&settings_path, serialized).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: settings_path.clone(),
+            operation: format!("write settings: {e}"),
+        })
+    })?;
+
+    Ok(HooksSetupResult {
+        success: true,
+        settings_path,
+        events_registered: registered,
+        events_skipped: skipped,
+        dry_run: false,
+        merged_json,
+        message: "Hooks registered".to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +472,25 @@ mod tests {
     fn test_mcp_scope_display() {
         assert_eq!(format!("{}", McpScope::Global), "global");
         assert_eq!(format!("{}", McpScope::Local), "local");
+    }
+
+    #[test]
+    fn test_parse_disabled_events_empty() {
+        assert!(parse_disabled_events("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_disabled_events_kebab_and_canonical() {
+        let set = parse_disabled_events("session-start, PostToolUse");
+        assert!(set.contains("SessionStart"));
+        assert!(set.contains("PostToolUse"));
+        assert_eq!(set.len(), 2);
+    }
+
+    #[test]
+    fn test_claude_settings_path_local() {
+        let cwd = std::path::Path::new("/tmp/project");
+        let p = claude_settings_path(cwd, "local").unwrap();
+        assert_eq!(p, cwd.join(".claude").join("settings.local.json"));
     }
 }

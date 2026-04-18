@@ -32,7 +32,8 @@ use mdkb::cli::hooks;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
     Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand,
-    MemoryCommand, MetricsCommand, OutputFormat, SessionCommand, SetupCommand, SetupMcpCommand,
+    MemoryCommand, MetricsCommand, OutputFormat, SessionCommand, SetupCommand, SetupHooksCommand,
+    SetupMcpCommand,
 };
 use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
@@ -666,6 +667,27 @@ async fn main() -> Result<()> {
                         println!("Restart Claude Code to activate the mdkb MCP server.");
                     } else {
                         println!("{}", result.message);
+                    }
+                }
+            },
+            SetupCommand::Hooks(hooks_cmd) => match hooks_cmd {
+                SetupHooksCommand::Claude {
+                    scope,
+                    disable,
+                    dry_run,
+                } => {
+                    let result = mdkb::cli::setup::handle_setup_hooks_claude(
+                        &cwd, &scope, &disable, dry_run,
+                    )?;
+                    if !result.dry_run {
+                        if !result.events_registered.is_empty() {
+                            println!("Registered hooks: {}", result.events_registered.join(", "));
+                        }
+                        if !result.events_skipped.is_empty() {
+                            println!("Skipped: {}", result.events_skipped.join(", "));
+                        }
+                        println!("Wrote: {}", result.settings_path.display());
+                        println!("Opt out per-directory with .mdkbignore-hooks");
                     }
                 }
             },
