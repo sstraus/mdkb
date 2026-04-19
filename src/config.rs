@@ -666,7 +666,16 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
     use super::*;
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_default_config() {
@@ -815,58 +824,37 @@ default_limit = 20
 
     #[test]
     fn test_env_override_search_limit() {
-        // SAFETY: Test environment, single-threaded execution
-        unsafe {
-            std::env::set_var("MDKB_SEARCH_DEFAULT_LIMIT", "25");
-        }
+        let _guard = env_lock();
+        unsafe { std::env::set_var("MDKB_SEARCH_DEFAULT_LIMIT", "25") };
         let config = Config::from_env_with_defaults();
-        unsafe {
-            std::env::remove_var("MDKB_SEARCH_DEFAULT_LIMIT");
-        }
-
+        unsafe { std::env::remove_var("MDKB_SEARCH_DEFAULT_LIMIT") };
         assert_eq!(config.search.default_limit, 25);
     }
 
     #[test]
     fn test_env_override_indexing_debounce() {
-        // SAFETY: Test environment, single-threaded execution
-        unsafe {
-            std::env::set_var("MDKB_INDEXING_DEBOUNCE_MS", "500");
-        }
+        let _guard = env_lock();
+        unsafe { std::env::set_var("MDKB_INDEXING_DEBOUNCE_MS", "500") };
         let config = Config::from_env_with_defaults();
-        unsafe {
-            std::env::remove_var("MDKB_INDEXING_DEBOUNCE_MS");
-        }
-
+        unsafe { std::env::remove_var("MDKB_INDEXING_DEBOUNCE_MS") };
         assert_eq!(config.indexing.debounce_ms, 500);
     }
 
     #[test]
     fn test_env_override_memory_warmup_limit() {
-        // SAFETY: Test environment, single-threaded execution
-        unsafe {
-            std::env::set_var("MDKB_MEMORY_WARMUP_LIMIT", "100");
-        }
+        let _guard = env_lock();
+        unsafe { std::env::set_var("MDKB_MEMORY_WARMUP_LIMIT", "100") };
         let config = Config::from_env_with_defaults();
-        unsafe {
-            std::env::remove_var("MDKB_MEMORY_WARMUP_LIMIT");
-        }
-
+        unsafe { std::env::remove_var("MDKB_MEMORY_WARMUP_LIMIT") };
         assert_eq!(config.memory.warmup_limit, 100);
     }
 
     #[test]
     fn test_env_override_invalid_value_uses_default() {
-        // SAFETY: Test environment, single-threaded execution
-        unsafe {
-            std::env::set_var("MDKB_SEARCH_DEFAULT_LIMIT", "not_a_number");
-        }
+        let _guard = env_lock();
+        unsafe { std::env::set_var("MDKB_SEARCH_DEFAULT_LIMIT", "not_a_number") };
         let config = Config::from_env_with_defaults();
-        unsafe {
-            std::env::remove_var("MDKB_SEARCH_DEFAULT_LIMIT");
-        }
-
-        // Should fall back to default when parse fails
+        unsafe { std::env::remove_var("MDKB_SEARCH_DEFAULT_LIMIT") };
         assert_eq!(config.search.default_limit, 10);
     }
 
