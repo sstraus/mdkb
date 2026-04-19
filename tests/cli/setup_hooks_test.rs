@@ -219,3 +219,39 @@ fn preserves_non_mdkb_hook_entries() {
         "untagged PostToolUse entry must survive"
     );
 }
+
+/// Generated command must route through the daemon (`mdkb hook <event>`)
+/// and fall back to the in-process path on failure (`MDKB_NO_DAEMON=1 …`).
+/// This is the story 016 contract — legacy raw-CLI invocations are gone.
+#[test]
+fn generated_command_has_daemon_then_fallback_guard() {
+    let (_guard, project, _home) = isolated_project();
+
+    handle_setup_hooks_claude(project.path(), "local", "", false).expect("setup hooks ok");
+    let v = read_json(&local_settings_path(project.path()));
+
+    for (event_name, cli_event) in HOOK_EVENTS {
+        let managed = mdkb_entries(&v, event_name);
+        let cmd = managed[0]
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("command"))
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+
+        let expected_primary = format!("hook {cli_event}");
+        assert!(
+            cmd.contains(&expected_primary),
+            "{event_name}: primary invocation missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("MDKB_NO_DAEMON=1"),
+            "{event_name}: MDKB_NO_DAEMON=1 fallback missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("if !") && cmd.contains("; fi"),
+            "{event_name}: fallback must be wrapped in `if ! …; then …; fi`: {cmd}"
+        );
+    }
+}

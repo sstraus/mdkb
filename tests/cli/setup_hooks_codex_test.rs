@@ -228,3 +228,37 @@ fn reports_codex_hooks_flag_present_when_configured() {
         "config.toml with codex_hooks=true must report flag as present"
     );
 }
+
+/// Codex-side: same story 016 contract — daemon path first, `MDKB_NO_DAEMON=1`
+/// fallback second, wrapped in `if ! …; then …; fi`.
+#[test]
+fn codex_generated_command_has_daemon_then_fallback_guard() {
+    let (_guard, _project, home) = isolated_project();
+
+    handle_setup_hooks_codex("", false).expect("setup hooks codex ok");
+    let v = read_json(&codex_hooks_path(home.path()));
+
+    for (event_name, cli_event) in HOOK_EVENTS {
+        let managed = mdkb_entries(&v, event_name);
+        let cmd = managed[0]
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("command"))
+            .and_then(|c| c.as_str())
+            .unwrap_or_default();
+
+        assert!(
+            cmd.contains(&format!("hook {cli_event}")),
+            "{event_name}: primary invocation missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("MDKB_NO_DAEMON=1"),
+            "{event_name}: MDKB_NO_DAEMON=1 fallback missing: {cmd}"
+        );
+        assert!(
+            cmd.contains("if !") && cmd.contains("; fi"),
+            "{event_name}: fallback must be wrapped in `if ! …; then …; fi`: {cmd}"
+        );
+    }
+}

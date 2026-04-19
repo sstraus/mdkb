@@ -281,6 +281,21 @@ pub const HOOK_EVENTS: &[(&str, &str)] = &[
     ("PostToolUse", "post-tool-use"),
 ];
 
+/// Shell command written into Claude/Codex settings for a lifecycle event.
+///
+/// Primary path goes through the daemon via `mdkb hook <event>`. If that
+/// call fails (daemon missing or a transient auto-spawn error), the shell
+/// falls through to `MDKB_NO_DAEMON=1 mdkb hook <event>` which runs the
+/// same dispatch in-process. Both branches exit 0, so the host CLI is
+/// never blocked by mdkb.
+pub fn hook_command_line(binary_path: &str, cli_event: &str) -> String {
+    format!(
+        "if ! {bin} hook {event}; then MDKB_NO_DAEMON=1 {bin} hook {event}; fi",
+        bin = binary_path,
+        event = cli_event,
+    )
+}
+
 /// Resolve the Claude Code settings path for the given scope.
 /// - `local`: `<cwd>/.claude/settings.local.json`
 /// - `user`:  `$HOME/.claude/settings.json`
@@ -382,7 +397,7 @@ pub fn handle_setup_hooks_claude(
             continue;
         }
 
-        let command = format!("{} hook {}", binary_path, cli_event);
+        let command = hook_command_line(&binary_path, cli_event);
         let mdkb_entry = serde_json::json!({
             "_managedBy": "mdkb",
             "hooks": [{
@@ -574,7 +589,7 @@ pub fn handle_setup_hooks_codex(disable: &str, dry_run: bool) -> Result<HooksSet
             continue;
         }
 
-        let command = format!("{} hook {}", binary_path, cli_event);
+        let command = hook_command_line(&binary_path, cli_event);
         let mdkb_entry = serde_json::json!({
             "_managedBy": "mdkb",
             "hooks": [{
