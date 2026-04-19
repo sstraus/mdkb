@@ -130,11 +130,7 @@ fn handle_session_start(_event: Value) -> Value {
         }
     };
 
-    let limit = if cfg.recall_limit > 0 {
-        cfg.recall_limit.max(20)
-    } else {
-        50
-    };
+    let limit = cfg.warmup_limit.max(1);
     let lines = match get_warmup_index(&ctx.conn, limit) {
         Ok(l) => l,
         Err(e) => {

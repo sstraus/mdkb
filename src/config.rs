@@ -325,6 +325,9 @@ pub struct HooksConfig {
     pub user_prompt_submit_enabled: bool,
     pub post_tool_use_enabled: bool,
 
+    /// Maximum number of entries injected on SessionStart (warmup).
+    pub warmup_limit: usize,
+
     /// Maximum number of recall results injected on UserPromptSubmit.
     pub recall_limit: usize,
 
@@ -341,6 +344,7 @@ impl Default for HooksConfig {
             session_start_enabled: true,
             user_prompt_submit_enabled: true,
             post_tool_use_enabled: true,
+            warmup_limit: 50,
             recall_limit: 5,
             latency_budget_ms: 200,
             min_recall_score: 0.3,
@@ -692,6 +696,23 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.search.default_limit, parsed.search.default_limit);
+    }
+
+    #[test]
+    fn test_hooks_config_defaults() {
+        let cfg = HooksConfig::default();
+        // warmup_limit controls session-start; recall_limit controls user-prompt-submit
+        assert_eq!(cfg.warmup_limit, 50);
+        assert_eq!(cfg.recall_limit, 5);
+    }
+
+    #[test]
+    fn test_hooks_config_roundtrip() {
+        let config = Config::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(config.hooks.warmup_limit, parsed.hooks.warmup_limit);
+        assert_eq!(config.hooks.recall_limit, parsed.hooks.recall_limit);
     }
 
     // ==================== Models Config Tests ====================
