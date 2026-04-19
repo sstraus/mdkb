@@ -489,13 +489,11 @@ impl IndexFacade {
             })
             .collect();
 
+        let rel_path_strs: Vec<&str> = rel_paths.iter().map(|s| s.as_str()).collect();
         let symbols: Vec<Symbol> = self
             .db
-            .all_symbols()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|s| rel_paths.contains(&*s.file_path))
-            .collect();
+            .symbols_for_files(&rel_path_strs)
+            .unwrap_or_default();
 
         if symbols.is_empty() {
             return;

@@ -356,6 +356,31 @@ impl CodeDb {
         rows.collect()
     }
 
+    /// Get symbols whose `file_path` is in `paths`.
+    ///
+    /// Chunks into groups of 999 to stay within SQLite's variable limit.
+    pub fn symbols_for_files(&self, paths: &[&str]) -> rusqlite::Result<Vec<Symbol>> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut result = Vec::new();
+        for chunk in paths.chunks(999) {
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "{SYMBOL_COLUMNS} FROM code_symbols WHERE file_path IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let sql_params: Vec<&dyn rusqlite::types::ToSql> =
+                chunk.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            let rows = stmt.query_map(sql_params.as_slice(), |row| row_to_symbol(row))?;
+            for row in rows {
+                result.push(row?);
+            }
+        }
+        Ok(result)
+    }
+
     /// Batch lookup of symbols by their IDs.
     pub fn get_symbols_batch(&self, ids: &[i64]) -> rusqlite::Result<HashMap<i64, Symbol>> {
         if ids.is_empty() {
