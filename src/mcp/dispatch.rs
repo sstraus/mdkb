@@ -248,6 +248,10 @@ pub async fn memory_confirm_impl(
 /// `memory_write_impl` and `memory_write_batch_impl`. Synchronous because it
 /// runs against an already-locked `Connection`; embedding I/O is best-effort
 /// and falls back silently when the LLM service is unconfigured (tests).
+///
+/// `embedding` must be pre-computed by the async caller **before** the ctx
+/// lock is acquired so that CPU-bound ONNX inference never blocks the tokio
+/// executor while holding the Mutex guard.
 fn write_single_memory(
     conn: &rusqlite::Connection,
     id: &str,
@@ -258,6 +262,7 @@ fn write_single_memory(
     tags: &[String],
     ttl: Option<u64>,
     due_in: Option<u64>,
+    embedding: Option<Vec<f32>>,
 ) -> Result<String, McpError> {
     memory::validate_entry_input(id, title, tags, content).map_err(|e| mcp_error(e.to_string()))?;
 
@@ -280,25 +285,21 @@ fn write_single_memory(
 
     // Pre-write duplicate check: reject if a near-identical entry exists (new entries only).
     // L2 distance < 0.32 ≈ cosine similarity > 0.95 — very high bar, minimizes false positives.
+    // Uses the pre-computed embedding passed in by the async caller (computed outside the lock).
     if is_new {
-        if let Ok(service) = crate::llm::get_cached_service() {
-            let embed_text = format!("{title} {content}");
-            if let Ok(embedding) = service.embed_query(&embed_text) {
-                if let Ok(similar) =
-                    crate::store::vectors::memory_vector_search(conn, &embedding, 3)
-                {
-                    for (rowid, distance) in &similar {
-                        if *distance < 0.32 {
-                            if let Ok(Some(dup)) = memory::get_entry_by_rowid(conn, *rowid) {
-                                let similarity = 1.0 - (*distance as f64 * *distance as f64 / 2.0);
-                                return Err(mcp_error(format!(
-                                    "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
-                                     Update that entry instead, or use a more distinct title/content.",
-                                    dup.title,
-                                    dup.id,
-                                    similarity * 100.0
-                                )));
-                            }
+        if let Some(ref emb) = embedding {
+            if let Ok(similar) = crate::store::vectors::memory_vector_search(conn, emb, 3) {
+                for (rowid, distance) in &similar {
+                    if *distance < 0.32 {
+                        if let Ok(Some(dup)) = memory::get_entry_by_rowid(conn, *rowid) {
+                            let similarity = 1.0 - (*distance as f64 * *distance as f64 / 2.0);
+                            return Err(mcp_error(format!(
+                                "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
+                                 Update that entry instead, or use a more distinct title/content.",
+                                dup.title,
+                                dup.id,
+                                similarity * 100.0
+                            )));
                         }
                     }
                 }
@@ -363,29 +364,23 @@ fn write_single_memory(
         format!("Created memory entry: {id}")
     };
 
-    // Generate embedding for hybrid search + duplicate detection
-    if let Ok(service) = crate::llm::get_cached_service() {
-        let embed_text = format!("{title} {content}");
-        match service.embed_query(&embed_text) {
-            Ok(embedding) => {
-                if let Some(rowid) = memory::get_rowid(conn, id).unwrap_or(None) {
-                    if let Err(e) = crate::store::vectors::store_memory_embedding(
-                        conn,
-                        rowid,
-                        &embedding,
-                        crate::llm::embeddings::MODEL_NAME,
-                    ) {
-                        tracing::warn!("Failed to store memory embedding for '{id}': {e}");
-                    }
-
-                    if is_new {
-                        let warnings = memory::find_similar_entries(conn, &embedding, rowid, id);
-                        output.push_str(&warnings);
-                    }
-                }
+    // Store the pre-computed embedding and append similarity warnings.
+    // The embedding was computed outside the lock by the async caller to avoid
+    // blocking the tokio executor during CPU-bound ONNX inference.
+    if let Some(ref emb) = embedding {
+        if let Some(rowid) = memory::get_rowid(conn, id).unwrap_or(None) {
+            if let Err(e) = crate::store::vectors::store_memory_embedding(
+                conn,
+                rowid,
+                emb,
+                crate::llm::embeddings::MODEL_NAME,
+            ) {
+                tracing::warn!("Failed to store memory embedding for '{id}': {e}");
             }
-            Err(e) => {
-                tracing::warn!("Failed to embed memory entry '{id}': {e}");
+
+            if is_new {
+                let warnings = memory::find_similar_entries(conn, emb, rowid, id);
+                output.push_str(&warnings);
             }
         }
     }
@@ -395,11 +390,25 @@ fn write_single_memory(
 
 /// `memory_write` — create or update a single memory entry. Wraps
 /// `write_single_memory` with `RepoHandle` ctx acquisition.
+///
+/// Embedding is generated **before** the ctx lock is acquired so that
+/// CPU-bound ONNX inference (10–100 ms) never blocks the tokio executor
+/// while holding the Mutex guard.
 pub async fn memory_write_impl(
     handle: &RepoHandle,
     entry: &MemoryWriteBatchEntry,
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
+
+    // Pre-compute embedding outside the lock — ONNX is CPU-bound.
+    let embed_text = format!("{} {}", entry.title, entry.content);
+    let embedding = tokio::task::spawn_blocking(move || {
+        crate::llm::get_cached_service()
+            .ok()
+            .and_then(|svc| svc.embed_query(&embed_text).ok())
+    })
+    .await
+    .unwrap_or(None);
 
     let ctx_guard = handle.ctx.lock().await;
     let ctx = ctx_guard
@@ -416,12 +425,17 @@ pub async fn memory_write_impl(
         &entry.tags,
         entry.ttl,
         entry.due_in,
+        embedding,
     )
 }
 
 /// `memory_write_batch` — create or update up to 20 entries in one call.
 /// Returns `(joined_output, count)`. Enforces empty/limit guards before
 /// touching the DB.
+///
+/// All embeddings are generated **before** the ctx lock is acquired so that
+/// CPU-bound ONNX inference never blocks the tokio executor while holding
+/// the Mutex guard.
 pub async fn memory_write_batch_impl(
     handle: &RepoHandle,
     entries: &[MemoryWriteBatchEntry],
@@ -435,13 +449,30 @@ pub async fn memory_write_batch_impl(
 
     ensure_handle_context(handle).await?;
 
+    // Pre-compute embeddings for all entries outside the lock — ONNX is CPU-bound.
+    let embed_texts: Vec<String> = entries
+        .iter()
+        .map(|e| format!("{} {}", e.title, e.content))
+        .collect();
+    let embeddings: Vec<Option<Vec<f32>>> = tokio::task::spawn_blocking(move || {
+        match crate::llm::get_cached_service() {
+            Ok(svc) => embed_texts
+                .iter()
+                .map(|text| svc.embed_query(text).ok())
+                .collect(),
+            Err(_) => vec![None; embed_texts.len()],
+        }
+    })
+    .await
+    .unwrap_or_else(|_| vec![None; entries.len()]);
+
     let ctx_guard = handle.ctx.lock().await;
     let ctx = ctx_guard
         .as_ref()
         .ok_or_else(|| mcp_error("Database not initialized"))?;
 
     let mut results = Vec::with_capacity(entries.len());
-    for entry in entries {
+    for (entry, embedding) in entries.iter().zip(embeddings.into_iter()) {
         let result = write_single_memory(
             &ctx.conn,
             &entry.id,
@@ -452,6 +483,7 @@ pub async fn memory_write_batch_impl(
             &entry.tags,
             entry.ttl,
             entry.due_in,
+            embedding,
         )?;
         results.push(result);
     }

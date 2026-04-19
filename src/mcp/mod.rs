@@ -10,6 +10,20 @@ pub mod dispatch;
 pub mod server;
 pub mod tools;
 
+use std::borrow::Cow;
+
+use rmcp::ErrorData as McpError;
+use rmcp::model::ErrorCode;
+
+/// Create an `INTERNAL_ERROR` MCP error from any message.
+pub(super) fn mcp_error(message: impl Into<Cow<'static, str>>) -> McpError {
+    McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: message.into(),
+        data: None,
+    }
+}
+
 #[cfg(any(feature = "http-server", feature = "https-server"))]
 pub mod common;
 
