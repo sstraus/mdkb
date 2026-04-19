@@ -60,8 +60,9 @@ impl DaemonState {
         }
     }
 
-    fn is_running(&self) -> bool {
-        self.pid_alive
+    /// Returns the live PID if the daemon is running, `None` otherwise.
+    fn running_pid(&self) -> Option<u32> {
+        if self.pid_alive { self.pid } else { None }
     }
 }
 
@@ -69,8 +70,7 @@ impl DaemonState {
 /// missing/stale state is shown, not errored.
 pub fn handle_status() -> Result<()> {
     let s = DaemonState::probe();
-    if s.is_running() {
-        let pid = s.pid.unwrap();
+    if let Some(pid) = s.running_pid() {
         println!("mdkb daemon: running (pid {pid})");
     } else if let Some(pid) = s.pid {
         println!("mdkb daemon: not running (stale pid {pid} in {})", s.lock_path.display());
@@ -81,7 +81,7 @@ pub fn handle_status() -> Result<()> {
     println!("  mcp  sock:  {} {}", s.mcp_sock.display(), present(&s.mcp_sock));
     println!("  hook sock:  {} {}", s.hook_sock.display(), present(&s.hook_sock));
     if let Some(up) = s.uptime {
-        if s.is_running() {
+        if s.running_pid().is_some() {
             println!("  uptime:     {}", format_duration(up));
         }
     }
@@ -92,11 +92,10 @@ pub fn handle_status() -> Result<()> {
 /// sockets to be unlinked. No-op if the daemon is not running.
 pub async fn handle_stop() -> Result<()> {
     let s = DaemonState::probe();
-    if !s.is_running() {
+    let Some(pid) = s.running_pid() else {
         println!("mdkb daemon: not running");
         return Ok(());
-    }
-    let pid = s.pid.unwrap();
+    };
     signal_term(pid)?;
     println!("SIGTERM sent to pid {pid}; awaiting shutdown…");
 
@@ -120,7 +119,7 @@ pub async fn handle_stop() -> Result<()> {
 /// the sockets to come back.
 pub async fn handle_restart() -> Result<()> {
     let before = DaemonState::probe();
-    if before.is_running() {
+    if before.running_pid().is_some() {
         handle_stop().await?;
     }
 
@@ -129,9 +128,11 @@ pub async fn handle_restart() -> Result<()> {
     let deadline = Instant::now() + RESTART_READY_TIMEOUT;
     while Instant::now() < deadline {
         let s = DaemonState::probe();
-        if s.is_running() && s.mcp_sock.exists() && s.hook_sock.exists() {
-            println!("mdkb daemon: restarted (pid {})", s.pid.unwrap());
-            return Ok(());
+        if let Some(pid) = s.running_pid() {
+            if s.mcp_sock.exists() && s.hook_sock.exists() {
+                println!("mdkb daemon: restarted (pid {pid})");
+                return Ok(());
+            }
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -161,8 +162,12 @@ fn format_duration(d: Duration) -> String {
 /// iff the pid exists and we have permission to signal it.
 #[cfg(unix)]
 fn process_alive(pid: u32) -> bool {
+    // PIDs above i32::MAX cannot exist on any Unix platform; treat as dead.
+    let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
     // SAFETY: libc::kill is safe to call; signal 0 does nothing but errno-set.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    let rc = unsafe { libc::kill(pid_t, 0) };
     if rc == 0 {
         return true;
     }
@@ -178,7 +183,10 @@ fn process_alive(_pid: u32) -> bool {
 
 #[cfg(unix)]
 fn signal_term(pid: u32) -> Result<()> {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    let pid_t = libc::pid_t::try_from(pid).map_err(|_| {
+        Error::other(format!("pid {pid} overflows libc::pid_t (i32)"))
+    })?;
+    let rc = unsafe { libc::kill(pid_t, libc::SIGTERM) };
     if rc == 0 {
         Ok(())
     } else {
@@ -336,7 +344,7 @@ mod tests {
         // there is no pid it returns None.
         let s = DaemonState::probe();
         if s.pid.is_none() {
-            assert!(!s.is_running());
+            assert!(s.running_pid().is_none());
         }
     }
 
