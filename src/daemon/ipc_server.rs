@@ -27,6 +27,7 @@ use rmcp::ServiceExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::dispatch::{DispatchContext, dispatch_call};
@@ -118,6 +119,7 @@ pub async fn serve(
         hook_shutdown,
         Arc::clone(&registry),
         Arc::clone(&dctx),
+        MAX_HOOK_CONNECTIONS,
     ));
 
     shutdown.cancelled().await;
@@ -211,20 +213,34 @@ async fn handle_mcp_conn(stream: UnixStream, registry: Arc<RepoRegistry>) {
 
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Maximum number of concurrent hook connections. Each connection may allocate
+/// up to `MAX_MESSAGE_BYTES` (4 MiB) for a single message body, so this caps
+/// the worst-case RSS growth from hook traffic at ~256 MiB.
+pub const MAX_HOOK_CONNECTIONS: usize = 64;
+
 async fn hook_accept_loop(
     listener: UnixListener,
     shutdown: CancellationToken,
     registry: Arc<RepoRegistry>,
     dctx: Arc<DispatchContext>,
+    max_connections: usize,
 ) {
+    let semaphore = Arc::new(Semaphore::new(max_connections));
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _addr)) => {
+                    let permit = match Arc::clone(&semaphore).acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => return, // semaphore closed — shutting down
+                    };
                     let registry = Arc::clone(&registry);
                     let dctx = Arc::clone(&dctx);
-                    tokio::spawn(handle_hook_conn(stream, registry, dctx));
+                    tokio::spawn(async move {
+                        handle_hook_conn(stream, registry, dctx).await;
+                        drop(permit);
+                    });
                 }
                 Err(e) => {
                     tracing::warn!("ipc accept failed (hook): {e}");
