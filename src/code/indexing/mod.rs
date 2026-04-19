@@ -13,6 +13,7 @@ pub mod walker;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::code::semantic::{SemanticSearch, format_symbol_text};
 use crate::code::storage::CodeDb;
@@ -30,9 +31,7 @@ use self::types::IndexStats;
 pub struct IndexFacade {
     db: CodeDb,
     config: PipelineConfig,
-    semantic: Option<SemanticSearch>,
-    /// false = not yet attempted to initialize semantic search.
-    semantic_initialized: bool,
+    semantic: OnceLock<Option<SemanticSearch>>,
 }
 
 impl IndexFacade {
@@ -45,8 +44,7 @@ impl IndexFacade {
         Ok(Self {
             db,
             config: PipelineConfig::default(),
-            semantic: None,
-            semantic_initialized: false,
+            semantic: OnceLock::new(),
         })
     }
 
@@ -58,8 +56,7 @@ impl IndexFacade {
         Ok(Self {
             db,
             config: PipelineConfig::default(),
-            semantic: None,
-            semantic_initialized: false,
+            semantic: OnceLock::new(),
         })
     }
 
@@ -72,12 +69,10 @@ impl IndexFacade {
     /// Lazily initialize semantic search on first use.
     ///
     /// Loads the ONNX model (~300-800 MB RSS) only when actually needed.
-    fn ensure_semantic(&mut self) -> Option<&SemanticSearch> {
-        if !self.semantic_initialized {
-            self.semantic_initialized = true;
-            self.semantic = init_semantic(self.db.path());
-        }
-        self.semantic.as_ref()
+    fn ensure_semantic(&self) -> Option<&SemanticSearch> {
+        self.semantic
+            .get_or_init(|| init_semantic(self.db.path()))
+            .as_ref()
     }
 
     /// Get a reference to the underlying database.
@@ -148,7 +143,7 @@ impl IndexFacade {
         let _ = self.db.conn().execute_batch("ROLLBACK");
         self.db.clear()?;
         // Only clear semantic if already initialized (don't trigger lazy load for a clear)
-        if let Some(ref semantic) = self.semantic {
+        if let Some(Some(semantic)) = self.semantic.get() {
             if let Err(e) = semantic.clear() {
                 tracing::error!(
                     "Failed to clear semantic index: {e}. Impact: old embeddings may persist."
@@ -194,7 +189,7 @@ impl IndexFacade {
 
         // Only remove embeddings if semantic is already initialized;
         // avoid triggering lazy model load (~300-800 MB) for a delete operation.
-        if let Some(ref semantic) = self.semantic {
+        if let Some(Some(semantic)) = self.semantic.get() {
             if let Err(e) = semantic.remove_embeddings(&symbol_ids) {
                 tracing::error!(
                     error = %e,
@@ -412,15 +407,14 @@ impl IndexFacade {
     /// Returns `(Symbol, score)` pairs sorted by descending similarity.
     /// Triggers lazy initialization of the ONNX model on first call.
     pub fn semantic_search(
-        &mut self,
+        &self,
         query: &str,
         limit: usize,
         threshold: f32,
     ) -> anyhow::Result<Vec<(Symbol, f32)>> {
-        if self.ensure_semantic().is_none() {
+        let Some(semantic) = self.ensure_semantic() else {
             return Ok(Vec::new());
-        }
-        let semantic = self.semantic.as_ref().unwrap();
+        };
 
         let matches = semantic.search(query, limit, threshold)?;
 
@@ -444,14 +438,15 @@ impl IndexFacade {
     }
 
     /// Check if semantic search is available.
-    pub fn has_semantic_search(&mut self) -> bool {
+    pub fn has_semantic_search(&self) -> bool {
         self.ensure_semantic().is_some()
     }
 
     /// Number of stored semantic embeddings.
     pub fn semantic_count(&self) -> usize {
         self.semantic
-            .as_ref()
+            .get()
+            .and_then(|opt| opt.as_ref())
             .and_then(|s| s.count().ok())
             .unwrap_or(0)
     }
@@ -480,11 +475,10 @@ impl IndexFacade {
     // -----------------------------------------------------------------------
 
     /// Generate embeddings only for symbols in the given files.
-    fn generate_symbol_embeddings_for_files(&mut self, paths: &[PathBuf], root: &Path) {
-        if self.ensure_semantic().is_none() {
+    fn generate_symbol_embeddings_for_files(&self, paths: &[PathBuf], root: &Path) {
+        let Some(semantic) = self.ensure_semantic() else {
             return;
-        }
-        let semantic = self.semantic.as_ref().unwrap();
+        };
 
         let rel_paths: HashSet<String> = paths
             .iter()
@@ -539,11 +533,10 @@ impl IndexFacade {
     }
 
     /// Generate embeddings for all indexed symbols and write to the vector store.
-    fn generate_symbol_embeddings(&mut self) {
-        if self.ensure_semantic().is_none() {
+    fn generate_symbol_embeddings(&self) {
+        let Some(semantic) = self.ensure_semantic() else {
             return;
-        }
-        let semantic = self.semantic.as_ref().unwrap();
+        };
 
         let symbols = self.db.all_symbols().unwrap_or_default();
         if symbols.is_empty() {
@@ -613,14 +606,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let facade = IndexFacade::create(dir.path().join("code.sqlite")).unwrap();
 
-        // Semantic should NOT be initialized on construction (lazy)
+        // Semantic should NOT be initialized on construction (lazy via OnceLock)
         assert!(
-            !facade.semantic_initialized,
-            "semantic should not be initialized on create"
-        );
-        assert!(
-            facade.semantic.is_none(),
-            "semantic should be None on create"
+            facade.semantic.get().is_none(),
+            "semantic OnceLock should be uninitialized on create"
         );
     }
 
@@ -630,12 +619,8 @@ mod tests {
         let facade = IndexFacade::open_or_create(dir.path().join("code.sqlite")).unwrap();
 
         assert!(
-            !facade.semantic_initialized,
-            "semantic should not be initialized on open_or_create"
-        );
-        assert!(
-            facade.semantic.is_none(),
-            "semantic should be None on open_or_create"
+            facade.semantic.get().is_none(),
+            "semantic OnceLock should be uninitialized on open_or_create"
         );
     }
 

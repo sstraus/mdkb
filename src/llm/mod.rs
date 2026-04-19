@@ -42,6 +42,12 @@ pub fn get_cached_service() -> crate::error::Result<Arc<EmbeddingService>> {
     Ok(service)
 }
 
+/// Reset the cached service (test-only). Returns the old value if any.
+#[cfg(test)]
+fn reset_cached_service() -> Option<Arc<EmbeddingService>> {
+    CACHED_SERVICE.lock().ok().and_then(|mut g| g.take())
+}
+
 /// Release the cached embedding service to free ONNX Runtime memory.
 ///
 /// The ONNX Runtime arena allocator never returns memory to the OS while the
@@ -58,5 +64,23 @@ pub fn release_cached_service() {
     // Without this, the ~1GB+ of ONNX Runtime arena memory stays mapped.
     unsafe {
         libmimalloc_sys::mi_collect(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore] // requires ONNX model download
+    fn test_cached_service_returns_same_arc() {
+        reset_cached_service();
+        let a = get_cached_service().unwrap();
+        let b = get_cached_service().unwrap();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "get_cached_service() must return the same Arc instance"
+        );
+        reset_cached_service();
     }
 }
