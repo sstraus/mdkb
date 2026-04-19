@@ -46,152 +46,6 @@ fn mcp_error(message: impl Into<Cow<'static, str>>) -> McpError {
     }
 }
 
-/// Core logic for writing a single memory entry. Used by both `memory_write` and `memory_write_batch`.
-fn write_single_memory(
-    conn: &rusqlite::Connection,
-    id: &str,
-    title: &str,
-    content: &str,
-    entry_type_str: &str,
-    source_type_str: &str,
-    tags: &[String],
-    ttl: Option<u64>,
-    due_in: Option<u64>,
-) -> Result<String, McpError> {
-    memory::validate_entry_input(id, title, tags, content).map_err(|e| mcp_error(e.to_string()))?;
-
-    let existing = memory::get_entry_without_tracking(conn, id)
-        .map_err(|e| mcp_error(format!("Failed to check existing entry: {e}")))?;
-
-    let entry_type: memory::EntryType = entry_type_str.parse().map_err(|e: String| {
-        mcp_error(format!(
-            "{e}. Valid types: topic, problem, decision, reminder"
-        ))
-    })?;
-
-    let source_type: memory::SourceType =
-        source_type_str.parse().map_err(|e: String| mcp_error(e))?;
-
-    let now = chrono::Utc::now().timestamp();
-    let expires_at = ttl.map(|s| now + s as i64);
-    let due_at = due_in.map(|s| now + s as i64);
-    let is_new = existing.is_none();
-
-    // Pre-write duplicate check: reject if a near-identical entry exists (new entries only).
-    // L2 distance < 0.32 ≈ cosine similarity > 0.95 — very high bar, minimizes false positives.
-    if is_new {
-        if let Ok(service) = crate::llm::get_cached_service() {
-            let embed_text = format!("{title} {content}");
-            if let Ok(embedding) = service.embed_query(&embed_text) {
-                if let Ok(similar) =
-                    crate::store::vectors::memory_vector_search(conn, &embedding, 3)
-                {
-                    for (rowid, distance) in &similar {
-                        if *distance < 0.32 {
-                            if let Ok(Some(dup)) = memory::get_entry_by_rowid(conn, *rowid) {
-                                let similarity = 1.0 - (*distance as f64 * *distance as f64 / 2.0);
-                                return Err(mcp_error(format!(
-                                    "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
-                                     Update that entry instead, or use a more distinct title/content.",
-                                    dup.title,
-                                    dup.id,
-                                    similarity * 100.0
-                                )));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let mut output = if let Some(mut existing_entry) = existing {
-        if let Err(e) = memory::save_revision(
-            conn,
-            id,
-            &existing_entry.content,
-            content,
-            existing_entry.source_type,
-        ) {
-            tracing::warn!("Failed to save revision for {id}: {e}");
-        }
-
-        existing_entry.title = title.to_string();
-        existing_entry.content = content.to_string();
-        existing_entry.entry_type = entry_type;
-        existing_entry.tags = tags.to_vec();
-        existing_entry.expires_at = expires_at;
-        if due_in.is_some() {
-            existing_entry.due_at = due_at;
-        }
-        memory::update_entry(conn, &existing_entry)
-            .map_err(|e| mcp_error(format!("Failed to update memory entry: {e}")))?;
-
-        let rev_info = memory::get_revision_summary(conn, id)
-            .map(|s| {
-                if s.count > 0 {
-                    format!(" ({} revisions)", s.count)
-                } else {
-                    String::new()
-                }
-            })
-            .unwrap_or_default();
-        format!("Updated memory entry: {id}{rev_info}")
-    } else {
-        let entry = memory::MemoryEntry {
-            id: id.to_string(),
-            title: title.to_string(),
-            content: content.to_string(),
-            entry_type,
-            tags: tags.to_vec(),
-            status: memory::EntryStatus::Active,
-            created_at: now,
-            updated_at: now,
-            superseded_by: None,
-            access_count: 0,
-            last_accessed: None,
-            source_path: None,
-            confirmations: 0,
-            last_confirmed_at: None,
-            source_type,
-            expires_at,
-            due_at,
-        };
-        memory::add_entry(conn, &entry)
-            .map_err(|e| mcp_error(format!("Failed to create memory entry: {e}")))?;
-        format!("Created memory entry: {id}")
-    };
-
-    // Generate embedding for hybrid search + duplicate detection
-    if let Ok(service) = crate::llm::get_cached_service() {
-        let embed_text = format!("{title} {content}");
-        match service.embed_query(&embed_text) {
-            Ok(embedding) => {
-                if let Some(rowid) = memory::get_rowid(conn, id).unwrap_or(None) {
-                    if let Err(e) = crate::store::vectors::store_memory_embedding(
-                        conn,
-                        rowid,
-                        &embedding,
-                        crate::llm::embeddings::MODEL_NAME,
-                    ) {
-                        tracing::warn!("Failed to store memory embedding for '{id}': {e}");
-                    }
-
-                    if is_new {
-                        let warnings = memory::find_similar_entries(conn, &embedding, rowid, id);
-                        output.push_str(&warnings);
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Failed to embed memory entry '{id}': {e}");
-            }
-        }
-    }
-
-    Ok(output)
-}
-
 /// MCP server for mdkb.
 #[derive(Clone)]
 pub struct McpServer {
@@ -1590,29 +1444,19 @@ impl McpServer {
         Parameters(params): Parameters<MemoryWriteParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
+        let entry = super::tools::MemoryWriteBatchEntry {
+            id: params.id,
+            title: params.title,
+            content: params.content,
+            entry_type: params.entry_type,
+            tags: params.tags,
+            source_type: params.source_type,
+            ttl: params.ttl,
+            due_in: params.due_in,
+        };
+        let output = super::dispatch::memory_write_impl(&handle, &entry).await?;
 
-        let (output, tokens) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let output = write_single_memory(
-                &ctx.conn,
-                &params.id,
-                &params.title,
-                &params.content,
-                &params.entry_type,
-                &params.source_type,
-                &params.tags,
-                params.ttl,
-                params.due_in,
-            )?;
-
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        }; // ctx_guard dropped here
-
+        let tokens = count_tokens(&output);
         self.record_persistent_call("memory_write", tokens, 1, false)
             .await;
         tracing::debug!("mdkb_memory_write: {}", output);
@@ -1628,43 +1472,11 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryWriteBatchParams>,
     ) -> Result<CallToolResult, McpError> {
-        if params.entries.is_empty() {
-            return Err(mcp_error("entries array must not be empty"));
-        }
-        if params.entries.len() > 20 {
-            return Err(mcp_error("max 20 entries per batch"));
-        }
-
         let handle = self.resolve_handle(params.root.as_deref()).await?;
+        let (output, count) =
+            super::dispatch::memory_write_batch_impl(&handle, &params.entries).await?;
 
-        let (output, tokens, count) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let mut results = Vec::with_capacity(params.entries.len());
-            for entry in &params.entries {
-                let result = write_single_memory(
-                    &ctx.conn,
-                    &entry.id,
-                    &entry.title,
-                    &entry.content,
-                    &entry.entry_type,
-                    &entry.source_type,
-                    &entry.tags,
-                    entry.ttl,
-                    entry.due_in,
-                )?;
-                results.push(result);
-            }
-
-            let output = results.join("\n");
-            let tokens = count_tokens(&output);
-            let count = results.len();
-            (output, tokens, count)
-        }; // ctx_guard dropped here
-
+        let tokens = count_tokens(&output);
         self.record_persistent_call("memory_write_batch", tokens, count, false)
             .await;
         tracing::debug!("mdkb_memory_write_batch: {} entries", count);
@@ -1679,25 +1491,9 @@ impl McpServer {
         Parameters(params): Parameters<MemoryDeleteParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
+        let output = super::dispatch::memory_delete_impl(&handle, &params.id).await?;
 
-        let (output, tokens) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let deleted = memory::delete_entry(&ctx.conn, &params.id)
-                .map_err(|e| mcp_error(format!("Failed to delete memory entry: {}", e)))?;
-
-            let output = if deleted {
-                format!("Deleted memory entry '{}'.", params.id)
-            } else {
-                format!("Memory entry '{}' not found.", params.id)
-            };
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        }; // ctx_guard dropped here
-
+        let tokens = count_tokens(&output);
         self.record_persistent_call("memory_delete", tokens, 1, false)
             .await;
         tracing::debug!("mdkb_memory_delete: {}", output);
@@ -1713,30 +1509,11 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<MemoryConfirmParams>,
     ) -> Result<CallToolResult, McpError> {
-        let delta: i32 = match params.outcome.as_str() {
-            "confirmed" => 1,
-            "refuted" => -1,
-            other => {
-                return Err(mcp_error(format!(
-                    "Invalid outcome '{other}'. Expected \"confirmed\" or \"refuted\"."
-                )));
-            }
-        };
-
         let handle = self.resolve_handle(params.root.as_deref()).await?;
+        let output =
+            super::dispatch::memory_confirm_impl(&handle, &params.id, &params.outcome).await?;
 
-        let (output, tokens) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let output = memory::confirm_entry(&ctx.conn, &params.id, delta)
-                .map_err(|e| mcp_error(format!("Failed to confirm memory entry: {}", e)))?;
-            let tokens = count_tokens(&output);
-            (output, tokens)
-        };
-
+        let tokens = count_tokens(&output);
         self.record_persistent_call("memory_confirm", tokens, 1, false)
             .await;
         tracing::debug!("mdkb_memory_confirm: {}", output);
@@ -1751,55 +1528,10 @@ impl McpServer {
         Parameters(params): Parameters<MemoryListParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
+        let (output, count) =
+            super::dispatch::memory_list_impl(&handle, params.limit, &params.sort).await?;
 
-        let sort: memory::MemorySortOrder =
-            params.sort.parse().map_err(|e: String| mcp_error(e))?;
-
-        let (output, tokens, count) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let entries = memory::list_entries_sorted(
-                &ctx.conn,
-                params.limit,
-                sort,
-                Some(memory::EntryStatus::Active),
-            )
-            .map_err(|e| mcp_error(format!("Failed to list memory entries: {}", e)))?;
-
-            if entries.is_empty() {
-                let output = "No memory entries.".to_string();
-                let tokens = count_tokens(&output);
-                (output, tokens, 0)
-            } else {
-                let mut out = format!("Found {} memory entries:\n\n", entries.len());
-                for e in &entries {
-                    let tags = e
-                        .tags
-                        .iter()
-                        .map(|t| format!("#{t}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    let ttl_info = format_ttl_info(e.expires_at);
-                    out.push_str(&format!(
-                        "- [{}] {} ({}, {}{}): {} {}\n",
-                        e.entry_type,
-                        e.id,
-                        e.title,
-                        relative_time_ago(e.updated_at),
-                        ttl_info,
-                        truncate_text(&e.content, 80),
-                        tags,
-                    ));
-                }
-                let count = entries.len();
-                let tokens = count_tokens(&out);
-                (out, tokens, count)
-            }
-        }; // ctx_guard dropped here
-
+        let tokens = count_tokens(&output);
         self.metrics.record_search(tokens, count);
         self.record_persistent_call("memory_list", tokens, count, false)
             .await;
@@ -2673,7 +2405,7 @@ fn load_server_instructions(root: &std::path::Path, limit: usize) -> String {
 }
 
 /// Format a Unix timestamp as a compact relative time string (e.g., "3d ago", "2mo ago").
-fn relative_time_ago(unix_ts: i64) -> String {
+pub(super) fn relative_time_ago(unix_ts: i64) -> String {
     let now = chrono::Utc::now().timestamp();
     let secs = (now - unix_ts).max(0);
 
@@ -2695,7 +2427,7 @@ fn relative_time_ago(unix_ts: i64) -> String {
 }
 
 /// Truncate text to a maximum length with ellipsis.
-fn truncate_text(text: &str, max_len: usize) -> String {
+pub(super) fn truncate_text(text: &str, max_len: usize) -> String {
     let text = text.replace('\n', " ");
     if text.len() <= max_len {
         text
@@ -2845,7 +2577,7 @@ fn apply_min_confidence(
 }
 
 /// Format TTL info for display. Returns empty string for permanent entries.
-fn format_ttl_info(expires_at: Option<i64>) -> String {
+pub(super) fn format_ttl_info(expires_at: Option<i64>) -> String {
     match expires_at {
         Some(ts) => {
             let now = chrono::Utc::now().timestamp();
