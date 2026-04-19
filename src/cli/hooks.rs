@@ -87,12 +87,17 @@ fn log_slow_hook(root: &Path, event: &str, elapsed_ms: u128, budget_ms: u64) {
         "budget_ms": budget_ms,
         "ts": chrono::Utc::now().timestamp(),
     });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
     {
-        let _ = writeln!(f, "{}", line);
+        Ok(mut f) => {
+            let _ = writeln!(f, "{}", line);
+        }
+        Err(e) => {
+            tracing::warn!("log_slow_hook: failed to open {:?}: {}", log_path, e);
+        }
     }
 }
 
