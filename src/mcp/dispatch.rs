@@ -1248,26 +1248,31 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
         }
     };
 
-    let session_output = {
-        let sessions_base = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-            .join(".claude/projects");
-        let project_root = handle.root.to_string_lossy().to_string();
-
-        let mut ctx_guard = handle.ctx.lock().await;
-        if let Some(ctx) = ctx_guard.as_mut() {
-            match handle_session_index(ctx, &sessions_base, &project_root) {
-                Ok(sr) if sr.added > 0 || sr.updated > 0 => format!(
-                    "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}",
-                    sr.added, sr.updated, sr.unchanged
-                ),
-                Ok(_) => String::new(),
-                Err(e) => {
-                    tracing::warn!("Session indexing failed: {e}");
-                    String::new()
-                }
-            }
-        } else {
+    let session_output = match crate::daemon::config::home_dir() {
+        Err(e) => {
+            tracing::warn!("Session indexing skipped: cannot resolve home dir: {e}");
             String::new()
+        }
+        Ok(home) => {
+            let sessions_base = home.join(".claude/projects");
+            let project_root = handle.root.to_string_lossy().to_string();
+
+            let mut ctx_guard = handle.ctx.lock().await;
+            if let Some(ctx) = ctx_guard.as_mut() {
+                match handle_session_index(ctx, &sessions_base, &project_root) {
+                    Ok(sr) if sr.added > 0 || sr.updated > 0 => format!(
+                        "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}",
+                        sr.added, sr.updated, sr.unchanged
+                    ),
+                    Ok(_) => String::new(),
+                    Err(e) => {
+                        tracing::warn!("Session indexing failed: {e}");
+                        String::new()
+                    }
+                }
+            } else {
+                String::new()
+            }
         }
     };
 

@@ -267,20 +267,25 @@ async fn run() -> Result<()> {
                 }
 
                 // Also reindex Claude Code sessions
-                let sessions_base =
-                    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                        .join(".claude/projects");
-                let project_root = cwd.to_string_lossy().to_string();
-                match handle_session_index(&ctx, &sessions_base, &project_root) {
-                    Ok(sr) if sr.added > 0 || sr.updated > 0 => {
-                        println!(
-                            "\nSessions: {} added, {} updated, {} unchanged",
-                            sr.added, sr.updated, sr.unchanged
-                        );
+                match mdkb::daemon::config::home_dir() {
+                    Ok(home) => {
+                        let sessions_base = home.join(".claude/projects");
+                        let project_root = cwd.to_string_lossy().to_string();
+                        match handle_session_index(&ctx, &sessions_base, &project_root) {
+                            Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+                                println!(
+                                    "\nSessions: {} added, {} updated, {} unchanged",
+                                    sr.added, sr.updated, sr.unchanged
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!("Session indexing failed: {:?}", e);
+                            }
+                        }
                     }
-                    Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!("Session indexing failed: {:?}", e);
+                        tracing::warn!("Session indexing skipped: cannot resolve home dir: {e}");
                     }
                 }
             } else {
@@ -847,13 +852,10 @@ async fn run() -> Result<()> {
                 project_root,
             } => {
                 let ctx = Context::open(&cwd)?;
-                let sessions_base =
-                    sessions_path
-                        .map(std::path::PathBuf::from)
-                        .unwrap_or_else(|| {
-                            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                                .join(".claude/projects")
-                        });
+                let sessions_base = match sessions_path {
+                    Some(p) => std::path::PathBuf::from(p),
+                    None => mdkb::daemon::config::home_dir()?.join(".claude/projects"),
+                };
                 let root = project_root.unwrap_or_else(|| cwd.to_string_lossy().to_string());
                 let result = handle_session_index(&ctx, &sessions_base, &root)?;
                 format_update_result(&result, cli.format);

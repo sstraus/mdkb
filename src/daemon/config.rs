@@ -15,6 +15,17 @@ const DEFAULT_PID_NAME: &str = "daemon.pid";
 /// Default maximum number of concurrently active repo handles.
 const DEFAULT_MAX_ACTIVE_REPOS: usize = 5;
 
+/// Resolve the current user's home directory via [`directories::BaseDirs`].
+///
+/// Returns `Ok(PathBuf)` on success. Returns an error with a clear message
+/// when the home directory cannot be resolved (e.g. HOME unset or empty),
+/// so callers fail fast instead of silently producing paths relative to CWD.
+pub fn home_dir() -> Result<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|b| b.home_dir().to_path_buf())
+        .ok_or_else(|| Error::other("Cannot resolve home directory: HOME is unset or empty"))
+}
+
 /// Daemon configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -78,9 +89,13 @@ impl DaemonConfig {
     }
 
     /// Resolve the daemon home directory (~/.mdkb/).
+    ///
+    /// Falls back to `/tmp/.mdkb` only when the home directory is genuinely
+    /// unresolvable (e.g. in a containerised environment without a home).
     pub fn daemon_home() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home).join(".mdkb")
+        home_dir()
+            .map(|h| h.join(".mdkb"))
+            .unwrap_or_else(|_| PathBuf::from("/tmp/.mdkb"))
     }
 
     /// Resolve the config file path.
@@ -141,8 +156,9 @@ impl DaemonConfig {
 /// Expand ~ at the start of a path to the user's home directory.
 fn expand_tilde(path: &str) -> PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        PathBuf::from(home).join(rest)
+        home_dir()
+            .map(|h| h.join(rest))
+            .unwrap_or_else(|_| PathBuf::from("/tmp").join(rest))
     } else {
         PathBuf::from(path)
     }
@@ -321,5 +337,17 @@ whitelist_dirs = ["~/Code"]
     fn test_expand_tilde_absolute_unchanged() {
         let expanded = expand_tilde("/absolute/path");
         assert_eq!(expanded, PathBuf::from("/absolute/path"));
+    }
+
+    #[test]
+    fn test_home_dir_returns_ok() {
+        // In normal CI/dev environments HOME is always set, so this must succeed.
+        let result = home_dir();
+        assert!(result.is_ok(), "home_dir() failed: {:?}", result);
+        let path = result.unwrap();
+        assert!(
+            path.is_absolute(),
+            "home_dir() returned a relative path: {path:?}"
+        );
     }
 }
