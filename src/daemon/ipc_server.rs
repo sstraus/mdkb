@@ -10,6 +10,14 @@
 //!
 //! Both sockets are chmod'd to `0600` via explicit `set_permissions` after
 //! bind — umask is not a reliable guarantee across platforms.
+//!
+//! # TOCTOU mitigation
+//!
+//! The `~/.mdkb` base directory is created (or corrected) with mode `0700`
+//! before any socket operations. This prevents a local attacker from placing
+//! a file at the socket path in the window between `remove_if_exists` and
+//! `UnixListener::bind`, because unprivileged processes cannot write into a
+//! directory they do not own when its mode is `0700`.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -47,6 +55,13 @@ pub enum IpcError {
         source: std::io::Error,
     },
 
+    #[error("mkdir {path}: {source}")]
+    Mkdir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -54,8 +69,9 @@ pub enum IpcError {
 /// Bind the two IPC sockets under `base_dir`, serve until `shutdown` is
 /// triggered, then unlink both socket files.
 ///
-/// `base_dir` is typically `~/.mdkb`. The directory must already exist
-/// (the daemon singleton lock creates it).
+/// `base_dir` is typically `~/.mdkb`. The directory is created (or its
+/// permissions corrected) to mode `0700` before socket operations to close
+/// the TOCTOU window between `remove_if_exists` and `UnixListener::bind`.
 ///
 /// The hook socket routes JSON-RPC method calls through
 /// `mcp::dispatch::dispatch_call`, resolving the target repo via
@@ -66,6 +82,8 @@ pub async fn serve(
     registry: Arc<RepoRegistry>,
     dctx: Arc<DispatchContext>,
 ) -> Result<(), IpcError> {
+    ensure_base_dir_0700(base_dir)?;
+
     let mcp_path = base_dir.join(MCP_SOCKET_NAME);
     let hook_path = base_dir.join(HOOK_SOCKET_NAME);
 
@@ -111,6 +129,25 @@ pub async fn serve(
     let _ = std::fs::remove_file(&mcp_path);
     let _ = std::fs::remove_file(&hook_path);
     Ok(())
+}
+
+/// Create `base_dir` if it does not exist, then enforce mode `0700`.
+///
+/// Enforcing after creation (rather than relying on umask) is required
+/// because `create_dir_all` honours the process umask, which may be too
+/// permissive.  Setting permissions explicitly closes the TOCTOU window: a
+/// local attacker cannot plant files in a directory they cannot write to.
+fn ensure_base_dir_0700(dir: &Path) -> Result<(), IpcError> {
+    std::fs::create_dir_all(dir).map_err(|e| IpcError::Mkdir {
+        path: dir.to_path_buf(),
+        source: e,
+    })?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| {
+        IpcError::Chmod {
+            path: dir.to_path_buf(),
+            source: e,
+        }
+    })
 }
 
 fn remove_if_exists(path: &Path) -> Result<(), IpcError> {
@@ -314,6 +351,73 @@ mod tests {
             persistent_call_count: Arc::new(AtomicU64::new(0)),
             optimize_interval_calls: 200,
         })
+    }
+
+    // ── Security: directory and socket permissions ──────────────────────────
+
+    /// `ensure_base_dir_0700` must create the directory with mode `0700`.
+    #[test]
+    fn base_dir_created_with_0700() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("mdkb");
+        ensure_base_dir_0700(&base).unwrap();
+        let meta = std::fs::metadata(&base).unwrap();
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "base dir mode should be 0700, got {mode:o}");
+    }
+
+    /// `ensure_base_dir_0700` must tighten an existing directory that has
+    /// overly permissive bits (e.g. 0755 from a previous `create_dir_all`).
+    #[test]
+    fn base_dir_permissions_tightened_if_too_open() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("mdkb");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        ensure_base_dir_0700(&base).unwrap();
+
+        let mode = std::fs::metadata(&base).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "base dir mode should be 0700 after tightening, got {mode:o}");
+    }
+
+    /// After `serve()` binds, the socket files must have mode `0600`.
+    #[tokio::test]
+    async fn socket_permissions_are_0600_after_bind() {
+        use tokio_util::sync::CancellationToken;
+
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("mdkb");
+
+        let shutdown = CancellationToken::new();
+        let registry = make_registry();
+        let dctx = make_dctx();
+
+        let shutdown_clone = shutdown.clone();
+        let base_clone = base.clone();
+        let serve_handle = tokio::spawn(async move {
+            serve(&base_clone, shutdown_clone, registry, dctx).await
+        });
+
+        // Wait until serve() has created both sockets (i.e., bind completed).
+        let mcp_path = base.join(MCP_SOCKET_NAME);
+        let hook_path = base.join(HOOK_SOCKET_NAME);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if mcp_path.exists() && hook_path.exists() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "sockets not created within 5s");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mcp_mode = std::fs::metadata(&mcp_path).unwrap().permissions().mode() & 0o777;
+        let hook_mode = std::fs::metadata(&hook_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mcp_mode, 0o600, "mcp socket mode should be 0600, got {mcp_mode:o}");
+        assert_eq!(hook_mode, 0o600, "hook socket mode should be 0600, got {hook_mode:o}");
+
+        shutdown.cancel();
+        serve_handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
