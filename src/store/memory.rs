@@ -585,12 +585,14 @@ pub fn get_revision_summary(conn: &Connection, memory_id: &str) -> Result<Revisi
 /// Get a memory entry by ID and increment access count.
 pub fn get_entry(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
     let now = Utc::now().timestamp();
-
-    // Increment access count
-    conn.execute(
+    let rows = conn.execute(
         "UPDATE memory_entries SET access_count = access_count + 1, last_accessed = ?1 WHERE id = ?2",
         params![now, id],
     )?;
+
+    if rows == 0 {
+        return Ok(None);
+    }
 
     get_entry_without_tracking(conn, id)
 }
