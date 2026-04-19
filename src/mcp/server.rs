@@ -294,29 +294,6 @@ impl McpServer {
         Ok(())
     }
 
-    /// Acquire the code index lock on a RepoHandle, lazily initializing if needed.
-    async fn acquire_handle_code_index(
-        handle: &RepoHandle,
-    ) -> Result<tokio::sync::MutexGuard<'_, Option<IndexFacade>>, McpError> {
-        if handle.code_reindex_active.load(Ordering::Relaxed) {
-            return Ok(handle.code_index.lock().await);
-        }
-        let mut idx_guard = handle.code_index.lock().await;
-        if idx_guard.is_none() {
-            let index_path = handle.root.join(".mdkb/code.sqlite");
-            let mut facade = IndexFacade::open_or_create(&index_path)
-                .map_err(|e| mcp_error(format!("Failed to open code index: {e}")))?;
-            let pipeline_config = crate::code::indexing::pipeline::PipelineConfig {
-                ignore_patterns: handle.code_ignore_patterns.clone(),
-                respect_gitignore: handle.config.code.indexing.respect_gitignore,
-                ..Default::default()
-            };
-            facade = facade.with_config(pipeline_config);
-            *idx_guard = Some(facade);
-        }
-        Ok(idx_guard)
-    }
-
     /// Query MCP roots from the client and register them in the registry.
     async fn sync_roots_from_client(
         &self,
@@ -451,7 +428,7 @@ impl McpServer {
     /// If `symbol_id` is provided, looks up by ID directly.
     /// If only `name` is provided, finds all matches. Returns an error with
     /// a disambiguation list if multiple symbols share the name.
-    fn resolve_symbol(
+    pub(super) fn resolve_symbol(
         facade: &IndexFacade,
         name: &str,
         symbol_id: Option<u32>,
@@ -627,73 +604,7 @@ impl McpServer {
         Parameters(_): Parameters<EmptyObject>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(None).await?;
-
-        // Phase 1: Reindex documents (markdown collections)
-        let doc_output = {
-            let mut ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_mut()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let result = handle_update(ctx, &handle.root)
-                .map_err(|e| mcp_error(format!("Document update failed: {}", e)))?;
-
-            format!(
-                "## Documents\n\nAdded: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
-                result.added, result.updated, result.removed, result.unchanged
-            )
-        }; // ctx_guard dropped here
-
-        // Phase 2: Reindex source code (tree-sitter + SQLite)
-        let code_output = {
-            let mut idx_guard = Self::acquire_handle_code_index(&handle).await?;
-            if let Some(facade) = idx_guard.as_mut() {
-                match facade.reindex(&handle.root) {
-                    Ok(stats) => {
-                        format!(
-                            "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
-                            stats.files_indexed,
-                            stats.symbols_indexed,
-                            stats.relationships_collected
-                        )
-                    }
-                    Err(e) => {
-                        tracing::error!("Code reindex failed: {}", e);
-                        format!("\n\n## Code\n\nReindex failed: {}", e)
-                    }
-                }
-            } else {
-                String::new()
-            }
-        }; // idx_guard dropped here
-
-        // Phase 3: Reindex Claude Code sessions
-        let session_output = {
-            let sessions_base = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".claude/projects");
-            let project_root = handle.root.to_string_lossy().to_string();
-
-            let mut ctx_guard = handle.ctx.lock().await;
-            if let Some(ctx) = ctx_guard.as_mut() {
-                match handle_session_index(ctx, &sessions_base, &project_root) {
-                    Ok(sr) if sr.added > 0 || sr.updated > 0 => {
-                        format!(
-                            "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}",
-                            sr.added, sr.updated, sr.unchanged
-                        )
-                    }
-                    Ok(_) => String::new(),
-                    Err(e) => {
-                        tracing::warn!("Session indexing failed: {}", e);
-                        String::new()
-                    }
-                }
-            } else {
-                String::new()
-            }
-        };
-
-        let output = format!("{}{}{}", doc_output, code_output, session_output);
+        let output = super::dispatch::update_impl(&handle).await?;
         let tokens = count_tokens(&output);
         self.metrics.record_update(tokens);
         self.record_persistent_call("update", tokens, 1, false)
@@ -820,101 +731,7 @@ impl McpServer {
         Parameters(params): Parameters<CodeGraphParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
-
-        let output = {
-            let idx_guard = Self::acquire_handle_code_index(&handle).await?;
-            let facade = match idx_guard.as_ref() {
-                Some(f) => f,
-                None => {
-                    return Ok(CallToolResult::success(vec![Content::text(
-                        "Code index is being rebuilt, retry shortly.",
-                    )]));
-                }
-            };
-
-            let symbol = Self::resolve_symbol(facade, &params.name, params.symbol_id)?;
-
-            match params.direction.as_str() {
-                "calls" => {
-                    let called = facade.get_called_functions(symbol.id);
-                    if called.is_empty() {
-                        format!(
-                            "{} ({:?}) does not call any indexed functions.",
-                            symbol.name, symbol.kind
-                        )
-                    } else {
-                        let mut out = format!(
-                            "{} ({:?}) calls {} function(s):\n\n",
-                            symbol.name,
-                            symbol.kind,
-                            called.len()
-                        );
-                        for sym in &called {
-                            out.push_str(&format_symbol(sym));
-                            out.push('\n');
-                        }
-                        out
-                    }
-                }
-                "callers" => {
-                    let callers = facade.get_calling_functions(symbol.id);
-                    if callers.is_empty() {
-                        format!(
-                            "{} ({:?}) has no indexed callers.",
-                            symbol.name, symbol.kind
-                        )
-                    } else {
-                        let mut out = format!(
-                            "{} ({:?}) is called by {} function(s):\n\n",
-                            symbol.name,
-                            symbol.kind,
-                            callers.len()
-                        );
-                        for sym in &callers {
-                            out.push_str(&format_symbol(sym));
-                            out.push('\n');
-                        }
-                        out
-                    }
-                }
-                "impact" => {
-                    let impacted_ids = facade.get_impact_radius(symbol.id, params.max_depth);
-                    if impacted_ids.is_empty() {
-                        format!(
-                            "{} ({:?}) has no reachable symbols within {} hop(s).",
-                            symbol.name, symbol.kind, params.max_depth
-                        )
-                    } else {
-                        let mut out = format!(
-                            "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
-                            symbol.name,
-                            symbol.kind,
-                            impacted_ids.len(),
-                            params.max_depth
-                        );
-                        for sid in &impacted_ids {
-                            if let Some(sym) = facade.get_symbol(*sid) {
-                                out.push_str(&format_symbol(&sym));
-                                out.push('\n');
-                            } else {
-                                out.push_str(&format!(
-                                    "  sym#{} (not found in index)\n",
-                                    sid.value()
-                                ));
-                            }
-                        }
-                        out
-                    }
-                }
-                _ => {
-                    return Err(mcp_error(format!(
-                        "Invalid direction: '{}'. Valid: calls, callers, impact.",
-                        params.direction
-                    )));
-                }
-            }
-        }; // idx_guard dropped
-
+        let output = super::dispatch::code_graph_impl(&handle, &params).await?;
         let tokens = count_tokens(&output);
         self.record_persistent_call("code_graph", tokens, 1, false)
             .await;
@@ -931,113 +748,8 @@ impl McpServer {
         Parameters(params): Parameters<UsageParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
-
-        let output = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let session_id = self.session_id.load(Ordering::Relaxed);
-            let session = if session_id > 0 {
-                stats::get_session(&ctx.conn, session_id)
-                    .map_err(|e| mcp_error(format!("Failed to read session: {e}")))?
-            } else {
-                None
-            };
-            let session_tool_usage = if session_id > 0 {
-                stats::get_tool_usage(&ctx.conn, session_id)
-                    .map_err(|e| mcp_error(format!("Failed to read tool usage: {e}")))?
-            } else {
-                Vec::new()
-            };
-
-            let lifetime = if !params.session_only {
-                Some(
-                    stats::get_aggregate_stats(&ctx.conn)
-                        .map_err(|e| mcp_error(format!("Failed to read lifetime stats: {e}")))?,
-                )
-            } else {
-                None
-            };
-            let lifetime_tool_usage = if !params.session_only {
-                stats::get_aggregate_tool_usage(&ctx.conn)
-                    .map_err(|e| mcp_error(format!("Failed to read lifetime tool usage: {e}")))?
-            } else {
-                Vec::new()
-            };
-
-            let primary_tools = if params.session_only {
-                &session_tool_usage
-            } else {
-                &lifetime_tool_usage
-            };
-            let mut top_sorted: Vec<&stats::ToolUsageRecord> = primary_tools.iter().collect();
-            top_sorted.sort_by_key(|r| std::cmp::Reverse(r.call_count));
-            let top_5_most_called: Vec<serde_json::Value> = top_sorted
-                .iter()
-                .take(5)
-                .map(|r| {
-                    serde_json::json!({
-                        "tool_name": r.tool_name,
-                        "call_count": r.call_count,
-                    })
-                })
-                .collect();
-
-            let per_tool: Vec<serde_json::Value> = session_tool_usage
-                .iter()
-                .map(|r| {
-                    serde_json::json!({
-                        "tool_name": r.tool_name,
-                        "call_count": r.call_count,
-                        "total_tokens": r.total_tokens,
-                        "total_results": r.total_results,
-                    })
-                })
-                .collect();
-
-            let session_json = session.as_ref().map(|s| {
-                serde_json::json!({
-                    "id": s.id,
-                    "total_calls": s.total_calls,
-                    "total_tokens": s.total_tokens,
-                    "truncations": s.truncation_count,
-                })
-            });
-
-            let mut out = serde_json::json!({
-                "session": session_json,
-                "per_tool": per_tool,
-                "top_5_most_called": top_5_most_called,
-            });
-
-            if let Some(l) = lifetime {
-                out["lifetime"] = serde_json::json!({
-                    "total_sessions": l.total_sessions,
-                    "total_calls": l.total_calls,
-                    "total_tokens": l.total_tokens,
-                    "truncations": l.total_truncations,
-                    "avg_tokens_per_call": l.avg_tokens_per_call,
-                });
-                let lifetime_per_tool: Vec<serde_json::Value> = lifetime_tool_usage
-                    .iter()
-                    .map(|r| {
-                        serde_json::json!({
-                            "tool_name": r.tool_name,
-                            "call_count": r.call_count,
-                            "total_tokens": r.total_tokens,
-                            "total_results": r.total_results,
-                        })
-                    })
-                    .collect();
-                out["lifetime_per_tool"] = serde_json::Value::Array(lifetime_per_tool);
-            }
-
-            serde_json::to_string_pretty(&out)
-                .map_err(|e| mcp_error(format!("Failed to serialize usage: {e}")))?
-        };
-
+        let session_id = self.session_id.load(Ordering::Relaxed);
+        let output = super::dispatch::usage_impl(&handle, &params, session_id).await?;
         let tokens = count_tokens(&output);
         self.record_persistent_call("usage", tokens, 1, false).await;
 

@@ -17,7 +17,9 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
 
-use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget};
+use crate::cli::handlers::{
+    Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update,
+};
 use crate::code::indexing::IndexFacade;
 use crate::daemon::registry::RepoHandle;
 use crate::domain::SearchResult;
@@ -29,7 +31,7 @@ use super::server::{
     format_symbol, format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago,
     resolve_document, truncate_text,
 };
-use super::tools::{GetParams, MemoryWriteBatchEntry, SearchParams};
+use super::tools::{CodeGraphParams, GetParams, MemoryWriteBatchEntry, SearchParams, UsageParams};
 
 /// Daemon-global state shared across all dispatched tool calls.
 #[derive(Clone)]
@@ -1210,6 +1212,275 @@ pub async fn get_impl(
     Err(mcp_error(format!("Not found: '{}'.", params.id)))
 }
 
+/// `update` — three-phase differential reindex: documents, code, sessions.
+/// Returns the human-readable summary aggregated from each phase.
+pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
+    ensure_handle_context(handle).await?;
+
+    let doc_output = {
+        let mut ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_mut()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let result = handle_update(ctx, &handle.root)
+            .map_err(|e| mcp_error(format!("Document update failed: {e}")))?;
+        format!(
+            "## Documents\n\nAdded: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
+            result.added, result.updated, result.removed, result.unchanged
+        )
+    };
+
+    let code_output = {
+        let mut idx_guard = acquire_handle_code_index(handle).await?;
+        if let Some(facade) = idx_guard.as_mut() {
+            match facade.reindex(&handle.root) {
+                Ok(stats) => format!(
+                    "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
+                    stats.files_indexed, stats.symbols_indexed, stats.relationships_collected
+                ),
+                Err(e) => {
+                    tracing::error!("Code reindex failed: {e}");
+                    format!("\n\n## Code\n\nReindex failed: {e}")
+                }
+            }
+        } else {
+            String::new()
+        }
+    };
+
+    let session_output = {
+        let sessions_base = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".claude/projects");
+        let project_root = handle.root.to_string_lossy().to_string();
+
+        let mut ctx_guard = handle.ctx.lock().await;
+        if let Some(ctx) = ctx_guard.as_mut() {
+            match handle_session_index(ctx, &sessions_base, &project_root) {
+                Ok(sr) if sr.added > 0 || sr.updated > 0 => format!(
+                    "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}",
+                    sr.added, sr.updated, sr.unchanged
+                ),
+                Ok(_) => String::new(),
+                Err(e) => {
+                    tracing::warn!("Session indexing failed: {e}");
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        }
+    };
+
+    Ok(format!("{doc_output}{code_output}{session_output}"))
+}
+
+/// `code_graph` — call graph queries. Resolves the symbol then dispatches by
+/// direction (calls/callers/impact). Returns the formatted output text.
+pub async fn code_graph_impl(
+    handle: &RepoHandle,
+    params: &CodeGraphParams,
+) -> Result<String, McpError> {
+    let idx_guard = acquire_handle_code_index(handle).await?;
+    let facade = match idx_guard.as_ref() {
+        Some(f) => f,
+        None => return Ok("Code index is being rebuilt, retry shortly.".to_string()),
+    };
+
+    let symbol = super::server::McpServer::resolve_symbol(facade, &params.name, params.symbol_id)?;
+
+    let output = match params.direction.as_str() {
+        "calls" => {
+            let called = facade.get_called_functions(symbol.id);
+            if called.is_empty() {
+                format!(
+                    "{} ({:?}) does not call any indexed functions.",
+                    symbol.name, symbol.kind
+                )
+            } else {
+                let mut out = format!(
+                    "{} ({:?}) calls {} function(s):\n\n",
+                    symbol.name,
+                    symbol.kind,
+                    called.len()
+                );
+                for sym in &called {
+                    out.push_str(&format_symbol(sym));
+                    out.push('\n');
+                }
+                out
+            }
+        }
+        "callers" => {
+            let callers = facade.get_calling_functions(symbol.id);
+            if callers.is_empty() {
+                format!(
+                    "{} ({:?}) has no indexed callers.",
+                    symbol.name, symbol.kind
+                )
+            } else {
+                let mut out = format!(
+                    "{} ({:?}) is called by {} function(s):\n\n",
+                    symbol.name,
+                    symbol.kind,
+                    callers.len()
+                );
+                for sym in &callers {
+                    out.push_str(&format_symbol(sym));
+                    out.push('\n');
+                }
+                out
+            }
+        }
+        "impact" => {
+            let impacted_ids = facade.get_impact_radius(symbol.id, params.max_depth);
+            if impacted_ids.is_empty() {
+                format!(
+                    "{} ({:?}) has no reachable symbols within {} hop(s).",
+                    symbol.name, symbol.kind, params.max_depth
+                )
+            } else {
+                let mut out = format!(
+                    "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
+                    symbol.name,
+                    symbol.kind,
+                    impacted_ids.len(),
+                    params.max_depth
+                );
+                for sid in &impacted_ids {
+                    if let Some(sym) = facade.get_symbol(*sid) {
+                        out.push_str(&format_symbol(&sym));
+                        out.push('\n');
+                    } else {
+                        out.push_str(&format!("  sym#{} (not found in index)\n", sid.value()));
+                    }
+                }
+                out
+            }
+        }
+        _ => {
+            return Err(mcp_error(format!(
+                "Invalid direction: '{}'. Valid: calls, callers, impact.",
+                params.direction
+            )));
+        }
+    };
+
+    Ok(output)
+}
+
+/// `usage` — token economy audit. Reads session + lifetime stats and returns
+/// a JSON-formatted string. `session_id` is the daemon-global current session.
+pub async fn usage_impl(
+    handle: &RepoHandle,
+    params: &UsageParams,
+    session_id: i64,
+) -> Result<String, McpError> {
+    ensure_handle_context(handle).await?;
+
+    let ctx_guard = handle.ctx.lock().await;
+    let ctx = ctx_guard
+        .as_ref()
+        .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+    let session = if session_id > 0 {
+        stats::get_session(&ctx.conn, session_id)
+            .map_err(|e| mcp_error(format!("Failed to read session: {e}")))?
+    } else {
+        None
+    };
+    let session_tool_usage = if session_id > 0 {
+        stats::get_tool_usage(&ctx.conn, session_id)
+            .map_err(|e| mcp_error(format!("Failed to read tool usage: {e}")))?
+    } else {
+        Vec::new()
+    };
+
+    let lifetime = if !params.session_only {
+        Some(
+            stats::get_aggregate_stats(&ctx.conn)
+                .map_err(|e| mcp_error(format!("Failed to read lifetime stats: {e}")))?,
+        )
+    } else {
+        None
+    };
+    let lifetime_tool_usage = if !params.session_only {
+        stats::get_aggregate_tool_usage(&ctx.conn)
+            .map_err(|e| mcp_error(format!("Failed to read lifetime tool usage: {e}")))?
+    } else {
+        Vec::new()
+    };
+
+    let primary_tools = if params.session_only {
+        &session_tool_usage
+    } else {
+        &lifetime_tool_usage
+    };
+    let mut top_sorted: Vec<&stats::ToolUsageRecord> = primary_tools.iter().collect();
+    top_sorted.sort_by_key(|r| std::cmp::Reverse(r.call_count));
+    let top_5_most_called: Vec<Value> = top_sorted
+        .iter()
+        .take(5)
+        .map(|r| {
+            json!({
+                "tool_name": r.tool_name,
+                "call_count": r.call_count,
+            })
+        })
+        .collect();
+
+    let per_tool: Vec<Value> = session_tool_usage
+        .iter()
+        .map(|r| {
+            json!({
+                "tool_name": r.tool_name,
+                "call_count": r.call_count,
+                "total_tokens": r.total_tokens,
+                "total_results": r.total_results,
+            })
+        })
+        .collect();
+
+    let session_json = session.as_ref().map(|s| {
+        json!({
+            "id": s.id,
+            "total_calls": s.total_calls,
+            "total_tokens": s.total_tokens,
+            "truncations": s.truncation_count,
+        })
+    });
+
+    let mut out = json!({
+        "session": session_json,
+        "per_tool": per_tool,
+        "top_5_most_called": top_5_most_called,
+    });
+
+    if let Some(l) = lifetime {
+        out["lifetime"] = json!({
+            "total_sessions": l.total_sessions,
+            "total_calls": l.total_calls,
+            "total_tokens": l.total_tokens,
+            "truncations": l.total_truncations,
+            "avg_tokens_per_call": l.avg_tokens_per_call,
+        });
+        let lifetime_per_tool: Vec<Value> = lifetime_tool_usage
+            .iter()
+            .map(|r| {
+                json!({
+                    "tool_name": r.tool_name,
+                    "call_count": r.call_count,
+                    "total_tokens": r.total_tokens,
+                    "total_results": r.total_results,
+                })
+            })
+            .collect();
+        out["lifetime_per_tool"] = Value::Array(lifetime_per_tool);
+    }
+
+    serde_json::to_string_pretty(&out)
+        .map_err(|e| mcp_error(format!("Failed to serialize usage: {e}")))
+}
+
 /// Dispatch a tool call by method name. Returns a JSON value — callers are
 /// responsible for the transport envelope.
 ///
@@ -1319,6 +1590,33 @@ pub async fn dispatch_call(
             dctx.record_persistent_call(&handle, "memory_list", tokens, count, false)
                 .await;
             Ok(json!({ "text": text, "tokens": tokens, "count": count }))
+        }
+        "update" => {
+            let text = update_impl(&handle).await?;
+            let tokens = count_tokens(&text);
+            dctx.metrics.record_update(tokens);
+            dctx.record_persistent_call(&handle, "update", tokens, 1, false)
+                .await;
+            Ok(json!({ "text": text, "tokens": tokens }))
+        }
+        "code_graph" => {
+            let cp: CodeGraphParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("code_graph: invalid params: {e}")))?;
+            let text = code_graph_impl(&handle, &cp).await?;
+            let tokens = count_tokens(&text);
+            dctx.record_persistent_call(&handle, "code_graph", tokens, 1, false)
+                .await;
+            Ok(json!({ "text": text, "tokens": tokens }))
+        }
+        "usage" => {
+            let up: UsageParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("usage: invalid params: {e}")))?;
+            let session_id = dctx.session_id.load(Ordering::Relaxed);
+            let text = usage_impl(&handle, &up, session_id).await?;
+            let tokens = count_tokens(&text);
+            dctx.record_persistent_call(&handle, "usage", tokens, 1, false)
+                .await;
+            Ok(json!({ "text": text, "tokens": tokens }))
         }
         other => Err(McpError {
             code: ErrorCode::METHOD_NOT_FOUND,
@@ -1967,5 +2265,89 @@ mod tests {
             "result: {result}"
         );
         assert!(result.get("tokens").is_some(), "result: {result}");
+    }
+
+    #[tokio::test]
+    async fn usage_impl_returns_empty_session_when_no_session_id() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let params = UsageParams {
+            session_only: true,
+            root: None,
+        };
+
+        let body = usage_impl(&handle, &params, 0).await.expect("usage impl");
+        let parsed: Value = serde_json::from_str(&body).expect("json");
+
+        assert!(parsed.get("session").map_or(false, Value::is_null));
+        assert_eq!(parsed["per_tool"].as_array().map(Vec::len), Some(0));
+        assert_eq!(parsed["top_5_most_called"].as_array().map(Vec::len), Some(0));
+        assert!(parsed.get("lifetime").is_none());
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_routes_usage_to_impl() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+
+        let result = dispatch_call("usage", json!({}), handle, &dctx)
+            .await
+            .expect("dispatch");
+
+        let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+        let parsed: Value = serde_json::from_str(text).expect("usage text is json");
+        assert!(parsed.get("session").is_some(), "result: {result}");
+        assert!(result.get("tokens").is_some(), "result: {result}");
+    }
+
+    #[tokio::test]
+    async fn code_graph_impl_returns_rebuild_hint_when_no_index() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        // Mark reindex active so acquire_handle_code_index returns the (None) lock.
+        handle
+            .code_reindex_active
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let params = CodeGraphParams {
+            name: "anything".into(),
+            root: None,
+            direction: "calls".into(),
+            symbol_id: None,
+            max_depth: 3,
+        };
+
+        let text = code_graph_impl(&handle, &params)
+            .await
+            .expect("code_graph impl");
+        assert!(
+            text.contains("Code index is being rebuilt"),
+            "text: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_code_graph_invalid_params_errors() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+
+        let err = dispatch_call("code_graph", json!({}), handle, &dctx)
+            .await
+            .expect_err("missing name");
+        assert!(err.message.contains("invalid params"), "msg: {}", err.message);
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_unknown_method_remains_method_not_found_after_new_routes() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+
+        let err = dispatch_call("nonexistent_tool_xyz", json!({}), handle, &dctx)
+            .await
+            .expect_err("should be method-not-found");
+        assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
     }
 }
