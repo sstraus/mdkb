@@ -545,6 +545,7 @@ impl Config {
         }
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -793,6 +794,23 @@ default_limit = 20
         assert_eq!(config.search.default_limit, 20);
         // Other fields should have defaults
         assert!(config.indexing.parse_frontmatter);
+    }
+
+    #[test]
+    fn test_load_rejects_invalid_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+
+        // search.default_limit = 0 violates validate()
+        let toml_content = r#"
+[search]
+default_limit = 0
+"#;
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let result = Config::load(&config_path);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("default_limit"));
     }
 
     #[test]
