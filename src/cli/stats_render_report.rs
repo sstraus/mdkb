@@ -94,32 +94,75 @@ fn render_memory(out: &mut String, m: &MemorySummary) {
 }
 
 fn render_code(out: &mut String, c: &CodeSummary) {
-    if c.symbols_by_language.is_empty() && c.top_files_by_tokens.is_empty() {
+    if c.files == 0 {
         out.push_str(&frame("Code Index", "  (not indexed)", WIDTH));
         return;
     }
 
-    let max_sym = c.symbols_by_language.values().copied().max().unwrap_or(0) as u64;
     let bar_w = 14;
     let mut lines = Vec::new();
 
-    let mut langs: Vec<(&String, &usize)> = c.symbols_by_language.iter().collect();
-    langs.sort_by(|a, b| b.1.cmp(a.1));
-
-    for (lang, count) in &langs {
-        let b = bar(**count as u64, max_sym.max(1), bar_w);
-        lines.push(format!("  {:12} [{b}] {:>5}", lang, count));
+    lines.push(format!(
+        "  files {:>6}  symbols {:>6}  relations {:>6}",
+        c.files, c.symbols, c.relations,
+    ));
+    if let Some(ts) = c.last_indexed
+        .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+    {
+        lines.push(format!("  indexed {}", ts.format("%Y-%m-%d %H:%M UTC")));
     }
 
-    if !c.top_files_by_tokens.is_empty() {
+    if !c.languages.is_empty() {
+        let max = c.languages.iter().map(|l| l.symbols).max().unwrap_or(0) as u64;
         lines.push(String::new());
-        lines.push("  Top files by tokens:".to_string());
-        for f in &c.top_files_by_tokens {
-            lines.push(format!("    {:>6}  {}", f.token_count, f.path));
+        lines.push("  Languages:".to_string());
+        for l in &c.languages {
+            let b = bar(l.symbols as u64, max.max(1), bar_w);
+            lines.push(format!(
+                "    {:10} [{b}] {:>4} files {:>5} syms",
+                truncate(&l.language, 10), l.files, l.symbols,
+            ));
+        }
+    }
+
+    if !c.symbols_by_kind.is_empty() {
+        let max = c.symbols_by_kind.iter().map(|k| k.count).max().unwrap_or(0) as u64;
+        lines.push(String::new());
+        lines.push("  Symbol kinds:".to_string());
+        for k in &c.symbols_by_kind {
+            let b = bar(k.count as u64, max.max(1), bar_w);
+            lines.push(format!("    {:12} [{b}] {:>6}", truncate(&k.kind, 12), k.count));
+        }
+    }
+
+    if !c.relations_by_kind.is_empty() {
+        let max = c.relations_by_kind.iter().map(|k| k.count).max().unwrap_or(0) as u64;
+        lines.push(String::new());
+        lines.push("  Relations:".to_string());
+        for k in &c.relations_by_kind {
+            let b = bar(k.count as u64, max.max(1), bar_w);
+            lines.push(format!("    {:12} [{b}] {:>6}", truncate(&k.kind, 12), k.count));
+        }
+    }
+
+    if !c.top_files.is_empty() {
+        lines.push(String::new());
+        lines.push("  Top files by symbols:".to_string());
+        for f in &c.top_files {
+            lines.push(format!("    {:>5} syms  {}", f.symbols, truncate(&f.path, 48)));
         }
     }
 
     out.push_str(&frame("Code Index", &lines.join("\n"), WIDTH));
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 fn render_sessions(out: &mut String, s: &SessionsSummary) {
@@ -192,14 +235,24 @@ mod tests {
                 reminders_upcoming_7d: 2,
             },
             code: CodeSummary {
-                symbols_by_language: {
-                    let mut m = HashMap::new();
-                    m.insert("rust".to_string(), 300);
-                    m.insert("typescript".to_string(), 120);
-                    m
-                },
-                top_files_by_tokens: vec![
-                    FileTokenRow { path: "src/main.rs".to_string(), token_count: 1200 },
+                files: 12,
+                symbols: 420,
+                relations: 880,
+                last_indexed: Some(1_700_000_000),
+                languages: vec![
+                    LanguageRow { language: "rust".to_string(), files: 8, symbols: 300 },
+                    LanguageRow { language: "typescript".to_string(), files: 4, symbols: 120 },
+                ],
+                symbols_by_kind: vec![
+                    KindCount { kind: "Function".to_string(), count: 210 },
+                    KindCount { kind: "Struct".to_string(), count: 80 },
+                ],
+                relations_by_kind: vec![
+                    KindCount { kind: "Calls".to_string(), count: 640 },
+                    KindCount { kind: "Uses".to_string(), count: 240 },
+                ],
+                top_files: vec![
+                    FileSymbolRow { path: "src/main.rs".to_string(), symbols: 120 },
                 ],
             },
             sessions: SessionsSummary {
@@ -272,10 +325,30 @@ mod tests {
     #[test]
     fn render_no_code_shows_not_indexed() {
         let mut r = fixture_report();
-        r.code.symbols_by_language.clear();
-        r.code.top_files_by_tokens.clear();
+        r.code.files = 0;
+        r.code.symbols = 0;
+        r.code.relations = 0;
+        r.code.languages.clear();
+        r.code.symbols_by_kind.clear();
+        r.code.relations_by_kind.clear();
+        r.code.top_files.clear();
         let out = render(&r, false);
         assert!(out.contains("(not indexed)"));
+    }
+
+    #[test]
+    fn render_code_shows_totals_and_sections() {
+        let out = render(&fixture_report(), false);
+        assert!(out.contains("files"));
+        assert!(out.contains("symbols"));
+        assert!(out.contains("relations"));
+        assert!(out.contains("Languages:"));
+        assert!(out.contains("Symbol kinds:"));
+        assert!(out.contains("Relations:"));
+        assert!(out.contains("Top files by symbols:"));
+        assert!(out.contains("Function"));
+        assert!(out.contains("Calls"));
+        assert!(out.contains("src/main.rs"));
     }
 
     #[test]
