@@ -2029,10 +2029,17 @@ fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format:
 /// 4. Waits for SIGINT/SIGTERM, then signals the IPC server to unlink sockets
 ///    and drops the lock guard. Watcher + registry wire-up arrives in Story 7.
 async fn run_daemon() -> Result<()> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicI64, AtomicU64};
+
+    use mdkb::daemon::config::DaemonConfig;
     use mdkb::daemon::ipc_server;
+    use mdkb::daemon::registry::RepoRegistry;
     use mdkb::daemon::singleton::{
         AcquireError, acquire_singleton_lock, default_lock_path, read_pid,
     };
+    use mdkb::mcp::dispatch::DispatchContext;
+    use mdkb::metrics::UsageMetrics;
     use tokio_util::sync::CancellationToken;
 
     let lock_path = default_lock_path();
@@ -2067,10 +2074,25 @@ async fn run_daemon() -> Result<()> {
         base_dir.display()
     );
 
+    let daemon_config_path = base_dir.join("daemon.toml");
+    let daemon_config = DaemonConfig::load_or_default(&daemon_config_path)
+        .map_err(|e| mdkb::Error::other(format!("daemon config: {e}")))?;
+    let registry = Arc::new(RepoRegistry::new(daemon_config));
+    let dctx = Arc::new(DispatchContext {
+        metrics: Arc::new(UsageMetrics::new()),
+        session_id: Arc::new(AtomicI64::new(0)),
+        persistent_call_count: Arc::new(AtomicU64::new(0)),
+        optimize_interval_calls: 200,
+    });
+
     let shutdown = CancellationToken::new();
     let ipc_shutdown = shutdown.clone();
     let ipc_base = base_dir.clone();
-    let ipc_task = tokio::spawn(async move { ipc_server::serve(&ipc_base, ipc_shutdown).await });
+    let ipc_registry = Arc::clone(&registry);
+    let ipc_dctx = Arc::clone(&dctx);
+    let ipc_task = tokio::spawn(async move {
+        ipc_server::serve(&ipc_base, ipc_shutdown, ipc_registry, ipc_dctx).await
+    });
 
     // Wait for SIGINT or SIGTERM, whichever arrives first.
     wait_for_shutdown_signal().await?;
