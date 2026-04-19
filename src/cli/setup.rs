@@ -210,8 +210,7 @@ pub fn handle_setup_mcp_claude(
 /// 1. Current executable path (if running from cargo or installed binary)
 /// 2. PATH lookup
 fn find_mdkb_binary() -> Result<String> {
-    // Test / CI override — lets integration tests point at the built `mdkb`
-    // bin under target/debug without polluting PATH.
+    #[cfg(debug_assertions)]
     if let Some(override_path) = env::var_os("MDKB_BINARY_OVERRIDE") {
         let s = override_path.to_string_lossy().to_string();
         if !s.is_empty() {
@@ -281,6 +280,13 @@ pub const HOOK_EVENTS: &[(&str, &str)] = &[
     ("PostToolUse", "post-tool-use"),
 ];
 
+/// Single-quote shell escaping: wraps `s` in single quotes, escaping any
+/// embedded single quotes with the `'\''` pattern.
+fn shell_quote(s: &str) -> String {
+    let escaped = s.replace('\'', "'\\''");
+    format!("'{escaped}'")
+}
+
 /// Shell command written into Claude/Codex settings for a lifecycle event.
 ///
 /// Primary path goes through the daemon via `mdkb hook <event>`. If that
@@ -289,9 +295,10 @@ pub const HOOK_EVENTS: &[(&str, &str)] = &[
 /// same dispatch in-process. Both branches exit 0, so the host CLI is
 /// never blocked by mdkb.
 pub fn hook_command_line(binary_path: &str, cli_event: &str) -> String {
+    let bin = shell_quote(binary_path);
     format!(
         "if ! {bin} hook {event}; then MDKB_NO_DAEMON=1 {bin} hook {event}; fi",
-        bin = binary_path,
+        bin = bin,
         event = cli_event,
     )
 }
@@ -826,5 +833,59 @@ mod tests {
         let cwd = std::path::Path::new("/tmp/project");
         let p = claude_settings_path(cwd, "local").unwrap();
         assert_eq!(p, cwd.join(".claude").join("settings.local.json"));
+    }
+
+    #[test]
+    fn test_shell_quote_plain() {
+        assert_eq!(shell_quote("/usr/local/bin/mdkb"), "'/usr/local/bin/mdkb'");
+    }
+
+    #[test]
+    fn test_shell_quote_spaces_and_metacharacters() {
+        // Path with spaces and shell metacharacters must not cause injection.
+        let path = "/home/user/my programs/md;kb$(evil)";
+        let quoted = shell_quote(path);
+        assert_eq!(quoted, "'/home/user/my programs/md;kb$(evil)'");
+        // The quoted form must start and end with single quotes.
+        assert!(quoted.starts_with('\''));
+        assert!(quoted.ends_with('\''));
+    }
+
+    #[test]
+    fn test_shell_quote_embedded_single_quote() {
+        // Single quotes inside the path are escaped with the '\\'' pattern.
+        let path = "/home/user/it's/mdkb";
+        let quoted = shell_quote(path);
+        assert_eq!(quoted, "'/home/user/it'\\''s/mdkb'");
+    }
+
+    #[test]
+    fn test_hook_command_line_safe_with_spaces() {
+        let cmd = hook_command_line("/path/with spaces/mdkb", "session-start");
+        // Binary must be quoted, not raw.
+        assert!(cmd.contains("'/path/with spaces/mdkb'"));
+        assert!(!cmd.contains(" /path/with spaces/mdkb "));
+    }
+
+    #[test]
+    fn test_hook_command_line_safe_with_metacharacters() {
+        let cmd = hook_command_line("/usr/bin/md;kb$(rm -rf /)", "post-tool-use");
+        assert!(cmd.contains("'/usr/bin/md;kb$(rm -rf /)'"));
+        // The raw injection string must not appear unquoted.
+        assert!(!cmd.contains("md;kb$(rm -rf /)\" "));
+    }
+
+    #[test]
+    fn test_binary_override_honored_in_tests() {
+        // MDKB_BINARY_OVERRIDE must be visible inside #[cfg(test)] code paths.
+        // SAFETY: single-threaded test; no concurrent env readers.
+        unsafe {
+            std::env::set_var("MDKB_BINARY_OVERRIDE", "/fake/mdkb");
+        }
+        let result = find_mdkb_binary();
+        unsafe {
+            std::env::remove_var("MDKB_BINARY_OVERRIDE");
+        }
+        assert_eq!(result.unwrap(), "/fake/mdkb");
     }
 }
