@@ -243,6 +243,10 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
     // paths) where no tokio runtime exists. Bail silently in that case — the
     // daemon always runs under tokio, so production still gets the watcher.
     if tokio::runtime::Handle::try_current().is_err() {
+        tracing::warn!(
+            root = %handle.root.display(),
+            "spawn_watcher_for_handle: no tokio runtime — file watcher skipped"
+        );
         return;
     }
     let root = handle.root.clone();
