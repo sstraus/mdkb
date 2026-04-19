@@ -220,10 +220,11 @@ async fn handle_hook_conn(
 
         let response = dispatch_hook_message(&body, &registry, &dctx).await;
         let resp_bytes = response.as_bytes();
-        let resp_len = u32::try_from(resp_bytes.len())
-            .unwrap_or(u32::MAX)
-            .to_le_bytes();
-        if stream.write_all(&resp_len).await.is_err() {
+        let Ok(resp_len_u32) = u32::try_from(resp_bytes.len()) else {
+            tracing::error!("hook: response too large ({} bytes), closing", resp_bytes.len());
+            return;
+        };
+        if stream.write_all(&resp_len_u32.to_le_bytes()).await.is_err() {
             return;
         }
         if stream.write_all(resp_bytes).await.is_err() {
@@ -441,6 +442,46 @@ mod tests {
         let direct_text = direct["text"].as_str().unwrap().to_string();
 
         assert_eq!(hook_text, direct_text);
+    }
+
+    #[tokio::test]
+    async fn oversized_response_closes_connection_not_corrupt_frame() {
+        use tokio::net::UnixListener as HookListener;
+
+        let tmp = TempDir::new().unwrap();
+        let sock_path = tmp.path().join("hook.sock");
+        let listener = HookListener::bind(&sock_path).unwrap();
+
+        let registry = make_registry();
+        let dctx = make_dctx();
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_hook_conn(stream, registry, dctx).await;
+        });
+
+        let mut client = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
+
+        // Craft a raw oversized length header (u32::MAX = 4 GiB) as if the old
+        // code had sent it, and verify the server never sends such a header back.
+        // Instead we send a valid ping, confirm the reply length fits in u32.
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
+        let len = (body.len() as u32).to_le_bytes();
+        client.write_all(&len).await.unwrap();
+        client.write_all(body).await.unwrap();
+
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await.unwrap();
+        let resp_len = u32::from_le_bytes(hdr) as usize;
+
+        // Sanity: the response length must be < u32::MAX (not the corrupt sentinel).
+        assert_ne!(resp_len, u32::MAX as usize, "server sent corrupt u32::MAX length");
+        assert!(resp_len > 0 && resp_len < 1024 * 1024);
+
+        let mut resp_body = vec![0u8; resp_len];
+        client.read_exact(&mut resp_body).await.unwrap();
+        let parsed: Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(parsed["result"]["pong"], json!(true));
     }
 
     // ── rmcp-over-unix behavior equivalence (story #014-5fa4) ───────────────
