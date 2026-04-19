@@ -322,7 +322,6 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
         let mut counter = SymbolCounter::new();
 
         let symbols = parser.parse(&fc.content, dummy_file_id, &mut counter);
-        let _imports = parser.find_imports(&fc.content, dummy_file_id);
         let calls = parser.find_calls(&fc.content);
         let implementations = parser.find_implementations(&fc.content);
         let extends = parser.find_extends(&fc.content);
