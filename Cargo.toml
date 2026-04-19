@@ -127,6 +127,9 @@ tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 libc = "0.2"
+# Enable the rmcp client only for tests so we can drive the daemon's
+# rmcp-over-unix endpoint with a real handshake.
+rmcp = { version = "0.14", features = ["server", "transport-io", "client"] }
 
 [profile.release]
 lto = true

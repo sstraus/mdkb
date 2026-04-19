@@ -1,7 +1,9 @@
 //! Daemon IPC server: two unix domain sockets.
 //!
-//! - `daemon.sock` (MCP): rmcp traffic. Story 4 wires the actual protocol;
-//!   here we only accept connections so the listener path is testable.
+//! - `daemon.sock` (MCP): rmcp NDJSON traffic. Each connection runs a real
+//!   `McpServer::global(registry)` bound directly to the stream, so the
+//!   `mdkb mcp` proxy can act as a dumb byte forwarder between Claude's
+//!   stdio and this socket.
 //! - `daemon-hook.sock` (hooks): length-prefixed JSON-RPC 2.0. Each message
 //!   is `u32_le(body_len) ++ body_bytes`. Methods are routed through
 //!   `mcp::dispatch::dispatch_call` against the per-request `params.root`.
@@ -13,12 +15,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rmcp::ServiceExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::sync::CancellationToken;
 
 use crate::mcp::dispatch::{DispatchContext, dispatch_call};
+use crate::mcp::server::McpServer;
 
 use super::registry::RepoRegistry;
 
@@ -87,7 +91,8 @@ pub async fn serve(
     );
 
     let mcp_shutdown = shutdown.clone();
-    let mcp_task = tokio::spawn(mcp_accept_loop(mcp_listener, mcp_shutdown));
+    let mcp_registry = Arc::clone(&registry);
+    let mcp_task = tokio::spawn(mcp_accept_loop(mcp_listener, mcp_shutdown, mcp_registry));
 
     let hook_shutdown = shutdown.clone();
     let hook_task = tokio::spawn(hook_accept_loop(
@@ -127,13 +132,18 @@ fn chmod_0600(path: &Path) -> Result<(), IpcError> {
 
 // ── MCP socket (rmcp stream) ────────────────────────────────────────────────
 
-async fn mcp_accept_loop(listener: UnixListener, shutdown: CancellationToken) {
+async fn mcp_accept_loop(
+    listener: UnixListener,
+    shutdown: CancellationToken,
+    registry: Arc<RepoRegistry>,
+) {
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _addr)) => {
-                    tokio::spawn(handle_mcp_conn(stream));
+                    let registry = Arc::clone(&registry);
+                    tokio::spawn(handle_mcp_conn(stream, registry));
                 }
                 Err(e) => {
                     tracing::warn!("ipc accept failed (mcp): {e}");
@@ -143,16 +153,20 @@ async fn mcp_accept_loop(listener: UnixListener, shutdown: CancellationToken) {
     }
 }
 
-/// Minimal MCP connection handler. Story 4 replaces this with the real
-/// rmcp server bound to the stream. Today it only holds the stream open
-/// so clients confirm the listener is accepting.
-async fn handle_mcp_conn(mut stream: UnixStream) {
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
+/// Bind a real rmcp `McpServer` to the accepted UnixStream. The server
+/// runs in global mode and resolves repos via the shared `RepoRegistry`,
+/// so a single daemon can host any number of concurrent MCP clients.
+async fn handle_mcp_conn(stream: UnixStream, registry: Arc<RepoRegistry>) {
+    let server = McpServer::global(registry);
+    let service = match server.serve(stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("mcp serve init failed: {e}");
+            return;
         }
+    };
+    if let Err(e) = service.waiting().await {
+        tracing::debug!("mcp connection ended: {e}");
     }
 }
 
@@ -427,5 +441,154 @@ mod tests {
         let direct_text = direct["text"].as_str().unwrap().to_string();
 
         assert_eq!(hook_text, direct_text);
+    }
+
+    // ── rmcp-over-unix behavior equivalence (story #014-5fa4) ───────────────
+    //
+    // Drive the daemon's MCP socket end-to-end with a real rmcp client and
+    // confirm the tool result text matches what `dispatch_call` returns.
+    // This is the proof that `mdkb mcp` (a dumb byte forwarder) gives Claude
+    // the exact same answer it would get talking directly to dispatch.
+
+    use rmcp::model::CallToolRequestParams;
+    use tokio::net::UnixListener as TokioUnixListener;
+
+    /// Spawn `McpServer::global(registry).serve(stream)` on every accepted
+    /// connection until the listener is dropped.
+    fn spawn_mcp_listener(
+        listener: TokioUnixListener,
+        registry: Arc<RepoRegistry>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let registry = Arc::clone(&registry);
+                tokio::spawn(async move {
+                    let server = crate::mcp::server::McpServer::global(registry);
+                    if let Ok(s) = server.serve(stream).await {
+                        let _ = s.waiting().await;
+                    }
+                });
+            }
+        })
+    }
+
+    fn args_from(v: Value) -> Option<serde_json::Map<String, Value>> {
+        v.as_object().cloned()
+    }
+
+    #[tokio::test]
+    async fn mcp_socket_status_equals_dispatch_call() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".mdkb")).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sock = tmp.path().join("mcp.sock");
+
+        let registry = make_registry();
+        let dctx = make_dctx();
+
+        // Pre-register the repo so global mode auto-selects it without roots.
+        let _ = registry.get_or_open(&root).unwrap();
+
+        let listener = TokioUnixListener::bind(&sock).unwrap();
+        let server_task = spawn_mcp_listener(listener, Arc::clone(&registry));
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let client = timeout(Duration::from_secs(10), ().serve(stream))
+            .await
+            .expect("client handshake timed out")
+            .expect("client handshake error");
+        let result = timeout(
+            Duration::from_secs(15),
+            client.call_tool(CallToolRequestParams {
+                name: "status".into(),
+                arguments: args_from(json!({})),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .expect("call_tool status timed out")
+        .expect("call_tool status error");
+
+        // Extract the single text content block.
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("status returned text content");
+
+        let direct_handle = registry.get_or_open(&root).unwrap();
+        let direct = dispatch_call("status", json!({}), direct_handle, &dctx)
+            .await
+            .unwrap();
+        assert_eq!(text, direct["text"].as_str().unwrap());
+
+        let _ = client.cancel().await;
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mcp_socket_search_equals_dispatch_call() {
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".mdkb")).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let sock = tmp.path().join("mcp.sock");
+
+        let registry = make_registry();
+        let dctx = make_dctx();
+        let _ = registry.get_or_open(&root).unwrap();
+
+        let listener = TokioUnixListener::bind(&sock).unwrap();
+        let server_task = spawn_mcp_listener(listener, Arc::clone(&registry));
+
+        let stream = UnixStream::connect(&sock).await.unwrap();
+        let client = timeout(Duration::from_secs(10), ().serve(stream))
+            .await
+            .expect("client handshake timed out")
+            .expect("client handshake error");
+        let result = timeout(
+            Duration::from_secs(15),
+            client.call_tool(CallToolRequestParams {
+                name: "search".into(),
+                arguments: args_from(json!({
+                    "query": "anything",
+                    "scope": "docs",
+                    "root": root.display().to_string(),
+                })),
+                meta: None,
+                task: None,
+            }),
+        )
+        .await
+        .expect("call_tool search timed out")
+        .expect("call_tool search error");
+
+        let text = result
+            .content
+            .first()
+            .and_then(|c| c.as_text())
+            .map(|t| t.text.clone())
+            .expect("search returned text content");
+
+        let direct_handle = registry.get_or_open(&root).unwrap();
+        let direct = dispatch_call(
+            "search",
+            json!({"query":"anything","scope":"docs"}),
+            direct_handle,
+            &dctx,
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, direct["text"].as_str().unwrap());
+
+        let _ = client.cancel().await;
+        server_task.abort();
     }
 }

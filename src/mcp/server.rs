@@ -294,13 +294,11 @@ impl McpServer {
         Ok(())
     }
 
-    /// Query MCP roots from the client and register them in the registry.
-    async fn sync_roots_from_client(
-        &self,
-        context: &NotificationContext<RoleServer>,
-        registry: &RepoRegistry,
-    ) {
-        match context.peer.list_roots().await {
+    /// Query MCP roots from the client peer and register them in the registry.
+    /// Takes `peer` by value so this can run inside a detached task without
+    /// blocking the server's notification loop on a slow client reply.
+    async fn sync_roots_from_peer(peer: &rmcp::Peer<RoleServer>, registry: &RepoRegistry) {
+        match peer.list_roots().await {
             Ok(result) => {
                 for root in &result.roots {
                     if let Some(path) = uri_to_path(&root.uri) {
@@ -841,13 +839,24 @@ impl ServerHandler for McpServer {
 
     async fn on_initialized(&self, context: NotificationContext<RoleServer>) {
         if let Some(registry) = &self.registry {
-            self.sync_roots_from_client(&context, registry).await;
+            // Detach so the server's notification loop is never blocked by a
+            // slow / non-responsive client. Critical for transports where the
+            // peer's `roots/list` reply is not guaranteed (tests, hooks).
+            let registry = Arc::clone(registry);
+            let peer = context.peer.clone();
+            tokio::spawn(async move {
+                Self::sync_roots_from_peer(&peer, &registry).await;
+            });
         }
     }
 
     async fn on_roots_list_changed(&self, context: NotificationContext<RoleServer>) {
         if let Some(registry) = &self.registry {
-            self.sync_roots_from_client(&context, registry).await;
+            let registry = Arc::clone(registry);
+            let peer = context.peer.clone();
+            tokio::spawn(async move {
+                Self::sync_roots_from_peer(&peer, &registry).await;
+            });
         }
     }
 }

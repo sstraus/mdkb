@@ -323,6 +323,38 @@ async fn main() -> Result<()> {
                 run_server(cwd, transport).await?;
             }
         }
+        Command::Mcp { socket } => {
+            if std::env::var_os("MDKB_NO_DAEMON").is_some() {
+                // Bypass the daemon entirely: run rmcp in-process in global
+                // mode, talking over stdio. Same wire protocol; the only
+                // difference is the server instance lives in this process.
+                let daemon_config =
+                    mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())?;
+                let registry =
+                    std::sync::Arc::new(mdkb::daemon::registry::RepoRegistry::new(daemon_config));
+                let server = mdkb::mcp::server::McpServer::global(registry);
+
+                tracing::info!("Starting mdkb MCP in-process (MDKB_NO_DAEMON=1)...");
+                let (stdin, stdout) = rmcp::transport::io::stdio();
+                let service = server
+                    .serve((stdin, stdout))
+                    .await
+                    .map_err(|e| mdkb::Error::other(format!("Failed to start server: {e}")))?;
+                service
+                    .waiting()
+                    .await
+                    .map_err(|e| mdkb::Error::other(format!("Server error: {e}")))?;
+            } else {
+                let socket_path = socket.unwrap_or_else(|| {
+                    mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())
+                        .map(|c| c.socket_path())
+                        .unwrap_or_else(|_| {
+                            mdkb::DaemonConfig::daemon_home().join("daemon.sock")
+                        })
+                });
+                mdkb::cli::mcp_proxy::run_proxy(socket_path).await?;
+            }
+        }
         Command::Stats { no_color } => {
             let ctx = Context::open(&cwd)?;
             let report = mdkb::cli::stats_report::collect_report(&ctx)?;

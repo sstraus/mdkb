@@ -3,10 +3,13 @@
 pub mod handlers;
 pub mod hooks;
 pub mod journal;
+pub mod mcp_proxy;
 pub mod setup;
 pub mod stats_render;
 pub mod stats_render_report;
 pub mod stats_report;
+
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
@@ -135,6 +138,15 @@ pub enum Command {
         /// A second invocation exits 0 with a message on stderr.
         #[arg(long)]
         daemon: bool,
+    },
+
+    /// Connect Claude's stdio MCP transport to the mdkb daemon over its unix
+    /// socket. Auto-spawns the daemon if it isn't running. Set
+    /// `MDKB_NO_DAEMON=1` to bypass the daemon and run in-process instead.
+    Mcp {
+        /// Override the daemon socket path (default: ~/.mdkb/daemon.sock).
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 
     /// Show diagnostic statistics (index health, memory, code, sessions, hooks)
