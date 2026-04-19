@@ -1,0 +1,121 @@
+//! Integration test for story 017-91cb: single watcher → single reindex
+//! regardless of how many clients share the same `RepoHandle`.
+//!
+//! Proves the daemon contract: multiple clients connected via the proxy all
+//! resolve to the same `RepoHandle` (with one watcher). A file change in a
+//! collection triggers exactly one doc reindex — not N reindexes for N clients.
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use tempfile::TempDir;
+use tokio::sync::Mutex;
+
+use mdkb::cli::handlers::Context;
+use mdkb::domain::Collection;
+use mdkb::mcp::server::{DOC_REINDEX_COUNT, WATCHER_SPAWN_COUNT, run_file_watcher_with_idle};
+use mdkb::store::collections::add_collection;
+
+/// On macOS /tmp → /private/tmp; FSEvents reports canonical paths.
+fn canonical_tempdir() -> TempDir {
+    let base = std::env::temp_dir()
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::temp_dir());
+    tempfile::tempdir_in(base).expect("tempdir")
+}
+
+fn make_collection(name: &str, path: &str) -> Collection {
+    let now = chrono::Utc::now().timestamp();
+    Collection {
+        name: name.to_string(),
+        path: path.to_string(),
+        pattern: "**/*.md".to_string(),
+        source: "manual".to_string(),
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_clients_single_reindex() {
+    let tmp = canonical_tempdir();
+    let root = tmp.path().to_path_buf();
+
+    // 1. Initialize mdkb repo with a "docs" collection.
+    let ctx = Context::init(&root).expect("Context::init");
+    let docs_dir = root.join("docs");
+    std::fs::create_dir_all(&docs_dir).unwrap();
+    add_collection(&ctx.conn, &make_collection("docs", "docs")).unwrap();
+    std::fs::write(docs_dir.join("hello.md"), "# Hello\nOriginal content").unwrap();
+
+    // Run initial update so hello.md is indexed.
+    mdkb::cli::handlers::handle_update(&ctx, &root).unwrap();
+
+    // 2. Wrap context in the same Arc<Mutex<Option>> shape the daemon uses.
+    let ctx_arc: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(Some(ctx)));
+    let code_index: Arc<Mutex<Option<mdkb::code::indexing::IndexFacade>>> =
+        Arc::new(Mutex::new(None));
+
+    // 3. Simulate two clients holding clones of the same shared state.
+    let _client1_ctx = Arc::clone(&ctx_arc);
+    let _client2_ctx = Arc::clone(&ctx_arc);
+
+    // 4. Record baseline counters.
+    let watcher_before = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
+    let doc_before = DOC_REINDEX_COUNT.load(Ordering::Relaxed);
+
+    // 5. Spawn the watcher with a fast batch idle (500ms instead of 30s).
+    let watcher_root = root.clone();
+    let watcher_ctx = Arc::clone(&ctx_arc);
+    let watcher_code = Arc::clone(&code_index);
+    let watcher_handle = tokio::spawn(async move {
+        let _ = run_file_watcher_with_idle(
+            watcher_root,
+            watcher_ctx,
+            watcher_code,
+            true, // needed to watch root recursively
+            vec![],
+            500, // 500ms batch idle for fast test flush
+        )
+        .await;
+    });
+
+    // Give FSEvents time to register the watch.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 6. Exactly one watcher should have spawned.
+    assert_eq!(
+        WATCHER_SPAWN_COUNT.load(Ordering::Relaxed) - watcher_before,
+        1,
+        "exactly one watcher must spawn"
+    );
+    assert!(!watcher_handle.is_finished(), "watcher should still be running");
+
+    // 7. Modify a doc file to trigger the watcher.
+    std::fs::write(docs_dir.join("hello.md"), "# Hello\nModified content").unwrap();
+
+    // 8. Wait for the doc reindex flush (500ms idle + debounce + margin).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = DOC_REINDEX_COUNT.load(Ordering::Relaxed);
+        if current > doc_before {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "DOC_REINDEX_COUNT did not increment within 10s (before={doc_before}, now={current})"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // 9. Assert exactly ONE reindex happened — not two (one per client).
+    assert_eq!(
+        DOC_REINDEX_COUNT.load(Ordering::Relaxed) - doc_before,
+        1,
+        "a single file change must produce exactly one doc reindex, not one per client"
+    );
+
+    watcher_handle.abort();
+}

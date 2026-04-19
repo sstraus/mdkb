@@ -159,6 +159,11 @@ impl RepoRegistry {
         self.handles.insert(canonical.clone(), Arc::clone(&handle));
         tracing::info!("Registered repo: {}", canonical.display());
 
+        // Spawn the file watcher for this repo exactly once (on first open).
+        // Story 017-91cb: the watcher lives only inside the daemon — standalone
+        // MCP stdio sessions never touch files.
+        spawn_watcher_for_handle(&handle);
+
         Ok(handle)
     }
 
@@ -209,6 +214,39 @@ impl RepoRegistry {
             }
         }
     }
+}
+
+/// Spawn the file watcher for a freshly opened `RepoHandle`.
+///
+/// The watcher increments `mcp::server::WATCHER_SPAWN_COUNT` and drives
+/// incremental reindex on change events. It shares `ctx` / `code_index`
+/// Arcs with the handle, so every client that resolves the handle via
+/// the registry sees the same watcher-driven state.
+fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
+    // `get_or_open` is called from sync contexts (tests, synchronous CLI
+    // paths) where no tokio runtime exists. Bail silently in that case — the
+    // daemon always runs under tokio, so production still gets the watcher.
+    if tokio::runtime::Handle::try_current().is_err() {
+        return;
+    }
+    let root = handle.root.clone();
+    let ctx = Arc::clone(&handle.ctx);
+    let code_index = Arc::clone(&handle.code_index);
+    let code_enabled = handle.config.code.enabled;
+    let code_ignore_patterns = handle.code_ignore_patterns.clone();
+    tokio::spawn(async move {
+        if let Err(e) = crate::mcp::server::run_file_watcher(
+            root,
+            ctx,
+            code_index,
+            code_enabled,
+            code_ignore_patterns,
+        )
+        .await
+        {
+            tracing::error!("File watcher error: {e}");
+        }
+    });
 }
 
 /// Canonicalize a root path, resolving symlinks and normalizing.
@@ -399,6 +437,57 @@ mod tests {
     fn test_canonicalize_root_nonexistent() {
         let result = canonicalize_root(Path::new("/definitely/not/a/real/path"));
         assert!(result.is_err());
+    }
+
+    /// Serializes every test that reads `WATCHER_SPAWN_COUNT` — it's a
+    /// process-global counter and parallel tests would race on deltas.
+    static WATCHER_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Story 017-91cb: both halves of the contract.
+    ///
+    /// 1. Standalone `McpServer::new` must NOT spawn a watcher.
+    /// 2. `RepoRegistry::get_or_open` spawns exactly ONE watcher even when
+    ///    called twice with the same root — cache hits must not re-spawn.
+    ///
+    /// Both halves share the global `WATCHER_SPAWN_COUNT`, so they live in
+    /// one test behind a serializing mutex.
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_spawn_gated_to_daemon_registry() {
+        use crate::mcp::server::{McpServer, WATCHER_SPAWN_COUNT};
+        use std::sync::atomic::Ordering;
+
+        let _guard = WATCHER_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        // --- Half 1: standalone must not spawn a watcher. ---
+        let tmp_standalone = TempDir::new().unwrap();
+        let root_standalone = make_repo(&tmp_standalone);
+        let before_standalone = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
+
+        let _server = McpServer::new(root_standalone);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let after_standalone = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after_standalone, before_standalone,
+            "McpServer::new must not spawn a file watcher (standalone path)"
+        );
+
+        // --- Half 2: registry.get_or_open x2 on same root spawns 1 watcher. ---
+        let tmp_daemon = TempDir::new().unwrap();
+        let root_daemon = make_repo(&tmp_daemon);
+        let registry = RepoRegistry::new(DaemonConfig::default());
+        let before_daemon = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
+
+        let _h1 = registry.get_or_open(&root_daemon).unwrap();
+        let _h2 = registry.get_or_open(&root_daemon).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let after_daemon = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after_daemon - before_daemon,
+            1,
+            "two get_or_open calls for the same root must produce exactly one watcher"
+        );
     }
 
     #[test]

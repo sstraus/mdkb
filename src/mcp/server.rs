@@ -1019,25 +1019,10 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
         });
     }
 
-    // Start file watcher in background
-    let watcher_root = root.clone();
-    let watcher_ctx = server.ctx.clone();
-    let watcher_code_index = server.code_index.clone();
-    let watcher_code_enabled = server.full_config.code.enabled;
-    let watcher_ignore_patterns = server.code_ignore_patterns.clone();
-    tokio::spawn(async move {
-        if let Err(e) = run_file_watcher(
-            watcher_root,
-            watcher_ctx,
-            watcher_code_index,
-            watcher_code_enabled,
-            watcher_ignore_patterns,
-        )
-        .await
-        {
-            tracing::error!("File watcher error: {}", e);
-        }
-    });
+    // NOTE: standalone mode does not spawn a file watcher. The watcher lives
+    // only inside the daemon (`McpServer::global` / `RepoRegistry`), so N
+    // client sessions share exactly one notify backend and one reindex stream.
+    // Story 017-91cb / plan AC: "File watcher runs only in daemon mode".
 
     match transport {
         TransportMode::Stdio => {
@@ -1127,29 +1112,74 @@ fn classify_change(
 /// accumulate into a single efficient batch while still feeling responsive.
 const CODE_BATCH_IDLE_MS: u64 = 30_000;
 
+/// How long the watcher waits for context initialization before giving up.
+const CTX_WAIT_SECS: u64 = 60;
+
+/// Number of times `run_file_watcher` has been entered across the process.
+/// Observable by tests to assert that the standalone path never spawns a
+/// watcher and that the daemon spawns exactly one per registered repo.
+pub static WATCHER_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of completed doc reindex flushes (observable by integration tests).
+pub static DOC_REINDEX_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Number of completed code reindex flushes (observable by integration tests).
+pub static CODE_REINDEX_COUNT: AtomicU64 = AtomicU64::new(0);
+
 /// Run the file watcher and trigger reindex on changes.
-async fn run_file_watcher(
+///
+/// Spawned only from `RepoRegistry::get_or_open` when a new `RepoHandle` is
+/// created (daemon mode). Never spawned in standalone MCP stdio sessions.
+pub async fn run_file_watcher(
     root: PathBuf,
     ctx: Arc<Mutex<Option<Context>>>,
     code_index: Arc<Mutex<Option<IndexFacade>>>,
     code_enabled: bool,
     code_ignore_patterns: Vec<String>,
 ) -> crate::error::Result<()> {
+    run_file_watcher_with_idle(
+        root,
+        ctx,
+        code_index,
+        code_enabled,
+        code_ignore_patterns,
+        CODE_BATCH_IDLE_MS,
+    )
+    .await
+}
+
+/// Inner implementation with configurable batch idle (testable).
+pub async fn run_file_watcher_with_idle(
+    root: PathBuf,
+    ctx: Arc<Mutex<Option<Context>>>,
+    code_index: Arc<Mutex<Option<IndexFacade>>>,
+    code_enabled: bool,
+    code_ignore_patterns: Vec<String>,
+    batch_idle_ms: u64,
+) -> crate::error::Result<()> {
+    WATCHER_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
     let config = WatcherConfig::default();
     let mut watcher = FileWatcher::new(config)?;
 
-    // Open context to get collection paths
-    let ctx_guard = ctx.lock().await;
-    if ctx_guard.is_none() {
-        drop(ctx_guard);
-        return Ok(());
-    }
-
+    // Wait for context initialization (driven by first client request via
+    // ensure_handle_context). Without this poll the watcher would race against
+    // the dispatch path and exit immediately when ctx is still None.
     let collection_list = {
-        let ctx_ref = ctx_guard.as_ref().unwrap();
-        collections::list_collections(&ctx_ref.conn)?
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(CTX_WAIT_SECS);
+        loop {
+            let ctx_guard = ctx.lock().await;
+            if let Some(ctx_ref) = ctx_guard.as_ref() {
+                break collections::list_collections(&ctx_ref.conn)?;
+            }
+            drop(ctx_guard);
+            if tokio::time::Instant::now() >= deadline {
+                tracing::debug!("Watcher: context never initialized, exiting");
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
     };
-    drop(ctx_guard);
 
     // Resolve absolute collection paths for routing
     let collection_paths: Vec<PathBuf> = collection_list
@@ -1157,7 +1187,6 @@ async fn run_file_watcher(
         .map(|coll| root.join(&coll.path))
         .filter(|p| p.exists())
         .collect();
-
     // Build exclude matcher for code changes (node_modules, dist, target, etc.)
     let code_excludes = build_code_excludes(&root, &code_ignore_patterns);
 
@@ -1199,7 +1228,7 @@ async fn run_file_watcher(
         } else {
             // Pending batch — wait for more events or flush after idle timeout
             match tokio::time::timeout(
-                std::time::Duration::from_millis(CODE_BATCH_IDLE_MS),
+                std::time::Duration::from_millis(batch_idle_ms),
                 watcher.recv(),
             )
             .await
@@ -1259,6 +1288,7 @@ async fn flush_code_batch(
             Err(e) => tracing::error!("Code reindex failed: {}", e),
         }
         crate::llm::release_cached_service();
+        CODE_REINDEX_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1272,6 +1302,7 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
     if let Some(ctx_ref) = ctx_guard.as_mut() {
         match handle_update(ctx_ref, root) {
             Ok(result) => {
+                DOC_REINDEX_COUNT.fetch_add(1, Ordering::Relaxed);
                 if result.added > 0 || result.updated > 0 || result.removed > 0 {
                     tracing::info!(
                         "Reindexed: {} added, {} updated, {} removed",
