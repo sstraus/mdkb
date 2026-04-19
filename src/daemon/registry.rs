@@ -114,6 +114,9 @@ pub struct RepoRegistry {
     handles: DashMap<PathBuf, Arc<RepoHandle>>,
     max_active: usize,
     daemon_config: DaemonConfig,
+    /// Serializes the check-evict-insert triple so concurrent callers cannot
+    /// both pass the capacity check before either inserts, which would exceed max_active.
+    open_gate: std::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for RepoRegistry {
@@ -133,6 +136,7 @@ impl RepoRegistry {
             handles: DashMap::new(),
             max_active,
             daemon_config: config,
+            open_gate: std::sync::Mutex::new(()),
         }
     }
 
@@ -149,6 +153,16 @@ impl RepoRegistry {
         // Whitelist check before opening
         self.daemon_config.check_whitelist(&canonical)?;
 
+        // Serializes check-evict-insert so concurrent callers cannot both pass
+        // the capacity check before either has inserted, which would exceed max_active.
+        let _gate = self.open_gate.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Re-check after acquiring the gate: another caller may have just inserted this key.
+        if let Some(handle) = self.handles.get(&canonical) {
+            handle.touch();
+            return Ok(Arc::clone(&handle));
+        }
+
         // Evict if at capacity
         if self.handles.len() >= self.max_active {
             self.evict_lru();
@@ -158,6 +172,8 @@ impl RepoRegistry {
         let handle = Arc::new(RepoHandle::open(&canonical)?);
         self.handles.insert(canonical.clone(), Arc::clone(&handle));
         tracing::info!("Registered repo: {}", canonical.display());
+
+        drop(_gate);
 
         // Spawn the file watcher for this repo exactly once (on first open).
         // Story 017-91cb: the watcher lives only inside the daemon — standalone
@@ -437,6 +453,48 @@ mod tests {
     fn test_canonicalize_root_nonexistent() {
         let result = canonicalize_root(Path::new("/definitely/not/a/real/path"));
         assert!(result.is_err());
+    }
+
+    /// AC#2 — concurrent get_or_open never exceeds max_active.
+    ///
+    /// Runs outside a tokio runtime so spawn_watcher_for_handle bails early
+    /// (try_current().is_err()) and WATCHER_SPAWN_COUNT stays unaffected.
+    #[test]
+    fn test_concurrent_get_or_open_respects_max_active() {
+        use std::sync::{Arc, Barrier};
+
+        const MAX: usize = 3;
+        const TASKS: usize = 20;
+
+        let tmps: Vec<TempDir> = (0..TASKS).map(|_| TempDir::new().unwrap()).collect();
+        let roots: Vec<PathBuf> = tmps.iter().map(|t| make_repo(t)).collect();
+
+        let config = DaemonConfig {
+            max_active_repos: MAX,
+            ..Default::default()
+        };
+        let registry = Arc::new(RepoRegistry::new(config));
+        // Barrier ensures all threads hit get_or_open simultaneously.
+        let barrier = Arc::new(Barrier::new(TASKS));
+
+        std::thread::scope(|s| {
+            for root in &roots {
+                let reg = Arc::clone(&registry);
+                let bar = Arc::clone(&barrier);
+                let root = root.clone();
+                s.spawn(move || {
+                    bar.wait();
+                    reg.get_or_open(&root).ok();
+                });
+            }
+        });
+
+        assert!(
+            registry.active_count() <= MAX,
+            "active_count {} exceeded max_active {}",
+            registry.active_count(),
+            MAX
+        );
     }
 
     /// Serializes every test that reads `WATCHER_SPAWN_COUNT` — it's a
