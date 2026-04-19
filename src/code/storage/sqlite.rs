@@ -321,7 +321,11 @@ impl CodeDb {
         file_pattern: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<Symbol>> {
-        let pattern = format!("%{file_pattern}%");
+        let escaped = file_pattern
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
         let mut stmt = self.conn.prepare_cached(&format!(
             "{SYMBOL_COLUMNS} FROM code_symbols WHERE file_path LIKE ?1 ESCAPE '\\' ORDER BY file_path, line_start LIMIT ?2"
         ))?;
@@ -1191,6 +1195,72 @@ mod tests {
         // "g%" would match both if unescaped; should match neither as literal "g%"
         let results = db.search_symbols("g%", 10).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_find_symbols_by_file_escapes_like_metacharacters() {
+        let (_dir, db) = temp_db();
+        // Register two files: one with metacharacters in path, one normal
+        let file_id_meta = db
+            .insert_file(
+                "src/100%_done/lib.rs",
+                "src/100%_done/lib.rs",
+                "h1",
+                Some("Rust"),
+                None,
+                None,
+            )
+            .unwrap();
+        let file_id_other = db
+            .insert_file("src/other.rs", "src/other.rs", "h2", Some("Rust"), None, None)
+            .unwrap();
+        db.insert_symbol(
+            "meta_fn",
+            "Function",
+            file_id_meta,
+            "src/100%_done/lib.rs",
+            1,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "other_fn",
+            "Function",
+            file_id_other,
+            "src/other.rs",
+            1,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // Literal "%" must not act as a wildcard — should match only the file whose
+        // path actually contains "%", not both files.
+        let results = db.find_symbols_by_file("100%_done", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_name(), "meta_fn");
+
+        // A bare "%" alone would match everything if unescaped; escaped it matches nothing.
+        let results = db.find_symbols_by_file("%", 10).unwrap();
+        assert_eq!(results.len(), 1); // only the file whose path contains a literal "%"
+
+        // A bare "_" would match any single char if unescaped.
+        let results = db.find_symbols_by_file("_done", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_name(), "meta_fn");
     }
 
     #[test]
