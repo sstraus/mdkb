@@ -304,6 +304,52 @@ fn handle_user_prompt_submit(event: Value) -> Value {
     })
 }
 
+/// Resolve `raw` relative to `base`, canonicalize, and return the canonical
+/// path only if it is strictly under `base`. Returns `None` for traversal
+/// attempts or paths that cannot be resolved on disk.
+///
+/// Strategy: canonicalize `base` first (resolves platform symlinks like
+/// `/tmp` -> `/private/tmp` on macOS). Then join `raw` onto the canonical
+/// base and collapse `..`/`.` lexically. This avoids hitting the FS for the
+/// target file (it may not exist yet for Write/Edit on new files) while
+/// still producing a path that is comparable to `base_canonical`.
+fn canonicalize_under_cwd(base: &Path, raw: &str) -> Option<String> {
+    // Canonicalize the base directory. If it doesn't exist we can't proceed.
+    let base_canonical = std::fs::canonicalize(base).ok()?;
+
+    // Build the full path: if `raw` is absolute, use it directly; otherwise
+    // join onto the canonical base so that the result is already symlink-free.
+    let joined = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        base_canonical.join(raw)
+    };
+
+    // Prefer fs::canonicalize (resolves symlinks in the target); fall back to
+    // lexical normalization for files that don't exist yet (new Write targets).
+    let canonical = std::fs::canonicalize(&joined).unwrap_or_else(|_| {
+        // Lexical collapse of `..` and `.` components. Because `joined` is
+        // already rooted at the canonical base, the result is canonical too.
+        let mut out = PathBuf::new();
+        for comp in joined.components() {
+            match comp {
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                std::path::Component::CurDir => {}
+                c => out.push(c),
+            }
+        }
+        out
+    });
+
+    if canonical.starts_with(&base_canonical) {
+        Some(canonical.to_string_lossy().into_owned())
+    } else {
+        None
+    }
+}
+
 /// Tool names whose output may modify on-disk files we want to reindex.
 const REINDEX_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit", "MultiEdit"];
 
@@ -349,9 +395,22 @@ fn handle_post_tool_use(event: Value) -> Value {
         return json!({});
     }
 
-    let path = match event.get("tool_input").and_then(tool_input_path) {
+    let raw_path = match event.get("tool_input").and_then(tool_input_path) {
         Some(p) => p,
         None => return json!({}),
+    };
+
+    // Security: canonicalize and verify the path is under cwd before enqueuing.
+    // This prevents path traversal (e.g. "../../etc/passwd") from reaching the queue.
+    let path = match canonicalize_under_cwd(&cwd, &raw_path) {
+        Some(p) => p,
+        None => {
+            tracing::warn!(
+                "post-tool-use hook: rejected path outside cwd: {}",
+                raw_path
+            );
+            return json!({});
+        }
     };
 
     let queue_path = mdkb_dir.join("reindex-queue.jsonl");
@@ -375,4 +434,63 @@ fn handle_post_tool_use(event: Value) -> Value {
     }
 
     json!({})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp_base() -> PathBuf {
+        std::env::temp_dir().join("mdkb_hook_tests")
+    }
+
+    #[test]
+    fn path_traversal_rejected() {
+        let base = tmp_base();
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(
+            canonicalize_under_cwd(&base, "../../etc/passwd").is_none(),
+            "traversal via ../../etc/passwd must be rejected"
+        );
+    }
+
+    #[test]
+    fn path_traversal_absolute_outside_rejected() {
+        let base = tmp_base();
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(
+            canonicalize_under_cwd(&base, "/etc/passwd").is_none(),
+            "absolute path outside cwd must be rejected"
+        );
+    }
+
+    #[test]
+    fn valid_relative_path_accepted() {
+        let base = tmp_base();
+        std::fs::create_dir_all(&base).unwrap();
+        let result = canonicalize_under_cwd(&base, "foo/bar.md");
+        assert!(result.is_some(), "relative path inside cwd must be accepted");
+        let s = result.unwrap();
+        assert!(s.contains("mdkb_hook_tests"), "result should be under base");
+    }
+
+    #[test]
+    fn dot_dot_in_middle_rejected() {
+        let base = tmp_base();
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(
+            canonicalize_under_cwd(&base, "subdir/../../etc/shadow").is_none(),
+            "mid-path traversal must be rejected"
+        );
+    }
+
+    #[test]
+    fn absolute_path_inside_cwd_accepted() {
+        let base = tmp_base();
+        std::fs::create_dir_all(&base).unwrap();
+        let base_real = std::fs::canonicalize(&base).unwrap();
+        let inside = base_real.join("notes/foo.md").to_string_lossy().into_owned();
+        let result = canonicalize_under_cwd(&base, &inside);
+        assert!(result.is_some(), "absolute path inside cwd must be accepted");
+    }
 }
