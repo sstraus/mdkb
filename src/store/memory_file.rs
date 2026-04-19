@@ -256,7 +256,10 @@ fn needs_quoting(value: &str) -> bool {
     if value.parse::<f64>().is_ok() {
         return true;
     }
-    if matches!(first, '-' | '?' | '!' | '&' | '*' | '>' | '|' | '%' | '@' | '`') {
+    if matches!(
+        first,
+        '-' | '?' | '!' | '&' | '*' | '>' | '|' | '%' | '@' | '`'
+    ) {
         return true;
     }
     if first.is_whitespace() || value.ends_with(char::is_whitespace) {

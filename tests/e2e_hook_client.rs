@@ -83,7 +83,8 @@ fn make_repo() -> TempDir {
 fn call_once(socket: &std::path::Path, body: &[u8]) -> (Duration, Vec<u8>) {
     let mut sock = UnixStream::connect(socket).expect("connect hook socket");
     sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    sock.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
 
     let start = Instant::now();
     let len = u32::try_from(body.len()).unwrap().to_le_bytes();

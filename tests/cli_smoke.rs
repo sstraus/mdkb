@@ -214,7 +214,10 @@ fn smoke_stats_json() {
 #[test]
 fn smoke_collection_add_remove() {
     let repo = Repo::new();
-    let out = run(&["collection", "add", "notes", "docs", "-p", "**/*.md"], &repo.root);
+    let out = run(
+        &["collection", "add", "notes", "docs", "-p", "**/*.md"],
+        &repo.root,
+    );
     assert_ok(&out, "collection add");
 
     let out = run(&["collection", "rename", "notes", "notes2"], &repo.root);
@@ -232,11 +235,17 @@ fn smoke_memory_lifecycle() {
 
     let out = run(
         &[
-            "memory", "add", "smoke-test-entry",
-            "-t", "Smoke test entry",
-            "-T", "topic",
-            "--tags", "test,smoke",
-            "-c", "This is a smoke test memory entry for CLI validation.",
+            "memory",
+            "add",
+            "smoke-test-entry",
+            "-t",
+            "Smoke test entry",
+            "-T",
+            "topic",
+            "--tags",
+            "test,smoke",
+            "-c",
+            "This is a smoke test memory entry for CLI validation.",
         ],
         &repo.root,
     );
@@ -280,9 +289,13 @@ fn smoke_memory_import_export_roundtrip() {
 
     run(
         &[
-            "memory", "add", "export-test",
-            "-t", "Export test",
-            "-c", "Content for export roundtrip.",
+            "memory",
+            "add",
+            "export-test",
+            "-t",
+            "Export test",
+            "-c",
+            "Content for export roundtrip.",
         ],
         &repo.root,
     );
@@ -290,13 +303,24 @@ fn smoke_memory_import_export_roundtrip() {
     let export_dir = repo.root.join("mem-export");
     std::fs::create_dir_all(&export_dir).unwrap();
     let out = run(
-        &["memory", "export", "--dir", export_dir.to_str().unwrap(), "--overwrite"],
+        &[
+            "memory",
+            "export",
+            "--dir",
+            export_dir.to_str().unwrap(),
+            "--overwrite",
+        ],
         &repo.root,
     );
     assert_ok(&out, "memory export");
 
     let out = run(
-        &["memory", "import", export_dir.to_str().unwrap(), "--skip-duplicates"],
+        &[
+            "memory",
+            "import",
+            export_dir.to_str().unwrap(),
+            "--skip-duplicates",
+        ],
         &repo.root,
     );
     assert_ok(&out, "memory import");
@@ -313,7 +337,14 @@ fn smoke_evolve_and_history() {
 
     // Paths are collection-relative (docs/ collection → guide.md, v2.md).
     let out = run(
-        &["evolve", "supersedes", "v2.md", "guide.md", "-r", "newer version"],
+        &[
+            "evolve",
+            "supersedes",
+            "v2.md",
+            "guide.md",
+            "-r",
+            "newer version",
+        ],
         &repo.root,
     );
     assert_ok(&out, "evolve supersedes");
@@ -370,10 +401,15 @@ fn smoke_experiment_lifecycle() {
 
     let out = run(
         &[
-            "experiment", "create", "smoke-exp",
-            "--config-a", r#"{"model":"v1"}"#,
-            "--config-b", r#"{"model":"v2"}"#,
-            "-d", "smoke test experiment",
+            "experiment",
+            "create",
+            "smoke-exp",
+            "--config-a",
+            r#"{"model":"v1"}"#,
+            "--config-b",
+            r#"{"model":"v2"}"#,
+            "-d",
+            "smoke test experiment",
         ],
         &repo.root,
     );
@@ -497,15 +533,13 @@ fn smoke_journal_import_all_dry_run() {
     let repo = Repo::new();
     let journal_dir = repo.root.join("journals");
     std::fs::create_dir_all(&journal_dir).unwrap();
-    std::fs::write(
-        journal_dir.join("entry1.md"),
-        "# Entry\n\nSome content.\n",
-    )
-    .unwrap();
+    std::fs::write(journal_dir.join("entry1.md"), "# Entry\n\nSome content.\n").unwrap();
     let out = run(
         &[
-            "journal", "import-all",
-            "--dir", journal_dir.to_str().unwrap(),
+            "journal",
+            "import-all",
+            "--dir",
+            journal_dir.to_str().unwrap(),
             "-n",
         ],
         &repo.root,
@@ -522,8 +556,10 @@ fn smoke_session_index_no_sessions() {
     std::fs::create_dir_all(&fake_sessions).unwrap();
     let out = run(
         &[
-            "session", "index",
-            "--sessions-path", fake_sessions.to_str().unwrap(),
+            "session",
+            "index",
+            "--sessions-path",
+            fake_sessions.to_str().unwrap(),
         ],
         &repo.root,
     );
@@ -554,7 +590,9 @@ fn smoke_format_json_search() {
 fn smoke_format_csv_memory_list() {
     let repo = Repo::new();
     run(
-        &["memory", "add", "csv-test", "-t", "CSV test", "-c", "content"],
+        &[
+            "memory", "add", "csv-test", "-t", "CSV test", "-c", "content",
+        ],
         &repo.root,
     );
     let out = run(&["--format", "csv", "memory", "list"], &repo.root);
@@ -647,7 +685,9 @@ fn smoke_get_nonexistent() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        !out.status.success() || combined.to_lowercase().contains("not found") || combined.is_empty(),
+        !out.status.success()
+            || combined.to_lowercase().contains("not found")
+            || combined.is_empty(),
         "get nonexistent should fail gracefully: {combined}"
     );
 }

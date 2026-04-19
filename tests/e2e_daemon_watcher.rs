@@ -90,7 +90,10 @@ async fn two_clients_single_reindex() {
         1,
         "exactly one watcher must spawn"
     );
-    assert!(!watcher_handle.is_finished(), "watcher should still be running");
+    assert!(
+        !watcher_handle.is_finished(),
+        "watcher should still be running"
+    );
 
     // 7. Modify a doc file to trigger the watcher.
     std::fs::write(docs_dir.join("hello.md"), "# Hello\nModified content").unwrap();

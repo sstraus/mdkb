@@ -23,7 +23,9 @@ use crate::cli::handlers::{
 use crate::code::indexing::IndexFacade;
 use crate::daemon::registry::RepoHandle;
 use crate::domain::SearchResult;
-use crate::metrics::{UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis};
+use crate::metrics::{
+    UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
+};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::mcp_error;
@@ -161,8 +163,8 @@ pub async fn status_impl(handle: &RepoHandle) -> Result<String, McpError> {
             output.push_str("No collections configured. Markdown files are indexed via collections (use CLI: `mdkb collection add <name> <path>`).\n");
         } else {
             for coll in &coll_list {
-                let doc_count = collections::get_collection_document_count(&ctx.conn, &coll.name)
-                    .unwrap_or(0);
+                let doc_count =
+                    collections::get_collection_document_count(&ctx.conn, &coll.name).unwrap_or(0);
                 let source_tag = if coll.source == "convention" {
                     "[convention]"
                 } else {
@@ -454,17 +456,16 @@ pub async fn memory_write_batch_impl(
         .iter()
         .map(|e| format!("{} {}", e.title, e.content))
         .collect();
-    let embeddings: Vec<Option<Vec<f32>>> = tokio::task::spawn_blocking(move || {
-        match crate::llm::get_cached_service() {
+    let embeddings: Vec<Option<Vec<f32>>> =
+        tokio::task::spawn_blocking(move || match crate::llm::get_cached_service() {
             Ok(svc) => embed_texts
                 .iter()
                 .map(|text| svc.embed_query(text).ok())
                 .collect(),
             Err(_) => vec![None; embed_texts.len()],
-        }
-    })
-    .await
-    .unwrap_or_else(|_| vec![None; entries.len()]);
+        })
+        .await
+        .unwrap_or_else(|_| vec![None; entries.len()]);
 
     let ctx_guard = handle.ctx.lock().await;
     let ctx = ctx_guard
@@ -585,15 +586,14 @@ pub async fn search_impl(
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
-            let query_embedding = match crate::llm::get_cached_service()
-                .and_then(|s| s.embed_query(&params.query))
-            {
-                Ok(emb) => Some(emb),
-                Err(e) => {
-                    tracing::warn!("Memory search falling back to BM25-only: {e}");
-                    None
-                }
-            };
+            let query_embedding =
+                match crate::llm::get_cached_service().and_then(|s| s.embed_query(&params.query)) {
+                    Ok(emb) => Some(emb),
+                    Err(e) => {
+                        tracing::warn!("Memory search falling back to BM25-only: {e}");
+                        None
+                    }
+                };
             let entries = memory::search_entries_hybrid(
                 &ctx.conn,
                 &params.query,
@@ -625,15 +625,14 @@ pub async fn search_impl(
             )
             .map_err(|e| mcp_error(format!("Search failed: {e}")))?;
 
-            let query_embedding = match crate::llm::get_cached_service()
-                .and_then(|s| s.embed_query(&params.query))
-            {
-                Ok(emb) => Some(emb),
-                Err(e) => {
-                    tracing::warn!("Memory search falling back to BM25-only: {e}");
-                    None
-                }
-            };
+            let query_embedding =
+                match crate::llm::get_cached_service().and_then(|s| s.embed_query(&params.query)) {
+                    Ok(emb) => Some(emb),
+                    Err(e) => {
+                        tracing::warn!("Memory search falling back to BM25-only: {e}");
+                        None
+                    }
+                };
             let mem_entries = memory::search_entries_hybrid(
                 &ctx.conn,
                 &params.query,
@@ -716,8 +715,7 @@ pub async fn search_impl(
                 Ok((out, count))
             } else {
                 let mut symbols = if let Some(ref file_pattern) = params.file {
-                    let mut results =
-                        facade.find_symbols_by_file(file_pattern, params.limit * 2);
+                    let mut results = facade.find_symbols_by_file(file_pattern, params.limit * 2);
                     if !params.query.is_empty() && params.query != "*" {
                         let q = params.query.to_lowercase();
                         results.retain(|s| s.name.to_lowercase().contains(&q));
@@ -892,8 +890,11 @@ pub async fn cross_repo_search_impl(
         }
     });
 
-    let mut all_results: Vec<SearchResult> =
-        join_all(per_repo_futures).await.into_iter().flatten().collect();
+    let mut all_results: Vec<SearchResult> = join_all(per_repo_futures)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
 
     all_results.sort_by(|a, b| {
         b.score
@@ -1973,14 +1974,20 @@ mod tests {
         let created = memory_write_impl(&handle, &entry_input("w-1"))
             .await
             .expect("write impl");
-        assert!(created.starts_with("Created memory entry: w-1"), "out: {created}");
+        assert!(
+            created.starts_with("Created memory entry: w-1"),
+            "out: {created}"
+        );
 
         let mut second = entry_input("w-1");
         second.content = "Updated content body".to_string();
         let updated = memory_write_impl(&handle, &second)
             .await
             .expect("write impl update");
-        assert!(updated.starts_with("Updated memory entry: w-1"), "out: {updated}");
+        assert!(
+            updated.starts_with("Updated memory entry: w-1"),
+            "out: {updated}"
+        );
     }
 
     #[tokio::test]
@@ -1991,7 +1998,11 @@ mod tests {
         let err = memory_write_batch_impl(&handle, &[])
             .await
             .expect_err("must reject");
-        assert!(err.message.contains("must not be empty"), "msg: {}", err.message);
+        assert!(
+            err.message.contains("must not be empty"),
+            "msg: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -2003,7 +2014,11 @@ mod tests {
         let err = memory_write_batch_impl(&handle, &entries)
             .await
             .expect_err("must reject");
-        assert!(err.message.contains("max 20 entries"), "msg: {}", err.message);
+        assert!(
+            err.message.contains("max 20 entries"),
+            "msg: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -2053,7 +2068,10 @@ mod tests {
         .expect("dispatch");
 
         let text = result.get("text").and_then(Value::as_str).unwrap_or("");
-        assert!(text.contains("Created memory entry: via-dispatch"), "result: {result}");
+        assert!(
+            text.contains("Created memory entry: via-dispatch"),
+            "result: {result}"
+        );
     }
 
     #[tokio::test]
@@ -2146,7 +2164,9 @@ mod tests {
         let handle = make_handle(&tmp);
         let params = search_params("anything", Some("bogus"));
 
-        let err = search_impl(&handle, &params).await.expect_err("should error");
+        let err = search_impl(&handle, &params)
+            .await
+            .expect_err("should error");
         let msg = err.to_string();
         assert!(msg.contains("Invalid scope"), "msg: {msg}");
         assert!(msg.contains("bogus"), "msg: {msg}");
@@ -2178,9 +2198,7 @@ mod tests {
         let handle = make_handle(&tmp);
         let params = search_params("anything", Some("symbols"));
 
-        let (text, count) = search_impl(&handle, &params)
-            .await
-            .expect("symbols scope");
+        let (text, count) = search_impl(&handle, &params).await.expect("symbols scope");
         assert_eq!(count, 0, "text: {text}");
         assert!(text.contains("No symbols found"), "text: {text}");
     }
@@ -2241,11 +2259,13 @@ mod tests {
         let handle = make_handle(&tmp);
         let params = get_params("**/*.md");
 
-        let (text, count, truncated) =
-            get_impl(&handle, &params).await.expect("glob get");
+        let (text, count, truncated) = get_impl(&handle, &params).await.expect("glob get");
         assert_eq!(count, 0, "text: {text}");
         assert!(!truncated);
-        assert!(text.contains("No documents matched pattern"), "text: {text}");
+        assert!(
+            text.contains("No documents matched pattern"),
+            "text: {text}"
+        );
     }
 
     #[tokio::test]
@@ -2283,14 +2303,9 @@ mod tests {
         let dctx = make_dctx();
         seed_memory_entry(&handle, "dispatched-get").await;
 
-        let result = dispatch_call(
-            "get",
-            json!({ "id": "dispatched-get" }),
-            handle,
-            &dctx,
-        )
-        .await
-        .expect("dispatch");
+        let result = dispatch_call("get", json!({ "id": "dispatched-get" }), handle, &dctx)
+            .await
+            .expect("dispatch");
 
         assert_eq!(
             result.get("count").and_then(Value::as_u64).unwrap_or(0),
@@ -2356,7 +2371,10 @@ mod tests {
 
         assert!(parsed.get("session").map_or(false, Value::is_null));
         assert_eq!(parsed["per_tool"].as_array().map(Vec::len), Some(0));
-        assert_eq!(parsed["top_5_most_called"].as_array().map(Vec::len), Some(0));
+        assert_eq!(
+            parsed["top_5_most_called"].as_array().map(Vec::len),
+            Some(0)
+        );
         assert!(parsed.get("lifetime").is_none());
     }
 
@@ -2396,10 +2414,7 @@ mod tests {
         let text = code_graph_impl(&handle, &params)
             .await
             .expect("code_graph impl");
-        assert!(
-            text.contains("Code index is being rebuilt"),
-            "text: {text}"
-        );
+        assert!(text.contains("Code index is being rebuilt"), "text: {text}");
     }
 
     #[tokio::test]
@@ -2411,7 +2426,11 @@ mod tests {
         let err = dispatch_call("code_graph", json!({}), handle, &dctx)
             .await
             .expect_err("missing name");
-        assert!(err.message.contains("invalid params"), "msg: {}", err.message);
+        assert!(
+            err.message.contains("invalid params"),
+            "msg: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -2477,7 +2496,10 @@ mod tests {
         ensure_handle_context(&handle).await.unwrap();
 
         // Build a comma-separated string of 51 IDs
-        let ids: String = (1..=51).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let ids: String = (1..=51)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let err = get_batch_impl(&handle, &ids, None)
             .await
             .expect_err("must reject >50 IDs");
@@ -2495,7 +2517,10 @@ mod tests {
         ensure_handle_context(&handle).await.unwrap();
 
         // 50 IDs that don't exist — should succeed (returning "Not found" entries)
-        let ids: String = (1..=50).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let ids: String = (1..=50)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         // Panics only if the cap itself errors — "not found" is acceptable output
         let _ = get_batch_impl(&handle, &ids, None).await;
     }

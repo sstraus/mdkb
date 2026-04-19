@@ -15,20 +15,20 @@ use tracing_subscriber::EnvFilter;
 
 use mdkb::Result;
 use mdkb::cli::CodeCommand;
+use mdkb::cli::daemon as daemon_cli;
 use mdkb::cli::handlers::{
-    Context, EmbedResult, EvolutionHistoryEntry, handle_collection_add,
-    handle_collection_remove, handle_collection_rename, handle_current, handle_embed,
-    handle_evolve_corrects, handle_evolve_extends, handle_evolve_retracts,
-    handle_evolve_supersedes, handle_evolve_updates, handle_experiment_cancel,
-    handle_experiment_create, handle_experiment_end, handle_experiment_list,
-    handle_experiment_status, handle_get, handle_history, handle_hybrid_search, handle_init,
-    handle_memory_add, handle_memory_export, handle_memory_import, handle_memory_import_dir,
-    handle_memory_list, handle_memory_prune,
+    Context, EmbedResult, EvolutionHistoryEntry, handle_collection_add, handle_collection_remove,
+    handle_collection_rename, handle_current, handle_embed, handle_evolve_corrects,
+    handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
+    handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
+    handle_experiment_list, handle_experiment_status, handle_get, handle_history,
+    handle_hybrid_search, handle_init, handle_memory_add, handle_memory_export,
+    handle_memory_import, handle_memory_import_dir, handle_memory_list, handle_memory_prune,
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
     handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
-    handle_session_index, handle_superseded_by, handle_update,
-    handle_update_files,
+    handle_session_index, handle_superseded_by, handle_update, handle_update_files,
 };
+use mdkb::cli::hook_client;
 use mdkb::cli::hooks;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
@@ -36,8 +36,6 @@ use mdkb::cli::{
     HookEvent, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SessionCommand,
     SetupCommand, SetupHooksCommand, SetupMcpCommand,
 };
-use mdkb::cli::daemon as daemon_cli;
-use mdkb::cli::hook_client;
 use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
@@ -405,9 +403,7 @@ async fn run() -> Result<()> {
                 let socket_path = socket.unwrap_or_else(|| {
                     mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())
                         .map(|c| c.socket_path())
-                        .unwrap_or_else(|_| {
-                            mdkb::DaemonConfig::daemon_home().join("daemon.sock")
-                        })
+                        .unwrap_or_else(|_| mdkb::DaemonConfig::daemon_home().join("daemon.sock"))
                 });
                 mdkb::cli::mcp_proxy::run_proxy(socket_path).await?;
             }
@@ -535,13 +531,8 @@ async fn run() -> Result<()> {
                 } => {
                     let mdkb_dir = ctx.db_path.parent().expect("db_path has parent");
                     let out_dir = dir.unwrap_or_else(|| mdkb_dir.join("memory/entries"));
-                    let result = handle_memory_export(
-                        &ctx,
-                        &out_dir,
-                        include_expired,
-                        overwrite,
-                        dry_run,
-                    )?;
+                    let result =
+                        handle_memory_export(&ctx, &out_dir, include_expired, overwrite, dry_run)?;
                     if dry_run {
                         println!("Dry run: would export {} entries", result.exported);
                     } else {

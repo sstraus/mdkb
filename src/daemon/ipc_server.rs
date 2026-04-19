@@ -274,7 +274,10 @@ async fn handle_hook_conn(
         let response = dispatch_hook_message(&body, &registry, &dctx).await;
         let resp_bytes = response.as_bytes();
         let Ok(resp_len_u32) = u32::try_from(resp_bytes.len()) else {
-            tracing::error!("hook: response too large ({} bytes), closing", resp_bytes.len());
+            tracing::error!(
+                "hook: response too large ({} bytes), closing",
+                resp_bytes.len()
+            );
             return;
         };
         if stream.write_all(&resp_len_u32.to_le_bytes()).await.is_err() {
@@ -394,7 +397,10 @@ mod tests {
         ensure_base_dir_0700(&base).unwrap();
 
         let mode = std::fs::metadata(&base).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "base dir mode should be 0700 after tightening, got {mode:o}");
+        assert_eq!(
+            mode, 0o700,
+            "base dir mode should be 0700 after tightening, got {mode:o}"
+        );
     }
 
     /// After `serve()` binds, the socket files must have mode `0600`.
@@ -411,9 +417,8 @@ mod tests {
 
         let shutdown_clone = shutdown.clone();
         let base_clone = base.clone();
-        let serve_handle = tokio::spawn(async move {
-            serve(&base_clone, shutdown_clone, registry, dctx).await
-        });
+        let serve_handle =
+            tokio::spawn(async move { serve(&base_clone, shutdown_clone, registry, dctx).await });
 
         // Wait until serve() has created both sockets (i.e., bind completed).
         let mcp_path = base.join(MCP_SOCKET_NAME);
@@ -423,14 +428,23 @@ mod tests {
             if mcp_path.exists() && hook_path.exists() {
                 break;
             }
-            assert!(std::time::Instant::now() < deadline, "sockets not created within 5s");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sockets not created within 5s"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
         let mcp_mode = std::fs::metadata(&mcp_path).unwrap().permissions().mode() & 0o777;
         let hook_mode = std::fs::metadata(&hook_path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mcp_mode, 0o600, "mcp socket mode should be 0600, got {mcp_mode:o}");
-        assert_eq!(hook_mode, 0o600, "hook socket mode should be 0600, got {hook_mode:o}");
+        assert_eq!(
+            mcp_mode, 0o600,
+            "mcp socket mode should be 0600, got {mcp_mode:o}"
+        );
+        assert_eq!(
+            hook_mode, 0o600,
+            "hook socket mode should be 0600, got {hook_mode:o}"
+        );
 
         shutdown.cancel();
         serve_handle.await.unwrap().unwrap();
@@ -595,7 +609,11 @@ mod tests {
         let resp_len = u32::from_le_bytes(hdr) as usize;
 
         // Sanity: the response length must be < u32::MAX (not the corrupt sentinel).
-        assert_ne!(resp_len, u32::MAX as usize, "server sent corrupt u32::MAX length");
+        assert_ne!(
+            resp_len,
+            u32::MAX as usize,
+            "server sent corrupt u32::MAX length"
+        );
         assert!(resp_len > 0 && resp_len < 1024 * 1024);
 
         let mut resp_body = vec![0u8; resp_len];

@@ -1114,10 +1114,7 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
                 SET status = 'archived', updated_at = ?1
                 WHERE id IN (SELECT value FROM json_each(?2))
                 "#,
-                params![
-                    now,
-                    serde_json::to_string(&ids).unwrap_or_default()
-                ],
+                params![now, serde_json::to_string(&ids).unwrap_or_default()],
             )?;
         }
 

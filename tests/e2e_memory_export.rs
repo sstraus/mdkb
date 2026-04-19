@@ -20,7 +20,11 @@ impl Env {
         let root = dir.path().to_path_buf();
         handle_init(&root).expect("init");
         let ctx = Context::open(&root).expect("open");
-        Self { _dir: dir, root, ctx }
+        Self {
+            _dir: dir,
+            root,
+            ctx,
+        }
     }
 
     fn add(&self, entry: MemoryEntry) {
@@ -64,10 +68,7 @@ fn export_writes_one_file_per_entry() {
 
     let out_dir = env.root.join("out");
     let result = handle_memory_export(
-        &env.ctx,
-        &out_dir,
-        /* include_expired */ false,
-        /* overwrite */ false,
+        &env.ctx, &out_dir, /* include_expired */ false, /* overwrite */ false,
         /* dry_run */ false,
     )
     .expect("export");
@@ -92,14 +93,8 @@ fn export_dry_run_prints_without_writing() {
     env.add(make_entry("dry-a", "Dry A", EntryType::Topic));
 
     let out_dir = env.root.join("dry-out");
-    let result = handle_memory_export(
-        &env.ctx,
-        &out_dir,
-        false,
-        false,
-        /* dry_run */ true,
-    )
-    .expect("export dry_run");
+    let result = handle_memory_export(&env.ctx, &out_dir, false, false, /* dry_run */ true)
+        .expect("export dry_run");
 
     assert_eq!(result.exported, 1, "dry_run still reports 1");
     assert!(!out_dir.exists(), "dir must not be created in dry_run");
@@ -130,9 +125,8 @@ fn export_overwrite_true_replaces_existing() {
     std::fs::create_dir_all(&out_dir).unwrap();
     std::fs::write(out_dir.join("rewrite.md"), "old").unwrap();
 
-    let result =
-        handle_memory_export(&env.ctx, &out_dir, false, /* overwrite */ true, false)
-            .expect("export");
+    let result = handle_memory_export(&env.ctx, &out_dir, false, /* overwrite */ true, false)
+        .expect("export");
 
     assert_eq!(result.exported, 1);
     let content = std::fs::read_to_string(out_dir.join("rewrite.md")).unwrap();
@@ -150,8 +144,7 @@ fn export_excludes_expired_by_default() {
     env.add(expired);
 
     let out_dir = env.root.join("out4");
-    let result =
-        handle_memory_export(&env.ctx, &out_dir, false, false, false).expect("export");
+    let result = handle_memory_export(&env.ctx, &out_dir, false, false, false).expect("export");
 
     assert_eq!(result.exported, 1, "expired entry skipped");
     assert_eq!(result.skipped, 1);
@@ -166,9 +159,10 @@ fn export_include_expired_flag_includes_them() {
     env.add(expired);
 
     let out_dir = env.root.join("out5");
-    let result =
-        handle_memory_export(&env.ctx, &out_dir, /* include_expired */ true, false, false)
-            .expect("export");
+    let result = handle_memory_export(
+        &env.ctx, &out_dir, /* include_expired */ true, false, false,
+    )
+    .expect("export");
 
     assert_eq!(result.exported, 2);
 }
@@ -247,7 +241,11 @@ fn import_dir_skip_duplicates() {
 
     // Import without skip — should error
     let imp = handle_memory_import_dir(&env.ctx, &out_dir, false, false).expect("import");
-    assert_eq!(imp.errors.len(), 1, "duplicate without --skip-duplicates → error");
+    assert_eq!(
+        imp.errors.len(),
+        1,
+        "duplicate without --skip-duplicates → error"
+    );
 
     // Import with skip
     let imp2 = handle_memory_import_dir(&env.ctx, &out_dir, false, true).expect("import2");
@@ -278,7 +276,10 @@ fn import_dir_missing_directory_returns_io_error() {
     let err = handle_memory_import_dir(&env.ctx, &missing, false, false)
         .expect_err("missing dir must return Err");
     let msg = format!("{err}");
-    assert!(msg.contains("read_dir"), "error should mention read_dir: {msg}");
+    assert!(
+        msg.contains("read_dir"),
+        "error should mention read_dir: {msg}"
+    );
 }
 
 #[test]

@@ -15,7 +15,11 @@ pub fn bar(value: u64, max: u64, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let ratio = if max == 0 { 0.0 } else { value as f64 / max as f64 };
+    let ratio = if max == 0 {
+        0.0
+    } else {
+        value as f64 / max as f64
+    };
     let filled = (ratio * width as f64).round() as usize;
     let filled = filled.min(width);
     let empty = width - filled;
@@ -114,11 +118,7 @@ fn truncate(s: &str, max_chars: usize) -> &str {
         }
         count += 1;
     }
-    if count < max_chars {
-        s
-    } else {
-        &s[..end]
-    }
+    if count < max_chars { s } else { &s[..end] }
 }
 
 fn pad_or_truncate(s: &str, width: usize) -> String {

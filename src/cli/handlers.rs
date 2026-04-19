@@ -1430,7 +1430,11 @@ pub fn handle_memory_export(
     let now = chrono::Utc::now().timestamp();
     let entries = memory::list_entries_all(&ctx.conn)?;
 
-    let mut result = ExportResult { exported: 0, skipped: 0, errors: Vec::new() };
+    let mut result = ExportResult {
+        exported: 0,
+        skipped: 0,
+        errors: Vec::new(),
+    };
 
     if !dry_run {
         std::fs::create_dir_all(dir).map_err(|e| ErrorKind::Io {
@@ -1484,7 +1488,11 @@ pub fn handle_memory_import_dir(
     dry_run: bool,
     skip_duplicates: bool,
 ) -> Result<ImportResult> {
-    let mut result = ImportResult { imported: 0, skipped: 0, errors: Vec::new() };
+    let mut result = ImportResult {
+        imported: 0,
+        skipped: 0,
+        errors: Vec::new(),
+    };
 
     let read_dir = std::fs::read_dir(dir).map_err(|e| ErrorKind::Io {
         path: dir.to_path_buf(),
@@ -1515,7 +1523,9 @@ pub fn handle_memory_import_dir(
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
             Err(e) => {
-                result.errors.push(format!("{}: read error: {e}", path.display()));
+                result
+                    .errors
+                    .push(format!("{}: read error: {e}", path.display()));
                 continue;
             }
         };
@@ -1523,14 +1533,18 @@ pub fn handle_memory_import_dir(
         let mf = match crate::store::memory_file::from_markdown(&text) {
             Ok(mf) => mf,
             Err(e) => {
-                result.errors.push(format!("{}: parse error: {e}", path.display()));
+                result
+                    .errors
+                    .push(format!("{}: parse error: {e}", path.display()));
                 continue;
             }
         };
 
         let id = mf.meta.id.clone();
 
-        if let Err(e) = memory::validate_entry_input(&mf.meta.id, &mf.meta.title, &mf.meta.tags, &mf.content) {
+        if let Err(e) =
+            memory::validate_entry_input(&mf.meta.id, &mf.meta.title, &mf.meta.tags, &mf.content)
+        {
             result.errors.push(format!("{id}: {e}"));
             continue;
         }
@@ -1539,7 +1553,9 @@ pub fn handle_memory_import_dir(
             if skip_duplicates {
                 result.skipped += 1;
             } else {
-                result.errors.push(format!("{id}: already exists (use --skip-duplicates to ignore)"));
+                result.errors.push(format!(
+                    "{id}: already exists (use --skip-duplicates to ignore)"
+                ));
             }
             continue;
         }
@@ -3681,11 +3697,17 @@ mod tests {
         let result = handle_memory_import(&ctx, &path, false, false);
 
         // The function must return Err (UNIQUE constraint propagated via `?`).
-        assert!(result.is_err(), "expected Err from UNIQUE constraint violation");
+        assert!(
+            result.is_err(),
+            "expected Err from UNIQUE constraint violation"
+        );
 
         // Neither entry must survive the rollback.
         let entry = handle_memory_show(&ctx, "dup-id").unwrap();
-        assert!(entry.is_none(), "rollback must have removed the first insert");
+        assert!(
+            entry.is_none(),
+            "rollback must have removed the first insert"
+        );
     }
 }
 

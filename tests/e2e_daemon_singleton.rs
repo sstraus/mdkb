@@ -67,8 +67,8 @@ fn stale_lock_from_dead_process_is_reclaimed() {
     // held by THIS process, so a second acquire from the same process should
     // still fail. This test documents that semantics: stale reclaim requires
     // a dead process (separate FD table), not just a leaked guard.
-    let err = acquire_singleton_lock(&path)
-        .expect_err("same-process forget must still block reacquire");
+    let err =
+        acquire_singleton_lock(&path).expect_err("same-process forget must still block reacquire");
     assert!(matches!(err, AcquireError::AlreadyHeld));
 }
 
@@ -77,8 +77,7 @@ fn parent_directory_is_created() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("nested/sub/daemon.lock");
 
-    let _guard =
-        acquire_singleton_lock(&path).expect("acquire must create parent dirs if missing");
+    let _guard = acquire_singleton_lock(&path).expect("acquire must create parent dirs if missing");
     assert!(path.exists());
 }
 

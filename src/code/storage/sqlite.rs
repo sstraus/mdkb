@@ -155,8 +155,7 @@ impl CodeDb {
         }
         let mut map = HashMap::new();
         for chunk in rel_paths.chunks(999) {
-            let placeholders: Vec<String> =
-                (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
             let sql = format!(
                 "SELECT rel_path, token_estimate FROM code_files \
                  WHERE token_estimate IS NOT NULL AND rel_path IN ({})",
@@ -375,8 +374,10 @@ impl CodeDb {
                 placeholders.join(",")
             );
             let mut stmt = self.conn.prepare(&sql)?;
-            let sql_params: Vec<&dyn rusqlite::types::ToSql> =
-                chunk.iter().map(|p| p as &dyn rusqlite::types::ToSql).collect();
+            let sql_params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
             let rows = stmt.query_map(sql_params.as_slice(), |row| row_to_symbol(row))?;
             for row in rows {
                 result.push(row?);
@@ -394,8 +395,7 @@ impl CodeDb {
         }
         let mut map = HashMap::new();
         for chunk in ids.chunks(999) {
-            let placeholders: Vec<String> =
-                (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let placeholders: Vec<String> = (1..=chunk.len()).map(|i| format!("?{i}")).collect();
             let sql = format!(
                 "{SYMBOL_COLUMNS} FROM code_symbols WHERE id IN ({})",
                 placeholders.join(",")
@@ -1246,7 +1246,14 @@ mod tests {
             )
             .unwrap();
         let file_id_other = db
-            .insert_file("src/other.rs", "src/other.rs", "h2", Some("Rust"), None, None)
+            .insert_file(
+                "src/other.rs",
+                "src/other.rs",
+                "h2",
+                Some("Rust"),
+                None,
+                None,
+            )
             .unwrap();
         db.insert_symbol(
             "meta_fn",
@@ -1443,7 +1450,11 @@ mod tests {
             rel_paths.push(rel);
         }
         let map = db.get_file_token_estimates(&rel_paths).unwrap();
-        assert_eq!(map.len(), 1001, "all 1001 token estimates should be returned");
+        assert_eq!(
+            map.len(),
+            1001,
+            "all 1001 token estimates should be returned"
+        );
     }
 
     #[test]

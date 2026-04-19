@@ -93,7 +93,8 @@ fn hook_socket_responds_to_ping() {
     let d = DaemonProc::spawn();
     let mut sock = UnixStream::connect(d.hook_socket()).expect("connect hook socket");
     sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    sock.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+    sock.set_write_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
 
     // Length-prefixed JSON-RPC: 4-byte LE u32 length + JSON body.
     let req = br#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;

@@ -158,25 +158,37 @@ fn collect_header(ctx: &Context, root: &Path, status: &IndexStatus) -> HeaderInf
         .to_string();
     let version = env!("CARGO_PKG_VERSION").to_string();
     let db_size_bytes = ctx.db_path.metadata().map(|m| m.len()).unwrap_or(0);
-    HeaderInfo { repo, version, db_size_bytes, last_updated: status.last_updated }
+    HeaderInfo {
+        repo,
+        version,
+        db_size_bytes,
+        last_updated: status.last_updated,
+    }
 }
 
 fn collect_index_health(ctx: &Context, status: &IndexStatus) -> Result<IndexHealth> {
     let document_count = status.documents;
     let memory_count = memory::count_active_entries(&ctx.conn)?;
 
-    let (free_pages, total_pages): (i64, i64) = ctx.conn.query_row(
-        "SELECT freelist_count, page_count FROM pragma_freelist_count(), pragma_page_count()",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    ).unwrap_or((0, 1));
+    let (free_pages, total_pages): (i64, i64) = ctx
+        .conn
+        .query_row(
+            "SELECT freelist_count, page_count FROM pragma_freelist_count(), pragma_page_count()",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, 1));
     let free_page_ratio = if total_pages == 0 {
         0.0
     } else {
         free_pages as f64 / total_pages as f64
     };
 
-    Ok(IndexHealth { document_count, memory_count, free_page_ratio })
+    Ok(IndexHealth {
+        document_count,
+        memory_count,
+        free_page_ratio,
+    })
 }
 
 fn collect_collections(ctx: &Context) -> Result<CollectionsSummary> {
@@ -228,13 +240,16 @@ fn collect_memory(ctx: &Context) -> Result<MemorySummary> {
         |r| r.get(0),
     ).unwrap_or(0);
 
-    let reminders_upcoming_7d: i64 = ctx.conn.query_row(
-        "SELECT COUNT(*) FROM memory_entries
+    let reminders_upcoming_7d: i64 = ctx
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_entries
          WHERE status = 'active' AND entry_type = 'reminder' AND due_at IS NOT NULL
            AND due_at > ?1 AND due_at <= ?2",
-        [now, week],
-        |r| r.get(0),
-    ).unwrap_or(0);
+            [now, week],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
 
     Ok(MemorySummary {
         active_count,
@@ -275,7 +290,9 @@ fn collect_code(mdkb_dir: &Path) -> CodeSummary {
     let symbols = scalar_count(&conn, "SELECT COUNT(*) FROM code_symbols");
     let relations = scalar_count(&conn, "SELECT COUNT(*) FROM code_relationships");
     let last_indexed: Option<i64> = conn
-        .query_row("SELECT MAX(indexed_at) FROM code_files", [], |r| r.get::<_, Option<i64>>(0))
+        .query_row("SELECT MAX(indexed_at) FROM code_files", [], |r| {
+            r.get::<_, Option<i64>>(0)
+        })
         .unwrap_or(None);
 
     let languages = query_rows(
@@ -287,23 +304,35 @@ fn collect_code(mdkb_dir: &Path) -> CodeSummary {
          LEFT JOIN code_symbols s ON s.file_id = f.id
          GROUP BY f.language
          ORDER BY COUNT(s.id) DESC",
-        |row| Ok(LanguageRow {
-            language: row.get(0)?,
-            files: row.get::<_, i64>(1)? as usize,
-            symbols: row.get::<_, i64>(2)? as usize,
-        }),
+        |row| {
+            Ok(LanguageRow {
+                language: row.get(0)?,
+                files: row.get::<_, i64>(1)? as usize,
+                symbols: row.get::<_, i64>(2)? as usize,
+            })
+        },
     );
 
     let symbols_by_kind = query_rows(
         &conn,
         "SELECT kind, COUNT(*) FROM code_symbols GROUP BY kind ORDER BY COUNT(*) DESC",
-        |row| Ok(KindCount { kind: row.get(0)?, count: row.get::<_, i64>(1)? as usize }),
+        |row| {
+            Ok(KindCount {
+                kind: row.get(0)?,
+                count: row.get::<_, i64>(1)? as usize,
+            })
+        },
     );
 
     let relations_by_kind = query_rows(
         &conn,
         "SELECT kind, COUNT(*) FROM code_relationships GROUP BY kind ORDER BY COUNT(*) DESC",
-        |row| Ok(KindCount { kind: row.get(0)?, count: row.get::<_, i64>(1)? as usize }),
+        |row| {
+            Ok(KindCount {
+                kind: row.get(0)?,
+                count: row.get::<_, i64>(1)? as usize,
+            })
+        },
     );
 
     let top_files = query_rows(
@@ -314,10 +343,12 @@ fn collect_code(mdkb_dir: &Path) -> CodeSummary {
          GROUP BY f.id
          ORDER BY COUNT(s.id) DESC
          LIMIT 8",
-        |row| Ok(FileSymbolRow {
-            path: row.get(0)?,
-            symbols: row.get::<_, i64>(1)? as usize,
-        }),
+        |row| {
+            Ok(FileSymbolRow {
+                path: row.get(0)?,
+                symbols: row.get::<_, i64>(1)? as usize,
+            })
+        },
     );
 
     CodeSummary {
@@ -375,7 +406,10 @@ fn collect_sessions(ctx: &Context) -> Result<SessionsSummary> {
     let tool_rows: Vec<ToolRow> = stats::get_aggregate_tool_usage(&ctx.conn)?
         .into_iter()
         .take(10)
-        .map(|t| ToolRow { tool_name: t.tool_name, call_count: t.call_count })
+        .map(|t| ToolRow {
+            tool_name: t.tool_name,
+            call_count: t.call_count,
+        })
         .collect();
 
     Ok(SessionsSummary {
@@ -391,12 +425,17 @@ fn collect_hooks(mdkb_dir: &Path) -> HooksSummary {
     let slow_events_7d = count_slow_events(mdkb_dir, cutoff);
     let reindex_queue_pending = count_jsonl_lines(&mdkb_dir.join("reindex-queue.jsonl"));
 
-    HooksSummary { slow_events_7d, reindex_queue_pending }
+    HooksSummary {
+        slow_events_7d,
+        reindex_queue_pending,
+    }
 }
 
 fn count_slow_events(mdkb_dir: &Path, since_ts: i64) -> usize {
     let path = mdkb_dir.join("hook-slow.jsonl");
-    let Ok(content) = std::fs::read_to_string(&path) else { return 0 };
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
     content
         .lines()
         .filter(|line| {
@@ -412,7 +451,9 @@ fn count_slow_events(mdkb_dir: &Path, since_ts: i64) -> usize {
 }
 
 fn count_jsonl_lines(path: &Path) -> usize {
-    let Ok(content) = std::fs::read_to_string(path) else { return 0 };
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return 0;
+    };
     content.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
@@ -441,25 +482,29 @@ mod tests {
 
         fn add_memory(&self, id: &str, entry_type: EntryType) {
             let now = chrono::Utc::now().timestamp();
-            add_entry(&self.ctx.conn, &MemoryEntry {
-                id: id.to_string(),
-                title: id.to_string(),
-                content: "test".to_string(),
-                entry_type,
-                tags: vec![],
-                status: EntryStatus::Active,
-                created_at: now,
-                updated_at: now,
-                superseded_by: None,
-                access_count: 0,
-                last_accessed: None,
-                source_path: None,
-                confirmations: 0,
-                last_confirmed_at: None,
-                source_type: SourceType::UserStatement,
-                expires_at: None,
-                due_at: None,
-            }).expect("add_entry");
+            add_entry(
+                &self.ctx.conn,
+                &MemoryEntry {
+                    id: id.to_string(),
+                    title: id.to_string(),
+                    content: "test".to_string(),
+                    entry_type,
+                    tags: vec![],
+                    status: EntryStatus::Active,
+                    created_at: now,
+                    updated_at: now,
+                    superseded_by: None,
+                    access_count: 0,
+                    last_accessed: None,
+                    source_path: None,
+                    confirmations: 0,
+                    last_confirmed_at: None,
+                    source_type: SourceType::UserStatement,
+                    expires_at: None,
+                    due_at: None,
+                },
+            )
+            .expect("add_entry");
         }
     }
 
@@ -483,9 +528,33 @@ mod tests {
         env.add_memory("d1", EntryType::Decision);
 
         let report = collect_report(&env.ctx).expect("collect");
-        assert_eq!(report.memory.counts_by_type.get("topic").copied().unwrap_or(0), 2);
-        assert_eq!(report.memory.counts_by_type.get("problem").copied().unwrap_or(0), 1);
-        assert_eq!(report.memory.counts_by_type.get("decision").copied().unwrap_or(0), 1);
+        assert_eq!(
+            report
+                .memory
+                .counts_by_type
+                .get("topic")
+                .copied()
+                .unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            report
+                .memory
+                .counts_by_type
+                .get("problem")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            report
+                .memory
+                .counts_by_type
+                .get("decision")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
         assert_eq!(report.memory.active_count, 4);
     }
 
@@ -521,7 +590,15 @@ mod tests {
 
         let report = collect_report(&env.ctx).expect("collect");
         // Only the one active topic
-        assert_eq!(report.memory.counts_by_type.get("topic").copied().unwrap_or(0), 1);
+        assert_eq!(
+            report
+                .memory
+                .counts_by_type
+                .get("topic")
+                .copied()
+                .unwrap_or(0),
+            1
+        );
         assert_eq!(report.memory.active_count, 1);
         // No reminders are active
         assert_eq!(report.memory.reminders_due, 0);
@@ -563,8 +640,14 @@ mod tests {
         let mdkb_dir = env.ctx.db_path.parent().unwrap();
         let now = chrono::Utc::now().timestamp();
 
-        let line_old = format!("{{\"event\":\"session-start\",\"elapsed_ms\":400,\"ts\":{}}}\n", now - 8 * 86_400);
-        let line_new = format!("{{\"event\":\"session-start\",\"elapsed_ms\":400,\"ts\":{}}}\n", now - 3600);
+        let line_old = format!(
+            "{{\"event\":\"session-start\",\"elapsed_ms\":400,\"ts\":{}}}\n",
+            now - 8 * 86_400
+        );
+        let line_new = format!(
+            "{{\"event\":\"session-start\",\"elapsed_ms\":400,\"ts\":{}}}\n",
+            now - 3600
+        );
         std::fs::write(mdkb_dir.join("hook-slow.jsonl"), line_old + &line_new).unwrap();
 
         let report = collect_report(&env.ctx).expect("collect");
@@ -576,12 +659,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cutoff = 100;
         let content = [
-            "not json",                            // parse error → skipped
-            "{\"event\":\"x\"}",                   // missing ts → skipped
-            "{\"ts\":50}",                         // below cutoff → skipped
-            "{\"ts\":100}",                        // at cutoff → counted
-            "{\"ts\":200}",                        // above cutoff → counted
-            "{\"ts\":\"string\"}",                 // non-integer ts → skipped
+            "not json",            // parse error → skipped
+            "{\"event\":\"x\"}",   // missing ts → skipped
+            "{\"ts\":50}",         // below cutoff → skipped
+            "{\"ts\":100}",        // at cutoff → counted
+            "{\"ts\":200}",        // above cutoff → counted
+            "{\"ts\":\"string\"}", // non-integer ts → skipped
         ]
         .join("\n");
         std::fs::write(dir.path().join("hook-slow.jsonl"), content).unwrap();
@@ -595,7 +678,10 @@ mod tests {
         let mut r = make_empty_report();
         r.memory.counts_by_type.clear();
         let out = render(&r, false);
-        assert!(out.contains("(no entries)"), "empty memory must render placeholder");
+        assert!(
+            out.contains("(no entries)"),
+            "empty memory must render placeholder"
+        );
     }
 
     #[test]
@@ -611,10 +697,19 @@ mod tests {
     fn make_empty_report() -> StatsReport {
         StatsReport {
             header: HeaderInfo {
-                repo: "t".into(), version: "0.0.0".into(), db_size_bytes: 0, last_updated: None,
+                repo: "t".into(),
+                version: "0.0.0".into(),
+                db_size_bytes: 0,
+                last_updated: None,
             },
-            index: IndexHealth { document_count: 0, memory_count: 0, free_page_ratio: 0.0 },
-            collections: CollectionsSummary { collections: vec![] },
+            index: IndexHealth {
+                document_count: 0,
+                memory_count: 0,
+                free_page_ratio: 0.0,
+            },
+            collections: CollectionsSummary {
+                collections: vec![],
+            },
             memory: MemorySummary {
                 active_count: 0,
                 counts_by_type: HashMap::new(),
@@ -627,7 +722,10 @@ mod tests {
                 total_calls: 0,
                 top_tools: vec![],
             },
-            hooks: HooksSummary { slow_events_7d: 0, reindex_queue_pending: 0 },
+            hooks: HooksSummary {
+                slow_events_7d: 0,
+                reindex_queue_pending: 0,
+            },
         }
     }
 
@@ -638,7 +736,8 @@ mod tests {
         std::fs::write(
             mdkb_dir.join("reindex-queue.jsonl"),
             "{\"path\":\"a.rs\"}\n{\"path\":\"b.rs\"}\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let report = collect_report(&env.ctx).expect("collect");
         assert_eq!(report.hooks.reindex_queue_pending, 2);

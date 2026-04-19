@@ -482,7 +482,10 @@ mod tests {
         let base = tmp_base();
         std::fs::create_dir_all(&base).unwrap();
         let result = canonicalize_under_cwd(&base, "foo/bar.md");
-        assert!(result.is_some(), "relative path inside cwd must be accepted");
+        assert!(
+            result.is_some(),
+            "relative path inside cwd must be accepted"
+        );
         let s = result.unwrap();
         assert!(s.contains("mdkb_hook_tests"), "result should be under base");
     }
@@ -502,8 +505,14 @@ mod tests {
         let base = tmp_base();
         std::fs::create_dir_all(&base).unwrap();
         let base_real = std::fs::canonicalize(&base).unwrap();
-        let inside = base_real.join("notes/foo.md").to_string_lossy().into_owned();
+        let inside = base_real
+            .join("notes/foo.md")
+            .to_string_lossy()
+            .into_owned();
         let result = canonicalize_under_cwd(&base, &inside);
-        assert!(result.is_some(), "absolute path inside cwd must be accepted");
+        assert!(
+            result.is_some(),
+            "absolute path inside cwd must be accepted"
+        );
     }
 }

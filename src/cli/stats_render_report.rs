@@ -33,7 +33,8 @@ pub fn render(report: &StatsReport, _color: bool) -> String {
 
 fn render_header(out: &mut String, h: &HeaderInfo) {
     let db_kb = h.db_size_bytes / 1024;
-    let last = h.last_updated
+    let last = h
+        .last_updated
         .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
         .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
         .unwrap_or_else(|| "never".to_string());
@@ -50,7 +51,9 @@ fn render_index(out: &mut String, h: &IndexHealth) {
     let free_bar = bar((h.free_page_ratio * 100.0) as u64, 100, bar_w);
     let body = format!(
         "  documents  {:>6}\n  memory     {:>6}\n  free pages [{free_bar}] {:.0}%",
-        h.document_count, h.memory_count, h.free_page_ratio * 100.0,
+        h.document_count,
+        h.memory_count,
+        h.free_page_ratio * 100.0,
     );
     out.push_str(&frame("Index Health", &body, WIDTH));
 }
@@ -62,7 +65,11 @@ fn render_collections(out: &mut String, c: &CollectionsSummary) {
     }
     let mut body = String::new();
     for col in &c.collections {
-        let _ = writeln!(body, "  {:20} {:>5} docs  {}", col.name, col.doc_count, col.path);
+        let _ = writeln!(
+            body,
+            "  {:20} {:>5} docs  {}",
+            col.name, col.doc_count, col.path
+        );
     }
     out.push_str(&frame("Collections", body.trim_end(), WIDTH));
 }
@@ -84,7 +91,10 @@ fn render_memory(out: &mut String, m: &MemorySummary) {
         lines.push(format!("  reminders DUE       {:>4}", m.reminders_due));
     }
     if m.reminders_upcoming_7d > 0 {
-        lines.push(format!("  upcoming (7d)       {:>4}", m.reminders_upcoming_7d));
+        lines.push(format!(
+            "  upcoming (7d)       {:>4}",
+            m.reminders_upcoming_7d
+        ));
     }
     if lines.is_empty() {
         lines.push("  (no entries)".to_string());
@@ -106,7 +116,8 @@ fn render_code(out: &mut String, c: &CodeSummary) {
         "  files {:>6}  symbols {:>6}  relations {:>6}",
         c.files, c.symbols, c.relations,
     ));
-    if let Some(ts) = c.last_indexed
+    if let Some(ts) = c
+        .last_indexed
         .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
     {
         lines.push(format!("  indexed {}", ts.format("%Y-%m-%d %H:%M UTC")));
@@ -120,7 +131,9 @@ fn render_code(out: &mut String, c: &CodeSummary) {
             let b = bar(l.symbols as u64, max.max(1), bar_w);
             lines.push(format!(
                 "    {:10} [{b}] {:>4} files {:>5} syms",
-                truncate(&l.language, 10), l.files, l.symbols,
+                truncate(&l.language, 10),
+                l.files,
+                l.symbols,
             ));
         }
     }
@@ -131,17 +144,30 @@ fn render_code(out: &mut String, c: &CodeSummary) {
         lines.push("  Symbol kinds:".to_string());
         for k in &c.symbols_by_kind {
             let b = bar(k.count as u64, max.max(1), bar_w);
-            lines.push(format!("    {:12} [{b}] {:>6}", truncate(&k.kind, 12), k.count));
+            lines.push(format!(
+                "    {:12} [{b}] {:>6}",
+                truncate(&k.kind, 12),
+                k.count
+            ));
         }
     }
 
     if !c.relations_by_kind.is_empty() {
-        let max = c.relations_by_kind.iter().map(|k| k.count).max().unwrap_or(0) as u64;
+        let max = c
+            .relations_by_kind
+            .iter()
+            .map(|k| k.count)
+            .max()
+            .unwrap_or(0) as u64;
         lines.push(String::new());
         lines.push("  Relations:".to_string());
         for k in &c.relations_by_kind {
             let b = bar(k.count as u64, max.max(1), bar_w);
-            lines.push(format!("    {:12} [{b}] {:>6}", truncate(&k.kind, 12), k.count));
+            lines.push(format!(
+                "    {:12} [{b}] {:>6}",
+                truncate(&k.kind, 12),
+                k.count
+            ));
         }
     }
 
@@ -149,7 +175,11 @@ fn render_code(out: &mut String, c: &CodeSummary) {
         lines.push(String::new());
         lines.push("  Top files by symbols:".to_string());
         for f in &c.top_files {
-            lines.push(format!("    {:>5} syms  {}", f.symbols, truncate(&f.path, 48)));
+            lines.push(format!(
+                "    {:>5} syms  {}",
+                f.symbols,
+                truncate(&f.path, 48)
+            ));
         }
     }
 
@@ -167,7 +197,10 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn render_sessions(out: &mut String, s: &SessionsSummary) {
     let mut lines = Vec::new();
-    lines.push(format!("  sessions {:>6}  calls {:>6}", s.total_sessions, s.total_calls));
+    lines.push(format!(
+        "  sessions {:>6}  calls {:>6}",
+        s.total_sessions, s.total_calls
+    ));
 
     if !s.top_tools.is_empty() {
         let max_calls = s.top_tools.iter().map(|t| t.call_count).max().unwrap_or(1);
@@ -213,14 +246,12 @@ mod tests {
                 free_page_ratio: 0.1,
             },
             collections: CollectionsSummary {
-                collections: vec![
-                    CollectionRow {
-                        name: "docs".to_string(),
-                        path: "./docs".to_string(),
-                        pattern: "**/*.md".to_string(),
-                        doc_count: 42,
-                    },
-                ],
+                collections: vec![CollectionRow {
+                    name: "docs".to_string(),
+                    path: "./docs".to_string(),
+                    pattern: "**/*.md".to_string(),
+                    doc_count: 42,
+                }],
             },
             memory: MemorySummary {
                 active_count: 7,
@@ -240,27 +271,54 @@ mod tests {
                 relations: 880,
                 last_indexed: Some(1_700_000_000),
                 languages: vec![
-                    LanguageRow { language: "rust".to_string(), files: 8, symbols: 300 },
-                    LanguageRow { language: "typescript".to_string(), files: 4, symbols: 120 },
+                    LanguageRow {
+                        language: "rust".to_string(),
+                        files: 8,
+                        symbols: 300,
+                    },
+                    LanguageRow {
+                        language: "typescript".to_string(),
+                        files: 4,
+                        symbols: 120,
+                    },
                 ],
                 symbols_by_kind: vec![
-                    KindCount { kind: "Function".to_string(), count: 210 },
-                    KindCount { kind: "Struct".to_string(), count: 80 },
+                    KindCount {
+                        kind: "Function".to_string(),
+                        count: 210,
+                    },
+                    KindCount {
+                        kind: "Struct".to_string(),
+                        count: 80,
+                    },
                 ],
                 relations_by_kind: vec![
-                    KindCount { kind: "Calls".to_string(), count: 640 },
-                    KindCount { kind: "Uses".to_string(), count: 240 },
+                    KindCount {
+                        kind: "Calls".to_string(),
+                        count: 640,
+                    },
+                    KindCount {
+                        kind: "Uses".to_string(),
+                        count: 240,
+                    },
                 ],
-                top_files: vec![
-                    FileSymbolRow { path: "src/main.rs".to_string(), symbols: 120 },
-                ],
+                top_files: vec![FileSymbolRow {
+                    path: "src/main.rs".to_string(),
+                    symbols: 120,
+                }],
             },
             sessions: SessionsSummary {
                 total_sessions: 5,
                 total_calls: 200,
                 top_tools: vec![
-                    ToolRow { tool_name: "search".to_string(), call_count: 80 },
-                    ToolRow { tool_name: "memory_write".to_string(), call_count: 30 },
+                    ToolRow {
+                        tool_name: "search".to_string(),
+                        call_count: 80,
+                    },
+                    ToolRow {
+                        tool_name: "memory_write".to_string(),
+                        call_count: 30,
+                    },
                 ],
             },
             hooks: HooksSummary {
@@ -273,7 +331,15 @@ mod tests {
     #[test]
     fn render_contains_all_section_titles() {
         let out = render(&fixture_report(), false);
-        for title in &["mdkb", "Index Health", "Collections", "Memory", "Code Index", "Sessions", "Hooks"] {
+        for title in &[
+            "mdkb",
+            "Index Health",
+            "Collections",
+            "Memory",
+            "Code Index",
+            "Sessions",
+            "Hooks",
+        ] {
             assert!(out.contains(title), "missing section '{title}'");
         }
     }
@@ -303,7 +369,7 @@ mod tests {
     #[test]
     fn render_sessions_shows_totals() {
         let out = render(&fixture_report(), false);
-        assert!(out.contains('5'));   // sessions
+        assert!(out.contains('5')); // sessions
         assert!(out.contains("200")); // calls
         assert!(out.contains("search"));
     }
@@ -356,10 +422,7 @@ mod tests {
         let out = render(&fixture_report(), false);
         for line in out.lines() {
             let len = line.chars().count();
-            assert!(
-                len <= WIDTH,
-                "line too wide ({len} > {WIDTH}): {line:?}"
-            );
+            assert!(len <= WIDTH, "line too wide ({len} > {WIDTH}): {line:?}");
         }
     }
 }

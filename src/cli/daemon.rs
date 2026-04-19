@@ -73,13 +73,24 @@ pub fn handle_status() -> Result<()> {
     if let Some(pid) = s.running_pid() {
         println!("mdkb daemon: running (pid {pid})");
     } else if let Some(pid) = s.pid {
-        println!("mdkb daemon: not running (stale pid {pid} in {})", s.lock_path.display());
+        println!(
+            "mdkb daemon: not running (stale pid {pid} in {})",
+            s.lock_path.display()
+        );
     } else {
         println!("mdkb daemon: not running");
     }
     println!("  base:       {}", s.base_dir.display());
-    println!("  mcp  sock:  {} {}", s.mcp_sock.display(), present(&s.mcp_sock));
-    println!("  hook sock:  {} {}", s.hook_sock.display(), present(&s.hook_sock));
+    println!(
+        "  mcp  sock:  {} {}",
+        s.mcp_sock.display(),
+        present(&s.mcp_sock)
+    );
+    println!(
+        "  hook sock:  {} {}",
+        s.hook_sock.display(),
+        present(&s.hook_sock)
+    );
     if let Some(up) = s.uptime {
         if s.running_pid().is_some() {
             println!("  uptime:     {}", format_duration(up));
@@ -183,9 +194,8 @@ fn process_alive(_pid: u32) -> bool {
 
 #[cfg(unix)]
 fn signal_term(pid: u32) -> Result<()> {
-    let pid_t = libc::pid_t::try_from(pid).map_err(|_| {
-        Error::other(format!("pid {pid} overflows libc::pid_t (i32)"))
-    })?;
+    let pid_t = libc::pid_t::try_from(pid)
+        .map_err(|_| Error::other(format!("pid {pid} overflows libc::pid_t (i32)")))?;
     let rc = unsafe { libc::kill(pid_t, libc::SIGTERM) };
     if rc == 0 {
         Ok(())
@@ -199,7 +209,9 @@ fn signal_term(pid: u32) -> Result<()> {
 
 #[cfg(not(unix))]
 fn signal_term(_pid: u32) -> Result<()> {
-    Err(Error::other("daemon control not supported on this platform"))
+    Err(Error::other(
+        "daemon control not supported on this platform",
+    ))
 }
 
 /// Double-fork + setsid + stdio redirection. Must be called BEFORE tokio
@@ -214,10 +226,12 @@ pub fn detach_current_process() -> Result<()> {
     // First fork: parent exits so the shell returns. The child is still
     // in the same process group.
     match unsafe { libc::fork() } {
-        -1 => return Err(Error::other(format!(
-            "fork: {}",
-            std::io::Error::last_os_error()
-        ))),
+        -1 => {
+            return Err(Error::other(format!(
+                "fork: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
         0 => {}
         _ => {
             // Parent: exit without running destructors (tokio runtime, etc).
@@ -236,10 +250,12 @@ pub fn detach_current_process() -> Result<()> {
     // Second fork: guarantees the final process is not a session leader,
     // so it can never reacquire a controlling terminal.
     match unsafe { libc::fork() } {
-        -1 => return Err(Error::other(format!(
-            "fork 2: {}",
-            std::io::Error::last_os_error()
-        ))),
+        -1 => {
+            return Err(Error::other(format!(
+                "fork 2: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
         0 => {}
         _ => unsafe { libc::_exit(0) },
     }
@@ -291,8 +307,7 @@ fn redirect_stdio_to_log() -> Result<()> {
 /// Spawn `mdkb serve --daemon --detach` as a detached process group.
 /// Used by `restart`; the daemon itself handles the actual double-fork.
 fn spawn_daemon_detached() -> Result<()> {
-    let exe = std::env::current_exe()
-        .map_err(|e| Error::other(format!("current_exe: {e}")))?;
+    let exe = std::env::current_exe().map_err(|e| Error::other(format!("current_exe: {e}")))?;
 
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;

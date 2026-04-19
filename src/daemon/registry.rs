@@ -534,7 +534,9 @@ mod tests {
         use crate::mcp::server::{McpServer, WATCHER_SPAWN_COUNT};
         use std::sync::atomic::Ordering;
 
-        let _guard = WATCHER_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = WATCHER_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
 
         // --- Half 1: standalone must not spawn a watcher. ---
         let tmp_standalone = TempDir::new().unwrap();

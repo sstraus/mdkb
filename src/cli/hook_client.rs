@@ -197,7 +197,11 @@ fn print_response(method: &str, result: &Value) {
 ///
 /// Returns `Err` for transport failures and for JSON-RPC `error` envelopes;
 /// the caller is expected to log and swallow both.
-async fn call_daemon(socket_path: &Path, method: &str, params: &Value) -> std::result::Result<Value, String> {
+async fn call_daemon(
+    socket_path: &Path,
+    method: &str,
+    params: &Value,
+) -> std::result::Result<Value, String> {
     ensure_daemon_running(socket_path)
         .await
         .map_err(|e| format!("daemon unavailable: {e}"))?;
@@ -309,7 +313,9 @@ mod tests {
             json!({"jsonrpc":"2.0","result":{"text":"ok","tokens":1}}),
         );
 
-        let result = call_daemon(&sock, "status", &json!({"root":"/tmp"})).await.unwrap();
+        let result = call_daemon(&sock, "status", &json!({"root":"/tmp"}))
+            .await
+            .unwrap();
         assert_eq!(result["text"], "ok");
     }
 
@@ -383,7 +389,11 @@ mod tests {
     #[test]
     fn hook_socket_path_under_daemon_home() {
         let path = hook_socket_path();
-        assert!(path.ends_with("daemon-hook.sock"), "path: {}", path.display());
+        assert!(
+            path.ends_with("daemon-hook.sock"),
+            "path: {}",
+            path.display()
+        );
         assert!(path.to_string_lossy().contains(".mdkb"));
     }
 }

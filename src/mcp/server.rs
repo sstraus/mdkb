@@ -19,9 +19,7 @@ use tokio::sync::Mutex;
 
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 
-use crate::cli::handlers::{
-    Context, handle_session_index, handle_update,
-};
+use crate::cli::handlers::{Context, handle_session_index, handle_update};
 use crate::code::indexing::IndexFacade;
 use crate::code::types::SymbolId;
 use crate::config::McpConfig;
@@ -1165,8 +1163,7 @@ pub async fn run_file_watcher_with_idle(
     // ensure_handle_context). Without this poll the watcher would race against
     // the dispatch path and exit immediately when ctx is still None.
     let collection_list = {
-        let deadline =
-            tokio::time::Instant::now() + std::time::Duration::from_secs(CTX_WAIT_SECS);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(CTX_WAIT_SECS);
         loop {
             let ctx_guard = ctx.lock().await;
             if let Some(ctx_ref) = ctx_guard.as_ref() {
@@ -2578,7 +2575,8 @@ if (require.main === module) {
 
             // Create/reuse code index (init auto-bootstraps it)
             let index_path = root.join(".mdkb/code.sqlite");
-            let mut facade = IndexFacade::open_or_create(&index_path).expect("Failed to open code index");
+            let mut facade =
+                IndexFacade::open_or_create(&index_path).expect("Failed to open code index");
             facade
                 .index_directory(&src_dir)
                 .expect("Failed to index source files");
