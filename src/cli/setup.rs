@@ -498,12 +498,11 @@ fn upsert_hook_entries(
             .unwrap()
             .entry((*event_name).to_string())
             .or_insert_with(|| serde_json::json!([]));
-        let arr = match entry_list.as_array_mut() {
-            Some(a) => a,
-            None => {
-                *entry_list = serde_json::json!([]);
-                entry_list.as_array_mut().unwrap()
-            }
+        let arr = if let Some(a) = entry_list.as_array_mut() {
+            a
+        } else {
+            *entry_list = serde_json::json!([]);
+            entry_list.as_array_mut().unwrap()
         };
         arr.retain(|item| {
             item.get("_managedBy")

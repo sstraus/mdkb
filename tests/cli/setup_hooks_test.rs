@@ -220,6 +220,51 @@ fn preserves_non_mdkb_hook_entries() {
     );
 }
 
+/// Concurrent invocations writing the same settings file must not lose each
+/// other's entries. Without the advisory lock two writers could interleave:
+///
+///   T1: read (empty)     T2: read (empty)
+///   T1: merge A          T2: merge A
+///   T1: write {A}        T2: write {A}  ← T1's write is clobbered
+///
+/// With the lock, T2 waits until T1 finishes and then sees T1's output when
+/// it reads inside the critical section — the result is still idempotent (one
+/// mdkb entry per event), but both writers complete without data loss.
+#[test]
+fn concurrent_invocations_preserve_each_others_entries() {
+    use std::thread;
+
+    let (_guard, project, _home) = isolated_project();
+    let project_path = project.path().to_path_buf();
+
+    // Use the same project dir from N threads. Each spawns handle_setup_hooks_claude
+    // for "local" scope, which writes .claude/settings.local.json.
+    const N: usize = 8;
+    let handles: Vec<_> = (0..N)
+        .map(|_| {
+            let p = project_path.clone();
+            thread::spawn(move || {
+                handle_setup_hooks_claude(&p, "local", "", false)
+                    .expect("concurrent setup hooks ok")
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("thread panicked");
+    }
+
+    let v = read_json(&local_settings_path(&project_path));
+    for (event_name, _) in HOOK_EVENTS {
+        let managed = mdkb_entries(&v, event_name);
+        assert_eq!(
+            managed.len(),
+            1,
+            "event {event_name} must have exactly one mdkb entry after {N} concurrent writes"
+        );
+    }
+}
+
 /// Generated command must route through the daemon (`mdkb hook <event>`)
 /// and fall back to the in-process path on failure (`MDKB_NO_DAEMON=1 …`).
 /// This is the story 016 contract — legacy raw-CLI invocations are gone.
