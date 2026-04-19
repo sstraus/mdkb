@@ -145,6 +145,7 @@ impl CodeDb {
     /// Look up file token estimates for a set of relative paths.
     ///
     /// Returns a map containing only paths with a known (non-NULL) estimate.
+    /// Chunks into groups of 999 to stay within SQLite's variable limit.
     pub fn get_file_token_estimates(
         &self,
         rel_paths: &[String],
@@ -152,26 +153,29 @@ impl CodeDb {
         if rel_paths.is_empty() {
             return Ok(HashMap::new());
         }
-        let placeholders: Vec<String> = (1..=rel_paths.len()).map(|i| format!("?{i}")).collect();
-        let sql = format!(
-            "SELECT rel_path, token_estimate FROM code_files \
-             WHERE token_estimate IS NOT NULL AND rel_path IN ({})",
-            placeholders.join(",")
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let sql_params: Vec<&dyn rusqlite::types::ToSql> = rel_paths
-            .iter()
-            .map(|p| p as &dyn rusqlite::types::ToSql)
-            .collect();
-        let rows = stmt.query_map(sql_params.as_slice(), |row| {
-            let path: String = row.get(0)?;
-            let est: i64 = row.get(1)?;
-            Ok((path, est.max(0) as u32))
-        })?;
         let mut map = HashMap::new();
-        for row in rows {
-            let (p, e) = row?;
-            map.insert(p, e);
+        for chunk in rel_paths.chunks(999) {
+            let placeholders: Vec<String> =
+                (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "SELECT rel_path, token_estimate FROM code_files \
+                 WHERE token_estimate IS NOT NULL AND rel_path IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let sql_params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(sql_params.as_slice(), |row| {
+                let path: String = row.get(0)?;
+                let est: i64 = row.get(1)?;
+                Ok((path, est.max(0) as u32))
+            })?;
+            for row in rows {
+                let (p, e) = row?;
+                map.insert(p, e);
+            }
         }
         Ok(map)
     }
@@ -382,29 +386,34 @@ impl CodeDb {
     }
 
     /// Batch lookup of symbols by their IDs.
+    ///
+    /// Chunks into groups of 999 to stay within SQLite's variable limit.
     pub fn get_symbols_batch(&self, ids: &[i64]) -> rusqlite::Result<HashMap<i64, Symbol>> {
         if ids.is_empty() {
             return Ok(HashMap::new());
         }
-        let placeholders: Vec<String> = (1..=ids.len()).map(|i| format!("?{i}")).collect();
-        let sql = format!(
-            "{SYMBOL_COLUMNS} FROM code_symbols WHERE id IN ({})",
-            placeholders.join(",")
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let sql_params: Vec<&dyn rusqlite::types::ToSql> = ids
-            .iter()
-            .map(|id| id as &dyn rusqlite::types::ToSql)
-            .collect();
-        let rows = stmt.query_map(sql_params.as_slice(), |row| {
-            let sym = row_to_symbol(row)?;
-            let id: i64 = row.get(0)?;
-            Ok((id, sym))
-        })?;
         let mut map = HashMap::new();
-        for row in rows {
-            let (id, sym) = row?;
-            map.insert(id, sym);
+        for chunk in ids.chunks(999) {
+            let placeholders: Vec<String> =
+                (1..=chunk.len()).map(|i| format!("?{i}")).collect();
+            let sql = format!(
+                "{SYMBOL_COLUMNS} FROM code_symbols WHERE id IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let sql_params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(sql_params.as_slice(), |row| {
+                let sym = row_to_symbol(row)?;
+                let id: i64 = row.get(0)?;
+                Ok((id, sym))
+            })?;
+            for row in rows {
+                let (id, sym) = row?;
+                map.insert(id, sym);
+            }
         }
         Ok(map)
     }
@@ -1389,5 +1398,64 @@ mod tests {
         // Should not error when deleting a file that doesn't exist
         let deleted = db.delete_by_file("nonexistent").unwrap();
         assert_eq!(deleted, 0);
+    }
+
+    #[test]
+    fn test_get_symbols_batch_chunked_across_999_limit() {
+        // Insert 1001 symbols and fetch them all — verifies chunking across the
+        // SQLite 999-variable limit does not error and returns all rows.
+        let (_dir, db) = temp_db();
+        let file_id = insert_test_file(&db);
+        let mut inserted_ids: Vec<i64> = Vec::new();
+        for i in 0..1001_u32 {
+            let id = db
+                .insert_symbol(
+                    &format!("sym_{i}"),
+                    "Function",
+                    file_id,
+                    "test.rs",
+                    i,
+                    None,
+                    None,
+                    None,
+                    0,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            inserted_ids.push(id);
+        }
+        let batch = db.get_symbols_batch(&inserted_ids).unwrap();
+        assert_eq!(batch.len(), 1001, "all 1001 symbols should be returned");
+    }
+
+    #[test]
+    fn test_get_file_token_estimates_chunked_across_999_limit() {
+        // Insert 1001 files with token estimates; fetch all — verifies chunking.
+        let (_dir, db) = temp_db();
+        let mut rel_paths: Vec<String> = Vec::new();
+        for i in 0..1001_u32 {
+            let rel = format!("file_{i}.rs");
+            db.insert_file(&rel, &rel, "hash", Some("Rust"), None, Some(i as i64))
+                .unwrap();
+            rel_paths.push(rel);
+        }
+        let map = db.get_file_token_estimates(&rel_paths).unwrap();
+        assert_eq!(map.len(), 1001, "all 1001 token estimates should be returned");
+    }
+
+    #[test]
+    fn test_get_file_token_estimates_skips_null_estimates() {
+        let (_dir, db) = temp_db();
+        db.insert_file("a.rs", "a.rs", "h1", Some("Rust"), None, Some(42))
+            .unwrap();
+        db.insert_file("b.rs", "b.rs", "h2", Some("Rust"), None, None)
+            .unwrap();
+        let paths = vec!["a.rs".to_string(), "b.rs".to_string()];
+        let map = db.get_file_token_estimates(&paths).unwrap();
+        assert_eq!(map.len(), 1, "only file with non-NULL estimate returned");
+        assert_eq!(map["a.rs"], 42);
     }
 }
