@@ -10,8 +10,19 @@ No cloud APIs. No token-heavy context dumps. Just fast, local, relevant retrieva
 
 - **Hybrid search** — BM25 + semantic vectors over your markdown docs
 - **Code intelligence** — tree-sitter parsing for 13 languages, call graphs, symbol search
-- **Persistent memory** — AI-created knowledge entries that survive across sessions
-- **Zero config serving** — auto-indexes on startup, watches for file changes
+- **Persistent memory** — AI-created knowledge entries that survive across sessions, including time-bound `reminder` entries with due-date surfacing
+- **Lifecycle hooks** — proactive context injection and reindex enqueue via Claude Code / Codex CLI hooks (no tool call required)
+- **Markdown-native memory** — export/import memory entries as a folder of `.md` files for review, git tracking, or bulk edit
+- **Unified diagnostics** — `mdkb stats` renders a static ASCII dashboard (index health, collections, memory, code, sessions, hooks)
+- **Zero config serving** — auto-indexes on startup, watches for file changes, auto-`VACUUM`s on drift
+
+### Recent highlights (2.0.0 / 1.5.0 / 1.4.0)
+
+Full details in [CHANGES.md](CHANGES.md).
+
+- **2.0.0 (breaking)** — `mdkb status` removed (use `mdkb stats`); `mdkb memory export`/`import` round-trip entries as `.md` files with YAML frontmatter; unified ASCII stats dashboard with `--format json` and `--no-color`.
+- **1.5.0** — lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PostToolUse`) via `mdkb setup hooks claude|codex`; `usage` MCP tool (session+lifetime token ledger); access-count × recency as a third RRF signal in `search`; `memory_confirm` atomic Bayesian signal; auto-`VACUUM` + `PRAGMA optimize` on drift; `mdkb setup mcp codex`.
+- **1.4.0** — `reminder` entry type with `due_in` (surfaced in session warmup once due); schema migration v9 → v10; input hardening (reject control chars in titles/tags).
 
 ## Installation
 
@@ -57,12 +68,51 @@ Restart Claude Code after setup. The MCP server auto-indexes on startup and watc
 MCP gives the assistant tools; hooks make it use them. Register the lifecycle dispatcher so Claude gets a memory warmup at session start and relevant context on every prompt — without having to call `search` first:
 
 ```bash
+# Claude Code, project-scoped (writes .claude/settings.local.json)
 mdkb setup hooks claude --scope local
-# or, for Codex CLI:
+
+# Claude Code, user-scoped / global (writes ~/.claude/settings.json)
+mdkb setup hooks claude --scope user
+
+# Codex CLI (writes ~/.codex/hooks.json)
 mdkb setup hooks codex
+
+# Preview the merged settings JSON without writing
+mdkb setup hooks claude --scope local --dry-run
+
+# Disable specific events at install time
+mdkb setup hooks claude --disable post-tool-use
+mdkb setup hooks claude --disable user-prompt-submit,post-tool-use
 ```
 
-Restart the host CLI after setup. Full contract, config, and opt-out in [docs/hooks.md](docs/hooks.md).
+Restart the host CLI after setup. Re-running is idempotent: existing hook entries are replaced, unrelated settings preserved. Events: `session-start`, `user-prompt-submit`, `post-tool-use`. Full contract, config, and opt-out in [docs/hooks.md](docs/hooks.md).
+
+### Binary path caveat
+
+`mdkb setup mcp …` and `mdkb setup hooks …` hard-code the absolute path of the binary that ran the setup. If you later move or rebuild the binary, the recorded command breaks. For stable global installs, first run `cargo install --path .` (binary lands in `~/.cargo/bin/mdkb`), then run setup from that binary.
+
+### Uninstalling
+
+There is no dedicated `mdkb uninstall` subcommand — removal is a few targeted edits:
+
+**MCP (Claude Code):**
+
+```bash
+claude mcp remove mdkb -s local   # per-project
+claude mcp remove mdkb -s user    # global
+```
+
+Note: `claude mcp remove` operates on `~/.claude-private/.claude.json`, while `mdkb setup mcp claude` writes to `~/.claude.json`. If you registered via `mdkb setup`, also manually delete the `mdkb` block from the `mcpServers` object in `~/.claude.json` (user scope) or from the per-project entry (local scope).
+
+**Hooks:**
+
+No CLI removal exists. Delete the three `_managedBy: "mdkb"` entries (`SessionStart`, `UserPromptSubmit`, `PostToolUse`) from:
+
+- `.claude/settings.local.json` — if installed with `--scope local`
+- `~/.claude/settings.json` — if installed with `--scope user`
+- `~/.codex/hooks.json` — for Codex CLI
+
+Soft alternatives before uninstalling: create an empty `.mdkbignore-hooks` marker at the repo root to silence hooks for that working tree, or toggle `session_start_enabled` / `user_prompt_submit_enabled` / `post_tool_use_enabled` in `.mdkb/config.toml`.
 
 ### Manual MCP Setup
 
@@ -83,19 +133,21 @@ Add to your Claude Code MCP config (`.claude/mcp.json` or `~/.claude/mcp.json`):
 
 The `cwd` must point to a directory with `.mdkb/` initialized.
 
-## MCP Tools (10)
+## MCP Tools (11)
 
 | Tool | Description |
 |------|-------------|
-| `search` | Hybrid search across docs+memory (default), or scoped to `docs`, `memory`, `code`, `symbols` |
+| `search` | Hybrid search across docs+memory (default), or scoped to `docs`, `memory`, `code`, `symbols`. `scope="memory"` accepts `min_confidence` to filter decayed entries |
 | `get` | Retrieve by ID, path, memory slug, glob pattern, or comma-separated list |
 | `code_graph` | Call graph queries: `calls`, `callers`, or `impact` (transitive) |
 | `status` | Index health, collections, and code index stats |
 | `update` | Differential reindex of all collections and source code |
-| `memory_write` | Create or update a memory entry (with duplicate detection) |
+| `memory_write` | Create or update a memory entry (supports `ttl`, `due_in` for reminders, near-duplicate rejection) |
 | `memory_write_batch` | Create or update multiple memory entries at once (max 20) |
+| `memory_confirm` | Atomic Bayesian signal — `outcome="confirmed"` / `"refuted"` bumps `confirmations` and `last_confirmed_at` without rewriting content |
 | `memory_delete` | Delete a memory entry |
 | `memory_list` | List memory entries sorted by recency, popularity, or creation date |
+| `usage` | Session and lifetime token ledger (per-tool call counts, token totals, truncation stats) |
 
 ### Search Scopes
 
@@ -203,16 +255,20 @@ mdkb memory import entries.json --dry-run --skip-duplicates
 
 ### Stats
 
+`mdkb stats` is the unified diagnostic dashboard introduced in 2.0.0 (replaces the former `mdkb status` — not aliased, it was removed).
+
 ```bash
 # Unified ASCII diagnostic dashboard
 mdkb stats
 
-# Machine-readable JSON output
+# Machine-readable JSON output (safe for pipes and scripts)
 mdkb stats --format json
 
-# Plain text (no ANSI color)
+# Plain text (no ANSI color, no Unicode box-drawing)
 mdkb stats --no-color
 ```
+
+The report is stacked: header (repo, version, db size, last update) → index health → collections → memory (by entry type, reminders DUE / upcoming 7d) → code (by language, top files by tokens) → sessions (totals, top tools) → hooks (slow events last 7d, reindex queue pending). Output auto-detects whether stdout is a TTY; the JSON format is stable for scripting.
 
 ## Configuration
 
