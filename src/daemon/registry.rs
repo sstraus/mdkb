@@ -222,11 +222,27 @@ impl RepoRegistry {
             .map(|entry| entry.key().clone());
 
         if let Some(key) = lru_key {
-            if let Some((path, _handle)) = self.handles.remove(&key) {
-                tracing::info!("Evicted repo (LRU): {}", path.display());
-                // RepoHandle drop releases SQLite connections, Tantivy readers.
-                // ONNX Session (if held by IndexFacade) is dropped here too.
-                // Caller should trigger mi_collect(true) after eviction batch.
+            if let Some((path, handle)) = self.handles.remove(&key) {
+                // Arc::strong_count includes the clone we just removed from the map.
+                // A count > 1 means callers still hold live clones; resources
+                // (SQLite, Tantivy, ONNX Session) will not be freed until those
+                // clones are dropped. Eviction from the registry is still correct
+                // (no new callers will receive this handle), but resource release
+                // is deferred — log a warning so operators can tune max_active_repos.
+                let outstanding = Arc::strong_count(&handle).saturating_sub(1);
+                if outstanding > 0 {
+                    tracing::warn!(
+                        path = %path.display(),
+                        outstanding_clones = outstanding,
+                        "Evicted repo handle has outstanding Arc clones; \
+                         SQLite/Tantivy resources will not be freed until all \
+                         clones are dropped. Consider increasing max_active_repos."
+                    );
+                } else {
+                    tracing::info!("Evicted repo (LRU): {}", path.display());
+                }
+                // `handle` drops here; if outstanding == 0 resources are freed
+                // immediately, otherwise deferred to last clone drop.
             }
         }
     }
