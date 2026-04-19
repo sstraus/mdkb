@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use crate::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType};
+use crate::store::memory::{EntryStatus, EntryType, MAX_ID_LEN, MemoryEntry, SourceType};
 
 /// Parsed sections from a journal entry.
 #[derive(Debug, Default)]
@@ -312,11 +312,14 @@ pub fn journal_to_memory_entries(
             continue;
         }
 
-        let slug = section_name
+        let raw_slug = section_name
             .to_lowercase()
             .chars()
             .map(|c| if c.is_alphanumeric() { c } else { '-' })
             .collect::<String>();
+        // Truncate slug so that base_id + "-" + slug fits within MAX_ID_LEN.
+        let max_slug_len = MAX_ID_LEN.saturating_sub(base_id.len() + 1);
+        let slug: String = raw_slug.chars().take(max_slug_len).collect();
 
         entries.push(MemoryEntry {
             id: format!("{}-{}", base_id, slug),
@@ -460,6 +463,43 @@ Test summary.
         assert_eq!(
             path_to_base_id(Path::new("some file with spaces.md")),
             "some-file-with-spaces"
+        );
+    }
+
+    #[test]
+    fn test_long_slug_truncated_to_max_id_len() {
+        // base_id = "base" (4 chars), separator "-" = 1 → slug budget = MAX_ID_LEN - 5 = 95.
+        // Supply a section name of 120 chars; raw slug would be 120 chars, exceeding the limit.
+        let long_section_name = "A".repeat(120);
+        // Section content must be >= 100 bytes to pass the size filter.
+        let long_content = "x".repeat(100);
+
+        let other_sections = vec![(long_section_name.clone(), long_content)];
+
+        let journal = ParsedJournal {
+            title: "Test".to_string(),
+            other_sections,
+            ..Default::default()
+        };
+
+        let base_id = "base";
+        let entries = journal_to_memory_entries(&journal, Path::new("/test/j.md"), base_id);
+
+        assert_eq!(entries.len(), 1, "expected one entry for the long section");
+        let id = &entries[0].id;
+        assert!(
+            id.len() <= MAX_ID_LEN,
+            "ID length {} exceeds MAX_ID_LEN {}",
+            id.len(),
+            MAX_ID_LEN
+        );
+        assert!(id.starts_with("base-"), "ID should start with 'base-'");
+        // Slug part should fill the remaining budget exactly.
+        let slug_part = &id["base-".len()..];
+        assert_eq!(
+            slug_part.len(),
+            MAX_ID_LEN - base_id.len() - 1,
+            "slug should be truncated to fill remaining budget"
         );
     }
 }
