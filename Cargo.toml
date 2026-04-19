@@ -35,6 +35,7 @@ gray_matter = "0.2"
 # Async (for MCP)
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
+futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # Concurrent collections
 dashmap = "6"
@@ -70,6 +71,9 @@ libmimalloc-sys = { version = "0.1", features = ["extended"] }
 
 # Text diffing (memory revision history)
 similar = "2"
+
+# Atomic file writes (temp-file + rename for settings.json / hooks.json)
+tempfile = "3"
 
 # Utilities
 sha2 = "0.10"
@@ -126,7 +130,6 @@ http-server = ["dep:axum", "dep:tower", "dep:subtle", "rmcp/transport-streamable
 https-server = ["http-server", "dep:rcgen", "dep:axum-server", "dep:rustls"]
 
 [dev-dependencies]
-tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
 # Enable the rmcp client only for tests so we can drive the daemon's

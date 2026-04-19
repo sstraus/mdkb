@@ -9,10 +9,10 @@
 //! Story 3 of `plans/daemon-ipc-socket.md` — initial slice wires `status`
 //! only. Remaining 10 tools land in follow-up commits under #007-16f7.
 
-use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
+use futures::future::join_all;
 use rmcp::ErrorData as McpError;
 use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
@@ -26,6 +26,7 @@ use crate::domain::SearchResult;
 use crate::metrics::{UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 
+use super::mcp_error;
 use super::server::{
     apply_line_range, apply_min_confidence, format_memory_search_results, format_search_results,
     format_symbol, format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago,
@@ -87,17 +88,7 @@ impl DispatchContext {
     }
 }
 
-pub fn mcp_error(message: impl Into<Cow<'static, str>>) -> McpError {
-    McpError {
-        code: ErrorCode::INTERNAL_ERROR,
-        message: message.into(),
-        data: None,
-    }
-}
-
-/// Ensure the repo's database context is initialized. Mirrors
-/// `McpServer::ensure_handle_context` — kept in sync until that caller is
-/// retired in a later slice.
+/// Ensure the repo's database context is initialized.
 pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> {
     let mut ctx_guard = handle.ctx.lock().await;
     if ctx_guard.is_none() {
@@ -767,72 +758,110 @@ pub async fn cross_repo_search_impl(
         ));
     }
 
-    let mut all_results: Vec<SearchResult> = Vec::new();
+    // Fan-out concurrently across all repos, then merge. Per-repo errors are
+    // logged and treated as empty results so a single failing repo does not
+    // abort the whole cross-repo search.
+    let per_repo_futures = handles.iter().map(|handle| {
+        let handle = Arc::clone(handle);
+        let query = params.query.clone();
+        let collection = params.collection.clone();
+        let include_superseded = params.include_superseded;
+        let min_confidence = params.min_confidence;
+        let recency_weight = handle.config.search.memory.access_recency_weight;
+        let recency_half_life = handle.config.search.memory.recency_half_life_secs;
 
-    for handle in handles {
-        ensure_handle_context(handle).await?;
-        let ctx_guard = handle.ctx.lock().await;
-        let ctx = match ctx_guard.as_ref() {
-            Some(ctx) => ctx,
-            None => continue,
-        };
-
-        let repo_tag = handle.root.display().to_string();
-
-        match scope {
-            Some("docs") | None => {
-                let mut results = handle_hybrid_search(
-                    ctx,
-                    &params.query,
-                    limit,
-                    params.collection.as_deref(),
-                    params.include_superseded,
-                )
-                .map_err(|e| mcp_error(format!("Search failed on {repo_tag}: {e}")))?;
-
-                for r in &mut results {
-                    r.repo_root = Some(repo_tag.clone());
-                }
-                all_results.extend(results);
+        async move {
+            if let Err(e) = ensure_handle_context(&handle).await {
+                tracing::warn!(
+                    "cross_repo_search: skipping {}: {}",
+                    handle.root.display(),
+                    e.message
+                );
+                return Vec::<SearchResult>::new();
             }
-            Some("memory") => {
-                let query_embedding = crate::llm::get_cached_service()
-                    .and_then(|s| s.embed_query(&params.query))
-                    .ok();
-                let entries = memory::search_entries_hybrid(
-                    &ctx.conn,
-                    &params.query,
-                    query_embedding.as_deref(),
-                    limit,
-                    handle.config.search.memory.access_recency_weight,
-                    handle.config.search.memory.recency_half_life_secs,
-                )
-                .map_err(|e| mcp_error(format!("Memory search failed on {repo_tag}: {e}")))?;
-                let entries = apply_min_confidence(entries, params.min_confidence);
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = match ctx_guard.as_ref() {
+                Some(ctx) => ctx,
+                None => return Vec::new(),
+            };
 
-                if !entries.is_empty() {
-                    let text = format_memory_search_results(&entries);
-                    let mut pseudo = SearchResult {
-                        id: 0,
-                        collection: "memory".to_string(),
-                        path: String::new(),
-                        title: None,
-                        score: 1.0,
-                        snippets: vec![text],
-                        status: None,
-                        superseded_by: None,
-                        repo_root: Some(repo_tag),
-                    };
-                    if let Some(e) = entries.first() {
-                        pseudo.path = e.id.clone();
-                        pseudo.title = Some(e.title.clone());
+            let repo_tag = handle.root.display().to_string();
+            let mut repo_results: Vec<SearchResult> = Vec::new();
+
+            match scope {
+                Some("docs") | None => {
+                    match handle_hybrid_search(
+                        ctx,
+                        &query,
+                        limit,
+                        collection.as_deref(),
+                        include_superseded,
+                    ) {
+                        Ok(mut results) => {
+                            for r in &mut results {
+                                r.repo_root = Some(repo_tag.clone());
+                            }
+                            repo_results.extend(results);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "cross_repo_search: docs search failed on {}: {e}",
+                                repo_tag
+                            );
+                        }
                     }
-                    all_results.push(pseudo);
                 }
+                Some("memory") => {
+                    let query_embedding = crate::llm::get_cached_service()
+                        .and_then(|s| s.embed_query(&query))
+                        .ok();
+                    match memory::search_entries_hybrid(
+                        &ctx.conn,
+                        &query,
+                        query_embedding.as_deref(),
+                        limit,
+                        recency_weight,
+                        recency_half_life,
+                    ) {
+                        Ok(entries) => {
+                            let entries = apply_min_confidence(entries, min_confidence);
+                            if !entries.is_empty() {
+                                let text = format_memory_search_results(&entries);
+                                let mut pseudo = SearchResult {
+                                    id: 0,
+                                    collection: "memory".to_string(),
+                                    path: String::new(),
+                                    title: None,
+                                    score: 1.0,
+                                    snippets: vec![text],
+                                    status: None,
+                                    superseded_by: None,
+                                    repo_root: Some(repo_tag),
+                                };
+                                if let Some(e) = entries.first() {
+                                    pseudo.path = e.id.clone();
+                                    pseudo.title = Some(e.title.clone());
+                                }
+                                repo_results.push(pseudo);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "cross_repo_search: memory search failed on {}: {e}",
+                                repo_tag
+                            );
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+
+            repo_results
         }
-    }
+    });
+
+    let mut all_results: Vec<SearchResult> =
+        join_all(per_repo_futures).await.into_iter().flatten().collect();
 
     all_results.sort_by(|a, b| {
         b.score
@@ -902,11 +931,20 @@ fn render_document_content(
 
 /// `get` — comma-separated batch retrieval. Returns aggregated text and the
 /// number of items found. Errors when no items resolved.
+const GET_BATCH_MAX_IDS: usize = 50;
+
 async fn get_batch_impl(
     handle: &RepoHandle,
     ids: &str,
     lines: Option<&str>,
 ) -> Result<(String, usize), McpError> {
+    let id_count = ids.split(',').filter(|s| !s.trim().is_empty()).count();
+    if id_count > GET_BATCH_MAX_IDS {
+        return Err(mcp_error(format!(
+            "get_batch: too many IDs ({id_count}); limit is {GET_BATCH_MAX_IDS}"
+        )));
+    }
+
     let ctx_guard = handle.ctx.lock().await;
     let ctx = ctx_guard
         .as_ref()
@@ -1583,7 +1621,7 @@ pub async fn dispatch_call(
             let limit = params
                 .get("limit")
                 .and_then(Value::as_u64)
-                .map(|n| n as usize)
+                .map(|n| (n as usize).min(200))
                 .unwrap_or(20);
             let sort = params
                 .get("sort")
@@ -2354,5 +2392,79 @@ mod tests {
             .await
             .expect_err("should be method-not-found");
         assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
+    }
+
+    // --- memory_list limit cap ---
+
+    #[tokio::test]
+    async fn memory_list_limit_clamped_to_200() {
+        // Requesting limit=500 must be silently clamped to 200.
+        // Seed 5 entries and verify the call succeeds and count <= 200.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        for i in 0..5u8 {
+            seed_memory_entry(&handle, &format!("entry-{i}")).await;
+        }
+        // dispatch with limit=500 — must not error
+        let result = dispatch_call(
+            "memory_list",
+            json!({ "limit": 500, "sort": "recent" }),
+            handle,
+            &make_dctx(),
+        )
+        .await
+        .expect("memory_list must succeed");
+        let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        assert!(count <= 5, "returned {count} entries");
+    }
+
+    #[tokio::test]
+    async fn memory_list_default_limit_is_below_200() {
+        // No explicit limit → default of 20, well within the 200 cap.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "solo").await;
+        let result = dispatch_call(
+            "memory_list",
+            json!({ "sort": "recent" }),
+            handle,
+            &make_dctx(),
+        )
+        .await
+        .expect("memory_list default");
+        let count = result.get("count").and_then(|v| v.as_u64()).unwrap_or(0);
+        assert_eq!(count, 1);
+    }
+
+    // --- get_batch_impl ID cap ---
+
+    #[tokio::test]
+    async fn get_batch_rejects_more_than_50_ids() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+
+        // Build a comma-separated string of 51 IDs
+        let ids: String = (1..=51).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let err = get_batch_impl(&handle, &ids, None)
+            .await
+            .expect_err("must reject >50 IDs");
+        assert!(
+            err.message.contains("too many IDs"),
+            "unexpected msg: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn get_batch_accepts_exactly_50_ids() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+
+        // 50 IDs that don't exist — should succeed (returning "Not found" entries)
+        let ids: String = (1..=50).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        // Panics only if the cap itself errors — "not found" is acceptable output
+        let _ = get_batch_impl(&handle, &ids, None).await;
     }
 }

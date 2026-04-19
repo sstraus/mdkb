@@ -2004,6 +2004,7 @@ dependencies = [
  "directories",
  "fastembed",
  "fs4",
+ "futures",
  "glob",
  "globset",
  "gray_matter",
