@@ -1,5 +1,6 @@
 //! CLI layer - command parsing and execution with clap.
 
+pub mod daemon;
 pub mod handlers;
 pub mod hook_client;
 pub mod hooks;
@@ -139,7 +140,18 @@ pub enum Command {
         /// A second invocation exits 0 with a message on stderr.
         #[arg(long)]
         daemon: bool,
+
+        /// Fully detach from the controlling terminal: double-fork + setsid,
+        /// redirect stdio to ~/.mdkb/logs/daemon.log, then run the daemon.
+        /// Only meaningful with --daemon. The parent exits as soon as the
+        /// grandchild is spawned so the shell returns immediately.
+        #[arg(long)]
+        detach: bool,
     },
+
+    /// Daemon lifecycle controls: status, stop, restart.
+    #[command(subcommand)]
+    Daemon(DaemonCommand),
 
     /// Connect Claude's stdio MCP transport to the mdkb daemon over its unix
     /// socket. Auto-spawns the daemon if it isn't running. Set
@@ -217,6 +229,19 @@ pub enum Command {
     /// still exit 0.
     #[command(subcommand)]
     Hook(HookCommand),
+}
+
+/// `mdkb daemon <cmd>` subcommands. See `cli::daemon` for behavior.
+#[derive(Subcommand, Debug)]
+pub enum DaemonCommand {
+    /// Print daemon pid, socket state, and uptime. Always exits 0.
+    Status,
+
+    /// Send SIGTERM to the running daemon and wait for shutdown.
+    Stop,
+
+    /// Stop (if running) and re-spawn the daemon detached.
+    Restart,
 }
 
 /// `mdkb hook <cmd>` subcommands.

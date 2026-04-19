@@ -32,18 +32,51 @@ use mdkb::cli::handlers::{
 use mdkb::cli::hooks;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
-    Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, HookCommand, HookEvent,
-    JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SessionCommand, SetupCommand,
-    SetupHooksCommand, SetupMcpCommand,
+    Cli, CollectionCommand, Command, DaemonCommand, EvolveCommand, ExperimentCommand, HookCommand,
+    HookEvent, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SessionCommand,
+    SetupCommand, SetupHooksCommand, SetupMcpCommand,
 };
+use mdkb::cli::daemon as daemon_cli;
 use mdkb::cli::hook_client;
 use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
 use rmcp::ServiceExt;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // `--detach` has to happen before any threads exist — tokio spawns
+    // workers eagerly, and fork() with live threads is undefined behavior.
+    // We detect the flag by argv and run the double-fork in a single
+    // threaded world, then build the runtime in the grandchild.
+    if should_detach_from_argv() {
+        mdkb::cli::daemon::detach_current_process()?;
+    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| mdkb::Error::other(format!("build tokio runtime: {e}")))?;
+    rt.block_on(run())
+}
+
+/// True iff the invocation is `mdkb serve --daemon --detach` in any argv
+/// order. Anything else — in particular `mdkb daemon restart`, which spawns
+/// a detached daemon as a CHILD — does not detach the current process.
+fn should_detach_from_argv() -> bool {
+    let mut has_serve = false;
+    let mut has_daemon = false;
+    let mut has_detach = false;
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "serve" => has_serve = true,
+            "--daemon" => has_daemon = true,
+            "--detach" => has_detach = true,
+            _ => {}
+        }
+    }
+    has_serve && has_daemon && has_detach
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse_args();
 
     // Set up tracing based on verbosity
@@ -280,8 +313,14 @@ async fn main() -> Result<()> {
             token,
             global,
             daemon,
+            detach,
         } => {
             if daemon {
+                // --detach is handled pre-tokio in `main()` so the fork
+                // happens before any threads exist. By the time we're here
+                // we're already the detached grandchild (or were never
+                // asked to detach).
+                let _ = detach;
                 run_daemon().await?;
             } else if global {
                 // Global mode: single process serving multiple repos via MCP roots
@@ -302,7 +341,19 @@ async fn main() -> Result<()> {
                     .await
                     .map_err(|e| mdkb::Error::other(format!("Server error: {e}")))?;
             } else {
-                // Standalone mode: single repo from cwd (existing behavior)
+                // Standalone mode: single repo from cwd (existing behavior).
+                //
+                // When launched from a legacy mcp.json entry (no flags, stdin
+                // piped) we emit a one-line deprecation nudge on stderr so
+                // operators know to migrate to `mdkb mcp`. The server itself
+                // still runs in-process stdio exactly as before — no behavior
+                // change, just guidance.
+                if !http && !https && bind.is_none() && token.is_none() && stdin_is_not_tty() {
+                    eprintln!(
+                        "mdkb serve: legacy stdio mode is deprecated; \
+                         please update your MCP config to `mdkb mcp`."
+                    );
+                }
                 let transport = if https {
                     mdkb::mcp::server::TransportMode::Https {
                         bind: bind.unwrap_or_else(|| "127.0.0.1:8443".to_string()),
@@ -807,6 +858,11 @@ async fn main() -> Result<()> {
                 let result = handle_session_index(&ctx, &sessions_base, &root)?;
                 format_update_result(&result, cli.format);
             }
+        },
+        Command::Daemon(cmd) => match cmd {
+            DaemonCommand::Status => daemon_cli::handle_status()?,
+            DaemonCommand::Stop => daemon_cli::handle_stop().await?,
+            DaemonCommand::Restart => daemon_cli::handle_restart().await?,
         },
         Command::Hook(hook_cmd) => match hook_cmd {
             HookCommand::SessionStart => hooks::dispatch(HookEvent::SessionStart),
@@ -2171,6 +2227,14 @@ async fn run_daemon() -> Result<()> {
 
     drop(guard);
     Ok(())
+}
+
+/// True when stdin is not attached to a terminal. Used by the `mdkb serve`
+/// back-compat shim to detect the "legacy mcp.json" launch pattern without
+/// surprising an interactive operator running `mdkb serve` in their shell.
+fn stdin_is_not_tty() -> bool {
+    use std::io::IsTerminal;
+    !std::io::stdin().is_terminal()
 }
 
 /// Wait for the first of SIGINT or SIGTERM. On platforms without SIGTERM

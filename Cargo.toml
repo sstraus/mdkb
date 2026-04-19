@@ -42,6 +42,9 @@ dashmap = "6"
 # Advisory file locking (daemon singleton)
 fs4 = "0.12"
 
+# Unix syscalls (daemon lifecycle: kill, fork, setsid, dup2)
+libc = "0.2"
+
 # MCP protocol
 rmcp = { version = "0.14", features = ["server", "transport-io"] }
 
@@ -126,7 +129,6 @@ https-server = ["http-server", "dep:rcgen", "dep:axum-server", "dep:rustls"]
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
-libc = "0.2"
 # Enable the rmcp client only for tests so we can drive the daemon's
 # rmcp-over-unix endpoint with a real handshake.
 rmcp = { version = "0.14", features = ["server", "transport-io", "client"] }
