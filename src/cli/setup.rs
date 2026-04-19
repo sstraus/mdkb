@@ -1,9 +1,13 @@
 //! Setup command handlers for configuring mdkb integrations.
 
 use std::env;
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+
+use fs4::fs_std::FileExt;
 
 use crate::error::{Error, ErrorKind, Result};
 
@@ -342,50 +346,131 @@ pub fn parse_disabled_events(raw: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Register Claude Code lifecycle hooks idempotently.
+/// Run `f` under an exclusive advisory lock on `target.lock`, then write the
+/// returned JSON value to `target` atomically (temp-file + rename).
 ///
-/// Writes into `.claude/settings.local.json` (local scope) or
-/// `~/.claude/settings.json` (user scope). Existing non-mdkb hooks are
-/// preserved; entries tagged `_managedBy: "mdkb"` are replaced rather than
-/// duplicated so repeated invocation is safe.
-pub fn handle_setup_hooks_claude(
-    cwd: &Path,
-    scope: &str,
-    disable: &str,
-    dry_run: bool,
-) -> Result<HooksSetupResult> {
-    let settings_path = claude_settings_path(cwd, scope)?;
-    let binary_path = find_mdkb_binary()?;
-    let disabled = parse_disabled_events(disable);
+/// The lock is acquired **before** `f` is called, so `f` can safely read
+/// `target` from disk knowing no other process is concurrently writing it.
+/// The lock is released when this function returns (the `lock_file` drops).
+///
+/// The lock file (`target.lock`) is never removed — it is a stable sentinel
+/// reused across invocations, consistent with the daemon-singleton pattern.
+fn locked_read_modify_write<F>(target: &Path, f: F) -> Result<()>
+where
+    F: FnOnce() -> Result<serde_json::Value>,
+{
+    // Ensure parent directory exists before opening the lock file.
+    let parent_dir = target.parent().unwrap_or(Path::new("."));
+    std::fs::create_dir_all(parent_dir).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: parent_dir.to_path_buf(),
+            operation: format!("create parent dir: {e}"),
+        })
+    })?;
 
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let raw = std::fs::read_to_string(&settings_path).map_err(|e| {
+    // Build the lock-file path: same name with ".lock" appended.
+    let lock_path: PathBuf = {
+        let mut p = target.as_os_str().to_owned();
+        p.push(".lock");
+        PathBuf::from(p)
+    };
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|e| {
             Error::from(ErrorKind::Io {
-                path: settings_path.clone(),
-                operation: format!("read settings: {e}"),
+                path: lock_path.clone(),
+                operation: format!("open lock file: {e}"),
             })
         })?;
-        if raw.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&raw).map_err(|e| {
-                Error::from(ErrorKind::Command {
-                    command: "setup hooks claude".to_string(),
-                    message: format!("failed to parse {}: {e}", settings_path.display()),
-                })
-            })?
-        }
-    } else {
-        serde_json::json!({})
-    };
+    // Blocking exclusive lock — waits until any concurrent holder releases it.
+    lock_file.lock_exclusive().map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: lock_path.clone(),
+            operation: format!("lock_exclusive: {e}"),
+        })
+    })?;
 
-    if !settings.is_object() {
+    // Run the caller's read+modify logic while holding the lock.
+    let value = f()?;
+
+    // Write to a temp file in the same directory so the rename is atomic
+    // (same filesystem — no cross-device move).
+    let mut tmp = tempfile::NamedTempFile::new_in(parent_dir).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: parent_dir.to_path_buf(),
+            operation: format!("create temp file: {e}"),
+        })
+    })?;
+    let serialized = serde_json::to_string_pretty(&value).map_err(|e| {
+        Error::from(ErrorKind::Command {
+            command: "setup hooks".to_string(),
+            message: format!("serialize JSON: {e}"),
+        })
+    })?;
+    tmp.write_all(serialized.as_bytes()).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: parent_dir.to_path_buf(),
+            operation: format!("write temp file: {e}"),
+        })
+    })?;
+    tmp.flush().map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: parent_dir.to_path_buf(),
+            operation: format!("flush temp file: {e}"),
+        })
+    })?;
+    tmp.persist(target).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: target.to_path_buf(),
+            operation: format!("rename temp -> target: {e}"),
+        })
+    })?;
+
+    // `lock_file` drops here, releasing the advisory lock.
+    Ok(())
+}
+
+/// Read and parse `path` as a JSON object. Missing or empty file yields `{}`.
+fn read_json_file(path: &Path, cmd: &str) -> Result<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let raw = std::fs::read_to_string(path).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: path.to_path_buf(),
+            operation: format!("read: {e}"),
+        })
+    })?;
+    if raw.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        Error::from(ErrorKind::Command {
+            command: cmd.to_string(),
+            message: format!("failed to parse {}: {e}", path.display()),
+        })
+    })?;
+    if !v.is_object() {
         return Err(Error::from(ErrorKind::Command {
-            command: "setup hooks claude".to_string(),
+            command: cmd.to_string(),
             message: "settings file root must be a JSON object".to_string(),
         }));
     }
+    Ok(v)
+}
 
+/// Upsert mdkb hook entries into `settings` in-place, replacing any existing
+/// `_managedBy: "mdkb"` entries and skipping events in `disabled`.
+/// Returns `(registered_events, skipped_events)`.
+fn upsert_hook_entries(
+    settings: &mut serde_json::Value,
+    binary_path: &str,
+    disabled: &std::collections::HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
     let hooks_root = settings
         .as_object_mut()
         .unwrap()
@@ -403,22 +488,16 @@ pub fn handle_setup_hooks_claude(
             skipped.push((*event_name).to_string());
             continue;
         }
-
-        let command = hook_command_line(&binary_path, cli_event);
+        let command = hook_command_line(binary_path, cli_event);
         let mdkb_entry = serde_json::json!({
             "_managedBy": "mdkb",
-            "hooks": [{
-                "type": "command",
-                "command": command,
-            }]
+            "hooks": [{"type": "command", "command": command}]
         });
-
         let entry_list = hooks_root
             .as_object_mut()
             .unwrap()
             .entry((*event_name).to_string())
             .or_insert_with(|| serde_json::json!([]));
-
         let arr = match entry_list.as_array_mut() {
             Some(a) => a,
             None => {
@@ -426,7 +505,6 @@ pub fn handle_setup_hooks_claude(
                 entry_list.as_array_mut().unwrap()
             }
         };
-
         arr.retain(|item| {
             item.get("_managedBy")
                 .and_then(|v| v.as_str())
@@ -434,59 +512,91 @@ pub fn handle_setup_hooks_claude(
                 .unwrap_or(true)
         });
         arr.push(mdkb_entry);
-
         registered.push((*event_name).to_string());
     }
 
-    let merged_json = settings.clone();
+    (registered, skipped)
+}
 
+/// Shared core: read `settings_path`, upsert mdkb hook entries idempotently,
+/// and either print (dry-run) or write the result via `locked_read_modify_write`.
+///
+/// For the real (non-dry-run) path the read happens **inside** the lock closure
+/// so the full read-modify-write is atomic with respect to other processes.
+///
+/// `cmd_name` appears in error messages. Returns `(registered, skipped, merged_json)`.
+fn write_hook_entries(
+    settings_path: &Path,
+    binary_path: &str,
+    disabled: &std::collections::HashSet<String>,
+    cmd_name: &str,
+    dry_run: bool,
+) -> Result<(Vec<String>, Vec<String>, serde_json::Value)> {
     if dry_run {
+        // Dry-run: read without locking (no write will happen).
+        let mut settings = read_json_file(settings_path, cmd_name)?;
+        let (registered, skipped) = upsert_hook_entries(&mut settings, binary_path, disabled);
         println!(
             "{}",
             serde_json::to_string_pretty(&settings).unwrap_or_default()
         );
-        return Ok(HooksSetupResult {
-            success: true,
-            settings_path,
-            events_registered: registered,
-            events_skipped: skipped,
-            dry_run: true,
-            merged_json,
-            message: "Dry run: no changes written".to_string(),
-            codex_hooks_flag_present: false,
-        });
+        return Ok((registered, skipped, settings));
     }
 
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            Error::from(ErrorKind::Io {
-                path: parent.to_path_buf(),
-                operation: format!("create parent dir: {e}"),
-            })
-        })?;
-    }
+    // Non-dry-run: hold the advisory lock across the full read-modify-write so
+    // concurrent invocations serialize and each sees the other's changes.
+    let mut registered_out = Vec::new();
+    let mut skipped_out = Vec::new();
+    let registered_ref = &mut registered_out;
+    let skipped_ref = &mut skipped_out;
+    locked_read_modify_write(settings_path, || {
+        let mut settings = read_json_file(settings_path, cmd_name)?;
+        let (registered, skipped) = upsert_hook_entries(&mut settings, binary_path, disabled);
+        *registered_ref = registered;
+        *skipped_ref = skipped;
+        Ok(settings)
+    })?;
 
-    let serialized = serde_json::to_string_pretty(&settings).map_err(|e| {
-        Error::from(ErrorKind::Command {
-            command: "setup hooks claude".to_string(),
-            message: format!("serialize settings: {e}"),
-        })
-    })?;
-    std::fs::write(&settings_path, serialized).map_err(|e| {
-        Error::from(ErrorKind::Io {
-            path: settings_path.clone(),
-            operation: format!("write settings: {e}"),
-        })
-    })?;
+    let merged_json = read_json_file(settings_path, cmd_name)?;
+    Ok((registered_out, skipped_out, merged_json))
+}
+
+/// Register Claude Code lifecycle hooks idempotently.
+///
+/// Writes into `.claude/settings.local.json` (local scope) or
+/// `~/.claude/settings.json` (user scope). Existing non-mdkb hooks are
+/// preserved; entries tagged `_managedBy: "mdkb"` are replaced rather than
+/// duplicated so repeated invocation is safe.
+pub fn handle_setup_hooks_claude(
+    cwd: &Path,
+    scope: &str,
+    disable: &str,
+    dry_run: bool,
+) -> Result<HooksSetupResult> {
+    let settings_path = claude_settings_path(cwd, scope)?;
+    let binary_path = find_mdkb_binary()?;
+    let disabled = parse_disabled_events(disable);
+
+    let (registered, skipped, merged_json) = write_hook_entries(
+        &settings_path,
+        &binary_path,
+        &disabled,
+        "setup hooks claude",
+        dry_run,
+    )?;
 
     Ok(HooksSetupResult {
         success: true,
         settings_path,
         events_registered: registered,
         events_skipped: skipped,
-        dry_run: false,
+        dry_run,
         merged_json,
-        message: "Hooks registered".to_string(),
+        message: if dry_run {
+            "Dry run: no changes written".to_string()
+        } else {
+            "Hooks registered".to_string()
+        },
         codex_hooks_flag_present: false,
     })
 }
@@ -550,135 +660,24 @@ pub fn handle_setup_hooks_codex(disable: &str, dry_run: bool) -> Result<HooksSet
     let disabled = parse_disabled_events(disable);
     let codex_hooks_flag_present = probe_codex_hooks_flag();
 
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let raw = std::fs::read_to_string(&settings_path).map_err(|e| {
-            Error::from(ErrorKind::Io {
-                path: settings_path.clone(),
-                operation: format!("read hooks.json: {e}"),
-            })
-        })?;
-        if raw.trim().is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::from_str(&raw).map_err(|e| {
-                Error::from(ErrorKind::Command {
-                    command: "setup hooks codex".to_string(),
-                    message: format!("failed to parse {}: {e}", settings_path.display()),
-                })
-            })?
-        }
-    } else {
-        serde_json::json!({})
-    };
-
-    if !settings.is_object() {
-        return Err(Error::from(ErrorKind::Command {
-            command: "setup hooks codex".to_string(),
-            message: "hooks.json root must be a JSON object".to_string(),
-        }));
-    }
-
-    let hooks_root = settings
-        .as_object_mut()
-        .unwrap()
-        .entry("hooks")
-        .or_insert_with(|| serde_json::json!({}));
-    if !hooks_root.is_object() {
-        *hooks_root = serde_json::json!({});
-    }
-
-    let mut registered = Vec::new();
-    let mut skipped = Vec::new();
-
-    for (event_name, cli_event) in HOOK_EVENTS {
-        if disabled.contains(*event_name) {
-            skipped.push((*event_name).to_string());
-            continue;
-        }
-
-        let command = hook_command_line(&binary_path, cli_event);
-        let mdkb_entry = serde_json::json!({
-            "_managedBy": "mdkb",
-            "hooks": [{
-                "type": "command",
-                "command": command,
-            }]
-        });
-
-        let entry_list = hooks_root
-            .as_object_mut()
-            .unwrap()
-            .entry((*event_name).to_string())
-            .or_insert_with(|| serde_json::json!([]));
-
-        let arr = match entry_list.as_array_mut() {
-            Some(a) => a,
-            None => {
-                *entry_list = serde_json::json!([]);
-                entry_list.as_array_mut().unwrap()
-            }
-        };
-
-        arr.retain(|item| {
-            item.get("_managedBy")
-                .and_then(|v| v.as_str())
-                .map(|s| s != "mdkb")
-                .unwrap_or(true)
-        });
-        arr.push(mdkb_entry);
-
-        registered.push((*event_name).to_string());
-    }
-
-    let merged_json = settings.clone();
-
-    if dry_run {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&settings).unwrap_or_default()
-        );
-        return Ok(HooksSetupResult {
-            success: true,
-            settings_path,
-            events_registered: registered,
-            events_skipped: skipped,
-            dry_run: true,
-            merged_json,
-            message: "Dry run: no changes written".to_string(),
-            codex_hooks_flag_present,
-        });
-    }
-
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            Error::from(ErrorKind::Io {
-                path: parent.to_path_buf(),
-                operation: format!("create parent dir: {e}"),
-            })
-        })?;
-    }
-
-    let serialized = serde_json::to_string_pretty(&settings).map_err(|e| {
-        Error::from(ErrorKind::Command {
-            command: "setup hooks codex".to_string(),
-            message: format!("serialize hooks.json: {e}"),
-        })
-    })?;
-    std::fs::write(&settings_path, serialized).map_err(|e| {
-        Error::from(ErrorKind::Io {
-            path: settings_path.clone(),
-            operation: format!("write hooks.json: {e}"),
-        })
-    })?;
+    let (registered, skipped, merged_json) = write_hook_entries(
+        &settings_path,
+        &binary_path,
+        &disabled,
+        "setup hooks codex",
+        dry_run,
+    )?;
 
     Ok(HooksSetupResult {
         success: true,
         settings_path,
         events_registered: registered,
         events_skipped: skipped,
-        dry_run: false,
+        dry_run,
         merged_json,
-        message: if codex_hooks_flag_present {
+        message: if dry_run {
+            "Dry run: no changes written".to_string()
+        } else if codex_hooks_flag_present {
             "Hooks registered".to_string()
         } else {
             "Hooks registered. Warning: `codex_hooks = true` not found in ~/.codex/config.toml — Codex CLI will not invoke these hooks until the flag is set.".to_string()
