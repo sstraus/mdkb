@@ -73,16 +73,41 @@ pub struct MemorySummary {
 
 #[derive(Debug, Serialize)]
 pub struct CodeSummary {
-    /// Number of symbols per language. Empty when code.sqlite absent.
-    pub symbols_by_language: HashMap<String, usize>,
-    /// Top files by estimated token count (up to 10). Empty when absent.
-    pub top_files_by_tokens: Vec<FileTokenRow>,
+    /// Total indexed files. Zero means code.sqlite absent or empty.
+    pub files: usize,
+    /// Total symbols across all indexed files.
+    pub symbols: usize,
+    /// Total edges in the symbol graph (calls, uses, defines, implements, …).
+    pub relations: usize,
+    /// Unix timestamp of the most-recent `code_files.indexed_at`.
+    pub last_indexed: Option<i64>,
+    /// Per-language breakdown, sorted by symbol count descending.
+    pub languages: Vec<LanguageRow>,
+    /// Symbol counts per `kind` (Function, Method, Struct, …), desc.
+    pub symbols_by_kind: Vec<KindCount>,
+    /// Relation counts per `kind` (Calls, Uses, Defines, …), desc.
+    pub relations_by_kind: Vec<KindCount>,
+    /// Files with the most symbols (up to 8), desc.
+    pub top_files: Vec<FileSymbolRow>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct FileTokenRow {
+pub struct LanguageRow {
+    pub language: String,
+    pub files: usize,
+    pub symbols: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct KindCount {
+    pub kind: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileSymbolRow {
     pub path: String,
-    pub token_count: i64,
+    pub symbols: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -189,7 +214,7 @@ fn collect_memory(ctx: &Context) -> Result<MemorySummary> {
     let mut counts_by_type: HashMap<String, usize> = HashMap::new();
     let mut stmt = ctx
         .conn
-        .prepare("SELECT entry_type, COUNT(*) FROM memory_entries GROUP BY entry_type")?;
+        .prepare("SELECT entry_type, COUNT(*) FROM memory_entries WHERE status = 'active' GROUP BY entry_type")?;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     for row in rows {
         let (ty, count) = row?;
@@ -198,14 +223,14 @@ fn collect_memory(ctx: &Context) -> Result<MemorySummary> {
 
     let reminders_due: i64 = ctx.conn.query_row(
         "SELECT COUNT(*) FROM memory_entries
-         WHERE entry_type = 'reminder' AND due_at IS NOT NULL AND due_at <= ?1",
+         WHERE status = 'active' AND entry_type = 'reminder' AND due_at IS NOT NULL AND due_at <= ?1",
         [now],
         |r| r.get(0),
     ).unwrap_or(0);
 
     let reminders_upcoming_7d: i64 = ctx.conn.query_row(
         "SELECT COUNT(*) FROM memory_entries
-         WHERE entry_type = 'reminder' AND due_at IS NOT NULL
+         WHERE status = 'active' AND entry_type = 'reminder' AND due_at IS NOT NULL
            AND due_at > ?1 AND due_at <= ?2",
         [now, week],
         |r| r.get(0),
@@ -219,65 +244,129 @@ fn collect_memory(ctx: &Context) -> Result<MemorySummary> {
     })
 }
 
+fn empty_code_summary() -> CodeSummary {
+    CodeSummary {
+        files: 0,
+        symbols: 0,
+        relations: 0,
+        last_indexed: None,
+        languages: vec![],
+        symbols_by_kind: vec![],
+        relations_by_kind: vec![],
+        top_files: vec![],
+    }
+}
+
 fn collect_code(mdkb_dir: &Path) -> CodeSummary {
     let code_path = mdkb_dir.join("code.sqlite");
     if !code_path.exists() {
-        return CodeSummary {
-            symbols_by_language: HashMap::new(),
-            top_files_by_tokens: vec![],
-        };
+        return empty_code_summary();
     }
 
     let Ok(conn) = rusqlite::Connection::open_with_flags(
         &code_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
     ) else {
-        return CodeSummary { symbols_by_language: HashMap::new(), top_files_by_tokens: vec![] };
+        tracing::warn!(path = %code_path.display(), "code.sqlite open failed");
+        return empty_code_summary();
     };
 
-    let mut symbols_by_language: HashMap<String, usize> = HashMap::new();
-    match conn.prepare(
-        "SELECT language, COUNT(*) FROM symbols GROUP BY language ORDER BY COUNT(*) DESC",
-    ) {
-        Ok(mut stmt) => match stmt
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?)))
-        {
-            Ok(rows) => {
-                for row in rows {
-                    match row {
-                        Ok((lang, count)) => {
-                            symbols_by_language.insert(lang, count);
-                        }
-                        Err(e) => tracing::warn!(error = %e, "code.sqlite symbols row"),
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "code.sqlite symbols query"),
-        },
-        Err(e) => tracing::warn!(error = %e, "code.sqlite symbols prepare"),
-    }
+    let files = scalar_count(&conn, "SELECT COUNT(*) FROM code_files");
+    let symbols = scalar_count(&conn, "SELECT COUNT(*) FROM code_symbols");
+    let relations = scalar_count(&conn, "SELECT COUNT(*) FROM code_relationships");
+    let last_indexed: Option<i64> = conn
+        .query_row("SELECT MAX(indexed_at) FROM code_files", [], |r| r.get::<_, Option<i64>>(0))
+        .unwrap_or(None);
 
-    let mut top_files_by_tokens: Vec<FileTokenRow> = Vec::new();
-    match conn.prepare(
-        "SELECT path, token_count FROM files WHERE token_count IS NOT NULL ORDER BY token_count DESC LIMIT 10",
-    ) {
-        Ok(mut stmt) => match stmt.query_map([], |row| {
-            Ok(FileTokenRow { path: row.get(0)?, token_count: row.get(1)? })
-        }) {
-            Ok(rows) => {
-                for row in rows {
-                    match row {
-                        Ok(file) => top_files_by_tokens.push(file),
-                        Err(e) => tracing::warn!(error = %e, "code.sqlite files row"),
-                    }
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "code.sqlite files query"),
-        },
-        Err(e) => tracing::warn!(error = %e, "code.sqlite files prepare"),
-    }
+    let languages = query_rows(
+        &conn,
+        "SELECT COALESCE(f.language, 'unknown'),
+                COUNT(DISTINCT f.id),
+                COUNT(s.id)
+         FROM code_files f
+         LEFT JOIN code_symbols s ON s.file_id = f.id
+         GROUP BY f.language
+         ORDER BY COUNT(s.id) DESC",
+        |row| Ok(LanguageRow {
+            language: row.get(0)?,
+            files: row.get::<_, i64>(1)? as usize,
+            symbols: row.get::<_, i64>(2)? as usize,
+        }),
+    );
 
-    CodeSummary { symbols_by_language, top_files_by_tokens }
+    let symbols_by_kind = query_rows(
+        &conn,
+        "SELECT kind, COUNT(*) FROM code_symbols GROUP BY kind ORDER BY COUNT(*) DESC",
+        |row| Ok(KindCount { kind: row.get(0)?, count: row.get::<_, i64>(1)? as usize }),
+    );
+
+    let relations_by_kind = query_rows(
+        &conn,
+        "SELECT kind, COUNT(*) FROM code_relationships GROUP BY kind ORDER BY COUNT(*) DESC",
+        |row| Ok(KindCount { kind: row.get(0)?, count: row.get::<_, i64>(1)? as usize }),
+    );
+
+    let top_files = query_rows(
+        &conn,
+        "SELECT f.rel_path, COUNT(s.id)
+         FROM code_files f
+         LEFT JOIN code_symbols s ON s.file_id = f.id
+         GROUP BY f.id
+         ORDER BY COUNT(s.id) DESC
+         LIMIT 8",
+        |row| Ok(FileSymbolRow {
+            path: row.get(0)?,
+            symbols: row.get::<_, i64>(1)? as usize,
+        }),
+    );
+
+    CodeSummary {
+        files,
+        symbols,
+        relations,
+        last_indexed,
+        languages,
+        symbols_by_kind,
+        relations_by_kind,
+        top_files,
+    }
+}
+
+fn scalar_count(conn: &rusqlite::Connection, sql: &str) -> usize {
+    conn.query_row(sql, [], |r| r.get::<_, i64>(0))
+        .map(|n| n as usize)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, sql, "code.sqlite scalar query failed");
+            0
+        })
+}
+
+fn query_rows<T, F>(conn: &rusqlite::Connection, sql: &str, mut map: F) -> Vec<T>
+where
+    F: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+{
+    let mut out = Vec::new();
+    let mut stmt = match conn.prepare(sql) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, sql, "code.sqlite prepare failed");
+            return out;
+        }
+    };
+    let rows = match stmt.query_map([], |r| map(r)) {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, sql, "code.sqlite query_map failed");
+            return out;
+        }
+    };
+    for row in rows {
+        match row {
+            Ok(v) => out.push(v),
+            Err(e) => tracing::warn!(error = %e, sql, "code.sqlite row decode failed"),
+        }
+    }
+    out
 }
 
 fn collect_sessions(ctx: &Context) -> Result<SessionsSummary> {
@@ -401,6 +490,45 @@ mod tests {
     }
 
     #[test]
+    fn archived_entries_excluded_from_stats() {
+        let env = Env::new();
+        let now = chrono::Utc::now().timestamp();
+
+        // Active topic — should be counted
+        env.add_memory("active-t", EntryType::Topic);
+
+        // Archived topic — must NOT appear in counts_by_type or active_count
+        let mut archived = make_entry("archived-t", EntryType::Topic);
+        archived.status = EntryStatus::Archived;
+        add_entry(&env.ctx.conn, &archived).expect("add archived");
+
+        // Superseded topic — must NOT appear either
+        let mut superseded = make_entry("superseded-t", EntryType::Topic);
+        superseded.status = EntryStatus::Superseded;
+        add_entry(&env.ctx.conn, &superseded).expect("add superseded");
+
+        // Archived reminder with due_at in the past — must NOT count as due
+        let mut archived_due = make_entry("archived-r", EntryType::Reminder);
+        archived_due.status = EntryStatus::Archived;
+        archived_due.due_at = Some(now - 60);
+        add_entry(&env.ctx.conn, &archived_due).expect("add archived reminder");
+
+        // Archived reminder upcoming — must NOT count in upcoming_7d
+        let mut archived_upcoming = make_entry("archived-upcoming-r", EntryType::Reminder);
+        archived_upcoming.status = EntryStatus::Archived;
+        archived_upcoming.due_at = Some(now + 2 * 86_400);
+        add_entry(&env.ctx.conn, &archived_upcoming).expect("add archived upcoming");
+
+        let report = collect_report(&env.ctx).expect("collect");
+        // Only the one active topic
+        assert_eq!(report.memory.counts_by_type.get("topic").copied().unwrap_or(0), 1);
+        assert_eq!(report.memory.active_count, 1);
+        // No reminders are active
+        assert_eq!(report.memory.reminders_due, 0);
+        assert_eq!(report.memory.reminders_upcoming_7d, 0);
+    }
+
+    #[test]
     fn reminder_due_counted() {
         let env = Env::new();
         let now = chrono::Utc::now().timestamp();
@@ -493,10 +621,7 @@ mod tests {
                 reminders_due: 0,
                 reminders_upcoming_7d: 0,
             },
-            code: CodeSummary {
-                symbols_by_language: HashMap::new(),
-                top_files_by_tokens: vec![],
-            },
+            code: empty_code_summary(),
             sessions: SessionsSummary {
                 total_sessions: 0,
                 total_calls: 0,
