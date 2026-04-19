@@ -2576,9 +2576,9 @@ if (require.main === module) {
             )
             .unwrap();
 
-            // Create code index
+            // Create/reuse code index (init auto-bootstraps it)
             let index_path = root.join(".mdkb/code.sqlite");
-            let mut facade = IndexFacade::create(&index_path).expect("Failed to create code index");
+            let mut facade = IndexFacade::open_or_create(&index_path).expect("Failed to open code index");
             facade
                 .index_directory(&src_dir)
                 .expect("Failed to index source files");

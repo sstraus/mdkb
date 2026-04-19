@@ -171,7 +171,31 @@ pub fn handle_init(root: impl AsRef<Path>) -> Result<()> {
 
     let ctx = Context::init(root)?;
     apply_conventions(&ctx, root)?;
+
+    let config = Config::load_or_default(mdkb_dir.join("config.toml"));
+    if config.code.enabled {
+        bootstrap_code_index(root);
+    }
+
     Ok(())
+}
+
+/// Create and populate the code index. Non-fatal: logs warnings on failure.
+fn bootstrap_code_index(root: &Path) {
+    let index_path = root.join(".mdkb/code.sqlite");
+    match crate::code::indexing::IndexFacade::open_or_create(&index_path) {
+        Ok(mut facade) => match facade.index_directory(root) {
+            Ok(stats) => {
+                eprintln!(
+                    "Code index: {} files, {} symbols",
+                    stats.files_indexed, stats.symbols_indexed,
+                );
+            }
+            Err(e) => eprintln!("Warning: code indexing failed: {e}"),
+        },
+        Err(e) => eprintln!("Warning: could not create code index: {e}"),
+    }
+    crate::llm::release_cached_service();
 }
 
 /// Handle `mdkb collection add` command.
@@ -542,6 +566,14 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
     apply_conventions(ctx, root)?;
 
     let config = Config::load_or_default(&ctx.config_path);
+
+    if config.code.enabled {
+        let index_path = root.join(".mdkb/code.sqlite");
+        if !index_path.exists() {
+            bootstrap_code_index(root);
+        }
+    }
+
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult::default();
 
@@ -4062,14 +4094,11 @@ pub struct CodeInfoResult {
     pub relationships: usize,
 }
 
-/// Handle `mdkb code init` - initialize code index directory.
+/// Handle `mdkb code init` - initialize code index directory (idempotent).
 pub fn handle_code_init(root: &Path) -> Result<()> {
     let index_path = root.join(".mdkb/code.sqlite");
     if index_path.exists() {
-        return Err(Error::other(format!(
-            "Code index already exists at {}",
-            index_path.display()
-        )));
+        return Ok(());
     }
     crate::code::indexing::IndexFacade::create(&index_path)
         .map_err(|e| Error::other(format!("Failed to create code index: {}", e)))?;
