@@ -1477,6 +1477,8 @@ pub fn handle_memory_import_dir(
     }
     paths.sort();
 
+    // Phase 1: read, parse, validate, and check duplicates — no DB writes.
+    let mut entries_to_insert: Vec<MemoryEntry> = Vec::new();
     for path in &paths {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -1516,13 +1518,24 @@ pub fn handle_memory_import_dir(
         }
 
         // Derived counters (access_count etc.) are DB-owned; fresh entry starts at 0.
-        let entry = mf.into_fresh_entry();
+        entries_to_insert.push(mf.into_fresh_entry());
+    }
 
-        memory::add_entry(&ctx.conn, &entry)?;
-        if let Err(e) = save_entry_to_disk(ctx, &entry) {
-            tracing::warn!("Failed to save imported entry {id} to disk: {e}");
+    // Phase 2: insert all valid entries atomically.
+    if !entries_to_insert.is_empty() {
+        with_transaction(&ctx.conn, || {
+            for entry in &entries_to_insert {
+                memory::add_entry(&ctx.conn, entry)?;
+            }
+            Ok(())
+        })?;
+
+        for entry in &entries_to_insert {
+            if let Err(e) = save_entry_to_disk(ctx, entry) {
+                tracing::warn!("Failed to save imported entry {} to disk: {e}", entry.id);
+            }
+            result.imported += 1;
         }
-        result.imported += 1;
     }
 
     if !dry_run && result.imported > 0 {
@@ -1561,6 +1574,8 @@ pub fn handle_memory_import(
     };
     let now = chrono::Utc::now().timestamp();
 
+    // Phase 1: parse, validate, and check duplicates — no DB writes.
+    let mut entries_to_insert: Vec<MemoryEntry> = Vec::new();
     for raw in &import_file.entries {
         // Parse entry_type
         let entry_type: EntryType = match raw.entry_type.parse() {
@@ -1607,7 +1622,7 @@ pub fn handle_memory_import(
             continue;
         }
 
-        let entry = MemoryEntry {
+        entries_to_insert.push(MemoryEntry {
             id: raw.id.clone(),
             title: raw.title.clone(),
             content: raw.content.clone(),
@@ -1621,18 +1636,28 @@ pub fn handle_memory_import(
             last_accessed: None,
             source_path: None,
             confirmations: 0,
-
             last_confirmed_at: None,
             source_type,
             expires_at: None,
             due_at: None,
-        };
+        });
+    }
 
-        memory::add_entry(&ctx.conn, &entry)?;
-        if let Err(e) = save_entry_to_disk(ctx, &entry) {
-            tracing::warn!("Failed to save imported entry {} to disk: {e}", raw.id);
+    // Phase 2: insert all valid entries atomically.
+    if !entries_to_insert.is_empty() {
+        with_transaction(&ctx.conn, || {
+            for entry in &entries_to_insert {
+                memory::add_entry(&ctx.conn, entry)?;
+            }
+            Ok(())
+        })?;
+
+        for entry in &entries_to_insert {
+            if let Err(e) = save_entry_to_disk(ctx, entry) {
+                tracing::warn!("Failed to save imported entry {} to disk: {e}", entry.id);
+            }
+            result.imported += 1;
         }
-        result.imported += 1;
     }
 
     if !dry_run && result.imported > 0 {
@@ -3602,6 +3627,33 @@ mod tests {
         let result = handle_memory_import(&ctx, &path, false, false).unwrap();
         assert_eq!(result.imported, 0);
         assert_eq!(result.errors.len(), 1);
+    }
+
+    /// Atomicity: when two entries share the same ID the second INSERT violates the UNIQUE
+    /// constraint, causing the transaction to roll back so that *neither* entry lands in the DB.
+    #[test]
+    fn test_memory_import_atomic_rollback_on_duplicate_id() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Both entries share the same id.  Phase-1 sees neither in the DB (no pre-existing rows),
+        // so both are queued for insert.  Phase-2 inserts "dup-id" successfully, then hits a
+        // UNIQUE constraint on the second insert, triggering a rollback of the whole transaction.
+        let json = r#"{"entries": [
+            {"id": "dup-id", "title": "First",  "content": "Content A"},
+            {"id": "dup-id", "title": "Second", "content": "Content B"}
+        ]}"#;
+        let path = write_import_json(temp.path(), json);
+
+        let result = handle_memory_import(&ctx, &path, false, false);
+
+        // The function must return Err (UNIQUE constraint propagated via `?`).
+        assert!(result.is_err(), "expected Err from UNIQUE constraint violation");
+
+        // Neither entry must survive the rollback.
+        let entry = handle_memory_show(&ctx, "dup-id").unwrap();
+        assert!(entry.is_none(), "rollback must have removed the first insert");
     }
 }
 
