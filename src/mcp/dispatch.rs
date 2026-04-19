@@ -17,14 +17,18 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
 
-use crate::cli::handlers::Context;
+use crate::cli::handlers::{Context, handle_hybrid_search};
 use crate::code::indexing::IndexFacade;
 use crate::daemon::registry::RepoHandle;
+use crate::domain::SearchResult;
 use crate::metrics::{UsageMetrics, count_tokens};
 use crate::store::{collections, memory, search, stats};
 
-use super::server::{format_ttl_info, relative_time_ago, truncate_text};
-use super::tools::MemoryWriteBatchEntry;
+use super::server::{
+    apply_min_confidence, format_memory_search_results, format_search_results, format_symbol,
+    format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago, truncate_text,
+};
+use super::tools::{MemoryWriteBatchEntry, SearchParams};
 
 /// Daemon-global state shared across all dispatched tool calls.
 #[derive(Clone)]
@@ -515,6 +519,335 @@ pub async fn memory_list_impl(
     Ok((out, count))
 }
 
+/// `search` — single-repo hybrid search. Routes by `params.scope`:
+/// "docs", "memory", "code", "symbols", or `None` (docs+memory). Returns
+/// `(rendered_text, result_count)`. Cross-repo (`root="*"`) lives in
+/// `cross_repo_search_impl`.
+pub async fn search_impl(
+    handle: &RepoHandle,
+    params: &SearchParams,
+) -> Result<(String, usize), McpError> {
+    ensure_handle_context(handle).await?;
+
+    let scope = params.scope.as_deref();
+    let limit = params.limit.min(100);
+
+    match scope {
+        Some("docs") => {
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+            let results = handle_hybrid_search(
+                ctx,
+                &params.query,
+                limit,
+                params.collection.as_deref(),
+                params.include_superseded,
+            )
+            .map_err(|e| mcp_error(format!("Search failed: {e}")))?;
+
+            let top_score = results.first().map(|r| r.score);
+            let mut output = format_search_results(&results, limit);
+            if let Some(hint) = ood_hint(results.len(), top_score) {
+                output.push_str(hint);
+            }
+            Ok((output, results.len()))
+        }
+        Some("memory") => {
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+            let query_embedding = match crate::llm::get_cached_service()
+                .and_then(|s| s.embed_query(&params.query))
+            {
+                Ok(emb) => Some(emb),
+                Err(e) => {
+                    tracing::warn!("Memory search falling back to BM25-only: {e}");
+                    None
+                }
+            };
+            let entries = memory::search_entries_hybrid(
+                &ctx.conn,
+                &params.query,
+                query_embedding.as_deref(),
+                limit,
+                handle.config.search.memory.access_recency_weight,
+                handle.config.search.memory.recency_half_life_secs,
+            )
+            .map_err(|e| mcp_error(format!("Memory search failed: {e}")))?;
+            let entries = apply_min_confidence(entries, params.min_confidence);
+
+            let mut output = format_memory_search_results(&entries);
+            if let Some(hint) = ood_hint(entries.len(), None) {
+                output.push_str(hint);
+            }
+            Ok((output, entries.len()))
+        }
+        None => {
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database not initialized"))?;
+            let doc_results = handle_hybrid_search(
+                ctx,
+                &params.query,
+                limit,
+                params.collection.as_deref(),
+                params.include_superseded,
+            )
+            .map_err(|e| mcp_error(format!("Search failed: {e}")))?;
+
+            let query_embedding = match crate::llm::get_cached_service()
+                .and_then(|s| s.embed_query(&params.query))
+            {
+                Ok(emb) => Some(emb),
+                Err(e) => {
+                    tracing::warn!("Memory search falling back to BM25-only: {e}");
+                    None
+                }
+            };
+            let mem_entries = memory::search_entries_hybrid(
+                &ctx.conn,
+                &params.query,
+                query_embedding.as_deref(),
+                limit,
+                handle.config.search.memory.access_recency_weight,
+                handle.config.search.memory.recency_half_life_secs,
+            )
+            .map_err(|e| mcp_error(format!("Memory search failed: {e}")))?;
+            let mem_entries = apply_min_confidence(mem_entries, params.min_confidence);
+
+            let total = doc_results.len() + mem_entries.len();
+            let top_score = doc_results.first().map(|r| r.score);
+
+            let mut output = if total == 0 {
+                String::new()
+            } else {
+                let mut s = String::new();
+                if !doc_results.is_empty() {
+                    s.push_str(&format_search_results(&doc_results, limit));
+                }
+                if !mem_entries.is_empty() {
+                    if !doc_results.is_empty() {
+                        s.push_str("\n## Memory\n\n");
+                    }
+                    s.push_str(&format_memory_search_results(&mem_entries));
+                }
+                s
+            };
+            if let Some(hint) = ood_hint(total, top_score) {
+                output.push_str(hint);
+            }
+            Ok((output, total))
+        }
+        Some("code") | Some("symbols") => {
+            let mut idx_guard = acquire_handle_code_index(handle).await?;
+            let facade = match idx_guard.as_mut() {
+                Some(f) => f,
+                None => {
+                    return Ok(("Code index is being rebuilt, retry shortly.".to_string(), 0));
+                }
+            };
+
+            if scope == Some("code") {
+                if !handle.config.code.semantic_search.enabled {
+                    return Err(mcp_error(
+                        "Semantic code search is disabled. Enable it in mdkb.toml: [code.semantic_search] enabled = true, then re-index.",
+                    ));
+                }
+                let code_limit = params.limit.min(5);
+                let mut results = facade
+                    .semantic_search(&params.query, code_limit, params.threshold)
+                    .map_err(|e| {
+                        tracing::error!("Semantic code search failed: {e}");
+                        mcp_error(
+                            "Semantic code search failed. The embedding model may not be installed — run `mdkb code index` to initialize.",
+                        )
+                    })?;
+
+                if let Some(ref kind_str) = params.kind {
+                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
+                        results.retain(|(s, _)| s.kind == kind);
+                    } else {
+                        return Err(mcp_error(format!(
+                            "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro"
+                        )));
+                    }
+                }
+
+                if results.is_empty() {
+                    return Ok(("No semantic matches found.".to_string(), 0));
+                }
+                let mut out = format!("Found {} semantic match(es):\n\n", results.len());
+                for (sym, score) in &results {
+                    out.push_str(&format_symbol(sym));
+                    out.push_str(&format!("    Similarity: {score:.3}\n"));
+                    out.push('\n');
+                }
+                let count = results.len();
+                Ok((out, count))
+            } else {
+                let mut symbols = if let Some(ref file_pattern) = params.file {
+                    let mut results =
+                        facade.find_symbols_by_file(file_pattern, params.limit * 2);
+                    if !params.query.is_empty() && params.query != "*" {
+                        let q = params.query.to_lowercase();
+                        results.retain(|s| s.name.to_lowercase().contains(&q));
+                    }
+                    results
+                } else {
+                    facade.search_symbols(&params.query, params.limit)
+                };
+
+                if let Some(ref kind_str) = params.kind {
+                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
+                        symbols.retain(|s| s.kind == kind);
+                    } else {
+                        return Err(mcp_error(format!(
+                            "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro"
+                        )));
+                    }
+                }
+
+                if symbols.is_empty() {
+                    return Ok(("No symbols found.".to_string(), 0));
+                }
+                let rel_paths: Vec<String> = symbols
+                    .iter()
+                    .map(|s| s.file_path.to_string())
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                let token_map = facade.get_file_token_estimates(&rel_paths);
+                let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
+                for sym in &symbols {
+                    out.push_str(&format_symbol_with_file_tokens(
+                        sym,
+                        token_map.get(sym.file_path.as_ref()).copied(),
+                    ));
+                    out.push('\n');
+                }
+                let count = symbols.len();
+                Ok((out, count))
+            }
+        }
+        Some(invalid) => Err(mcp_error(format!(
+            "Invalid scope: '{invalid}'. Valid: docs, memory, code, symbols."
+        ))),
+    }
+}
+
+/// `search` (cross-repo) — fan out across the registered handles, merge with
+/// score-descending sort, and truncate to `params.limit`. Memory results from
+/// each repo are formatted as a single pseudo-result for compatibility with
+/// `SearchResult`-based aggregation.
+///
+/// Code/symbols scopes are rejected — those indexes are per-repo only.
+pub async fn cross_repo_search_impl(
+    handles: &[Arc<RepoHandle>],
+    params: &SearchParams,
+) -> Result<(String, usize), McpError> {
+    if handles.is_empty() {
+        return Err(mcp_error(
+            "No repos registered. Waiting for MCP roots from client.",
+        ));
+    }
+
+    let scope = params.scope.as_deref();
+    let limit = params.limit.min(100);
+
+    if matches!(scope, Some("code") | Some("symbols")) {
+        return Err(mcp_error(
+            "Cross-repo search is not supported for code/symbols scope. Specify a root.",
+        ));
+    }
+
+    let mut all_results: Vec<SearchResult> = Vec::new();
+
+    for handle in handles {
+        ensure_handle_context(handle).await?;
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = match ctx_guard.as_ref() {
+            Some(ctx) => ctx,
+            None => continue,
+        };
+
+        let repo_tag = handle.root.display().to_string();
+
+        match scope {
+            Some("docs") | None => {
+                let mut results = handle_hybrid_search(
+                    ctx,
+                    &params.query,
+                    limit,
+                    params.collection.as_deref(),
+                    params.include_superseded,
+                )
+                .map_err(|e| mcp_error(format!("Search failed on {repo_tag}: {e}")))?;
+
+                for r in &mut results {
+                    r.repo_root = Some(repo_tag.clone());
+                }
+                all_results.extend(results);
+            }
+            Some("memory") => {
+                let query_embedding = crate::llm::get_cached_service()
+                    .and_then(|s| s.embed_query(&params.query))
+                    .ok();
+                let entries = memory::search_entries_hybrid(
+                    &ctx.conn,
+                    &params.query,
+                    query_embedding.as_deref(),
+                    limit,
+                    handle.config.search.memory.access_recency_weight,
+                    handle.config.search.memory.recency_half_life_secs,
+                )
+                .map_err(|e| mcp_error(format!("Memory search failed on {repo_tag}: {e}")))?;
+                let entries = apply_min_confidence(entries, params.min_confidence);
+
+                if !entries.is_empty() {
+                    let text = format_memory_search_results(&entries);
+                    let mut pseudo = SearchResult {
+                        id: 0,
+                        collection: "memory".to_string(),
+                        path: String::new(),
+                        title: None,
+                        score: 1.0,
+                        snippets: vec![text],
+                        status: None,
+                        superseded_by: None,
+                        repo_root: Some(repo_tag),
+                    };
+                    if let Some(e) = entries.first() {
+                        pseudo.path = e.id.clone();
+                        pseudo.title = Some(e.title.clone());
+                    }
+                    all_results.push(pseudo);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    all_results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    all_results.truncate(limit);
+
+    let output = if all_results.is_empty() {
+        "No results across repos. Try broader terms.".to_string()
+    } else {
+        format_search_results(&all_results, limit)
+    };
+
+    let count = all_results.len();
+    Ok((output, count))
+}
+
 /// Dispatch a tool call by method name. Returns a JSON value — callers are
 /// responsible for the transport envelope.
 ///
@@ -580,6 +913,21 @@ pub async fn dispatch_call(
             let (text, count) = memory_write_batch_impl(&handle, &entries).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "memory_write_batch", tokens, count, false)
+                .await;
+            Ok(json!({ "text": text, "tokens": tokens, "count": count }))
+        }
+        "search" => {
+            let sp: SearchParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("search: invalid params: {e}")))?;
+            if sp.root.as_deref() == Some("*") {
+                return Err(mcp_error(
+                    "Cross-repo search via dispatch_call is not supported (no registry handle).",
+                ));
+            }
+            let (text, count) = search_impl(&handle, &sp).await?;
+            let tokens = count_tokens(&text);
+            dctx.metrics.record_search(tokens, count);
+            dctx.record_persistent_call(&handle, "search", tokens, count, false)
                 .await;
             Ok(json!({ "text": text, "tokens": tokens, "count": count }))
         }
@@ -1030,5 +1378,119 @@ mod tests {
         );
         let text = result.get("text").and_then(Value::as_str).unwrap_or("");
         assert!(text.contains("listed"), "text: {text}");
+    }
+
+    fn search_params(query: &str, scope: Option<&str>) -> SearchParams {
+        SearchParams {
+            query: query.to_string(),
+            root: None,
+            limit: 10,
+            collection: None,
+            include_superseded: false,
+            scope: scope.map(str::to_string),
+            kind: None,
+            threshold: 0.5,
+            file: None,
+            min_confidence: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn search_impl_rejects_invalid_scope() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let params = search_params("anything", Some("bogus"));
+
+        let err = search_impl(&handle, &params).await.expect_err("should error");
+        let msg = err.to_string();
+        assert!(msg.contains("Invalid scope"), "msg: {msg}");
+        assert!(msg.contains("bogus"), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn search_impl_docs_scope_returns_empty_for_no_docs() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let params = search_params("nothing matches", Some("docs"));
+
+        let (text, count) = search_impl(&handle, &params).await.expect("docs scope");
+        assert_eq!(count, 0, "expected zero, text: {text}");
+    }
+
+    #[tokio::test]
+    async fn search_impl_memory_scope_returns_empty_for_no_entries() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let params = search_params("anything", Some("memory"));
+
+        let (_text, count) = search_impl(&handle, &params).await.expect("memory scope");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn search_impl_symbols_scope_returns_empty_for_no_index() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let params = search_params("anything", Some("symbols"));
+
+        let (text, count) = search_impl(&handle, &params)
+            .await
+            .expect("symbols scope");
+        assert_eq!(count, 0, "text: {text}");
+        assert!(text.contains("No symbols found"), "text: {text}");
+    }
+
+    #[tokio::test]
+    async fn cross_repo_search_impl_rejects_empty_handles() {
+        let params = search_params("anything", None);
+        let err = cross_repo_search_impl(&[], &params)
+            .await
+            .expect_err("should error");
+        let msg = err.to_string();
+        assert!(msg.contains("No repos registered"), "msg: {msg}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_search_rejects_cross_repo() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+
+        let err = dispatch_call(
+            "search",
+            json!({ "query": "x", "root": "*" }),
+            handle,
+            &dctx,
+        )
+        .await
+        .expect_err("should error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Cross-repo search via dispatch_call is not supported"),
+            "msg: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_routes_search_to_impl() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+
+        let result = dispatch_call(
+            "search",
+            json!({ "query": "anything", "scope": "docs" }),
+            handle,
+            &dctx,
+        )
+        .await
+        .expect("dispatch");
+
+        assert_eq!(
+            result.get("count").and_then(Value::as_u64).unwrap_or(99),
+            0,
+            "result: {result}"
+        );
+        assert!(result.get("tokens").is_some(), "result: {result}");
     }
 }

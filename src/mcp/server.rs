@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 
 use crate::cli::handlers::{
-    Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update,
+    Context, handle_mget, handle_session_index, handle_update,
 };
 use crate::code::indexing::IndexFacade;
 use crate::code::types::SymbolId;
@@ -206,108 +206,10 @@ impl McpServer {
             .ok_or_else(|| mcp_error("Cross-repo search requires global mode (--global)."))?;
 
         let handles = registry.all_handles();
-        if handles.is_empty() {
-            return Err(mcp_error(
-                "No repos registered. Waiting for MCP roots from client.",
-            ));
-        }
-
-        let scope = params.scope.as_deref();
-        let limit = params.limit.min(100);
-
-        // Only docs/memory/default scopes support cross-repo (code index is per-repo)
-        if matches!(scope, Some("code") | Some("symbols")) {
-            return Err(mcp_error(
-                "Cross-repo search is not supported for code/symbols scope. Specify a root.",
-            ));
-        }
-
-        let mut all_results: Vec<SearchResult> = Vec::new();
-
-        for handle in &handles {
-            Self::ensure_handle_context(handle).await?;
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = match ctx_guard.as_ref() {
-                Some(ctx) => ctx,
-                None => continue,
-            };
-
-            let repo_tag = handle.root.display().to_string();
-
-            match scope {
-                Some("docs") | None => {
-                    let mut results = handle_hybrid_search(
-                        ctx,
-                        &params.query,
-                        limit,
-                        params.collection.as_deref(),
-                        params.include_superseded,
-                    )
-                    .map_err(|e| mcp_error(format!("Search failed on {}: {e}", repo_tag)))?;
-
-                    for r in &mut results {
-                        r.repo_root = Some(repo_tag.clone());
-                    }
-                    all_results.extend(results);
-                }
-                Some("memory") => {
-                    let query_embedding = crate::llm::get_cached_service()
-                        .and_then(|s| s.embed_query(&params.query))
-                        .ok();
-                    let entries = memory::search_entries_hybrid(
-                        &ctx.conn,
-                        &params.query,
-                        query_embedding.as_deref(),
-                        limit,
-                        self.full_config.search.memory.access_recency_weight,
-                        self.full_config.search.memory.recency_half_life_secs,
-                    )
-                    .map_err(|e| mcp_error(format!("Memory search failed on {}: {e}", repo_tag)))?;
-                    let entries = apply_min_confidence(entries, params.min_confidence);
-
-                    // Memory results are formatted separately, return early per-repo
-                    // For simplicity, collect and merge textually
-                    if !entries.is_empty() {
-                        let text = format_memory_search_results(&entries);
-                        let mut pseudo = SearchResult {
-                            id: 0,
-                            collection: "memory".to_string(),
-                            path: String::new(),
-                            title: None,
-                            score: 1.0,
-                            snippets: vec![text],
-                            status: None,
-                            superseded_by: None,
-                            repo_root: Some(repo_tag),
-                        };
-                        // Use first entry as representative
-                        if let Some(e) = entries.first() {
-                            pseudo.path = e.id.clone();
-                            pseudo.title = Some(e.title.clone());
-                        }
-                        all_results.push(pseudo);
-                    }
-                }
-                _ => {} // handled above
-            }
-        }
-
-        // Sort by score descending, take top N
-        all_results.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all_results.truncate(limit);
-
-        let output = if all_results.is_empty() {
-            "No results across repos. Try broader terms.".to_string()
-        } else {
-            format_search_results(&all_results, limit)
-        };
+        let (output, result_count) =
+            super::dispatch::cross_repo_search_impl(&handles, params).await?;
 
         let tokens = count_tokens(&output);
-        let result_count = all_results.len();
         self.metrics.record_search(tokens, result_count);
         self.record_persistent_call("search", tokens, result_count, false)
             .await;
@@ -891,249 +793,14 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        // Cross-repo search: fan out to all registered repos
         if params.root.as_deref() == Some("*") {
             return self.cross_repo_search(&params).await;
         }
 
         let handle = self.resolve_handle(params.root.as_deref()).await?;
+        let (output, result_count) = super::dispatch::search_impl(&handle, &params).await?;
 
-        let scope = params.scope.as_deref();
-        let limit = params.limit.min(100); // Cap to prevent unbounded result sets
-
-        let (output, tokens, result_count) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            match scope {
-                Some("docs") => {
-                    let results = handle_hybrid_search(
-                        ctx,
-                        &params.query,
-                        limit,
-                        params.collection.as_deref(),
-                        params.include_superseded,
-                    )
-                    .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
-
-                    let top_score = results.first().map(|r| r.score);
-                    let mut output = format_search_results(&results, limit);
-                    if let Some(hint) = ood_hint(results.len(), top_score) {
-                        output.push_str(hint);
-                    }
-                    let tokens = count_tokens(&output);
-                    (output, tokens, results.len())
-                }
-                Some("memory") => {
-                    let query_embedding = match crate::llm::get_cached_service()
-                        .and_then(|s| s.embed_query(&params.query))
-                    {
-                        Ok(emb) => Some(emb),
-                        Err(e) => {
-                            tracing::warn!("Memory search falling back to BM25-only: {e}");
-                            None
-                        }
-                    };
-                    let entries = memory::search_entries_hybrid(
-                        &ctx.conn,
-                        &params.query,
-                        query_embedding.as_deref(),
-                        limit,
-                        self.full_config.search.memory.access_recency_weight,
-                        self.full_config.search.memory.recency_half_life_secs,
-                    )
-                    .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
-                    let entries = apply_min_confidence(entries, params.min_confidence);
-
-                    let mut output = format_memory_search_results(&entries);
-                    if let Some(hint) = ood_hint(entries.len(), None) {
-                        output.push_str(hint);
-                    }
-                    let tokens = count_tokens(&output);
-                    (output, tokens, entries.len())
-                }
-                None => {
-                    let doc_results = handle_hybrid_search(
-                        ctx,
-                        &params.query,
-                        limit,
-                        params.collection.as_deref(),
-                        params.include_superseded,
-                    )
-                    .map_err(|e| mcp_error(format!("Search failed: {}", e)))?;
-
-                    let query_embedding = match crate::llm::get_cached_service()
-                        .and_then(|s| s.embed_query(&params.query))
-                    {
-                        Ok(emb) => Some(emb),
-                        Err(e) => {
-                            tracing::warn!("Memory search falling back to BM25-only: {e}");
-                            None
-                        }
-                    };
-                    let mem_entries = memory::search_entries_hybrid(
-                        &ctx.conn,
-                        &params.query,
-                        query_embedding.as_deref(),
-                        limit,
-                        self.full_config.search.memory.access_recency_weight,
-                        self.full_config.search.memory.recency_half_life_secs,
-                    )
-                    .map_err(|e| mcp_error(format!("Memory search failed: {}", e)))?;
-                    let mem_entries = apply_min_confidence(mem_entries, params.min_confidence);
-
-                    let total = doc_results.len() + mem_entries.len();
-                    let top_score = doc_results.first().map(|r| r.score);
-
-                    let mut output = if total == 0 {
-                        String::new()
-                    } else {
-                        let mut s = String::new();
-                        if !doc_results.is_empty() {
-                            s.push_str(&format_search_results(&doc_results, limit));
-                        }
-                        if !mem_entries.is_empty() {
-                            if !doc_results.is_empty() {
-                                s.push_str("\n## Memory\n\n");
-                            }
-                            s.push_str(&format_memory_search_results(&mem_entries));
-                        }
-                        s
-                    };
-
-                    if let Some(hint) = ood_hint(total, top_score) {
-                        output.push_str(hint);
-                    }
-
-                    let tokens = count_tokens(&output);
-                    (output, tokens, total)
-                }
-                Some("code") | Some("symbols") => {
-                    // Drop ctx_guard before acquiring code_index lock
-                    drop(ctx_guard);
-
-                    {
-                        let mut idx_guard = Self::acquire_handle_code_index(&handle).await?;
-                        let facade = match idx_guard.as_mut() {
-                            Some(f) => f,
-                            None => {
-                                return Ok(CallToolResult::success(vec![Content::text(
-                                    "Code index is being rebuilt, retry shortly.",
-                                )]));
-                            }
-                        };
-
-                        if scope == Some("code") {
-                            // Check if semantic search is enabled
-                            if !handle.config.code.semantic_search.enabled {
-                                return Err(mcp_error(
-                                    "Semantic code search is disabled. Enable it in mdkb.toml: [code.semantic_search] enabled = true, then re-index.".to_string(),
-                                ));
-                            }
-                            // Semantic search (embedding similarity)
-                            // Cap at 5 to avoid flooding context with low-quality matches
-                            let code_limit = params.limit.min(5);
-                            let mut results = facade
-                                .semantic_search(&params.query, code_limit, params.threshold)
-                                .map_err(|e| {
-                                    tracing::error!("Semantic code search failed: {e}");
-                                    mcp_error("Semantic code search failed. The embedding model may not be installed — run `mdkb code index` to initialize.".to_string())
-                                })?;
-
-                            // Apply kind filter
-                            if let Some(ref kind_str) = params.kind {
-                                if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>()
-                                {
-                                    results.retain(|(s, _)| s.kind == kind);
-                                } else {
-                                    return Err(mcp_error(format!(
-                                        "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro"
-                                    )));
-                                }
-                            }
-
-                            if results.is_empty() {
-                                let output = "No semantic matches found.".to_string();
-                                let tokens = count_tokens(&output);
-                                (output, tokens, 0)
-                            } else {
-                                let mut out =
-                                    format!("Found {} semantic match(es):\n\n", results.len());
-                                for (sym, score) in &results {
-                                    out.push_str(&format_symbol(sym));
-                                    out.push_str(&format!("    Similarity: {:.3}\n", score));
-                                    out.push('\n');
-                                }
-                                let result_count = results.len();
-                                let tokens = count_tokens(&out);
-                                (out, tokens, result_count)
-                            }
-                        } else {
-                            // symbols scope: file-first or text search
-                            let mut symbols = if let Some(ref file_pattern) = params.file {
-                                // File filter present → query by file path directly
-                                let mut results =
-                                    facade.find_symbols_by_file(file_pattern, params.limit * 2);
-                                // If query is non-trivial, further filter by name
-                                if !params.query.is_empty() && params.query != "*" {
-                                    let q = params.query.to_lowercase();
-                                    results.retain(|s| s.name.to_lowercase().contains(&q));
-                                }
-                                results
-                            } else {
-                                facade.search_symbols(&params.query, params.limit)
-                            };
-
-                            // Apply kind filter
-                            if let Some(ref kind_str) = params.kind {
-                                if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>()
-                                {
-                                    symbols.retain(|s| s.kind == kind);
-                                } else {
-                                    return Err(mcp_error(format!(
-                                        "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro"
-                                    )));
-                                }
-                            }
-
-                            if symbols.is_empty() {
-                                let output = "No symbols found.".to_string();
-                                let tokens = count_tokens(&output);
-                                (output, tokens, 0)
-                            } else {
-                                let rel_paths: Vec<String> = symbols
-                                    .iter()
-                                    .map(|s| s.file_path.to_string())
-                                    .collect::<std::collections::HashSet<_>>()
-                                    .into_iter()
-                                    .collect();
-                                let token_map = facade.get_file_token_estimates(&rel_paths);
-                                let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
-                                for sym in &symbols {
-                                    out.push_str(&format_symbol_with_file_tokens(
-                                        sym,
-                                        token_map.get(sym.file_path.as_ref()).copied(),
-                                    ));
-                                    out.push('\n');
-                                }
-                                let result_count = symbols.len();
-                                let tokens = count_tokens(&out);
-                                (out, tokens, result_count)
-                            }
-                        }
-                    }
-                }
-                Some(invalid) => {
-                    return Err(mcp_error(format!(
-                        "Invalid scope: '{}'. Valid: docs, memory, code, symbols.",
-                        invalid
-                    )));
-                }
-            }
-        }; // ctx_guard dropped here before record_persistent_call
-
+        let tokens = count_tokens(&output);
         self.metrics.record_search(tokens, result_count);
         self.record_persistent_call("search", tokens, result_count, false)
             .await;
@@ -1778,12 +1445,12 @@ impl McpServer {
 }
 
 /// Format a code symbol for MCP output.
-fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
+pub(super) fn format_symbol(sym: &crate::code::symbol::Symbol) -> String {
     format_symbol_with_file_tokens(sym, None)
 }
 
 /// Format a code symbol, optionally annotating the containing file's token estimate.
-fn format_symbol_with_file_tokens(
+pub(super) fn format_symbol_with_file_tokens(
     sym: &crate::code::symbol::Symbol,
     file_tokens: Option<u32>,
 ) -> String {
@@ -2448,7 +2115,7 @@ const OOD_SCORE_THRESHOLD: f64 = 0.3;
 ///
 /// Returns `None` when results are strong enough to be useful.
 /// Returns a hint string when results are absent or weak — to be appended to output.
-fn ood_hint(result_count: usize, top_score: Option<f64>) -> Option<&'static str> {
+pub(super) fn ood_hint(result_count: usize, top_score: Option<f64>) -> Option<&'static str> {
     if result_count == 0 {
         return Some(
             "\n> No relevant knowledge found. \
@@ -2465,7 +2132,7 @@ fn ood_hint(result_count: usize, top_score: Option<f64>) -> Option<&'static str>
     None
 }
 
-fn format_search_results(results: &[SearchResult], limit: usize) -> String {
+pub(super) fn format_search_results(results: &[SearchResult], limit: usize) -> String {
     use crate::store::hybrid::lost_in_middle_reorder;
 
     let filtered: Vec<_> = results.iter().filter(|r| r.score != 0.0).collect();
@@ -2521,7 +2188,7 @@ fn format_search_results(results: &[SearchResult], limit: usize) -> String {
 }
 
 /// Format memory search results for output.
-fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
+pub(super) fn format_memory_search_results(entries: &[memory::MemoryEntry]) -> String {
     use crate::store::hybrid::lost_in_middle_reorder;
 
     if entries.is_empty() {
@@ -2563,7 +2230,7 @@ fn format_confirmed_info(last_confirmed_at: Option<i64>) -> String {
 
 /// Drop memory entries whose confidence() falls below `min`.
 /// Omitted filter or `0.0` is a no-op (current behavior).
-fn apply_min_confidence(
+pub(super) fn apply_min_confidence(
     entries: Vec<memory::MemoryEntry>,
     min: Option<f64>,
 ) -> Vec<memory::MemoryEntry> {
