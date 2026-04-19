@@ -1,6 +1,7 @@
 //! CLI layer - command parsing and execution with clap.
 
 pub mod handlers;
+pub mod hook_client;
 pub mod hooks;
 pub mod journal;
 pub mod mcp_proxy;
@@ -206,17 +207,119 @@ pub enum Command {
     #[command(subcommand)]
     Session(SessionCommand),
 
-    /// Dispatch a lifecycle hook event (invoked by Claude Code / Codex).
+    /// Lifecycle hook dispatch (SessionStart, PostToolUse, …) and one-shot
+    /// JSON-RPC client for hooks (reindex, search, memory-write, status, …).
     ///
-    /// Reads event JSON from stdin, writes response JSON to stdout, always exits 0.
-    /// Host CLIs must never be blocked by mdkb — failures are logged, not propagated.
-    Hook {
-        /// Hook event name.
-        event: HookEvent,
+    /// Lifecycle events read JSON from stdin and always exit 0. One-shot
+    /// client methods connect the daemon hook socket (auto-spawning the
+    /// daemon if needed), issue one JSON-RPC call, and print the result.
+    /// Host CLIs must never be blocked by mdkb — failures log to stderr and
+    /// still exit 0.
+    #[command(subcommand)]
+    Hook(HookCommand),
+}
+
+/// `mdkb hook <cmd>` subcommands.
+///
+/// The first three variants are Claude Code / Codex lifecycle event names
+/// (read stdin JSON, write response JSON). The remaining variants are
+/// one-shot JSON-RPC client calls routed through the daemon hook socket.
+#[derive(Subcommand, Debug)]
+pub enum HookCommand {
+    /// Lifecycle event: session started.
+    SessionStart,
+
+    /// Lifecycle event: user prompt submitted.
+    UserPromptSubmit,
+
+    /// Lifecycle event: tool use completed.
+    PostToolUse,
+
+    /// Trigger an index refresh via the daemon.
+    Reindex {
+        /// Restrict reindex to these files (absolute or repo-relative).
+        #[arg(long, num_args = 1..)]
+        files: Vec<String>,
+
+        /// Target repo root (defaults to $PWD).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+
+    /// Issue a search call through the daemon.
+    Search {
+        /// Search query.
+        query: String,
+
+        /// Search scope (docs, memory, code, symbols). Omit for docs+memory.
+        #[arg(long)]
+        scope: Option<String>,
+
+        /// Maximum results.
+        #[arg(long)]
+        limit: Option<usize>,
+
+        /// Target repo root (defaults to $PWD).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+
+    /// Persist a memory entry via the daemon.
+    MemoryWrite {
+        /// Entry slug (e.g. "auth-oauth2-flow").
+        #[arg(long)]
+        id: String,
+
+        /// Concise title.
+        #[arg(long)]
+        title: String,
+
+        /// Entry type (topic, decision, problem, pattern, …).
+        #[arg(long = "entry-type", default_value = "topic")]
+        entry_type: String,
+
+        /// Entry body (markdown).
+        #[arg(long)]
+        content: String,
+
+        /// Comma-separated tags.
+        #[arg(long)]
+        tags: Option<String>,
+
+        /// TTL in seconds.
+        #[arg(long)]
+        ttl: Option<u64>,
+
+        /// Target repo root (defaults to $PWD).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+
+    /// Confirm a pending memory outcome via the daemon.
+    MemoryConfirm {
+        /// Entry slug.
+        #[arg(long)]
+        id: String,
+
+        /// Outcome (confirmed, rejected, …).
+        #[arg(long)]
+        outcome: String,
+
+        /// Target repo root (defaults to $PWD).
+        #[arg(long)]
+        root: Option<PathBuf>,
+    },
+
+    /// Query daemon-side index status.
+    Status {
+        /// Target repo root (defaults to $PWD).
+        #[arg(long)]
+        root: Option<PathBuf>,
     },
 }
 
-/// Lifecycle hook events supported by mdkb.
+/// Lifecycle hook events supported by mdkb. Kept for back-compat with
+/// `hooks::dispatch`; new callers use `HookCommand` variants directly.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum HookEvent {
     SessionStart,

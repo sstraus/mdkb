@@ -32,10 +32,11 @@ use mdkb::cli::handlers::{
 use mdkb::cli::hooks;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
-    Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand,
-    MemoryCommand, MetricsCommand, OutputFormat, SessionCommand, SetupCommand, SetupHooksCommand,
-    SetupMcpCommand,
+    Cli, CollectionCommand, Command, EvolveCommand, ExperimentCommand, HookCommand, HookEvent,
+    JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SessionCommand, SetupCommand,
+    SetupHooksCommand, SetupMcpCommand,
 };
+use mdkb::cli::hook_client;
 use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
@@ -807,9 +808,40 @@ async fn main() -> Result<()> {
                 format_update_result(&result, cli.format);
             }
         },
-        Command::Hook { event } => {
-            hooks::dispatch(event);
-        }
+        Command::Hook(hook_cmd) => match hook_cmd {
+            HookCommand::SessionStart => hooks::dispatch(HookEvent::SessionStart),
+            HookCommand::UserPromptSubmit => hooks::dispatch(HookEvent::UserPromptSubmit),
+            HookCommand::PostToolUse => hooks::dispatch(HookEvent::PostToolUse),
+            HookCommand::Reindex { files, root } => {
+                hook_client::call_reindex(files, root).await?;
+            }
+            HookCommand::Search {
+                query,
+                scope,
+                limit,
+                root,
+            } => {
+                hook_client::call_search(query, scope, limit, root).await?;
+            }
+            HookCommand::MemoryWrite {
+                id,
+                title,
+                entry_type,
+                content,
+                tags,
+                ttl,
+                root,
+            } => {
+                hook_client::call_memory_write(id, title, entry_type, content, tags, ttl, root)
+                    .await?;
+            }
+            HookCommand::MemoryConfirm { id, outcome, root } => {
+                hook_client::call_memory_confirm(id, outcome, root).await?;
+            }
+            HookCommand::Status { root } => {
+                hook_client::call_status(root).await?;
+            }
+        },
     }
 
     Ok(())
