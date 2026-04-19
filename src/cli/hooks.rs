@@ -317,10 +317,23 @@ fn canonicalize_under_cwd(base: &Path, raw: &str) -> Option<String> {
     // Canonicalize the base directory. If it doesn't exist we can't proceed.
     let base_canonical = std::fs::canonicalize(base).ok()?;
 
-    // Build the full path: if `raw` is absolute, use it directly; otherwise
-    // join onto the canonical base so that the result is already symlink-free.
     let joined = if Path::new(raw).is_absolute() {
-        PathBuf::from(raw)
+        // For absolute paths, try to canonicalize the parent to resolve symlinks
+        // (e.g. /tmp → /private/tmp on macOS), then re-append the filename.
+        let abs = PathBuf::from(raw);
+        if let Some(parent) = abs.parent() {
+            if let Ok(canon_parent) = std::fs::canonicalize(parent) {
+                if let Some(fname) = abs.file_name() {
+                    canon_parent.join(fname)
+                } else {
+                    canon_parent
+                }
+            } else {
+                abs
+            }
+        } else {
+            abs
+        }
     } else {
         base_canonical.join(raw)
     };

@@ -59,7 +59,8 @@ fn read_queue_lines(root: &Path) -> Vec<serde_json::Value> {
 #[test]
 fn post_tool_use_enqueues_edit_path() {
     let tmp = init_project();
-    let target = tmp.path().join("src/foo.rs");
+    let canonical_root = std::fs::canonicalize(tmp.path()).unwrap();
+    let target = canonical_root.join("src/foo.rs");
     let event = format!(
         r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#,
         target.display()
@@ -99,7 +100,8 @@ fn post_tool_use_enqueues_write_path() {
 #[test]
 fn post_tool_use_enqueues_notebook_edit_path() {
     let tmp = init_project();
-    let target = tmp.path().join("notebook.ipynb");
+    let canonical_root = std::fs::canonicalize(tmp.path()).unwrap();
+    let target = canonical_root.join("notebook.ipynb");
     let event = format!(
         r#"{{"tool_name":"NotebookEdit","tool_input":{{"notebook_path":"{}"}}}}"#,
         target.display()
