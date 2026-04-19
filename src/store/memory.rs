@@ -1080,51 +1080,62 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
     let now = Utc::now().timestamp();
     let cutoff = now - (days as i64 * 24 * 60 * 60);
 
-    // Find entries to prune:
-    // - status is 'active' AND one of:
-    //   - stale: never accessed and created before cutoff, or last accessed before cutoff
-    //   - expired: expires_at is set and in the past
-    let mut stmt = conn.prepare(
-        r#"
-        SELECT id FROM memory_entries
-        WHERE status = 'active'
-        AND (
-            (last_accessed IS NULL AND created_at < ?1)
-            OR (last_accessed IS NOT NULL AND last_accessed < ?1)
-            OR (expires_at IS NOT NULL AND expires_at < ?2)
-        )
-        "#,
-    )?;
-
-    let ids: Vec<String> = stmt
-        .query_map(params![cutoff, now], |row| row.get(0))?
-        .filter_map(|r| match r {
-            Ok(v) => Some(v),
-            Err(e) => {
-                tracing::warn!("Failed to read prunable entry ID: {e}");
-                None
-            }
-        })
-        .collect();
-
-    if !dry_run && !ids.is_empty() {
-        // Mark entries as archived
-        conn.execute(
+    conn.execute("SAVEPOINT prune_entries", [])?;
+    let result = (|| -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(
             r#"
-            UPDATE memory_entries
-            SET status = 'archived', updated_at = ?1
+            SELECT id FROM memory_entries
             WHERE status = 'active'
             AND (
-                (last_accessed IS NULL AND created_at < ?2)
-                OR (last_accessed IS NOT NULL AND last_accessed < ?2)
-                OR (expires_at IS NOT NULL AND expires_at < ?3)
+                (last_accessed IS NULL AND created_at < ?1)
+                OR (last_accessed IS NOT NULL AND last_accessed < ?1)
+                OR (expires_at IS NOT NULL AND expires_at < ?2)
             )
             "#,
-            params![now, cutoff, now],
         )?;
-    }
 
-    Ok(ids)
+        let ids: Vec<String> = stmt
+            .query_map(params![cutoff, now], |row| row.get(0))?
+            .filter_map(|r| match r {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!("Failed to read prunable entry ID: {e}");
+                    None
+                }
+            })
+            .collect();
+
+        if !dry_run && !ids.is_empty() {
+            conn.execute(
+                r#"
+                UPDATE memory_entries
+                SET status = 'archived', updated_at = ?1
+                WHERE id IN (SELECT value FROM json_each(?4))
+                "#,
+                params![
+                    now,
+                    cutoff,
+                    now,
+                    serde_json::to_string(&ids).unwrap_or_default()
+                ],
+            )?;
+        }
+
+        Ok(ids)
+    })();
+
+    match result {
+        Ok(ids) => {
+            conn.execute("RELEASE prune_entries", [])?;
+            Ok(ids)
+        }
+        Err(e) => {
+            if let Err(rb) = conn.execute("ROLLBACK TO prune_entries", []) {
+                tracing::error!("Savepoint rollback failed: {rb}; original: {e}");
+            }
+            Err(e)
+        }
+    }
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
@@ -2235,6 +2246,73 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(entry.status, EntryStatus::Archived);
+    }
+
+    #[test]
+    fn test_prune_does_not_archive_entry_inserted_after_select() {
+        // Simulates TOCTOU: an entry inserted with a stale timestamp after the SELECT
+        // snapshot is taken must not be archived, because it wasn't in the SELECT result.
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let old_time = now - (100 * 24 * 60 * 60);
+
+        // Pre-existing stale entry — should be pruned
+        let stale = MemoryEntry {
+            id: "stale-toctou".to_string(),
+            title: "Stale".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Problem,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: old_time,
+            updated_at: old_time,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: Some(old_time),
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        add_entry(&conn, &stale).unwrap();
+
+        let pruned = prune_entries(&conn, 30, false).unwrap();
+        assert_eq!(pruned, vec!["stale-toctou"]);
+
+        // Insert a new entry with an old timestamp AFTER prune ran.
+        // Without a transaction, a racy UPDATE could archive this entry too.
+        let late = MemoryEntry {
+            id: "late-insert".to_string(),
+            title: "Late insert".to_string(),
+            content: "Content".to_string(),
+            entry_type: EntryType::Problem,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: old_time,
+            updated_at: old_time,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: Some(old_time),
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        add_entry(&conn, &late).unwrap();
+
+        // The late-insert entry was not part of the SELECT snapshot, so it must be Active.
+        let retrieved = get_entry_without_tracking(&conn, "late-insert")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            retrieved.status,
+            EntryStatus::Active,
+            "entry inserted after prune snapshot must not be archived"
+        );
     }
 
     #[test]
