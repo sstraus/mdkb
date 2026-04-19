@@ -20,16 +20,14 @@ use tokio::sync::Mutex;
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 
 use crate::cli::handlers::{
-    Context, handle_mget, handle_session_index, handle_update,
+    Context, handle_session_index, handle_update,
 };
 use crate::code::indexing::IndexFacade;
 use crate::code::types::SymbolId;
 use crate::config::McpConfig;
 use crate::domain::SearchResult;
-use crate::metrics::{
-    UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
-};
-use crate::store::{collections, documents, evolution, memory, stats};
+use crate::metrics::{UsageMetrics, count_tokens};
+use crate::store::{collections, documents, memory, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
@@ -59,7 +57,9 @@ pub struct McpServer {
     tool_router: ToolRouter<Self>,
     /// Usage metrics tracker (in-memory).
     metrics: Arc<UsageMetrics>,
-    /// MCP configuration.
+    /// MCP configuration. Retained for the constructor surface; tool impls
+    /// now read settings from `full_config.mcp` via the per-repo handle.
+    #[allow(dead_code)]
     config: McpConfig,
     /// Current session ID for persistent stats.
     session_id: Arc<AtomicI64>,
@@ -417,237 +417,6 @@ impl McpServer {
         Ok(())
     }
 
-    /// Helper: retrieve document content with optional line range and evolution metadata.
-    fn get_document_content(
-        &self,
-        ctx: &Context,
-        doc: &crate::domain::Document,
-        lines: &Option<String>,
-    ) -> Result<String, McpError> {
-        let content = documents::get_content(&ctx.conn, &doc.hash)
-            .map_err(|e| mcp_error(format!("Failed to get content: {}", e)))?
-            .ok_or_else(|| mcp_error("Content missing for document. Try `update` to reindex."))?;
-
-        // Apply line range if specified
-        let mut output = if let Some(range) = lines {
-            apply_line_range(&content, range)?
-        } else {
-            content
-        };
-
-        // Append evolution metadata
-        if let Ok(Some((status, reason))) = evolution::get_document_status(&ctx.conn, doc.id) {
-            let status_str = format!("{:?}", status);
-            if status_str != "Current" {
-                output.push_str(&format!("\n\n---\n**Status:** {}", status_str));
-                if let Some(r) = reason {
-                    output.push_str(&format!(" ({})", r));
-                }
-
-                // Show what supersedes this document
-                if let Ok(descendants) = evolution::get_superseded_by(&ctx.conn, doc.id) {
-                    for evo in &descendants {
-                        if let Ok(Some(source)) =
-                            documents::get_document(&ctx.conn, evo.source_doc_id)
-                        {
-                            output.push_str(&format!(
-                                "\n**Superseded by:** {} ({})",
-                                source.relative_path, evo.relationship
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Apply token limit with continuation guidance
-        let max_tokens = self.config.max_response_tokens;
-        let output = if max_tokens > 0 {
-            truncate_with_continuation(&output, max_tokens, doc.id).content
-        } else {
-            output
-        };
-
-        Ok(output)
-    }
-
-    /// Helper: finish a document get by recording metrics.
-    async fn finish_get(&self, output: String, tokens: usize) -> Result<CallToolResult, McpError> {
-        self.metrics.record_get(tokens);
-        self.record_persistent_call("get", tokens, 1, false).await;
-        tracing::debug!("mdkb_get: {} tokens", tokens);
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
-    /// Retrieve multiple documents by comma-separated IDs/paths/slugs.
-    async fn get_batch(
-        &self,
-        handle: &RepoHandle,
-        ids: &str,
-        lines: &Option<String>,
-    ) -> Result<CallToolResult, McpError> {
-        let ctx_guard = handle.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-        let mut output = String::new();
-        let mut found = 0;
-
-        for raw_id in ids.split(',') {
-            let id = raw_id.trim();
-            if id.is_empty() {
-                continue;
-            }
-
-            // Try numeric ID
-            if let Ok(numeric_id) = id.parse::<i64>() {
-                if let Ok(Some(doc)) = documents::get_document(&ctx.conn, numeric_id) {
-                    match self.get_document_content(ctx, &doc, lines) {
-                        Ok(content) => {
-                            let title = doc.title.as_deref().unwrap_or("(untitled)");
-                            output.push_str(&format!(
-                                "=== [{}] {} - {} ===\n{}\n\n",
-                                doc.id, doc.relative_path, title, content
-                            ));
-                            found += 1;
-                            continue;
-                        }
-                        Err(e) => {
-                            output.push_str(&format!(
-                                "=== [{}] {} ===\nContent error: {}\n\n",
-                                doc.id, doc.relative_path, e
-                            ));
-                            found += 1;
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // Try path resolution
-            if let Ok(doc) = resolve_document(&ctx.conn, id) {
-                match self.get_document_content(ctx, &doc, lines) {
-                    Ok(content) => {
-                        let title = doc.title.as_deref().unwrap_or("(untitled)");
-                        output.push_str(&format!(
-                            "=== [{}] {} - {} ===\n{}\n\n",
-                            doc.id, doc.relative_path, title, content
-                        ));
-                        found += 1;
-                        continue;
-                    }
-                    Err(e) => {
-                        output.push_str(&format!(
-                            "=== [{}] {} ===\nContent error: {}\n\n",
-                            doc.id, doc.relative_path, e
-                        ));
-                        found += 1;
-                        continue;
-                    }
-                }
-            }
-
-            // Try memory slug
-            if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
-                let ttl = format_ttl_info(entry.expires_at);
-                output.push_str(&format!(
-                    "=== [MEM] {} - {}{} ===\n{}\n\n",
-                    entry.id, entry.title, ttl, entry.content
-                ));
-                found += 1;
-                continue;
-            }
-
-            output.push_str(&format!("=== {} ===\nNot found\n\n", id));
-        }
-
-        if found == 0 {
-            return Err(mcp_error("None of the requested items were found."));
-        }
-
-        let tokens = count_tokens(&output);
-        drop(ctx_guard);
-        self.finish_get(output, tokens).await
-    }
-
-    /// Retrieve multiple documents matching a glob pattern.
-    async fn get_glob(
-        &self,
-        handle: &RepoHandle,
-        pattern: &str,
-    ) -> Result<CallToolResult, McpError> {
-        let doc_limit = self.config.max_document_tokens;
-        let truncate_ellipsis = self.config.truncate_with_ellipsis;
-        let max_response_tokens = self.config.max_response_tokens;
-
-        let (output, result_count) = {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-            let results = handle_mget(ctx, pattern, None)
-                .map_err(|e| mcp_error(format!("Glob retrieval failed: {}", e)))?;
-
-            if results.is_empty() {
-                return Ok(CallToolResult::success(vec![Content::text(
-                    "No documents matched pattern.",
-                )]));
-            }
-
-            let mut output = format!("Found {} documents:\n\n", results.len());
-
-            for (doc, content) in &results {
-                let title = doc.title.as_deref().unwrap_or("(untitled)");
-
-                let truncated_content = if doc_limit > 0 {
-                    let content_tokens = count_tokens(content);
-                    if content_tokens > doc_limit {
-                        if truncate_ellipsis {
-                            truncate_with_ellipsis(content, doc_limit)
-                        } else {
-                            crate::metrics::tokens::truncate_to_tokens(content, doc_limit).0
-                        }
-                    } else {
-                        content.clone()
-                    }
-                } else {
-                    content.clone()
-                };
-
-                output.push_str(&format!(
-                    "=== [{}] {} - {} ===\n{}\n\n",
-                    doc.id, doc.relative_path, title, truncated_content
-                ));
-            }
-
-            let result_count = results.len();
-            (output, result_count)
-        }; // ctx_guard dropped here
-
-        let original_len = output.len();
-        let output = if max_response_tokens > 0 {
-            crate::metrics::tokens::truncate_to_tokens(&output, max_response_tokens).0
-        } else {
-            output
-        };
-        let truncated = output.len() < original_len;
-        let tokens = count_tokens(&output);
-
-        self.metrics.record_get(tokens);
-        self.record_persistent_call("get", tokens, result_count, truncated)
-            .await;
-        tracing::debug!(
-            "mdkb_get_glob: {} tokens, {} docs, truncated={}",
-            tokens,
-            result_count,
-            truncated
-        );
-
-        Ok(CallToolResult::success(vec![Content::text(output)]))
-    }
-
     /// Opens or creates the SQLite code index at `.mdkb/code.sqlite`.
     /// Acquire the code index lock, lazily initializing the facade if needed.
     ///
@@ -819,186 +588,18 @@ impl McpServer {
         Parameters(params): Parameters<GetParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
-
-        let id = &params.id;
-
-        // Comma-separated list → batch retrieve
-        if id.contains(',') {
-            return self.get_batch(&handle, id, &params.lines).await;
-        }
-
-        // Glob pattern → batch retrieve by pattern
-        if id.contains('*') || id.contains('?') {
-            return self.get_glob(&handle, id).await;
-        }
-
-        let ctx_guard = handle.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-        // Resolution strategy:
-        // 1. Numeric ID → document lookup
-        // 2. Contains / or . → path resolution across collections
-        // 3. Slug (hyphens, no slashes/dots) → memory entry lookup
-        // 4. Fallback: try full resolve_document for edge cases
-
-        // Try numeric ID first
-        if let Ok(numeric_id) = id.parse::<i64>() {
-            if let Some(doc) = documents::get_document(&ctx.conn, numeric_id)
-                .map_err(|e| mcp_error(format!("Failed to get document: {}", e)))?
-            {
-                let output = self.get_document_content(ctx, &doc, &params.lines)?;
-                let tokens = count_tokens(&output);
-                drop(ctx_guard);
-                return self.finish_get(output, tokens).await;
-            }
-        }
-
-        // Try path resolution (contains / or .)
-        if id.contains('/') || id.contains('.') {
-            if let Ok(doc) = resolve_document(&ctx.conn, id) {
-                let output = self.get_document_content(ctx, &doc, &params.lines)?;
-                let tokens = count_tokens(&output);
-                drop(ctx_guard);
-                return self.finish_get(output, tokens).await;
-            }
-        }
-
-        // Try memory slug
-        if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
-            // History format: return revision diffs instead of content
-            if params.format.as_deref() == Some("history") {
-                let revisions = memory::get_revisions(&ctx.conn, &entry.id).unwrap_or_default();
-                let output = if revisions.is_empty() {
-                    format!("No revision history for '{}'", entry.id)
-                } else {
-                    let mut parts = vec![format!(
-                        "# Revision history for '{}' ({} revision{})\n",
-                        entry.id,
-                        revisions.len(),
-                        if revisions.len() == 1 { "" } else { "s" }
-                    )];
-                    for (i, rev) in revisions.iter().enumerate() {
-                        let date = chrono::DateTime::from_timestamp(rev.created_at, 0)
-                            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
-                            .unwrap_or_else(|| "?".to_string());
-                        parts.push(format!(
-                            "## Revision {} ({})\n```diff\n{}\n```",
-                            i + 1,
-                            date,
-                            rev.diff
-                        ));
-                    }
-                    parts.join("\n\n")
-                };
-                let tokens = count_tokens(&output);
-                drop(ctx_guard);
-                self.record_persistent_call("get", tokens, 1, false).await;
-                return Ok(CallToolResult::success(vec![Content::text(output)]));
-            }
-
-            let is_summary = params.format.as_deref() == Some("summary");
-            let body = if is_summary {
-                // Summary: first paragraph only
-                entry
-                    .content
-                    .split("\n\n")
-                    .next()
-                    .unwrap_or(&entry.content)
-                    .to_string()
-            } else {
-                entry.content.clone()
-            };
-            // Confidence breakdown
-            let conf = entry.confidence();
-            let last_conf = entry
-                .last_confirmed_at
-                .map(|ts| {
-                    let days = (chrono::Utc::now().timestamp() - ts) as f64 / 86400.0;
-                    if days < 1.0 {
-                        "today".to_string()
-                    } else {
-                        format!("{}d ago", days as u64)
-                    }
-                })
-                .unwrap_or_else(|| "never".to_string());
-            let conf_line = format!(
-                "Confidence: {:.2} ({}↑, confirmed {}, source: {})",
-                conf, entry.confirmations, last_conf, entry.source_type
-            );
-
-            // Revision history summary
-            let rev_line = memory::get_revision_summary(&ctx.conn, &entry.id)
-                .map(|s| {
-                    if s.count == 0 {
-                        return String::new();
-                    }
-                    let dates: Vec<String> = s
-                        .dates
-                        .iter()
-                        .map(|&ts| {
-                            chrono::DateTime::from_timestamp(ts, 0)
-                                .map(|dt| dt.format("%Y-%m-%d").to_string())
-                                .unwrap_or_else(|| "?".to_string())
-                        })
-                        .collect();
-                    format!(
-                        "\nHistory: {} revision{} ({})",
-                        s.count,
-                        if s.count == 1 { "" } else { "s" },
-                        dates.join(", ")
-                    )
-                })
-                .unwrap_or_default();
-
-            let now = chrono::Utc::now().timestamp();
-            let expired_marker = match entry.expires_at {
-                Some(ts) if ts <= now => " [EXPIRED]",
-                _ => "",
-            };
-            let ttl_line = match entry.expires_at {
-                Some(ts) => {
-                    let dt = chrono::DateTime::from_timestamp(ts, 0)
-                        .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
-                        .unwrap_or_else(|| ts.to_string());
-                    format!("\nExpires: {dt}")
-                }
-                None => String::new(),
-            };
-            let output = format!(
-                "# {}{} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}{}{}\n\n{}",
-                entry.title,
-                expired_marker,
-                entry.id,
-                entry.entry_type,
-                entry.status,
-                if entry.tags.is_empty() {
-                    "none".to_string()
-                } else {
-                    entry.tags.join(", ")
-                },
-                entry.access_count,
-                conf_line,
-                rev_line,
-                ttl_line,
-                body
-            );
-            let tokens = count_tokens(&output);
-            drop(ctx_guard);
-            self.record_persistent_call("get", tokens, 1, false).await;
-            return Ok(CallToolResult::success(vec![Content::text(output)]));
-        }
-
-        // Fallback: try full resolve_document for edge cases
-        if let Ok(doc) = resolve_document(&ctx.conn, id) {
-            let output = self.get_document_content(ctx, &doc, &params.lines)?;
-            let tokens = count_tokens(&output);
-            drop(ctx_guard);
-            return self.finish_get(output, tokens).await;
-        }
-
-        Err(mcp_error(format!("Not found: '{}'.", params.id)))
+        let (output, count, truncated) = super::dispatch::get_impl(&handle, &params).await?;
+        let tokens = count_tokens(&output);
+        self.metrics.record_get(tokens);
+        self.record_persistent_call("get", tokens, count, truncated)
+            .await;
+        tracing::debug!(
+            "mdkb_get: {} tokens, {} results, truncated={}",
+            tokens,
+            count,
+            truncated
+        );
+        Ok(CallToolResult::success(vec![Content::text(output)]))
     }
 
     /// Get index status including documents, collections, and code index.
@@ -1485,7 +1086,7 @@ fn uri_to_path(uri: &str) -> Option<PathBuf> {
     if path.is_absolute() { Some(path) } else { None }
 }
 
-fn resolve_document(
+pub(super) fn resolve_document(
     conn: &rusqlite::Connection,
     path_or_id: &str,
 ) -> crate::error::Result<crate::domain::Document> {
@@ -2262,7 +1863,7 @@ pub(super) fn format_ttl_info(expires_at: Option<i64>) -> String {
 }
 
 /// Apply line range to content.
-fn apply_line_range(content: &str, range: &str) -> Result<String, McpError> {
+pub(super) fn apply_line_range(content: &str, range: &str) -> Result<String, McpError> {
     let parts: Vec<&str> = range.split(':').collect();
     if parts.len() != 2 {
         return Err(mcp_error(format!(

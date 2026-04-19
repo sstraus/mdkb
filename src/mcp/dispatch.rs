@@ -17,18 +17,19 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
 
-use crate::cli::handlers::{Context, handle_hybrid_search};
+use crate::cli::handlers::{Context, handle_hybrid_search, handle_mget};
 use crate::code::indexing::IndexFacade;
 use crate::daemon::registry::RepoHandle;
 use crate::domain::SearchResult;
-use crate::metrics::{UsageMetrics, count_tokens};
-use crate::store::{collections, memory, search, stats};
+use crate::metrics::{UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis};
+use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::server::{
-    apply_min_confidence, format_memory_search_results, format_search_results, format_symbol,
-    format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago, truncate_text,
+    apply_line_range, apply_min_confidence, format_memory_search_results, format_search_results,
+    format_symbol, format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago,
+    resolve_document, truncate_text,
 };
-use super::tools::{MemoryWriteBatchEntry, SearchParams};
+use super::tools::{GetParams, MemoryWriteBatchEntry, SearchParams};
 
 /// Daemon-global state shared across all dispatched tool calls.
 #[derive(Clone)]
@@ -848,6 +849,367 @@ pub async fn cross_repo_search_impl(
     Ok((output, count))
 }
 
+/// Render a single document's content with optional line range and evolution
+/// metadata. Mirrors `McpServer::get_document_content`. Truncation uses
+/// `handle.config.mcp.max_response_tokens` for parity.
+fn render_document_content(
+    handle: &RepoHandle,
+    ctx: &Context,
+    doc: &crate::domain::Document,
+    lines: Option<&str>,
+) -> Result<String, McpError> {
+    let content = documents::get_content(&ctx.conn, &doc.hash)
+        .map_err(|e| mcp_error(format!("Failed to get content: {e}")))?
+        .ok_or_else(|| mcp_error("Content missing for document. Try `update` to reindex."))?;
+
+    let mut output = if let Some(range) = lines {
+        apply_line_range(&content, range)?
+    } else {
+        content
+    };
+
+    if let Ok(Some((status, reason))) = evolution::get_document_status(&ctx.conn, doc.id) {
+        let status_str = format!("{status:?}");
+        if status_str != "Current" {
+            output.push_str(&format!("\n\n---\n**Status:** {status_str}"));
+            if let Some(r) = reason {
+                output.push_str(&format!(" ({r})"));
+            }
+            if let Ok(descendants) = evolution::get_superseded_by(&ctx.conn, doc.id) {
+                for evo in &descendants {
+                    if let Ok(Some(source)) = documents::get_document(&ctx.conn, evo.source_doc_id)
+                    {
+                        output.push_str(&format!(
+                            "\n**Superseded by:** {} ({})",
+                            source.relative_path, evo.relationship
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    let max_tokens = handle.config.mcp.max_response_tokens;
+    let output = if max_tokens > 0 {
+        truncate_with_continuation(&output, max_tokens, doc.id).content
+    } else {
+        output
+    };
+    Ok(output)
+}
+
+/// `get` — comma-separated batch retrieval. Returns aggregated text and the
+/// number of items found. Errors when no items resolved.
+async fn get_batch_impl(
+    handle: &RepoHandle,
+    ids: &str,
+    lines: Option<&str>,
+) -> Result<(String, usize), McpError> {
+    let ctx_guard = handle.ctx.lock().await;
+    let ctx = ctx_guard
+        .as_ref()
+        .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+    let mut output = String::new();
+    let mut found = 0usize;
+
+    for raw_id in ids.split(',') {
+        let id = raw_id.trim();
+        if id.is_empty() {
+            continue;
+        }
+
+        if let Ok(numeric_id) = id.parse::<i64>() {
+            if let Ok(Some(doc)) = documents::get_document(&ctx.conn, numeric_id) {
+                match render_document_content(handle, ctx, &doc, lines) {
+                    Ok(content) => {
+                        let title = doc.title.as_deref().unwrap_or("(untitled)");
+                        output.push_str(&format!(
+                            "=== [{}] {} - {} ===\n{}\n\n",
+                            doc.id, doc.relative_path, title, content
+                        ));
+                        found += 1;
+                        continue;
+                    }
+                    Err(e) => {
+                        output.push_str(&format!(
+                            "=== [{}] {} ===\nContent error: {}\n\n",
+                            doc.id, doc.relative_path, e
+                        ));
+                        found += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if let Ok(doc) = resolve_document(&ctx.conn, id) {
+            match render_document_content(handle, ctx, &doc, lines) {
+                Ok(content) => {
+                    let title = doc.title.as_deref().unwrap_or("(untitled)");
+                    output.push_str(&format!(
+                        "=== [{}] {} - {} ===\n{}\n\n",
+                        doc.id, doc.relative_path, title, content
+                    ));
+                    found += 1;
+                    continue;
+                }
+                Err(e) => {
+                    output.push_str(&format!(
+                        "=== [{}] {} ===\nContent error: {}\n\n",
+                        doc.id, doc.relative_path, e
+                    ));
+                    found += 1;
+                    continue;
+                }
+            }
+        }
+
+        if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+            let ttl = format_ttl_info(entry.expires_at);
+            output.push_str(&format!(
+                "=== [MEM] {} - {}{} ===\n{}\n\n",
+                entry.id, entry.title, ttl, entry.content
+            ));
+            found += 1;
+            continue;
+        }
+
+        output.push_str(&format!("=== {id} ===\nNot found\n\n"));
+    }
+
+    if found == 0 {
+        return Err(mcp_error("None of the requested items were found."));
+    }
+    Ok((output, found))
+}
+
+/// `get` — glob retrieval. Returns aggregated text, number of docs matched,
+/// and a `truncated` flag indicating whether `max_response_tokens` clipped
+/// the output.
+async fn get_glob_impl(
+    handle: &RepoHandle,
+    pattern: &str,
+) -> Result<(String, usize, bool), McpError> {
+    let doc_limit = handle.config.mcp.max_document_tokens;
+    let truncate_ellipsis = handle.config.mcp.truncate_with_ellipsis;
+    let max_response_tokens = handle.config.mcp.max_response_tokens;
+
+    let (output, result_count) = {
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+        let results = handle_mget(ctx, pattern, None)
+            .map_err(|e| mcp_error(format!("Glob retrieval failed: {e}")))?;
+
+        if results.is_empty() {
+            return Ok(("No documents matched pattern.".to_string(), 0, false));
+        }
+
+        let mut output = format!("Found {} documents:\n\n", results.len());
+        for (doc, content) in &results {
+            let title = doc.title.as_deref().unwrap_or("(untitled)");
+
+            let truncated_content = if doc_limit > 0 {
+                let content_tokens = count_tokens(content);
+                if content_tokens > doc_limit {
+                    if truncate_ellipsis {
+                        truncate_with_ellipsis(content, doc_limit)
+                    } else {
+                        crate::metrics::tokens::truncate_to_tokens(content, doc_limit).0
+                    }
+                } else {
+                    content.clone()
+                }
+            } else {
+                content.clone()
+            };
+
+            output.push_str(&format!(
+                "=== [{}] {} - {} ===\n{}\n\n",
+                doc.id, doc.relative_path, title, truncated_content
+            ));
+        }
+        let result_count = results.len();
+        (output, result_count)
+    };
+
+    let original_len = output.len();
+    let output = if max_response_tokens > 0 {
+        crate::metrics::tokens::truncate_to_tokens(&output, max_response_tokens).0
+    } else {
+        output
+    };
+    let truncated = output.len() < original_len;
+    Ok((output, result_count, truncated))
+}
+
+/// `get` — full implementation. Returns `(text, count, truncated)` so callers
+/// can record metrics. Single-doc and memory-slug paths report `count=1` and
+/// `truncated=false`. Batch and glob paths report their own counts and (for
+/// glob) actual truncation status.
+pub async fn get_impl(
+    handle: &RepoHandle,
+    params: &GetParams,
+) -> Result<(String, usize, bool), McpError> {
+    ensure_handle_context(handle).await?;
+
+    let id = &params.id;
+
+    if id.contains(',') {
+        let (text, count) = get_batch_impl(handle, id, params.lines.as_deref()).await?;
+        return Ok((text, count, false));
+    }
+
+    if id.contains('*') || id.contains('?') {
+        return get_glob_impl(handle, id).await;
+    }
+
+    let ctx_guard = handle.ctx.lock().await;
+    let ctx = ctx_guard
+        .as_ref()
+        .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+    if let Ok(numeric_id) = id.parse::<i64>() {
+        if let Some(doc) = documents::get_document(&ctx.conn, numeric_id)
+            .map_err(|e| mcp_error(format!("Failed to get document: {e}")))?
+        {
+            let output = render_document_content(handle, ctx, &doc, params.lines.as_deref())?;
+            return Ok((output, 1, false));
+        }
+    }
+
+    if id.contains('/') || id.contains('.') {
+        if let Ok(doc) = resolve_document(&ctx.conn, id) {
+            let output = render_document_content(handle, ctx, &doc, params.lines.as_deref())?;
+            return Ok((output, 1, false));
+        }
+    }
+
+    if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+        if params.format.as_deref() == Some("history") {
+            let revisions = memory::get_revisions(&ctx.conn, &entry.id).unwrap_or_default();
+            let output = if revisions.is_empty() {
+                format!("No revision history for '{}'", entry.id)
+            } else {
+                let mut parts = vec![format!(
+                    "# Revision history for '{}' ({} revision{})\n",
+                    entry.id,
+                    revisions.len(),
+                    if revisions.len() == 1 { "" } else { "s" }
+                )];
+                for (i, rev) in revisions.iter().enumerate() {
+                    let date = chrono::DateTime::from_timestamp(rev.created_at, 0)
+                        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    parts.push(format!(
+                        "## Revision {} ({})\n```diff\n{}\n```",
+                        i + 1,
+                        date,
+                        rev.diff
+                    ));
+                }
+                parts.join("\n\n")
+            };
+            return Ok((output, 1, false));
+        }
+
+        let is_summary = params.format.as_deref() == Some("summary");
+        let body = if is_summary {
+            entry
+                .content
+                .split("\n\n")
+                .next()
+                .unwrap_or(&entry.content)
+                .to_string()
+        } else {
+            entry.content.clone()
+        };
+        let conf = entry.confidence();
+        let last_conf = entry
+            .last_confirmed_at
+            .map(|ts| {
+                let days = (chrono::Utc::now().timestamp() - ts) as f64 / 86400.0;
+                if days < 1.0 {
+                    "today".to_string()
+                } else {
+                    format!("{}d ago", days as u64)
+                }
+            })
+            .unwrap_or_else(|| "never".to_string());
+        let conf_line = format!(
+            "Confidence: {:.2} ({}↑, confirmed {}, source: {})",
+            conf, entry.confirmations, last_conf, entry.source_type
+        );
+
+        let rev_line = memory::get_revision_summary(&ctx.conn, &entry.id)
+            .map(|s| {
+                if s.count == 0 {
+                    return String::new();
+                }
+                let dates: Vec<String> = s
+                    .dates
+                    .iter()
+                    .map(|&ts| {
+                        chrono::DateTime::from_timestamp(ts, 0)
+                            .map(|dt| dt.format("%Y-%m-%d").to_string())
+                            .unwrap_or_else(|| "?".to_string())
+                    })
+                    .collect();
+                format!(
+                    "\nHistory: {} revision{} ({})",
+                    s.count,
+                    if s.count == 1 { "" } else { "s" },
+                    dates.join(", ")
+                )
+            })
+            .unwrap_or_default();
+
+        let now = chrono::Utc::now().timestamp();
+        let expired_marker = match entry.expires_at {
+            Some(ts) if ts <= now => " [EXPIRED]",
+            _ => "",
+        };
+        let ttl_line = match entry.expires_at {
+            Some(ts) => {
+                let dt = chrono::DateTime::from_timestamp(ts, 0)
+                    .map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_else(|| ts.to_string());
+                format!("\nExpires: {dt}")
+            }
+            None => String::new(),
+        };
+        let output = format!(
+            "# {}{} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}{}{}\n\n{}",
+            entry.title,
+            expired_marker,
+            entry.id,
+            entry.entry_type,
+            entry.status,
+            if entry.tags.is_empty() {
+                "none".to_string()
+            } else {
+                entry.tags.join(", ")
+            },
+            entry.access_count,
+            conf_line,
+            rev_line,
+            ttl_line,
+            body
+        );
+        return Ok((output, 1, false));
+    }
+
+    if let Ok(doc) = resolve_document(&ctx.conn, id) {
+        let output = render_document_content(handle, ctx, &doc, params.lines.as_deref())?;
+        return Ok((output, 1, false));
+    }
+
+    Err(mcp_error(format!("Not found: '{}'.", params.id)))
+}
+
 /// Dispatch a tool call by method name. Returns a JSON value — callers are
 /// responsible for the transport envelope.
 ///
@@ -930,6 +1292,16 @@ pub async fn dispatch_call(
             dctx.record_persistent_call(&handle, "search", tokens, count, false)
                 .await;
             Ok(json!({ "text": text, "tokens": tokens, "count": count }))
+        }
+        "get" => {
+            let gp: GetParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("get: invalid params: {e}")))?;
+            let (text, count, truncated) = get_impl(&handle, &gp).await?;
+            let tokens = count_tokens(&text);
+            dctx.metrics.record_get(tokens);
+            dctx.record_persistent_call(&handle, "get", tokens, count, truncated)
+                .await;
+            Ok(json!({ "text": text, "tokens": tokens, "count": count, "truncated": truncated }))
         }
         "memory_list" => {
             let limit = params
@@ -1468,6 +1840,109 @@ mod tests {
         assert!(
             msg.contains("Cross-repo search via dispatch_call is not supported"),
             "msg: {msg}"
+        );
+    }
+
+    fn get_params(id: &str) -> GetParams {
+        GetParams {
+            id: id.to_string(),
+            root: None,
+            lines: None,
+            format: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn get_impl_unknown_id_errors() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let params = get_params("does-not-exist");
+
+        let err = get_impl(&handle, &params).await.expect_err("should error");
+        assert!(err.to_string().contains("Not found"), "msg: {err}");
+    }
+
+    #[tokio::test]
+    async fn get_impl_glob_returns_no_match_for_empty_repo() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let params = get_params("**/*.md");
+
+        let (text, count, truncated) =
+            get_impl(&handle, &params).await.expect("glob get");
+        assert_eq!(count, 0, "text: {text}");
+        assert!(!truncated);
+        assert!(text.contains("No documents matched pattern"), "text: {text}");
+    }
+
+    #[tokio::test]
+    async fn get_impl_batch_errors_when_no_items_resolve() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let params = get_params("missing-1, missing-2");
+
+        let err = get_impl(&handle, &params).await.expect_err("should error");
+        assert!(
+            err.to_string()
+                .contains("None of the requested items were found"),
+            "msg: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_impl_returns_seeded_memory_entry() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "seeded-get").await;
+
+        let params = get_params("seeded-get");
+        let (text, count, truncated) = get_impl(&handle, &params).await.expect("memory get");
+        assert_eq!(count, 1);
+        assert!(!truncated);
+        assert!(text.contains("seeded-get"), "text: {text}");
+        assert!(text.contains("Type:"), "text: {text}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_routes_get_to_impl() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        seed_memory_entry(&handle, "dispatched-get").await;
+
+        let result = dispatch_call(
+            "get",
+            json!({ "id": "dispatched-get" }),
+            handle,
+            &dctx,
+        )
+        .await
+        .expect("dispatch");
+
+        assert_eq!(
+            result.get("count").and_then(Value::as_u64).unwrap_or(0),
+            1,
+            "result: {result}"
+        );
+        assert_eq!(
+            result.get("truncated").and_then(Value::as_bool),
+            Some(false),
+            "result: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_get_missing_id_errors() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+
+        let err = dispatch_call("get", json!({}), handle, &dctx)
+            .await
+            .expect_err("should error");
+        assert!(
+            err.to_string().contains("get: invalid params"),
+            "msg: {err}"
         );
     }
 
