@@ -260,6 +260,9 @@ pub enum HookCommand {
     /// Lifecycle event: tool use completed.
     PostToolUse,
 
+    /// Lifecycle event: before tool execution (advisory).
+    PreToolUse,
+
     /// Trigger an index refresh via the daemon.
     Reindex {
         /// Restrict reindex to these files (absolute or repo-relative).
@@ -350,6 +353,7 @@ pub enum HookEvent {
     SessionStart,
     UserPromptSubmit,
     PostToolUse,
+    PreToolUse,
 }
 
 /// Session indexing subcommands.
@@ -783,13 +787,18 @@ pub enum SetupHooksCommand {
         #[arg(short, long, default_value = "local")]
         scope: String,
 
-        /// Comma-separated list of events to skip (session-start, user-prompt-submit, post-tool-use)
+        /// Comma-separated list of events to skip (session-start, user-prompt-submit, post-tool-use, pre-tool-use)
         #[arg(long, default_value = "")]
         disable: String,
 
         /// Print the merged settings to stdout without writing
         #[arg(long)]
         dry_run: bool,
+
+        /// Claude Code profile directory (default: ~/.claude).
+        /// Use for non-standard profiles like ~/.claude-private.
+        #[arg(long)]
+        profile_dir: Option<PathBuf>,
     },
 
     /// Register lifecycle hooks with Codex CLI (writes ~/.codex/hooks.json)

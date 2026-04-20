@@ -9,6 +9,7 @@ use std::process::Command;
 
 use fs4::fs_std::FileExt;
 
+use crate::config::Config;
 use crate::error::{Error, ErrorKind, Result};
 
 /// Result of MCP setup operation.
@@ -277,12 +278,13 @@ pub struct HooksSetupResult {
     pub codex_hooks_flag_present: bool,
 }
 
-/// Three events currently emitted by `mdkb hook`.
+/// Lifecycle events emitted by `mdkb hook`.
 /// Tuple: (event_name, cli_event, optional matcher for settings.json).
 pub const HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
     ("SessionStart", "session-start", None),
     ("UserPromptSubmit", "user-prompt-submit", None),
     ("PostToolUse", "post-tool-use", Some("Edit|Write|NotebookEdit|MultiEdit")),
+    ("PreToolUse", "pre-tool-use", Some("Grep")),
 ];
 
 /// Single-quote shell escaping: wraps `s` in single quotes, escaping any
@@ -299,31 +301,45 @@ fn shell_quote(s: &str) -> String {
 /// falls through to `MDKB_NO_DAEMON=1 mdkb hook <event>` which runs the
 /// same dispatch in-process. Both branches exit 0, so the host CLI is
 /// never blocked by mdkb.
-pub fn hook_command_line(binary_path: &str, cli_event: &str) -> String {
+///
+/// When `daemon_required` is true, the fallback is omitted — the hook
+/// runs daemon-only and silently returns `{}` if the daemon is down.
+pub fn hook_command_line(binary_path: &str, cli_event: &str, daemon_required: bool) -> String {
     let bin = shell_quote(binary_path);
-    format!(
-        "if ! {bin} hook {event}; then MDKB_NO_DAEMON=1 {bin} hook {event}; fi",
-        bin = bin,
-        event = cli_event,
-    )
+    if daemon_required {
+        format!("{bin} hook {event}", bin = bin, event = cli_event)
+    } else {
+        format!(
+            "if ! {bin} hook {event}; then MDKB_NO_DAEMON=1 {bin} hook {event}; fi",
+            bin = bin,
+            event = cli_event,
+        )
+    }
 }
 
 /// Resolve the Claude Code settings path for the given scope.
 /// - `local`: `<cwd>/.claude/settings.local.json`
-/// - `user`:  `$HOME/.claude/settings.json`
-pub fn claude_settings_path(cwd: &Path, scope: &str) -> Result<std::path::PathBuf> {
+/// - `user`:  `<profile_dir>/settings.json` (default profile_dir: `$HOME/.claude`)
+pub fn claude_settings_path(
+    cwd: &Path,
+    scope: &str,
+    profile_dir: Option<&Path>,
+) -> Result<std::path::PathBuf> {
     match scope {
         "local" | "project" => Ok(cwd.join(".claude").join("settings.local.json")),
         "user" | "global" => {
-            let home = env::var_os("HOME").ok_or_else(|| {
-                Error::from(ErrorKind::Command {
-                    command: "setup hooks claude".to_string(),
-                    message: "HOME environment variable not set".to_string(),
-                })
-            })?;
-            Ok(std::path::PathBuf::from(home)
-                .join(".claude")
-                .join("settings.json"))
+            let dir = if let Some(p) = profile_dir {
+                p.to_path_buf()
+            } else {
+                let home = env::var_os("HOME").ok_or_else(|| {
+                    Error::from(ErrorKind::Command {
+                        command: "setup hooks claude".to_string(),
+                        message: "HOME environment variable not set".to_string(),
+                    })
+                })?;
+                std::path::PathBuf::from(home).join(".claude")
+            };
+            Ok(dir.join("settings.json"))
         }
         other => Err(Error::from(ErrorKind::Command {
             command: "setup hooks claude".to_string(),
@@ -342,6 +358,9 @@ pub fn parse_disabled_events(raw: &str) -> std::collections::HashSet<String> {
             "sessionstart" | "session-start" => "SessionStart".to_string(),
             "userpromptsubmit" | "user-prompt-submit" => "UserPromptSubmit".to_string(),
             "posttooluse" | "post-tool-use" => "PostToolUse".to_string(),
+            // DEFERRED (2026-04-20) — "pretooluse"/"pre-tool-use" not in HOOK_EVENTS yet;
+            // alias kept so --disable pre-tool-use is silently accepted without error.
+            "pretooluse" | "pre-tool-use" => "PreToolUse".to_string(),
             other => other.to_string(),
         })
         .collect()
@@ -471,6 +490,7 @@ fn upsert_hook_entries(
     settings: &mut serde_json::Value,
     binary_path: &str,
     disabled: &std::collections::HashSet<String>,
+    daemon_required: bool,
 ) -> (Vec<String>, Vec<String>) {
     let hooks_root = settings
         .as_object_mut()
@@ -489,7 +509,7 @@ fn upsert_hook_entries(
             skipped.push((*event_name).to_string());
             continue;
         }
-        let command = hook_command_line(binary_path, cli_event);
+        let command = hook_command_line(binary_path, cli_event, daemon_required);
         let mut mdkb_entry = serde_json::json!({
             "_managedBy": "mdkb",
             "hooks": [{"type": "command", "command": command}]
@@ -534,11 +554,13 @@ fn write_hook_entries(
     disabled: &std::collections::HashSet<String>,
     cmd_name: &str,
     dry_run: bool,
+    daemon_required: bool,
 ) -> Result<(Vec<String>, Vec<String>, serde_json::Value)> {
     if dry_run {
         // Dry-run: read without locking (no write will happen).
         let mut settings = read_json_file(settings_path, cmd_name)?;
-        let (registered, skipped) = upsert_hook_entries(&mut settings, binary_path, disabled);
+        let (registered, skipped) =
+            upsert_hook_entries(&mut settings, binary_path, disabled, daemon_required);
         println!(
             "{}",
             serde_json::to_string_pretty(&settings).unwrap_or_default()
@@ -554,7 +576,8 @@ fn write_hook_entries(
     let skipped_ref = &mut skipped_out;
     locked_read_modify_write(settings_path, || {
         let mut settings = read_json_file(settings_path, cmd_name)?;
-        let (registered, skipped) = upsert_hook_entries(&mut settings, binary_path, disabled);
+        let (registered, skipped) =
+            upsert_hook_entries(&mut settings, binary_path, disabled, daemon_required);
         *registered_ref = registered;
         *skipped_ref = skipped;
         Ok(settings)
@@ -575,10 +598,13 @@ pub fn handle_setup_hooks_claude(
     scope: &str,
     disable: &str,
     dry_run: bool,
+    profile_dir: Option<&Path>,
 ) -> Result<HooksSetupResult> {
-    let settings_path = claude_settings_path(cwd, scope)?;
+    let settings_path = claude_settings_path(cwd, scope, profile_dir)?;
     let binary_path = find_mdkb_binary()?;
     let disabled = parse_disabled_events(disable);
+    let cfg_path = cwd.join(".mdkb").join("config.toml");
+    let hooks_cfg = Config::load_or_default(&cfg_path).hooks;
 
     let (registered, skipped, merged_json) = write_hook_entries(
         &settings_path,
@@ -586,6 +612,7 @@ pub fn handle_setup_hooks_claude(
         &disabled,
         "setup hooks claude",
         dry_run,
+        hooks_cfg.daemon_required,
     )?;
 
     Ok(HooksSetupResult {
@@ -662,6 +689,13 @@ pub fn handle_setup_hooks_codex(disable: &str, dry_run: bool) -> Result<HooksSet
     let binary_path = find_mdkb_binary()?;
     let disabled = parse_disabled_events(disable);
     let codex_hooks_flag_present = probe_codex_hooks_flag();
+    let daemon_required = std::env::current_dir()
+        .ok()
+        .map(|cwd| {
+            let cfg_path = cwd.join(".mdkb").join("config.toml");
+            Config::load_or_default(&cfg_path).hooks.daemon_required
+        })
+        .unwrap_or(false);
 
     let (registered, skipped, merged_json) = write_hook_entries(
         &settings_path,
@@ -669,6 +703,7 @@ pub fn handle_setup_hooks_codex(disable: &str, dry_run: bool) -> Result<HooksSet
         &disabled,
         "setup hooks codex",
         dry_run,
+        daemon_required,
     )?;
 
     Ok(HooksSetupResult {
@@ -833,7 +868,7 @@ mod tests {
     #[test]
     fn test_claude_settings_path_local() {
         let cwd = std::path::Path::new("/tmp/project");
-        let p = claude_settings_path(cwd, "local").unwrap();
+        let p = claude_settings_path(cwd, "local", None).unwrap();
         assert_eq!(p, cwd.join(".claude").join("settings.local.json"));
     }
 
@@ -863,18 +898,24 @@ mod tests {
 
     #[test]
     fn test_hook_command_line_safe_with_spaces() {
-        let cmd = hook_command_line("/path/with spaces/mdkb", "session-start");
-        // Binary must be quoted, not raw.
+        let cmd = hook_command_line("/path/with spaces/mdkb", "session-start", false);
         assert!(cmd.contains("'/path/with spaces/mdkb'"));
         assert!(!cmd.contains(" /path/with spaces/mdkb "));
     }
 
     #[test]
     fn test_hook_command_line_safe_with_metacharacters() {
-        let cmd = hook_command_line("/usr/bin/md;kb$(rm -rf /)", "post-tool-use");
+        let cmd = hook_command_line("/usr/bin/md;kb$(rm -rf /)", "post-tool-use", false);
         assert!(cmd.contains("'/usr/bin/md;kb$(rm -rf /)'"));
-        // The raw injection string must not appear unquoted.
         assert!(!cmd.contains("md;kb$(rm -rf /)\" "));
+    }
+
+    #[test]
+    fn test_hook_command_line_daemon_required_no_fallback() {
+        let cmd = hook_command_line("/usr/bin/mdkb", "session-start", true);
+        assert!(!cmd.contains("MDKB_NO_DAEMON"), "daemon_required must omit fallback");
+        assert!(!cmd.contains("if !"), "daemon_required must omit if-then-fi wrapper");
+        assert!(cmd.contains("hook session-start"));
     }
 
     #[test]

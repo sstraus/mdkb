@@ -199,3 +199,116 @@ fn user_prompt_submit_no_prompt_field_returns_empty() {
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
     assert!(parsed.get("hookSpecificOutput").is_none());
 }
+
+/// Seed a project with two memory entries that differ only in access_count/last_accessed.
+/// Returns a TempDir with the project root.
+fn seed_two_entries_with_access_counts(
+    low_id: &str,
+    high_id: &str,
+    shared_keyword: &str,
+) -> TempDir {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    handle_init(&root).expect("init");
+    let ctx = Context::open(&root).expect("open ctx");
+
+    let now = chrono::Utc::now().timestamp();
+
+    // Low-access entry: accessed once, 30 days ago.
+    let low = MemoryEntry {
+        id: low_id.to_string(),
+        title: format!("{shared_keyword} low-access entry"),
+        content: format!(
+            "{shared_keyword} implementation detail rarely accessed by anyone"
+        ),
+        entry_type: EntryType::Decision,
+        tags: vec![shared_keyword.to_string()],
+        status: EntryStatus::Active,
+        created_at: now - 40 * 86400,
+        updated_at: now - 40 * 86400,
+        superseded_by: None,
+        access_count: 1,
+        last_accessed: Some(now - 30 * 86400),
+        source_path: None,
+        confirmations: 0,
+        last_confirmed_at: None,
+        source_type: SourceType::UserStatement,
+        expires_at: None,
+        due_at: None,
+    };
+
+    // High-access entry: accessed 50 times, 1 hour ago — should rank first.
+    let high = MemoryEntry {
+        id: high_id.to_string(),
+        title: format!("{shared_keyword} high-access entry"),
+        content: format!(
+            "{shared_keyword} implementation detail frequently accessed by the team"
+        ),
+        entry_type: EntryType::Decision,
+        tags: vec![shared_keyword.to_string()],
+        status: EntryStatus::Active,
+        created_at: now - 5 * 86400,
+        updated_at: now - 5 * 86400,
+        superseded_by: None,
+        access_count: 50,
+        last_accessed: Some(now - 3600),
+        source_path: None,
+        confirmations: 0,
+        last_confirmed_at: None,
+        source_type: SourceType::UserStatement,
+        expires_at: None,
+        due_at: None,
+    };
+
+    add_entry(&ctx.conn, &low).expect("add low entry");
+    add_entry(&ctx.conn, &high).expect("add high entry");
+
+    tmp
+}
+
+#[test]
+fn user_prompt_submit_access_recency_reranks_higher_access_first() {
+    // Both entries share a unique keyword so both will match FTS.
+    // The high-access entry should float to the top after re-ranking.
+    let keyword = "cacherefreshpolicy";
+    let low_id = "cache-low-access";
+    let high_id = "cache-high-access";
+
+    let tmp = seed_two_entries_with_access_counts(low_id, high_id, keyword);
+
+    let event = format!(r#"{{"prompt":"how does the {keyword} work in our system"}}"#);
+    let (code, stdout) = run_user_prompt_submit_in(tmp.path(), &event);
+
+    assert_eq!(code, 0, "hook must always exit 0");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+
+    let ctx_block = parsed
+        .get("hookSpecificOutput")
+        .and_then(|h| h.get("additionalContext"))
+        .and_then(|v| v.as_str())
+        .expect("additionalContext must be present when both entries match");
+
+    // Both entries must appear in the output.
+    assert!(
+        ctx_block.contains(high_id),
+        "high-access entry must appear in output, got:\n{ctx_block}"
+    );
+    assert!(
+        ctx_block.contains(low_id),
+        "low-access entry must appear in output, got:\n{ctx_block}"
+    );
+
+    // High-access entry must appear BEFORE the low-access entry.
+    let high_pos = ctx_block
+        .find(high_id)
+        .expect("high_id must be present");
+    let low_pos = ctx_block
+        .find(low_id)
+        .expect("low_id must be present");
+
+    assert!(
+        high_pos < low_pos,
+        "high-access entry (pos {high_pos}) must appear before low-access (pos {low_pos}) in:\n{ctx_block}"
+    );
+}

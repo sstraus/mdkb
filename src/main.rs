@@ -801,9 +801,14 @@ async fn run() -> Result<()> {
                     scope,
                     disable,
                     dry_run,
+                    profile_dir,
                 } => {
                     let result = mdkb::cli::setup::handle_setup_hooks_claude(
-                        &cwd, &scope, &disable, dry_run,
+                        &cwd,
+                        &scope,
+                        &disable,
+                        dry_run,
+                        profile_dir.as_deref(),
                     )?;
                     if !result.dry_run {
                         if !result.events_registered.is_empty() {
@@ -861,6 +866,7 @@ async fn run() -> Result<()> {
             HookCommand::SessionStart => hooks::dispatch(HookEvent::SessionStart),
             HookCommand::UserPromptSubmit => hooks::dispatch(HookEvent::UserPromptSubmit),
             HookCommand::PostToolUse => hooks::dispatch(HookEvent::PostToolUse),
+            HookCommand::PreToolUse => hooks::dispatch(HookEvent::PreToolUse),
             HookCommand::Reindex { files, root } => {
                 hook_client::call_reindex(files, root).await?;
             }

@@ -50,7 +50,7 @@ fn fresh_settings_gets_three_managed_hook_entries() {
     let (_guard, project, _home) = isolated_project();
 
     let result =
-        handle_setup_hooks_claude(project.path(), "local", "", false).expect("setup hooks ok");
+        handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("setup hooks ok");
     assert!(result.success);
     assert_eq!(result.events_registered.len(), HOOK_EVENTS.len());
     assert!(result.events_skipped.is_empty());
@@ -85,9 +85,9 @@ fn fresh_settings_gets_three_managed_hook_entries() {
 fn rerunning_is_idempotent_no_duplicates() {
     let (_guard, project, _home) = isolated_project();
 
-    handle_setup_hooks_claude(project.path(), "local", "", false).expect("first run");
-    handle_setup_hooks_claude(project.path(), "local", "", false).expect("second run");
-    handle_setup_hooks_claude(project.path(), "local", "", false).expect("third run");
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("first run");
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("second run");
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("third run");
 
     let v = read_json(&local_settings_path(project.path()));
     for (event_name, ..) in HOOK_EVENTS {
@@ -109,9 +109,12 @@ fn disable_skips_named_events() {
         "local",
         "session-start,post-tool-use",
         false,
+        None,
     )
     .expect("setup hooks ok");
-    assert_eq!(result.events_registered, vec!["UserPromptSubmit"]);
+    assert_eq!(result.events_registered.len(), 2);
+    assert!(result.events_registered.contains(&"UserPromptSubmit".to_string()));
+    assert!(result.events_registered.contains(&"PreToolUse".to_string()));
     assert_eq!(result.events_skipped.len(), 2);
     assert!(result.events_skipped.contains(&"SessionStart".to_string()));
     assert!(result.events_skipped.contains(&"PostToolUse".to_string()));
@@ -120,13 +123,14 @@ fn disable_skips_named_events() {
     assert!(mdkb_entries(&v, "SessionStart").is_empty());
     assert!(mdkb_entries(&v, "PostToolUse").is_empty());
     assert_eq!(mdkb_entries(&v, "UserPromptSubmit").len(), 1);
+    assert_eq!(mdkb_entries(&v, "PreToolUse").len(), 1);
 }
 
 #[test]
 fn dry_run_does_not_write_file() {
     let (_guard, project, _home) = isolated_project();
 
-    let result = handle_setup_hooks_claude(project.path(), "local", "", true).expect("dry run ok");
+    let result = handle_setup_hooks_claude(project.path(), "local", "", true, None).expect("dry run ok");
     assert!(result.dry_run);
     assert!(result.success);
     assert_eq!(result.events_registered.len(), HOOK_EVENTS.len());
@@ -168,7 +172,7 @@ fn preserves_non_mdkb_hook_entries() {
     )
     .unwrap();
 
-    handle_setup_hooks_claude(project.path(), "local", "", false).expect("setup hooks ok");
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("setup hooks ok");
 
     let v = read_json(&settings_path);
 
@@ -244,7 +248,7 @@ fn concurrent_invocations_preserve_each_others_entries() {
         .map(|_| {
             let p = project_path.clone();
             thread::spawn(move || {
-                handle_setup_hooks_claude(&p, "local", "", false)
+                handle_setup_hooks_claude(&p, "local", "", false, None)
                     .expect("concurrent setup hooks ok")
             })
         })
@@ -272,7 +276,7 @@ fn concurrent_invocations_preserve_each_others_entries() {
 fn generated_command_has_daemon_then_fallback_guard() {
     let (_guard, project, _home) = isolated_project();
 
-    handle_setup_hooks_claude(project.path(), "local", "", false).expect("setup hooks ok");
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("setup hooks ok");
     let v = read_json(&local_settings_path(project.path()));
 
     for (event_name, cli_event, expected_matcher) in HOOK_EVENTS {

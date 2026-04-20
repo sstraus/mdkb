@@ -130,6 +130,17 @@ pub struct HooksSummary {
     pub slow_events_7d: usize,
     /// Lines pending in reindex-queue.jsonl.
     pub reindex_queue_pending: usize,
+    /// Per-event invocation stats (last 7 days, from hook-events.jsonl).
+    pub events: Vec<HookEventStats>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct HookEventStats {
+    pub event: String,
+    pub invocations: usize,
+    pub fired: usize,
+    pub avg_ms: u64,
+    pub p95_ms: u64,
 }
 
 // ── collect_report ───────────────────────────────────────────────────────────
@@ -424,11 +435,73 @@ fn collect_hooks(mdkb_dir: &Path) -> HooksSummary {
 
     let slow_events_7d = count_slow_events(mdkb_dir, cutoff);
     let reindex_queue_pending = count_jsonl_lines(&mdkb_dir.join("reindex-queue.jsonl"));
+    let events = collect_hook_event_stats(mdkb_dir, cutoff);
 
     HooksSummary {
         slow_events_7d,
         reindex_queue_pending,
+        events,
     }
+}
+
+fn collect_hook_event_stats(mdkb_dir: &Path, since_ts: i64) -> Vec<HookEventStats> {
+    let path = mdkb_dir.join("hook-events.jsonl");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+
+    let mut buckets: HashMap<String, Vec<(bool, u64)>> = HashMap::new();
+
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let ts = v.get("ts").and_then(|t| t.as_i64()).unwrap_or(0);
+        if ts < since_ts {
+            continue;
+        }
+        let event = v
+            .get("event")
+            .and_then(|e| e.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let outcome = v.get("outcome").and_then(|o| o.as_str()).unwrap_or("skipped");
+        let elapsed = v.get("elapsed_ms").and_then(|e| e.as_u64()).unwrap_or(0);
+        buckets
+            .entry(event)
+            .or_default()
+            .push((outcome == "fired", elapsed));
+    }
+
+    let mut stats: Vec<HookEventStats> = buckets
+        .into_iter()
+        .map(|(event, entries)| {
+            let invocations = entries.len();
+            let fired = entries.iter().filter(|(f, _)| *f).count();
+            let mut latencies: Vec<u64> = entries.iter().map(|(_, ms)| *ms).collect();
+            latencies.sort_unstable();
+            let avg_ms = if invocations > 0 {
+                latencies.iter().sum::<u64>() / invocations as u64
+            } else {
+                0
+            };
+            let p95_ms = if invocations > 0 {
+                latencies[(invocations as f64 * 0.95).ceil() as usize - 1]
+            } else {
+                0
+            };
+            HookEventStats {
+                event,
+                invocations,
+                fired,
+                avg_ms,
+                p95_ms,
+            }
+        })
+        .collect();
+
+    stats.sort_by(|a, b| b.invocations.cmp(&a.invocations));
+    stats
 }
 
 fn count_slow_events(mdkb_dir: &Path, since_ts: i64) -> usize {
@@ -725,6 +798,7 @@ mod tests {
             hooks: HooksSummary {
                 slow_events_7d: 0,
                 reindex_queue_pending: 0,
+                events: vec![],
             },
         }
     }
@@ -741,6 +815,39 @@ mod tests {
 
         let report = collect_report(&env.ctx).expect("collect");
         assert_eq!(report.hooks.reindex_queue_pending, 2);
+    }
+
+    #[test]
+    fn hooks_summary_aggregates_event_stats() {
+        let env = Env::new();
+        let mdkb_dir = env.ctx.db_path.parent().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let lines = [
+            format!(r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":5,"ts":{}}}"#, now),
+            format!(r#"{{"event":"PreToolUse","outcome":"skipped","elapsed_ms":2,"ts":{}}}"#, now),
+            format!(r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":10,"ts":{}}}"#, now),
+            format!(r#"{{"event":"PostToolUse","outcome":"fired","elapsed_ms":3,"ts":{}}}"#, now),
+            // Old event — should be excluded (8 days ago)
+            format!(r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":1,"ts":{}}}"#, now - 8 * 86_400),
+        ];
+        std::fs::write(
+            mdkb_dir.join("hook-events.jsonl"),
+            lines.join("\n") + "\n",
+        )
+        .unwrap();
+
+        let report = collect_report(&env.ctx).expect("collect");
+        assert_eq!(report.hooks.events.len(), 2);
+
+        let pre = report.hooks.events.iter().find(|e| e.event == "PreToolUse").unwrap();
+        assert_eq!(pre.invocations, 3);
+        assert_eq!(pre.fired, 2);
+        assert_eq!(pre.avg_ms, 5); // (5+2+10)/3 = 5
+        assert_eq!(pre.p95_ms, 10); // sorted: [2,5,10], idx ceil(3*0.95)-1 = 2 → 10
+
+        let post = report.hooks.events.iter().find(|e| e.event == "PostToolUse").unwrap();
+        assert_eq!(post.invocations, 1);
+        assert_eq!(post.fired, 1);
     }
 
     fn make_entry(id: &str, entry_type: EntryType) -> MemoryEntry {

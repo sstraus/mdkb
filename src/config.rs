@@ -324,6 +324,7 @@ pub struct HooksConfig {
     pub session_start_enabled: bool,
     pub user_prompt_submit_enabled: bool,
     pub post_tool_use_enabled: bool,
+    pub pre_tool_use_enabled: bool,
 
     /// Maximum number of entries injected on SessionStart (warmup).
     pub warmup_limit: usize,
@@ -336,6 +337,17 @@ pub struct HooksConfig {
 
     /// Minimum hybrid score for a recall result to be injected.
     pub min_recall_score: f64,
+
+    /// Half-life for access-recency re-ranking in seconds (default 7 days).
+    ///
+    /// Controls how quickly the recency signal decays. Entries accessed more
+    /// recently get a larger boost. Set to 0 to disable re-ranking.
+    pub recall_half_life_secs: i64,
+
+    /// When true, hooks require a running daemon and skip the in-process
+    /// fallback (MDKB_NO_DAEMON=1). The generated shell command will NOT
+    /// include the `if ! ...; then MDKB_NO_DAEMON=1 ...; fi` wrapper.
+    pub daemon_required: bool,
 }
 
 impl Default for HooksConfig {
@@ -344,10 +356,13 @@ impl Default for HooksConfig {
             session_start_enabled: true,
             user_prompt_submit_enabled: true,
             post_tool_use_enabled: true,
+            pre_tool_use_enabled: true,
             warmup_limit: 50,
             recall_limit: 5,
             latency_budget_ms: 200,
             min_recall_score: 0.3,
+            recall_half_life_secs: 7 * 24 * 60 * 60, // 7 days
+            daemon_required: false,
         }
     }
 }
