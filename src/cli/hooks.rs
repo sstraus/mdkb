@@ -15,7 +15,6 @@ use serde_json::{Value, json};
 use crate::cli::HookEvent;
 use crate::cli::handlers::Context;
 use crate::config::{Config, HooksConfig};
-use crate::daemon::config::DaemonConfig;
 use crate::store::memory::{access_recency_score, get_warmup_index, search_entries_fts};
 
 /// Entry point for `mdkb hook <event>`.
@@ -183,12 +182,25 @@ fn handle_session_start(_event: Value) -> Value {
         return json!({});
     }
 
+    let bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "mdkb".to_string());
+
     let mut body = String::from("## mdkb memory warmup\n\n");
     for line in &lines {
         body.push_str("- ");
         body.push_str(line);
         body.push('\n');
     }
+
+    body.push_str(&format!(
+        "\n**mdkb CLI** (semantic search — not available via Grep/Glob):\n\
+         - `{0} search <query>` — docs/memory/code\n\
+         - `{0} search --scope symbols <name>` — symbol lookup with file:line\n\
+         - `{0} code callers|calls|impact <symbol>` — call graph\n",
+        bin
+    ));
 
     let elapsed_ms = start.elapsed().as_millis();
     if elapsed_ms > cfg.latency_budget_ms as u128 {
@@ -518,7 +530,7 @@ fn handle_post_tool_use(event: Value) -> Value {
 /// could answer more efficiently via `search(scope="symbols")` or `code_graph`.
 ///
 /// Returns `Some(suggestion_text)` when the pattern is permutable, `None` otherwise.
-fn classify_grep_pattern(pattern: &str, path: Option<&str>) -> Option<String> {
+fn classify_grep_pattern(pattern: &str, path: Option<&str>, bin: &str) -> Option<String> {
     if pattern.len() < 3 {
         return None;
     }
@@ -540,7 +552,7 @@ fn classify_grep_pattern(pattern: &str, path: Option<&str>) -> Option<String> {
     let regex_meta = ['*', '+', '?', '{', '}', '[', ']', '(', ')', '^', '$', '|', '.'];
     let has_regex = pattern.chars().any(|c| regex_meta.contains(&c));
     if has_regex {
-        return classify_callsite_pattern(pattern);
+        return classify_callsite_pattern(pattern, bin);
     }
 
     // Pure identifier: snake_case, CamelCase, SCREAMING_SNAKE, with optional :: separators.
@@ -549,10 +561,8 @@ fn classify_grep_pattern(pattern: &str, path: Option<&str>) -> Option<String> {
         .all(|c| c.is_alphanumeric() || c == '_' || c == ':');
     if is_ident {
         return Some(format!(
-            "\"{}\" is a symbol name — use `mcp__mdkb__search` scope=\"symbols\" q=\"{}\" instead of Grep: \
-             it returns ranked results with file:line locations. \
-             For callers/callees use `mcp__mdkb__code_graph` symbol=\"{}\".",
-            pattern, pattern, pattern
+            "Use `{} search --scope symbols \"{}\"` or `{} code callers {}` via Bash.",
+            bin, pattern, bin, pattern
         ));
     }
 
@@ -560,7 +570,7 @@ fn classify_grep_pattern(pattern: &str, path: Option<&str>) -> Option<String> {
 }
 
 /// Check for callsite patterns like `function_name\(` or `ClassName\.method`.
-fn classify_callsite_pattern(pattern: &str) -> Option<String> {
+fn classify_callsite_pattern(pattern: &str, bin: &str) -> Option<String> {
     // Pattern: identifier followed by escaped paren or dot — looking for call sites.
     let stripped = pattern
         .trim_end_matches("\\(")
@@ -577,9 +587,8 @@ fn classify_callsite_pattern(pattern: &str) -> Option<String> {
 
     if is_ident && stripped.len() < pattern.len() {
         return Some(format!(
-            "Callsite search for \"{}\" — use `mcp__mdkb__code_graph` symbol=\"{}\" direction=\"callers\" instead: \
-             it returns all call sites with file:line, more efficient than regex matching.",
-            stripped, stripped
+            "Use `{} code callers {}` via Bash.",
+            bin, stripped
         ));
     }
 
@@ -593,7 +602,7 @@ const DEF_KEYWORDS: &[&str] = &[
     "pub trait ", "async fn ", "pub async fn ",
 ];
 
-fn classify_definition_search(pattern: &str) -> Option<String> {
+fn classify_definition_search(pattern: &str, bin: &str) -> Option<String> {
     let lower = pattern.to_lowercase();
     for kw in DEF_KEYWORDS {
         if lower.starts_with(kw) {
@@ -604,9 +613,8 @@ fn classify_definition_search(pattern: &str) -> Option<String> {
                     .all(|c| c.is_alphanumeric() || c == '_')
             {
                 return Some(format!(
-                    "Definition search for \"{}\" — use `mcp__mdkb__search` scope=\"symbols\" q=\"{}\" instead: \
-                     it finds definitions directly with file:line, more efficient than regex.",
-                    symbol, symbol
+                    "Use `{} search --scope symbols \"{}\"` via Bash.",
+                    bin, symbol
                 ));
             }
         }
@@ -654,16 +662,14 @@ fn handle_pre_tool_use(event: Value) -> Value {
 
     let path = tool_input.get("path").and_then(|v| v.as_str());
 
-    // Only suggest mdkb alternatives when the daemon is reachable —
-    // without it, search/code_graph would fail or fall back to cold DB open.
-    let daemon_socket = DaemonConfig::daemon_home().join("daemon-hook.sock");
-    if !daemon_socket.exists() {
-        return json!({});
-    }
+    let bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "mdkb".to_string());
 
     // Try classifiers in order: definition search, callsite, then pure symbol.
-    let suggestion = classify_definition_search(pattern)
-        .or_else(|| classify_grep_pattern(pattern, path));
+    let suggestion = classify_definition_search(pattern, &bin)
+        .or_else(|| classify_grep_pattern(pattern, path, &bin));
 
     match suggestion {
         Some(text) => json!({
@@ -748,74 +754,74 @@ mod tests {
 
     #[test]
     fn classify_symbol_name() {
-        let r = classify_grep_pattern("handle_post_tool_use", None);
+        let r = classify_grep_pattern("handle_post_tool_use", None, "mdkb");
         assert!(r.is_some(), "snake_case identifier must be classified");
-        assert!(r.unwrap().contains("mcp__mdkb__search"));
+        assert!(r.unwrap().contains("mdkb search"));
     }
 
     #[test]
     fn classify_camel_case_symbol() {
-        let r = classify_grep_pattern("MemoryEntry", None);
+        let r = classify_grep_pattern("MemoryEntry", None, "mdkb");
         assert!(r.is_some(), "CamelCase identifier must be classified");
     }
 
     #[test]
     fn classify_scoped_symbol() {
-        let r = classify_grep_pattern("hooks::dispatch", None);
+        let r = classify_grep_pattern("hooks::dispatch", None, "mdkb");
         assert!(r.is_some(), "scoped identifier must be classified");
     }
 
     #[test]
     fn classify_short_pattern_skipped() {
-        assert!(classify_grep_pattern("fn", None).is_none());
-        assert!(classify_grep_pattern("ab", None).is_none());
+        assert!(classify_grep_pattern("fn", None, "mdkb").is_none());
+        assert!(classify_grep_pattern("ab", None, "mdkb").is_none());
     }
 
     #[test]
     fn classify_regex_not_permutable() {
-        assert!(classify_grep_pattern("log.*Error", None).is_none());
-        assert!(classify_grep_pattern("fn\\s+\\w+", None).is_none());
-        assert!(classify_grep_pattern("[A-Z]+_CONFIG", None).is_none());
+        assert!(classify_grep_pattern("log.*Error", None, "mdkb").is_none());
+        assert!(classify_grep_pattern("fn\\s+\\w+", None, "mdkb").is_none());
+        assert!(classify_grep_pattern("[A-Z]+_CONFIG", None, "mdkb").is_none());
     }
 
     #[test]
     fn classify_callsite_pattern_detected() {
-        let r = classify_grep_pattern("dispatch\\(", None);
+        let r = classify_grep_pattern("dispatch\\(", None, "mdkb");
         assert!(r.is_some(), "callsite pattern must be classified");
-        assert!(r.unwrap().contains("code_graph"));
+        assert!(r.unwrap().contains("code callers"));
     }
 
     #[test]
     fn classify_single_file_path_skipped() {
-        let r = classify_grep_pattern("MemoryEntry", Some("src/store/memory.rs"));
+        let r = classify_grep_pattern("MemoryEntry", Some("src/store/memory.rs"), "mdkb");
         assert!(r.is_none(), "single-file grep should not be redirected");
     }
 
     #[test]
     fn classify_directory_path_not_skipped() {
-        let r = classify_grep_pattern("MemoryEntry", Some("src/"));
+        let r = classify_grep_pattern("MemoryEntry", Some("src/"), "mdkb");
         assert!(r.is_some(), "directory grep should suggest alternative");
     }
 
     #[test]
     fn classify_definition_search_detected() {
-        let r = classify_definition_search("fn dispatch");
+        let r = classify_definition_search("fn dispatch", "mdkb");
         assert!(r.is_some());
-        assert!(r.unwrap().contains("mcp__mdkb__search"));
+        assert!(r.unwrap().contains("mdkb search"));
     }
 
     #[test]
     fn classify_definition_pub_fn() {
-        assert!(classify_definition_search("pub fn handle_update").is_some());
+        assert!(classify_definition_search("pub fn handle_update", "mdkb").is_some());
     }
 
     #[test]
     fn classify_definition_struct() {
-        assert!(classify_definition_search("struct HooksConfig").is_some());
+        assert!(classify_definition_search("struct HooksConfig", "mdkb").is_some());
     }
 
     #[test]
     fn classify_non_definition_pattern() {
-        assert!(classify_definition_search("random text here").is_none());
+        assert!(classify_definition_search("random text here", "mdkb").is_none());
     }
 }

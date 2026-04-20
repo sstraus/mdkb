@@ -1332,30 +1332,26 @@ const BASE_INSTRUCTIONS: &str = "\
 | Semantic code query | `search(query, scope=\"code\")` | 1 |
 | Architecture/decisions | `search(query)` → `get(id)` | 2 |
 
-**Grep for:** regex, literal strings, files not in index. **mdkb for:** call graphs, symbol lookup, impact analysis, semantic/architectural queries.
-
 ## Memory
 
 - `search(query, scope=\"memory\")` — check before writing duplicates.
 - `memory_write` / `memory_write_batch` — persist after solving problems.
-- `memory_confirm(id, outcome=\"confirmed\"|\"refuted\")` — Bayesian signal: atomic confirmations +/-1 (floor 0) + last_confirmed_at. Use instead of memory_write when only adjusting belief.
+- `memory_confirm(id, outcome=\"confirmed\"|\"refuted\")` — Bayesian signal: +/-1 (floor 0). Use instead of memory_write when only adjusting belief.
 - `memory_delete` — remove stale entries.
-- `usage` — audit token economy when output feels expensive.
+- `usage` — audit token economy.
 
-`entry_type`: `problem`, `decision`, `topic`, `reminder` (time-bound follow-up; requires `due_in`).
-`ttl` (seconds): auto-expire. Omit = permanent. `search` returns IDs → `get(id)` for full content.
-Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
+`search` returns IDs → `get(id)` for full content. Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
 
 ### Reminders
 
 Create: `memory_write(id, title, content, entry_type=\"reminder\", due_in=<seconds>)`.
-A due reminder appears at the top of these instructions as `[reminder:DUE] {id}: {title}` once `due_in` elapses.
+A due reminder appears as `[reminder:DUE] {id}: {title}` once `due_in` elapses.
 
 When you see one:
-1. Ask the user if it is done. End your turn — do NOT call `memory_delete` yet.
-2. Wait for the user's next message. Delete only on an unambiguous affirmative whose primary intent is confirming this reminder. Ambiguous replies or incidental mentions of the topic = re-ask.
-3. Confirmed → `memory_delete(id)`. If response is \"not found\", tell the user it was already removed.
-4. Snooze → first `get(id)` for the content, then `memory_write(id, title, <content>, entry_type=\"reminder\", due_in=<new_seconds>)` (same `id` updates the record).
+1. Ask if done. End your turn — do NOT delete yet.
+2. Delete only on unambiguous affirmative. Ambiguous = re-ask.
+3. Confirmed → `memory_delete(id)`. \"not found\" = already removed.
+4. Snooze → `get(id)`, then `memory_write(id, title, <content>, entry_type=\"reminder\", due_in=<new_seconds>)`.
 ";
 
 /// Select the base instructions variant based on `MDKB_INSTRUCTIONS_VARIANT` env var.

@@ -85,7 +85,7 @@ pub struct MemoryWriteParams {
     /// Full content.
     pub content: String,
 
-    /// Entry type: topic, problem, decision, or reminder (time-bound; pair with due_in).
+    /// Entry type: topic, problem, decision, reminder (time-bound; pair with due_in), or prior (behavioral; 30d TTL default).
     #[serde(default = "default_entry_type")]
     pub entry_type: String,
 
@@ -126,7 +126,7 @@ pub struct MemoryWriteBatchEntry {
     /// Full content.
     pub content: String,
 
-    /// Entry type: topic, problem, decision, or reminder (time-bound; pair with due_in).
+    /// Entry type: topic, problem, decision, reminder (time-bound; pair with due_in), or prior (behavioral; 30d TTL default).
     #[serde(default = "default_entry_type")]
     pub entry_type: String,
 

@@ -273,7 +273,7 @@ fn write_single_memory(
 
     let entry_type: memory::EntryType = entry_type_str.parse().map_err(|e: String| {
         mcp_error(format!(
-            "{e}. Valid types: topic, problem, decision, reminder"
+            "{e}. Valid types: topic, problem, decision, reminder, prior"
         ))
     })?;
 
@@ -281,7 +281,14 @@ fn write_single_memory(
         source_type_str.parse().map_err(|e: String| mcp_error(e))?;
 
     let now = chrono::Utc::now().timestamp();
-    let expires_at = ttl.map(|s| now + s as i64);
+    // Priors default to 30-day TTL if not explicitly specified.
+    const PRIOR_DEFAULT_TTL: u64 = 30 * 24 * 3600;
+    let effective_ttl = ttl.or(if entry_type == memory::EntryType::Prior {
+        Some(PRIOR_DEFAULT_TTL)
+    } else {
+        None
+    });
+    let expires_at = effective_ttl.map(|s| now + s as i64);
     let due_at = due_in.map(|s| now + s as i64);
     let is_new = existing.is_none();
 

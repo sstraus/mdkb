@@ -189,6 +189,7 @@ pub enum EntryType {
     Problem,
     Decision,
     Reminder,
+    Prior,
 }
 
 impl std::fmt::Display for EntryType {
@@ -198,6 +199,7 @@ impl std::fmt::Display for EntryType {
             Self::Problem => write!(f, "problem"),
             Self::Decision => write!(f, "decision"),
             Self::Reminder => write!(f, "reminder"),
+            Self::Prior => write!(f, "prior"),
         }
     }
 }
@@ -211,6 +213,7 @@ impl std::str::FromStr for EntryType {
             "problem" => Ok(Self::Problem),
             "decision" => Ok(Self::Decision),
             "reminder" => Ok(Self::Reminder),
+            "prior" => Ok(Self::Prior),
             _ => Err(format!("Invalid entry type: {s}")),
         }
     }
@@ -295,13 +298,15 @@ pub fn list_entries_sorted(
             "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
             FROM memory_entries WHERE status = ?1
             AND (expires_at IS NULL OR expires_at > ?2)
-            AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?2)) {order_clause} LIMIT ?3"
+            AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?2))
+            AND entry_type != 'prior' {order_clause} LIMIT ?3"
         )
     } else {
         format!(
             "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
             FROM memory_entries WHERE (expires_at IS NULL OR expires_at > ?1)
-            AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?1)) {order_clause} LIMIT ?2"
+            AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?1))
+            AND entry_type != 'prior' {order_clause} LIMIT ?2"
         )
     };
 
@@ -648,6 +653,36 @@ pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Ve
     search_entries_fts(conn, &fts_query, limit)
 }
 
+/// FTS search filtered to a single entry_type. No default exclusions applied.
+pub fn search_entries_by_type(
+    conn: &Connection,
+    query: &str,
+    entry_type: &str,
+    limit: usize,
+) -> Result<Vec<MemoryEntry>> {
+    let fts_query = crate::store::search::escape_fts5_query(query);
+    let now = Utc::now().timestamp();
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at, m.due_at
+         FROM memory_entries m
+         JOIN memory_fts f ON m.rowid = f.rowid
+         WHERE memory_fts MATCH ?1
+         AND m.entry_type = ?4
+         AND (m.expires_at IS NULL OR m.expires_at > ?3)
+         ORDER BY bm25(memory_fts)
+         LIMIT ?2"
+    )?;
+
+    let rows = stmt.query_map(params![fts_query, limit as i64, now, entry_type], row_to_entry)?;
+
+    let mut entries = Vec::new();
+    for row in rows {
+        entries.push(row?);
+    }
+
+    Ok(entries)
+}
+
 /// Search memory entries using a pre-built FTS5 query expression.
 ///
 /// Callers are responsible for producing a valid FTS5 query (including OR /
@@ -667,6 +702,7 @@ pub fn search_entries_fts(
          WHERE memory_fts MATCH ?1
          AND (m.expires_at IS NULL OR m.expires_at > ?3)
          AND NOT (m.entry_type = 'reminder' AND (m.due_at IS NULL OR m.due_at > ?3))
+         AND m.entry_type != 'prior'
          ORDER BY bm25(memory_fts)
          LIMIT ?2"
     )?;
@@ -696,6 +732,7 @@ fn bm25_search_with_rowid(
          WHERE memory_fts MATCH ?1
          AND (m.expires_at IS NULL OR m.expires_at > ?3)
          AND NOT (m.entry_type = 'reminder' AND (m.due_at IS NULL OR m.due_at > ?3))
+         AND m.entry_type != 'prior'
          ORDER BY bm25(memory_fts)
          LIMIT ?2"
     )?;
@@ -1022,7 +1059,7 @@ pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> 
     let mut stmt = conn.prepare(
         "SELECT id, title, entry_type, tags FROM memory_entries
          WHERE status = 'active'
-         AND entry_type != 'reminder'
+         AND entry_type NOT IN ('reminder', 'prior')
          AND (expires_at IS NULL OR expires_at > ?2)
          ORDER BY access_count DESC
          LIMIT ?1",
@@ -1068,7 +1105,8 @@ pub fn count_active_entries(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM memory_entries WHERE status = 'active'
          AND (expires_at IS NULL OR expires_at > ?1)
-         AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?1))",
+         AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?1))
+         AND entry_type != 'prior'",
         params![now],
         |row| row.get(0),
     )?;

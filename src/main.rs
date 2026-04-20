@@ -132,6 +132,7 @@ async fn run() -> Result<()> {
             scope,
             kind,
             file,
+            entry_type,
         } => {
             let ctx = Context::open(&cwd)?;
             match scope.as_deref() {
@@ -146,7 +147,11 @@ async fn run() -> Result<()> {
                     format_search_results(&results, cli.format);
                 }
                 Some("memory") => {
-                    let entries = handle_memory_search(&ctx, &query, limit)?;
+                    let entries = if let Some(ref et) = entry_type {
+                        mdkb::store::memory::search_entries_by_type(&ctx.conn, &query, et, limit)?
+                    } else {
+                        handle_memory_search(&ctx, &query, limit)?
+                    };
                     format_memory_list(&entries, cli.format);
                 }
                 None => {

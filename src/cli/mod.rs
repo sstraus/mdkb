@@ -80,6 +80,10 @@ pub enum Command {
         /// Filter by file path (substring match) - used with symbols scope
         #[arg(short, long)]
         file: Option<String>,
+
+        /// Filter by entry type (topic, problem, decision, reminder, prior) - used with memory scope
+        #[arg(long = "entry-type")]
+        entry_type: Option<String>,
     },
 
     /// Retrieve a document by ID, path, memory slug, glob pattern, or comma-separated list
