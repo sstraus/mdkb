@@ -12,17 +12,20 @@ Claude Code / Codex CLI
   |
   |-- SessionStart -------> mdkb hook session-start -----> warmup context
   |-- UserPromptSubmit ----> mdkb hook user-prompt-submit -> recall context
+  |-- PreToolUse ----------> mdkb hook pre-tool-use ------> CLI suggestions
+  |    (matcher: Grep)
   |-- PostToolUse ---------> mdkb hook post-tool-use -----> reindex queue
        (matcher: Edit|Write|
         NotebookEdit|MultiEdit)
 ```
 
-Three lifecycle hooks, each with a single responsibility:
+Four lifecycle hooks, each with a single responsibility:
 
 | Hook | Trigger | Purpose | Output |
 |------|---------|---------|--------|
 | **SessionStart** | Session opens | Inject memory warmup so the assistant knows what's stored | `additionalContext` with entry summaries |
 | **UserPromptSubmit** | Every user message | Match prompt keywords against memory FTS index, inject relevant entries | `additionalContext` with matched entries |
+| **PreToolUse** | Before Grep | Classify grep pattern and suggest `mdkb search`/`mdkb code` CLI commands | `additionalContext` with CLI suggestion |
 | **PostToolUse** | Edit/Write/NotebookEdit/MultiEdit | Queue changed files for reindexing | Append to `reindex-queue.jsonl` |
 
 ## Execution Model
@@ -120,6 +123,28 @@ stopwords or short words produce no FTS tokens → hook returns `{}`.
 reminder context before the assistant processes the prompt. This is
 proactive recall — the assistant doesn't need to decide to search.
 
+### PreToolUse
+
+**Flow:**
+1. Check `.mdkbignore-hooks` and `.mdkb/` → skip if absent
+2. Extract `tool_input.pattern` from stdin JSON → skip if empty
+3. Classify pattern:
+   - Pure identifier (single word, no regex metacharacters) → suggest
+     `mdkb search --scope symbols "{pattern}"`
+   - Definition search (`fn X`, `func X`, `def X`, `class X`, etc.) →
+     suggest `mdkb code callers {name}`
+   - Callsite pattern (`name(`) → suggest `mdkb code callers {name}`
+   - Other → return `{}`
+4. Resolve binary path via `std::env::current_exe()`
+5. Build suggestion: `Use '{binary} search --scope symbols "{pattern}"'
+   or '{binary} code callers {pattern}' via Bash.`
+
+**Matcher:** `Grep` — only Grep tool invocations trigger this hook.
+
+**What the assistant sees:** A suggestion to use mdkb CLI commands
+instead of (or in addition to) Grep. Works without MCP — the suggestion
+references the CLI binary directly.
+
 ### PostToolUse
 
 **Flow:**
@@ -148,6 +173,7 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 |-----|------|---------|-------|
 | `session_start_enabled` | bool | `true` | Disable warmup injection |
 | `user_prompt_submit_enabled` | bool | `true` | Disable recall injection |
+| `pre_tool_use_enabled` | bool | `true` | Disable Grep interception suggestions |
 | `post_tool_use_enabled` | bool | `true` | Disable reindex queue writes |
 | `warmup_limit` | usize | `50` | Max entries in SessionStart warmup |
 | `recall_limit` | usize | `5` | Max FTS results in UserPromptSubmit |
@@ -162,7 +188,8 @@ From most to least granular:
    return `{}` for any CWD under this marker. Searched upward to `$HOME`.
 2. **Per-event toggle** — `session_start_enabled = false` etc. in config.toml.
 3. **Disable at install** — `mdkb setup hooks claude --disable post-tool-use`.
-4. **Uninstall** — remove hook entries from settings file.
+4. **Uninstall** — `mdkb setup remove hooks claude|codex`, or remove
+   hook entries from settings file manually.
 
 ## Observability
 

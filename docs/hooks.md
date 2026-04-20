@@ -14,6 +14,9 @@ from stale training data. Hooks make recall proactive:
   memory entries as soon as a session opens.
 - **UserPromptSubmit** — match the user's prompt against the memory FTS
   index and inject the top-N entries before the assistant replies.
+- **PreToolUse** — intercept `Grep` calls and suggest `mdkb search` /
+  `mdkb code` CLI commands when the pattern looks like an identifier or
+  definition search. Works without MCP.
 - **PostToolUse** — when `Edit` / `Write` / `MultiEdit` / `NotebookEdit`
   touches a file, append it to `.mdkb/reindex-queue.jsonl` so the next
   `mdkb update` pass picks it up.
@@ -44,7 +47,7 @@ mdkb setup hooks claude --disable post-tool-use
 mdkb setup hooks claude --disable user-prompt-submit,post-tool-use
 ```
 
-Valid values: `session-start`, `user-prompt-submit`, `post-tool-use`.
+Valid values: `session-start`, `user-prompt-submit`, `pre-tool-use`, `post-tool-use`.
 
 ### Dry run
 
@@ -99,6 +102,40 @@ Output (when matches are found):
 }
 ```
 
+### PreToolUse
+
+Input:
+
+```json
+{
+  "tool_name": "Grep",
+  "tool_input": { "pattern": "handleAuth", "path": "src/" }
+}
+```
+
+Only `Grep` is intercepted (via the `matcher` field in settings).
+The handler classifies the grep pattern:
+
+- **Pure identifier** (e.g. `handleAuth`) → suggests `mdkb search --scope symbols`
+- **Definition search** (e.g. `func handleAuth`, `fn handle_auth`) →
+  suggests `mdkb code callers`
+- **Callsite pattern** (e.g. `handleAuth(`) → suggests `mdkb code callers`
+- **Other patterns** → no suggestion (returns `{}`)
+
+Output (when a suggestion applies):
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "additionalContext": "Use '/path/to/mdkb search --scope symbols \"handleAuth\"' via Bash.\n"
+  }
+}
+```
+
+The binary path is resolved via `current_exe()` so suggestions work
+regardless of installation location.
+
 ### PostToolUse
 
 Input:
@@ -129,6 +166,7 @@ All toggles live under `[hooks]` in `.mdkb/config.toml`:
 [hooks]
 session_start_enabled = true
 user_prompt_submit_enabled = true
+pre_tool_use_enabled = true
 post_tool_use_enabled = true
 
 # Max recall results injected on UserPromptSubmit.
@@ -159,9 +197,9 @@ Three ways, in order of granularity:
 2. **Per-event config toggle** — set
    `session_start_enabled = false` (or the other two) in
    `.mdkb/config.toml`.
-3. **Uninstall** — remove the hook entries from the host CLI's
-   settings file (`.claude/settings.local.json`, `~/.claude/settings.json`,
-   or `~/.codex/hooks.json`).
+3. **Uninstall** — `mdkb setup remove hooks claude --scope local|user`
+   or `mdkb setup remove hooks codex`. Or remove the `_managedBy: "mdkb"`
+   entries manually from the settings file.
 
 The `.mdkbignore-hooks` marker is looked up by walking ancestor
 directories up to `$HOME`; it is never searched above the user home
