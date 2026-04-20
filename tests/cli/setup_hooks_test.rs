@@ -60,7 +60,7 @@ fn fresh_settings_gets_three_managed_hook_entries() {
     assert!(path.exists(), "settings file must be written");
 
     let v = read_json(&path);
-    for (event_name, _) in HOOK_EVENTS {
+    for (event_name, ..) in HOOK_EVENTS {
         let managed = mdkb_entries(&v, event_name);
         assert_eq!(
             managed.len(),
@@ -90,7 +90,7 @@ fn rerunning_is_idempotent_no_duplicates() {
     handle_setup_hooks_claude(project.path(), "local", "", false).expect("third run");
 
     let v = read_json(&local_settings_path(project.path()));
-    for (event_name, _) in HOOK_EVENTS {
+    for (event_name, ..) in HOOK_EVENTS {
         let managed = mdkb_entries(&v, event_name);
         assert_eq!(
             managed.len(),
@@ -255,7 +255,7 @@ fn concurrent_invocations_preserve_each_others_entries() {
     }
 
     let v = read_json(&local_settings_path(&project_path));
-    for (event_name, _) in HOOK_EVENTS {
+    for (event_name, ..) in HOOK_EVENTS {
         let managed = mdkb_entries(&v, event_name);
         assert_eq!(
             managed.len(),
@@ -275,7 +275,7 @@ fn generated_command_has_daemon_then_fallback_guard() {
     handle_setup_hooks_claude(project.path(), "local", "", false).expect("setup hooks ok");
     let v = read_json(&local_settings_path(project.path()));
 
-    for (event_name, cli_event) in HOOK_EVENTS {
+    for (event_name, cli_event, expected_matcher) in HOOK_EVENTS {
         let managed = mdkb_entries(&v, event_name);
         let cmd = managed[0]
             .get("hooks")
@@ -297,6 +297,12 @@ fn generated_command_has_daemon_then_fallback_guard() {
         assert!(
             cmd.contains("if !") && cmd.contains("; fi"),
             "{event_name}: fallback must be wrapped in `if ! …; then …; fi`: {cmd}"
+        );
+
+        let actual_matcher = managed[0].get("matcher").and_then(|v| v.as_str());
+        assert_eq!(
+            actual_matcher, *expected_matcher,
+            "{event_name}: matcher mismatch"
         );
     }
 }

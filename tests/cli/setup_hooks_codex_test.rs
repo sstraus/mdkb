@@ -61,7 +61,7 @@ fn fresh_hooks_file_gets_managed_entries_for_each_event() {
     assert!(path.exists(), "hooks.json must be written");
 
     let v = read_json(&path);
-    for (event_name, _) in HOOK_EVENTS {
+    for (event_name, ..) in HOOK_EVENTS {
         let managed = mdkb_entries(&v, event_name);
         assert_eq!(
             managed.len(),
@@ -92,7 +92,7 @@ fn rerunning_codex_is_idempotent() {
 
     let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
     let v = read_json(&codex_hooks_path(&home));
-    for (event_name, _) in HOOK_EVENTS {
+    for (event_name, ..) in HOOK_EVENTS {
         let managed = mdkb_entries(&v, event_name);
         assert_eq!(
             managed.len(),
@@ -238,7 +238,7 @@ fn codex_generated_command_has_daemon_then_fallback_guard() {
     handle_setup_hooks_codex("", false).expect("setup hooks codex ok");
     let v = read_json(&codex_hooks_path(home.path()));
 
-    for (event_name, cli_event) in HOOK_EVENTS {
+    for (event_name, cli_event, expected_matcher) in HOOK_EVENTS {
         let managed = mdkb_entries(&v, event_name);
         let cmd = managed[0]
             .get("hooks")
@@ -259,6 +259,12 @@ fn codex_generated_command_has_daemon_then_fallback_guard() {
         assert!(
             cmd.contains("if !") && cmd.contains("; fi"),
             "{event_name}: fallback must be wrapped in `if ! …; then …; fi`: {cmd}"
+        );
+
+        let actual_matcher = managed[0].get("matcher").and_then(|v| v.as_str());
+        assert_eq!(
+            actual_matcher, *expected_matcher,
+            "{event_name}: matcher mismatch"
         );
     }
 }

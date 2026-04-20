@@ -278,10 +278,11 @@ pub struct HooksSetupResult {
 }
 
 /// Three events currently emitted by `mdkb hook`.
-pub const HOOK_EVENTS: &[(&str, &str)] = &[
-    ("SessionStart", "session-start"),
-    ("UserPromptSubmit", "user-prompt-submit"),
-    ("PostToolUse", "post-tool-use"),
+/// Tuple: (event_name, cli_event, optional matcher for settings.json).
+pub const HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
+    ("SessionStart", "session-start", None),
+    ("UserPromptSubmit", "user-prompt-submit", None),
+    ("PostToolUse", "post-tool-use", Some("Edit|Write|NotebookEdit|MultiEdit")),
 ];
 
 /// Single-quote shell escaping: wraps `s` in single quotes, escaping any
@@ -483,16 +484,19 @@ fn upsert_hook_entries(
     let mut registered = Vec::new();
     let mut skipped = Vec::new();
 
-    for (event_name, cli_event) in HOOK_EVENTS {
+    for (event_name, cli_event, matcher) in HOOK_EVENTS {
         if disabled.contains(*event_name) {
             skipped.push((*event_name).to_string());
             continue;
         }
         let command = hook_command_line(binary_path, cli_event);
-        let mdkb_entry = serde_json::json!({
+        let mut mdkb_entry = serde_json::json!({
             "_managedBy": "mdkb",
             "hooks": [{"type": "command", "command": command}]
         });
+        if let Some(m) = matcher {
+            mdkb_entry["matcher"] = serde_json::json!(m);
+        }
         let entry_list = hooks_root
             .as_object_mut()
             .unwrap()
