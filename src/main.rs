@@ -722,6 +722,44 @@ async fn run() -> Result<()> {
                 }
             }
         }
+        Command::Cheatsheet => {
+            let bin = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+                .unwrap_or_else(|| "mdkb".to_string());
+            print!(
+                "\
+# Search
+{0} search <query>                                    # docs + memory (default)
+{0} search <query> --scope memory                     # memory only
+{0} search <query> --scope memory --entry-type TYPE    # filter by type
+{0} search <query> --scope docs                        # documents only
+{0} search <query> --scope symbols                     # symbol definitions (fuzzy)
+{0} search <query> --scope symbols --file '*hook*'     # symbols in matching files
+{0} search <query> --scope code                        # semantic code search
+{0} get <id>                                           # full document/memory by ID
+{0} get <id> --lines 10:50                             # line range
+
+# Memory (--entry-type: topic, problem, decision, reminder, prior)
+{0} memory add <id> --title T --content C              # create (default: topic)
+{0} memory add <id> --title T --content C --entry-type prior --tags t1,t2
+{0} memory add <id> --title T --content C --entry-type reminder --due-in 3600
+{0} memory rm <id>                                     # delete
+{0} memory list                                        # list active entries
+
+# Code intelligence
+{0} code callers <symbol>                              # who calls this?
+{0} code calls <symbol>                                # what does this call?
+{0} code impact <symbol>                               # transitive dependency graph
+{0} code search <query>                                # fuzzy symbol search
+
+# Maintenance
+{0} update                                             # reindex all
+{0} stats                                              # index health, hooks, sessions
+",
+                bin
+            );
+        }
         Command::Code(cmd) => match cmd {
             CodeCommand::Init => {
                 mdkb::cli::handlers::handle_code_init(&cwd)?;

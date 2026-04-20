@@ -219,6 +219,9 @@ pub enum Command {
     #[command(subcommand)]
     Code(CodeCommand),
 
+    /// Compact command reference for AI consumption
+    Cheatsheet,
+
     /// Claude Code session indexing
     #[command(subcommand)]
     Session(SessionCommand),

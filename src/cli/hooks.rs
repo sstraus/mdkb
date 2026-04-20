@@ -195,10 +195,7 @@ fn handle_session_start(_event: Value) -> Value {
     }
 
     body.push_str(&format!(
-        "\n**mdkb CLI** (semantic search — not available via Grep/Glob):\n\
-         - `{0} search <query>` — docs/memory/code\n\
-         - `{0} search --scope symbols <name>` — symbol lookup with file:line\n\
-         - `{0} code callers|calls|impact <symbol>` — call graph\n",
+        "\n**mdkb CLI** (semantic search — not available via Grep/Glob). Run `{0} cheatsheet` for full syntax.\n",
         bin
     ));
 
