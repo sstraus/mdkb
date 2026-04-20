@@ -1,6 +1,6 @@
 [package]
 name = "mdkb"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 description = "Local markdown knowledge base with semantic search"
 license = "MIT"

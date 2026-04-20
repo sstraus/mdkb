@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.2.0 (2026-04-20)
+
+### Added
+
+- **`prior` entry type** — behavioral pattern entries for external analyzers
+  (e.g., HUD stop hooks). 30-day default TTL. Excluded from all default
+  searches; query with `--entry-type prior` or `search(scope="memory",
+  entry_type="prior")` via MCP.
+- **`mdkb cheatsheet`** — AI-friendly compact command reference with full
+  binary paths via `current_exe()`. Eliminates trial-and-error CLI discovery.
+- **`--entry-type` filter on `mdkb search`** — filter memory searches by
+  entry type (topic, problem, decision, reminder, prior).
+- **PreToolUse Grep interceptor suggests CLI commands** — works without MCP.
+  Classifies Grep patterns (pure identifiers, definition searches, callsite
+  patterns) and suggests `mdkb search`/`mdkb code` via Bash.
+- **`mdkb setup remove`** — CLI removal of MCP and hook registrations.
+  `setup remove mcp claude|codex`, `setup remove hooks claude|codex`,
+  `setup remove claude --scope local|user` (MCP + hooks in one shot).
+
+### Changed
+
+- **Hook suggestions use CLI instead of MCP tool names** — `current_exe()`
+  resolves the binary path dynamically. No daemon socket check required.
+- **Optimized injected text** — ~185 fewer tokens per turn across
+  BASE_INSTRUCTIONS, PreToolUse messages, and SessionStart tip.
+- **SessionStart tip points to `mdkb cheatsheet`** instead of inline syntax.
+- **Removed duplicated entry_type/ttl docs from BASE_INSTRUCTIONS** — already
+  in JSON Schema `/// doc` comments.
+
 ## 2.0.0 (2026-04-18)
 
 ### Breaking Changes

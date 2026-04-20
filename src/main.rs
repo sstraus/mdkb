@@ -34,7 +34,8 @@ use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
     Cli, CollectionCommand, Command, DaemonCommand, EvolveCommand, ExperimentCommand, HookCommand,
     HookEvent, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SessionCommand,
-    SetupCommand, SetupHooksCommand, SetupMcpCommand,
+    RemoveHooksCommand, RemoveMcpCommand, SetupCommand, SetupHooksCommand, SetupMcpCommand,
+    SetupRemoveCommand,
 };
 use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
@@ -829,7 +830,7 @@ async fn run() -> Result<()> {
                         println!("{}", result.message);
                     }
                 }
-                SetupMcpCommand::Codex { yes: _, dry_run } => {
+                SetupMcpCommand::Codex { dry_run } => {
                     let result = mdkb::cli::setup::handle_setup_mcp_codex(dry_run)?;
                     if !result.dry_run {
                         println!("{}", result.message);
@@ -881,6 +882,45 @@ async fn run() -> Result<()> {
                             );
                         }
                         println!("Opt out per-directory with .mdkbignore-hooks");
+                    }
+                }
+            },
+            SetupCommand::Remove(remove_cmd) => match remove_cmd {
+                SetupRemoveCommand::Mcp(mcp_cmd) => match mcp_cmd {
+                    RemoveMcpCommand::Claude { scope } => {
+                        let msg = mdkb::cli::setup::handle_remove_mcp_claude(&scope)?;
+                        println!("{msg}");
+                    }
+                    RemoveMcpCommand::Codex => {
+                        let msg = mdkb::cli::setup::handle_remove_mcp_codex()?;
+                        println!("{msg}");
+                    }
+                },
+                SetupRemoveCommand::Hooks(hooks_cmd) => match hooks_cmd {
+                    RemoveHooksCommand::Claude {
+                        scope,
+                        profile_dir,
+                    } => {
+                        let msg = mdkb::cli::setup::handle_remove_hooks_claude(
+                            &cwd,
+                            &scope,
+                            profile_dir.as_deref(),
+                        )?;
+                        println!("{msg}");
+                    }
+                    RemoveHooksCommand::Codex => {
+                        let msg = mdkb::cli::setup::handle_remove_hooks_codex()?;
+                        println!("{msg}");
+                    }
+                },
+                SetupRemoveCommand::Claude { scope } => {
+                    match mdkb::cli::setup::handle_remove_mcp_claude(&scope) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => eprintln!("Warning: MCP removal failed: {e}"),
+                    }
+                    match mdkb::cli::setup::handle_remove_hooks_claude(&cwd, &scope, None) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => eprintln!("Warning: hooks removal failed: {e}"),
                     }
                 }
             },

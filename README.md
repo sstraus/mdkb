@@ -10,16 +10,17 @@ No cloud APIs. No token-heavy context dumps. Just fast, local, relevant retrieva
 
 - **Hybrid search** — BM25 + semantic vectors over your markdown docs
 - **Code intelligence** — tree-sitter parsing for 13 languages, call graphs, symbol search
-- **Persistent memory** — AI-created knowledge entries that survive across sessions, including time-bound `reminder` entries with due-date surfacing
+- **Persistent memory** — AI-created knowledge entries that survive across sessions, including time-bound `reminder` entries with due-date surfacing and `prior` entries for behavioral patterns (30-day TTL default)
 - **Lifecycle hooks** — proactive context injection and reindex enqueue via Claude Code / Codex CLI hooks (no tool call required)
 - **Markdown-native memory** — export/import memory entries as a folder of `.md` files for review, git tracking, or bulk edit
 - **Unified diagnostics** — `mdkb stats` renders a static ASCII dashboard (index health, collections, memory, code, sessions, hooks)
 - **Zero config serving** — auto-indexes on startup, watches for file changes, auto-`VACUUM`s on drift
 
-### Recent highlights (2.0.0 / 1.5.0 / 1.4.0)
+### Recent highlights (2.2.0 / 2.0.0 / 1.5.0)
 
 Full details in [CHANGES.md](CHANGES.md).
 
+- **2.2.0** — `prior` entry type for behavioral patterns (30d TTL default, excluded from searches); `mdkb cheatsheet` AI-friendly command reference; `--entry-type` filter on `mdkb search`; PreToolUse Grep hook suggests CLI commands (works without MCP); optimized injected text (~185 fewer tokens per turn).
 - **2.0.0 (breaking)** — `mdkb status` removed (use `mdkb stats`); `mdkb memory export`/`import` round-trip entries as `.md` files with YAML frontmatter; unified ASCII stats dashboard with `--format json` and `--no-color`.
 - **1.5.0** — lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PostToolUse`) via `mdkb setup hooks claude|codex`; `usage` MCP tool (session+lifetime token ledger); access-count × recency as a third RRF signal in `search`; `memory_confirm` atomic Bayesian signal; auto-`VACUUM` + `PRAGMA optimize` on drift; `mdkb setup mcp codex`.
 - **1.4.0** — `reminder` entry type with `due_in` (surfaced in session warmup once due); schema migration v9 → v10; input hardening (reject control chars in titles/tags).
@@ -65,7 +66,9 @@ Restart Claude Code after setup. The MCP server auto-indexes on startup and watc
 
 ### Hooks (optional, recommended)
 
-MCP gives the assistant tools; hooks make it use them. Register the lifecycle dispatcher so Claude gets a memory warmup at session start and relevant context on every prompt — without having to call `search` first:
+MCP gives the assistant tools; hooks make it use them. Hooks also work standalone without MCP — the `PreToolUse` Grep interceptor suggests CLI commands via `current_exe()`, and `SessionStart` points to `mdkb cheatsheet` for the full command reference.
+
+Register the lifecycle dispatcher so Claude gets a memory warmup at session start, relevant context on every prompt, and Grep-to-mdkb suggestions — without having to call `search` first:
 
 ```bash
 # Claude Code, project-scoped (writes .claude/settings.local.json)
@@ -85,7 +88,7 @@ mdkb setup hooks claude --disable post-tool-use
 mdkb setup hooks claude --disable user-prompt-submit,post-tool-use
 ```
 
-Restart the host CLI after setup. Re-running is idempotent: existing hook entries are replaced, unrelated settings preserved. Events: `session-start`, `user-prompt-submit`, `post-tool-use`. Full contract, config, and opt-out in [docs/hooks.md](docs/hooks.md).
+Restart the host CLI after setup. Re-running is idempotent: existing hook entries are replaced, unrelated settings preserved. Events: `session-start`, `user-prompt-submit`, `pre-tool-use` (Grep interceptor), `post-tool-use`. Full contract, config, and opt-out in [docs/hooks.md](docs/hooks.md).
 
 ### Binary path caveat
 
@@ -93,24 +96,17 @@ Restart the host CLI after setup. Re-running is idempotent: existing hook entrie
 
 ### Uninstalling
 
-There is no dedicated `mdkb uninstall` subcommand — removal is a few targeted edits:
-
-**MCP (Claude Code):**
-
 ```bash
-claude mcp remove mdkb -s local   # per-project
-claude mcp remove mdkb -s user    # global
+# Remove all Claude Code registrations (MCP + hooks)
+mdkb setup remove claude --scope local   # per-project
+mdkb setup remove claude --scope user    # global
+
+# Remove individually
+mdkb setup remove mcp claude --scope local
+mdkb setup remove mcp codex
+mdkb setup remove hooks claude --scope local
+mdkb setup remove hooks codex
 ```
-
-Note: `claude mcp remove` operates on `~/.claude-private/.claude.json`, while `mdkb setup mcp claude` writes to `~/.claude.json`. If you registered via `mdkb setup`, also manually delete the `mdkb` block from the `mcpServers` object in `~/.claude.json` (user scope) or from the per-project entry (local scope).
-
-**Hooks:**
-
-No CLI removal exists. Delete the three `_managedBy: "mdkb"` entries (`SessionStart`, `UserPromptSubmit`, `PostToolUse`) from:
-
-- `.claude/settings.local.json` — if installed with `--scope local`
-- `~/.claude/settings.json` — if installed with `--scope user`
-- `~/.codex/hooks.json` — for Codex CLI
 
 Soft alternatives before uninstalling: create an empty `.mdkbignore-hooks` marker at the repo root to silence hooks for that working tree, or toggle `session_start_enabled` / `user_prompt_submit_enabled` / `post_tool_use_enabled` in `.mdkb/config.toml`.
 
@@ -168,11 +164,15 @@ Persistent AI knowledge that survives across sessions — decisions, patterns, s
 - **Revision tracking** — manual entries track up to 3 revision diffs
 - **TTL (time-to-live)** — pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Expired entries are filtered from searches and listings but remain accessible via `get(id)` with an `[EXPIRED]` marker, so they can be inspected or renewed. Omit `ttl` for permanent entries.
 
-Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices), `reminder` (time-bound — see below).
+Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices), `reminder` (time-bound — see below), `prior` (behavioral patterns — 30-day TTL default, excluded from default searches).
 
 #### Reminders
 
 Create with `memory_write(id, title, content, entry_type="reminder", due_in=<seconds>)` (or `mdkb memory add --entry-type reminder --due-in N`). While `due_at > now` the reminder is hidden from searches and listings. Once due, it appears in the session warmup index prefixed `[reminder:DUE] {id}: {title}` so the MCP client sees it on the next turn. The AI is instructed to ask for confirmation before deleting and to snooze via `memory_write` with a new `due_in` (same `id` updates the record).
+
+#### Priors
+
+Behavioral pattern entries written by external analyzers (e.g., HUD stop hooks). Create with `memory_write(id, title, content, entry_type="prior")` or `mdkb memory add <id> --entry-type prior`. Priors default to 30-day TTL and are excluded from all default searches — query them explicitly with `mdkb search --scope memory --entry-type prior "query"` or `search(query, scope="memory", entry_type="prior")` via MCP.
 
 Source types control confidence weighting:
 

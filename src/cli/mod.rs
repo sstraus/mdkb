@@ -757,6 +757,10 @@ pub enum SetupCommand {
     /// Register mdkb lifecycle hooks
     #[command(subcommand)]
     Hooks(SetupHooksCommand),
+
+    /// Remove mdkb registrations (MCP and/or hooks)
+    #[command(subcommand)]
+    Remove(SetupRemoveCommand),
 }
 
 /// MCP setup subcommands.
@@ -775,10 +779,6 @@ pub enum SetupMcpCommand {
 
     /// Register mdkb with Codex CLI (writes ~/.codex/config.toml)
     Codex {
-        /// Skip confirmation prompt
-        #[arg(short, long)]
-        yes: bool,
-
         /// Print the merged config.toml to stdout without writing
         #[arg(long)]
         dry_run: bool,
@@ -818,6 +818,57 @@ pub enum SetupHooksCommand {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// Removal subcommands.
+#[derive(Subcommand, Debug)]
+pub enum SetupRemoveCommand {
+    /// Remove mdkb MCP server registration
+    #[command(subcommand)]
+    Mcp(RemoveMcpCommand),
+
+    /// Remove mdkb lifecycle hooks
+    #[command(subcommand)]
+    Hooks(RemoveHooksCommand),
+
+    /// Remove all Claude Code mdkb registrations (MCP + hooks)
+    Claude {
+        /// Scope: local (project-specific, default) or user (global)
+        #[arg(short, long, default_value = "local")]
+        scope: String,
+    },
+}
+
+/// MCP removal subcommands.
+#[derive(Subcommand, Debug)]
+pub enum RemoveMcpCommand {
+    /// Remove mdkb from Claude Code
+    Claude {
+        /// Scope: local (project-specific, default) or user (global)
+        #[arg(short, long, default_value = "local")]
+        scope: String,
+    },
+
+    /// Remove mdkb from Codex CLI (~/.codex/config.toml)
+    Codex,
+}
+
+/// Hooks removal subcommands.
+#[derive(Subcommand, Debug)]
+pub enum RemoveHooksCommand {
+    /// Remove mdkb hooks from Claude Code
+    Claude {
+        /// Scope: local or user
+        #[arg(short, long, default_value = "local")]
+        scope: String,
+
+        /// Claude Code profile directory (default: ~/.claude)
+        #[arg(long)]
+        profile_dir: Option<PathBuf>,
+    },
+
+    /// Remove mdkb hooks from Codex CLI (~/.codex/hooks.json)
+    Codex,
 }
 
 /// Code intelligence subcommands.

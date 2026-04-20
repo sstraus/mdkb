@@ -842,6 +842,175 @@ pub fn handle_setup_mcp_codex(dry_run: bool) -> Result<McpCodexSetupResult> {
     })
 }
 
+// ── Removal handlers ──────────────────────────────────────────────
+
+/// Remove mdkb MCP server from Claude Code via `claude mcp remove`.
+pub fn handle_remove_mcp_claude(scope: &str) -> Result<String> {
+    let scope_arg = match scope {
+        "local" | "project" => "local",
+        "user" | "global" => "user",
+        other => {
+            return Err(Error::from(ErrorKind::Command {
+                command: "setup remove mcp claude".to_string(),
+                message: format!("Invalid scope '{other}'. Must be 'local' or 'user'."),
+            }))
+        }
+    };
+
+    let output = Command::new("claude")
+        .args(["mcp", "remove", "-s", scope_arg, "mdkb"])
+        .output();
+
+    match output {
+        Ok(output) => {
+            if output.status.success() {
+                Ok(format!(
+                    "Removed mdkb MCP server from Claude Code (scope: {scope_arg})"
+                ))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let combined = format!("{stderr}{stdout}");
+                if combined.contains("not found") && combined.contains("mdkb") {
+                    Ok("mdkb MCP server was not registered in Claude Code".to_string())
+                } else {
+                    Err(Error::from(ErrorKind::Command {
+                        command: "claude mcp remove".to_string(),
+                        message: format!("Failed: {stderr}{stdout}"),
+                    }))
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            Ok("Claude CLI not found — nothing to remove".to_string())
+        }
+        Err(e) => Err(Error::from(ErrorKind::Command {
+            command: "claude mcp remove".to_string(),
+            message: format!("Failed to execute: {e}"),
+        })),
+    }
+}
+
+/// Remove mdkb MCP server from Codex CLI's `~/.codex/config.toml`.
+pub fn handle_remove_mcp_codex() -> Result<String> {
+    let config_path = codex_config_path()?;
+    if !config_path.exists() {
+        return Ok("~/.codex/config.toml does not exist — nothing to remove".to_string());
+    }
+
+    let raw = std::fs::read_to_string(&config_path).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: config_path.clone(),
+            operation: format!("read config.toml: {e}"),
+        })
+    })?;
+    let mut doc: toml_edit::DocumentMut = raw.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        Error::from(ErrorKind::Command {
+            command: "setup remove mcp codex".to_string(),
+            message: format!("failed to parse {}: {e}", config_path.display()),
+        })
+    })?;
+
+    let removed = if let Some(servers) = doc.get_mut("mcp_servers").and_then(|v| v.as_table_mut())
+    {
+        servers.remove("mdkb").is_some()
+    } else {
+        false
+    };
+
+    if removed {
+        std::fs::write(&config_path, doc.to_string()).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: config_path.clone(),
+                operation: format!("write config.toml: {e}"),
+            })
+        })?;
+        Ok(format!(
+            "Removed [mcp_servers.mdkb] from {}",
+            config_path.display()
+        ))
+    } else {
+        Ok("mdkb was not registered in ~/.codex/config.toml".to_string())
+    }
+}
+
+/// Remove mdkb-managed hook entries from a Claude/Codex settings JSON file.
+/// Returns count of removed entries.
+fn remove_mdkb_hook_entries(settings: &mut serde_json::Value) -> usize {
+    let Some(hooks_root) = settings.get_mut("hooks").and_then(|v| v.as_object_mut()) else {
+        return 0;
+    };
+
+    let mut removed = 0;
+    let event_keys: Vec<String> = hooks_root.keys().cloned().collect();
+    for key in &event_keys {
+        if let Some(arr) = hooks_root.get_mut(key).and_then(|v| v.as_array_mut()) {
+            let before = arr.len();
+            arr.retain(|item| {
+                item.get("_managedBy")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s != "mdkb")
+                    .unwrap_or(true)
+            });
+            removed += before - arr.len();
+        }
+    }
+
+    // Prune empty arrays.
+    hooks_root.retain(|_, v| v.as_array().map(|a| !a.is_empty()).unwrap_or(true));
+    // Prune empty hooks object.
+    if hooks_root.is_empty() {
+        if let Some(obj) = settings.as_object_mut() {
+            obj.remove("hooks");
+        }
+    }
+
+    removed
+}
+
+/// Remove all `_managedBy: "mdkb"` hook entries from a settings JSON file.
+fn remove_hooks_from(settings_path: &Path) -> Result<String> {
+    if !settings_path.exists() {
+        return Ok(format!(
+            "{} does not exist — no hooks to remove",
+            settings_path.display()
+        ));
+    }
+
+    let mut removed_count = 0;
+    locked_read_modify_write(settings_path, || {
+        let mut settings = read_json_file(settings_path, "setup remove hooks")?;
+        removed_count = remove_mdkb_hook_entries(&mut settings);
+        Ok(settings)
+    })?;
+
+    if removed_count > 0 {
+        Ok(format!(
+            "Removed {removed_count} mdkb hook entries from {}",
+            settings_path.display()
+        ))
+    } else {
+        Ok(format!(
+            "No mdkb hooks found in {}",
+            settings_path.display()
+        ))
+    }
+}
+
+/// Remove mdkb hooks from Claude Code settings.
+pub fn handle_remove_hooks_claude(
+    cwd: &Path,
+    scope: &str,
+    profile_dir: Option<&Path>,
+) -> Result<String> {
+    remove_hooks_from(&claude_settings_path(cwd, scope, profile_dir)?)
+}
+
+/// Remove mdkb hooks from Codex CLI's hooks.json.
+pub fn handle_remove_hooks_codex() -> Result<String> {
+    remove_hooks_from(&codex_hooks_path()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,5 +1099,46 @@ mod tests {
             std::env::remove_var("MDKB_BINARY_OVERRIDE");
         }
         assert_eq!(result.unwrap(), "/fake/mdkb");
+    }
+
+    #[test]
+    fn test_remove_mdkb_hook_entries_removes_managed() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook session-start"}]},
+                    {"_managedBy": "other", "hooks": [{"type": "command", "command": "other-tool"}]}
+                ],
+                "PostToolUse": [
+                    {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook post-tool-use"}]}
+                ]
+            }
+        });
+        let removed = remove_mdkb_hook_entries(&mut settings);
+        assert_eq!(removed, 2);
+        let hooks = settings["hooks"].as_object().unwrap();
+        assert_eq!(hooks["SessionStart"].as_array().unwrap().len(), 1);
+        assert!(!hooks.contains_key("PostToolUse"), "empty array should be pruned");
+    }
+
+    #[test]
+    fn test_remove_mdkb_hook_entries_empty_hooks_pruned() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {"_managedBy": "mdkb", "hooks": []}
+                ]
+            }
+        });
+        let removed = remove_mdkb_hook_entries(&mut settings);
+        assert_eq!(removed, 1);
+        assert!(settings.get("hooks").is_none(), "empty hooks object should be pruned");
+    }
+
+    #[test]
+    fn test_remove_mdkb_hook_entries_no_hooks() {
+        let mut settings = serde_json::json!({"key": "value"});
+        let removed = remove_mdkb_hook_entries(&mut settings);
+        assert_eq!(removed, 0);
     }
 }
