@@ -26,6 +26,7 @@ fn run_hook(event: &str, cwd: &Path, stdin_payload: &str) -> (String, String, i3
     let mut child = Command::new(mdkb_bin())
         .args(["hook", event])
         .current_dir(cwd)
+        .env("MDKB_NO_DAEMON", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -113,7 +114,10 @@ fn hooks_e2e_warmup_recall_and_reindex() {
         "user-prompt-submit must surface the seeded entry. Got: {recall}"
     );
 
-    // --- PostToolUse: reindex queue must gain an entry ------------------
+    // --- PostToolUse: path injected into watcher channel (no queue file) ----
+    // With IPC dispatch, post-tool-use sends the path directly to the watcher's
+    // mpsc channel instead of writing reindex-queue.jsonl. Verify exit 0 and
+    // silent stdout; full daemon-side verification is in e2e_daemon_watcher.rs.
     let edited_file = root.join("notes.md");
     std::fs::write(&edited_file, "hello").expect("seed edited file");
     let tool_payload = serde_json::json!({
@@ -129,30 +133,15 @@ fn hooks_e2e_warmup_recall_and_reindex() {
         code, 0,
         "post-tool-use must exit 0. stderr={stderr} stdout={stdout}"
     );
-
+    assert!(
+        stdout.trim().is_empty(),
+        "post-tool-use must produce no stdout (silent). Got: {stdout}"
+    );
+    // reindex-queue.jsonl must NOT exist — the queue file is abolished.
     let queue_path = root.join(".mdkb").join("reindex-queue.jsonl");
     assert!(
-        queue_path.exists(),
-        "post-tool-use must create reindex-queue.jsonl"
-    );
-    let queue_raw = std::fs::read_to_string(&queue_path).expect("read queue");
-    let last_line = queue_raw
-        .lines()
-        .last()
-        .expect("queue must have at least one line");
-    let entry: Value = serde_json::from_str(last_line).expect("queue line is JSON");
-    assert_eq!(
-        entry.get("tool").and_then(|v| v.as_str()),
-        Some("Edit"),
-        "queue entry tool must be Edit"
-    );
-    let queued_path = entry
-        .get("path")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    assert!(
-        queued_path.ends_with("notes.md"),
-        "queue entry path must point at the edited file. Got: {queued_path}"
+        !queue_path.exists(),
+        "reindex-queue.jsonl must not be created by IPC dispatch"
     );
 }
 

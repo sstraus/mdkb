@@ -18,6 +18,7 @@ fn run_session_start_in(dir: &Path, stdin_json: &str) -> (i32, String) {
     let mut child = mdkb_bin()
         .args(["hook", "session-start"])
         .current_dir(dir)
+        .env("MDKB_NO_DAEMON", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

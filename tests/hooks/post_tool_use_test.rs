@@ -1,4 +1,10 @@
-//! Integration tests for `mdkb hook post-tool-use` — reindex queue.
+//! Integration tests for `mdkb hook post-tool-use`.
+//!
+//! With IPC dispatch (story 051-064), paths are injected into the watcher's
+//! mpsc channel instead of written to reindex-queue.jsonl. Tests verify:
+//! - exit 0 and silent stdout for all code paths
+//! - reindex-queue.jsonl is NOT created (the queue file is abolished)
+//! - non-editing tools, missing input, and mdkbignore are still silently ignored
 
 use std::fs;
 use std::io::Write;
@@ -17,6 +23,7 @@ fn run_post_tool_use_in(dir: &Path, stdin_json: &str) -> (i32, String) {
     let mut child = mdkb_bin()
         .args(["hook", "post-tool-use"])
         .current_dir(dir)
+        .env("MDKB_NO_DAEMON", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -47,17 +54,8 @@ fn queue_path(root: &Path) -> std::path::PathBuf {
     root.join(".mdkb").join("reindex-queue.jsonl")
 }
 
-fn read_queue_lines(root: &Path) -> Vec<serde_json::Value> {
-    let content = fs::read_to_string(queue_path(root)).unwrap_or_default();
-    content
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str(l).expect("queue line must be valid JSON"))
-        .collect()
-}
-
 #[test]
-fn post_tool_use_enqueues_edit_path() {
+fn post_tool_use_injects_edit_path_silently() {
     let tmp = init_project();
     let canonical_root = std::fs::canonicalize(tmp.path()).unwrap();
     let target = canonical_root.join("src/foo.rs");
@@ -66,23 +64,14 @@ fn post_tool_use_enqueues_edit_path() {
         target.display()
     );
 
-    let (code, _stdout) = run_post_tool_use_in(tmp.path(), &event);
-    assert_eq!(code, 0);
-
-    let entries = read_queue_lines(tmp.path());
-    assert_eq!(entries.len(), 1);
-    assert_eq!(
-        entries[0].get("path").and_then(|v| v.as_str()),
-        Some(target.to_string_lossy().as_ref())
-    );
-    assert!(
-        entries[0].get("at").and_then(|v| v.as_i64()).is_some(),
-        "timestamp must be present"
-    );
+    let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
+    assert_eq!(code, 0, "must exit 0; stdout={stdout}");
+    assert!(stdout.trim().is_empty(), "must produce no stdout; got: {stdout}");
+    assert!(!queue_path(tmp.path()).exists(), "reindex-queue.jsonl must not be created");
 }
 
 #[test]
-fn post_tool_use_enqueues_write_path() {
+fn post_tool_use_injects_write_path_silently() {
     let tmp = init_project();
     let target = tmp.path().join("README.md");
     let event = format!(
@@ -90,15 +79,14 @@ fn post_tool_use_enqueues_write_path() {
         target.display()
     );
 
-    let (code, _) = run_post_tool_use_in(tmp.path(), &event);
-    assert_eq!(code, 0);
-
-    let entries = read_queue_lines(tmp.path());
-    assert_eq!(entries.len(), 1);
+    let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
+    assert_eq!(code, 0, "must exit 0; stdout={stdout}");
+    assert!(stdout.trim().is_empty(), "must produce no stdout; got: {stdout}");
+    assert!(!queue_path(tmp.path()).exists(), "reindex-queue.jsonl must not be created");
 }
 
 #[test]
-fn post_tool_use_enqueues_notebook_edit_path() {
+fn post_tool_use_injects_notebook_edit_path_silently() {
     let tmp = init_project();
     let canonical_root = std::fs::canonicalize(tmp.path()).unwrap();
     let target = canonical_root.join("notebook.ipynb");
@@ -107,15 +95,10 @@ fn post_tool_use_enqueues_notebook_edit_path() {
         target.display()
     );
 
-    let (code, _) = run_post_tool_use_in(tmp.path(), &event);
-    assert_eq!(code, 0);
-
-    let entries = read_queue_lines(tmp.path());
-    assert_eq!(entries.len(), 1);
-    assert_eq!(
-        entries[0].get("path").and_then(|v| v.as_str()),
-        Some(target.to_string_lossy().as_ref())
-    );
+    let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
+    assert_eq!(code, 0, "must exit 0; stdout={stdout}");
+    assert!(stdout.trim().is_empty(), "must produce no stdout; got: {stdout}");
+    assert!(!queue_path(tmp.path()).exists(), "reindex-queue.jsonl must not be created");
 }
 
 #[test]
@@ -123,39 +106,27 @@ fn post_tool_use_ignores_non_edit_tools() {
     let tmp = init_project();
     let event = r#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
 
-    let (code, _) = run_post_tool_use_in(tmp.path(), event);
-    assert_eq!(code, 0);
-
-    assert!(
-        !queue_path(tmp.path()).exists() || read_queue_lines(tmp.path()).is_empty(),
-        "non-editing tools must not produce queue entries"
-    );
+    let (code, stdout) = run_post_tool_use_in(tmp.path(), event);
+    assert_eq!(code, 0, "must exit 0; stdout={stdout}");
+    assert!(stdout.trim().is_empty(), "non-editing tool must produce no stdout; got: {stdout}");
+    assert!(!queue_path(tmp.path()).exists(), "non-editing tool must not create queue file");
 }
 
 #[test]
-fn post_tool_use_appends_to_existing_queue() {
+fn post_tool_use_multiple_calls_each_succeed_silently() {
     let tmp = init_project();
     let p1 = tmp.path().join("a.rs");
     let p2 = tmp.path().join("b.rs");
 
-    let e1 = format!(
-        r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#,
-        p1.display()
-    );
-    let e2 = format!(
-        r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#,
-        p2.display()
-    );
+    let e1 = format!(r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#, p1.display());
+    let e2 = format!(r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#, p2.display());
 
-    run_post_tool_use_in(tmp.path(), &e1);
-    run_post_tool_use_in(tmp.path(), &e2);
+    let (c1, s1) = run_post_tool_use_in(tmp.path(), &e1);
+    let (c2, s2) = run_post_tool_use_in(tmp.path(), &e2);
 
-    let entries = read_queue_lines(tmp.path());
-    assert_eq!(
-        entries.len(),
-        2,
-        "queue must be append-only, got: {entries:?}"
-    );
+    assert_eq!(c1, 0, "first call must exit 0; stdout={s1}");
+    assert_eq!(c2, 0, "second call must exit 0; stdout={s2}");
+    assert!(!queue_path(tmp.path()).exists(), "reindex-queue.jsonl must not be created");
 }
 
 #[test]
@@ -168,13 +139,10 @@ fn post_tool_use_respects_mdkbignore_hooks_marker() {
         target.display()
     );
 
-    let (code, _) = run_post_tool_use_in(tmp.path(), &event);
-    assert_eq!(code, 0);
-
-    assert!(
-        !queue_path(tmp.path()).exists(),
-        "opt-out marker must suppress queueing"
-    );
+    let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
+    assert_eq!(code, 0, "must exit 0; stdout={stdout}");
+    assert!(stdout.trim().is_empty(), "opt-out marker must suppress output; got: {stdout}");
+    assert!(!queue_path(tmp.path()).exists(), "opt-out marker must suppress queue creation");
 }
 
 #[test]
@@ -187,15 +155,12 @@ fn post_tool_use_on_uninitialized_project_is_noop() {
     );
 
     let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
-    assert_eq!(code, 0, "must never block");
+    assert_eq!(code, 0, "must never block; stdout={stdout}");
     assert!(
         stdout.trim().is_empty(),
         "no .mdkb/ means no output, got: {stdout}"
     );
-    assert!(
-        !queue_path(tmp.path()).exists(),
-        "no .mdkb/ means no queue file"
-    );
+    assert!(!queue_path(tmp.path()).exists(), "no .mdkb/ means no queue file");
 }
 
 #[test]
@@ -203,10 +168,7 @@ fn post_tool_use_missing_file_path_is_noop() {
     let tmp = init_project();
     let event = r#"{"tool_name":"Edit","tool_input":{}}"#;
 
-    let (code, _) = run_post_tool_use_in(tmp.path(), event);
-    assert_eq!(code, 0);
-    assert!(
-        !queue_path(tmp.path()).exists() || read_queue_lines(tmp.path()).is_empty(),
-        "missing file_path must not produce queue entries"
-    );
+    let (code, stdout) = run_post_tool_use_in(tmp.path(), event);
+    assert_eq!(code, 0, "must exit 0; stdout={stdout}");
+    assert!(!queue_path(tmp.path()).exists(), "missing file_path must not create queue file");
 }

@@ -29,6 +29,7 @@ use mdkb::cli::handlers::{
     handle_session_index, handle_superseded_by, handle_update, handle_update_files,
 };
 use mdkb::cli::hook_client;
+use mdkb::cli::hook_logic;
 use mdkb::cli::hooks;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
@@ -943,10 +944,38 @@ async fn run() -> Result<()> {
             DaemonCommand::Restart => daemon_cli::handle_restart().await?,
         },
         Command::Hook(hook_cmd) => match hook_cmd {
-            HookCommand::SessionStart => hooks::dispatch(HookEvent::SessionStart),
-            HookCommand::UserPromptSubmit => hooks::dispatch(HookEvent::UserPromptSubmit),
-            HookCommand::PostToolUse => hooks::dispatch(HookEvent::PostToolUse),
-            HookCommand::PreToolUse => hooks::dispatch(HookEvent::PreToolUse),
+            HookCommand::SessionStart => {
+                let input = hook_logic::read_stdin_best_effort();
+                let event = hook_logic::parse_event(&input);
+                let cwd = std::env::current_dir()?;
+                if !hook_logic::mdkbignore_hooks_present(&cwd) {
+                    hook_client::call_hook_event("hook.session_start", event, None).await?;
+                }
+            }
+            HookCommand::UserPromptSubmit => {
+                let input = hook_logic::read_stdin_best_effort();
+                let event = hook_logic::parse_event(&input);
+                let cwd = std::env::current_dir()?;
+                if !hook_logic::mdkbignore_hooks_present(&cwd) {
+                    hook_client::call_hook_event("hook.user_prompt_submit", event, None).await?;
+                }
+            }
+            HookCommand::PostToolUse => {
+                let input = hook_logic::read_stdin_best_effort();
+                let event = hook_logic::parse_event(&input);
+                let cwd = std::env::current_dir()?;
+                if !hook_logic::mdkbignore_hooks_present(&cwd) {
+                    hook_client::call_hook_event("hook.post_tool_use", event, None).await?;
+                }
+            }
+            HookCommand::PreToolUse => {
+                let input = hook_logic::read_stdin_best_effort();
+                let event = hook_logic::parse_event(&input);
+                let cwd = std::env::current_dir()?;
+                if !hook_logic::mdkbignore_hooks_present(&cwd) {
+                    hook_client::call_hook_event("hook.pre_tool_use", event, None).await?;
+                }
+            }
             HookCommand::Reindex { files, root } => {
                 hook_client::call_reindex(files, root).await?;
             }

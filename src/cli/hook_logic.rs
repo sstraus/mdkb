@@ -3,9 +3,25 @@
 //! These are extracted from hook dispatch so they can be used by both the
 //! in-process path and daemon-side dispatch methods without importing hooks.rs.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+
+// ── Stdin / JSON helpers ──────────────────────────────────────────────────────
+
+pub fn read_stdin_best_effort() -> String {
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_to_string(&mut buf);
+    buf
+}
+
+pub fn parse_event(input: &str) -> Value {
+    if input.trim().is_empty() {
+        return Value::Null;
+    }
+    serde_json::from_str(input).unwrap_or(Value::Null)
+}
 
 // ── Wrapup detection ─────────────────────────────────────────────────────────
 
