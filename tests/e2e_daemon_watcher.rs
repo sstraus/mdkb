@@ -5,6 +5,7 @@
 //! resolve to the same `RepoHandle` (with one watcher). A file change in a
 //! collection triggers exactly one doc reindex — not N reindexes for N clients.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -14,7 +15,8 @@ use tokio::sync::Mutex;
 
 use mdkb::cli::handlers::Context;
 use mdkb::domain::Collection;
-use mdkb::mcp::server::{DOC_REINDEX_COUNT, WATCHER_SPAWN_COUNT, run_file_watcher_inner};
+use mdkb::code::indexing::IndexFacade;
+use mdkb::mcp::server::{CODE_REINDEX_COUNT, DOC_REINDEX_COUNT, WATCHER_SPAWN_COUNT, run_file_watcher_inner};
 use mdkb::store::collections::add_collection;
 
 /// On macOS /tmp → /private/tmp; FSEvents reports canonical paths.
@@ -80,6 +82,7 @@ async fn two_clients_single_reindex() {
             vec![],
             500, // 500ms batch idle for fast test flush
             Some(ready_clone),
+            None,
         )
         .await;
     });
@@ -123,6 +126,82 @@ async fn two_clients_single_reindex() {
         DOC_REINDEX_COUNT.load(Ordering::Relaxed) - doc_before,
         1,
         "a single file change must produce exactly one doc reindex, not one per client"
+    );
+
+    watcher_handle.abort();
+}
+
+/// Story 050-cc15: injecting a path via the reindex channel triggers a code reindex.
+///
+/// This is the daemon-side half of the post-tool-use IPC hook: instead of writing
+/// a path to reindex-queue.jsonl, the hook will send it directly into the watcher
+/// via `RepoHandle::reindex_tx`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn injected_path_triggers_code_reindex() {
+    let tmp = canonical_tempdir();
+    let root = tmp.path().to_path_buf();
+
+    // Initialize mdkb repo (needed for the watcher's CTX_WAIT_SECS poll).
+    let ctx = Context::init(&root).expect("Context::init");
+    let ctx_arc: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(Some(ctx)));
+
+    // Create a real IndexFacade so flush_code_batch can actually reindex.
+    let db_path = root.join(".mdkb").join("code.sqlite");
+    let facade = IndexFacade::create(db_path).expect("IndexFacade::create");
+    let code_index: Arc<Mutex<Option<IndexFacade>>> = Arc::new(Mutex::new(Some(facade)));
+
+    // Create the inject channel — this is what RepoHandle::reindex_tx wraps.
+    let (tx, rx) = tokio::sync::mpsc::channel::<PathBuf>(64);
+
+    let code_before = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
+
+    // Spawn watcher with the receiver.
+    let watcher_root = root.clone();
+    let watcher_ctx = Arc::clone(&ctx_arc);
+    let watcher_code = Arc::clone(&code_index);
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let ready_clone = Arc::clone(&ready);
+    let watcher_handle = tokio::spawn(async move {
+        let _ = run_file_watcher_inner(
+            watcher_root,
+            watcher_ctx,
+            watcher_code,
+            true,
+            vec![],
+            200, // fast flush for test
+            Some(ready_clone),
+            Some(rx),
+        )
+        .await;
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), ready.notified())
+        .await
+        .expect("watcher did not become ready within 10s");
+
+    // Inject a path — simulates what the post-tool-use IPC hook will do.
+    let injected = root.join("src").join("lib.rs");
+    tx.send(injected).await.expect("send injected path");
+
+    // Wait for CODE_REINDEX_COUNT to increment (200ms idle + margin).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let current = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
+        if current > code_before {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "CODE_REINDEX_COUNT did not increment within 5s (before={code_before}, now={current})"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_eq!(
+        CODE_REINDEX_COUNT.load(Ordering::Relaxed) - code_before,
+        1,
+        "exactly one code reindex must fire after a single injected path"
     );
 
     watcher_handle.abort();

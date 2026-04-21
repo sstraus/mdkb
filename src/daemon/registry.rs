@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use dashmap::DashMap;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::cli::handlers::Context;
 use crate::code::indexing::IndexFacade;
@@ -32,6 +32,11 @@ pub struct RepoHandle {
     pub doc_reindex_active: Arc<AtomicBool>,
     /// True while startup code reindex is in progress.
     pub code_reindex_active: Arc<AtomicBool>,
+    /// Sender for injecting file paths directly into the watcher's reindex batch.
+    /// post-tool-use IPC hook clones this to bypass the reindex-queue.jsonl file.
+    pub reindex_tx: mpsc::Sender<PathBuf>,
+    /// Receiver consumed once by spawn_watcher_for_handle; None after the watcher starts.
+    reindex_rx: std::sync::Mutex<Option<mpsc::Receiver<PathBuf>>>,
 }
 
 impl std::fmt::Debug for RepoHandle {
@@ -63,6 +68,7 @@ impl RepoHandle {
         };
         let code_ignore_patterns = config.code.indexing.ignore_patterns.clone();
 
+        let (reindex_tx, reindex_rx) = mpsc::channel(64);
         Ok(Self {
             root,
             ctx: Arc::new(Mutex::new(None)),
@@ -72,6 +78,8 @@ impl RepoHandle {
             last_access: AtomicI64::new(now_unix()),
             doc_reindex_active: Arc::new(AtomicBool::new(false)),
             code_reindex_active: Arc::new(AtomicBool::new(false)),
+            reindex_tx,
+            reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
         })
     }
 
@@ -86,6 +94,7 @@ impl RepoHandle {
         doc_reindex_active: Arc<AtomicBool>,
         code_reindex_active: Arc<AtomicBool>,
     ) -> Self {
+        let (reindex_tx, reindex_rx) = mpsc::channel(64);
         Self {
             root,
             ctx,
@@ -95,6 +104,8 @@ impl RepoHandle {
             last_access: AtomicI64::new(now_unix()),
             doc_reindex_active,
             code_reindex_active,
+            reindex_tx,
+            reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
         }
     }
 
@@ -270,6 +281,8 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
     let code_index = Arc::clone(&handle.code_index);
     let code_enabled = handle.config.code.enabled;
     let code_ignore_patterns = handle.code_ignore_patterns.clone();
+    // Take the receiver exactly once; subsequent calls (same handle) yield None.
+    let reindex_rx = handle.reindex_rx.lock().unwrap_or_else(|e| e.into_inner()).take();
     tokio::spawn(async move {
         if let Err(e) = crate::mcp::server::run_file_watcher(
             root,
@@ -277,6 +290,7 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
             code_index,
             code_enabled,
             code_ignore_patterns,
+            reindex_rx,
         )
         .await
         {

@@ -1134,6 +1134,7 @@ pub async fn run_file_watcher(
     code_index: Arc<Mutex<Option<IndexFacade>>>,
     code_enabled: bool,
     code_ignore_patterns: Vec<String>,
+    reindex_rx: Option<tokio::sync::mpsc::Receiver<PathBuf>>,
 ) -> crate::error::Result<()> {
     run_file_watcher_inner(
         root,
@@ -1143,6 +1144,7 @@ pub async fn run_file_watcher(
         code_ignore_patterns,
         CODE_BATCH_IDLE_MS,
         None,
+        reindex_rx,
     )
     .await
 }
@@ -1156,6 +1158,7 @@ pub async fn run_file_watcher_inner(
     code_ignore_patterns: Vec<String>,
     batch_idle_ms: u64,
     ready: Option<Arc<tokio::sync::Notify>>,
+    mut reindex_rx: Option<tokio::sync::mpsc::Receiver<PathBuf>>,
 ) -> crate::error::Result<()> {
     WATCHER_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
     let config = WatcherConfig::default();
@@ -1217,48 +1220,66 @@ pub async fn run_file_watcher_inner(
         notify.notify_one();
     }
 
-    // Process file changes with batching for code reindex
+    // Process file changes with batching for code reindex.
+    // Two event sources: FSEvents watcher and injected paths from post-tool-use IPC.
     let mut code_batch: Vec<PathBuf> = Vec::new();
     let mut needs_doc_update = false;
 
     loop {
-        let change = if code_batch.is_empty() && !needs_doc_update {
-            // No pending work — block until next event
-            match watcher.recv().await {
-                Some(c) => c,
-                None => break,
-            }
-        } else {
-            // Pending batch — wait for more events or flush after idle timeout
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(batch_idle_ms),
-                watcher.recv(),
-            )
-            .await
-            {
-                Ok(Some(c)) => c,
-                Ok(None) => break, // channel closed
-                Err(_) => {
-                    // Timeout: flush pending batch
-                    flush_code_batch(&code_index, &root, &mut code_batch).await;
-                    flush_doc_update(&ctx, &root, &mut needs_doc_update).await;
-                    continue;
+        // Helper: receive from the optional injected-path channel, or block forever if absent.
+        macro_rules! recv_injected {
+            () => {
+                async {
+                    match reindex_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending::<Option<PathBuf>>().await,
+                    }
+                }
+            };
+        }
+
+        if code_batch.is_empty() && !needs_doc_update {
+            // No pending work — block until next event from either source.
+            tokio::select! {
+                change = watcher.recv() => {
+                    let Some(change) = change else { break };
+                    tracing::debug!("File change detected: {:?}", change.path);
+                    let (is_code, is_doc) = classify_change(&change.path, &collection_paths, &code_excludes);
+                    if is_code { code_batch.push(change.path.clone()); }
+                    if is_doc { needs_doc_update = true; }
+                    if !is_code && !is_doc {
+                        tracing::debug!("Ignoring non-code, non-doc change: {:?}", change.path);
+                    }
+                }
+                path = recv_injected!() => {
+                    if let Some(p) = path { code_batch.push(p); }
                 }
             }
-        };
-
-        tracing::debug!("File change detected: {:?}", change.path);
-
-        let (is_code, is_doc) = classify_change(&change.path, &collection_paths, &code_excludes);
-
-        if is_code {
-            code_batch.push(change.path.clone());
-        }
-        if is_doc {
-            needs_doc_update = true;
-        }
-        if !is_code && !is_doc {
-            tracing::debug!("Ignoring non-code, non-doc change: {:?}", change.path);
+        } else {
+            // Pending batch — accumulate more events or flush after idle timeout.
+            tokio::select! {
+                change = watcher.recv() => {
+                    match change {
+                        Some(change) => {
+                            tracing::debug!("File change detected: {:?}", change.path);
+                            let (is_code, is_doc) = classify_change(&change.path, &collection_paths, &code_excludes);
+                            if is_code { code_batch.push(change.path.clone()); }
+                            if is_doc { needs_doc_update = true; }
+                            if !is_code && !is_doc {
+                                tracing::debug!("Ignoring non-code, non-doc change: {:?}", change.path);
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                path = recv_injected!() => {
+                    if let Some(p) = path { code_batch.push(p); }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(batch_idle_ms)) => {
+                    flush_code_batch(&code_index, &root, &mut code_batch).await;
+                    flush_doc_update(&ctx, &root, &mut needs_doc_update).await;
+                }
+            }
         }
     }
 
