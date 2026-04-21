@@ -1579,13 +1579,25 @@ pub async fn usage_impl(
 // Called from dispatch_call "hook.*" arms and from hook_client's no-daemon path.
 
 /// Append one line to `.mdkb/hook-events.jsonl`; also `.mdkb/hook-slow.jsonl`
-/// when elapsed exceeds 500 ms. Best-effort — silently drops on I/O failure.
-fn log_hook_event(root: &std::path::Path, event: &str, outcome: &str, elapsed_ms: u64) {
+/// when elapsed exceeds the configured budget. Best-effort — silently drops on
+/// I/O failure. Designed to run inside `spawn_blocking`.
+fn log_hook_event(
+    root: std::path::PathBuf,
+    event: &str,
+    outcome: &str,
+    elapsed_ms: u64,
+    slow_threshold_ms: u64,
+) {
     use std::io::Write as _;
     let ts = chrono::Utc::now().timestamp();
-    let line = format!(
-        r#"{{"ts":{ts},"event":{event:?},"outcome":{outcome:?},"elapsed_ms":{elapsed_ms}}}"#
-    ) + "\n";
+    let mut line = serde_json::json!({
+        "ts": ts,
+        "event": event,
+        "outcome": outcome,
+        "elapsed_ms": elapsed_ms,
+    })
+    .to_string();
+    line.push('\n');
     let mdkb_dir = root.join(".mdkb");
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
@@ -1594,14 +1606,13 @@ fn log_hook_event(root: &std::path::Path, event: &str, outcome: &str, elapsed_ms
     {
         let _ = f.write_all(line.as_bytes());
     }
-    if elapsed_ms > 500 {
-        let slow = format!(r#"{{"ts":{ts},"event":{event:?},"elapsed_ms":{elapsed_ms}}}"#) + "\n";
+    if elapsed_ms > slow_threshold_ms {
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(mdkb_dir.join("hook-slow.jsonl"))
         {
-            let _ = f.write_all(slow.as_bytes());
+            let _ = f.write_all(line.as_bytes());
         }
     }
 }
@@ -1753,8 +1764,9 @@ pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Valu
     };
     if let Err(e) = handle.reindex_tx.try_send(path) {
         tracing::warn!("hook.post_tool_use: reindex_tx send failed: {e}");
+        return json!({});
     }
-    json!({})
+    json!({"queued": true})
 }
 
 pub fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
@@ -1934,35 +1946,43 @@ pub async fn dispatch_call(
             let result = hook_session_start_impl(&handle).await;
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) { "skipped" } else { "fired" };
-            log_hook_event(&handle.root, "session_start", outcome, ms);
+            let root = handle.root.clone();
+            let budget = handle.config.hooks.latency_budget_ms;
+            tokio::task::spawn_blocking(move || log_hook_event(root, "session_start", outcome, ms, budget));
             Ok(result)
         }
         "hook.user_prompt_submit" => {
             let prompt = params
                 .get("prompt")
                 .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
+                .unwrap_or_default();
             let t0 = std::time::Instant::now();
-            let result = hook_user_prompt_submit_impl(&handle, &prompt).await;
+            let result = hook_user_prompt_submit_impl(&handle, prompt).await;
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) { "skipped" } else { "fired" };
-            log_hook_event(&handle.root, "user_prompt_submit", outcome, ms);
+            let root = handle.root.clone();
+            let budget = handle.config.hooks.latency_budget_ms;
+            tokio::task::spawn_blocking(move || log_hook_event(root, "user_prompt_submit", outcome, ms, budget));
             Ok(result)
         }
         "hook.post_tool_use" => {
             let t0 = std::time::Instant::now();
             let result = hook_post_tool_use_impl(&handle, &params).await;
             let ms = t0.elapsed().as_millis() as u64;
-            log_hook_event(&handle.root, "post_tool_use", "fired", ms);
-            Ok(result)
+            let outcome = if result == json!({}) { "skipped" } else { "fired" };
+            let root = handle.root.clone();
+            let budget = handle.config.hooks.latency_budget_ms;
+            tokio::task::spawn_blocking(move || log_hook_event(root, "post_tool_use", outcome, ms, budget));
+            Ok(json!({}))
         }
         "hook.pre_tool_use" => {
             let t0 = std::time::Instant::now();
             let result = hook_pre_tool_use_impl(&handle, &params);
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) { "skipped" } else { "fired" };
-            log_hook_event(&handle.root, "pre_tool_use", outcome, ms);
+            let root = handle.root.clone();
+            let budget = handle.config.hooks.latency_budget_ms;
+            tokio::task::spawn_blocking(move || log_hook_event(root, "pre_tool_use", outcome, ms, budget));
             Ok(result)
         }
         other => Err(McpError {
@@ -2874,10 +2894,7 @@ mod tests {
             "tool_input": {"file_path": file.to_str().unwrap()},
         });
         let result = hook_post_tool_use_impl(&handle, &event).await;
-        assert_eq!(result, json!({}), "post_tool_use always returns {{}}");
-        // Verify path was injected into the channel
-        let path = handle.reindex_tx.downgrade();
-        drop(path); // just check it didn't panic
+        assert_eq!(result, json!({"queued": true}), "post_tool_use returns queued on success");
     }
 
     #[tokio::test]
