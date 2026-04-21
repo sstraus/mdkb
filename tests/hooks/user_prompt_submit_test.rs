@@ -207,9 +207,7 @@ fn seed_two_entries_with_access_counts(
     let low = MemoryEntry {
         id: low_id.to_string(),
         title: format!("{shared_keyword} low-access entry"),
-        content: format!(
-            "{shared_keyword} implementation detail rarely accessed by anyone"
-        ),
+        content: format!("{shared_keyword} implementation detail rarely accessed by anyone"),
         entry_type: EntryType::Decision,
         tags: vec![shared_keyword.to_string()],
         status: EntryStatus::Active,
@@ -230,9 +228,7 @@ fn seed_two_entries_with_access_counts(
     let high = MemoryEntry {
         id: high_id.to_string(),
         title: format!("{shared_keyword} high-access entry"),
-        content: format!(
-            "{shared_keyword} implementation detail frequently accessed by the team"
-        ),
+        content: format!("{shared_keyword} implementation detail frequently accessed by the team"),
         entry_type: EntryType::Decision,
         tags: vec![shared_keyword.to_string()],
         status: EntryStatus::Active,
@@ -289,12 +285,8 @@ fn user_prompt_submit_access_recency_reranks_higher_access_first() {
     );
 
     // High-access entry must appear BEFORE the low-access entry.
-    let high_pos = ctx_block
-        .find(high_id)
-        .expect("high_id must be present");
-    let low_pos = ctx_block
-        .find(low_id)
-        .expect("low_id must be present");
+    let high_pos = ctx_block.find(high_id).expect("high_id must be present");
+    let low_pos = ctx_block.find(low_id).expect("low_id must be present");
 
     assert!(
         high_pos < low_pos,

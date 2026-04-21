@@ -49,8 +49,8 @@ fn mdkb_entries<'a>(value: &'a serde_json::Value, event: &str) -> Vec<&'a serde_
 fn fresh_settings_gets_three_managed_hook_entries() {
     let (_guard, project, _home) = isolated_project();
 
-    let result =
-        handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("setup hooks ok");
+    let result = handle_setup_hooks_claude(project.path(), "local", "", false, None)
+        .expect("setup hooks ok");
     assert!(result.success);
     assert_eq!(result.events_registered.len(), HOOK_EVENTS.len());
     assert!(result.events_skipped.is_empty());
@@ -113,7 +113,11 @@ fn disable_skips_named_events() {
     )
     .expect("setup hooks ok");
     assert_eq!(result.events_registered.len(), 2);
-    assert!(result.events_registered.contains(&"UserPromptSubmit".to_string()));
+    assert!(
+        result
+            .events_registered
+            .contains(&"UserPromptSubmit".to_string())
+    );
     assert!(result.events_registered.contains(&"PreToolUse".to_string()));
     assert_eq!(result.events_skipped.len(), 2);
     assert!(result.events_skipped.contains(&"SessionStart".to_string()));
@@ -130,7 +134,8 @@ fn disable_skips_named_events() {
 fn dry_run_does_not_write_file() {
     let (_guard, project, _home) = isolated_project();
 
-    let result = handle_setup_hooks_claude(project.path(), "local", "", true, None).expect("dry run ok");
+    let result =
+        handle_setup_hooks_claude(project.path(), "local", "", true, None).expect("dry run ok");
     assert!(result.dry_run);
     assert!(result.success);
     assert_eq!(result.events_registered.len(), HOOK_EVENTS.len());

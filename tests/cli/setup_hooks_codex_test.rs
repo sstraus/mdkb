@@ -109,7 +109,11 @@ fn disable_flag_skips_named_events() {
     let result =
         handle_setup_hooks_codex("session-start,post-tool-use", false).expect("setup hooks codex");
     assert_eq!(result.events_registered.len(), 2);
-    assert!(result.events_registered.contains(&"UserPromptSubmit".to_string()));
+    assert!(
+        result
+            .events_registered
+            .contains(&"UserPromptSubmit".to_string())
+    );
     assert!(result.events_registered.contains(&"PreToolUse".to_string()));
     assert_eq!(result.events_skipped.len(), 2);
     assert!(result.events_skipped.contains(&"SessionStart".to_string()));

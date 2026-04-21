@@ -673,7 +673,10 @@ pub fn search_entries_by_type(
          LIMIT ?2"
     )?;
 
-    let rows = stmt.query_map(params![fts_query, limit as i64, now, entry_type], row_to_entry)?;
+    let rows = stmt.query_map(
+        params![fts_query, limit as i64, now, entry_type],
+        row_to_entry,
+    )?;
 
     let mut entries = Vec::new();
     for row in rows {

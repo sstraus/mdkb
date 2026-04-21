@@ -33,8 +33,8 @@ use mdkb::cli::hooks;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
     Cli, CollectionCommand, Command, DaemonCommand, EvolveCommand, ExperimentCommand, HookCommand,
-    HookEvent, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, SessionCommand,
-    RemoveHooksCommand, RemoveMcpCommand, SetupCommand, SetupHooksCommand, SetupMcpCommand,
+    HookEvent, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, RemoveHooksCommand,
+    RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand, SetupMcpCommand,
     SetupRemoveCommand,
 };
 use mdkb::mcp::server::run_server;
@@ -897,10 +897,7 @@ async fn run() -> Result<()> {
                     }
                 },
                 SetupRemoveCommand::Hooks(hooks_cmd) => match hooks_cmd {
-                    RemoveHooksCommand::Claude {
-                        scope,
-                        profile_dir,
-                    } => {
+                    RemoveHooksCommand::Claude { scope, profile_dir } => {
                         let msg = mdkb::cli::setup::handle_remove_hooks_claude(
                             &cwd,
                             &scope,

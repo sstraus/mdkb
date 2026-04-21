@@ -465,7 +465,10 @@ fn collect_hook_event_stats(mdkb_dir: &Path, since_ts: i64) -> Vec<HookEventStat
             .and_then(|e| e.as_str())
             .unwrap_or("?")
             .to_string();
-        let outcome = v.get("outcome").and_then(|o| o.as_str()).unwrap_or("skipped");
+        let outcome = v
+            .get("outcome")
+            .and_then(|o| o.as_str())
+            .unwrap_or("skipped");
         let elapsed = v.get("elapsed_ms").and_then(|e| e.as_u64()).unwrap_or(0);
         buckets
             .entry(event)
@@ -823,29 +826,50 @@ mod tests {
         let mdkb_dir = env.ctx.db_path.parent().unwrap();
         let now = chrono::Utc::now().timestamp();
         let lines = [
-            format!(r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":5,"ts":{}}}"#, now),
-            format!(r#"{{"event":"PreToolUse","outcome":"skipped","elapsed_ms":2,"ts":{}}}"#, now),
-            format!(r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":10,"ts":{}}}"#, now),
-            format!(r#"{{"event":"PostToolUse","outcome":"fired","elapsed_ms":3,"ts":{}}}"#, now),
+            format!(
+                r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":5,"ts":{}}}"#,
+                now
+            ),
+            format!(
+                r#"{{"event":"PreToolUse","outcome":"skipped","elapsed_ms":2,"ts":{}}}"#,
+                now
+            ),
+            format!(
+                r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":10,"ts":{}}}"#,
+                now
+            ),
+            format!(
+                r#"{{"event":"PostToolUse","outcome":"fired","elapsed_ms":3,"ts":{}}}"#,
+                now
+            ),
             // Old event — should be excluded (8 days ago)
-            format!(r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":1,"ts":{}}}"#, now - 8 * 86_400),
+            format!(
+                r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":1,"ts":{}}}"#,
+                now - 8 * 86_400
+            ),
         ];
-        std::fs::write(
-            mdkb_dir.join("hook-events.jsonl"),
-            lines.join("\n") + "\n",
-        )
-        .unwrap();
+        std::fs::write(mdkb_dir.join("hook-events.jsonl"), lines.join("\n") + "\n").unwrap();
 
         let report = collect_report(&env.ctx).expect("collect");
         assert_eq!(report.hooks.events.len(), 2);
 
-        let pre = report.hooks.events.iter().find(|e| e.event == "PreToolUse").unwrap();
+        let pre = report
+            .hooks
+            .events
+            .iter()
+            .find(|e| e.event == "PreToolUse")
+            .unwrap();
         assert_eq!(pre.invocations, 3);
         assert_eq!(pre.fired, 2);
         assert_eq!(pre.avg_ms, 5); // (5+2+10)/3 = 5
         assert_eq!(pre.p95_ms, 10); // sorted: [2,5,10], idx ceil(3*0.95)-1 = 2 → 10
 
-        let post = report.hooks.events.iter().find(|e| e.event == "PostToolUse").unwrap();
+        let post = report
+            .hooks
+            .events
+            .iter()
+            .find(|e| e.event == "PostToolUse")
+            .unwrap();
         assert_eq!(post.invocations, 1);
         assert_eq!(post.fired, 1);
     }

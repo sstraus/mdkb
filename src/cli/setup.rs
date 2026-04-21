@@ -283,7 +283,11 @@ pub struct HooksSetupResult {
 pub const HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
     ("SessionStart", "session-start", None),
     ("UserPromptSubmit", "user-prompt-submit", None),
-    ("PostToolUse", "post-tool-use", Some("Edit|Write|NotebookEdit|MultiEdit")),
+    (
+        "PostToolUse",
+        "post-tool-use",
+        Some("Edit|Write|NotebookEdit|MultiEdit"),
+    ),
     ("PreToolUse", "pre-tool-use", Some("Grep")),
 ];
 
@@ -853,7 +857,7 @@ pub fn handle_remove_mcp_claude(scope: &str) -> Result<String> {
             return Err(Error::from(ErrorKind::Command {
                 command: "setup remove mcp claude".to_string(),
                 message: format!("Invalid scope '{other}'. Must be 'local' or 'user'."),
-            }))
+            }));
         }
     };
 
@@ -911,8 +915,7 @@ pub fn handle_remove_mcp_codex() -> Result<String> {
         })
     })?;
 
-    let removed = if let Some(servers) = doc.get_mut("mcp_servers").and_then(|v| v.as_table_mut())
-    {
+    let removed = if let Some(servers) = doc.get_mut("mcp_servers").and_then(|v| v.as_table_mut()) {
         servers.remove("mdkb").is_some()
     } else {
         false
@@ -1082,8 +1085,14 @@ mod tests {
     #[test]
     fn test_hook_command_line_daemon_required_no_fallback() {
         let cmd = hook_command_line("/usr/bin/mdkb", "session-start", true);
-        assert!(!cmd.contains("MDKB_NO_DAEMON"), "daemon_required must omit fallback");
-        assert!(!cmd.contains("if !"), "daemon_required must omit if-then-fi wrapper");
+        assert!(
+            !cmd.contains("MDKB_NO_DAEMON"),
+            "daemon_required must omit fallback"
+        );
+        assert!(
+            !cmd.contains("if !"),
+            "daemon_required must omit if-then-fi wrapper"
+        );
         assert!(cmd.contains("hook session-start"));
     }
 
@@ -1118,7 +1127,10 @@ mod tests {
         assert_eq!(removed, 2);
         let hooks = settings["hooks"].as_object().unwrap();
         assert_eq!(hooks["SessionStart"].as_array().unwrap().len(), 1);
-        assert!(!hooks.contains_key("PostToolUse"), "empty array should be pruned");
+        assert!(
+            !hooks.contains_key("PostToolUse"),
+            "empty array should be pruned"
+        );
     }
 
     #[test]
@@ -1132,7 +1144,10 @@ mod tests {
         });
         let removed = remove_mdkb_hook_entries(&mut settings);
         assert_eq!(removed, 1);
-        assert!(settings.get("hooks").is_none(), "empty hooks object should be pruned");
+        assert!(
+            settings.get("hooks").is_none(),
+            "empty hooks object should be pruned"
+        );
     }
 
     #[test]

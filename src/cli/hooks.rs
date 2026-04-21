@@ -550,9 +550,7 @@ fn classify_grep_pattern(pattern: &str, path: Option<&str>, bin: &str) -> Option
     if let Some(p) = path {
         let p = p.trim_end_matches('/');
         if p.contains('.') && !p.ends_with('/') && !p.is_empty() {
-            let looks_like_file = std::path::Path::new(p)
-                .extension()
-                .is_some();
+            let looks_like_file = std::path::Path::new(p).extension().is_some();
             if looks_like_file {
                 return None;
             }
@@ -560,7 +558,9 @@ fn classify_grep_pattern(pattern: &str, path: Option<&str>, bin: &str) -> Option
     }
 
     // Complex regex: Grep is the right tool.
-    let regex_meta = ['*', '+', '?', '{', '}', '[', ']', '(', ')', '^', '$', '|', '.'];
+    let regex_meta = [
+        '*', '+', '?', '{', '}', '[', ']', '(', ')', '^', '$', '|', '.',
+    ];
     let has_regex = pattern.chars().any(|c| regex_meta.contains(&c));
     if has_regex {
         return classify_callsite_pattern(pattern, bin);
@@ -597,10 +597,7 @@ fn classify_callsite_pattern(pattern: &str, bin: &str) -> Option<String> {
         .all(|c| c.is_alphanumeric() || c == '_' || c == ':');
 
     if is_ident && stripped.len() < pattern.len() {
-        return Some(format!(
-            "Use `{} code callers {}` via Bash.",
-            bin, stripped
-        ));
+        return Some(format!("Use `{} code callers {}` via Bash.", bin, stripped));
     }
 
     None
@@ -608,9 +605,25 @@ fn classify_callsite_pattern(pattern: &str, bin: &str) -> Option<String> {
 
 /// Definition-search patterns: `fn X`, `struct X`, `class X`, etc.
 const DEF_KEYWORDS: &[&str] = &[
-    "fn ", "func ", "def ", "class ", "struct ", "impl ", "trait ", "type ", "enum ",
-    "interface ", "const ", "let ", "var ", "pub fn ", "pub struct ", "pub enum ",
-    "pub trait ", "async fn ", "pub async fn ",
+    "fn ",
+    "func ",
+    "def ",
+    "class ",
+    "struct ",
+    "impl ",
+    "trait ",
+    "type ",
+    "enum ",
+    "interface ",
+    "const ",
+    "let ",
+    "var ",
+    "pub fn ",
+    "pub struct ",
+    "pub enum ",
+    "pub trait ",
+    "async fn ",
+    "pub async fn ",
 ];
 
 fn classify_definition_search(pattern: &str, bin: &str) -> Option<String> {
@@ -618,11 +631,7 @@ fn classify_definition_search(pattern: &str, bin: &str) -> Option<String> {
     for kw in DEF_KEYWORDS {
         if lower.starts_with(kw) {
             let symbol = pattern[kw.len()..].trim();
-            if symbol.len() >= 2
-                && symbol
-                    .chars()
-                    .all(|c| c.is_alphanumeric() || c == '_')
-            {
+            if symbol.len() >= 2 && symbol.chars().all(|c| c.is_alphanumeric() || c == '_') {
                 return Some(format!(
                     "Use `{} search --scope symbols \"{}\"` via Bash.",
                     bin, symbol
