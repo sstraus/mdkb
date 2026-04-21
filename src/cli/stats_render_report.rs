@@ -218,8 +218,8 @@ fn render_sessions(out: &mut String, s: &SessionsSummary) {
 
 fn render_hooks(out: &mut String, h: &HooksSummary) {
     let mut body = format!(
-        "  slow events (7d)  {:>4}\n  reindex pending   {:>4}",
-        h.slow_events_7d, h.reindex_queue_pending
+        "  slow events (7d)  {:>4}",
+        h.slow_events_7d
     );
 
     if !h.events.is_empty() {
@@ -341,7 +341,6 @@ mod tests {
             },
             hooks: HooksSummary {
                 slow_events_7d: 3,
-                reindex_queue_pending: 0,
                 events: vec![],
             },
         }

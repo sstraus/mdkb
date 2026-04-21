@@ -4,7 +4,6 @@ pub mod daemon;
 pub mod handlers;
 pub mod hook_client;
 pub mod hook_logic;
-pub mod hooks;
 pub mod journal;
 pub mod mcp_proxy;
 pub mod setup;
@@ -352,16 +351,6 @@ pub enum HookCommand {
         #[arg(long)]
         root: Option<PathBuf>,
     },
-}
-
-/// Lifecycle hook events supported by mdkb. Kept for back-compat with
-/// `hooks::dispatch`; new callers use `HookCommand` variants directly.
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-pub enum HookEvent {
-    SessionStart,
-    UserPromptSubmit,
-    PostToolUse,
-    PreToolUse,
 }
 
 /// Session indexing subcommands.

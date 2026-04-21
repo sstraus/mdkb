@@ -30,11 +30,10 @@ use mdkb::cli::handlers::{
 };
 use mdkb::cli::hook_client;
 use mdkb::cli::hook_logic;
-use mdkb::cli::hooks;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
     Cli, CollectionCommand, Command, DaemonCommand, EvolveCommand, ExperimentCommand, HookCommand,
-    HookEvent, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, RemoveHooksCommand,
+    JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, RemoveHooksCommand,
     RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand, SetupMcpCommand,
     SetupRemoveCommand,
 };

@@ -128,8 +128,6 @@ pub struct ToolRow {
 pub struct HooksSummary {
     /// Slow hook events in the last 7 days (from hook-slow.jsonl).
     pub slow_events_7d: usize,
-    /// Lines pending in reindex-queue.jsonl.
-    pub reindex_queue_pending: usize,
     /// Per-event invocation stats (last 7 days, from hook-events.jsonl).
     pub events: Vec<HookEventStats>,
 }
@@ -434,12 +432,10 @@ fn collect_hooks(mdkb_dir: &Path) -> HooksSummary {
     let cutoff = chrono::Utc::now().timestamp() - 7 * 86_400;
 
     let slow_events_7d = count_slow_events(mdkb_dir, cutoff);
-    let reindex_queue_pending = count_jsonl_lines(&mdkb_dir.join("reindex-queue.jsonl"));
     let events = collect_hook_event_stats(mdkb_dir, cutoff);
 
     HooksSummary {
         slow_events_7d,
-        reindex_queue_pending,
         events,
     }
 }
@@ -524,13 +520,6 @@ fn count_slow_events(mdkb_dir: &Path, since_ts: i64) -> usize {
                 .is_some_and(|ts| ts >= since_ts)
         })
         .count()
-}
-
-fn count_jsonl_lines(path: &Path) -> usize {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return 0;
-    };
-    content.lines().filter(|l| !l.trim().is_empty()).count()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -800,24 +789,9 @@ mod tests {
             },
             hooks: HooksSummary {
                 slow_events_7d: 0,
-                reindex_queue_pending: 0,
                 events: vec![],
             },
         }
-    }
-
-    #[test]
-    fn hooks_summary_counts_reindex_queue() {
-        let env = Env::new();
-        let mdkb_dir = env.ctx.db_path.parent().unwrap();
-        std::fs::write(
-            mdkb_dir.join("reindex-queue.jsonl"),
-            "{\"path\":\"a.rs\"}\n{\"path\":\"b.rs\"}\n",
-        )
-        .unwrap();
-
-        let report = collect_report(&env.ctx).expect("collect");
-        assert_eq!(report.hooks.reindex_queue_pending, 2);
     }
 
     #[test]
