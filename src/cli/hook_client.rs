@@ -138,6 +138,93 @@ fn hook_socket_path() -> PathBuf {
     DaemonConfig::daemon_home().join(HOOK_SOCKET_NAME)
 }
 
+// ── Per-event hook timeouts (daemon must answer within these) ────────────────
+
+const HOOK_TIMEOUT_SESSION_START: Duration = Duration::from_secs(2);
+const HOOK_TIMEOUT_USER_PROMPT_SUBMIT: Duration = Duration::from_secs(1);
+const HOOK_TIMEOUT_POST_TOOL_USE: Duration = Duration::from_millis(500);
+const HOOK_TIMEOUT_PRE_TOOL_USE: Duration = Duration::from_millis(300);
+
+/// Return the per-event socket timeout for a hook method.
+fn hook_timeout(method: &str) -> Duration {
+    match method {
+        "hook.session_start" => HOOK_TIMEOUT_SESSION_START,
+        "hook.user_prompt_submit" => HOOK_TIMEOUT_USER_PROMPT_SUBMIT,
+        "hook.post_tool_use" => HOOK_TIMEOUT_POST_TOOL_USE,
+        "hook.pre_tool_use" => HOOK_TIMEOUT_PRE_TOOL_USE,
+        _ => CALL_TIMEOUT,
+    }
+}
+
+/// Send a lifecycle hook event to the daemon and emit the result to stdout.
+///
+/// `event` is the raw event JSON received on stdin by the hook binary.
+/// On any error the function logs to stderr and returns `Ok(())` — host CLIs
+/// must see exit 0.
+pub async fn call_hook_event(
+    method: &str,
+    event: Value,
+    root: Option<PathBuf>,
+) -> Result<()> {
+    run_hook(method, event, root).await
+}
+
+/// Like `run` but routes through `emit_hook_response` (raw envelope → stdout)
+/// rather than `print_response` (text extraction). Uses per-event timeouts.
+async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<()> {
+    let root = resolve_root(root);
+    params["root"] = json!(root.display().to_string());
+
+    if std::env::var_os("MDKB_NO_DAEMON").is_some() {
+        return run_hook_in_process(method, params, &root).await;
+    }
+
+    let socket_path = hook_socket_path();
+    let timeout = hook_timeout(method);
+    match call_daemon_with_timeout(&socket_path, method, &params, timeout).await {
+        Ok(response) => emit_hook_response(&response),
+        Err(e) => eprintln!("mdkb hook {method}: {e}"),
+    }
+    Ok(())
+}
+
+/// In-process fallback for `MDKB_NO_DAEMON=1`. Same logic as `run_in_process`
+/// but uses `emit_hook_response`.
+async fn run_hook_in_process(method: &str, params: Value, root: &Path) -> Result<()> {
+    let daemon_config = DaemonConfig::load_or_default(&DaemonConfig::config_path())?;
+    let registry = Arc::new(RepoRegistry::new(daemon_config));
+    let dctx = DispatchContext {
+        metrics: Arc::new(UsageMetrics::new()),
+        session_id: Arc::new(AtomicI64::new(0)),
+        persistent_call_count: Arc::new(AtomicU64::new(0)),
+        optimize_interval_calls: 200,
+    };
+
+    match registry.get_or_open(root) {
+        Ok(handle) => match dispatch_call(method, params, handle, &dctx).await {
+            Ok(result) => emit_hook_response(&result),
+            Err(e) => eprintln!("mdkb hook {method}: {}", e.message),
+        },
+        Err(e) => eprintln!("mdkb hook {method}: repo registry: {e}"),
+    }
+    Ok(())
+}
+
+/// Write the hook result envelope to stdout when it contains output.
+/// Silent when the result is `{}` — the host CLI must receive nothing in
+/// that case (stdout silence = "hook has nothing to add").
+pub fn emit_hook_response(result: &Value) {
+    match result {
+        Value::Null => {}
+        Value::Object(o) if o.is_empty() => {}
+        _ => {
+            if let Ok(s) = serde_json::to_string(result) {
+                println!("{s}");
+            }
+        }
+    }
+}
+
 /// Run a single JSON-RPC call. On any daemon-reported or transport error,
 /// log to stderr and return Ok(()) — the host hook must exit 0.
 async fn run(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<()> {
@@ -202,6 +289,15 @@ async fn call_daemon(
     method: &str,
     params: &Value,
 ) -> std::result::Result<Value, String> {
+    call_daemon_with_timeout(socket_path, method, params, CALL_TIMEOUT).await
+}
+
+async fn call_daemon_with_timeout(
+    socket_path: &Path,
+    method: &str,
+    params: &Value,
+    timeout: Duration,
+) -> std::result::Result<Value, String> {
     ensure_daemon_running(socket_path)
         .await
         .map_err(|e| format!("daemon unavailable: {e}"))?;
@@ -218,9 +314,9 @@ async fn call_daemon(
     });
     let body = serde_json::to_vec(&request).map_err(|e| format!("serialize request: {e}"))?;
 
-    let response = tokio::time::timeout(CALL_TIMEOUT, send_and_read(stream, &body))
+    let response = tokio::time::timeout(timeout, send_and_read(stream, &body))
         .await
-        .map_err(|_| format!("timeout after {CALL_TIMEOUT:?}"))?
+        .map_err(|_| format!("timeout after {timeout:?}"))?
         .map_err(|e| format!("io: {e}"))?;
 
     let envelope: Value =
@@ -395,5 +491,57 @@ mod tests {
             path.display()
         );
         assert!(path.to_string_lossy().contains(".mdkb"));
+    }
+
+    // ── emit_hook_response ────────────────────────────────────────────────────
+
+    #[test]
+    fn emit_hook_response_silent_on_empty_object() {
+        // Can't capture stdout in unit tests, but we can verify it doesn't panic
+        // and returns quickly. The real output contract is verified in e2e tests.
+        emit_hook_response(&json!({}));
+    }
+
+    #[test]
+    fn emit_hook_response_silent_on_null() {
+        emit_hook_response(&Value::Null);
+    }
+
+    #[test]
+    fn hook_timeout_returns_per_event_durations() {
+        assert_eq!(hook_timeout("hook.session_start"), HOOK_TIMEOUT_SESSION_START);
+        assert_eq!(hook_timeout("hook.user_prompt_submit"), HOOK_TIMEOUT_USER_PROMPT_SUBMIT);
+        assert_eq!(hook_timeout("hook.post_tool_use"), HOOK_TIMEOUT_POST_TOOL_USE);
+        assert_eq!(hook_timeout("hook.pre_tool_use"), HOOK_TIMEOUT_PRE_TOOL_USE);
+        assert_eq!(hook_timeout("status"), CALL_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn call_hook_event_via_fake_daemon() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("hook.sock");
+        let envelope = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "additionalContext": "Use mdkb search instead",
+            }
+        });
+        let _srv = spawn_fake_hook_server(
+            sock.clone(),
+            json!({"jsonrpc":"2.0","result": envelope}),
+        );
+
+        // call_daemon_with_timeout returns the result envelope
+        let result = call_daemon_with_timeout(
+            &sock,
+            "hook.pre_tool_use",
+            &json!({"root": "/tmp", "tool_name": "Grep", "tool_input": {"pattern": "foo"}}),
+            HOOK_TIMEOUT_PRE_TOOL_USE,
+        )
+        .await
+        .unwrap();
+
+        assert!(result.get("hookSpecificOutput").is_some(), "result: {result}");
     }
 }
