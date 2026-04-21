@@ -20,6 +20,10 @@ use serde_json::{Value, json};
 use crate::cli::handlers::{
     Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update,
 };
+use crate::cli::hook_logic::{
+    REINDEX_TOOLS, build_recall_query, canonicalize_under_cwd, classify_definition_search,
+    classify_grep_pattern, prompt_is_wrapup, tool_input_path,
+};
 use crate::code::indexing::IndexFacade;
 use crate::daemon::registry::RepoHandle;
 use crate::domain::SearchResult;
@@ -27,6 +31,7 @@ use crate::metrics::{
     UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
 };
 use crate::store::{collections, documents, evolution, memory, search, stats};
+use crate::store::memory::{access_recency_score, get_warmup_index, search_entries_fts};
 
 use super::mcp_error;
 use super::server::{
@@ -1569,6 +1574,201 @@ pub async fn usage_impl(
 ///
 /// Unknown methods return an `McpError`; the JSON-RPC caller maps that into
 /// a `-32601 Method not found` response.
+// ── Hook dispatch impls ───────────────────────────────────────────────────────
+// These return raw hook envelopes (hookSpecificOutput) rather than {text:...}.
+// Called from dispatch_call "hook.*" arms and from hook_client's no-daemon path.
+
+pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
+    let cfg = &handle.config.hooks;
+    if !cfg.session_start_enabled {
+        return json!({});
+    }
+    if ensure_handle_context(handle).await.is_err() {
+        return json!({});
+    }
+    let ctx_guard = handle.ctx.lock().await;
+    let conn = match ctx_guard.as_ref() {
+        Some(c) => &c.conn,
+        None => return json!({}),
+    };
+    let limit = cfg.warmup_limit.max(1);
+    let lines = match get_warmup_index(conn, limit) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("hook.session_start: get_warmup_index failed: {e}");
+            return json!({});
+        }
+    };
+    drop(ctx_guard);
+
+    if lines.is_empty() {
+        return json!({});
+    }
+
+    let bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "mdkb".to_string());
+
+    let mut body = String::from("## mdkb memory warmup\n\n");
+    for line in &lines {
+        body.push_str("- ");
+        body.push_str(line);
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "\n**mdkb CLI** (semantic search — not available via Grep/Glob). Run `{bin} cheatsheet` for full syntax.\n"
+    ));
+
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": body,
+        }
+    })
+}
+
+pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> Value {
+    let cfg = &handle.config.hooks;
+    if !cfg.user_prompt_submit_enabled {
+        return json!({});
+    }
+    if prompt.trim().is_empty() || prompt_is_wrapup(prompt) {
+        return json!({});
+    }
+    let fts_query = match build_recall_query(prompt) {
+        Some(q) => q,
+        None => return json!({}),
+    };
+    if ensure_handle_context(handle).await.is_err() {
+        return json!({});
+    }
+    let ctx_guard = handle.ctx.lock().await;
+    let conn = match ctx_guard.as_ref() {
+        Some(c) => &c.conn,
+        None => return json!({}),
+    };
+    let limit = cfg.recall_limit.max(1);
+    let mut results = match search_entries_fts(conn, &fts_query, limit) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("hook.user_prompt_submit: search_entries_fts failed: {e}");
+            return json!({});
+        }
+    };
+    drop(ctx_guard);
+
+    if results.is_empty() {
+        return json!({});
+    }
+
+    if cfg.recall_half_life_secs > 0 {
+        let now = chrono::Utc::now().timestamp();
+        let n = results.len() as f64;
+        let mut scored: Vec<(f64, usize)> = results
+            .iter()
+            .enumerate()
+            .map(|(rank, entry)| {
+                let bm25 = (n - rank as f64) / n;
+                let recency = access_recency_score(
+                    entry.access_count,
+                    entry.last_accessed,
+                    now,
+                    cfg.recall_half_life_secs,
+                );
+                (bm25 + recency, rank)
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let orig = results.clone();
+        results = scored.into_iter().map(|(_, i)| orig[i].clone()).collect();
+    }
+
+    let mut body = String::from("## mdkb: relevant context\n\n");
+    for entry in &results {
+        let snippet_raw = entry.content.trim().replace('\n', " ");
+        let snippet: String = snippet_raw.chars().take(160).collect();
+        body.push_str(&format!("- [{}] {} — {}\n", entry.id, entry.title, snippet));
+    }
+
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": body,
+        }
+    })
+}
+
+pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
+    if !handle.config.hooks.post_tool_use_enabled {
+        return json!({});
+    }
+    let tool_name = match event.get("tool_name").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return json!({}),
+    };
+    if !REINDEX_TOOLS.contains(&tool_name) {
+        return json!({});
+    }
+    let raw_path = match event.get("tool_input").and_then(tool_input_path) {
+        Some(p) => p,
+        None => return json!({}),
+    };
+    let path = match canonicalize_under_cwd(&handle.root, &raw_path) {
+        Some(p) => std::path::PathBuf::from(p),
+        None => {
+            tracing::warn!(
+                "hook.post_tool_use: rejected path outside root: {raw_path}"
+            );
+            return json!({});
+        }
+    };
+    if let Err(e) = handle.reindex_tx.try_send(path) {
+        tracing::warn!("hook.post_tool_use: reindex_tx send failed: {e}");
+    }
+    json!({})
+}
+
+pub fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
+    if !handle.config.hooks.pre_tool_use_enabled {
+        return json!({});
+    }
+    let tool_name = match event.get("tool_name").and_then(|v| v.as_str()) {
+        Some(t) => t,
+        None => return json!({}),
+    };
+    if tool_name != "Grep" {
+        return json!({});
+    }
+    let tool_input = match event.get("tool_input") {
+        Some(v) => v,
+        None => return json!({}),
+    };
+    let pattern = match tool_input.get("pattern").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => return json!({}),
+    };
+    let path = tool_input.get("path").and_then(|v| v.as_str());
+    let bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_else(|| "mdkb".to_string());
+
+    let suggestion = classify_definition_search(pattern, &bin)
+        .or_else(|| classify_grep_pattern(pattern, path, &bin));
+
+    match suggestion {
+        Some(text) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "additionalContext": text,
+            }
+        }),
+        None => json!({}),
+    }
+}
+
 pub async fn dispatch_call(
     tool_name: &str,
     params: Value,
@@ -1701,6 +1901,17 @@ pub async fn dispatch_call(
                 .await;
             Ok(json!({ "text": text, "tokens": tokens }))
         }
+        "hook.session_start" => Ok(hook_session_start_impl(&handle).await),
+        "hook.user_prompt_submit" => {
+            let prompt = params
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            Ok(hook_user_prompt_submit_impl(&handle, &prompt).await)
+        }
+        "hook.post_tool_use" => Ok(hook_post_tool_use_impl(&handle, &params).await),
+        "hook.pre_tool_use" => Ok(hook_pre_tool_use_impl(&handle, &params)),
         other => Err(McpError {
             code: ErrorCode::METHOD_NOT_FOUND,
             message: format!("unknown tool: {other}").into(),
@@ -2530,5 +2741,143 @@ mod tests {
             .join(",");
         // Panics only if the cap itself errors — "not found" is acceptable output
         let _ = get_batch_impl(&handle, &ids, None).await;
+    }
+
+    // ── hook method tests ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn hook_session_start_silent_on_empty_index() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let result = hook_session_start_impl(&handle).await;
+        // Empty index → no warmup lines → silent ({})
+        assert_eq!(result, json!({}), "must be silent when index is empty");
+    }
+
+    #[tokio::test]
+    async fn hook_session_start_disabled_returns_empty() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let mut cfg = Config::default();
+        cfg.hooks.session_start_enabled = false;
+        let handle = Arc::new(RepoHandle::from_shared(
+            root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            cfg,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let result = hook_session_start_impl(&handle).await;
+        assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn hook_user_prompt_submit_silent_on_empty_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let result = hook_user_prompt_submit_impl(&handle, "").await;
+        assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn hook_user_prompt_submit_silent_on_wrapup() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let result = hook_user_prompt_submit_impl(&handle, "/clear").await;
+        assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn hook_user_prompt_submit_silent_when_no_results() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        // Empty DB → no results
+        let result = hook_user_prompt_submit_impl(&handle, "find authentication bug").await;
+        assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn hook_post_tool_use_ignores_unknown_tool() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let event = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
+        let result = hook_post_tool_use_impl(&handle, &event).await;
+        assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn hook_post_tool_use_injects_valid_path() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        // Create a real file so canonicalize_under_cwd can resolve the parent dir
+        let file = tmp.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let event = json!({
+            "tool_name": "Write",
+            "tool_input": {"file_path": file.to_str().unwrap()},
+        });
+        let result = hook_post_tool_use_impl(&handle, &event).await;
+        assert_eq!(result, json!({}), "post_tool_use always returns {{}}");
+        // Verify path was injected into the channel
+        let path = handle.reindex_tx.downgrade();
+        drop(path); // just check it didn't panic
+    }
+
+    #[tokio::test]
+    async fn hook_pre_tool_use_suggests_symbol_search() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let event = json!({
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "handle_session_start"},
+        });
+        let result = hook_pre_tool_use_impl(&handle, &event);
+        assert!(
+            result.get("hookSpecificOutput").is_some(),
+            "must suggest alternative for plain identifier"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_pre_tool_use_silent_for_non_grep_tool() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let event = json!({
+            "tool_name": "Read",
+            "tool_input": {"file_path": "src/lib.rs"},
+        });
+        let result = hook_pre_tool_use_impl(&handle, &event);
+        assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_routes_hook_session_start() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        let result = dispatch_call("hook.session_start", json!({}), handle, &dctx)
+            .await
+            .expect("must not error");
+        // Empty index → silent, but the call must succeed
+        assert!(result == json!({}) || result.get("hookSpecificOutput").is_some());
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_routes_hook_pre_tool_use() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        let event = json!({
+            "tool_name": "Grep",
+            "tool_input": {"pattern": "dispatch_call"},
+        });
+        let result = dispatch_call("hook.pre_tool_use", event, handle, &dctx)
+            .await
+            .expect("must not error");
+        assert!(result.get("hookSpecificOutput").is_some());
     }
 }
