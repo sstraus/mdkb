@@ -1578,6 +1578,34 @@ pub async fn usage_impl(
 // These return raw hook envelopes (hookSpecificOutput) rather than {text:...}.
 // Called from dispatch_call "hook.*" arms and from hook_client's no-daemon path.
 
+/// Append one line to `.mdkb/hook-events.jsonl`; also `.mdkb/hook-slow.jsonl`
+/// when elapsed exceeds 500 ms. Best-effort — silently drops on I/O failure.
+fn log_hook_event(root: &std::path::Path, event: &str, outcome: &str, elapsed_ms: u64) {
+    use std::io::Write as _;
+    let ts = chrono::Utc::now().timestamp();
+    let line = format!(
+        r#"{{"ts":{ts},"event":{event:?},"outcome":{outcome:?},"elapsed_ms":{elapsed_ms}}}"#
+    ) + "\n";
+    let mdkb_dir = root.join(".mdkb");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(mdkb_dir.join("hook-events.jsonl"))
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+    if elapsed_ms > 500 {
+        let slow = format!(r#"{{"ts":{ts},"event":{event:?},"elapsed_ms":{elapsed_ms}}}"#) + "\n";
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(mdkb_dir.join("hook-slow.jsonl"))
+        {
+            let _ = f.write_all(slow.as_bytes());
+        }
+    }
+}
+
 pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
@@ -1901,17 +1929,42 @@ pub async fn dispatch_call(
                 .await;
             Ok(json!({ "text": text, "tokens": tokens }))
         }
-        "hook.session_start" => Ok(hook_session_start_impl(&handle).await),
+        "hook.session_start" => {
+            let t0 = std::time::Instant::now();
+            let result = hook_session_start_impl(&handle).await;
+            let ms = t0.elapsed().as_millis() as u64;
+            let outcome = if result == json!({}) { "skipped" } else { "fired" };
+            log_hook_event(&handle.root, "session_start", outcome, ms);
+            Ok(result)
+        }
         "hook.user_prompt_submit" => {
             let prompt = params
                 .get("prompt")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            Ok(hook_user_prompt_submit_impl(&handle, &prompt).await)
+            let t0 = std::time::Instant::now();
+            let result = hook_user_prompt_submit_impl(&handle, &prompt).await;
+            let ms = t0.elapsed().as_millis() as u64;
+            let outcome = if result == json!({}) { "skipped" } else { "fired" };
+            log_hook_event(&handle.root, "user_prompt_submit", outcome, ms);
+            Ok(result)
         }
-        "hook.post_tool_use" => Ok(hook_post_tool_use_impl(&handle, &params).await),
-        "hook.pre_tool_use" => Ok(hook_pre_tool_use_impl(&handle, &params)),
+        "hook.post_tool_use" => {
+            let t0 = std::time::Instant::now();
+            let result = hook_post_tool_use_impl(&handle, &params).await;
+            let ms = t0.elapsed().as_millis() as u64;
+            log_hook_event(&handle.root, "post_tool_use", "fired", ms);
+            Ok(result)
+        }
+        "hook.pre_tool_use" => {
+            let t0 = std::time::Instant::now();
+            let result = hook_pre_tool_use_impl(&handle, &params);
+            let ms = t0.elapsed().as_millis() as u64;
+            let outcome = if result == json!({}) { "skipped" } else { "fired" };
+            log_hook_event(&handle.root, "pre_tool_use", outcome, ms);
+            Ok(result)
+        }
         other => Err(McpError {
             code: ErrorCode::METHOD_NOT_FOUND,
             message: format!("unknown tool: {other}").into(),
