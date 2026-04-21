@@ -1,8 +1,8 @@
 # mdkb
 
-**Give your AI coding assistant a memory and a search engine.**
+**Local memory, search, and code intelligence — integrated with Claude Code and Codex via CLI, lifecycle hooks, and MCP.**
 
-mdkb indexes your project's docs, source code, and persistent knowledge into a local hybrid search engine — then exposes it to Claude Code (or any MCP client) so the AI finds what it needs instead of guessing.
+mdkb indexes your project's docs, source code, and persistent knowledge into a local hybrid search engine — then exposes it to Claude Code, Codex, or any MCP client so the AI finds what it needs instead of guessing.
 
 No cloud APIs. No token-heavy context dumps. Just fast, local, relevant retrieval.
 

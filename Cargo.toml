@@ -2,9 +2,9 @@
 name = "mdkb"
 version = "2.2.1"
 edition = "2024"
-description = "Local markdown knowledge base with semantic search"
+description = "Persistent memory, hybrid search, and code intelligence for Claude Code and Codex — with CLI, lifecycle hooks, and MCP"
 license = "MIT"
-repository = "https://github.com/user/mdkb"
+repository = "https://github.com/sstraus/mdkb"
 readme = "README.md"
 keywords = ["markdown", "knowledge-base", "search", "mcp"]
 categories = ["command-line-utilities", "text-processing"]
