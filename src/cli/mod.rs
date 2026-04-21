@@ -3,6 +3,7 @@
 pub mod daemon;
 pub mod handlers;
 pub mod hook_client;
+pub mod hook_logic;
 pub mod hooks;
 pub mod journal;
 pub mod mcp_proxy;
