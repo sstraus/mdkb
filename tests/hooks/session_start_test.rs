@@ -111,30 +111,20 @@ fn session_start_respects_mdkbignore_hooks_marker() {
     let (code, stdout) = run_session_start_in(tmp.path(), "");
 
     assert_eq!(code, 0);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
-
     assert!(
-        parsed.get("hookSpecificOutput").is_none()
-            || parsed
-                .get("hookSpecificOutput")
-                .and_then(|h| h.get("additionalContext"))
-                .is_none(),
-        "opt-out marker must suppress context injection, got: {parsed}"
+        stdout.trim().is_empty(),
+        "opt-out marker must suppress all output, got: {stdout}"
     );
 }
 
 #[test]
-fn session_start_on_uninitialized_project_returns_empty_object() {
+fn session_start_on_uninitialized_project_returns_silence() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (code, stdout) = run_session_start_in(tmp.path(), "");
 
     assert_eq!(code, 0, "hook must never block, even without .mdkb/");
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
-    assert!(parsed.is_object());
     assert!(
-        parsed.get("hookSpecificOutput").is_none(),
-        "no .mdkb/ means no injection, got: {parsed}"
+        stdout.trim().is_empty(),
+        "no .mdkb/ means no output, got: {stdout}"
     );
 }

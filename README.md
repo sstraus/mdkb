@@ -16,10 +16,11 @@ No cloud APIs. No token-heavy context dumps. Just fast, local, relevant retrieva
 - **Unified diagnostics** — `mdkb stats` renders a static ASCII dashboard (index health, collections, memory, code, sessions, hooks)
 - **Zero config serving** — auto-indexes on startup, watches for file changes, auto-`VACUUM`s on drift
 
-### Recent highlights (2.2.0 / 2.0.0 / 1.5.0)
+### Recent highlights (2.2.1 / 2.0.0 / 1.5.0)
 
 Full details in [CHANGES.md](CHANGES.md).
 
+- **2.2.1** — Silent hooks (no stdout when nothing to report); graceful emit_response error handling; deterministic watcher tests via `Notify` readiness signal.
 - **2.2.0** — `prior` entry type for behavioral patterns (30d TTL default, excluded from searches); `mdkb cheatsheet` AI-friendly command reference; `--entry-type` filter on `mdkb search`; PreToolUse Grep hook suggests CLI commands (works without MCP); optimized injected text (~185 fewer tokens per turn).
 - **2.0.0 (breaking)** — `mdkb status` removed (use `mdkb stats`); `mdkb memory export`/`import` round-trip entries as `.md` files with YAML frontmatter; unified ASCII stats dashboard with `--format json` and `--no-color`.
 - **1.5.0** — lifecycle hooks (`SessionStart`, `UserPromptSubmit`, `PostToolUse`) via `mdkb setup hooks claude|codex`; `usage` MCP tool (session+lifetime token ledger); access-count × recency as a third RRF signal in `search`; `memory_confirm` atomic Bayesian signal; auto-`VACUUM` + `PRAGMA optimize` on drift; `mdkb setup mcp codex`.

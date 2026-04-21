@@ -14,7 +14,7 @@ use tokio::sync::Mutex;
 
 use mdkb::cli::handlers::Context;
 use mdkb::domain::Collection;
-use mdkb::mcp::server::{DOC_REINDEX_COUNT, WATCHER_SPAWN_COUNT, run_file_watcher_with_idle};
+use mdkb::mcp::server::{DOC_REINDEX_COUNT, WATCHER_SPAWN_COUNT, run_file_watcher_inner};
 use mdkb::store::collections::add_collection;
 
 /// On macOS /tmp → /private/tmp; FSEvents reports canonical paths.
@@ -69,20 +69,25 @@ async fn two_clients_single_reindex() {
     let watcher_root = root.clone();
     let watcher_ctx = Arc::clone(&ctx_arc);
     let watcher_code = Arc::clone(&code_index);
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let ready_clone = Arc::clone(&ready);
     let watcher_handle = tokio::spawn(async move {
-        let _ = run_file_watcher_with_idle(
+        let _ = run_file_watcher_inner(
             watcher_root,
             watcher_ctx,
             watcher_code,
             true, // needed to watch root recursively
             vec![],
             500, // 500ms batch idle for fast test flush
+            Some(ready_clone),
         )
         .await;
     });
 
-    // Give FSEvents time to register the watch.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for the watcher to finish registering watches.
+    tokio::time::timeout(Duration::from_secs(10), ready.notified())
+        .await
+        .expect("watcher did not become ready within 10s");
 
     // 6. Exactly one watcher should have spawned.
     assert_eq!(

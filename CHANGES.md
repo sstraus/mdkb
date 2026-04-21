@@ -1,5 +1,18 @@
 # Changelog
 
+## 2.2.1 (2026-04-21)
+
+### Changed
+
+- **Silent hooks** — hooks that have nothing to report now produce no stdout
+  output instead of an empty JSON object. Reduces noise for the host CLI.
+- **`emit_response` graceful error handling** — serialization failures are
+  logged to stderr instead of emitting a fallback `{}`.
+- **File watcher ready signal** — `run_file_watcher_inner` accepts an optional
+  `Notify` to signal readiness, replacing sleep-based synchronization in tests.
+- **Watcher test determinism** — `e2e_daemon_watcher` uses `Notify`-based
+  readiness instead of `sleep(500ms)`, eliminating flaky timing.
+
 ## 2.2.0 (2026-04-20)
 
 ### Added

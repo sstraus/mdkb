@@ -182,9 +182,8 @@ fn hooks_e2e_respects_mdkbignore_marker() {
 
     let (stdout, _stderr, code) = run_hook("session-start", &root, "{}");
     assert_eq!(code, 0);
-    let v: Value = serde_json::from_str(stdout.trim()).expect("json");
     assert!(
-        v.get("hookSpecificOutput").is_none(),
-        ".mdkbignore-hooks must suppress warmup. Got: {v}"
+        stdout.trim().is_empty(),
+        ".mdkbignore-hooks must suppress all output. Got: {stdout}"
     );
 }

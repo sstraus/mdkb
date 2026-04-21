@@ -123,15 +123,9 @@ fn user_prompt_submit_no_injection_when_no_match() {
     let (code, stdout) = run_user_prompt_submit_in(tmp.path(), event);
 
     assert_eq!(code, 0);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
-
     assert!(
-        parsed
-            .get("hookSpecificOutput")
-            .and_then(|h| h.get("additionalContext"))
-            .is_none(),
-        "no injection when no matches, got: {parsed}"
+        stdout.trim().is_empty(),
+        "no injection when no matches, got: {stdout}"
     );
 }
 
@@ -143,12 +137,9 @@ fn user_prompt_submit_skips_on_wrapup_marker() {
     let (code, stdout) = run_user_prompt_submit_in(tmp.path(), event);
 
     assert_eq!(code, 0);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
-
     assert!(
-        parsed.get("hookSpecificOutput").is_none(),
-        "wrap-up markers must suppress injection, got: {parsed}"
+        stdout.trim().is_empty(),
+        "wrap-up markers must suppress all output, got: {stdout}"
     );
 }
 
@@ -166,38 +157,36 @@ fn user_prompt_submit_respects_mdkbignore_hooks_marker() {
     let (code, stdout) = run_user_prompt_submit_in(tmp.path(), event);
 
     assert_eq!(code, 0);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
-
     assert!(
-        parsed.get("hookSpecificOutput").is_none(),
-        "opt-out marker must suppress injection, got: {parsed}"
+        stdout.trim().is_empty(),
+        "opt-out marker must suppress all output, got: {stdout}"
     );
 }
 
 #[test]
-fn user_prompt_submit_on_uninitialized_project_returns_empty_object() {
+fn user_prompt_submit_on_uninitialized_project_returns_silence() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let event = r#"{"prompt":"anything"}"#;
     let (code, stdout) = run_user_prompt_submit_in(tmp.path(), event);
 
     assert_eq!(code, 0, "hook must never block");
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
-    assert!(parsed.is_object());
-    assert!(parsed.get("hookSpecificOutput").is_none());
+    assert!(
+        stdout.trim().is_empty(),
+        "no .mdkb/ means no output, got: {stdout}"
+    );
 }
 
 #[test]
-fn user_prompt_submit_no_prompt_field_returns_empty() {
+fn user_prompt_submit_no_prompt_field_returns_silence() {
     let tmp = seed_project_with_memory("x", "x", "x", &[]);
     let event = r#"{}"#;
     let (code, stdout) = run_user_prompt_submit_in(tmp.path(), event);
 
     assert_eq!(code, 0);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
-    assert!(parsed.get("hookSpecificOutput").is_none());
+    assert!(
+        stdout.trim().is_empty(),
+        "missing prompt must produce no output, got: {stdout}"
+    );
 }
 
 /// Seed a project with two memory entries that differ only in access_count/last_accessed.

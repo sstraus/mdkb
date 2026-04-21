@@ -55,6 +55,16 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+fn assert_hook_output_valid(out: &Output, label: &str) {
+    let s = stdout(out);
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    serde_json::from_str::<serde_json::Value>(trimmed)
+        .unwrap_or_else(|e| panic!("{label} must return empty or valid JSON, got: {e}"));
+}
+
 struct Repo {
     _dir: tempfile::TempDir,
     root: PathBuf,
@@ -454,8 +464,7 @@ fn smoke_hook_session_start() {
     let repo = Repo::new();
     let out = run_stdin(&["hook", "session-start"], &repo.root, "{}");
     assert_ok(&out, "hook session-start");
-    serde_json::from_str::<serde_json::Value>(stdout(&out).trim())
-        .expect("hook session-start must return valid JSON");
+    assert_hook_output_valid(&out, "hook session-start");
 }
 
 #[test]
@@ -464,8 +473,7 @@ fn smoke_hook_user_prompt_submit() {
     let payload = r#"{"prompt":"test prompt"}"#;
     let out = run_stdin(&["hook", "user-prompt-submit"], &repo.root, payload);
     assert_ok(&out, "hook user-prompt-submit");
-    serde_json::from_str::<serde_json::Value>(stdout(&out).trim())
-        .expect("hook user-prompt-submit must return valid JSON");
+    assert_hook_output_valid(&out, "hook user-prompt-submit");
 }
 
 #[test]
@@ -474,8 +482,7 @@ fn smoke_hook_post_tool_use() {
     let payload = r#"{"tool_name":"Read","tool_input":{"file_path":"src/lib.rs"}}"#;
     let out = run_stdin(&["hook", "post-tool-use"], &repo.root, payload);
     assert_ok(&out, "hook post-tool-use");
-    serde_json::from_str::<serde_json::Value>(stdout(&out).trim())
-        .expect("hook post-tool-use must return valid JSON");
+    assert_hook_output_valid(&out, "hook post-tool-use");
 }
 
 #[test]

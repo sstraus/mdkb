@@ -188,9 +188,10 @@ fn post_tool_use_on_uninitialized_project_is_noop() {
 
     let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
     assert_eq!(code, 0, "must never block");
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
-    assert!(parsed.is_object());
+    assert!(
+        stdout.trim().is_empty(),
+        "no .mdkb/ means no output, got: {stdout}"
+    );
     assert!(
         !queue_path(tmp.path()).exists(),
         "no .mdkb/ means no queue file"

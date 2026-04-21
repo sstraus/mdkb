@@ -1135,25 +1135,27 @@ pub async fn run_file_watcher(
     code_enabled: bool,
     code_ignore_patterns: Vec<String>,
 ) -> crate::error::Result<()> {
-    run_file_watcher_with_idle(
+    run_file_watcher_inner(
         root,
         ctx,
         code_index,
         code_enabled,
         code_ignore_patterns,
         CODE_BATCH_IDLE_MS,
+        None,
     )
     .await
 }
 
-/// Inner implementation with configurable batch idle (testable).
-pub async fn run_file_watcher_with_idle(
+/// Configurable batch idle + optional ready signal for tests.
+pub async fn run_file_watcher_inner(
     root: PathBuf,
     ctx: Arc<Mutex<Option<Context>>>,
     code_index: Arc<Mutex<Option<IndexFacade>>>,
     code_enabled: bool,
     code_ignore_patterns: Vec<String>,
     batch_idle_ms: u64,
+    ready: Option<Arc<tokio::sync::Notify>>,
 ) -> crate::error::Result<()> {
     WATCHER_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
     let config = WatcherConfig::default();
@@ -1209,6 +1211,10 @@ pub async fn run_file_watcher_with_idle(
                 );
             }
         }
+    }
+
+    if let Some(notify) = ready {
+        notify.notify_one();
     }
 
     // Process file changes with batching for code reindex

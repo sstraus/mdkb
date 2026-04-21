@@ -1,10 +1,10 @@
 //! Hook dispatch handlers for Claude Code / Codex lifecycle events.
 //!
 //! Contract: every handler reads event JSON from stdin (best-effort, may be empty
-//! or malformed), writes a JSON object to stdout, and the process exits 0.
+//! or malformed), optionally writes a JSON response to stdout, and exits 0.
+//! When there is nothing to report, the handler stays silent (no stdout output).
 //! The host CLI must never be blocked by mdkb — internal failures are logged
-//! to stderr and swallowed. Actual recall / warmup / reindex logic lands in
-//! the event-specific stories (015 SessionStart, 016 UserPromptSubmit, 017 PostToolUse).
+//! to stderr and swallowed.
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -18,9 +18,6 @@ use crate::config::{Config, HooksConfig};
 use crate::store::memory::{access_recency_score, get_warmup_index, search_entries_fts};
 
 /// Entry point for `mdkb hook <event>`.
-///
-/// Always returns after writing a JSON object to stdout and exits 0-equivalent
-/// (caller in `main` propagates the `Ok(())`).
 pub fn dispatch(event: HookEvent) {
     let start = Instant::now();
     let input = read_stdin_best_effort();
@@ -87,7 +84,18 @@ fn parse_event(input: &str) -> Value {
 }
 
 fn emit_response(value: &Value) {
-    let serialized = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    match value {
+        Value::Null => return,
+        Value::Object(o) if o.is_empty() => return,
+        _ => {}
+    }
+    let serialized = match serde_json::to_string(value) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("emit_response: serialization failed: {}", e);
+            return;
+        }
+    };
     let stdout = io::stdout();
     let mut handle = stdout.lock();
     let _ = writeln!(handle, "{}", serialized);
@@ -512,7 +520,13 @@ fn handle_post_tool_use(event: Value) -> Value {
         .append(true)
         .open(&queue_path)
     {
-        let _ = writeln!(f, "{}", line);
+        if let Err(e) = writeln!(f, "{}", line) {
+            tracing::warn!(
+                "post-tool-use hook: failed to write reindex queue {}: {}",
+                queue_path.display(),
+                e
+            );
+        }
     } else {
         tracing::warn!(
             "post-tool-use hook: failed to open reindex queue {}",
