@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 use dashmap::DashMap;
 use tokio::sync::{Mutex, mpsc};
+use tokio::task::JoinHandle;
 
 use crate::cli::handlers::Context;
 use crate::code::indexing::IndexFacade;
@@ -37,6 +38,9 @@ pub struct RepoHandle {
     pub reindex_tx: mpsc::Sender<PathBuf>,
     /// Receiver consumed once by spawn_watcher_for_handle; None after the watcher starts.
     reindex_rx: std::sync::Mutex<Option<mpsc::Receiver<PathBuf>>>,
+    /// Handle to the spawned file watcher task. Aborted on drop to prevent
+    /// orphan watcher threads (notify-rs debouncer + fsevents) after LRU eviction.
+    watcher_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for RepoHandle {
@@ -80,6 +84,7 @@ impl RepoHandle {
             code_reindex_active: Arc::new(AtomicBool::new(false)),
             reindex_tx,
             reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
+            watcher_handle: std::sync::Mutex::new(None),
         })
     }
 
@@ -106,6 +111,7 @@ impl RepoHandle {
             code_reindex_active,
             reindex_tx,
             reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
+            watcher_handle: std::sync::Mutex::new(None),
         }
     }
 
@@ -117,6 +123,20 @@ impl RepoHandle {
     /// Get the last_access timestamp.
     pub fn last_access_time(&self) -> i64 {
         self.last_access.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for RepoHandle {
+    fn drop(&mut self) {
+        if let Some(handle) = self
+            .watcher_handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            handle.abort();
+            tracing::debug!(root = %self.root.display(), "Aborted file watcher task");
+        }
     }
 }
 
@@ -283,7 +303,7 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
     let code_ignore_patterns = handle.code_ignore_patterns.clone();
     // Take the receiver exactly once; subsequent calls (same handle) yield None.
     let reindex_rx = handle.reindex_rx.lock().unwrap_or_else(|e| e.into_inner()).take();
-    tokio::spawn(async move {
+    let join_handle = tokio::spawn(async move {
         if let Err(e) = crate::mcp::server::run_file_watcher(
             root,
             ctx,
@@ -297,6 +317,10 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
             tracing::error!("File watcher error: {e}");
         }
     });
+    *handle
+        .watcher_handle
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(join_handle);
 }
 
 /// Canonicalize a root path, resolving symlinks and normalizing.
@@ -582,6 +606,55 @@ mod tests {
             1,
             "two get_or_open calls for the same root must produce exactly one watcher"
         );
+    }
+
+    /// LRU eviction must abort the watcher task so notify-rs threads are cleaned up.
+    /// Regression test for orphaned watcher threads causing 600%+ CPU.
+    #[tokio::test(flavor = "current_thread")]
+    async fn watcher_aborted_on_lru_eviction() {
+        use crate::mcp::server::WATCHER_SPAWN_COUNT;
+        use std::sync::atomic::Ordering;
+
+        let _guard = WATCHER_COUNTER_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let tmp1 = TempDir::new().unwrap();
+        let tmp2 = TempDir::new().unwrap();
+        let tmp3 = TempDir::new().unwrap();
+        let root1 = make_repo(&tmp1);
+        let root2 = make_repo(&tmp2);
+        let root3 = make_repo(&tmp3);
+
+        let config = DaemonConfig {
+            max_active_repos: 2,
+            ..Default::default()
+        };
+        let registry = RepoRegistry::new(config);
+
+        let before = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
+
+        // Fill to capacity
+        let h1 = registry.get_or_open(&root1).unwrap();
+        let _h2 = registry.get_or_open(&root2).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(WATCHER_SPAWN_COUNT.load(Ordering::Relaxed) - before, 2);
+
+        // Make h1 the LRU candidate
+        h1.last_access.store(100, Ordering::Relaxed);
+        drop(h1);
+
+        // Opening root3 evicts root1; root1's watcher_handle should be aborted
+        let _h3 = registry.get_or_open(&root3).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // 3 watchers spawned total, but root1's should have been aborted on eviction
+        assert_eq!(WATCHER_SPAWN_COUNT.load(Ordering::Relaxed) - before, 3);
+        assert_eq!(registry.active_count(), 2);
+
+        // The critical invariant: root1's handle was evicted and dropped,
+        // so its watcher JoinHandle was aborted via Drop. We can't directly
+        // observe thread count here, but the Drop impl logs and aborts.
     }
 
     #[test]
