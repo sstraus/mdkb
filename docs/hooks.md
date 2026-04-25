@@ -150,13 +150,12 @@ Input:
 Only `Edit`, `Write`, `MultiEdit`, `NotebookEdit` are tracked. For
 notebooks the handler also reads `tool_input.notebook_path`.
 
-Effect: appends a JSON line to `.mdkb/reindex-queue.jsonl`:
+Effect: sends the edited file path to the daemon's watcher channel
+(`reindex_tx`) for immediate reindex. The path is first validated
+via `canonicalize_under_cwd()` to reject traversal attempts.
 
-```json
-{"path":"/abs/path/to/file.rs","tool":"Edit","at":1713398400}
-```
-
-Output: `{}` (PostToolUse must never return `additionalContext`).
+Output: `{"queued": true}` on success, `{}` when skipped or on error
+(PostToolUse must never return `additionalContext`).
 
 ## Configuration
 
@@ -239,11 +238,12 @@ Any hook that exceeds `latency_budget_ms` logs a line to
 
 Use this to tune the budget or diagnose cold-start issues.
 
-### Reindex queue growing unbounded
+### Edited files not reindexing
 
-`mdkb update` drains `.mdkb/reindex-queue.jsonl` on each run. If it
-grows between runs that is expected — trigger a manual `mdkb update`
-or wait for the next watcher pass.
+PostToolUse sends edited paths to the daemon's watcher channel. If
+the daemon is not running, the path is lost. Restart the daemon with
+`mdkb daemon restart` or run `mdkb update` for a full differential
+reindex.
 
 ## Automated verification
 

@@ -1,5 +1,46 @@
 # Changelog
 
+## 3.0.0 (2026-04-25)
+
+### Breaking Changes
+
+- **Hook dispatch via daemon IPC** — all hook events (`session-start`,
+  `user-prompt-submit`, `pre-tool-use`, `post-tool-use`) now dispatch
+  through the daemon's Unix socket instead of running in-process. The CLI
+  `mdkb hook <event>` connects to the daemon, auto-spawning it if needed,
+  with exponential backoff. Falls back to in-process (`MDKB_NO_DAEMON=1`)
+  if the daemon is unreachable.
+- **`reindex-queue.jsonl` removed** — `PostToolUse` no longer appends to a
+  file. Edited paths are sent directly to the daemon's watcher channel via
+  `reindex_tx`, triggering immediate reindex. Any tooling that read or
+  monitored `reindex-queue.jsonl` must be updated.
+- **`hooks.rs` deleted** — the monolithic hook handler is replaced by
+  `hook_logic.rs` (pure functions) + `hook_client.rs` (IPC client) +
+  `dispatch.rs` (4 hook methods in the daemon dispatch layer).
+
+### Added
+
+- **Hook event logging** — every hook invocation is logged to
+  `.mdkb/hook-events.jsonl` with event name, outcome (ok/empty/error),
+  elapsed time, and latency budget. Replaces the old `hook-slow.jsonl`
+  which only logged overruns.
+- **Per-event configurable thresholds** — `latency_budget_ms` can now be
+  set per event type in `[hooks]` config.
+- **`mdkb hook` one-shot IPC client** — `mdkb hook <event>` reads stdin,
+  sends a JSON-RPC call to the daemon socket, and prints the response. No
+  in-process DB access on the primary path.
+- **Agent DX CLI Scale** — imported evaluation rubric at
+  `.agents/skills/agent-dx-cli-scale/SKILL.md` for scoring CLI
+  agent-friendliness.
+
+### Changed
+
+- **`spawn_blocking` for CPU-bound hook work** — FTS tokenization and
+  pattern classification moved to `tokio::task::spawn_blocking` to avoid
+  blocking the async runtime.
+- **Safe JSON serialization** — hook responses use checked serialization
+  with fallback to `{}` on failure, preventing malformed output.
+
 ## 2.2.1 (2026-04-21)
 
 ### Changed

@@ -70,8 +70,8 @@ The `PostToolUse` hook entry includes a `matcher` field:
 ```
 
 This tells Claude Code to only invoke the hook for file-editing tools.
-Without it, every tool use (Read, Grep, Bash, Agent, etc.) would spawn
-the `mdkb` process just to discard it at line 407 of `hooks.rs`.
+Without it, every tool use (Read, Grep, Bash, Agent, etc.) would trigger
+a daemon IPC round-trip just to be discarded by the `REINDEX_TOOLS` check.
 SessionStart and UserPromptSubmit don't need matchers — they fire once
 per session/prompt by definition.
 
@@ -148,22 +148,22 @@ references the CLI binary directly.
 ### PostToolUse
 
 **Flow:**
-1. Check `.mdkbignore-hooks` and `.mdkb/` → skip if absent
-2. Read `[hooks]` config → skip if `post_tool_use_enabled = false`
-3. Check `tool_name` against `REINDEX_TOOLS` (`Edit`, `Write`, `NotebookEdit`,
+1. Check `post_tool_use_enabled` config → skip if false
+2. Check `tool_name` against `REINDEX_TOOLS` (`Edit`, `Write`, `NotebookEdit`,
    `MultiEdit`) → skip if not in list
-4. Extract file path from `tool_input.file_path` or `tool_input.notebook_path`
-5. **Security:** `canonicalize_under_cwd()` resolves the path and verifies it's
+3. Extract file path from `tool_input.file_path` or `tool_input.notebook_path`
+4. **Security:** `canonicalize_under_cwd()` resolves the path and verifies it's
    strictly under the working directory. Path traversal attempts
    (`../../etc/passwd`) are rejected with a warning
-6. Append JSON line to `.mdkb/reindex-queue.jsonl`:
-   `{"path": "/abs/path", "tool": "Edit", "at": 1713398400}`
+5. Send path to `handle.reindex_tx` (daemon watcher channel) for immediate
+   reindex
 
-**Queue consumption:** `mdkb update` drains the queue at the start of each
-run. The queue itself is diagnostic — the actual reindexing uses mtime-based
-differential comparison. The queue is deleted after draining.
+**Reindex mechanism:** The daemon's file watcher receives the path on its
+channel and triggers a targeted reindex. No intermediate queue file is
+involved.
 
-**Output:** Always `{}` — PostToolUse must never inject context.
+**Output:** `{"queued": true}` on success, `{}` when skipped —
+PostToolUse must never inject context.
 
 ## Configuration
 
@@ -174,7 +174,7 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `session_start_enabled` | bool | `true` | Disable warmup injection |
 | `user_prompt_submit_enabled` | bool | `true` | Disable recall injection |
 | `pre_tool_use_enabled` | bool | `true` | Disable Grep interception suggestions |
-| `post_tool_use_enabled` | bool | `true` | Disable reindex queue writes |
+| `post_tool_use_enabled` | bool | `true` | Disable reindex-on-edit notifications |
 | `warmup_limit` | usize | `50` | Max entries in SessionStart warmup |
 | `recall_limit` | usize | `5` | Max FTS results in UserPromptSubmit |
 | `latency_budget_ms` | u64 | `200` | Overrun threshold; logs to `hook-slow.jsonl` |
@@ -193,13 +193,10 @@ From most to least granular:
 
 ## Observability
 
-- **`mdkb stats`** — shows `HooksSummary` with `reindex_queue_pending`
-  count and `slow_events_7d` (hooks that exceeded latency budget in
-  last 7 days).
-- **`.mdkb/hook-slow.jsonl`** — one line per budget overrun, with event
-  name, elapsed/budget ms, and timestamp.
-- **`.mdkb/reindex-queue.jsonl`** — pending reindex entries. Grows between
-  `mdkb update` runs.
+- **`mdkb stats`** — shows `HooksSummary` with `slow_events_7d` (hooks
+  that exceeded latency budget in last 7 days).
+- **`.mdkb/hook-events.jsonl`** — one line per hook invocation, with event
+  name, outcome (ok/empty/error), elapsed time, and latency budget.
 - **stderr** — all internal errors are logged via `tracing::warn`.
 
 ## Security
@@ -221,33 +218,14 @@ The config field exists but `search_entries_fts` doesn't filter by it.
 Adding a `.filter(|r| r.score >= cfg.min_recall_score)` after the FTS
 query would reduce noise on loosely-matching prompts.
 
-### 2. PostToolUse latency tracking (low effort)
-
-SessionStart and UserPromptSubmit have latency budget checks.
-PostToolUse doesn't, though it does file I/O (canonicalize + append).
-Adding an `Instant::now()` + budget check would complete observability.
-
-### 3. Semantic recall alongside FTS (medium effort)
+### 2. Semantic recall alongside FTS (medium effort)
 
 UserPromptSubmit uses BM25-based FTS only. Adding embedding-based
 semantic search (the infrastructure already exists in the MCP `search`
 tool with `scope="memory"`) would catch conceptually-related entries
 that don't share exact keywords with the prompt.
 
-### 4. Queue-driven targeted reindex (medium effort)
-
-Currently the reindex queue is diagnostic — `mdkb update` does full
-mtime-based differential reindexing regardless. Using the queue to
-target specific files would make incremental reindex faster for large
-repos with many files but few edits per session.
-
-### 5. Debounce rapid edits (low effort)
-
-Multiple saves to the same file in quick succession each append a queue
-entry. A dedup pass (by path, keeping latest `at`) either at write time
-or at drain time would shrink the queue and reduce noise in stats.
-
-### 6. Warmup ranking by recency + frequency (medium effort)
+### 3. Warmup ranking by recency + frequency (medium effort)
 
 `get_warmup_index` currently returns entries in index order. Ranking by
 a combination of last-access time and access frequency would surface
@@ -257,10 +235,10 @@ the most relevant entries first, making better use of the `warmup_limit`.
 
 | Test file | Scope |
 |-----------|-------|
-| `tests/e2e_hooks.rs` | Full e2e: warmup, recall, queue lifecycle |
-| `tests/hooks/post_tool_use_test.rs` | Queue writes, tool filtering, traversal, marker |
-| `tests/cli/setup_hooks_test.rs` | Claude settings writer, idempotency, matcher |
-| `tests/cli/setup_hooks_codex_test.rs` | Codex hooks.json writer |
+| `tests/e2e_hooks.rs` | Full e2e: warmup, recall, hook lifecycle |
 | `tests/e2e_hook_client.rs` | Daemon JSON-RPC round-trip |
 | `tests/e2e_daemon_sockets.rs` | IPC server socket tests |
-| Unit tests in `src/cli/hooks.rs` | Path canonicalization, traversal rejection |
+| `tests/cli/setup_hooks_test.rs` | Claude settings writer, idempotency, matcher |
+| `tests/cli/setup_hooks_codex_test.rs` | Codex hooks.json writer |
+| Unit tests in `src/cli/hook_logic.rs` | Path canonicalization, traversal rejection, pattern classification |
+| Unit tests in `src/mcp/dispatch.rs` | Hook dispatch methods (post_tool_use, pre_tool_use, etc.) |
