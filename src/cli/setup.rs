@@ -149,7 +149,7 @@ pub fn handle_setup_mcp_claude(
             "mdkb",
             "--",
             &binary_path,
-            "serve",
+            "mcp",
         ])
         .current_dir(&server_cwd)
         .output();
@@ -811,7 +811,7 @@ pub fn handle_setup_mcp_codex(dry_run: bool) -> Result<McpCodexSetupResult> {
     let mut mdkb = toml_edit::Table::new();
     mdkb.insert("command", toml_edit::value(binary_path.clone()));
     let mut args = toml_edit::Array::new();
-    args.push("serve");
+    args.push("mcp");
     mdkb.insert("args", toml_edit::value(args));
     servers.insert("mdkb", toml_edit::Item::Table(mdkb));
 

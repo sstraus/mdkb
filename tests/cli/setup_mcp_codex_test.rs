@@ -58,7 +58,7 @@ fn fresh_config_gets_mdkb_mcp_server_entry() {
         .and_then(|v| v.as_array())
         .expect("args array present");
     let args_vec: Vec<&str> = args.iter().filter_map(|v| v.as_str()).collect();
-    assert_eq!(args_vec, vec!["serve"]);
+    assert_eq!(args_vec, vec!["mcp"]);
 }
 
 #[test]
@@ -206,5 +206,5 @@ args = ["old-arg"]
         .and_then(|v| v.as_array())
         .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
-    assert_eq!(args, vec!["serve"], "args must be reset to [\"serve\"]");
+    assert_eq!(args, vec!["mcp"], "args must be reset to [\"mcp\"]");
 }
