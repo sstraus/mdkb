@@ -82,7 +82,7 @@ pub enum Command {
         file: Option<String>,
 
         /// Filter by entry type (topic, problem, decision, reminder, prior) - used with memory scope
-        #[arg(long = "entry-type")]
+        #[arg(long = "entry-type", alias = "type")]
         entry_type: Option<String>,
     },
 
@@ -310,7 +310,7 @@ pub enum HookCommand {
         title: String,
 
         /// Entry type (topic, decision, problem, pattern, …).
-        #[arg(long = "entry-type", default_value = "topic")]
+        #[arg(long = "entry-type", alias = "type", default_value = "topic")]
         entry_type: String,
 
         /// Entry body (markdown).
@@ -534,7 +534,7 @@ pub enum MemoryCommand {
         title: String,
 
         /// Entry type
-        #[arg(short = 'T', long, default_value = "topic")]
+        #[arg(short = 'T', long, alias = "type", default_value = "topic")]
         entry_type: String,
 
         /// Tags (comma-separated)
