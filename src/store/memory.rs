@@ -190,6 +190,7 @@ pub enum EntryType {
     Decision,
     Reminder,
     Prior,
+    Handoff,
 }
 
 impl std::fmt::Display for EntryType {
@@ -200,6 +201,7 @@ impl std::fmt::Display for EntryType {
             Self::Decision => write!(f, "decision"),
             Self::Reminder => write!(f, "reminder"),
             Self::Prior => write!(f, "prior"),
+            Self::Handoff => write!(f, "handoff"),
         }
     }
 }
@@ -214,6 +216,7 @@ impl std::str::FromStr for EntryType {
             "decision" => Ok(Self::Decision),
             "reminder" => Ok(Self::Reminder),
             "prior" => Ok(Self::Prior),
+            "handoff" => Ok(Self::Handoff),
             _ => Err(format!("Invalid entry type: {s}")),
         }
     }

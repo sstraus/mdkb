@@ -252,6 +252,31 @@ pub async fn memory_confirm_impl(
 }
 
 /// Core logic for writing a single memory entry. Used by both
+/// Resolve `source_file` → content. Returns `(content, source_path)`.
+/// Errors if both content and source_file are provided.
+fn resolve_source_file(
+    content: &str,
+    source_file: Option<&str>,
+) -> Result<(String, Option<String>), McpError> {
+    match source_file {
+        Some(_) if !content.is_empty() => Err(mcp_error(
+            "Cannot specify both content and source_file — use one or the other",
+        )),
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|e| mcp_error(format!("Failed to read source_file {path}: {e}")))?;
+            let abs = std::path::Path::new(path)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(path));
+            Ok((text, Some(abs.to_string_lossy().to_string())))
+        }
+        None if content.is_empty() => Err(mcp_error(
+            "Either content or source_file must be provided",
+        )),
+        None => Ok((content.to_string(), None)),
+    }
+}
+
 /// `memory_write_impl` and `memory_write_batch_impl`. Synchronous because it
 /// runs against an already-locked `Connection`; embedding I/O is best-effort
 /// and falls back silently when the LLM service is unconfigured (tests).
@@ -270,6 +295,7 @@ fn write_single_memory(
     ttl: Option<u64>,
     due_in: Option<u64>,
     embedding: Option<Vec<f32>>,
+    source_path: Option<&str>,
 ) -> Result<String, McpError> {
     memory::validate_entry_input(id, title, tags, content).map_err(|e| mcp_error(e.to_string()))?;
 
@@ -278,7 +304,7 @@ fn write_single_memory(
 
     let entry_type: memory::EntryType = entry_type_str.parse().map_err(|e: String| {
         mcp_error(format!(
-            "{e}. Valid types: topic, problem, decision, reminder, prior"
+            "{e}. Valid types: topic, problem, decision, reminder, prior, handoff"
         ))
     })?;
 
@@ -366,7 +392,7 @@ fn write_single_memory(
             superseded_by: None,
             access_count: 0,
             last_accessed: None,
-            source_path: None,
+            source_path: source_path.map(String::from),
             confirmations: 0,
             last_confirmed_at: None,
             source_type,
@@ -414,8 +440,11 @@ pub async fn memory_write_impl(
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
+    let (content, source_path) =
+        resolve_source_file(&entry.content, entry.source_file.as_deref())?;
+
     // Pre-compute embedding outside the lock — ONNX is CPU-bound.
-    let embed_text = format!("{} {}", entry.title, entry.content);
+    let embed_text = format!("{} {}", entry.title, content);
     let embedding = tokio::task::spawn_blocking(move || {
         crate::llm::get_cached_service()
             .ok()
@@ -433,13 +462,14 @@ pub async fn memory_write_impl(
         &ctx.conn,
         &entry.id,
         &entry.title,
-        &entry.content,
+        &content,
         &entry.entry_type,
         &entry.source_type,
         &entry.tags,
         entry.ttl,
         entry.due_in,
         embedding,
+        source_path.as_deref(),
     )
 }
 
@@ -463,10 +493,17 @@ pub async fn memory_write_batch_impl(
 
     ensure_handle_context(handle).await?;
 
+    // Resolve source_file → content for all entries before computing embeddings.
+    let resolved: Vec<(String, Option<String>)> = entries
+        .iter()
+        .map(|e| resolve_source_file(&e.content, e.source_file.as_deref()))
+        .collect::<Result<_, _>>()?;
+
     // Pre-compute embeddings for all entries outside the lock — ONNX is CPU-bound.
     let embed_texts: Vec<String> = entries
         .iter()
-        .map(|e| format!("{} {}", e.title, e.content))
+        .zip(resolved.iter())
+        .map(|(e, (content, _))| format!("{} {}", e.title, content))
         .collect();
     let embeddings: Vec<Option<Vec<f32>>> =
         tokio::task::spawn_blocking(move || match crate::llm::get_cached_service() {
@@ -485,18 +522,21 @@ pub async fn memory_write_batch_impl(
         .ok_or_else(|| mcp_error("Database not initialized"))?;
 
     let mut results = Vec::with_capacity(entries.len());
-    for (entry, embedding) in entries.iter().zip(embeddings.into_iter()) {
+    for ((entry, (content, source_path)), embedding) in
+        entries.iter().zip(resolved.iter()).zip(embeddings.into_iter())
+    {
         let result = write_single_memory(
             &ctx.conn,
             &entry.id,
             &entry.title,
-            &entry.content,
+            content,
             &entry.entry_type,
             &entry.source_type,
             &entry.tags,
             entry.ttl,
             entry.due_in,
             embedding,
+            source_path.as_deref(),
         )?;
         results.push(result);
     }
@@ -2249,6 +2289,7 @@ mod tests {
             id: id.to_string(),
             title: format!("Title {id}"),
             content: format!("Content for {id}"),
+            source_file: None,
             entry_type: "topic".to_string(),
             tags: vec!["t".to_string()],
             source_type: "user_statement".to_string(),

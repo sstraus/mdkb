@@ -164,7 +164,7 @@ Persistent AI knowledge that survives across sessions — decisions, patterns, s
 - **Revision tracking** — manual entries track up to 3 revision diffs
 - **TTL (time-to-live)** — pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Expired entries are filtered from searches and listings but remain accessible via `get(id)` with an `[EXPIRED]` marker, so they can be inspected or renewed. Omit `ttl` for permanent entries.
 
-Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices), `reminder` (time-bound — see below), `prior` (behavioral patterns — 30-day TTL default, excluded from default searches).
+Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices), `reminder` (time-bound — see below), `prior` (behavioral patterns — 30-day TTL default, excluded from default searches), `handoff` (session handover — no default TTL).
 
 #### Reminders
 
@@ -173,6 +173,10 @@ Create with `memory_write(id, title, content, entry_type="reminder", due_in=<sec
 #### Priors
 
 Behavioral pattern entries written by external analyzers (e.g., HUD stop hooks). Create with `memory_write(id, title, content, entry_type="prior")` or `mdkb memory add <id> --entry-type prior`. Priors default to 30-day TTL and are excluded from all default searches — query them explicitly with `mdkb search --scope memory --entry-type prior "query"` or `search(query, scope="memory", entry_type="prior")` via MCP.
+
+#### Handoffs
+
+Session context transfer entries. Create with `memory_write(id, title, content, entry_type="handoff")` or `mdkb memory add <id> --entry-type handoff`. Use `--file <path>` (CLI) or `source_file` (MCP) to read content from a file — saves tokens when agents write handoffs to the filesystem. The file path is persisted as `source_path` metadata. Handoffs have no default TTL; confidence decay handles relevance naturally.
 
 Source types control confidence weighting:
 

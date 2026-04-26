@@ -82,10 +82,15 @@ pub struct MemoryWriteParams {
     /// Concise title (max 50 chars).
     pub title: String,
 
-    /// Full content.
+    /// Full content. Omit when using source_file.
+    #[serde(default)]
     pub content: String,
 
-    /// Entry type: topic, problem, decision, reminder (time-bound; pair with due_in), or prior (behavioral; 30d TTL default).
+    /// Read content from this file path instead of content field. Mutually exclusive with content.
+    #[serde(default)]
+    pub source_file: Option<String>,
+
+    /// Entry type: topic, problem, decision, reminder (time-bound; pair with due_in), prior (behavioral; 30d TTL default), or handoff (session handover).
     #[serde(default = "default_entry_type")]
     pub entry_type: String,
 
@@ -123,10 +128,15 @@ pub struct MemoryWriteBatchEntry {
     /// Concise title (max 50 chars).
     pub title: String,
 
-    /// Full content.
+    /// Full content. Omit when using source_file.
+    #[serde(default)]
     pub content: String,
 
-    /// Entry type: topic, problem, decision, reminder (time-bound; pair with due_in), or prior (behavioral; 30d TTL default).
+    /// Read content from this file path instead of content field. Mutually exclusive with content.
+    #[serde(default)]
+    pub source_file: Option<String>,
+
+    /// Entry type: topic, problem, decision, reminder (time-bound; pair with due_in), prior (behavioral; 30d TTL default), or handoff (session handover).
     #[serde(default = "default_entry_type")]
     pub entry_type: String,
 

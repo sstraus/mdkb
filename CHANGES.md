@@ -1,5 +1,32 @@
 # Changelog
 
+## 3.0.3 (2026-04-26)
+
+### Added
+
+- **`handoff` entry type** — session handover entries for agent context
+  transfer. No default TTL (use `--ttl` to set one). Handoffs are project
+  history — confidence decay handles relevance naturally.
+- **`--file <path>` on `memory add`** — reads content from a file instead
+  of `--content` or stdin. Saves token overhead when agents write handoffs
+  to the filesystem and want to register them in mdkb. Mutually exclusive
+  with `--content`.
+- **`source_file` on MCP `memory_write` / `memory_write_batch`** — server-side
+  file read. The model passes only the path; mdkb reads the content. Mutually
+  exclusive with `content`.
+- **Source path metadata** — the file path is persisted in `source_path` and
+  displayed in `memory show` (text and markdown formats).
+- **Memory subcommand aliases** — hidden aliases for commands models commonly
+  guess: `write`/`create` → `add`, `get` → `show`, `delete` → `rm`.
+
+## 3.0.2 (2026-04-26)
+
+### Fixed
+
+- **`setup mcp claude/codex` registers `mdkb mcp` instead of `mdkb serve`** —
+  the old registration spawned standalone server processes per Claude session,
+  bypassing the singleton daemon. Now correctly proxies through the daemon.
+
 ## 3.0.0 (2026-04-25)
 
 ### Breaking Changes

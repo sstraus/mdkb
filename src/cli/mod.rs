@@ -524,6 +524,7 @@ pub enum MetricsCommand {
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommand {
     /// Add a new memory entry
+    #[command(alias = "write", alias = "create")]
     Add {
         /// Entry ID (slug, e.g., "auth-oauth2-flow")
         id: String,
@@ -544,6 +545,10 @@ pub enum MemoryCommand {
         #[arg(short, long)]
         content: Option<String>,
 
+        /// Read content from file instead of --content or stdin.
+        #[arg(short, long, conflicts_with = "content")]
+        file: Option<std::path::PathBuf>,
+
         /// TTL in seconds. Entry expires after this duration.
         #[arg(long)]
         ttl: Option<u64>,
@@ -554,6 +559,7 @@ pub enum MemoryCommand {
     },
 
     /// Show a memory entry
+    #[command(alias = "get")]
     Show {
         /// Entry ID
         id: String,
@@ -588,6 +594,7 @@ pub enum MemoryCommand {
     },
 
     /// Delete a memory entry
+    #[command(alias = "delete")]
     Rm {
         /// Entry ID
         id: String,

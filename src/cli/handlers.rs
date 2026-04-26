@@ -1203,6 +1203,7 @@ pub fn handle_memory_add(
     entry_type: &str,
     tags: Option<&str>,
     content: &str,
+    source_path: Option<&str>,
     ttl: Option<u64>,
     due_in: Option<u64>,
 ) -> Result<()> {
@@ -1232,7 +1233,7 @@ pub fn handle_memory_add(
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-        source_path: None,
+        source_path: source_path.map(String::from),
         confirmations: 0,
         last_confirmed_at: None,
         source_type: memory::SourceType::UserStatement,
@@ -2377,6 +2378,7 @@ mod tests {
             "# Test content\n\nThis is test content.",
             None,
             None,
+            None,
         )
         .expect("add memory should succeed");
 
@@ -2410,6 +2412,7 @@ mod tests {
             "topic",
             None,
             "Content",
+            None,
             None,
             None,
         )
@@ -3542,7 +3545,7 @@ mod tests {
 
         // Add an entry first
         handle_memory_add(
-            &ctx, "existing", "Existing", "topic", None, "Content", None, None,
+            &ctx, "existing", "Existing", "topic", None, "Content", None, None, None,
         )
         .unwrap();
 
@@ -3565,7 +3568,7 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
 
         handle_memory_add(
-            &ctx, "existing", "Existing", "topic", None, "Content", None, None,
+            &ctx, "existing", "Existing", "topic", None, "Content", None, None, None,
         )
         .unwrap();
 

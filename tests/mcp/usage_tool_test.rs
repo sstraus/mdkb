@@ -36,6 +36,7 @@ async fn server_with_activity() -> (tempfile::TempDir, McpServer) {
             root: None,
             title: "usage test".to_string(),
             content: "A tiny memory entry to populate the ledger.".to_string(),
+            source_file: None,
             entry_type: "topic".to_string(),
             tags: vec!["test".to_string()],
             source_type: "user_statement".to_string(),

@@ -458,19 +458,32 @@ async fn run() -> Result<()> {
                     entry_type,
                     tags,
                     content,
+                    file,
                     ttl,
                     due_in,
                 } => {
-                    const MAX_STDIN_SIZE: u64 = 100_000; // 100KB limit
-                    let content = content.unwrap_or_else(|| {
-                        use std::io::Read;
-                        let mut buf = String::new();
-                        std::io::stdin()
-                            .take(MAX_STDIN_SIZE)
-                            .read_to_string(&mut buf)
-                            .unwrap_or_default();
-                        buf
-                    });
+                    let (content, source_path) = if let Some(ref path) = file {
+                        let text = std::fs::read_to_string(path).map_err(|e| {
+                            mdkb::Error::other(format!(
+                                "Failed to read file {}: {e}",
+                                path.display()
+                            ))
+                        })?;
+                        let abs = path.canonicalize().unwrap_or_else(|_| path.clone());
+                        (text, Some(abs.to_string_lossy().to_string()))
+                    } else {
+                        const MAX_STDIN_SIZE: u64 = 100_000;
+                        let text = content.unwrap_or_else(|| {
+                            use std::io::Read;
+                            let mut buf = String::new();
+                            std::io::stdin()
+                                .take(MAX_STDIN_SIZE)
+                                .read_to_string(&mut buf)
+                                .unwrap_or_default();
+                            buf
+                        });
+                        (text, None)
+                    };
                     handle_memory_add(
                         &ctx,
                         &id,
@@ -478,6 +491,7 @@ async fn run() -> Result<()> {
                         &entry_type,
                         tags.as_deref(),
                         &content,
+                        source_path.as_deref(),
                         ttl,
                         due_in,
                     )?;
@@ -1215,7 +1229,11 @@ fn format_memory_entry(entry: &MemoryEntry, format: OutputFormat) {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
-            println!("**Access count:** {}\n", entry.access_count);
+            println!("**Access count:** {}", entry.access_count);
+            if let Some(ref path) = entry.source_path {
+                println!("**Source:** {path}");
+            }
+            println!();
             println!("---\n");
             println!("{}", entry.content);
         }
@@ -1233,6 +1251,9 @@ fn format_memory_entry(entry: &MemoryEntry, format: OutputFormat) {
                 );
             }
             println!("Access count: {}", entry.access_count);
+            if let Some(ref path) = entry.source_path {
+                println!("Source: {path}");
+            }
             println!("\n{}", entry.content);
         }
     }
