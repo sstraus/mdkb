@@ -151,6 +151,14 @@ impl Context {
         })
     }
 
+    /// Get the project root directory (parent of `.mdkb/`).
+    pub fn root(&self) -> &Path {
+        self.db_path
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("db_path must be inside .mdkb/")
+    }
+
     /// Get the memory directory path.
     pub fn memory_dir(&self) -> PathBuf {
         self.db_path.parent().unwrap().join("memory")
@@ -198,18 +206,36 @@ fn bootstrap_code_index(root: &Path) {
     crate::llm::release_cached_service();
 }
 
-/// Handle `mdkb collection add` command.
+/// Validate that a collection path stays within the project root.
 ///
-/// Validates that the collection path doesn't escape the root directory
-/// to prevent path traversal attacks.
-pub fn handle_collection_add(ctx: &Context, name: &str, path: &str, pattern: &str) -> Result<()> {
-    // Validate path doesn't contain traversal patterns (fixes P2-SEC-001)
-    if path.contains("..") {
+/// Uses `canonicalize` when the path exists on disk (resolves symlinks).
+/// Falls back to lexical `..` rejection for paths that don't exist yet —
+/// the robust canonicalize check in `handle_update_files` catches these
+/// at index time regardless.
+fn validate_collection_path(root: &Path, path: &str) -> Result<()> {
+    let candidate = root.join(path);
+    if let Ok(canonical) = candidate.canonicalize() {
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|e| Error::other(format!("Failed to canonicalize root: {e}")))?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err(Error::other(format!(
+                "Collection path '{}' escapes root directory (path traversal blocked)",
+                path
+            )));
+        }
+    } else if path.contains("..") {
         return Err(Error::other(format!(
             "Collection path '{}' contains path traversal pattern '..'",
             path
         )));
     }
+    Ok(())
+}
+
+/// Handle `mdkb collection add` command.
+pub fn handle_collection_add(ctx: &Context, name: &str, path: &str, pattern: &str) -> Result<()> {
+    validate_collection_path(ctx.root(), path)?;
 
     let now = chrono::Utc::now().timestamp();
     let collection = Collection {
@@ -2525,6 +2551,69 @@ mod tests {
         let result = handle_collection_add(&ctx, "docs", "./other", "**/*.md");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_collection_add_blocks_dotdot_traversal() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let result = handle_collection_add(&ctx, "evil", "../secret", "**/*");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("path traversal") || msg.contains("escapes root"));
+    }
+
+    #[test]
+    fn test_handle_collection_add_blocks_absolute_path_outside_root() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let result = handle_collection_add(&ctx, "evil", "/etc", "**/*");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("escapes root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_handle_collection_add_blocks_symlink_escape() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Create a symlink inside the project that points outside
+        let link_path = temp.path().join("sneaky");
+        std::os::unix::fs::symlink("/tmp", &link_path).unwrap();
+
+        let result = handle_collection_add(&ctx, "evil", "sneaky", "**/*");
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("escapes root"));
+    }
+
+    #[test]
+    fn test_handle_collection_add_allows_valid_relative_path() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        // Non-existent but valid relative path — should succeed (best-effort)
+        handle_collection_add(&ctx, "notes", "notes/drafts", "**/*.md")
+            .expect("valid relative path should succeed");
+    }
+
+    #[test]
+    fn test_handle_collection_add_allows_existing_subdir() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::create_dir_all(temp.path().join("src/lib")).unwrap();
+        handle_collection_add(&ctx, "src", "src/lib", "**/*.rs")
+            .expect("existing subdir should succeed");
     }
 
     #[test]
