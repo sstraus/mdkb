@@ -117,3 +117,13 @@ jobs:
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Homebrew tap
+        if: ${{ !contains(github.ref, '-rc') && !contains(github.ref, '-beta') && !contains(github.ref, '-alpha') }}
+        run: |
+          gh api repos/sstraus/homebrew-tap/dispatches \
+            -f event_type=release-published \
+            -f 'client_payload[repo]=mdkb' \
+            -f 'client_payload[version]=${{ github.ref_name }}'
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
