@@ -22,7 +22,7 @@ pub const MAX_CONTENT_SIZE: usize = 100_000;
 /// Validate memory entry input fields.
 ///
 /// Checks ID format, title length, tag count/length, and content size.
-pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &str) -> Result<()> {
+pub fn validate_entry_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > MAX_ID_LEN {
         return Err(ErrorKind::InvalidQuery(format!("ID must be 1-{MAX_ID_LEN} chars")).into());
     }
@@ -35,6 +35,11 @@ pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &st
         )
         .into());
     }
+    Ok(())
+}
+
+pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &str) -> Result<()> {
+    validate_entry_id(id)?;
     if title.is_empty() || title.len() > MAX_TITLE_LEN {
         return Err(
             ErrorKind::InvalidQuery(format!("Title must be 1-{MAX_TITLE_LEN} chars")).into(),

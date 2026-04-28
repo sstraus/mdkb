@@ -206,6 +206,7 @@ pub async fn status_impl(handle: &RepoHandle) -> Result<String, McpError> {
 /// `memory_delete` — delete a memory entry by id. Returns the human-readable
 /// result string; callers wrap it for the transport.
 pub async fn memory_delete_impl(handle: &RepoHandle, id: &str) -> Result<String, McpError> {
+    memory::validate_entry_id(id).map_err(|e| mcp_error(e.to_string()))?;
     ensure_handle_context(handle).await?;
 
     let ctx_guard = handle.ctx.lock().await;
@@ -2132,6 +2133,24 @@ mod tests {
             due_at: None,
         };
         crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed entry");
+    }
+
+    #[tokio::test]
+    async fn memory_delete_impl_rejects_invalid_id() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        let err = memory_delete_impl(&handle, "UPPER_CASE")
+            .await
+            .unwrap_err();
+        assert!(
+            err.message.contains("ID must be"),
+            "should reject invalid ID: {}",
+            err.message
+        );
+
+        let err2 = memory_delete_impl(&handle, "").await.unwrap_err();
+        assert!(err2.message.contains("ID must be"));
     }
 
     #[tokio::test]
