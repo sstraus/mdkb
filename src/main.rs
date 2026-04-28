@@ -28,6 +28,7 @@ use mdkb::cli::handlers::{
     handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
     handle_session_index, handle_superseded_by, handle_update, handle_update_files,
 };
+#[cfg(unix)]
 use mdkb::cli::hook_client;
 use mdkb::cli::hook_logic;
 use mdkb::cli::journal::JournalImportResult;
@@ -337,12 +338,11 @@ async fn run_cli(cli: Cli) -> Result<()> {
             detach,
         } => {
             if daemon {
-                // --detach is handled pre-tokio in `main()` so the fork
-                // happens before any threads exist. By the time we're here
-                // we're already the detached grandchild (or were never
-                // asked to detach).
                 let _ = detach;
+                #[cfg(unix)]
                 run_daemon().await?;
+                #[cfg(not(unix))]
+                return Err(mdkb::Error::other("Daemon mode requires Unix"));
             } else if global {
                 // Global mode: single process serving multiple repos via MCP roots
                 let daemon_config =
@@ -418,12 +418,24 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     .await
                     .map_err(|e| mdkb::Error::other(format!("Server error: {e}")))?;
             } else {
-                let socket_path = socket.unwrap_or_else(|| {
-                    mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())
-                        .map(|c| c.socket_path())
-                        .unwrap_or_else(|_| mdkb::DaemonConfig::daemon_home().join("daemon.sock"))
-                });
-                mdkb::cli::mcp_proxy::run_proxy(socket_path).await?;
+                #[cfg(unix)]
+                {
+                    let socket_path = socket.unwrap_or_else(|| {
+                        mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())
+                            .map(|c| c.socket_path())
+                            .unwrap_or_else(|_| {
+                                mdkb::DaemonConfig::daemon_home().join("daemon.sock")
+                            })
+                    });
+                    mdkb::cli::mcp_proxy::run_proxy(socket_path).await?;
+                }
+                #[cfg(not(unix))]
+                {
+                    let _ = socket;
+                    return Err(mdkb::Error::other(
+                        "Daemon proxy requires Unix (use MDKB_NO_DAEMON=1 for in-process mode)",
+                    ));
+                }
             }
         }
         Command::Stats { no_color } => {
@@ -968,69 +980,82 @@ async fn run_cli(cli: Cli) -> Result<()> {
             DaemonCommand::Stop => daemon_cli::handle_stop().await?,
             DaemonCommand::Restart => daemon_cli::handle_restart().await?,
         },
-        Command::Hook(hook_cmd) => match hook_cmd {
-            HookCommand::SessionStart => {
-                let input = hook_logic::read_stdin_best_effort();
-                let event = hook_logic::parse_event(&input);
-                let cwd = std::env::current_dir()?;
-                if !hook_logic::mdkbignore_hooks_present(&cwd) {
-                    hook_client::call_hook_event("hook.session_start", event, None).await?;
+        Command::Hook(hook_cmd) => {
+            #[cfg(unix)]
+            match hook_cmd {
+                HookCommand::SessionStart => {
+                    let input = hook_logic::read_stdin_best_effort();
+                    let event = hook_logic::parse_event(&input);
+                    let cwd = std::env::current_dir()?;
+                    if !hook_logic::mdkbignore_hooks_present(&cwd) {
+                        hook_client::call_hook_event("hook.session_start", event, None).await?;
+                    }
                 }
-            }
-            HookCommand::UserPromptSubmit => {
-                let input = hook_logic::read_stdin_best_effort();
-                let event = hook_logic::parse_event(&input);
-                let cwd = std::env::current_dir()?;
-                if !hook_logic::mdkbignore_hooks_present(&cwd) {
-                    hook_client::call_hook_event("hook.user_prompt_submit", event, None).await?;
+                HookCommand::UserPromptSubmit => {
+                    let input = hook_logic::read_stdin_best_effort();
+                    let event = hook_logic::parse_event(&input);
+                    let cwd = std::env::current_dir()?;
+                    if !hook_logic::mdkbignore_hooks_present(&cwd) {
+                        hook_client::call_hook_event("hook.user_prompt_submit", event, None)
+                            .await?;
+                    }
                 }
-            }
-            HookCommand::PostToolUse => {
-                let input = hook_logic::read_stdin_best_effort();
-                let event = hook_logic::parse_event(&input);
-                let cwd = std::env::current_dir()?;
-                if !hook_logic::mdkbignore_hooks_present(&cwd) {
-                    hook_client::call_hook_event("hook.post_tool_use", event, None).await?;
+                HookCommand::PostToolUse => {
+                    let input = hook_logic::read_stdin_best_effort();
+                    let event = hook_logic::parse_event(&input);
+                    let cwd = std::env::current_dir()?;
+                    if !hook_logic::mdkbignore_hooks_present(&cwd) {
+                        hook_client::call_hook_event("hook.post_tool_use", event, None).await?;
+                    }
                 }
-            }
-            HookCommand::PreToolUse => {
-                let input = hook_logic::read_stdin_best_effort();
-                let event = hook_logic::parse_event(&input);
-                let cwd = std::env::current_dir()?;
-                if !hook_logic::mdkbignore_hooks_present(&cwd) {
-                    hook_client::call_hook_event("hook.pre_tool_use", event, None).await?;
+                HookCommand::PreToolUse => {
+                    let input = hook_logic::read_stdin_best_effort();
+                    let event = hook_logic::parse_event(&input);
+                    let cwd = std::env::current_dir()?;
+                    if !hook_logic::mdkbignore_hooks_present(&cwd) {
+                        hook_client::call_hook_event("hook.pre_tool_use", event, None).await?;
+                    }
                 }
-            }
-            HookCommand::Reindex { files, root } => {
-                hook_client::call_reindex(files, root).await?;
-            }
-            HookCommand::Search {
-                query,
-                scope,
-                limit,
-                root,
-            } => {
-                hook_client::call_search(query, scope, limit, root).await?;
-            }
-            HookCommand::MemoryWrite {
-                id,
-                title,
-                entry_type,
-                content,
-                tags,
-                ttl,
-                root,
-            } => {
-                hook_client::call_memory_write(id, title, entry_type, content, tags, ttl, root)
+                HookCommand::Reindex { files, root } => {
+                    hook_client::call_reindex(files, root).await?;
+                }
+                HookCommand::Search {
+                    query,
+                    scope,
+                    limit,
+                    root,
+                } => {
+                    hook_client::call_search(query, scope, limit, root).await?;
+                }
+                HookCommand::MemoryWrite {
+                    id,
+                    title,
+                    entry_type,
+                    content,
+                    tags,
+                    ttl,
+                    root,
+                } => {
+                    hook_client::call_memory_write(
+                        id, title, entry_type, content, tags, ttl, root,
+                    )
                     .await?;
+                }
+                HookCommand::MemoryConfirm { id, outcome, root } => {
+                    hook_client::call_memory_confirm(id, outcome, root).await?;
+                }
+                HookCommand::Status { root } => {
+                    hook_client::call_status(root).await?;
+                }
             }
-            HookCommand::MemoryConfirm { id, outcome, root } => {
-                hook_client::call_memory_confirm(id, outcome, root).await?;
+            #[cfg(not(unix))]
+            {
+                let _ = hook_cmd;
+                return Err(mdkb::Error::other(
+                    "Hook commands require Unix domain sockets",
+                ));
             }
-            HookCommand::Status { root } => {
-                hook_client::call_status(root).await?;
-            }
-        },
+        }
     }
 
     Ok(())
@@ -2288,6 +2313,7 @@ fn format_code_parse(symbols: &[mdkb::code::symbol::Symbol], file: &str, format:
 /// 3. Starts IPC listeners (MCP + hook unix sockets) under `~/.mdkb/`.
 /// 4. Waits for SIGINT/SIGTERM, then signals the IPC server to unlink sockets
 ///    and drops the lock guard. Watcher + registry wire-up arrives in Story 7.
+#[cfg(unix)]
 async fn run_daemon() -> Result<()> {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicI64, AtomicU64};
@@ -2377,8 +2403,8 @@ fn stdin_is_not_tty() -> bool {
     !std::io::stdin().is_terminal()
 }
 
-/// Wait for the first of SIGINT or SIGTERM. On platforms without SIGTERM
-/// (none, in practice) we fall back to SIGINT only.
+/// Wait for the first of SIGINT or SIGTERM.
+#[cfg(unix)]
 async fn wait_for_shutdown_signal() -> Result<()> {
     #[cfg(unix)]
     {

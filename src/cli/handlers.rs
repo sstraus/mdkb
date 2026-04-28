@@ -219,7 +219,8 @@ fn validate_collection_name(name: &str) -> Result<()> {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
     {
         return Err(Error::other(
-            "Collection name must be lowercase alphanumeric with hyphens or underscores".to_string(),
+            "Collection name must be lowercase alphanumeric with hyphens or underscores"
+                .to_string(),
         ));
     }
     Ok(())
@@ -624,7 +625,6 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
     })?;
     Ok(result)
 }
-
 
 /// Detect and register convention-based collections.
 fn apply_conventions(ctx: &Context, root: &Path) -> Result<()> {

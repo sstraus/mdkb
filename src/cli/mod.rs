@@ -2,9 +2,11 @@
 
 pub mod daemon;
 pub mod handlers;
+#[cfg(unix)]
 pub mod hook_client;
 pub mod hook_logic;
 pub mod journal;
+#[cfg(unix)]
 pub mod mcp_proxy;
 pub mod setup;
 pub mod stats_render;

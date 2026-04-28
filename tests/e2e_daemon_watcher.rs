@@ -14,9 +14,11 @@ use tempfile::TempDir;
 use tokio::sync::Mutex;
 
 use mdkb::cli::handlers::Context;
-use mdkb::domain::Collection;
 use mdkb::code::indexing::IndexFacade;
-use mdkb::mcp::server::{CODE_REINDEX_COUNT, DOC_REINDEX_COUNT, WATCHER_SPAWN_COUNT, run_file_watcher_inner};
+use mdkb::domain::Collection;
+use mdkb::mcp::server::{
+    CODE_REINDEX_COUNT, DOC_REINDEX_COUNT, WATCHER_SPAWN_COUNT, run_file_watcher_inner,
+};
 use mdkb::store::collections::add_collection;
 
 /// On macOS /tmp → /private/tmp; FSEvents reports canonical paths.

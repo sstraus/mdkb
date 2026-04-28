@@ -30,8 +30,8 @@ use crate::domain::SearchResult;
 use crate::metrics::{
     UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
 };
-use crate::store::{collections, documents, evolution, memory, search, stats};
 use crate::store::memory::{access_recency_score, get_warmup_index, search_entries_fts};
+use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::mcp_error;
 use super::server::{
@@ -271,9 +271,9 @@ fn resolve_source_file(
                 .unwrap_or_else(|_| std::path::PathBuf::from(path));
             Ok((text, Some(abs.to_string_lossy().to_string())))
         }
-        None if content.is_empty() => Err(mcp_error(
-            "Either content or source_file must be provided",
-        )),
+        None if content.is_empty() => {
+            Err(mcp_error("Either content or source_file must be provided"))
+        }
         None => Ok((content.to_string(), None)),
     }
 }
@@ -441,8 +441,7 @@ pub async fn memory_write_impl(
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
-    let (content, source_path) =
-        resolve_source_file(&entry.content, entry.source_file.as_deref())?;
+    let (content, source_path) = resolve_source_file(&entry.content, entry.source_file.as_deref())?;
 
     // Pre-compute embedding outside the lock — ONNX is CPU-bound.
     let embed_text = format!("{} {}", entry.title, content);
@@ -523,8 +522,10 @@ pub async fn memory_write_batch_impl(
         .ok_or_else(|| mcp_error("Database not initialized"))?;
 
     let mut results = Vec::with_capacity(entries.len());
-    for ((entry, (content, source_path)), embedding) in
-        entries.iter().zip(resolved.iter()).zip(embeddings.into_iter())
+    for ((entry, (content, source_path)), embedding) in entries
+        .iter()
+        .zip(resolved.iter())
+        .zip(embeddings.into_iter())
     {
         let result = write_single_memory(
             &ctx.conn,
@@ -1797,9 +1798,7 @@ pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Valu
     let path = match canonicalize_under_cwd(&handle.root, &raw_path) {
         Some(p) => std::path::PathBuf::from(p),
         None => {
-            tracing::warn!(
-                "hook.post_tool_use: rejected path outside root: {raw_path}"
-            );
+            tracing::warn!("hook.post_tool_use: rejected path outside root: {raw_path}");
             return json!({});
         }
     };
@@ -1986,10 +1985,16 @@ pub async fn dispatch_call(
             let t0 = std::time::Instant::now();
             let result = hook_session_start_impl(&handle).await;
             let ms = t0.elapsed().as_millis() as u64;
-            let outcome = if result == json!({}) { "skipped" } else { "fired" };
+            let outcome = if result == json!({}) {
+                "skipped"
+            } else {
+                "fired"
+            };
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
-            tokio::task::spawn_blocking(move || log_hook_event(root, "session_start", outcome, ms, budget));
+            tokio::task::spawn_blocking(move || {
+                log_hook_event(root, "session_start", outcome, ms, budget)
+            });
             Ok(result)
         }
         "hook.user_prompt_submit" => {
@@ -2000,30 +2005,48 @@ pub async fn dispatch_call(
             let t0 = std::time::Instant::now();
             let result = hook_user_prompt_submit_impl(&handle, prompt).await;
             let ms = t0.elapsed().as_millis() as u64;
-            let outcome = if result == json!({}) { "skipped" } else { "fired" };
+            let outcome = if result == json!({}) {
+                "skipped"
+            } else {
+                "fired"
+            };
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
-            tokio::task::spawn_blocking(move || log_hook_event(root, "user_prompt_submit", outcome, ms, budget));
+            tokio::task::spawn_blocking(move || {
+                log_hook_event(root, "user_prompt_submit", outcome, ms, budget)
+            });
             Ok(result)
         }
         "hook.post_tool_use" => {
             let t0 = std::time::Instant::now();
             let result = hook_post_tool_use_impl(&handle, &params).await;
             let ms = t0.elapsed().as_millis() as u64;
-            let outcome = if result == json!({}) { "skipped" } else { "fired" };
+            let outcome = if result == json!({}) {
+                "skipped"
+            } else {
+                "fired"
+            };
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
-            tokio::task::spawn_blocking(move || log_hook_event(root, "post_tool_use", outcome, ms, budget));
+            tokio::task::spawn_blocking(move || {
+                log_hook_event(root, "post_tool_use", outcome, ms, budget)
+            });
             Ok(json!({}))
         }
         "hook.pre_tool_use" => {
             let t0 = std::time::Instant::now();
             let result = hook_pre_tool_use_impl(&handle, &params);
             let ms = t0.elapsed().as_millis() as u64;
-            let outcome = if result == json!({}) { "skipped" } else { "fired" };
+            let outcome = if result == json!({}) {
+                "skipped"
+            } else {
+                "fired"
+            };
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
-            tokio::task::spawn_blocking(move || log_hook_event(root, "pre_tool_use", outcome, ms, budget));
+            tokio::task::spawn_blocking(move || {
+                log_hook_event(root, "pre_tool_use", outcome, ms, budget)
+            });
             Ok(result)
         }
         other => Err(McpError {
@@ -2140,9 +2163,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
 
-        let err = memory_delete_impl(&handle, "UPPER_CASE")
-            .await
-            .unwrap_err();
+        let err = memory_delete_impl(&handle, "UPPER_CASE").await.unwrap_err();
         assert!(
             err.message.contains("ID must be"),
             "should reject invalid ID: {}",
@@ -2954,7 +2975,11 @@ mod tests {
             "tool_input": {"file_path": file.to_str().unwrap()},
         });
         let result = hook_post_tool_use_impl(&handle, &event).await;
-        assert_eq!(result, json!({"queued": true}), "post_tool_use returns queued on success");
+        assert_eq!(
+            result,
+            json!({"queued": true}),
+            "post_tool_use returns queued on success"
+        );
     }
 
     #[tokio::test]

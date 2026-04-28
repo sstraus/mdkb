@@ -302,7 +302,11 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
     let code_enabled = handle.config.code.enabled;
     let code_ignore_patterns = handle.code_ignore_patterns.clone();
     // Take the receiver exactly once; subsequent calls (same handle) yield None.
-    let reindex_rx = handle.reindex_rx.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let reindex_rx = handle
+        .reindex_rx
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
     let join_handle = tokio::spawn(async move {
         if let Err(e) = crate::mcp::server::run_file_watcher(
             root,

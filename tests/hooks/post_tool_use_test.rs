@@ -66,8 +66,14 @@ fn post_tool_use_injects_edit_path_silently() {
 
     let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
     assert_eq!(code, 0, "must exit 0; stdout={stdout}");
-    assert!(stdout.trim().is_empty(), "must produce no stdout; got: {stdout}");
-    assert!(!queue_path(tmp.path()).exists(), "reindex-queue.jsonl must not be created");
+    assert!(
+        stdout.trim().is_empty(),
+        "must produce no stdout; got: {stdout}"
+    );
+    assert!(
+        !queue_path(tmp.path()).exists(),
+        "reindex-queue.jsonl must not be created"
+    );
 }
 
 #[test]
@@ -81,8 +87,14 @@ fn post_tool_use_injects_write_path_silently() {
 
     let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
     assert_eq!(code, 0, "must exit 0; stdout={stdout}");
-    assert!(stdout.trim().is_empty(), "must produce no stdout; got: {stdout}");
-    assert!(!queue_path(tmp.path()).exists(), "reindex-queue.jsonl must not be created");
+    assert!(
+        stdout.trim().is_empty(),
+        "must produce no stdout; got: {stdout}"
+    );
+    assert!(
+        !queue_path(tmp.path()).exists(),
+        "reindex-queue.jsonl must not be created"
+    );
 }
 
 #[test]
@@ -97,8 +109,14 @@ fn post_tool_use_injects_notebook_edit_path_silently() {
 
     let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
     assert_eq!(code, 0, "must exit 0; stdout={stdout}");
-    assert!(stdout.trim().is_empty(), "must produce no stdout; got: {stdout}");
-    assert!(!queue_path(tmp.path()).exists(), "reindex-queue.jsonl must not be created");
+    assert!(
+        stdout.trim().is_empty(),
+        "must produce no stdout; got: {stdout}"
+    );
+    assert!(
+        !queue_path(tmp.path()).exists(),
+        "reindex-queue.jsonl must not be created"
+    );
 }
 
 #[test]
@@ -108,8 +126,14 @@ fn post_tool_use_ignores_non_edit_tools() {
 
     let (code, stdout) = run_post_tool_use_in(tmp.path(), event);
     assert_eq!(code, 0, "must exit 0; stdout={stdout}");
-    assert!(stdout.trim().is_empty(), "non-editing tool must produce no stdout; got: {stdout}");
-    assert!(!queue_path(tmp.path()).exists(), "non-editing tool must not create queue file");
+    assert!(
+        stdout.trim().is_empty(),
+        "non-editing tool must produce no stdout; got: {stdout}"
+    );
+    assert!(
+        !queue_path(tmp.path()).exists(),
+        "non-editing tool must not create queue file"
+    );
 }
 
 #[test]
@@ -118,15 +142,24 @@ fn post_tool_use_multiple_calls_each_succeed_silently() {
     let p1 = tmp.path().join("a.rs");
     let p2 = tmp.path().join("b.rs");
 
-    let e1 = format!(r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#, p1.display());
-    let e2 = format!(r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#, p2.display());
+    let e1 = format!(
+        r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#,
+        p1.display()
+    );
+    let e2 = format!(
+        r#"{{"tool_name":"Edit","tool_input":{{"file_path":"{}"}}}}"#,
+        p2.display()
+    );
 
     let (c1, s1) = run_post_tool_use_in(tmp.path(), &e1);
     let (c2, s2) = run_post_tool_use_in(tmp.path(), &e2);
 
     assert_eq!(c1, 0, "first call must exit 0; stdout={s1}");
     assert_eq!(c2, 0, "second call must exit 0; stdout={s2}");
-    assert!(!queue_path(tmp.path()).exists(), "reindex-queue.jsonl must not be created");
+    assert!(
+        !queue_path(tmp.path()).exists(),
+        "reindex-queue.jsonl must not be created"
+    );
 }
 
 #[test]
@@ -141,8 +174,14 @@ fn post_tool_use_respects_mdkbignore_hooks_marker() {
 
     let (code, stdout) = run_post_tool_use_in(tmp.path(), &event);
     assert_eq!(code, 0, "must exit 0; stdout={stdout}");
-    assert!(stdout.trim().is_empty(), "opt-out marker must suppress output; got: {stdout}");
-    assert!(!queue_path(tmp.path()).exists(), "opt-out marker must suppress queue creation");
+    assert!(
+        stdout.trim().is_empty(),
+        "opt-out marker must suppress output; got: {stdout}"
+    );
+    assert!(
+        !queue_path(tmp.path()).exists(),
+        "opt-out marker must suppress queue creation"
+    );
 }
 
 #[test]
@@ -160,7 +199,10 @@ fn post_tool_use_on_uninitialized_project_is_noop() {
         stdout.trim().is_empty(),
         "no .mdkb/ means no output, got: {stdout}"
     );
-    assert!(!queue_path(tmp.path()).exists(), "no .mdkb/ means no queue file");
+    assert!(
+        !queue_path(tmp.path()).exists(),
+        "no .mdkb/ means no queue file"
+    );
 }
 
 #[test]
@@ -170,5 +212,8 @@ fn post_tool_use_missing_file_path_is_noop() {
 
     let (code, stdout) = run_post_tool_use_in(tmp.path(), event);
     assert_eq!(code, 0, "must exit 0; stdout={stdout}");
-    assert!(!queue_path(tmp.path()).exists(), "missing file_path must not create queue file");
+    assert!(
+        !queue_path(tmp.path()).exists(),
+        "missing file_path must not create queue file"
+    );
 }

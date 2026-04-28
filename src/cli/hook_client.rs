@@ -161,11 +161,7 @@ fn hook_timeout(method: &str) -> Duration {
 /// `event` is the raw event JSON received on stdin by the hook binary.
 /// On any error the function logs to stderr and returns `Ok(())` — host CLIs
 /// must see exit 0.
-pub async fn call_hook_event(
-    method: &str,
-    event: Value,
-    root: Option<PathBuf>,
-) -> Result<()> {
+pub async fn call_hook_event(method: &str, event: Value, root: Option<PathBuf>) -> Result<()> {
     run_hook(method, event, root).await
 }
 
@@ -509,9 +505,18 @@ mod tests {
 
     #[test]
     fn hook_timeout_returns_per_event_durations() {
-        assert_eq!(hook_timeout("hook.session_start"), HOOK_TIMEOUT_SESSION_START);
-        assert_eq!(hook_timeout("hook.user_prompt_submit"), HOOK_TIMEOUT_USER_PROMPT_SUBMIT);
-        assert_eq!(hook_timeout("hook.post_tool_use"), HOOK_TIMEOUT_POST_TOOL_USE);
+        assert_eq!(
+            hook_timeout("hook.session_start"),
+            HOOK_TIMEOUT_SESSION_START
+        );
+        assert_eq!(
+            hook_timeout("hook.user_prompt_submit"),
+            HOOK_TIMEOUT_USER_PROMPT_SUBMIT
+        );
+        assert_eq!(
+            hook_timeout("hook.post_tool_use"),
+            HOOK_TIMEOUT_POST_TOOL_USE
+        );
         assert_eq!(hook_timeout("hook.pre_tool_use"), HOOK_TIMEOUT_PRE_TOOL_USE);
         assert_eq!(hook_timeout("status"), CALL_TIMEOUT);
     }
@@ -527,10 +532,8 @@ mod tests {
                 "additionalContext": "Use mdkb search instead",
             }
         });
-        let _srv = spawn_fake_hook_server(
-            sock.clone(),
-            json!({"jsonrpc":"2.0","result": envelope}),
-        );
+        let _srv =
+            spawn_fake_hook_server(sock.clone(), json!({"jsonrpc":"2.0","result": envelope}));
 
         // call_daemon_with_timeout returns the result envelope
         let result = call_daemon_with_timeout(
@@ -542,6 +545,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(result.get("hookSpecificOutput").is_some(), "result: {result}");
+        assert!(
+            result.get("hookSpecificOutput").is_some(),
+            "result: {result}"
+        );
     }
 }
