@@ -77,7 +77,19 @@ fn should_detach_from_argv() -> bool {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse_args();
+    let format = cli.format;
 
+    let result = run_cli(cli).await;
+    if let Err(ref e) = result {
+        if matches!(format, OutputFormat::Json) {
+            eprintln!("{}", serde_json::json!({"error": e.to_string()}));
+            std::process::exit(1);
+        }
+    }
+    result
+}
+
+async fn run_cli(cli: Cli) -> Result<()> {
     // Set up tracing based on verbosity
     let level = match cli.verbose {
         0 => Level::WARN,

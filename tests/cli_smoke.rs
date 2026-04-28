@@ -720,3 +720,21 @@ fn smoke_memory_show_nonexistent() {
         out.status.code()
     );
 }
+
+#[test]
+fn smoke_format_json_error_is_json() {
+    let tmp = tempfile::tempdir().unwrap();
+    // search without init should error; with --format json the error should be JSON on stderr
+    let out = run(&["--format", "json", "search", "anything"], tmp.path());
+    assert!(
+        !out.status.success(),
+        "should fail without init"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parsed: serde_json::Value = serde_json::from_str(stderr.trim())
+        .unwrap_or_else(|e| panic!("stderr should be JSON: {e}\nstderr: {stderr}"));
+    assert!(
+        parsed.get("error").is_some(),
+        "JSON error should have 'error' key: {parsed}"
+    );
+}
