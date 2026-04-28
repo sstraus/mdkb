@@ -206,6 +206,25 @@ fn bootstrap_code_index(root: &Path) {
     crate::llm::release_cached_service();
 }
 
+const MAX_COLLECTION_NAME_LEN: usize = 100;
+
+fn validate_collection_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > MAX_COLLECTION_NAME_LEN {
+        return Err(Error::other(format!(
+            "Collection name must be 1-{MAX_COLLECTION_NAME_LEN} chars"
+        )));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(Error::other(
+            "Collection name must be lowercase alphanumeric with hyphens or underscores".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that a collection path stays within the project root.
 ///
 /// Uses `canonicalize` when the path exists on disk (resolves symlinks).
@@ -235,6 +254,7 @@ fn validate_collection_path(root: &Path, path: &str) -> Result<()> {
 
 /// Handle `mdkb collection add` command.
 pub fn handle_collection_add(ctx: &Context, name: &str, path: &str, pattern: &str) -> Result<()> {
+    validate_collection_name(name)?;
     validate_collection_path(ctx.root(), path)?;
 
     let now = chrono::Utc::now().timestamp();
@@ -263,6 +283,7 @@ pub fn handle_collection_list(ctx: &Context) -> Result<Vec<Collection>> {
 
 /// Handle `mdkb collection rename` command.
 pub fn handle_collection_rename(ctx: &Context, old_name: &str, new_name: &str) -> Result<()> {
+    validate_collection_name(new_name)?;
     collections::rename_collection(&ctx.conn, old_name, new_name)
 }
 
@@ -2551,6 +2572,52 @@ mod tests {
         let result = handle_collection_add(&ctx, "docs", "./other", "**/*.md");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_handle_collection_add_rejects_invalid_name() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let too_long = "x".repeat(101);
+        let cases = vec![
+            ("My Docs", "spaces"),
+            ("UPPER", "uppercase"),
+            ("has/slash", "slash"),
+            ("ctrl\x00char", "null byte"),
+            ("", "empty"),
+            (too_long.as_str(), "too long"),
+        ];
+        for (name, label) in cases {
+            let result = handle_collection_add(&ctx, name, "./docs", "**/*.md");
+            assert!(result.is_err(), "should reject {label}: {name:?}");
+        }
+    }
+
+    #[test]
+    fn test_handle_collection_add_accepts_valid_names() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        for name in &["docs", "my-docs", "my_docs", "docs123", "a"] {
+            // Remove if exists, to allow re-adding
+            let _ = handle_collection_remove(&ctx, name);
+            handle_collection_add(&ctx, name, "./docs", "**/*.md")
+                .unwrap_or_else(|e| panic!("should accept {name:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn test_handle_collection_rename_validates_new_name() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        handle_collection_add(&ctx, "docs", "./docs", "**/*.md").unwrap();
+        let result = handle_collection_rename(&ctx, "docs", "Bad Name!");
+        assert!(result.is_err(), "rename should reject invalid new name");
     }
 
     #[test]
