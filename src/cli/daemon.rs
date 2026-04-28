@@ -4,156 +4,193 @@
 //! daemon via Unix signals. None of them require the daemon to be healthy —
 //! a stale pid file with a dead process is reported as "not running".
 
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
-use crate::DaemonConfig;
-use crate::daemon::ipc_server::{HOOK_SOCKET_NAME, MCP_SOCKET_NAME};
-use crate::daemon::singleton::{default_lock_path, read_pid};
 use crate::error::{Error, Result};
 
 /// Maximum time `stop` waits for the daemon to exit after SIGTERM.
+#[cfg(unix)]
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maximum time `restart` waits for the fresh daemon's sockets to appear.
+#[cfg(unix)]
 const RESTART_READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Snapshot of daemon-side files used for human-readable `status` output
-/// and for probing liveness from `stop`/`restart`.
-struct DaemonState {
-    lock_path: PathBuf,
-    base_dir: PathBuf,
-    mcp_sock: PathBuf,
-    hook_sock: PathBuf,
-    pid: Option<u32>,
-    pid_alive: bool,
-    uptime: Option<Duration>,
-}
+#[cfg(unix)]
+mod platform {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant, SystemTime};
 
-impl DaemonState {
-    fn probe() -> Self {
-        let lock_path = default_lock_path();
-        let base_dir = lock_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(DaemonConfig::daemon_home);
-        let mcp_sock = base_dir.join(MCP_SOCKET_NAME);
-        let hook_sock = base_dir.join(HOOK_SOCKET_NAME);
-        let pid = read_pid(&lock_path);
-        let pid_alive = pid.is_some_and(process_alive);
+    use crate::DaemonConfig;
+    use crate::daemon::ipc_server::{HOOK_SOCKET_NAME, MCP_SOCKET_NAME};
+    use crate::daemon::singleton::{default_lock_path, read_pid};
+    use crate::error::{Error, Result};
 
-        // Rough uptime from the pid file's mtime — good enough for humans,
-        // and doesn't require the daemon to expose a side-channel.
-        let uptime = std::fs::metadata(&lock_path)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| SystemTime::now().duration_since(t).ok());
+    use super::{RESTART_READY_TIMEOUT, STOP_TIMEOUT, format_duration, process_alive, signal_term};
 
-        DaemonState {
-            lock_path,
-            base_dir,
-            mcp_sock,
-            hook_sock,
-            pid,
-            pid_alive,
-            uptime,
-        }
+    struct DaemonState {
+        lock_path: PathBuf,
+        base_dir: PathBuf,
+        mcp_sock: PathBuf,
+        hook_sock: PathBuf,
+        pid: Option<u32>,
+        pid_alive: bool,
+        uptime: Option<Duration>,
     }
 
-    /// Returns the live PID if the daemon is running, `None` otherwise.
-    fn running_pid(&self) -> Option<u32> {
-        if self.pid_alive { self.pid } else { None }
-    }
-}
+    impl DaemonState {
+        fn probe() -> Self {
+            let lock_path = default_lock_path();
+            let base_dir = lock_path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(DaemonConfig::daemon_home);
+            let mcp_sock = base_dir.join(MCP_SOCKET_NAME);
+            let hook_sock = base_dir.join(HOOK_SOCKET_NAME);
+            let pid = read_pid(&lock_path);
+            let pid_alive = pid.is_some_and(process_alive);
 
-/// Print human-readable daemon status to stdout. Always returns Ok —
-/// missing/stale state is shown, not errored.
-pub fn handle_status() -> Result<()> {
-    let s = DaemonState::probe();
-    if let Some(pid) = s.running_pid() {
-        println!("mdkb daemon: running (pid {pid})");
-    } else if let Some(pid) = s.pid {
-        println!(
-            "mdkb daemon: not running (stale pid {pid} in {})",
-            s.lock_path.display()
-        );
-    } else {
-        println!("mdkb daemon: not running");
-    }
-    println!("  base:       {}", s.base_dir.display());
-    println!(
-        "  mcp  sock:  {} {}",
-        s.mcp_sock.display(),
-        present(&s.mcp_sock)
-    );
-    println!(
-        "  hook sock:  {} {}",
-        s.hook_sock.display(),
-        present(&s.hook_sock)
-    );
-    if let Some(up) = s.uptime {
-        if s.running_pid().is_some() {
-            println!("  uptime:     {}", format_duration(up));
-        }
-    }
-    Ok(())
-}
+            let uptime = std::fs::metadata(&lock_path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| SystemTime::now().duration_since(t).ok());
 
-/// Send SIGTERM to the daemon and wait up to `STOP_TIMEOUT` for the
-/// sockets to be unlinked. No-op if the daemon is not running.
-pub async fn handle_stop() -> Result<()> {
-    let s = DaemonState::probe();
-    let Some(pid) = s.running_pid() else {
-        println!("mdkb daemon: not running");
-        return Ok(());
-    };
-    signal_term(pid)?;
-    println!("SIGTERM sent to pid {pid}; awaiting shutdown…");
-
-    let deadline = Instant::now() + STOP_TIMEOUT;
-    while Instant::now() < deadline {
-        if !process_alive(pid) && !s.mcp_sock.exists() && !s.hook_sock.exists() {
-            println!("mdkb daemon: stopped");
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    Err(Error::other(format!(
-        "daemon pid {pid} did not exit within {:?} (sockets still present: mcp={} hook={})",
-        STOP_TIMEOUT,
-        s.mcp_sock.exists(),
-        s.hook_sock.exists()
-    )))
-}
-
-/// Stop the daemon (if running), then re-spawn it detached and wait for
-/// the sockets to come back.
-pub async fn handle_restart() -> Result<()> {
-    let before = DaemonState::probe();
-    if before.running_pid().is_some() {
-        handle_stop().await?;
-    }
-
-    spawn_daemon_detached()?;
-
-    let deadline = Instant::now() + RESTART_READY_TIMEOUT;
-    while Instant::now() < deadline {
-        let s = DaemonState::probe();
-        if let Some(pid) = s.running_pid() {
-            if s.mcp_sock.exists() && s.hook_sock.exists() {
-                println!("mdkb daemon: restarted (pid {pid})");
-                return Ok(());
+            DaemonState {
+                lock_path,
+                base_dir,
+                mcp_sock,
+                hook_sock,
+                pid,
+                pid_alive,
+                uptime,
             }
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        fn running_pid(&self) -> Option<u32> {
+            if self.pid_alive { self.pid } else { None }
+        }
     }
-    Err(Error::other(format!(
-        "daemon did not become ready within {RESTART_READY_TIMEOUT:?}"
-    )))
+
+    fn present(p: &Path) -> &'static str {
+        if p.exists() { "(present)" } else { "(absent)" }
+    }
+
+    pub fn handle_status() -> Result<()> {
+        let s = DaemonState::probe();
+        if let Some(pid) = s.running_pid() {
+            println!("mdkb daemon: running (pid {pid})");
+        } else if let Some(pid) = s.pid {
+            println!(
+                "mdkb daemon: not running (stale pid {pid} in {})",
+                s.lock_path.display()
+            );
+        } else {
+            println!("mdkb daemon: not running");
+        }
+        println!("  base:       {}", s.base_dir.display());
+        println!(
+            "  mcp  sock:  {} {}",
+            s.mcp_sock.display(),
+            present(&s.mcp_sock)
+        );
+        println!(
+            "  hook sock:  {} {}",
+            s.hook_sock.display(),
+            present(&s.hook_sock)
+        );
+        if let Some(up) = s.uptime {
+            if s.running_pid().is_some() {
+                println!("  uptime:     {}", format_duration(up));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn handle_stop() -> Result<()> {
+        let s = DaemonState::probe();
+        let Some(pid) = s.running_pid() else {
+            println!("mdkb daemon: not running");
+            return Ok(());
+        };
+        signal_term(pid)?;
+        println!("SIGTERM sent to pid {pid}; awaiting shutdown…");
+
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while Instant::now() < deadline {
+            if !process_alive(pid) && !s.mcp_sock.exists() && !s.hook_sock.exists() {
+                println!("mdkb daemon: stopped");
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(Error::other(format!(
+            "daemon pid {pid} did not exit within {:?} (sockets still present: mcp={} hook={})",
+            STOP_TIMEOUT,
+            s.mcp_sock.exists(),
+            s.hook_sock.exists()
+        )))
+    }
+
+    pub async fn handle_restart() -> Result<()> {
+        let before = DaemonState::probe();
+        if before.running_pid().is_some() {
+            handle_stop().await?;
+        }
+
+        spawn_daemon_detached()?;
+
+        let deadline = Instant::now() + RESTART_READY_TIMEOUT;
+        while Instant::now() < deadline {
+            let s = DaemonState::probe();
+            if let Some(pid) = s.running_pid() {
+                if s.mcp_sock.exists() && s.hook_sock.exists() {
+                    println!("mdkb daemon: restarted (pid {pid})");
+                    return Ok(());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(Error::other(format!(
+            "daemon did not become ready within {RESTART_READY_TIMEOUT:?}"
+        )))
+    }
+
+    fn spawn_daemon_detached() -> Result<()> {
+        use std::os::unix::process::CommandExt;
+
+        let exe = std::env::current_exe().map_err(|e| Error::other(format!("current_exe: {e}")))?;
+
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.arg("serve")
+            .arg("--daemon")
+            .arg("--detach")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0);
+
+        cmd.spawn()
+            .map(|_| ())
+            .map_err(|e| Error::other(format!("spawn mdkb daemon ({}): {e}", exe.display())))
+    }
 }
 
-fn present(p: &Path) -> &'static str {
-    if p.exists() { "(present)" } else { "(absent)" }
+#[cfg(unix)]
+pub use platform::{handle_restart, handle_status, handle_stop};
+
+#[cfg(not(unix))]
+pub fn handle_status() -> Result<()> {
+    Err(Error::other("Daemon commands require Unix"))
+}
+
+#[cfg(not(unix))]
+pub async fn handle_stop() -> Result<()> {
+    Err(Error::other("Daemon commands require Unix"))
+}
+
+#[cfg(not(unix))]
+pub async fn handle_restart() -> Result<()> {
+    Err(Error::other("Daemon commands require Unix"))
 }
 
 fn format_duration(d: Duration) -> String {
@@ -273,7 +310,7 @@ pub fn detach_current_process() -> Result<()> {
 fn redirect_stdio_to_log() -> Result<()> {
     use std::os::fd::AsRawFd;
 
-    let logs_dir = DaemonConfig::daemon_home().join("logs");
+    let logs_dir = crate::DaemonConfig::daemon_home().join("logs");
     std::fs::create_dir_all(&logs_dir)
         .map_err(|e| Error::other(format!("mkdir {}: {e}", logs_dir.display())))?;
     let log_path = logs_dir.join("daemon.log");
@@ -288,8 +325,6 @@ fn redirect_stdio_to_log() -> Result<()> {
         .open(&log_path)
         .map_err(|e| Error::other(format!("open {}: {e}", log_path.display())))?;
 
-    // dup2 replaces fds 0/1/2 atomically. SAFETY: fds come from live files
-    // we own; libc::dup2 handles invalid fds with EBADF, not UB.
     unsafe {
         if libc::dup2(devnull.as_raw_fd(), 0) < 0
             || libc::dup2(log.as_raw_fd(), 1) < 0
@@ -302,30 +337,6 @@ fn redirect_stdio_to_log() -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Spawn `mdkb serve --daemon --detach` as a detached process group.
-/// Used by `restart`; the daemon itself handles the actual double-fork.
-fn spawn_daemon_detached() -> Result<()> {
-    let exe = std::env::current_exe().map_err(|e| Error::other(format!("current_exe: {e}")))?;
-
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-
-    let mut cmd = std::process::Command::new(&exe);
-    cmd.arg("serve")
-        .arg("--daemon")
-        .arg("--detach")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    cmd.spawn()
-        .map(|_| ())
-        .map_err(|e| Error::other(format!("spawn mdkb daemon ({}): {e}", exe.display())))
 }
 
 #[cfg(test)]
@@ -353,17 +364,7 @@ mod tests {
     }
 
     #[test]
-    fn probe_reports_not_running_with_no_lock_file() {
-        // In CI the user's ~/.mdkb/daemon.pid may or may not exist. What we
-        // can assert portably is that probe() does not panic and that when
-        // there is no pid it returns None.
-        let s = DaemonState::probe();
-        if s.pid.is_none() {
-            assert!(s.running_pid().is_none());
-        }
-    }
-
-    #[test]
+    #[cfg(unix)]
     fn process_alive_is_true_for_current_process() {
         assert!(process_alive(std::process::id()));
     }

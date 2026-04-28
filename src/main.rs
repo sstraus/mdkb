@@ -1036,10 +1036,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     ttl,
                     root,
                 } => {
-                    hook_client::call_memory_write(
-                        id, title, entry_type, content, tags, ttl, root,
-                    )
-                    .await?;
+                    hook_client::call_memory_write(id, title, entry_type, content, tags, ttl, root)
+                        .await?;
                 }
                 HookCommand::MemoryConfirm { id, outcome, root } => {
                     hook_client::call_memory_confirm(id, outcome, root).await?;
