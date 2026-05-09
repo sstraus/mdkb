@@ -74,6 +74,9 @@ impl RepairReport {
 pub fn run_repairs(conn: &Connection) -> RepairReport {
     let mut report = RepairReport::default();
 
+    // Wait up to 5s for a concurrent writer (daemon) to release the lock.
+    let _ = conn.execute_batch("PRAGMA busy_timeout = 5000");
+
     // Dedup first — may create orphans that subsequent checks clean up.
     report.duplicate_rel_path_files = repair_duplicate_rel_paths(conn);
 
@@ -136,7 +139,13 @@ fn repair_fts(conn: &Connection) -> bool {
 }
 
 fn exec_count(conn: &Connection, sql: &str) -> usize {
-    conn.execute(sql, []).unwrap_or(0)
+    match conn.execute(sql, []) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %e, sql, "repair exec failed");
+            0
+        }
+    }
 }
 
 #[cfg(test)]

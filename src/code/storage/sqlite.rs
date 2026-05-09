@@ -81,6 +81,10 @@ impl CodeDb {
     // --- File operations ---
 
     /// Insert or replace a file record. Returns the SQLite rowid.
+    ///
+    /// Pre-deletes any row with the same `rel_path` but different `path` to
+    /// handle the absolute→relative path migration (old rows had `path` as
+    /// absolute, new code uses `rel_path` for both).
     pub fn insert_file(
         &self,
         path: &str,
@@ -90,6 +94,17 @@ impl CodeDb {
         mtime: Option<i64>,
         token_estimate: Option<i64>,
     ) -> rusqlite::Result<i64> {
+        // Clean up legacy rows where path was absolute but rel_path matches.
+        // FTS triggers require explicit symbol delete before file delete.
+        self.conn.execute(
+            "DELETE FROM code_symbols WHERE file_id IN \
+             (SELECT id FROM code_files WHERE rel_path = ?1 AND path != ?2)",
+            params![rel_path, path],
+        )?;
+        self.conn.execute(
+            "DELETE FROM code_files WHERE rel_path = ?1 AND path != ?2",
+            params![rel_path, path],
+        )?;
         self.conn.execute(
             "INSERT INTO code_files (path, rel_path, hash, language, mtime, indexed_at, token_estimate) \
              VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6) \
@@ -683,6 +698,41 @@ mod tests {
         assert_eq!(db.file_count().unwrap(), 1);
         let hashes = db.get_file_hashes().unwrap();
         assert_eq!(hashes.get("main.rs").unwrap(), "hash2");
+    }
+
+    #[test]
+    fn test_insert_file_deduplicates_legacy_absolute_path() {
+        let (_dir, db) = temp_db();
+        // Simulate legacy row with absolute path
+        db.insert_file("/abs/path/main.rs", "main.rs", "old_hash", None, None, None)
+            .unwrap();
+        let sym_id = db
+            .insert_symbol(
+                "old_fn", "Function", 1, "main.rs", 1, None, None, None, 0, None, None, None, None,
+            )
+            .unwrap();
+        assert_eq!(db.file_count().unwrap(), 1);
+        assert_eq!(db.symbol_count().unwrap(), 1);
+
+        // New code inserts with rel_path for both path and rel_path
+        db.insert_file("main.rs", "main.rs", "new_hash", None, None, None)
+            .unwrap();
+
+        // Should have exactly 1 file (legacy row cleaned up)
+        assert_eq!(db.file_count().unwrap(), 1);
+        let hashes = db.get_file_hashes().unwrap();
+        assert_eq!(hashes.get("main.rs").unwrap(), "new_hash");
+
+        // Old symbols should be gone (pre-delete cleaned them)
+        let remaining: i64 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM code_symbols WHERE name = 'old_fn'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, 0, "legacy symbols should be cleaned up");
     }
 
     #[test]
