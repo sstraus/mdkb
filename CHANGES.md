@@ -1,5 +1,22 @@
 # Changelog
 
+## 3.1.0 (2026-05-01)
+
+### Added
+
+- **Automatic code.sqlite repair on open** — idempotent integrity checks run
+  every time the code index is opened. Detects and fixes: NULL kind rows,
+  orphaned symbols (missing file), orphaned relationships (missing file or
+  symbol), and desynced FTS5 index. Fixes are reported to stderr; clean
+  databases have zero overhead beyond the integrity check queries.
+  New module: `code::storage::repair`.
+
+### Changed
+
+- **Stats report opens code.sqlite read-write** — enables autofix on
+  `mdkb stats` instead of silently logging a WARN nobody reads. Falls back
+  to read-only if write access is unavailable.
+
 ## 3.0.3 (2026-04-26)
 
 ### Added

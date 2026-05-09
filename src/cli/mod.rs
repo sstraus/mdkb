@@ -547,7 +547,7 @@ pub enum MemoryCommand {
         tags: Option<String>,
 
         /// Content (if not provided, reads from stdin)
-        #[arg(short, long)]
+        #[arg(short, long, alias = "body")]
         content: Option<String>,
 
         /// Read content from file instead of --content or stdin.

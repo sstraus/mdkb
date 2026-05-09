@@ -16,10 +16,11 @@ No cloud APIs. No token-heavy context dumps. Just fast, local, relevant retrieva
 - **Unified diagnostics** — `mdkb stats` renders a static ASCII dashboard (index health, collections, memory, code, sessions, hooks)
 - **Zero config serving** — auto-indexes on startup, watches for file changes, auto-`VACUUM`s on drift
 
-### Recent highlights (3.0.0 / 2.2.0 / 2.0.0)
+### Recent highlights (3.1.0 / 3.0.0 / 2.2.0 / 2.0.0)
 
 Full details in [CHANGES.md](CHANGES.md).
 
+- **3.1.0** — Automatic `code.sqlite` repair on open — idempotent integrity checks fix NULL kinds, orphaned rows, and desynced FTS without user intervention.
 - **3.0.0 (breaking)** — Hook dispatch via daemon IPC (Unix socket JSON-RPC instead of in-process execution); `reindex-queue.jsonl` removed (PostToolUse sends paths directly to daemon watcher channel); hook event logging to `hook-events.jsonl`; per-event configurable latency thresholds; `spawn_blocking` for CPU-bound hook work.
 - **2.2.0** — `prior` entry type for behavioral patterns (30d TTL default, excluded from searches); `mdkb cheatsheet` AI-friendly command reference; `--entry-type` filter on `mdkb search`; PreToolUse Grep hook suggests CLI commands (works without MCP); optimized injected text (~185 fewer tokens per turn).
 - **2.0.0 (breaking)** — `mdkb status` removed (use `mdkb stats`); `mdkb memory export`/`import` round-trip entries as `.md` files with YAML frontmatter; unified ASCII stats dashboard with `--format json` and `--no-color`.
@@ -186,6 +187,31 @@ Source types control confidence weighting:
 | `user_statement` | 0.85 | Human-stated facts (default) |
 | `auto_extracted` | 0.70 | Automated knowledge capture |
 | `inference` | 0.65 | AI-inferred knowledge |
+
+## Sessions
+
+mdkb indexes Claude Code session JSONL files from `~/.claude/projects` to track token usage and tool call statistics per session.
+
+### CLI
+
+```bash
+# Index sessions for the current project
+mdkb session index
+
+# Custom sessions directory or project root
+mdkb session index --sessions-path /path/to/sessions --project-root /path/to/project
+```
+
+Session data feeds the `mdkb stats` dashboard (session totals, top tools by call count and tokens) and the `usage` MCP tool.
+
+### MCP: `usage` tool
+
+Returns per-tool call counts, total tokens, and averages:
+
+```
+usage(session_only=true)   # current session (default)
+usage(session_only=false)  # lifetime aggregates across all sessions
+```
 
 ## Code Intelligence
 

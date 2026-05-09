@@ -790,7 +790,8 @@ pub async fn search_impl(
                 }
 
                 if symbols.is_empty() {
-                    return Ok(("No symbols found.".to_string(), 0));
+                    let total = facade.symbol_count();
+                    return Ok((format!("0 matches ({total} symbols indexed). Try a shorter name."), 0));
                 }
                 let rel_paths: Vec<String> = symbols
                     .iter()
@@ -1701,6 +1702,30 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
         "\n**mdkb CLI** (semantic search — not available via Grep/Glob). Run `{bin} cheatsheet` for full syntax.\n"
     ));
 
+    // Check code index staleness
+    let code_db = handle.root.join(".mdkb/code.sqlite");
+    if code_db.exists() {
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &code_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            let last: Option<i64> = conn
+                .query_row("SELECT MAX(indexed_at) FROM code_files", [], |r| {
+                    r.get::<_, Option<i64>>(0)
+                })
+                .unwrap_or(None);
+            if let Some(ts) = last {
+                let now = chrono::Utc::now().timestamp();
+                let age_days = (now - ts) / 86_400;
+                if age_days >= 7 {
+                    body.push_str(&format!(
+                        "\n**⚠️ Code index is {age_days} days stale.** Run `{bin} code index --incremental` to refresh.\n"
+                    ));
+                }
+            }
+        }
+    }
+
     json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -1710,6 +1735,8 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
 }
 
 pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> Value {
+    use crate::cli::hook_logic::prompt_wants_call_graph;
+
     let cfg = &handle.config.hooks;
     if !cfg.user_prompt_submit_enabled {
         return json!({});
@@ -1717,33 +1744,40 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
     if prompt.trim().is_empty() || prompt_is_wrapup(prompt) {
         return json!({});
     }
-    let fts_query = match build_recall_query(prompt) {
-        Some(q) => q,
-        None => return json!({}),
-    };
-    if ensure_handle_context(handle).await.is_err() {
+
+    let wants_cg = prompt_wants_call_graph(prompt);
+    let fts_query = build_recall_query(prompt);
+
+    if fts_query.is_none() && !wants_cg {
         return json!({});
     }
-    let ctx_guard = handle.ctx.lock().await;
-    let conn = match ctx_guard.as_ref() {
-        Some(c) => &c.conn,
-        None => return json!({}),
-    };
-    let limit = cfg.recall_limit.max(1);
-    let mut results = match search_entries_fts(conn, &fts_query, limit) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("hook.user_prompt_submit: search_entries_fts failed: {e}");
+
+    let mut results = Vec::new();
+    if let Some(ref q) = fts_query {
+        if ensure_handle_context(handle).await.is_err() {
             return json!({});
         }
-    };
-    drop(ctx_guard);
+        let ctx_guard = handle.ctx.lock().await;
+        let conn = match ctx_guard.as_ref() {
+            Some(c) => &c.conn,
+            None => return json!({}),
+        };
+        let limit = cfg.recall_limit.max(1);
+        results = match search_entries_fts(conn, q, limit) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("hook.user_prompt_submit: search_entries_fts failed: {e}");
+                Vec::new()
+            }
+        };
+        drop(ctx_guard);
+    }
 
-    if results.is_empty() {
+    if results.is_empty() && !wants_cg {
         return json!({});
     }
 
-    if cfg.recall_half_life_secs > 0 {
+    if cfg.recall_half_life_secs > 0 && !results.is_empty() {
         let now = chrono::Utc::now().timestamp();
         let n = results.len() as f64;
         let mut scored: Vec<(f64, usize)> = results
@@ -1765,11 +1799,29 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
         results = scored.into_iter().map(|(_, i)| orig[i].clone()).collect();
     }
 
-    let mut body = String::from("## mdkb: relevant context\n\n");
-    for entry in &results {
-        let snippet_raw = entry.content.trim().replace('\n', " ");
-        let snippet: String = snippet_raw.chars().take(160).collect();
-        body.push_str(&format!("- [{}] {} — {}\n", entry.id, entry.title, snippet));
+    let mut body = String::new();
+
+    if !results.is_empty() {
+        body.push_str("## mdkb: relevant context\n\n");
+        for entry in &results {
+            let snippet_raw = entry.content.trim().replace('\n', " ");
+            let snippet: String = snippet_raw.chars().take(160).collect();
+            body.push_str(&format!(
+                "- [{}] {} — {}\n",
+                entry.id, entry.title, snippet
+            ));
+        }
+        body.push_str("\nIf your work corroborates any entry above, use `memory_confirm(id, outcome=\"confirmed\")` instead of writing a new one.\n");
+    }
+
+    if wants_cg {
+        body.push_str(
+            "\n💡 This looks like a call-graph query. Use `code_graph(name)` or `code_graph(name, direction=\"callers\"|\"callees\"|\"impact\")` — one MCP call replaces multi-file Grep.\n",
+        );
+    }
+
+    if body.is_empty() {
+        return json!({});
     }
 
     json!({
@@ -2572,7 +2624,7 @@ mod tests {
 
         let (text, count) = search_impl(&handle, &params).await.expect("symbols scope");
         assert_eq!(count, 0, "text: {text}");
-        assert!(text.contains("No symbols found"), "text: {text}");
+        assert!(text.contains("0 matches"), "text: {text}");
     }
 
     #[tokio::test]

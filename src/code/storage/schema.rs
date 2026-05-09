@@ -105,13 +105,6 @@ pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE code_files ADD COLUMN token_estimate INTEGER")?;
     }
 
-    // Cleanup: remove rows with NULL kind that violate the NOT NULL constraint
-    // (can appear in databases created before constraint was enforced).
-    conn.execute_batch(
-        "DELETE FROM code_relationships WHERE kind IS NULL;
-         DELETE FROM code_symbols WHERE kind IS NULL;",
-    )?;
-
     // Triggers don't support IF NOT EXISTS — check before creating.
     let trigger_exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='code_symbols_fts_insert')",
@@ -121,6 +114,8 @@ pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     if !trigger_exists {
         conn.execute_batch(CREATE_TRIGGERS)?;
     }
+
+    super::repair::run_repairs(conn);
 
     Ok(())
 }

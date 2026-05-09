@@ -179,6 +179,30 @@ pub fn mdkbignore_hooks_present(start: &Path) -> bool {
     false
 }
 
+// ── Call-graph prompt detection ──────────────────────────────────────────────
+
+/// Patterns that signal the user is asking about call relationships.
+/// Returns true when the prompt matches a call-graph query.
+pub fn prompt_wants_call_graph(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    const PATTERNS: &[&str] = &[
+        "who calls",
+        "what calls",
+        "callers of",
+        "callees of",
+        "impact of",
+        "impact analysis",
+        "call graph",
+        "call chain",
+        "chi chiama",
+        "cosa chiama",
+        "chi usa",
+        "where is",
+        "used by",
+    ];
+    PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 // ── PreToolUse Grep classifiers ───────────────────────────────────────────────
 
 /// Classify whether a Grep pattern looks like a symbol name that mdkb
@@ -431,5 +455,30 @@ mod tests {
     #[test]
     fn classify_non_definition_pattern() {
         assert!(classify_definition_search("random text here", "mdkb").is_none());
+    }
+
+    // ── prompt_wants_call_graph ───────────────────────────────────────────
+
+    #[test]
+    fn call_graph_english_patterns() {
+        assert!(prompt_wants_call_graph("who calls dispatch?"));
+        assert!(prompt_wants_call_graph("What calls handle_update?"));
+        assert!(prompt_wants_call_graph("callers of write_single_memory"));
+        assert!(prompt_wants_call_graph("show me the impact of this change"));
+        assert!(prompt_wants_call_graph("I need a call graph for this"));
+    }
+
+    #[test]
+    fn call_graph_italian_patterns() {
+        assert!(prompt_wants_call_graph("chi chiama dispatch?"));
+        assert!(prompt_wants_call_graph("cosa chiama questa funzione?"));
+        assert!(prompt_wants_call_graph("chi usa memory_write?"));
+    }
+
+    #[test]
+    fn call_graph_negative() {
+        assert!(!prompt_wants_call_graph("fix the bug in dispatch"));
+        assert!(!prompt_wants_call_graph("add error handling"));
+        assert!(!prompt_wants_call_graph("refactor this function"));
     }
 }

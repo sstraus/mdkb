@@ -231,12 +231,17 @@ fn collect_memory(ctx: &Context) -> Result<MemorySummary> {
     let week = now + 7 * 86_400;
     let active_count = memory::count_active_entries(&ctx.conn)?;
 
-    // SQL GROUP BY is O(N) server-side; no need to hydrate every row (PERF).
+    // Must match count_active_entries criteria: exclude expired, non-due reminders, and priors.
     let mut counts_by_type: HashMap<String, usize> = HashMap::new();
-    let mut stmt = ctx
-        .conn
-        .prepare("SELECT entry_type, COUNT(*) FROM memory_entries WHERE status = 'active' GROUP BY entry_type")?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+    let mut stmt = ctx.conn.prepare(
+        "SELECT entry_type, COUNT(*) FROM memory_entries
+         WHERE status = 'active'
+           AND (expires_at IS NULL OR expires_at > ?1)
+           AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?1))
+           AND entry_type != 'prior'
+         GROUP BY entry_type",
+    )?;
+    let rows = stmt.query_map([now], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
     for row in rows {
         let (ty, count) = row?;
         counts_by_type.insert(ty, count as usize);
@@ -287,12 +292,20 @@ fn collect_code(mdkb_dir: &Path) -> CodeSummary {
         return empty_code_summary();
     }
 
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &code_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) else {
-        tracing::warn!(path = %code_path.display(), "code.sqlite open failed");
-        return empty_code_summary();
+    let conn = match rusqlite::Connection::open(&code_path) {
+        Ok(c) => {
+            crate::code::storage::repair::run_repairs(&c);
+            c
+        }
+        Err(_) => {
+            match rusqlite::Connection::open_with_flags(
+                &code_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) {
+                Ok(c) => c,
+                Err(_) => return empty_code_summary(),
+            }
+        }
     };
 
     let files = scalar_count(&conn, "SELECT COUNT(*) FROM code_files");
@@ -671,6 +684,37 @@ mod tests {
     }
 
     #[test]
+    fn counts_by_type_excludes_priors_and_expired() {
+        let env = Env::new();
+        let now = chrono::Utc::now().timestamp();
+
+        // Active topic — counted
+        env.add_memory("t1", EntryType::Topic);
+
+        // Active prior — excluded (entry_type != 'prior')
+        let mut prior = make_entry("p1", EntryType::Prior);
+        prior.expires_at = Some(now + 86_400);
+        add_entry(&env.ctx.conn, &prior).expect("add prior");
+
+        // Expired topic — excluded (expires_at < now)
+        let mut expired = make_entry("t-expired", EntryType::Topic);
+        expired.expires_at = Some(now - 60);
+        add_entry(&env.ctx.conn, &expired).expect("add expired");
+
+        let report = collect_report(&env.ctx).expect("collect");
+        let type_sum: usize = report.memory.counts_by_type.values().sum();
+        assert_eq!(
+            type_sum, report.memory.active_count,
+            "sum of counts_by_type must equal active_count"
+        );
+        assert_eq!(
+            report.memory.counts_by_type.get("prior").copied().unwrap_or(0),
+            0,
+            "priors excluded from counts_by_type"
+        );
+    }
+
+    #[test]
     fn reminder_due_counted() {
         let env = Env::new();
         let now = chrono::Utc::now().timestamp();
@@ -846,6 +890,64 @@ mod tests {
             .unwrap();
         assert_eq!(post.invocations, 1);
         assert_eq!(post.fired, 1);
+    }
+
+    #[test]
+    fn repair_removes_corrupt_rows_on_stats_collect() {
+        use crate::code::storage::repair::run_repairs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("code.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+
+        // Legacy schema without NOT NULL constraints
+        conn.execute_batch(
+            "CREATE TABLE code_files (
+                id INTEGER PRIMARY KEY, path TEXT, rel_path TEXT, hash TEXT, indexed_at INTEGER
+             );
+             CREATE TABLE code_symbols (
+                id INTEGER PRIMARY KEY, name TEXT, kind TEXT, file_id INTEGER, file_path TEXT,
+                line_start INTEGER, line_end INTEGER
+             );
+             CREATE TABLE code_relationships (
+                id INTEGER PRIMARY KEY, from_symbol_id INTEGER, from_name TEXT,
+                to_name TEXT, kind TEXT, file_id INTEGER
+             );
+             CREATE VIRTUAL TABLE code_symbols_fts USING fts5(
+                name, doc_comment, signature, content=code_symbols, content_rowid=id,
+                tokenize='trigram case_sensitive 0'
+             );",
+        )
+        .unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO code_files VALUES (1, 'a.rs', 'a.rs', 'h1', 1);
+             INSERT INTO code_symbols VALUES (1, 'good', 'fn', 1, 'a.rs', 1, 2);
+             INSERT INTO code_symbols VALUES (2, 'bad_null', NULL, 1, 'a.rs', 3, 4);
+             INSERT INTO code_symbols VALUES (3, 'orphan', 'fn', 999, 'gone.rs', 1, 2);
+             INSERT INTO code_relationships VALUES (1, 1, 'a', 'b', 'calls', 1);
+             INSERT INTO code_relationships VALUES (2, 1, 'x', 'y', NULL, 1);
+             INSERT INTO code_relationships VALUES (3, 1, 'c', 'd', 'calls', 999);
+             INSERT INTO code_relationships VALUES (4, 999, 'e', 'f', 'calls', 1);",
+        )
+        .unwrap();
+
+        let report = run_repairs(&conn);
+
+        assert_eq!(report.null_kind_symbols, 1);
+        assert_eq!(report.null_kind_relationships, 1);
+        assert_eq!(report.orphaned_symbols, 1);
+        assert_eq!(report.orphaned_relationships_file, 1);
+        assert_eq!(report.orphaned_relationships_symbol, 1);
+
+        let sym_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_symbols", [], |r| r.get(0))
+            .unwrap();
+        let rel_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM code_relationships", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sym_count, 1);
+        assert_eq!(rel_count, 1);
     }
 
     fn make_entry(id: &str, entry_type: EntryType) -> MemoryEntry {

@@ -2667,7 +2667,7 @@ if (require.main === module) {
             .expect("search scope=symbols failed");
 
             let text = extract_text(&result);
-            assert!(text.contains("No symbols found"), "Got: {}", text);
+            assert!(text.contains("0 matches"), "Got: {}", text);
         }
 
         #[tokio::test]
