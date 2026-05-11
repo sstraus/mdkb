@@ -327,6 +327,38 @@ impl McpServer {
         &self.metrics
     }
 
+    /// Initialize context, set `doc_reindex_active`, and take ctx out of the
+    /// lock — all in one lock acquisition. This eliminates a race where tool
+    /// calls could see ctx=Some with doc_reindex_active=false between
+    /// ensure_context() and the flag set, causing flaky test failures on CI.
+    async fn init_and_take_for_reindex(&self) -> Result<Option<Context>, McpError> {
+        let mut ctx_guard = self.ctx.lock().await;
+        if ctx_guard.is_none() {
+            let ctx = match Context::open(&self.root) {
+                Ok(ctx) => ctx,
+                Err(e) if e.is_not_found() => {
+                    tracing::info!("Auto-initializing mdkb at {}", self.root.display());
+                    Context::init(&self.root)
+                        .map_err(|e| mcp_error(format!("Failed to auto-initialize mdkb: {}", e)))?
+                }
+                Err(e) => return Err(mcp_error(format!("Failed to open database: {}", e))),
+            };
+            stats::init_stats_schema(&ctx.conn)
+                .map_err(|e| mcp_error(format!("Failed to init stats schema: {}", e)))?;
+            self.apply_conventions(&ctx)
+                .map_err(|e| mcp_error(format!("Failed to apply conventions: {}", e)))?;
+            if self.session_id.load(Ordering::Relaxed) == 0 {
+                let session_id = stats::create_session(&ctx.conn)
+                    .map_err(|e| mcp_error(format!("Failed to create session: {}", e)))?;
+                self.session_id.store(session_id, Ordering::Relaxed);
+                tracing::info!("Started stats session {}", session_id);
+            }
+            *ctx_guard = Some(ctx);
+        }
+        self.doc_reindex_active.store(true, Ordering::Relaxed);
+        Ok(ctx_guard.take())
+    }
+
     /// Initialize the database connection and stats session.
     ///
     /// Auto-initializes `.mdkb/` if it doesn't exist, so the MCP server
@@ -910,21 +942,16 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
         let startup_server = server.clone();
         let startup_root = root.clone();
         tokio::spawn(async move {
-            // Initialize context (auto-creates .mdkb/ if needed, detects conventions)
-            if let Err(e) = startup_server.ensure_context().await {
-                tracing::error!("Startup auto-init failed: {:?}", e);
-                return;
-            }
-
-            // Take ctx out of the lock for doc/session reindex so tool calls
-            // get "initializing, retry shortly" instead of blocking for minutes.
-            startup_server
-                .doc_reindex_active
-                .store(true, Ordering::Relaxed);
-            let taken_ctx = {
-                let mut ctx_guard = startup_server.ctx.lock().await;
-                ctx_guard.take()
-            }; // lock released immediately
+            // Initialize context and take it for reindex in one lock acquisition.
+            // This prevents a race where tool calls see ctx=Some before the
+            // doc_reindex_active flag is set.
+            let taken_ctx = match startup_server.init_and_take_for_reindex().await {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    tracing::error!("Startup auto-init failed: {:?}", e);
+                    return;
+                }
+            };
 
             if let Some(mut ctx) = taken_ctx {
                 match handle_update(&mut ctx, &startup_root) {
