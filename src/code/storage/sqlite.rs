@@ -354,6 +354,36 @@ impl CodeDb {
         rows.collect()
     }
 
+    /// Get all symbols in a specific file, ordered by line_start (for outline view).
+    pub fn symbols_in_file_ordered(&self, rel_path: &str) -> rusqlite::Result<Vec<Symbol>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "{SYMBOL_COLUMNS} FROM code_symbols WHERE file_path = ?1 ORDER BY line_start, col_start"
+        ))?;
+        let rows = stmt.query_map(params![rel_path], |row| row_to_symbol(row))?;
+        rows.collect()
+    }
+
+    /// Find the innermost symbol enclosing a given position (line is 1-based).
+    pub fn symbol_at_position(
+        &self,
+        rel_path: &str,
+        line: u32,
+        _col: Option<u32>,
+    ) -> rusqlite::Result<Option<Symbol>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "{SYMBOL_COLUMNS} FROM code_symbols \
+             WHERE file_path = ?1 AND line_start <= ?2 AND (line_end IS NULL OR line_end >= ?2) \
+             ORDER BY (COALESCE(line_end, line_start) - line_start) ASC \
+             LIMIT 1"
+        ))?;
+        let mut rows = stmt.query_map(params![rel_path, line], |row| row_to_symbol(row))?;
+        match rows.next() {
+            Some(Ok(sym)) => Ok(Some(sym)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
+
     /// Get symbol IDs for all symbols belonging to a file (by relative path).
     pub fn get_symbol_ids_for_file(&self, rel_path: &str) -> rusqlite::Result<Vec<u32>> {
         let mut stmt = self.conn.prepare_cached(
@@ -1521,5 +1551,49 @@ mod tests {
         let map = db.get_file_token_estimates(&paths).unwrap();
         assert_eq!(map.len(), 1, "only file with non-NULL estimate returned");
         assert_eq!(map["a.rs"], 42);
+    }
+
+    #[test]
+    fn test_symbols_in_file_ordered() {
+        let (_dir, db) = temp_db();
+        let fid = insert_test_file(&db);
+        db.insert_symbol("beta", "Function", fid, "test.rs", 20, None, Some(30), None, 0, None, None, None, None).unwrap();
+        db.insert_symbol("alpha", "Function", fid, "test.rs", 5, None, Some(15), None, 0, None, None, None, None).unwrap();
+        db.insert_symbol("gamma", "Struct", fid, "test.rs", 35, None, Some(50), None, 0, None, None, None, None).unwrap();
+
+        let syms = db.symbols_in_file_ordered("test.rs").unwrap();
+        assert_eq!(syms.len(), 3);
+        assert_eq!(syms[0].name.as_ref(), "alpha");
+        assert_eq!(syms[1].name.as_ref(), "beta");
+        assert_eq!(syms[2].name.as_ref(), "gamma");
+    }
+
+    #[test]
+    fn test_symbols_in_file_ordered_empty() {
+        let (_dir, db) = temp_db();
+        let syms = db.symbols_in_file_ordered("nonexistent.rs").unwrap();
+        assert!(syms.is_empty());
+    }
+
+    #[test]
+    fn test_symbol_at_position_innermost() {
+        let (_dir, db) = temp_db();
+        let fid = insert_test_file(&db);
+        db.insert_symbol("outer", "Function", fid, "test.rs", 1, None, Some(50), None, 0, None, None, None, None).unwrap();
+        db.insert_symbol("inner", "Function", fid, "test.rs", 10, None, Some(20), None, 0, None, None, None, None).unwrap();
+
+        let sym = db.symbol_at_position("test.rs", 15, None).unwrap();
+        assert!(sym.is_some());
+        assert_eq!(sym.unwrap().name.as_ref(), "inner");
+    }
+
+    #[test]
+    fn test_symbol_at_position_no_match() {
+        let (_dir, db) = temp_db();
+        let fid = insert_test_file(&db);
+        db.insert_symbol("func", "Function", fid, "test.rs", 10, None, Some(20), None, 0, None, None, None, None).unwrap();
+
+        let sym = db.symbol_at_position("test.rs", 5, None).unwrap();
+        assert!(sym.is_none());
     }
 }

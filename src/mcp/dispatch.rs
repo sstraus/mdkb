@@ -39,7 +39,10 @@ use super::server::{
     format_symbol, format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago,
     resolve_document, truncate_text,
 };
-use super::tools::{CodeGraphParams, GetParams, MemoryWriteBatchEntry, SearchParams, UsageParams};
+use super::tools::{
+    CodeGraphParams, GetParams, MemoryWriteBatchEntry, SearchParams, SymbolAtPositionParams,
+    SymbolsInFileParams, UsageParams,
+};
 
 /// Daemon-global state shared across all dispatched tool calls.
 #[derive(Clone)]
@@ -1405,6 +1408,73 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
     Ok(format!("{doc_output}{code_output}{session_output}"))
 }
 
+/// `symbols_in_file` — list all symbols in a file, ordered by position.
+pub async fn symbols_in_file_impl(
+    handle: &RepoHandle,
+    params: &SymbolsInFileParams,
+) -> Result<String, McpError> {
+    let idx_guard = acquire_handle_code_index(handle).await?;
+    let facade = match idx_guard.as_ref() {
+        Some(f) => f,
+        None => return Err(mcp_error("code index not available — run `update` first")),
+    };
+    let symbols = facade
+        .db()
+        .symbols_in_file_ordered(&params.file)
+        .map_err(|e| mcp_error(format!("symbols_in_file: {e}")))?;
+
+    let json_symbols: Vec<serde_json::Value> = symbols
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name.as_ref(),
+                "kind": format!("{:?}", s.kind),
+                "file_path": s.file_path.as_ref(),
+                "line_start": s.range.start_line,
+                "line_end": s.range.end_line,
+                "col_start": s.range.start_column,
+                "col_end": s.range.end_column,
+                "signature": s.signature.as_deref(),
+                "scope_context": s.scope_context.as_ref().map(|sc| format!("{sc:?}")),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::to_string(&json_symbols).unwrap_or_else(|_| "[]".to_string()))
+}
+
+/// `symbol_at_position` — find the innermost symbol at a given file position.
+pub async fn symbol_at_position_impl(
+    handle: &RepoHandle,
+    params: &SymbolAtPositionParams,
+) -> Result<String, McpError> {
+    let idx_guard = acquire_handle_code_index(handle).await?;
+    let facade = match idx_guard.as_ref() {
+        Some(f) => f,
+        None => return Err(mcp_error("code index not available — run `update` first")),
+    };
+    let symbol = facade
+        .db()
+        .symbol_at_position(&params.file, params.line, params.col)
+        .map_err(|e| mcp_error(format!("symbol_at_position: {e}")))?;
+
+    match symbol {
+        Some(s) => Ok(serde_json::json!({
+            "name": s.name.as_ref(),
+            "kind": format!("{:?}", s.kind),
+            "file_path": s.file_path.as_ref(),
+            "line_start": s.range.start_line,
+            "line_end": s.range.end_line,
+            "col_start": s.range.start_column,
+            "col_end": s.range.end_column,
+            "signature": s.signature.as_deref(),
+            "module_path": s.module_path.as_deref(),
+        })
+        .to_string()),
+        None => Ok("null".to_string()),
+    }
+}
+
 /// `code_graph` — call graph queries. Resolves the symbol then dispatches by
 /// direction (calls/callers/impact). Returns the formatted output text.
 pub async fn code_graph_impl(
@@ -2020,6 +2090,24 @@ pub async fn dispatch_call(
             let text = code_graph_impl(&handle, &cp).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "code_graph", tokens, 1, false)
+                .await;
+            Ok(json!({ "text": text, "tokens": tokens }))
+        }
+        "symbols_in_file" => {
+            let sp: SymbolsInFileParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("symbols_in_file: invalid params: {e}")))?;
+            let text = symbols_in_file_impl(&handle, &sp).await?;
+            let tokens = count_tokens(&text);
+            dctx.record_persistent_call(&handle, "symbols_in_file", tokens, 1, false)
+                .await;
+            Ok(json!({ "text": text, "tokens": tokens }))
+        }
+        "symbol_at_position" => {
+            let sp: SymbolAtPositionParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("symbol_at_position: invalid params: {e}")))?;
+            let text = symbol_at_position_impl(&handle, &sp).await?;
+            let tokens = count_tokens(&text);
+            dctx.record_persistent_call(&handle, "symbol_at_position", tokens, 1, false)
                 .await;
             Ok(json!({ "text": text, "tokens": tokens }))
         }

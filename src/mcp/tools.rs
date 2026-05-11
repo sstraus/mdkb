@@ -272,6 +272,35 @@ fn default_session_only() -> bool {
     true
 }
 
+/// Parameters for symbols_in_file: list all symbols in a specific file.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SymbolsInFileParams {
+    /// Relative file path from repo root.
+    pub file: String,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
+/// Parameters for symbol_at_position: find the symbol at a given location.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SymbolAtPositionParams {
+    /// Relative file path from repo root.
+    pub file: String,
+
+    /// 1-based line number.
+    pub line: u32,
+
+    /// 0-based column number (optional).
+    #[serde(default)]
+    pub col: Option<u32>,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
