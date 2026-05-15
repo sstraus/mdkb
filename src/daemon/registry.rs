@@ -328,11 +328,14 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
 }
 
 /// Canonicalize a root path, resolving symlinks and normalizing.
+/// If the path is inside a git worktree, resolves to the main worktree root
+/// so that all worktrees of the same repo share a single `.mdkb/` directory.
 fn canonicalize_root(root: &Path) -> Result<PathBuf> {
-    root.canonicalize().map_err(|e| {
+    let resolved = crate::git::resolve_main_worktree(root);
+    resolved.canonicalize().map_err(|e| {
         Error::other(format!(
             "Failed to resolve repo path {}: {e}",
-            root.display()
+            resolved.display()
         ))
     })
 }
@@ -675,5 +678,73 @@ mod tests {
         // Access with canonicalized path should return same handle
         let canonical = root.canonicalize().unwrap();
         assert!(registry.get(&canonical).is_some());
+    }
+
+    #[test]
+    fn test_registry_worktree_resolves_to_main() {
+        let tmp = TempDir::new().unwrap();
+        let main_root = tmp.path().join("main-repo");
+        let wt_root = tmp.path().join("worktree-fix");
+
+        // Main repo with .mdkb/ (so RepoHandle::open succeeds)
+        std::fs::create_dir_all(main_root.join(".mdkb")).unwrap();
+        std::fs::create_dir_all(main_root.join(".git/worktrees/fix")).unwrap();
+
+        // Worktree with .git file
+        std::fs::create_dir_all(&wt_root).unwrap();
+        std::fs::write(
+            wt_root.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                main_root.join(".git/worktrees/fix").display()
+            ),
+        )
+        .unwrap();
+
+        let config = DaemonConfig::default();
+        let registry = RepoRegistry::new(config);
+
+        // Opening via worktree should resolve to main repo
+        let handle = registry.get_or_open(&wt_root).unwrap();
+        assert_eq!(handle.root, main_root.canonicalize().unwrap());
+
+        // Opening via main root returns the same handle
+        let handle2 = registry.get_or_open(&main_root).unwrap();
+        assert_eq!(Arc::as_ptr(&handle), Arc::as_ptr(&handle2));
+        assert_eq!(registry.active_count(), 1);
+    }
+
+    #[test]
+    fn test_registry_two_worktrees_share_one_handle() {
+        let tmp = TempDir::new().unwrap();
+        let main_root = tmp.path().join("main-repo");
+        let wt_a = tmp.path().join("worktree-a");
+        let wt_b = tmp.path().join("worktree-b");
+
+        std::fs::create_dir_all(main_root.join(".mdkb")).unwrap();
+        std::fs::create_dir_all(main_root.join(".git/worktrees/a")).unwrap();
+        std::fs::create_dir_all(main_root.join(".git/worktrees/b")).unwrap();
+
+        for (wt, name) in [(&wt_a, "a"), (&wt_b, "b")] {
+            std::fs::create_dir_all(wt).unwrap();
+            std::fs::write(
+                wt.join(".git"),
+                format!(
+                    "gitdir: {}\n",
+                    main_root.join(format!(".git/worktrees/{name}")).display()
+                ),
+            )
+            .unwrap();
+        }
+
+        let registry = RepoRegistry::new(DaemonConfig::default());
+
+        let ha = registry.get_or_open(&wt_a).unwrap();
+        let hb = registry.get_or_open(&wt_b).unwrap();
+        let hm = registry.get_or_open(&main_root).unwrap();
+
+        assert_eq!(Arc::as_ptr(&ha), Arc::as_ptr(&hb));
+        assert_eq!(Arc::as_ptr(&hb), Arc::as_ptr(&hm));
+        assert_eq!(registry.active_count(), 1);
     }
 }

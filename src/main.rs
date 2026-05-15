@@ -106,7 +106,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
     tracing::debug!("mdkb starting with verbosity level {}", cli.verbose);
 
-    let cwd = env::current_dir()?;
+    let raw_cwd = env::current_dir()?;
+    let cwd = mdkb::git::resolve_main_worktree(&raw_cwd);
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
 
     match cli.command {
         Command::Init => {

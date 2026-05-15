@@ -14,6 +14,7 @@ pub mod cli;
 pub mod code;
 pub mod config;
 pub mod daemon;
+pub mod git;
 pub mod domain;
 pub mod error;
 pub mod llm;

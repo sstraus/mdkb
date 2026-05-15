@@ -121,13 +121,14 @@ pub async fn call_memory_confirm(id: String, outcome: String, root: Option<PathB
 
 /// Pick the target repo root: explicit flag > current working directory.
 /// Absolute canonical form is preferred (daemon whitelist compares paths).
+/// If the resolved path is a git worktree, follows the gitdir pointer to
+/// the main worktree so all worktrees share a single `.mdkb/` directory.
 fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {
     let raw = explicit
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."));
-    // Canonicalize best-effort; if the path doesn't exist the daemon will
-    // reject it with a clear message we'll print to stderr.
-    raw.canonicalize().unwrap_or(raw)
+    let resolved = crate::git::resolve_main_worktree(&raw);
+    resolved.canonicalize().unwrap_or(resolved)
 }
 
 fn hook_socket_path() -> PathBuf {
