@@ -106,12 +106,30 @@ jobs:
           cat *.sha256 > checksums.txt
           ls -la
 
+      - name: Generate latest.json
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          cat > release/latest.json <<EOF
+          {
+            "version": "${VERSION}",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "assets": {
+              "macos-arm64": "https://github.com/sstraus/mdkb/releases/download/${GITHUB_REF_NAME}/mdkb-macos-arm64",
+              "macos-x64": "https://github.com/sstraus/mdkb/releases/download/${GITHUB_REF_NAME}/mdkb-macos-x64",
+              "linux-x64": "https://github.com/sstraus/mdkb/releases/download/${GITHUB_REF_NAME}/mdkb-linux-x64",
+              "linux-arm64": "https://github.com/sstraus/mdkb/releases/download/${GITHUB_REF_NAME}/mdkb-linux-arm64",
+              "windows-x64": "https://github.com/sstraus/mdkb/releases/download/${GITHUB_REF_NAME}/mdkb-windows-x64.exe"
+            }
+          }
+          EOF
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
             release/mdkb-*
             release/checksums.txt
+            release/latest.json
           generate_release_notes: true
           draft: false
           prerelease: ${{ contains(github.ref, '-rc') || contains(github.ref, '-beta') || contains(github.ref, '-alpha') }}
