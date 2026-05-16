@@ -14,6 +14,10 @@
 //! - `false` — gitignore files are fully ignored. `.mdkbignore` is read instead
 //!   (same syntax as `.gitignore`, with `!pattern` to re-include).
 //!
+//! Hidden files and directories (names starting with `.`) are always skipped
+//! in both modes. The `# mdkb:index` force-include path uses a separate walker
+//! with `hidden(false)` to reach files inside hidden directories.
+//!
 //! Additionally, [`WalkOptions::ignore_patterns`] (glob strings, e.g.
 //! `**/node_modules/**`) are applied as exclusions in both modes.
 
@@ -153,7 +157,7 @@ fn discover_forced_files(
 ///
 /// See [`WalkOptions`] for gitignore vs `.mdkbignore` semantics. The
 /// `ignore_patterns` globs are applied as additional exclusions in both modes.
-/// Hidden files (starting with `.`) are always skipped.
+/// Hidden files and directories (starting with `.`) are always skipped.
 pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let WalkOptions {
         root,
@@ -163,7 +167,7 @@ pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<
 
     let mut builder = WalkBuilder::new(root);
     builder
-        .hidden(false) // enter hidden dirs (let gitignore/mdkbignore handle filtering)
+        .hidden(true)
         .git_ignore(respect_gitignore)
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
@@ -210,16 +214,6 @@ pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<
         .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
         .filter_map(|entry| {
             let path = entry.into_path();
-
-            // Skip hidden files
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with('.'))
-            {
-                return None;
-            }
-
             if !accept(&path) {
                 return None;
             }

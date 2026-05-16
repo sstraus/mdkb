@@ -221,6 +221,14 @@ Tree-sitter parsing for **13 languages**: Rust, Go, TypeScript, JavaScript, Pyth
 - **Semantic code search** — find conceptually similar code using embeddings
 - **Persistent call graph** — function calls, callers, and transitive impact radius survive restarts
 
+Hidden directories (`.git/`, `.vscode/`, etc.) are excluded by default.
+To force-index files inside a hidden directory, annotate your `.gitignore`:
+
+```gitignore
+# mdkb:index
+.generated/**/*.rs
+```
+
 Generate semantic embeddings (downloads ~30MB ONNX model on first run):
 
 ```bash

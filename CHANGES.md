@@ -15,6 +15,12 @@
 - **Watcher receives `respect_gitignore` config** — the file watcher now
   creates its `PipelineConfig` with the correct `respect_gitignore` setting
   from `code.indexing.respect_gitignore`, instead of relying on the default.
+- **Hidden directories excluded from code index** — directories starting with
+  `.` (`.git/`, `.vscode/`, `.idea/`, etc.) are now skipped by the file walker.
+  Previously `hidden(false)` let the walker enter hidden directories, relying
+  on `.gitignore` to filter them — which failed when `respect_gitignore` was
+  false. Use `# mdkb:index` in `.gitignore` to force-include files inside
+  hidden directories.
 
 ## 3.1.0 (2026-05-01)
 
