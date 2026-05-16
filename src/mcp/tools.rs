@@ -283,6 +283,29 @@ pub struct SymbolsInFileParams {
     pub root: Option<String>,
 }
 
+/// Parameters for code_find: exact symbol name lookup with optional filters.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct CodeFindParams {
+    /// Exact symbol name to search for.
+    pub name: String,
+
+    /// Filter by symbol kind (e.g. "Function", "Struct", "Constant").
+    #[serde(default)]
+    pub kind: Option<String>,
+
+    /// Filter results to files matching this substring.
+    #[serde(default)]
+    pub file: Option<String>,
+
+    /// Max results to return (default 50).
+    #[serde(default)]
+    pub limit: Option<u32>,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
+}
+
 /// Parameters for symbol_at_position: find the symbol at a given location.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct SymbolAtPositionParams {

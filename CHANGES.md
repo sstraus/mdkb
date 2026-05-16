@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Watcher bootstraps code index on startup** — in daemon/global mode, the
+  file watcher now runs a full `index_directory` when `code.sqlite` is empty
+  (file_count == 0). Previously, repos opened via the daemon had 0 symbols
+  until a file change triggered the incremental watcher. Mirrors the standalone
+  startup task behavior.
+- **Standalone startup respects `code.enabled`** — the background code reindex
+  task now checks `code.enabled` before indexing. Previously it always ran,
+  ignoring the config flag that the CLI `init` path honored.
+- **Watcher receives `respect_gitignore` config** — the file watcher now
+  creates its `PipelineConfig` with the correct `respect_gitignore` setting
+  from `code.indexing.respect_gitignore`, instead of relying on the default.
+
 ## 3.1.0 (2026-05-01)
 
 ### Added

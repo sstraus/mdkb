@@ -82,7 +82,8 @@ async fn two_clients_single_reindex() {
             watcher_code,
             true, // needed to watch root recursively
             vec![],
-            500, // 500ms batch idle for fast test flush
+            true, // respect_gitignore
+            500,  // 500ms batch idle for fast test flush
             Some(ready_clone),
             None,
         )
@@ -170,7 +171,8 @@ async fn injected_path_triggers_code_reindex() {
             watcher_code,
             true,
             vec![],
-            200, // fast flush for test
+            true, // respect_gitignore
+            200,  // fast flush for test
             Some(ready_clone),
             Some(rx),
         )

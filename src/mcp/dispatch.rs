@@ -40,8 +40,8 @@ use super::server::{
     resolve_document, truncate_text,
 };
 use super::tools::{
-    CodeGraphParams, GetParams, MemoryWriteBatchEntry, SearchParams, SymbolAtPositionParams,
-    SymbolsInFileParams, UsageParams,
+    CodeFindParams, CodeGraphParams, GetParams, MemoryWriteBatchEntry, SearchParams,
+    SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
 };
 
 /// Daemon-global state shared across all dispatched tool calls.
@@ -1408,6 +1408,26 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
     Ok(format!("{doc_output}{code_output}{session_output}"))
 }
 
+fn symbol_to_json(s: &crate::code::symbol::Symbol) -> serde_json::Value {
+    serde_json::json!({
+        "name": s.name.as_ref(),
+        "kind": s.kind.to_string(),
+        "file_path": s.file_path.as_ref(),
+        "line_start": s.range.start_line,
+        "line_end": s.range.end_line,
+        "col_start": s.range.start_column,
+        "col_end": s.range.end_column,
+        "signature": s.signature.as_deref(),
+        "scope_context": s.scope_context.as_ref().map(|sc| format!("{sc:?}")),
+    })
+}
+
+fn symbols_to_json_string(symbols: &[crate::code::symbol::Symbol]) -> Result<String, McpError> {
+    let json_symbols: Vec<serde_json::Value> = symbols.iter().map(symbol_to_json).collect();
+    serde_json::to_string(&json_symbols)
+        .map_err(|e| mcp_error(format!("failed to serialize symbols: {e}")))
+}
+
 /// `symbols_in_file` — list all symbols in a file, ordered by position.
 pub async fn symbols_in_file_impl(
     handle: &RepoHandle,
@@ -1423,24 +1443,37 @@ pub async fn symbols_in_file_impl(
         .symbols_in_file_ordered(&params.file)
         .map_err(|e| mcp_error(format!("symbols_in_file: {e}")))?;
 
-    let json_symbols: Vec<serde_json::Value> = symbols
-        .iter()
-        .map(|s| {
-            serde_json::json!({
-                "name": s.name.as_ref(),
-                "kind": format!("{:?}", s.kind),
-                "file_path": s.file_path.as_ref(),
-                "line_start": s.range.start_line,
-                "line_end": s.range.end_line,
-                "col_start": s.range.start_column,
-                "col_end": s.range.end_column,
-                "signature": s.signature.as_deref(),
-                "scope_context": s.scope_context.as_ref().map(|sc| format!("{sc:?}")),
-            })
-        })
-        .collect();
+    symbols_to_json_string(&symbols)
+}
 
-    Ok(serde_json::to_string(&json_symbols).unwrap_or_else(|_| "[]".to_string()))
+/// `code_find` — exact symbol lookup by name with optional filters.
+pub async fn code_find_impl(
+    handle: &RepoHandle,
+    params: &CodeFindParams,
+) -> Result<String, McpError> {
+    let idx_guard = acquire_handle_code_index(handle).await?;
+    let facade = match idx_guard.as_ref() {
+        Some(f) => f,
+        None => return Err(mcp_error("code index not available — run `update` first")),
+    };
+
+    let mut results = facade.find_symbols_by_name(&params.name);
+
+    if let Some(kind_str) = &params.kind {
+        let kind: crate::code::types::SymbolKind = kind_str
+            .parse()
+            .map_err(|_| mcp_error(format!("unknown symbol kind: {kind_str}")))?;
+        results.retain(|s| s.kind == kind);
+    }
+
+    if let Some(file_substr) = &params.file {
+        results.retain(|s| s.file_path.as_ref().contains(file_substr.as_str()));
+    }
+
+    let limit = params.limit.unwrap_or(50) as usize;
+    results.truncate(limit);
+
+    symbols_to_json_string(&results)
 }
 
 /// `symbol_at_position` — find the innermost symbol at a given file position.
@@ -2108,6 +2141,15 @@ pub async fn dispatch_call(
             let text = symbol_at_position_impl(&handle, &sp).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "symbol_at_position", tokens, 1, false)
+                .await;
+            Ok(json!({ "text": text, "tokens": tokens }))
+        }
+        "code_find" => {
+            let cp: CodeFindParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("code_find: invalid params: {e}")))?;
+            let text = code_find_impl(&handle, &cp).await?;
+            let tokens = count_tokens(&text);
+            dctx.record_persistent_call(&handle, "code_find", tokens, 1, false)
                 .await;
             Ok(json!({ "text": text, "tokens": tokens }))
         }

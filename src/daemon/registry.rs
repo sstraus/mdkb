@@ -301,6 +301,7 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
     let code_index = Arc::clone(&handle.code_index);
     let code_enabled = handle.config.code.enabled;
     let code_ignore_patterns = handle.code_ignore_patterns.clone();
+    let respect_gitignore = handle.config.code.indexing.respect_gitignore;
     // Take the receiver exactly once; subsequent calls (same handle) yield None.
     let reindex_rx = handle
         .reindex_rx
@@ -314,6 +315,7 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
             code_index,
             code_enabled,
             code_ignore_patterns,
+            respect_gitignore,
             reindex_rx,
         )
         .await

@@ -995,6 +995,10 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 .store(false, Ordering::Relaxed);
 
             // Run code reindex (incremental if index already exists).
+            // Respects code.enabled — skip entirely when the user disabled code intelligence.
+            if !startup_server.full_config.code.enabled {
+                return;
+            }
             // Take the facade out of the lock to avoid blocking tool calls
             // during the (potentially slow) reindex + embedding generation.
             let taken_facade = match startup_server.acquire_code_index().await {
@@ -1162,6 +1166,7 @@ pub async fn run_file_watcher(
     code_index: Arc<Mutex<Option<IndexFacade>>>,
     code_enabled: bool,
     code_ignore_patterns: Vec<String>,
+    respect_gitignore: bool,
     reindex_rx: Option<tokio::sync::mpsc::Receiver<PathBuf>>,
 ) -> crate::error::Result<()> {
     run_file_watcher_inner(
@@ -1170,6 +1175,7 @@ pub async fn run_file_watcher(
         code_index,
         code_enabled,
         code_ignore_patterns,
+        respect_gitignore,
         CODE_BATCH_IDLE_MS,
         None,
         reindex_rx,
@@ -1184,6 +1190,7 @@ pub async fn run_file_watcher_inner(
     code_index: Arc<Mutex<Option<IndexFacade>>>,
     code_enabled: bool,
     code_ignore_patterns: Vec<String>,
+    respect_gitignore: bool,
     batch_idle_ms: u64,
     ready: Option<Arc<tokio::sync::Notify>>,
     mut reindex_rx: Option<tokio::sync::mpsc::Receiver<PathBuf>>,
@@ -1240,6 +1247,54 @@ pub async fn run_file_watcher_inner(
                     coll.name,
                     abs_path.display()
                 );
+            }
+        }
+    }
+
+    // Bootstrap code index if empty (mirrors standalone startup task behavior).
+    // Runs once before entering the event loop — holds the lock briefly to avoid
+    // racing with acquire_code_index(), then releases before the (slow) reindex.
+    if code_enabled {
+        let needs_bootstrap = {
+            let idx_guard = code_index.lock().await;
+            match idx_guard.as_ref() {
+                Some(f) => f.file_count() == 0,
+                None => true,
+            }
+        };
+        if needs_bootstrap {
+            let mut idx_guard = code_index.lock().await;
+            if idx_guard.is_none() {
+                let index_path = root.join(".mdkb/code.sqlite");
+                match IndexFacade::open_or_create(&index_path) {
+                    Ok(facade) => {
+                        let pipeline_config = crate::code::indexing::pipeline::PipelineConfig {
+                            ignore_patterns: code_ignore_patterns.clone(),
+                            respect_gitignore,
+                            ..Default::default()
+                        };
+                        *idx_guard = Some(facade.with_config(pipeline_config));
+                    }
+                    Err(e) => {
+                        tracing::error!("Watcher bootstrap: failed to open code index: {e}");
+                    }
+                }
+            }
+            if let Some(facade) = idx_guard.as_mut() {
+                if facade.file_count() == 0 {
+                    match facade.index_directory(&root) {
+                        Ok(stats) if stats.symbols_indexed > 0 || stats.files_indexed > 0 => {
+                            tracing::info!(
+                                "Watcher startup: indexed {} files, {} symbols",
+                                stats.files_indexed,
+                                stats.symbols_indexed,
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("Watcher startup reindex failed: {e}"),
+                    }
+                    crate::llm::release_cached_service();
+                }
             }
         }
     }
