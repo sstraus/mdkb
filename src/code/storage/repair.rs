@@ -80,12 +80,9 @@ pub fn run_repairs(conn: &Connection) -> RepairReport {
     // Dedup first — may create orphans that subsequent checks clean up.
     report.duplicate_rel_path_files = repair_duplicate_rel_paths(conn);
 
-    report.null_kind_relationships = exec_count(
-        conn,
-        "DELETE FROM code_relationships WHERE kind IS NULL",
-    );
-    report.null_kind_symbols =
-        exec_count(conn, "DELETE FROM code_symbols WHERE kind IS NULL");
+    report.null_kind_relationships =
+        exec_count(conn, "DELETE FROM code_relationships WHERE kind IS NULL");
+    report.null_kind_symbols = exec_count(conn, "DELETE FROM code_symbols WHERE kind IS NULL");
 
     report.orphaned_symbols = exec_count(
         conn,
@@ -235,7 +232,10 @@ mod tests {
         .unwrap();
 
         let report = run_repairs(&conn);
-        assert_eq!(report.duplicate_rel_path_files, 1, "one duplicate file removed");
+        assert_eq!(
+            report.duplicate_rel_path_files, 1,
+            "one duplicate file removed"
+        );
 
         let file_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM code_files", [], |r| r.get(0))
@@ -253,7 +253,10 @@ mod tests {
         assert_eq!(kept_id, 2, "higher id (most recent) should be kept");
 
         // Old file's symbols cleaned up by orphan repair (no CASCADE in legacy schema)
-        assert_eq!(report.orphaned_symbols, 1, "orphan repair catches old file symbols");
+        assert_eq!(
+            report.orphaned_symbols, 1,
+            "orphan repair catches old file symbols"
+        );
     }
 
     #[test]

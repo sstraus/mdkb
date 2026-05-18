@@ -708,7 +708,12 @@ mod tests {
             "sum of counts_by_type must equal active_count"
         );
         assert_eq!(
-            report.memory.counts_by_type.get("prior").copied().unwrap_or(0),
+            report
+                .memory
+                .counts_by_type
+                .get("prior")
+                .copied()
+                .unwrap_or(0),
             0,
             "priors excluded from counts_by_type"
         );

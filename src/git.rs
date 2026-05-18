@@ -120,7 +120,10 @@ mod tests {
         std::fs::create_dir_all(&wt_root).unwrap();
         std::fs::write(
             wt_root.join(".git"),
-            format!("gitdir: {}\n", main_root.join(".git/worktrees/release").display()),
+            format!(
+                "gitdir: {}\n",
+                main_root.join(".git/worktrees/release").display()
+            ),
         )
         .unwrap();
 
@@ -172,11 +175,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         // gitdir points to a valid path but not <main>/.git/worktrees/<name>
-        std::fs::write(
-            root.join(".git"),
-            "gitdir: /some/bare-repo.git\n",
-        )
-        .unwrap();
+        std::fs::write(root.join(".git"), "gitdir: /some/bare-repo.git\n").unwrap();
 
         let resolved = resolve_main_worktree(root);
         assert_eq!(resolved, root.to_path_buf());

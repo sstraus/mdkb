@@ -794,7 +794,10 @@ pub async fn search_impl(
 
                 if symbols.is_empty() {
                     let total = facade.symbol_count();
-                    return Ok((format!("0 matches ({total} symbols indexed). Try a shorter name."), 0));
+                    return Ok((
+                        format!("0 matches ({total} symbols indexed). Try a shorter name."),
+                        0,
+                    ));
                 }
                 let rel_paths: Vec<String> = symbols
                     .iter()
@@ -1909,10 +1912,7 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
         for entry in &results {
             let snippet_raw = entry.content.trim().replace('\n', " ");
             let snippet: String = snippet_raw.chars().take(160).collect();
-            body.push_str(&format!(
-                "- [{}] {} — {}\n",
-                entry.id, entry.title, snippet
-            ));
+            body.push_str(&format!("- [{}] {} — {}\n", entry.id, entry.title, snippet));
         }
         body.push_str("\nIf your work corroborates any entry above, use `memory_confirm(id, outcome=\"confirmed\")` instead of writing a new one.\n");
     }

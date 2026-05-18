@@ -1557,9 +1557,54 @@ mod tests {
     fn test_symbols_in_file_ordered() {
         let (_dir, db) = temp_db();
         let fid = insert_test_file(&db);
-        db.insert_symbol("beta", "Function", fid, "test.rs", 20, None, Some(30), None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("alpha", "Function", fid, "test.rs", 5, None, Some(15), None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("gamma", "Struct", fid, "test.rs", 35, None, Some(50), None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "beta",
+            "Function",
+            fid,
+            "test.rs",
+            20,
+            None,
+            Some(30),
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "alpha",
+            "Function",
+            fid,
+            "test.rs",
+            5,
+            None,
+            Some(15),
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "gamma",
+            "Struct",
+            fid,
+            "test.rs",
+            35,
+            None,
+            Some(50),
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let syms = db.symbols_in_file_ordered("test.rs").unwrap();
         assert_eq!(syms.len(), 3);
@@ -1579,8 +1624,38 @@ mod tests {
     fn test_symbol_at_position_innermost() {
         let (_dir, db) = temp_db();
         let fid = insert_test_file(&db);
-        db.insert_symbol("outer", "Function", fid, "test.rs", 1, None, Some(50), None, 0, None, None, None, None).unwrap();
-        db.insert_symbol("inner", "Function", fid, "test.rs", 10, None, Some(20), None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "outer",
+            "Function",
+            fid,
+            "test.rs",
+            1,
+            None,
+            Some(50),
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        db.insert_symbol(
+            "inner",
+            "Function",
+            fid,
+            "test.rs",
+            10,
+            None,
+            Some(20),
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let sym = db.symbol_at_position("test.rs", 15, None).unwrap();
         assert!(sym.is_some());
@@ -1591,7 +1666,22 @@ mod tests {
     fn test_symbol_at_position_no_match() {
         let (_dir, db) = temp_db();
         let fid = insert_test_file(&db);
-        db.insert_symbol("func", "Function", fid, "test.rs", 10, None, Some(20), None, 0, None, None, None, None).unwrap();
+        db.insert_symbol(
+            "func",
+            "Function",
+            fid,
+            "test.rs",
+            10,
+            None,
+            Some(20),
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
         let sym = db.symbol_at_position("test.rs", 5, None).unwrap();
         assert!(sym.is_none());
