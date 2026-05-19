@@ -561,7 +561,7 @@ impl McpServer {
 
     /// Search documents using hybrid search (BM25 + semantic with RRF fusion).
     #[tool(
-        description = "Search docs+memory (default), code symbols (scope=\"symbols\"), or semantic code (scope=\"code\")."
+        description = "Semantic search (fuzzy, not literal). Searches docs+memory (default), code symbols (scope=\"symbols\"), or semantic code (scope=\"code\"). For exact string/regex matching, use Grep instead."
     )]
     pub async fn search(
         &self,
@@ -1431,6 +1431,8 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
 const BASE_INSTRUCTIONS: &str = "\
 # mdkb — Project Knowledge Base
 
+mdkb is a **semantic** search engine (fuzzy, concept-based). It does NOT do literal string or regex matching. For exact strings, substrings, or regex patterns in source files, use Grep — not mdkb.
+
 ## Code Search
 
 | Need | Flow | Calls |
@@ -1441,6 +1443,7 @@ const BASE_INSTRUCTIONS: &str = "\
 | List symbols in a file | `search(\"*\", scope=\"symbols\", file=\"path\")` | 1 |
 | Semantic code query | `search(query, scope=\"code\")` | 1 |
 | Architecture/decisions | `search(query)` → `get(id)` | 2 |
+| Literal string in code | **Use Grep, not mdkb** | — |
 
 ## Memory
 
@@ -1574,15 +1577,14 @@ const OOD_SCORE_THRESHOLD: f64 = 0.3;
 pub(super) fn ood_hint(result_count: usize, top_score: Option<f64>) -> Option<&'static str> {
     if result_count == 0 {
         return Some(
-            "\n> No relevant knowledge found. \
-             This query appears outside the scope of indexed content — \
-             consider broadening terms or using Grep as fallback.",
+            "\n> No results. mdkb is semantic search — it won't match literal strings. \
+             Use Grep for exact string/regex matching in source files.",
         );
     }
     if top_score.is_some_and(|s| s < OOD_SCORE_THRESHOLD) {
         return Some(
-            "\n> Low-confidence results — top match score is below threshold. \
-             Indexed knowledge may not cover this topic well.",
+            "\n> Low-confidence results. If searching for a literal string or pattern, \
+             use Grep instead — mdkb only does semantic/fuzzy matching.",
         );
     }
     None
@@ -1759,7 +1761,7 @@ mod tests {
     fn test_ood_hint_zero_results() {
         let hint = ood_hint(0, None);
         assert!(hint.is_some());
-        assert!(hint.unwrap().contains("No relevant knowledge found"));
+        assert!(hint.unwrap().contains("No results"));
     }
 
     #[test]
@@ -2401,8 +2403,8 @@ mod tests {
 
         let text = extract_text(&result);
         assert!(
-            text.contains("No relevant knowledge found"),
-            "Should indicate no relevant knowledge (OOD), got: {}",
+            text.contains("No results"),
+            "Should indicate no results with Grep hint (OOD), got: {}",
             text
         );
     }
