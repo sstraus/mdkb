@@ -85,7 +85,7 @@ pub fn handle_setup_mcp_claude(
         println!();
         println!("  Name:    mdkb");
         println!("  Binary:  {}", binary_path);
-        println!("  Args:    serve");
+        println!("  Args:    mcp");
         println!("  Scope:   {}", scope);
         println!();
 

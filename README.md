@@ -121,14 +121,15 @@ Add to your Claude Code MCP config (`.claude/mcp.json` or `~/.claude/mcp.json`):
     "mdkb": {
       "type": "stdio",
       "command": "/path/to/mdkb",
-      "args": ["serve"],
-      "cwd": "/path/to/your/project"
+      "args": ["mcp"]
     }
   }
 }
 ```
 
-The `cwd` must point to a directory with `.mdkb/` initialized.
+The `mcp` subcommand connects to the daemon via unix socket (auto-spawning it
+if needed). Each Claude Code session runs a lightweight proxy instead of a
+full in-process server, sharing one daemon for file watching and indexing.
 
 ## MCP Tools (11)
 
