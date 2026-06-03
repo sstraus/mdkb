@@ -659,6 +659,22 @@ fn update_all_collections(
     Ok(())
 }
 
+/// Compile a collection's glob pattern with POSIX-correct separator handling.
+///
+/// globset defaults to letting `*` cross `/`, so a non-recursive pattern like
+/// `*.md` (the `_root` convention) would recursively swallow the whole tree and
+/// duplicate every other collection's documents. `literal_separator(true)` stops
+/// `*`/`?` from crossing `/` while `**` stays recursive — so `docs/**/*.md` is
+/// unaffected and `*.md` matches only top-level files.
+fn compile_collection_matcher(
+    pattern: &str,
+) -> std::result::Result<globset::GlobMatcher, globset::Error> {
+    Ok(globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher())
+}
+
 /// Update a single collection by scanning for file changes.
 fn update_collection(
     ctx: &Context,
@@ -700,15 +716,13 @@ fn update_collection(
         }
     }
 
-    // Build glob matcher
-    let glob = Glob::new(&collection.pattern)
-        .map_err(|e| {
-            Error::other(format!(
-                "Invalid glob pattern '{}': {}",
-                collection.pattern, e
-            ))
-        })?
-        .compile_matcher();
+    // Build glob matcher (POSIX separator semantics — see compile_collection_matcher)
+    let glob = compile_collection_matcher(&collection.pattern).map_err(|e| {
+        Error::other(format!(
+            "Invalid glob pattern '{}': {}",
+            collection.pattern, e
+        ))
+    })?;
 
     // Get existing documents for this collection — prefetch to avoid N+1 queries
     let existing_docs = documents::list_documents(&ctx.conn, &collection.name)?;
@@ -911,9 +925,9 @@ pub fn handle_update_files(
     let matchers: Vec<(&Collection, globset::GlobMatcher, PathBuf)> = collections
         .iter()
         .filter(|c| c.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
-        .filter_map(|coll| match Glob::new(&coll.pattern) {
-            Ok(g) => match root.join(&coll.path).canonicalize() {
-                Ok(canonical_base) => Some((coll, g.compile_matcher(), canonical_base)),
+        .filter_map(|coll| match compile_collection_matcher(&coll.pattern) {
+            Ok(matcher) => match root.join(&coll.path).canonicalize() {
+                Ok(canonical_base) => Some((coll, matcher, canonical_base)),
                 Err(e) => {
                     tracing::warn!(
                         collection = %coll.name,
@@ -3353,6 +3367,74 @@ mod tests {
         let results = handle_mget(&ctx, "*.md", None).expect("mget should succeed");
         assert_eq!(results.len(), 1);
         assert!(results[0].1.contains("Hello World"));
+    }
+
+    #[test]
+    fn root_collection_glob_is_non_recursive() {
+        // The `_root` convention collection uses pattern "*.md" with the explicit
+        // intent (conventions.rs) of matching ONLY root-level markdown. globset's
+        // default lets `*` cross `/`, which made "*.md" swallow the whole repo and
+        // duplicate every other collection's docs. Indexing must treat `*` as
+        // non-separator-crossing.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::write(temp.path().join("README.md"), "# Root").unwrap();
+        let docs_dir = temp.path().join("docs");
+        std::fs::create_dir(&docs_dir).unwrap();
+        std::fs::write(docs_dir.join("guide.md"), "# Nested").unwrap();
+
+        handle_collection_add(&ctx, "_root", ".", "*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        let paths: Vec<String> = documents::list_documents(&ctx.conn, "_root")
+            .unwrap()
+            .into_iter()
+            .map(|d| d.relative_path)
+            .collect();
+
+        assert!(
+            paths.iter().any(|p| p == "README.md"),
+            "root-level README.md must be indexed in _root: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains('/')),
+            "_root '*.md' must be non-recursive — nested files leaked: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_glob_still_matches_nested() {
+        // Regression guard: making `*` non-recursive must NOT break `**`, which is
+        // the explicit recursive token used by docs/stories/plans/reviews.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let docs_dir = temp.path().join("docs");
+        let sub = docs_dir.join("api");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(docs_dir.join("readme.md"), "# R").unwrap();
+        std::fs::write(sub.join("endpoints.md"), "# E").unwrap();
+
+        handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        let paths: Vec<String> = documents::list_documents(&ctx.conn, "docs")
+            .unwrap()
+            .into_iter()
+            .map(|d| d.relative_path)
+            .collect();
+
+        assert!(
+            paths.iter().any(|p| p == "readme.md"),
+            "root-level doc must stay indexed: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p.contains("api")),
+            "nested doc must stay indexed under '**': {paths:?}"
+        );
     }
 
     // ==================== Evolution Frontmatter Tests ====================
