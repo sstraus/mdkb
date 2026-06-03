@@ -45,7 +45,7 @@ impl CodeDb {
         }
         let conn = Connection::open(&path)?;
         schema::init_schema(&conn)?;
-        let _ = maintenance::run_startup_vacuum_if_needed(&conn);
+        let _ = maintenance::ensure_incremental_autovacuum(&conn);
         Ok(Self { conn, path })
     }
 
@@ -54,7 +54,7 @@ impl CodeDb {
         let path = path.as_ref().to_path_buf();
         let conn = Connection::open(&path)?;
         schema::init_schema(&conn)?;
-        let _ = maintenance::run_startup_vacuum_if_needed(&conn);
+        let _ = maintenance::ensure_incremental_autovacuum(&conn);
         Ok(Self { conn, path })
     }
 

@@ -1,16 +1,17 @@
-//! Integration test: startup VACUUM + runtime PRAGMA optimize.
+//! Integration test: incremental auto_vacuum conversion + runtime upkeep.
 //!
-//! VACUUM acquires an exclusive lock, so it MUST NOT run on the hot path.
-//! Safe pattern: VACUUM once at first-ever open (marker via PRAGMA user_version);
-//! PRAGMA optimize (non-locking) gated on a call-count drift counter at runtime.
+//! The one-shot conversion VACUUMs (exclusive lock) so it runs only at first
+//! open, gated by a `PRAGMA user_version` marker. `PRAGMA optimize` (non-locking)
+//! and `incremental_vacuum` (cheap reclaim) are gated on a call-count drift
+//! counter at runtime.
 
 use mdkb::cli::handlers::{Context, handle_init};
 use mdkb::store::maintenance::{
-    VACUUM_DONE_FLAG, run_optimize, run_startup_vacuum_if_needed, should_optimize,
+    AUTOVAC_DONE_FLAG, ensure_incremental_autovacuum, run_optimize, should_optimize,
 };
 
 #[test]
-fn startup_vacuum_runs_once_and_sets_marker() {
+fn incremental_autovacuum_runs_once_and_sets_marker() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().to_path_buf();
     handle_init(&root).expect("init mdkb");
@@ -22,11 +23,17 @@ fn startup_vacuum_runs_once_and_sets_marker() {
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .expect("read user_version");
     assert!(
-        version & VACUUM_DONE_FLAG != 0,
-        "startup vacuum marker must be set after first open, got user_version={version}"
+        version & AUTOVAC_DONE_FLAG != 0,
+        "conversion marker must be set after first open, got user_version={version}"
     );
 
-    let ran = run_startup_vacuum_if_needed(&ctx.conn).expect("second call");
+    let mode: i64 = ctx
+        .conn
+        .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
+        .expect("read auto_vacuum");
+    assert_eq!(mode, 2, "database must be in INCREMENTAL auto_vacuum mode");
+
+    let ran = ensure_incremental_autovacuum(&ctx.conn).expect("second call");
     assert!(!ran, "second call must be a no-op (marker already set)");
 }
 

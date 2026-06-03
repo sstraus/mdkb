@@ -103,7 +103,7 @@ impl Context {
         // exist even on databases created by older versions.
         schema::init_schema(&conn)?;
         vectors::init_vector_schema(&conn)?;
-        maintenance::run_startup_vacuum_if_needed(&conn)?;
+        maintenance::ensure_incremental_autovacuum(&conn)?;
 
         Ok(Self {
             conn,
@@ -142,7 +142,7 @@ impl Context {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         schema::init_schema(&conn)?;
         vectors::init_vector_schema(&conn)?;
-        maintenance::run_startup_vacuum_if_needed(&conn)?;
+        maintenance::ensure_incremental_autovacuum(&conn)?;
 
         Ok(Self {
             conn,
