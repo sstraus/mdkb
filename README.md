@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/sstraus/mdkb/main/assets/mdkb.png" alt="mdkb logo" width="420">
+</p>
+
 # mdkb
 
 **Local memory, search, and code intelligence — integrated with Claude Code and Codex via CLI, lifecycle hooks, and MCP.**
