@@ -104,8 +104,11 @@ mod tests {
             .unwrap();
         let payload = "x".repeat(2000);
         for i in 0..rows {
-            conn.execute("INSERT INTO t (id, blob) VALUES (?1, ?2)", (i as i64, &payload))
-                .unwrap();
+            conn.execute(
+                "INSERT INTO t (id, blob) VALUES (?1, ?2)",
+                (i as i64, &payload),
+            )
+            .unwrap();
         }
         conn.execute_batch("DELETE FROM t;").unwrap();
         conn
@@ -124,7 +127,9 @@ mod tests {
             .unwrap();
         assert_eq!(mode, 2, "auto_vacuum must be INCREMENTAL (2)");
 
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert!(version & AUTOVAC_DONE_FLAG != 0, "marker must be set");
 
         let ran_again = ensure_incremental_autovacuum(&conn).expect("second call");
