@@ -25,6 +25,28 @@
   memory guidance, and reminder protocol. Fewer always-injected tokens per
   session.
 
+## 3.2.0 (2026-06-03)
+
+### Added
+
+- **Automatic incremental `auto_vacuum` reclaim** — the maintenance pass now
+  runs incremental `auto_vacuum` so `index.sqlite` releases freed pages instead
+  of growing unbounded after deletes/reindexes.
+- **Git worktrees share the main repo's `.mdkb/`** — secondary worktrees no
+  longer get an isolated database; memory and index written in one worktree are
+  visible from the others.
+- **`symbols_in_file` and `symbol_at_position` MCP tools** — list the symbols
+  defined in a file, or resolve the symbol at a `line:col` position.
+
+### Changed
+
+- **MCP registration routes through the daemon proxy** — `mdkb setup` now
+  registers the server via the daemon proxy command instead of a direct binary
+  invocation.
+- **Instructions clarify mdkb is semantic search, not literal matching** — the
+  server instructions and tool text state that exact strings, substrings, and
+  regex belong to Grep, not mdkb.
+
 ### Fixed
 
 - **Watcher bootstraps code index on startup** — in daemon/global mode, the
@@ -44,6 +66,11 @@
   on `.gitignore` to filter them — which failed when `respect_gitignore` was
   false. Use `# mdkb:index` in `.gitignore` to force-include files inside
   hidden directories.
+- **`_root` collection no longer recursively duplicates docs** — indexing the
+  repo root stopped re-adding the same documents on each pass.
+- **Duplicate `rel_path` entries prevented in the code index** — plus
+  previously-silent repair failures are now surfaced.
+- **Race between `ensure_context` and the `doc_reindex_active` flag eliminated.**
 
 ## 3.1.0 (2026-05-01)
 
