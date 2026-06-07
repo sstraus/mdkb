@@ -288,7 +288,7 @@ pub const HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
         "post-tool-use",
         Some("Edit|Write|NotebookEdit|MultiEdit"),
     ),
-    ("PreToolUse", "pre-tool-use", Some("Grep")),
+    ("PreToolUse", "pre-tool-use", Some("Grep|Bash")),
 ];
 
 /// Single-quote shell escaping: wraps `s` in single quotes, escaping any

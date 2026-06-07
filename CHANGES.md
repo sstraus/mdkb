@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+## 3.3.0 (2026-06-07)
+
+### Added
+
+- **PreToolUse redirects Bash `grep`/`rg` to mdkb** — the hook now intercepts
+  `Bash` commands, not just the rarely-used `Grep` tool. Agents search code
+  through `Bash` far more than the `Grep` tool, so this is where the redirect
+  actually reaches them. The shell command is parsed quote-aware; only the
+  source stage of a pipeline is considered (a `… | grep x` stdout filter is
+  left alone), and bare `grep PATTERN` (stdin), single-file greps, and
+  regex/alternation patterns are left to grep. `sh|bash|zsh -lc "…"` wrappers
+  (used by Codex) are unwrapped first.
+- **Redirect conversion telemetry** — a new `mdkb_invocation` hook outcome
+  records when a `Bash` command actually runs mdkb. `mdkb stats` shows a `Conv`
+  column per hook event so the PreToolUse redirect's hit rate is measurable.
+
+### Changed
+
+- **Slimmed MCP server instructions** — dropped the code-search syntax table
+  that duplicated the tool JSON Schema. Kept the semantic-vs-literal routing,
+  memory guidance, and reminder protocol. Fewer always-injected tokens per
+  session.
+
 ### Fixed
 
 - **Watcher bootstraps code index on startup** — in daemon/global mode, the

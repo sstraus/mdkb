@@ -21,8 +21,9 @@ use crate::cli::handlers::{
     Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update,
 };
 use crate::cli::hook_logic::{
-    REINDEX_TOOLS, build_recall_query, canonicalize_under_cwd, classify_definition_search,
-    classify_grep_pattern, prompt_is_wrapup, tool_input_path,
+    REINDEX_TOOLS, build_recall_query, canonicalize_under_cwd, classify_bash_search,
+    classify_definition_search, classify_grep_pattern, is_mdkb_invocation, prompt_is_wrapup,
+    tool_input_path,
 };
 use crate::code::indexing::IndexFacade;
 use crate::daemon::registry::RepoHandle;
@@ -1978,26 +1979,41 @@ pub fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
         Some(t) => t,
         None => return json!({}),
     };
-    if tool_name != "Grep" {
-        return json!({});
-    }
     let tool_input = match event.get("tool_input") {
         Some(v) => v,
         None => return json!({}),
     };
-    let pattern = match tool_input.get("pattern").and_then(|v| v.as_str()) {
-        Some(p) => p,
-        None => return json!({}),
-    };
-    let path = tool_input.get("path").and_then(|v| v.as_str());
     let bin = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "mdkb".to_string());
 
-    let suggestion = classify_definition_search(pattern, &bin)
-        .or_else(|| classify_grep_pattern(pattern, path, &bin));
+    // Grep tool calls arrive with a clean pattern; Bash calls carry a raw shell
+    // command we parse for a `grep`/`rg` filesystem search. Both feed the same
+    // redirection classifiers. Claude searches code via Bash far more than the
+    // Grep tool, so matching Bash is where the redirect actually reaches it.
+    let suggestion = match tool_name {
+        "Grep" => {
+            let Some(pattern) = tool_input.get("pattern").and_then(|v| v.as_str()) else {
+                return json!({});
+            };
+            let path = tool_input.get("path").and_then(|v| v.as_str());
+            classify_definition_search(pattern, &bin)
+                .or_else(|| classify_grep_pattern(pattern, path, &bin))
+        }
+        "Bash" => {
+            let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
+                return json!({});
+            };
+            classify_bash_search(command, &bin)
+        }
+        _ => return json!({}),
+    };
 
+    // DEFERRED (2026-06-07) — inject actual symbol hits (file:line) inline
+    // instead of a suggestion ("act, not suggest"). Gated on conversion data
+    // from the `mdkb_invocation` telemetry: only worth the code-index lookup on
+    // this hot-path hook if the plain suggestion proves not to convert.
     match suggestion {
         Some(text) => json!({
             "hookSpecificOutput": {
@@ -2225,10 +2241,22 @@ pub async fn dispatch_call(
             let t0 = std::time::Instant::now();
             let result = hook_pre_tool_use_impl(&handle, &params);
             let ms = t0.elapsed().as_millis() as u64;
-            let outcome = if result == json!({}) {
-                "skipped"
-            } else {
+            // "mdkb_invocation" is the conversion signal: a Bash command that
+            // actually runs mdkb. Tracking it against "fired" measures whether
+            // the redirect suggestions land. (A fire produces a non-empty result;
+            // an mdkb call produces none, so the checks don't overlap.)
+            let outcome = if result != json!({}) {
                 "fired"
+            } else if params.get("tool_name").and_then(|v| v.as_str()) == Some("Bash")
+                && params
+                    .get("tool_input")
+                    .and_then(|t| t.get("command"))
+                    .and_then(|v| v.as_str())
+                    .is_some_and(is_mdkb_invocation)
+            {
+                "mdkb_invocation"
+            } else {
+                "skipped"
             };
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;

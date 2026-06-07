@@ -1437,29 +1437,23 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
 const BASE_INSTRUCTIONS: &str = "\
 # mdkb — Project Knowledge Base
 
-mdkb is a **semantic** search engine (fuzzy, concept-based). It does NOT do literal string or regex matching. For exact strings, substrings, or regex patterns in source files, use Grep — not mdkb.
+mdkb is a **semantic** search engine (fuzzy, concept-based). It does NOT match literal strings or regex — for those use Grep, not mdkb.
 
-## Code Search
+## Code
 
-| Need | Flow | Calls |
-|---|---|---|
-| Who calls/is called by X? | `code_graph(name)` — fuzzy name resolution built-in | 1 |
-| Map impact radius | `code_graph(name, direction=\"impact\")` | 1 |
-| Find function by name | `search(query, scope=\"symbols\")` | 1 |
-| List symbols in a file | `search(\"*\", scope=\"symbols\", file=\"path\")` | 1 |
-| Semantic code query | `search(query, scope=\"code\")` | 1 |
-| Architecture/decisions | `search(query)` → `get(id)` | 2 |
-| Literal string in code | **Use Grep, not mdkb** | — |
+- `code_graph(name)` — callers, callees, or impact radius in one call (`direction=\"callers\"|\"callees\"|\"impact\"`). Replaces multi-file Grep for \"who calls X\".
+- `search(query, scope=\"symbols\")` — find a symbol by name. `scope=\"code\"` — semantic code query.
+- Architecture/decisions: `search(query)` → `get(id)`.
+- Literal string or regex → Grep.
 
 ## Memory
 
 - `search(query, scope=\"memory\")` — check before writing duplicates.
 - `memory_write` / `memory_write_batch` — persist after solving problems.
-- `memory_confirm(id, outcome=\"confirmed\"|\"refuted\")` — Bayesian signal: +/-1 (floor 0). Use instead of memory_write when only adjusting belief.
+- `memory_confirm(id, outcome=\"confirmed\"|\"refuted\")` — adjust belief (+/-1, floor 0) instead of rewriting.
 - `memory_delete` — remove stale entries.
-- `usage` — audit token economy.
 
-`search` returns IDs → `get(id)` for full content. Multi-repo: pass `root` to target a repo. `root=\"*\"` for cross-repo.
+`search` returns IDs → `get(id)` for full content. Multi-repo: pass `root` (`\"*\"` for cross-repo).
 
 ### Reminders
 

@@ -137,6 +137,9 @@ pub struct HookEventStats {
     pub event: String,
     pub invocations: usize,
     pub fired: usize,
+    /// Count of `mdkb_invocation` outcomes: Bash calls that actually ran mdkb.
+    /// For `pre_tool_use`, `converted` vs `fired` is the redirect's hit rate.
+    pub converted: usize,
     pub avg_ms: u64,
     pub p95_ms: u64,
 }
@@ -459,7 +462,8 @@ fn collect_hook_event_stats(mdkb_dir: &Path, since_ts: i64) -> Vec<HookEventStat
         return Vec::new();
     };
 
-    let mut buckets: HashMap<String, Vec<(bool, u64)>> = HashMap::new();
+    // Per entry: (fired, converted, elapsed_ms).
+    let mut buckets: HashMap<String, Vec<(bool, bool, u64)>> = HashMap::new();
 
     for line in content.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -479,18 +483,20 @@ fn collect_hook_event_stats(mdkb_dir: &Path, since_ts: i64) -> Vec<HookEventStat
             .and_then(|o| o.as_str())
             .unwrap_or("skipped");
         let elapsed = v.get("elapsed_ms").and_then(|e| e.as_u64()).unwrap_or(0);
-        buckets
-            .entry(event)
-            .or_default()
-            .push((outcome == "fired", elapsed));
+        buckets.entry(event).or_default().push((
+            outcome == "fired",
+            outcome == "mdkb_invocation",
+            elapsed,
+        ));
     }
 
     let mut stats: Vec<HookEventStats> = buckets
         .into_iter()
         .map(|(event, entries)| {
             let invocations = entries.len();
-            let fired = entries.iter().filter(|(f, _)| *f).count();
-            let mut latencies: Vec<u64> = entries.iter().map(|(_, ms)| *ms).collect();
+            let fired = entries.iter().filter(|(f, _, _)| *f).count();
+            let converted = entries.iter().filter(|(_, c, _)| *c).count();
+            let mut latencies: Vec<u64> = entries.iter().map(|(_, _, ms)| *ms).collect();
             latencies.sort_unstable();
             let avg_ms = if invocations > 0 {
                 latencies.iter().sum::<u64>() / invocations as u64
@@ -506,6 +512,7 @@ fn collect_hook_event_stats(mdkb_dir: &Path, since_ts: i64) -> Vec<HookEventStat
                 event,
                 invocations,
                 fired,
+                converted,
                 avg_ms,
                 p95_ms,
             }
@@ -861,6 +868,11 @@ mod tests {
                 r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":10,"ts":{}}}"#,
                 now
             ),
+            // Conversion signal: Claude actually ran mdkb after a redirect.
+            format!(
+                r#"{{"event":"PreToolUse","outcome":"mdkb_invocation","elapsed_ms":1,"ts":{}}}"#,
+                now
+            ),
             format!(
                 r#"{{"event":"PostToolUse","outcome":"fired","elapsed_ms":3,"ts":{}}}"#,
                 now
@@ -882,10 +894,11 @@ mod tests {
             .iter()
             .find(|e| e.event == "PreToolUse")
             .unwrap();
-        assert_eq!(pre.invocations, 3);
+        assert_eq!(pre.invocations, 4); // 2 fired + 1 skipped + 1 mdkb_invocation
         assert_eq!(pre.fired, 2);
-        assert_eq!(pre.avg_ms, 5); // (5+2+10)/3 = 5
-        assert_eq!(pre.p95_ms, 10); // sorted: [2,5,10], idx ceil(3*0.95)-1 = 2 → 10
+        assert_eq!(pre.converted, 1); // the mdkb_invocation
+        assert_eq!(pre.avg_ms, 4); // (5+2+10+1)/4 = 4
+        assert_eq!(pre.p95_ms, 10); // sorted: [1,2,5,10], idx ceil(4*0.95)-1 = 3 → 10
 
         let post = report
             .hooks

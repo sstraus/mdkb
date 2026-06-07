@@ -104,7 +104,7 @@ Output (when matches are found):
 
 ### PreToolUse
 
-Input:
+Input (either the `Grep` tool or a `Bash` command):
 
 ```json
 {
@@ -113,14 +113,29 @@ Input:
 }
 ```
 
-Only `Grep` is intercepted (via the `matcher` field in settings).
-The handler classifies the grep pattern:
+```json
+{
+  "tool_name": "Bash",
+  "tool_input": { "command": "grep -rn handleAuth src/" }
+}
+```
+
+Both `Grep` and `Bash` are intercepted (via the `matcher` field in
+settings). Agents search code through `Bash` (`grep`/`rg`) far more than
+the `Grep` tool, so matching `Bash` is where the redirect actually
+reaches them. For `Bash`, the handler parses the command (quote-aware)
+and only considers the *source* stage of a pipeline — `… | grep x`
+filters stdout and is left alone, since mdkb cannot replace it. A bare
+`grep PATTERN` with no `-r` and no path reads stdin and is likewise
+skipped.
+
+The extracted pattern is then classified:
 
 - **Pure identifier** (e.g. `handleAuth`) → suggests `mdkb search --scope symbols`
 - **Definition search** (e.g. `func handleAuth`, `fn handle_auth`) →
   suggests `mdkb code callers`
 - **Callsite pattern** (e.g. `handleAuth(`) → suggests `mdkb code callers`
-- **Other patterns** → no suggestion (returns `{}`)
+- **Other patterns** (regex, alternation, single-file) → no suggestion (returns `{}`)
 
 Output (when a suggestion applies):
 

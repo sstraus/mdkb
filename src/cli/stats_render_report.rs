@@ -220,8 +220,8 @@ fn render_hooks(out: &mut String, h: &HooksSummary) {
     let mut body = format!("  slow events (7d)  {:>4}", h.slow_events_7d);
 
     if !h.events.is_empty() {
-        body.push_str("\n\n  Event              Calls  Fired  Hit%   Avg    P95");
-        body.push_str("\n  ─────────────────  ─────  ─────  ────  ─────  ─────");
+        body.push_str("\n\n  Event              Calls  Fired   Conv  Hit%   Avg    P95");
+        body.push_str("\n  ─────────────────  ─────  ─────  ─────  ────  ─────  ─────");
         for e in &h.events {
             let hit_pct = if e.invocations > 0 {
                 (e.fired as f64 / e.invocations as f64 * 100.0) as u64
@@ -230,8 +230,8 @@ fn render_hooks(out: &mut String, h: &HooksSummary) {
             };
             let _ = write!(
                 body,
-                "\n  {:<17}  {:>5}  {:>5}  {:>3}%  {:>4}ms {:>4}ms",
-                e.event, e.invocations, e.fired, hit_pct, e.avg_ms, e.p95_ms
+                "\n  {:<17}  {:>5}  {:>5}  {:>5}  {:>3}%  {:>4}ms {:>4}ms",
+                e.event, e.invocations, e.fired, e.converted, hit_pct, e.avg_ms, e.p95_ms
             );
         }
     }
