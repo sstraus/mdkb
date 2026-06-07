@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+
+- **CLI memory-write upserts instead of failing** — `mdkb memory add` (and the
+  bridge `memory-write` path) now updates an existing entry in place — saving a
+  revision — rather than crashing with `UNIQUE constraint failed:
+  memory_entries.id`. Matches the MCP `memory_write` behavior.
+- **`setup hooks` replaces legacy untagged entries** — re-running hook setup
+  removes prior `mdkb hook <event>` entries that predate the `_managedBy: mdkb`
+  tag, instead of leaving a duplicate that fires mdkb twice.
+- **`setup mcp claude` heals stale registrations** — it now removes an existing
+  registration at the target scope before adding, so a legacy `mdkb serve`
+  command is replaced by the `mdkb mcp` proxy instead of being reported as
+  "already registered" and left untouched.
+
 ## 3.3.0 (2026-06-07)
 
 ### Added

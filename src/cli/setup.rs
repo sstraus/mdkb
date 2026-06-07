@@ -140,6 +140,16 @@ pub fn handle_setup_mcp_claude(
     // - For 'user' scope: runs from wherever Claude Code is started
     let scope_arg = if global { "user" } else { "local" };
 
+    // Remove any existing registration at this scope first. `claude mcp add`
+    // reports "already exists" and refuses to overwrite, so a stale entry (e.g.
+    // a legacy `mdkb serve` command from before the daemon-proxy switch) would
+    // never be replaced by the current `mdkb mcp` proxy. Best-effort: ignore
+    // failures (most commonly "no such server"), then add the fresh entry.
+    let _ = Command::new("claude")
+        .args(["mcp", "remove", "--scope", scope_arg, "mdkb"])
+        .current_dir(&server_cwd)
+        .output();
+
     let output = Command::new("claude")
         .args([
             "mcp",
@@ -532,11 +542,26 @@ fn upsert_hook_entries(
             *entry_list = serde_json::json!([]);
             entry_list.as_array_mut().unwrap()
         };
+        // Drop any prior mdkb entry for this event so re-running setup replaces
+        // rather than duplicates. Two cases: our own `_managedBy: "mdkb"` tag,
+        // and legacy untagged installs (pre-tag) whose command still invokes
+        // `mdkb hook <event>`. rtk's `hook claude` and other hooks don't match.
+        let event_marker = format!("hook {cli_event}");
         arr.retain(|item| {
-            item.get("_managedBy")
-                .and_then(|v| v.as_str())
-                .map(|s| s != "mdkb")
-                .unwrap_or(true)
+            if item.get("_managedBy").and_then(|v| v.as_str()) == Some("mdkb") {
+                return false;
+            }
+            let is_legacy_mdkb =
+                item.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|c| c.contains(&event_marker))
+                        })
+                    });
+            !is_legacy_mdkb
         });
         arr.push(mdkb_entry);
         registered.push((*event_name).to_string());
@@ -1108,6 +1133,53 @@ mod tests {
             std::env::remove_var("MDKB_BINARY_OVERRIDE");
         }
         assert_eq!(result.unwrap(), "/fake/mdkb");
+    }
+
+    #[test]
+    fn test_upsert_replaces_legacy_untagged_mdkb_hook() {
+        // A pre-`_managedBy` install left an untagged `mdkb hook pre-tool-use`
+        // entry. Re-running setup must replace it (not duplicate), while leaving
+        // unrelated hooks (e.g. rtk) untouched.
+        use std::collections::HashSet;
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Grep", "hooks": [{"type": "command", "command": "mdkb hook pre-tool-use"}]},
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}
+                ]
+            }
+        });
+        upsert_hook_entries(&mut settings, "/usr/bin/mdkb", &HashSet::new(), false);
+
+        let pre = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        let managed = pre
+            .iter()
+            .filter(|e| e.get("_managedBy").and_then(|v| v.as_str()) == Some("mdkb"))
+            .count();
+        assert_eq!(managed, 1, "exactly one managed mdkb PreToolUse entry");
+
+        let legacy_remains = pre.iter().any(|e| {
+            e.get("_managedBy").is_none()
+                && e["hooks"].as_array().is_some_and(|h| {
+                    h.iter().any(|x| {
+                        x["command"]
+                            .as_str()
+                            .is_some_and(|c| c.contains("hook pre-tool-use"))
+                    })
+                })
+        });
+        assert!(
+            !legacy_remains,
+            "legacy untagged mdkb entry must be removed"
+        );
+
+        let rtk_preserved = pre.iter().any(|e| {
+            e["hooks"].as_array().is_some_and(|h| {
+                h.iter()
+                    .any(|x| x["command"].as_str() == Some("rtk hook claude"))
+            })
+        });
+        assert!(rtk_preserved, "unrelated rtk hook must be preserved");
     }
 
     #[test]

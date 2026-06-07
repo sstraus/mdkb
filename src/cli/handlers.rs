@@ -1302,10 +1302,37 @@ pub fn handle_memory_add(
         due_at,
     };
 
-    memory::add_entry(&ctx.conn, &entry)?;
+    // Upsert: update in place when the id already exists, else insert. Mirrors
+    // the MCP `memory_write` path so the CLI/bridge does not fail with a UNIQUE
+    // constraint violation when re-writing an existing entry.
+    let persisted = if let Some(mut existing) = memory::get_entry_without_tracking(&ctx.conn, id)? {
+        if let Err(e) = memory::save_revision(
+            &ctx.conn,
+            id,
+            &existing.content,
+            content,
+            existing.source_type,
+        ) {
+            tracing::warn!("Failed to save revision for {id}: {e}");
+        }
+        existing.title = entry.title;
+        existing.content = entry.content;
+        existing.entry_type = entry.entry_type;
+        existing.tags = entry.tags;
+        existing.expires_at = entry.expires_at;
+        if due_in.is_some() {
+            existing.due_at = entry.due_at;
+        }
+        existing.updated_at = now;
+        memory::update_entry(&ctx.conn, &existing)?;
+        existing
+    } else {
+        memory::add_entry(&ctx.conn, &entry)?;
+        entry
+    };
 
     // Save to disk and regenerate index
-    if let Err(e) = save_entry_to_disk(ctx, &entry) {
+    if let Err(e) = save_entry_to_disk(ctx, &persisted) {
         tracing::warn!("Failed to save entry to disk: {e}");
     }
     if let Err(e) = generate_memory_index(ctx) {
@@ -2457,6 +2484,54 @@ mod tests {
         let index = index.unwrap();
         assert_eq!(index.entries.len(), 1);
         assert!(index.entries[0].contains("test-entry"));
+    }
+
+    #[test]
+    fn test_memory_add_existing_id_upserts() {
+        // Writing the same id twice must update in place, not fail with a
+        // UNIQUE constraint violation (the CLI/bridge memory-write path).
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        handle_memory_add(
+            &ctx,
+            "dup-id",
+            "First",
+            "topic",
+            None,
+            "original content",
+            None,
+            None,
+            None,
+        )
+        .expect("first write should succeed");
+
+        // Second write with the same id — must not error.
+        handle_memory_add(
+            &ctx,
+            "dup-id",
+            "Second",
+            "decision",
+            Some("a,b"),
+            "updated content",
+            None,
+            None,
+            None,
+        )
+        .expect("re-writing an existing id must upsert, not fail");
+
+        // Still a single entry, with the updated fields.
+        let entry = handle_memory_show(&ctx, "dup-id")
+            .expect("show should succeed")
+            .expect("entry should exist");
+        assert_eq!(entry.title, "Second");
+        assert_eq!(entry.content, "updated content");
+        let count: i64 = ctx
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_entries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "upsert must not create a duplicate row");
     }
 
     #[test]
