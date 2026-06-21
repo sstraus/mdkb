@@ -135,13 +135,14 @@ The `mcp` subcommand connects to the daemon via unix socket (auto-spawning it
 if needed). Each Claude Code session runs a lightweight proxy instead of a
 full in-process server, sharing one daemon for file watching and indexing.
 
-## MCP Tools (11)
+## MCP Tools (12)
 
 | Tool | Description |
 |------|-------------|
 | `search` | Hybrid search across docs+memory (default), or scoped to `docs`, `memory`, `code`, `symbols`. `scope="memory"` accepts `min_confidence` to filter decayed entries |
 | `get` | Retrieve by ID, path, memory slug, glob pattern, or comma-separated list |
 | `code_graph` | Call graph queries: `calls`, `callers`, or `impact` (transitive) |
+| `graph` | Knowledge-graph queries over frontmatter + wikilink edges: `links` (outgoing), `backlinks` (incoming), `neighbors` (adjacent), or `path` (shortest path to `to`) |
 | `status` | Index health, collections, and code index stats |
 | `update` | Differential reindex of all collections and source code |
 | `memory_write` | Create or update a memory entry (supports `ttl`, `due_in` for reminders, near-duplicate rejection) |
@@ -274,6 +275,19 @@ mdkb code search "handler" --kind fn
 mdkb code calls main
 mdkb code callers handle_get
 mdkb code impact init --depth 5
+```
+
+### Knowledge Graph
+
+Typed edges are extracted during indexing from allowlisted frontmatter keys
+(strong) and body `[[wikilinks]]` (soft). Configure via the `[graph]` section.
+
+```bash
+mdkb graph links project.md                 # outgoing edges (owner, themes, links_to, ...)
+mdkb graph links project.md --relation owner # filter by relation
+mdkb graph backlinks alice                   # who points at this entity (works on dangling slugs)
+mdkb graph neighbors project.md --depth 2    # adjacent entities, undirected
+mdkb graph path project.md guide.md          # shortest path between two entities
 ```
 
 ### Memory

@@ -34,6 +34,9 @@ pub struct Config {
     /// Code intelligence configuration.
     pub code: CodeConfig,
 
+    /// Knowledge-graph edge extraction.
+    pub graph: GraphConfig,
+
     /// Claude Code / Codex lifecycle hooks.
     pub hooks: HooksConfig,
 
@@ -177,6 +180,22 @@ pub struct ConventionsConfig {
     pub enabled: bool,
 }
 
+/// Knowledge-graph edge extraction settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GraphConfig {
+    /// Enable knowledge-graph edge extraction during indexing.
+    pub enabled: bool,
+
+    /// Frontmatter keys treated as typed edges (allowlist). Evolution's own keys
+    /// (supersedes/updates/corrects/retracts/extends) are owned by the evolution
+    /// subsystem and should not be listed here.
+    pub frontmatter_relations: Vec<String>,
+
+    /// Extract body wikilinks (`[[target]]`) as soft edges.
+    pub include_wikilinks: bool,
+}
+
 /// MCP server settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -291,6 +310,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             conventions: ConventionsConfig::default(),
             code: CodeConfig::default(),
+            graph: GraphConfig::default(),
             hooks: HooksConfig::default(),
             db: DbConfig::default(),
         }
@@ -370,6 +390,19 @@ impl Default for HooksConfig {
 impl Default for ConventionsConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+impl Default for GraphConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            frontmatter_relations: ["owner", "stakeholders", "themes", "related"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            include_wikilinks: true,
+        }
     }
 }
 
@@ -923,6 +956,49 @@ default_limit = 0
         assert!(toml_str.contains("[memory]"));
         assert!(toml_str.contains("[models]"));
         assert!(toml_str.contains("[code]"));
+        assert!(toml_str.contains("[graph]"));
+    }
+
+    // ==================== Graph Config Tests ====================
+
+    #[test]
+    fn test_graph_config_defaults() {
+        let config = Config::default();
+        assert!(config.graph.enabled);
+        assert!(config.graph.include_wikilinks);
+        assert!(
+            config
+                .graph
+                .frontmatter_relations
+                .contains(&"owner".to_string()),
+            "default allowlist should include 'owner'"
+        );
+        // Evolution's reserved keys must not leak into the graph allowlist.
+        assert!(
+            !config
+                .graph
+                .frontmatter_relations
+                .contains(&"supersedes".to_string()),
+            "evolution keys must not be in the graph allowlist"
+        );
+    }
+
+    #[test]
+    fn test_graph_config_serialization_roundtrip() {
+        let config = Config::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        assert!(toml_str.contains("[graph]"));
+
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.graph.enabled, config.graph.enabled);
+        assert_eq!(
+            parsed.graph.include_wikilinks,
+            config.graph.include_wikilinks
+        );
+        assert_eq!(
+            parsed.graph.frontmatter_relations,
+            config.graph.frontmatter_relations
+        );
     }
 
     // ==================== Code Config Tests ====================

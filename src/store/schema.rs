@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 10;
+pub const SCHEMA_VERSION: i32 = 11;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -168,6 +168,24 @@ CREATE TABLE IF NOT EXISTS evolution (
 
 CREATE INDEX IF NOT EXISTS idx_evolution_source ON evolution(source_doc_id);
 CREATE INDEX IF NOT EXISTS idx_evolution_target ON evolution(target_doc_id);
+
+-- Knowledge-graph edges: typed relations from a document to an entity slug/path.
+-- source is always an indexed document; target_ref is free text that may resolve
+-- to a document at query time, or stay dangling until its target is indexed.
+CREATE TABLE IF NOT EXISTS edges (
+    id INTEGER PRIMARY KEY,
+    source_doc_id INTEGER NOT NULL,      -- The document the edge originates from
+    target_ref TEXT NOT NULL,            -- Raw slug/path of the target entity
+    relation TEXT NOT NULL,              -- Frontmatter key, or "links_to" for wikilinks
+    source_kind TEXT NOT NULL,           -- 'frontmatter' (strong) | 'wikilink' (soft)
+    scope TEXT,                          -- NULL = full doc, or section path
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(source_doc_id) REFERENCES documents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_doc_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_ref);
+CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
 "#;
 
 /// SQL for setting BM25 column weights (title 10x, body 1x).
@@ -409,6 +427,10 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
             conn.execute_batch("ALTER TABLE memory_entries ADD COLUMN due_at INTEGER;")?;
         }
     }
+
+    // Migration from v10 to v11: knowledge-graph edges table.
+    // Table + indexes are created by SCHEMA_SQL with IF NOT EXISTS (runs on every
+    // open), so existing databases pick it up here without an explicit DDL step.
 
     // Update schema version
     conn.execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION])?;
@@ -1002,6 +1024,95 @@ mod tests {
     }
 
     #[test]
+    fn test_edges_table_exists() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='edges'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(exists, "edges table should exist");
+    }
+
+    #[test]
+    fn test_edges_table_columns() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        // A row referencing a non-existent document must fail the FK, proving the
+        // FK is wired; insert a document first, then a valid edge.
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('docs', './docs', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('h1', '# A', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+             VALUES ('docs', 'a.md', 'h1', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let doc_id = conn.last_insert_rowid();
+
+        conn.execute(
+            "INSERT INTO edges (source_doc_id, target_ref, relation, source_kind, scope, created_at)
+             VALUES (?1, 'alice', 'owner', 'frontmatter', NULL, 1)",
+            [doc_id],
+        )
+        .expect("inserting a valid edge should work");
+
+        let (target_ref, relation, source_kind): (String, String, String) = conn
+            .query_row(
+                "SELECT target_ref, relation, source_kind FROM edges WHERE source_doc_id = ?1",
+                [doc_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(target_ref, "alice");
+        assert_eq!(relation, "owner");
+        assert_eq!(source_kind, "frontmatter");
+    }
+
+    #[test]
+    fn test_edges_indexes_exist() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_edges_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(
+            indexes.iter().any(|i| i.contains("source")),
+            "should have idx_edges_source index"
+        );
+        assert!(
+            indexes.iter().any(|i| i.contains("target")),
+            "should have idx_edges_target index"
+        );
+        assert!(
+            indexes.iter().any(|i| i.contains("relation")),
+            "should have idx_edges_relation index"
+        );
+    }
+
+    #[test]
     fn test_documents_has_status_columns() {
         let conn = setup_db();
         init_schema(&conn).expect("init_schema failed");
@@ -1577,5 +1688,65 @@ mod tests {
             due_at.is_none(),
             "existing entries should have NULL due_at after migration"
         );
+    }
+
+    #[test]
+    fn test_migrate_v10_to_v11_creates_edges() {
+        // Simulate a v10 database: fully initialised, then drop edges and roll the
+        // recorded version back to 10. Re-running init_schema must recreate the
+        // edges table (via SCHEMA_SQL IF NOT EXISTS) and bump the version to 11.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).expect("initial init_schema failed");
+
+        // Insert a document so we can prove pre-existing data survives the upgrade.
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('docs', './docs', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('h1', '# A', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+             VALUES ('docs', 'a.md', 'h1', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute_batch("DROP TABLE edges; UPDATE schema_version SET version = 10;")
+            .unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(10));
+
+        let has_edges: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='edges'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(!has_edges, "simulated v10 db should not have edges table");
+
+        // Real upgrade path: init_schema runs SCHEMA_SQL (recreates edges), then migrates.
+        init_schema(&conn).expect("v10→v11 init_schema failed");
+
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+        let has_edges: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='edges'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_edges, "edges table should exist after v10→v11 upgrade");
+
+        // Pre-existing document survives the upgrade.
+        let doc_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(doc_count, 1, "documents must survive the v10→v11 upgrade");
     }
 }

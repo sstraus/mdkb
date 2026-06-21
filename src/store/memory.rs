@@ -75,6 +75,11 @@ pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &st
             .into());
         }
     }
+    if content.contains('\0') {
+        return Err(
+            ErrorKind::InvalidQuery("Content must not contain null bytes".to_string()).into(),
+        );
+    }
     if content.len() > MAX_CONTENT_SIZE {
         return Err(
             ErrorKind::InvalidQuery(format!("Content exceeds {MAX_CONTENT_SIZE} bytes")).into(),
@@ -2625,6 +2630,12 @@ mod tests {
         let big = "x".repeat(MAX_CONTENT_SIZE + 1);
         let err = validate_entry_input("ok-id", "Title", &[], &big).unwrap_err();
         assert!(err.to_string().contains("Content exceeds"), "{err}");
+    }
+
+    #[test]
+    fn test_validate_entry_content_rejects_null_byte() {
+        let err = validate_entry_input("ok-id", "Title", &[], "before\0after").unwrap_err();
+        assert!(err.to_string().contains("null byte"), "{err}");
     }
 
     // ==================== Hybrid Search Tests ====================

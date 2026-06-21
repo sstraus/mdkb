@@ -41,7 +41,7 @@ use super::server::{
     resolve_document, truncate_text,
 };
 use super::tools::{
-    CodeFindParams, CodeGraphParams, GetParams, MemoryWriteBatchEntry, SearchParams,
+    CodeFindParams, CodeGraphParams, GetParams, GraphParams, MemoryWriteBatchEntry, SearchParams,
     SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
 };
 
@@ -215,7 +215,11 @@ pub async fn status_impl(handle: &RepoHandle) -> Result<String, McpError> {
 
 /// `memory_delete` — delete a memory entry by id. Returns the human-readable
 /// result string; callers wrap it for the transport.
-pub async fn memory_delete_impl(handle: &RepoHandle, id: &str) -> Result<String, McpError> {
+pub async fn memory_delete_impl(
+    handle: &RepoHandle,
+    id: &str,
+    dry_run: bool,
+) -> Result<String, McpError> {
     memory::validate_entry_id(id).map_err(|e| mcp_error(e.to_string()))?;
     ensure_handle_context(handle).await?;
 
@@ -223,6 +227,17 @@ pub async fn memory_delete_impl(handle: &RepoHandle, id: &str) -> Result<String,
     let ctx = ctx_guard
         .as_ref()
         .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+    if dry_run {
+        let exists = memory::get_entry_without_tracking(&ctx.conn, id)
+            .map_err(|e| mcp_error(format!("Failed to check existing entry: {e}")))?
+            .is_some();
+        return Ok(if exists {
+            format!("dry-run: would delete memory entry '{id}'")
+        } else {
+            format!("dry-run: memory entry '{id}' not found")
+        });
+    }
 
     let deleted = memory::delete_entry(&ctx.conn, id)
         .map_err(|e| mcp_error(format!("Failed to delete memory entry: {e}")))?;
@@ -307,6 +322,7 @@ fn write_single_memory(
     due_in: Option<u64>,
     embedding: Option<Vec<f32>>,
     source_path: Option<&str>,
+    dry_run: bool,
 ) -> Result<String, McpError> {
     memory::validate_entry_input(id, title, tags, content).map_err(|e| mcp_error(e.to_string()))?;
 
@@ -321,6 +337,15 @@ fn write_single_memory(
 
     let source_type: memory::SourceType =
         source_type_str.parse().map_err(|e: String| mcp_error(e))?;
+
+    if dry_run {
+        let action = if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        };
+        return Ok(format!("dry-run: would {action} memory entry '{id}'"));
+    }
 
     let now = chrono::Utc::now().timestamp();
     // Priors default to 30-day TTL if not explicitly specified.
@@ -448,20 +473,26 @@ fn write_single_memory(
 pub async fn memory_write_impl(
     handle: &RepoHandle,
     entry: &MemoryWriteBatchEntry,
+    dry_run: bool,
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
     let (content, source_path) = resolve_source_file(&entry.content, entry.source_file.as_deref())?;
 
-    // Pre-compute embedding outside the lock — ONNX is CPU-bound.
-    let embed_text = format!("{} {}", entry.title, content);
-    let embedding = tokio::task::spawn_blocking(move || {
-        crate::llm::get_cached_service()
-            .ok()
-            .and_then(|svc| svc.embed_query(&embed_text).ok())
-    })
-    .await
-    .unwrap_or(None);
+    // Pre-compute embedding outside the lock — ONNX is CPU-bound. Skipped for
+    // dry-run, which returns before any embedding or write happens.
+    let embedding = if dry_run {
+        None
+    } else {
+        let embed_text = format!("{} {}", entry.title, content);
+        tokio::task::spawn_blocking(move || {
+            crate::llm::get_cached_service()
+                .ok()
+                .and_then(|svc| svc.embed_query(&embed_text).ok())
+        })
+        .await
+        .unwrap_or(None)
+    };
 
     let ctx_guard = handle.ctx.lock().await;
     let ctx = ctx_guard
@@ -480,6 +511,7 @@ pub async fn memory_write_impl(
         entry.due_in,
         embedding,
         source_path.as_deref(),
+        dry_run,
     )
 }
 
@@ -493,6 +525,7 @@ pub async fn memory_write_impl(
 pub async fn memory_write_batch_impl(
     handle: &RepoHandle,
     entries: &[MemoryWriteBatchEntry],
+    dry_run: bool,
 ) -> Result<(String, usize), McpError> {
     if entries.is_empty() {
         return Err(mcp_error("entries array must not be empty"));
@@ -510,12 +543,15 @@ pub async fn memory_write_batch_impl(
         .collect::<Result<_, _>>()?;
 
     // Pre-compute embeddings for all entries outside the lock — ONNX is CPU-bound.
-    let embed_texts: Vec<String> = entries
-        .iter()
-        .zip(resolved.iter())
-        .map(|(e, (content, _))| format!("{} {}", e.title, content))
-        .collect();
-    let embeddings: Vec<Option<Vec<f32>>> =
+    // Skipped for dry-run, which returns before any embedding or write happens.
+    let embeddings: Vec<Option<Vec<f32>>> = if dry_run {
+        vec![None; entries.len()]
+    } else {
+        let embed_texts: Vec<String> = entries
+            .iter()
+            .zip(resolved.iter())
+            .map(|(e, (content, _))| format!("{} {}", e.title, content))
+            .collect();
         tokio::task::spawn_blocking(move || match crate::llm::get_cached_service() {
             Ok(svc) => embed_texts
                 .iter()
@@ -524,7 +560,8 @@ pub async fn memory_write_batch_impl(
             Err(_) => vec![None; embed_texts.len()],
         })
         .await
-        .unwrap_or_else(|_| vec![None; entries.len()]);
+        .unwrap_or_else(|_| vec![None; entries.len()])
+    };
 
     let ctx_guard = handle.ctx.lock().await;
     let ctx = ctx_guard
@@ -549,6 +586,7 @@ pub async fn memory_write_batch_impl(
             entry.due_in,
             embedding,
             source_path.as_deref(),
+            dry_run,
         )?;
         results.push(result);
     }
@@ -1518,6 +1556,88 @@ pub async fn symbol_at_position_impl(
     }
 }
 
+/// Hop limit for `graph` path queries over MCP (the CLI exposes `--max-hops`).
+const GRAPH_MCP_MAX_HOPS: u32 = 6;
+
+/// `graph` — knowledge-graph queries. Dispatches by direction (links/backlinks/
+/// neighbors/path) into the graph store and returns formatted text.
+pub async fn graph_impl(handle: &RepoHandle, params: &GraphParams) -> Result<String, McpError> {
+    use crate::store::graph;
+
+    ensure_handle_context(handle).await?;
+    let ctx_guard = handle.ctx.lock().await;
+    let ctx = ctx_guard
+        .as_ref()
+        .ok_or_else(|| mcp_error("Database not initialized"))?;
+
+    let relation = params.relation.as_deref();
+    let entity = &params.entity;
+
+    let output = match params.direction.as_str() {
+        "links" => {
+            let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
+            let edges = graph::get_outgoing(&ctx.conn, doc.id, relation)
+                .map_err(|e| mcp_error(e.to_string()))?;
+            format_graph_edges(entity, "links", &edges)
+        }
+        "backlinks" => {
+            let edges = graph::get_incoming(&ctx.conn, entity, relation)
+                .map_err(|e| mcp_error(e.to_string()))?;
+            format_graph_edges(entity, "backlinks", &edges)
+        }
+        "neighbors" => {
+            let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
+            let nbrs = graph::neighbors(&ctx.conn, doc.id, relation, params.depth)
+                .map_err(|e| mcp_error(e.to_string()))?;
+            format_graph_neighbors(entity, &nbrs)
+        }
+        "path" => {
+            let to = params
+                .to
+                .as_deref()
+                .ok_or_else(|| mcp_error("direction=path requires 'to'"))?;
+            let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
+            let path = graph::shortest_path(&ctx.conn, doc.id, to, GRAPH_MCP_MAX_HOPS)
+                .map_err(|e| mcp_error(e.to_string()))?;
+            match path {
+                Some(nodes) => format!("{}: {}", entity, nodes.join(" -> ")),
+                None => format!("No path from {entity} to {to}."),
+            }
+        }
+        other => {
+            return Err(mcp_error(format!(
+                "Unknown direction '{other}'. Use links, backlinks, neighbors, or path."
+            )));
+        }
+    };
+    Ok(output)
+}
+
+fn format_graph_edges(entity: &str, label: &str, edges: &[crate::store::graph::Edge]) -> String {
+    if edges.is_empty() {
+        return format!("No {label} for {entity}.");
+    }
+    let mut out = format!("{} {label} for {entity}:\n", edges.len());
+    for e in edges {
+        out.push_str(&format!(
+            "  [{}] --{}--> {} ({})\n",
+            e.source_doc_id, e.relation, e.target_ref, e.source_kind
+        ));
+    }
+    out
+}
+
+fn format_graph_neighbors(entity: &str, neighbors: &[crate::store::graph::Neighbor]) -> String {
+    if neighbors.is_empty() {
+        return format!("No neighbors for {entity}.");
+    }
+    let mut out = format!("{} neighbors of {entity}:\n", neighbors.len());
+    for n in neighbors {
+        out.push_str(&format!("  {} (depth {})\n", n.entity, n.depth));
+    }
+    out
+}
+
 /// `code_graph` — call graph queries. Resolves the symbol then dispatches by
 /// direction (calls/callers/impact). Returns the formatted output text.
 pub async fn code_graph_impl(
@@ -1773,6 +1893,41 @@ fn log_hook_event(
     }
 }
 
+/// Max ancestor stores layered into a read (keeps fan-out bounded; nested
+/// projects rarely sit more than a couple of levels under a parent store).
+const MAX_ANCESTOR_LAYERS: usize = 4;
+
+/// Run `f` against each existing ancestor store's `index.sqlite`, opened
+/// READ-ONLY. Never migrates, never creates, never spawns a watcher — it only
+/// surfaces stores a human/`init` already created above the primary (e.g. a
+/// nested git repo inheriting its parent repo's memory). Per-ancestor errors
+/// are logged and skipped so a missing/old ancestor can never break a read.
+fn for_each_ancestor_conn<F: FnMut(&rusqlite::Connection)>(primary_root: &std::path::Path, mut f: F) {
+    for anc in crate::git::discover_ancestor_stores(primary_root, MAX_ANCESTOR_LAYERS) {
+        let db = anc.join(".mdkb/index.sqlite");
+        if !db.exists() {
+            continue;
+        }
+        match rusqlite::Connection::open_with_flags(
+            &db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) {
+            Ok(conn) => f(&conn),
+            Err(e) => tracing::debug!("layer: skipping ancestor {}: {e}", anc.display()),
+        }
+    }
+}
+
+/// Extract the memory id from a warmup line (`[type] id: title #tags`).
+fn warmup_line_id(line: &str) -> &str {
+    line.split_once("] ")
+        .map(|(_, rest)| rest)
+        .unwrap_or(line)
+        .split_once(':')
+        .map(|(id, _)| id.trim())
+        .unwrap_or(line)
+}
+
 pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
@@ -1787,7 +1942,7 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
         None => return json!({}),
     };
     let limit = cfg.warmup_limit.max(1);
-    let lines = match get_warmup_index(conn, limit) {
+    let mut lines = match get_warmup_index(conn, limit) {
         Ok(l) => l,
         Err(e) => {
             tracing::warn!("hook.session_start: get_warmup_index failed: {e}");
@@ -1795,6 +1950,26 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
         }
     };
     drop(ctx_guard);
+
+    // Layer in ancestor stores (read-only): a nested project inherits its
+    // parent's warmup. Primary entries win on id collision; result is capped.
+    let mut seen: std::collections::HashSet<String> =
+        lines.iter().map(|l| warmup_line_id(l).to_string()).collect();
+    for_each_ancestor_conn(&handle.root, |conn| {
+        if lines.len() >= limit {
+            return;
+        }
+        if let Ok(anc_lines) = get_warmup_index(conn, limit) {
+            for line in anc_lines {
+                if lines.len() >= limit {
+                    break;
+                }
+                if seen.insert(warmup_line_id(&line).to_string()) {
+                    lines.push(line);
+                }
+            }
+        }
+    });
 
     if lines.is_empty() {
         return json!({});
@@ -1884,6 +2059,26 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
             }
         };
         drop(ctx_guard);
+
+        // Layer in ancestor stores (read-only): a nested project also recalls
+        // its parent's memory. Primary entries win on id collision; capped.
+        let mut seen: std::collections::HashSet<String> =
+            results.iter().map(|e| e.id.clone()).collect();
+        for_each_ancestor_conn(&handle.root, |conn| {
+            if results.len() >= limit {
+                return;
+            }
+            if let Ok(anc) = search_entries_fts(conn, q, limit) {
+                for e in anc {
+                    if results.len() >= limit {
+                        break;
+                    }
+                    if seen.insert(e.id.clone()) {
+                        results.push(e);
+                    }
+                }
+            }
+        });
     }
 
     if results.is_empty() && !wants_cg {
@@ -2046,7 +2241,11 @@ pub async fn dispatch_call(
                 .get("id")
                 .and_then(Value::as_str)
                 .ok_or_else(|| mcp_error("memory_delete: missing 'id'"))?;
-            let text = memory_delete_impl(&handle, id).await?;
+            let dry_run = params
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let text = memory_delete_impl(&handle, id, dry_run).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "memory_delete", tokens, 1, false)
                 .await;
@@ -2068,22 +2267,30 @@ pub async fn dispatch_call(
             Ok(json!({ "text": text, "tokens": tokens }))
         }
         "memory_write" => {
+            let dry_run = params
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let entry: MemoryWriteBatchEntry = serde_json::from_value(params)
                 .map_err(|e| mcp_error(format!("memory_write: invalid params: {e}")))?;
-            let text = memory_write_impl(&handle, &entry).await?;
+            let text = memory_write_impl(&handle, &entry, dry_run).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "memory_write", tokens, 1, false)
                 .await;
             Ok(json!({ "text": text, "tokens": tokens }))
         }
         "memory_write_batch" => {
+            let dry_run = params
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let entries_value = params
                 .get("entries")
                 .cloned()
                 .ok_or_else(|| mcp_error("memory_write_batch: missing 'entries'"))?;
             let entries: Vec<MemoryWriteBatchEntry> = serde_json::from_value(entries_value)
                 .map_err(|e| mcp_error(format!("memory_write_batch: invalid 'entries': {e}")))?;
-            let (text, count) = memory_write_batch_impl(&handle, &entries).await?;
+            let (text, count) = memory_write_batch_impl(&handle, &entries, dry_run).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "memory_write_batch", tokens, count, false)
                 .await;
@@ -2145,6 +2352,15 @@ pub async fn dispatch_call(
             let text = code_graph_impl(&handle, &cp).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "code_graph", tokens, 1, false)
+                .await;
+            Ok(json!({ "text": text, "tokens": tokens }))
+        }
+        "graph" => {
+            let gp: GraphParams = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("graph: invalid params: {e}")))?;
+            let text = graph_impl(&handle, &gp).await?;
+            let tokens = count_tokens(&text);
+            dctx.record_persistent_call(&handle, "graph", tokens, 1, false)
                 .await;
             Ok(json!({ "text": text, "tokens": tokens }))
         }
@@ -2375,18 +2591,233 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn warmup_layers_ancestor_store_readonly_without_creating() {
+        let tmp = TempDir::new().unwrap();
+        // Parent store (the ancestor) with its own memory entry.
+        let parent = make_handle(&tmp);
+        seed_memory_entry(&parent, "parent-mem").await;
+
+        // Primary store nested under the parent.
+        let nested_root = tmp.path().join("nested-repo");
+        std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
+        let primary = Arc::new(RepoHandle::from_shared(
+            nested_root.clone(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Config::default(),
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        seed_memory_entry(&primary, "child-mem").await;
+
+        let out = hook_session_start_impl(&primary).await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(body.contains("child-mem"), "primary entry missing: {body}");
+        assert!(
+            body.contains("parent-mem"),
+            "ancestor entry missing — layering broken: {body}"
+        );
+
+        // Guardrail: layered reads must never create a store anywhere.
+        assert!(!nested_root.join("sub/.mdkb").exists());
+    }
+
+    /// Seed a document `project.md` with an `owner -> alice` frontmatter edge.
+    /// Returns the document id.
+    async fn seed_graph_doc(handle: &RepoHandle) -> i64 {
+        ensure_handle_context(handle).await.expect("init ctx");
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let conn = &ctx.conn;
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('docs', './docs', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('h1', '# P', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+             VALUES ('docs', 'project.md', 'h1', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let doc_id = conn.last_insert_rowid();
+        crate::store::graph::add_edge(
+            conn,
+            doc_id,
+            "alice",
+            "owner",
+            crate::store::graph::KIND_FRONTMATTER,
+            None,
+        )
+        .unwrap();
+        doc_id
+    }
+
+    #[tokio::test]
+    async fn graph_impl_links_backlinks_neighbors() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_graph_doc(&handle).await;
+
+        // links: outgoing from the document.
+        let links = graph_impl(
+            &handle,
+            &GraphParams {
+                entity: "project.md".to_string(),
+                root: None,
+                to: None,
+                direction: "links".to_string(),
+                relation: None,
+                depth: 1,
+            },
+        )
+        .await
+        .expect("links");
+        assert!(links.contains("alice"), "links: {links}");
+        assert!(links.contains("owner"), "links: {links}");
+
+        // backlinks: by the raw dangling slug.
+        let backlinks = graph_impl(
+            &handle,
+            &GraphParams {
+                entity: "alice".to_string(),
+                root: None,
+                to: None,
+                direction: "backlinks".to_string(),
+                relation: None,
+                depth: 1,
+            },
+        )
+        .await
+        .expect("backlinks");
+        assert!(
+            backlinks.contains("backlinks for alice"),
+            "backlinks: {backlinks}"
+        );
+
+        // neighbors: alice is one hop from project.md (undirected).
+        let neighbors = graph_impl(
+            &handle,
+            &GraphParams {
+                entity: "project.md".to_string(),
+                root: None,
+                to: None,
+                direction: "neighbors".to_string(),
+                relation: None,
+                depth: 1,
+            },
+        )
+        .await
+        .expect("neighbors");
+        assert!(neighbors.contains("alice"), "neighbors: {neighbors}");
+
+        // path: project.md -> alice (alice is a dangling one-hop target).
+        let path = graph_impl(
+            &handle,
+            &GraphParams {
+                entity: "project.md".to_string(),
+                root: None,
+                to: Some("alice".to_string()),
+                direction: "path".to_string(),
+                relation: None,
+                depth: 1,
+            },
+        )
+        .await
+        .expect("path");
+        assert!(path.contains("project.md"), "path: {path}");
+        assert!(path.contains("alice"), "path: {path}");
+    }
+
+    #[tokio::test]
+    async fn graph_impl_path_requires_to() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_graph_doc(&handle).await;
+
+        let err = graph_impl(
+            &handle,
+            &GraphParams {
+                entity: "project.md".to_string(),
+                root: None,
+                to: None,
+                direction: "path".to_string(),
+                relation: None,
+                depth: 1,
+            },
+        )
+        .await
+        .expect_err("path without 'to' should error");
+        assert!(err.to_string().contains("requires 'to'"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn graph_impl_rejects_unknown_direction() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_graph_doc(&handle).await;
+
+        let err = graph_impl(
+            &handle,
+            &GraphParams {
+                entity: "project.md".to_string(),
+                root: None,
+                to: None,
+                direction: "sideways".to_string(),
+                relation: None,
+                depth: 1,
+            },
+        )
+        .await
+        .expect_err("unknown direction should error");
+        assert!(err.to_string().contains("Unknown direction"), "err: {err}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_call_routes_graph_to_impl() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        seed_graph_doc(&handle).await;
+
+        let result = dispatch_call(
+            "graph",
+            json!({ "entity": "project.md", "direction": "links" }),
+            handle,
+            &dctx,
+        )
+        .await
+        .expect("dispatch graph");
+
+        let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+        assert!(text.contains("alice"), "result: {result}");
+    }
+
+    #[tokio::test]
     async fn memory_delete_impl_rejects_invalid_id() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
 
-        let err = memory_delete_impl(&handle, "UPPER_CASE").await.unwrap_err();
+        let err = memory_delete_impl(&handle, "UPPER_CASE", false)
+            .await
+            .unwrap_err();
         assert!(
             err.message.contains("ID must be"),
             "should reject invalid ID: {}",
             err.message
         );
 
-        let err2 = memory_delete_impl(&handle, "").await.unwrap_err();
+        let err2 = memory_delete_impl(&handle, "", false).await.unwrap_err();
         assert!(err2.message.contains("ID must be"));
     }
 
@@ -2395,7 +2826,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
 
-        let out = memory_delete_impl(&handle, "does-not-exist")
+        let out = memory_delete_impl(&handle, "does-not-exist", false)
             .await
             .expect("delete impl");
 
@@ -2408,14 +2839,14 @@ mod tests {
         let handle = make_handle(&tmp);
         seed_memory_entry(&handle, "to-delete").await;
 
-        let out = memory_delete_impl(&handle, "to-delete")
+        let out = memory_delete_impl(&handle, "to-delete", false)
             .await
             .expect("delete impl");
 
         assert!(out.contains("Deleted memory entry"), "output: {out}");
 
         // Second call must report not found now.
-        let again = memory_delete_impl(&handle, "to-delete")
+        let again = memory_delete_impl(&handle, "to-delete", false)
             .await
             .expect("delete impl second");
         assert!(again.contains("not found"), "second: {again}");
@@ -2559,7 +2990,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
 
-        let created = memory_write_impl(&handle, &entry_input("w-1"))
+        let created = memory_write_impl(&handle, &entry_input("w-1"), false)
             .await
             .expect("write impl");
         assert!(
@@ -2569,7 +3000,7 @@ mod tests {
 
         let mut second = entry_input("w-1");
         second.content = "Updated content body".to_string();
-        let updated = memory_write_impl(&handle, &second)
+        let updated = memory_write_impl(&handle, &second, false)
             .await
             .expect("write impl update");
         assert!(
@@ -2579,11 +3010,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_write_impl_dry_run_does_not_persist() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        let preview = memory_write_impl(&handle, &entry_input("dry-w"), true)
+            .await
+            .expect("dry-run write");
+        assert_eq!(preview, "dry-run: would create memory entry 'dry-w'");
+
+        // A real delete must report the entry was never written.
+        let after = memory_delete_impl(&handle, "dry-w", false)
+            .await
+            .expect("delete impl");
+        assert!(after.contains("not found"), "entry persisted: {after}");
+    }
+
+    #[tokio::test]
+    async fn memory_delete_impl_dry_run_keeps_entry() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "dry-del").await;
+
+        let preview = memory_delete_impl(&handle, "dry-del", true)
+            .await
+            .expect("dry-run delete");
+        assert_eq!(preview, "dry-run: would delete memory entry 'dry-del'");
+
+        // The entry must still be present for a real delete to remove.
+        let real = memory_delete_impl(&handle, "dry-del", false)
+            .await
+            .expect("delete impl");
+        assert!(real.contains("Deleted memory entry"), "entry gone: {real}");
+    }
+
+    #[tokio::test]
     async fn memory_write_batch_impl_rejects_empty() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
 
-        let err = memory_write_batch_impl(&handle, &[])
+        let err = memory_write_batch_impl(&handle, &[], false)
             .await
             .expect_err("must reject");
         assert!(
@@ -2599,7 +3065,7 @@ mod tests {
         let handle = make_handle(&tmp);
         let entries: Vec<_> = (0..21).map(|i| entry_input(&format!("b-{i}"))).collect();
 
-        let err = memory_write_batch_impl(&handle, &entries)
+        let err = memory_write_batch_impl(&handle, &entries, false)
             .await
             .expect_err("must reject");
         assert!(
@@ -2623,7 +3089,7 @@ mod tests {
         c.title = "Frontend build config".to_string();
         c.content = "Vite chunk splitting and tree shaking knobs".to_string();
 
-        let (text, count) = memory_write_batch_impl(&handle, &[a, b, c])
+        let (text, count) = memory_write_batch_impl(&handle, &[a, b, c], false)
             .await
             .expect("batch impl");
 

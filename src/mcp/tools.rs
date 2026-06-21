@@ -109,6 +109,10 @@ pub struct MemoryWriteParams {
     /// Reminder due time in seconds from now. Use with entry_type="reminder". Omit for non-reminders.
     #[serde(default)]
     pub due_in: Option<u64>,
+
+    /// When true, validate and report the action without persisting.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 fn default_entry_type() -> String {
@@ -166,6 +170,10 @@ pub struct MemoryWriteBatchParams {
     /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
+
+    /// When true, validate and report the actions without persisting any entry.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Parameters for the memory_delete tool.
@@ -177,6 +185,10 @@ pub struct MemoryDeleteParams {
     /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
+
+    /// When true, report whether the entry would be deleted without removing it.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 /// Parameters for the memory_confirm tool.
@@ -246,6 +258,42 @@ pub struct CodeGraphParams {
 
 fn default_direction() -> String {
     "calls".to_string()
+}
+
+/// Parameters for graph: knowledge-graph queries with direction.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct GraphParams {
+    /// Entity to query: a document path, numeric ID, or raw slug.
+    pub entity: String,
+
+    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    #[serde(default)]
+    pub root: Option<String>,
+
+    /// Direction: "links" (default, outgoing edges), "backlinks" (incoming edges),
+    /// "neighbors" (adjacent entities, undirected), or "path" (shortest path to `to`).
+    #[serde(default = "default_graph_direction")]
+    pub direction: String,
+
+    /// Target entity, required when direction is "path".
+    #[serde(default)]
+    pub to: Option<String>,
+
+    /// Filter to a single relation type (e.g. "owner", "themes", "links_to").
+    #[serde(default)]
+    pub relation: Option<String>,
+
+    /// Traversal depth when direction is "neighbors" (default: 1).
+    #[serde(default = "default_graph_depth")]
+    pub depth: u32,
+}
+
+fn default_graph_direction() -> String {
+    "links".to_string()
+}
+
+fn default_graph_depth() -> u32 {
+    1
 }
 
 fn default_max_depth() -> usize {

@@ -29,8 +29,8 @@ use crate::store::{collections, documents, memory, stats};
 use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
-    CodeGraphParams, GetParams, MemoryConfirmParams, MemoryDeleteParams, MemoryListParams,
-    MemoryWriteBatchParams, MemoryWriteParams, SearchParams, UsageParams,
+    CodeGraphParams, GetParams, GraphParams, MemoryConfirmParams, MemoryDeleteParams,
+    MemoryListParams, MemoryWriteBatchParams, MemoryWriteParams, SearchParams, UsageParams,
 };
 
 /// Create an MCP error from a message.
@@ -300,6 +300,11 @@ impl McpServer {
             Ok(result) => {
                 for root in &result.roots {
                     if let Some(path) = uri_to_path(&root.uri) {
+                        // Anchor the client-provided root the same way hooks do
+                        // (nearest existing store → git root → launch dir) so
+                        // MCP and hooks converge on one store per project even
+                        // when the client launched in a sub-directory.
+                        let path = crate::git::resolve_project_root(&path, None);
                         match registry.get_or_open(&path) {
                             Ok(_) => {
                                 tracing::info!(
@@ -668,7 +673,7 @@ impl McpServer {
             ttl: params.ttl,
             due_in: params.due_in,
         };
-        let output = super::dispatch::memory_write_impl(&handle, &entry).await?;
+        let output = super::dispatch::memory_write_impl(&handle, &entry, params.dry_run).await?;
 
         let tokens = count_tokens(&output);
         self.record_persistent_call("memory_write", tokens, 1, false)
@@ -688,7 +693,8 @@ impl McpServer {
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
         let (output, count) =
-            super::dispatch::memory_write_batch_impl(&handle, &params.entries).await?;
+            super::dispatch::memory_write_batch_impl(&handle, &params.entries, params.dry_run)
+                .await?;
 
         let tokens = count_tokens(&output);
         self.record_persistent_call("memory_write_batch", tokens, count, false)
@@ -705,7 +711,8 @@ impl McpServer {
         Parameters(params): Parameters<MemoryDeleteParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
-        let output = super::dispatch::memory_delete_impl(&handle, &params.id).await?;
+        let output =
+            super::dispatch::memory_delete_impl(&handle, &params.id, params.dry_run).await?;
 
         let tokens = count_tokens(&output);
         self.record_persistent_call("memory_delete", tokens, 1, false)
@@ -770,6 +777,22 @@ impl McpServer {
         let tokens = count_tokens(&output);
         self.record_persistent_call("code_graph", tokens, 1, false)
             .await;
+
+        Ok(CallToolResult::success(vec![Content::text(output)]))
+    }
+
+    /// Query the knowledge graph: links, backlinks, neighbors, or shortest path.
+    #[tool(
+        description = "Query the knowledge graph (frontmatter + wikilink edges). Directions: links (default, outgoing), backlinks (incoming), neighbors (adjacent), path (shortest path to `to`)."
+    )]
+    async fn graph(
+        &self,
+        Parameters(params): Parameters<GraphParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let handle = self.resolve_handle(params.root.as_deref()).await?;
+        let output = super::dispatch::graph_impl(&handle, &params).await?;
+        let tokens = count_tokens(&output);
+        self.record_persistent_call("graph", tokens, 1, false).await;
 
         Ok(CallToolResult::success(vec![Content::text(output)]))
     }
@@ -2210,6 +2233,7 @@ mod tests {
                 ttl: None,
                 due_in: None,
                 root: None,
+                dry_run: false,
             }))
             .await
             .expect("Failed to write memory entry");
@@ -2220,6 +2244,7 @@ mod tests {
             server.memory_delete(Parameters(MemoryDeleteParams {
                 id: "test-delete-me".to_string(),
                 root: None,
+                dry_run: false,
             })),
         )
         .await;
@@ -2256,6 +2281,7 @@ mod tests {
             .memory_delete(Parameters(MemoryDeleteParams {
                 id: "nonexistent".to_string(),
                 root: None,
+                dry_run: false,
             }))
             .await
             .expect("Should not error");
@@ -2295,6 +2321,7 @@ mod tests {
                 ttl: None,
                 due_in: None,
                 root: None,
+                dry_run: false,
             })),
         )
         .await
@@ -2306,6 +2333,7 @@ mod tests {
             server.memory_delete(Parameters(MemoryDeleteParams {
                 id: "deadlock-test".to_string(),
                 root: None,
+                dry_run: false,
             })),
         )
         .await
@@ -2476,6 +2504,7 @@ mod tests {
             .memory_delete(Parameters(MemoryDeleteParams {
                 id: "nonexistent-entry".to_string(),
                 root: None,
+                dry_run: false,
             }))
             .await
             .expect("memory_delete should not error");
@@ -2532,6 +2561,7 @@ mod tests {
                 ttl: None,
                 due_in: None,
                 root: None,
+                dry_run: false,
             }))
             .await
             .expect("write A");
@@ -2548,6 +2578,7 @@ mod tests {
                 ttl: None,
                 due_in: None,
                 root: None,
+                dry_run: false,
             }))
             .await
             .expect("write B");
@@ -3382,6 +3413,7 @@ if (require.main === module) {
                 ttl: None,
                 due_in: None,
                 root: None,
+                dry_run: false,
             }))
             .await
             .expect("write should succeed");
@@ -3409,6 +3441,7 @@ if (require.main === module) {
                 ttl: None,
                 due_in: None,
                 root: None,
+                dry_run: false,
             }))
             .await
             .expect("update should succeed");
@@ -3896,6 +3929,7 @@ if (require.main === module) {
                     },
                 ],
                 root: None,
+                dry_run: false,
             }))
             .await
             .expect("batch write should succeed");
@@ -3935,6 +3969,7 @@ if (require.main === module) {
             .memory_write_batch(Parameters(MemoryWriteBatchParams {
                 entries: vec![],
                 root: None,
+                dry_run: false,
             }))
             .await;
 
@@ -3968,6 +4003,7 @@ if (require.main === module) {
             .memory_write_batch(Parameters(MemoryWriteBatchParams {
                 entries,
                 root: None,
+                dry_run: false,
             }))
             .await;
 

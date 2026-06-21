@@ -133,6 +133,15 @@ fn smoke_update_files() {
 }
 
 #[test]
+fn smoke_update_force() {
+    let repo = Repo::new();
+    run(&["update"], &repo.root);
+    // --force reindexes already-indexed files (applies config changes).
+    let out = run(&["update", "--force"], &repo.root);
+    assert_ok(&out, "update --force");
+}
+
+#[test]
 fn smoke_embed() {
     let repo = Repo::new();
     run(&["update"], &repo.root);
@@ -217,6 +226,48 @@ fn smoke_stats_json() {
         serde_json::from_str::<serde_json::Value>(s.trim())
             .unwrap_or_else(|e| panic!("stats json invalid: {e}\n{s}"));
     }
+}
+
+// ── Schema ─────────────────────────────────────────────────────────
+
+#[test]
+fn smoke_schema_full() {
+    let repo = Repo::new();
+    let out = run(&["schema"], &repo.root);
+    assert_ok(&out, "schema");
+    let s = stdout(&out);
+    let v: serde_json::Value =
+        serde_json::from_str(s.trim()).unwrap_or_else(|e| panic!("schema json invalid: {e}\n{s}"));
+    assert_eq!(v["name"], "mdkb", "root command name");
+    assert!(
+        v["subcommands"].as_array().is_some_and(|a| !a.is_empty()),
+        "schema must list subcommands"
+    );
+}
+
+#[test]
+fn smoke_schema_subcommand() {
+    let repo = Repo::new();
+    let out = run(&["schema", "search"], &repo.root);
+    assert_ok(&out, "schema search");
+    let s = stdout(&out);
+    let v: serde_json::Value = serde_json::from_str(s.trim())
+        .unwrap_or_else(|e| panic!("schema search json invalid: {e}\n{s}"));
+    assert_eq!(v["name"], "search", "subcommand name");
+    let has_query = v["args"]
+        .as_array()
+        .is_some_and(|args| args.iter().any(|a| a["name"] == "query"));
+    assert!(has_query, "search schema must expose the query arg: {s}");
+}
+
+#[test]
+fn smoke_schema_unknown_command_exits_nonzero() {
+    let repo = Repo::new();
+    let out = run(&["schema", "no-such-command"], &repo.root);
+    assert!(
+        !out.status.success(),
+        "schema on unknown command should exit non-zero"
+    );
 }
 
 // ── Compact ────────────────────────────────────────────────────────
@@ -376,6 +427,117 @@ fn smoke_evolve_and_history() {
 
     let out = run(&["superseded-by", "guide.md"], &repo.root);
     assert_ok(&out, "superseded-by");
+}
+
+// ── Knowledge graph ─────────────────────────────────────────────────
+
+#[test]
+fn smoke_graph() {
+    let repo = Repo::new();
+
+    std::fs::write(
+        repo.root.join("docs/project.md"),
+        "---\nowner: alice\nthemes:\n  - growth\n---\nSee [[guide]] for setup.\n",
+    )
+    .unwrap();
+    run(&["update"], &repo.root);
+
+    // links: by path, text and json.
+    assert_ok(
+        &run(&["graph", "links", "project.md"], &repo.root),
+        "graph links",
+    );
+    let out = run(
+        &["--format", "json", "graph", "links", "project.md"],
+        &repo.root,
+    );
+    assert_ok(&out, "graph links json");
+    serde_json::from_str::<serde_json::Value>(stdout(&out).trim()).expect("links json valid");
+
+    // links by document id (resolve_document_id accepts numeric ids).
+    assert_ok(
+        &run(&["graph", "links", "1"], &repo.root),
+        "graph links by id",
+    );
+
+    // backlinks: by raw slug (dangling 'alice') and relation filter.
+    assert_ok(
+        &run(&["graph", "backlinks", "alice"], &repo.root),
+        "graph backlinks",
+    );
+    assert_ok(
+        &run(&["graph", "backlinks", "alice", "-r", "owner"], &repo.root),
+        "graph backlinks --relation",
+    );
+
+    // neighbors: text and json, with depth.
+    assert_ok(
+        &run(
+            &["graph", "neighbors", "project.md", "--depth", "2"],
+            &repo.root,
+        ),
+        "graph neighbors",
+    );
+    let out = run(
+        &["--format", "json", "graph", "neighbors", "project.md"],
+        &repo.root,
+    );
+    assert_ok(&out, "graph neighbors json");
+    serde_json::from_str::<serde_json::Value>(stdout(&out).trim()).expect("neighbors json valid");
+
+    // path: project -> guide (the [[guide]] wikilink resolves to guide.md).
+    assert_ok(
+        &run(&["graph", "path", "project.md", "guide.md"], &repo.root),
+        "graph path",
+    );
+
+    // Regression: a numeric document id used as the *target* must resolve like
+    // the start argument does, not be treated as a literal slug. Make the owner
+    // edge point at a real document so a path exists, then address it by id.
+    std::fs::write(
+        repo.root.join("docs/alice.md"),
+        "---\ntitle: Alice\n---\nOwner.\n",
+    )
+    .unwrap();
+    run(&["update"], &repo.root);
+
+    // Sanity: path to the owner by path-form target is found (project -> alice).
+    let by_path = run(&["graph", "path", "project.md", "alice.md"], &repo.root);
+    assert_ok(&by_path, "graph path by target path");
+    assert!(
+        stdout(&by_path).contains("->"),
+        "expected project.md -> alice.md, got: {}",
+        stdout(&by_path)
+    );
+
+    // The two docs have ids 1 and 2; exactly one is alice.md and reachable via
+    // the owner edge. Before the fix BOTH numeric targets yielded "No path
+    // found" because the target was matched as a literal slug, never an id.
+    let by_id_1 = stdout(&run(&["graph", "path", "project.md", "1"], &repo.root));
+    let by_id_2 = stdout(&run(&["graph", "path", "project.md", "2"], &repo.root));
+    assert!(
+        by_id_1.contains("->") || by_id_2.contains("->"),
+        "numeric-id path target must resolve to a document; id1={by_id_1:?} id2={by_id_2:?}"
+    );
+
+    // Bare-slug parity: links/neighbors/path must accept a slug without the .md
+    // extension, exactly as backlinks does. Before the fix these errored with
+    // DocumentNotFound while `backlinks alice` succeeded.
+    assert_ok(
+        &run(&["graph", "links", "project"], &repo.root),
+        "graph links by bare slug",
+    );
+    assert_ok(
+        &run(&["graph", "neighbors", "project"], &repo.root),
+        "graph neighbors by bare slug",
+    );
+    let by_slug = run(&["graph", "path", "project", "alice"], &repo.root);
+    assert_ok(&by_slug, "graph path by bare slugs");
+    assert!(
+        stdout(&by_slug).contains("->"),
+        "expected project -> alice via bare slugs, got: {}",
+        stdout(&by_slug)
+    );
 }
 
 // ── Code intelligence ───────────────────────────────────────────────
@@ -644,6 +806,10 @@ fn smoke_help_all_subcommands() {
         &["history", "--help"],
         &["current", "--help"],
         &["superseded-by", "--help"],
+        &["graph", "--help"],
+        &["graph", "links", "--help"],
+        &["graph", "neighbors", "--help"],
+        &["graph", "path", "--help"],
         &["experiment", "--help"],
         &["experiment", "create", "--help"],
         &["metrics", "--help"],

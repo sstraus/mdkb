@@ -163,6 +163,35 @@ pub fn extract_evolution_refs(frontmatter: Option<&Value>, field: &str) -> Vec<E
     }
 }
 
+/// Extract knowledge-graph relation targets from a frontmatter key.
+///
+/// A relation value is one or more entity slugs. Supports a single string
+/// (`owner: alice`) or an array of strings (`stakeholders: [bob, carol]`).
+/// Non-string array elements and other value types yield no targets.
+pub fn extract_relation_refs(frontmatter: Option<&Value>, key: &str) -> Vec<String> {
+    let Some(value) = frontmatter.and_then(|fm| fm.get(key)) else {
+        return Vec::new();
+    };
+
+    match value {
+        Value::String(s) => {
+            let s = s.trim();
+            if s.is_empty() {
+                Vec::new()
+            } else {
+                vec![s.to_string()]
+            }
+        }
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Parse a single evolution reference from a JSON value.
 fn parse_evolution_ref(value: &Value) -> Option<EvolutionRef> {
     match value {
@@ -190,6 +219,27 @@ fn parse_evolution_ref(value: &Value) -> Option<EvolutionRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_extract_relation_refs_single_string() {
+        let parsed = parse_frontmatter("---\nowner: alice\n---\nbody");
+        let owners = extract_relation_refs(parsed.frontmatter.as_ref(), "owner");
+        assert_eq!(owners, vec!["alice".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_relation_refs_array() {
+        let parsed = parse_frontmatter("---\nstakeholders:\n  - bob\n  - carol\n---\nbody");
+        let refs = extract_relation_refs(parsed.frontmatter.as_ref(), "stakeholders");
+        assert_eq!(refs, vec!["bob".to_string(), "carol".to_string()]);
+    }
+
+    #[test]
+    fn test_extract_relation_refs_missing_key() {
+        let parsed = parse_frontmatter("---\nowner: alice\n---\nbody");
+        assert!(extract_relation_refs(parsed.frontmatter.as_ref(), "themes").is_empty());
+        assert!(extract_relation_refs(None, "owner").is_empty());
+    }
 
     #[test]
     fn test_parse_frontmatter_with_yaml() {

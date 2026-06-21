@@ -602,6 +602,15 @@ pub fn handle_mget(
 /// Wraps all collection updates in a single transaction to ensure atomicity.
 /// If any operation fails, the entire update is rolled back.
 pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResult> {
+    handle_update_force(ctx, root, false)
+}
+
+/// Like [`handle_update`], but `force` reindexes every file regardless of mtime.
+pub fn handle_update_force(
+    ctx: &Context,
+    root: impl AsRef<Path>,
+    force: bool,
+) -> Result<UpdateResult> {
     let root = root.as_ref();
 
     // Detect and register convention-based collections before processing
@@ -620,7 +629,7 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
     let mut result = UpdateResult::default();
 
     with_transaction(&ctx.conn, || {
-        update_all_collections(ctx, root, &config, &collections, &mut result)?;
+        update_all_collections(ctx, root, &config, &collections, force, &mut result)?;
         Ok(())
     })?;
     Ok(result)
@@ -651,10 +660,11 @@ fn update_all_collections(
     root: &Path,
     config: &Config,
     collections: &[Collection],
+    force: bool,
     result: &mut UpdateResult,
 ) -> Result<()> {
     for coll in collections {
-        update_collection(ctx, root, config, coll, result)?;
+        update_collection(ctx, root, config, coll, force, result)?;
     }
     Ok(())
 }
@@ -681,6 +691,7 @@ fn update_collection(
     root: &Path,
     config: &Config,
     collection: &Collection,
+    force: bool,
     result: &mut UpdateResult,
 ) -> Result<()> {
     let base_path = root.join(&collection.path);
@@ -775,6 +786,8 @@ fn update_collection(
             relative,
             existing_doc.as_ref(),
             &path.display().to_string(),
+            &config.graph,
+            force,
             result,
         );
     }
@@ -809,6 +822,8 @@ fn index_single_file(
     relative: String,
     existing_doc: Option<&Document>,
     display_name: &str,
+    graph_cfg: &crate::config::GraphConfig,
+    force: bool,
     result: &mut UpdateResult,
 ) {
     // Read file metadata for mtime
@@ -841,8 +856,10 @@ fn index_single_file(
         }
     };
 
-    // Check if document needs reindexing based on mtime
+    // Check if document needs reindexing based on mtime (--force reprocesses all,
+    // so config changes like graph relations reach already-indexed documents).
     let needs_index = match existing_doc {
+        Some(_) if force => true,
         Some(doc) => file_mtime > doc.indexed_at,
         None => true,
     };
@@ -889,6 +906,10 @@ fn index_single_file(
             if has_evolution_refs(&parsed) {
                 process_frontmatter_evolution(&ctx.conn, doc_id, collection_name, &parsed);
             }
+
+            if graph_cfg.enabled {
+                process_graph_edges(&ctx.conn, doc_id, &parsed, graph_cfg);
+            }
         }
         Err(e) => {
             result
@@ -906,6 +927,16 @@ pub fn handle_update_files(
     ctx: &Context,
     root: impl AsRef<Path>,
     files: &[String],
+) -> Result<UpdateResult> {
+    handle_update_files_force(ctx, root, files, false)
+}
+
+/// Like [`handle_update_files`], but `force` reindexes the files regardless of mtime.
+pub fn handle_update_files_force(
+    ctx: &Context,
+    root: impl AsRef<Path>,
+    files: &[String],
+    force: bool,
 ) -> Result<UpdateResult> {
     let root = root.as_ref();
     let collections = collections::list_collections(&ctx.conn)?;
@@ -958,8 +989,17 @@ pub fn handle_update_files(
         })
         .collect();
 
+    let config = Config::load_or_default(&ctx.config_path);
     with_transaction(&ctx.conn, || {
-        index_specified_files(ctx, &canonical_root, &matchers, files, &mut result)
+        index_specified_files(
+            ctx,
+            &canonical_root,
+            &matchers,
+            files,
+            &config.graph,
+            force,
+            &mut result,
+        )
     })?;
     Ok(result)
 }
@@ -970,6 +1010,8 @@ fn index_specified_files(
     canonical_root: &Path,
     matchers: &[(&Collection, globset::GlobMatcher, PathBuf)],
     files: &[String],
+    graph_cfg: &crate::config::GraphConfig,
+    force: bool,
     result: &mut UpdateResult,
 ) -> Result<()> {
     for file_arg in files {
@@ -1032,6 +1074,8 @@ fn index_specified_files(
             relative,
             existing_doc.as_ref(),
             file_arg,
+            graph_cfg,
+            force,
             result,
         );
     }
@@ -2178,6 +2222,55 @@ fn has_evolution_refs(parsed: &ParsedDocument) -> bool {
         || !parsed.extends.is_empty()
 }
 
+/// Populate knowledge-graph edges for a freshly indexed document.
+///
+/// Replaces the document's outgoing edges (idempotent re-index): edges from
+/// allowlisted frontmatter keys (strong) and body wikilinks (soft). Target refs
+/// are stored verbatim — dangling targets survive and resolve on later indexing.
+fn process_graph_edges(
+    conn: &Connection,
+    doc_id: i64,
+    parsed: &ParsedDocument,
+    cfg: &crate::config::GraphConfig,
+) {
+    use crate::store::graph;
+
+    if let Err(e) = graph::delete_edges_for_source(conn, doc_id) {
+        tracing::warn!("Graph: failed to clear edges for doc {doc_id}: {e}");
+        return;
+    }
+
+    for key in &cfg.frontmatter_relations {
+        for target in
+            crate::domain::frontmatter::extract_relation_refs(parsed.frontmatter.as_ref(), key)
+        {
+            if let Err(e) =
+                graph::add_edge(conn, doc_id, &target, key, graph::KIND_FRONTMATTER, None)
+            {
+                tracing::warn!("Graph: failed to add frontmatter edge '{key}->{target}': {e}");
+            }
+        }
+    }
+
+    if cfg.include_wikilinks {
+        for link in crate::domain::links::extract_wiki_links(&parsed.body) {
+            if let Err(e) = graph::add_edge(
+                conn,
+                doc_id,
+                &link.target,
+                graph::RELATION_WIKILINK,
+                graph::KIND_WIKILINK,
+                None,
+            ) {
+                tracing::warn!(
+                    "Graph: failed to add wikilink edge -> '{}': {e}",
+                    link.target
+                );
+            }
+        }
+    }
+}
+
 /// Resolve a document path or ID to a document ID.
 fn resolve_document_id(ctx: &Context, path_or_id: &str) -> Result<i64> {
     // Try to parse as ID first
@@ -2198,6 +2291,22 @@ fn resolve_document_id(ctx: &Context, path_or_id: &str) -> Result<i64> {
 
     Err(Error::from(ErrorKind::DocumentNotFound {
         id: path_or_id.to_string(),
+    }))
+}
+
+/// Resolve a graph entity argument to a document id. Extends `resolve_document_id`
+/// with the `.md`-form tolerance the rest of the graph layer uses, so that
+/// `links`/`neighbors`/`path` accept a bare slug (`people/x`) exactly like
+/// `backlinks` does — not only `people/x.md` or a numeric id.
+fn resolve_graph_entity(ctx: &Context, entity: &str) -> Result<i64> {
+    if let Ok(id) = resolve_document_id(ctx, entity) {
+        return Ok(id);
+    }
+    if let Some(id) = crate::store::graph::resolve_ref_to_doc(&ctx.conn, entity)? {
+        return Ok(id);
+    }
+    Err(Error::from(ErrorKind::DocumentNotFound {
+        id: entity.to_string(),
     }))
 }
 
@@ -2394,6 +2503,63 @@ pub fn handle_current(ctx: &Context, path_or_id: &str) -> Result<Option<Document
 pub fn handle_superseded_by(ctx: &Context, path_or_id: &str) -> Result<Vec<Evolution>> {
     let doc_id = resolve_document_id(ctx, path_or_id)?;
     evolution::get_superseded_by(&ctx.conn, doc_id)
+}
+
+// ==================== Knowledge-Graph Handlers ====================
+
+/// Outgoing edges from an entity (the entity must be an indexed document).
+pub fn handle_graph_links(
+    ctx: &Context,
+    entity: &str,
+    relation: Option<&str>,
+) -> Result<Vec<crate::store::graph::Edge>> {
+    let doc_id = resolve_graph_entity(ctx, entity)?;
+    crate::store::graph::get_outgoing(&ctx.conn, doc_id, relation)
+}
+
+/// Incoming edges to an entity. Accepts a dangling slug — no document required.
+pub fn handle_graph_backlinks(
+    ctx: &Context,
+    entity: &str,
+    relation: Option<&str>,
+) -> Result<Vec<crate::store::graph::Edge>> {
+    crate::store::graph::get_incoming(&ctx.conn, entity, relation)
+}
+
+/// Adjacent entities up to `depth` hops (undirected); start must be a document.
+pub fn handle_graph_neighbors(
+    ctx: &Context,
+    entity: &str,
+    relation: Option<&str>,
+    depth: u32,
+) -> Result<Vec<crate::store::graph::Neighbor>> {
+    let doc_id = resolve_graph_entity(ctx, entity)?;
+    crate::store::graph::neighbors(&ctx.conn, doc_id, relation, depth)
+}
+
+/// Shortest undirected path from `a` (a document) to `b` (any entity).
+pub fn handle_graph_path(
+    ctx: &Context,
+    a: &str,
+    b: &str,
+    max_hops: u32,
+) -> Result<Option<Vec<String>>> {
+    let start = resolve_graph_entity(ctx, a)?;
+    let target = resolve_target_key(ctx, b)?;
+    crate::store::graph::shortest_path(&ctx.conn, start, &target, max_hops)
+}
+
+/// Canonical key for a path target. When `b` names an existing document — by
+/// numeric id or path, exactly as the start argument is resolved — use that
+/// document's `relative_path` so traversal can match it. Otherwise keep `b`
+/// verbatim, preserving the dangling-target semantics (an unreachable slug).
+fn resolve_target_key(ctx: &Context, b: &str) -> Result<String> {
+    if let Ok(id) = resolve_document_id(ctx, b) {
+        if let Some(doc) = documents::get_document(&ctx.conn, id)? {
+            return Ok(doc.relative_path);
+        }
+    }
+    Ok(b.to_string())
 }
 
 // ==================== Metrics Handlers ====================
@@ -2649,6 +2815,112 @@ mod tests {
         let collections = handle_collection_list(&ctx).unwrap();
         assert_eq!(collections.len(), 1);
         assert_eq!(collections[0].name, "docs");
+    }
+
+    #[test]
+    fn test_graph_edges_indexed_dangling_and_idempotent() {
+        use crate::store::graph;
+
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::create_dir_all(temp.path().join("docs")).unwrap();
+        handle_collection_add(&ctx, "docs", "./docs", "**/*.md").unwrap();
+
+        let body = "---\nowner: alice\nthemes:\n  - growth\n---\nSee [[notes/related]].\n";
+        std::fs::write(temp.path().join("docs/x.md"), body).unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        let doc = documents::get_document_by_path(&ctx.conn, "docs", "x.md")
+            .unwrap()
+            .expect("x.md should be indexed");
+
+        // Frontmatter (strong) + wikilink (soft) edges, target refs stored verbatim.
+        let out = graph::get_outgoing(&ctx.conn, doc.id, None).unwrap();
+        assert_eq!(out.len(), 3, "owner + themes + wikilink");
+        assert!(
+            out.iter()
+                .any(|e| e.relation == "owner" && e.target_ref == "alice")
+        );
+        assert!(
+            out.iter()
+                .any(|e| e.relation == "themes" && e.target_ref == "growth")
+        );
+        assert!(
+            out.iter()
+                .any(|e| e.source_kind == graph::KIND_WIKILINK && e.target_ref == "notes/related")
+        );
+
+        // 'alice' is dangling: no document yet, but the backlink exists.
+        assert!(
+            graph::resolve_ref_to_doc(&ctx.conn, "alice")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            graph::get_incoming(&ctx.conn, "alice", None).unwrap().len(),
+            1
+        );
+
+        // Re-running the hook (simulating re-index) must not duplicate edges.
+        let parsed = parse_frontmatter(body);
+        process_graph_edges(
+            &ctx.conn,
+            doc.id,
+            &parsed,
+            &crate::config::GraphConfig::default(),
+        );
+        let after = graph::get_outgoing(&ctx.conn, doc.id, None).unwrap();
+        assert_eq!(after.len(), 3, "re-index must be idempotent");
+
+        // Index alice.md later: the previously dangling edge now resolves.
+        std::fs::write(temp.path().join("docs/alice.md"), "# Alice\n").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+        assert!(
+            graph::resolve_ref_to_doc(&ctx.conn, "alice")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn test_update_force_reindexes_unchanged_files() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        std::fs::create_dir_all(temp.path().join("docs")).unwrap();
+        handle_collection_add(&ctx, "docs", "./docs", "**/*.md").unwrap();
+        std::fs::write(
+            temp.path().join("docs/a.md"),
+            "---\nowner: alice\n---\nbody\n",
+        )
+        .unwrap();
+
+        let r1 = handle_update(&ctx, temp.path()).unwrap();
+        assert_eq!(r1.added, 1);
+
+        // Plain update: unchanged mtime → skipped, not reprocessed.
+        let r2 = handle_update(&ctx, temp.path()).unwrap();
+        assert_eq!(r2.unchanged, 1);
+        assert_eq!(r2.updated, 0);
+
+        // Forced update: reprocessed despite unchanged mtime (so config changes apply).
+        let r3 = handle_update_force(&ctx, temp.path(), true).unwrap();
+        assert_eq!(r3.updated, 1, "force must reprocess unchanged files");
+        assert_eq!(r3.unchanged, 0);
+
+        // Edges remain intact after the forced re-index (idempotent).
+        let doc = documents::get_document_by_path(&ctx.conn, "docs", "a.md")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            crate::store::graph::get_outgoing(&ctx.conn, doc.id, None)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

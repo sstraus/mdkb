@@ -21,20 +21,21 @@ use mdkb::cli::handlers::{
     handle_collection_rename, handle_current, handle_embed, handle_evolve_corrects,
     handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
-    handle_experiment_list, handle_experiment_status, handle_get, handle_history,
+    handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
+    handle_graph_links, handle_graph_neighbors, handle_graph_path, handle_history,
     handle_hybrid_search, handle_init, handle_memory_add, handle_memory_export,
     handle_memory_import, handle_memory_import_dir, handle_memory_list, handle_memory_prune,
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
     handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
-    handle_session_index, handle_superseded_by, handle_update, handle_update_files,
+    handle_session_index, handle_superseded_by, handle_update_files_force, handle_update_force,
 };
 #[cfg(unix)]
 use mdkb::cli::hook_client;
 use mdkb::cli::hook_logic;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
-    Cli, CollectionCommand, Command, DaemonCommand, EvolveCommand, ExperimentCommand, HookCommand,
-    JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, RemoveHooksCommand,
+    Cli, CollectionCommand, Command, DaemonCommand, EvolveCommand, ExperimentCommand, GraphCommand,
+    HookCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, RemoveHooksCommand,
     RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand, SetupMcpCommand,
     SetupRemoveCommand,
 };
@@ -107,7 +108,16 @@ async fn run_cli(cli: Cli) -> Result<()> {
     tracing::debug!("mdkb starting with verbosity level {}", cli.verbose);
 
     let raw_cwd = env::current_dir()?;
-    let cwd = mdkb::git::resolve_main_worktree(&raw_cwd);
+    // `init` creates a store exactly where it is invoked (explicit user intent).
+    // Every other command anchors to the nearest existing `.mdkb/` store, then
+    // the git root, then CLAUDE_PROJECT_DIR, then cwd — so running mdkb from a
+    // sub-directory finds the project's store instead of spawning a new one.
+    let cwd = if matches!(cli.command, Command::Init) {
+        mdkb::git::resolve_main_worktree(&raw_cwd)
+    } else {
+        let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(std::path::PathBuf::from);
+        mdkb::git::resolve_project_root(&raw_cwd, hint.as_deref())
+    };
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
     match cli.command {
@@ -265,12 +275,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
             let results = handle_mget(&ctx, &pattern, collection.as_deref())?;
             format_mget_results(&results, cli.format);
         }
-        Command::Update { files } => {
+        Command::Update { files, force } => {
             let ctx = Context::open(&cwd)?;
 
             if files.is_empty() {
-                // Full reindex
-                let result = handle_update(&ctx, &cwd)?;
+                // Full reindex (--force ignores mtime so config changes reach all docs)
+                let result = handle_update_force(&ctx, &cwd, force)?;
                 format_update_result(&result, cli.format);
 
                 // Also reindex code (matching MCP update behavior)
@@ -309,7 +319,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 }
             } else {
                 // Targeted file reindex (docs only — code index handles its own incremental)
-                let result = handle_update_files(&ctx, &cwd, &files)?;
+                let result = handle_update_files_force(&ctx, &cwd, &files, force)?;
                 format_update_result(&result, cli.format);
 
                 // Also reindex code for the specified files
@@ -707,6 +717,32 @@ async fn run_cli(cli: Cli) -> Result<()> {
             let evolutions = handle_superseded_by(&ctx, &path)?;
             format_superseded_by(&evolutions, cli.format);
         }
+        Command::Graph(cmd) => {
+            let ctx = Context::open(&cwd)?;
+            match cmd {
+                GraphCommand::Links { entity, relation } => {
+                    let edges = handle_graph_links(&ctx, &entity, relation.as_deref())?;
+                    format_graph_edges(&edges, cli.format);
+                }
+                GraphCommand::Backlinks { entity, relation } => {
+                    let edges = handle_graph_backlinks(&ctx, &entity, relation.as_deref())?;
+                    format_graph_edges(&edges, cli.format);
+                }
+                GraphCommand::Neighbors {
+                    entity,
+                    relation,
+                    depth,
+                } => {
+                    let neighbors =
+                        handle_graph_neighbors(&ctx, &entity, relation.as_deref(), depth)?;
+                    format_graph_neighbors(&neighbors, cli.format);
+                }
+                GraphCommand::Path { a, b, max_hops } => {
+                    let path = handle_graph_path(&ctx, &a, &b, max_hops)?;
+                    format_graph_path(&path, cli.format);
+                }
+            }
+        }
         Command::Experiment(cmd) => {
             let ctx = Context::open(&cwd)?;
             match cmd {
@@ -818,6 +854,20 @@ async fn run_cli(cli: Cli) -> Result<()> {
 {0} compact                                            # vacuum both databases
 ",
                 bin
+            );
+        }
+        Command::Schema { command } => {
+            use clap::CommandFactory;
+            let root = Cli::command();
+            let target = match command {
+                Some(ref name) => root
+                    .find_subcommand(name)
+                    .ok_or_else(|| mdkb::Error::other(format!("Unknown command: {name}")))?,
+                None => &root,
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&command_to_json(target))?
             );
         }
         Command::Code(cmd) => match cmd {
@@ -1577,6 +1627,99 @@ fn format_evolution_history(history: &[EvolutionHistoryEntry], format: OutputFor
                 }
             }
         }
+    }
+}
+
+fn format_graph_edges(edges: &[mdkb::store::graph::Edge], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(edges).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("source_doc_id,target_ref,relation,source_kind,scope");
+            for e in edges {
+                println!(
+                    "{},{},{},{},{}",
+                    e.source_doc_id,
+                    e.target_ref,
+                    e.relation,
+                    e.source_kind,
+                    e.scope.as_deref().unwrap_or(""),
+                );
+            }
+        }
+        OutputFormat::Markdown => {
+            if edges.is_empty() {
+                println!("No edges found.");
+            } else {
+                println!("| Source | Target | Relation | Kind |");
+                println!("|--------|--------|----------|------|");
+                for e in edges {
+                    println!(
+                        "| {} | {} | {} | {} |",
+                        e.source_doc_id, e.target_ref, e.relation, e.source_kind
+                    );
+                }
+            }
+        }
+        OutputFormat::Text => {
+            if edges.is_empty() {
+                println!("No edges found.");
+            } else {
+                for e in edges {
+                    println!(
+                        "  [{}] --{}--> {} ({})",
+                        e.source_doc_id, e.relation, e.target_ref, e.source_kind
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn format_graph_neighbors(neighbors: &[mdkb::store::graph::Neighbor], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(neighbors).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("entity,depth");
+            for n in neighbors {
+                println!("{},{}", n.entity, n.depth);
+            }
+        }
+        OutputFormat::Markdown => {
+            if neighbors.is_empty() {
+                println!("No neighbors found.");
+            } else {
+                println!("| Entity | Depth |");
+                println!("|--------|-------|");
+                for n in neighbors {
+                    println!("| {} | {} |", n.entity, n.depth);
+                }
+            }
+        }
+        OutputFormat::Text => {
+            if neighbors.is_empty() {
+                println!("No neighbors found.");
+            } else {
+                for n in neighbors {
+                    println!("  {} (depth {})", n.entity, n.depth);
+                }
+            }
+        }
+    }
+}
+
+fn format_graph_path(path: &Option<Vec<String>>, format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(path).unwrap());
+        }
+        _ => match path {
+            Some(nodes) => println!("{}", nodes.join(" -> ")),
+            None => println!("No path found."),
+        },
     }
 }
 
@@ -2420,6 +2563,35 @@ async fn run_daemon() -> Result<()> {
 fn stdin_is_not_tty() -> bool {
     use std::io::IsTerminal;
     !std::io::stdin().is_terminal()
+}
+
+/// Serialize a clap `Command` into a machine-readable JSON description
+/// (name, about, args, nested subcommands) for agent introspection.
+fn command_to_json(cmd: &clap::Command) -> serde_json::Value {
+    let args: Vec<serde_json::Value> = cmd
+        .get_arguments()
+        .filter(|a| a.get_id() != "help" && a.get_id() != "version")
+        .map(|a| {
+            serde_json::json!({
+                "name": a.get_id().as_str(),
+                "help": a.get_help().map(|h| h.to_string()),
+                "required": a.is_required_set(),
+                "positional": a.is_positional(),
+                "long": a.get_long(),
+                "short": a.get_short().map(|c| c.to_string()),
+                "takes_value": a.get_action().takes_values(),
+            })
+        })
+        .collect();
+
+    let subcommands: Vec<serde_json::Value> = cmd.get_subcommands().map(command_to_json).collect();
+
+    serde_json::json!({
+        "name": cmd.get_name(),
+        "about": cmd.get_about().map(|a| a.to_string()),
+        "args": args,
+        "subcommands": subcommands,
+    })
 }
 
 /// Wait for the first of SIGINT or SIGTERM.

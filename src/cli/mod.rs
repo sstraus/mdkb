@@ -113,6 +113,11 @@ pub enum Command {
         /// Only reindex specific files (absolute or relative paths)
         #[arg(long, num_args = 1..)]
         files: Vec<String>,
+
+        /// Reindex every file regardless of modification time (applies config changes
+        /// such as graph relations to already-indexed documents)
+        #[arg(long)]
+        force: bool,
     },
 
     /// Generate embeddings for documents
@@ -205,6 +210,10 @@ pub enum Command {
         path: String,
     },
 
+    /// Query the knowledge graph (typed edges from frontmatter + wikilinks)
+    #[command(subcommand)]
+    Graph(GraphCommand),
+
     /// Manage A/B experiments
     #[command(subcommand)]
     Experiment(ExperimentCommand),
@@ -226,6 +235,12 @@ pub enum Command {
 
     /// Compact command reference for AI consumption
     Cheatsheet,
+
+    /// Emit machine-readable CLI schema as JSON (omit COMMAND for the full tree)
+    Schema {
+        /// Specific subcommand to describe (omit for the full schema)
+        command: Option<String>,
+    },
 
     /// Claude Code session indexing
     #[command(subcommand)]
@@ -746,6 +761,57 @@ pub enum EvolveCommand {
         /// Reason for extension
         #[arg(short, long)]
         reason: Option<String>,
+    },
+}
+
+/// Knowledge-graph query subcommands.
+#[derive(Subcommand, Debug)]
+pub enum GraphCommand {
+    /// Outgoing edges from an entity (what it points to)
+    Links {
+        /// Entity (document path, ID, or raw slug)
+        entity: String,
+
+        /// Filter by relation type
+        #[arg(short, long)]
+        relation: Option<String>,
+    },
+
+    /// Incoming edges to an entity (what points to it)
+    Backlinks {
+        /// Entity (document path, ID, or raw slug)
+        entity: String,
+
+        /// Filter by relation type
+        #[arg(short, long)]
+        relation: Option<String>,
+    },
+
+    /// Adjacent entities up to a traversal depth (undirected)
+    Neighbors {
+        /// Entity (document path, ID, or raw slug)
+        entity: String,
+
+        /// Filter by relation type
+        #[arg(short, long)]
+        relation: Option<String>,
+
+        /// Maximum traversal depth
+        #[arg(short, long, default_value = "1")]
+        depth: u32,
+    },
+
+    /// Shortest path between two entities (undirected)
+    Path {
+        /// Start entity (document path, ID, or raw slug)
+        a: String,
+
+        /// Target entity (document path, ID, or raw slug)
+        b: String,
+
+        /// Maximum hops to search
+        #[arg(long, default_value = "6")]
+        max_hops: u32,
     },
 }
 

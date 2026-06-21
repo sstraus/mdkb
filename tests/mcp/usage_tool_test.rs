@@ -42,6 +42,7 @@ async fn server_with_activity() -> (tempfile::TempDir, McpServer) {
             source_type: "user_statement".to_string(),
             ttl: None,
             due_in: None,
+            dry_run: false,
         }))
         .await
         .expect("memory_write");

@@ -1,6 +1,30 @@
 # Changelog
 
-## Unreleased
+## 3.4.0 (2026-06-09)
+
+### Added
+
+- **Knowledge graph — typed edges from frontmatter + wikilinks.** A new `edges`
+  table (schema v11) records typed relations from a document to entity slugs,
+  derived during indexing from allowlisted frontmatter keys (strong) and body
+  `[[wikilinks]]` (soft). Targets are stored verbatim and resolved to documents
+  at query time, so cross-document links survive regardless of indexing order
+  (dangling edges resolve once their target is indexed). Re-indexing replaces a
+  document's outgoing edges idempotently.
+  - CLI: `mdkb graph links <entity> [--relation T]` (outgoing),
+    `mdkb graph backlinks <entity> [--relation T]` (incoming),
+    `mdkb graph neighbors <entity> [--relation T] [--depth N]` (adjacent,
+    undirected), and `mdkb graph path <a> <b> [--max-hops N]` (shortest path) —
+    all honoring `--format json|text|csv|markdown`.
+  - MCP: a single consolidated `graph` tool with
+    `direction=links|backlinks|neighbors|path` (mirrors `code_graph`), keeping
+    the always-on tool surface minimal.
+  - Config: a `[graph]` section (`enabled`, `frontmatter_relations`,
+    `include_wikilinks`) written into the default template by `init`.
+- **`mdkb update --force`** reindexes every file regardless of modification time.
+  Without it, `update` is mtime-incremental, so config changes (e.g.
+  `graph.frontmatter_relations` or `include_wikilinks`) only reach documents
+  that are subsequently edited; `--force` reapplies them to the whole index.
 
 ### Fixed
 
