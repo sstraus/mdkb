@@ -119,15 +119,25 @@ pub async fn call_memory_confirm(id: String, outcome: String, root: Option<PathB
 
 // ── Core dispatch ────────────────────────────────────────────────────────────
 
-/// Pick the target repo root: explicit flag > current working directory.
-/// Absolute canonical form is preferred (daemon whitelist compares paths).
-/// If the resolved path is a git worktree, follows the gitdir pointer to
-/// the main worktree so all worktrees share a single `.mdkb/` directory.
+/// Pick the target repo root, host-agnostically.
+///
+/// An explicit `--root` always wins. Otherwise the anchor is resolved by
+/// walking up from the current directory: nearest existing `.mdkb/` →
+/// nearest git root → `CLAUDE_PROJECT_DIR` (the stable launch dir on Claude
+/// Code) → cwd. This makes the store immune to working-directory drift (the
+/// hook process cwd changes as the agent `cd`s, on both Claude Code and
+/// Codex) and lets concurrent agents on one project share a single store.
+/// The result is collapsed to the main worktree and canonicalized (the
+/// daemon whitelist compares canonical paths).
 fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {
-    let raw = explicit
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let resolved = crate::git::resolve_main_worktree(&raw);
+    let resolved = match explicit {
+        Some(path) => crate::git::resolve_main_worktree(&path),
+        None => {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from);
+            crate::git::resolve_project_root(&cwd, hint.as_deref())
+        }
+    };
     resolved.canonicalize().unwrap_or(resolved)
 }
 
