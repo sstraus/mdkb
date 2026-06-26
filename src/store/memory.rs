@@ -718,7 +718,7 @@ pub fn search_entries_fts(
          WHERE memory_fts MATCH ?1
          AND (m.expires_at IS NULL OR m.expires_at > ?3)
          AND NOT (m.entry_type = 'reminder' AND (m.due_at IS NULL OR m.due_at > ?3))
-         AND m.entry_type != 'prior'
+         -- priors are surfaced (gated by confidence in the hook); list/stats paths still exclude them
          ORDER BY bm25(memory_fts)
          LIMIT ?2"
     )?;
@@ -734,12 +734,15 @@ pub fn search_entries_fts(
 }
 
 /// BM25 search returning (rowid, entry) pairs for RRF fusion.
+///
+/// `fts_query` must already be a valid FTS5 expression — callers escape via
+/// `escape_fts5_query` (default token-AND) or pass a pre-built OR-expression
+/// (e.g. recall's `build_recall_query`). This function does NOT re-escape.
 fn bm25_search_with_rowid(
     conn: &Connection,
-    query: &str,
+    fts_query: &str,
     limit: usize,
 ) -> Result<Vec<(i64, MemoryEntry)>> {
-    let fts_query = crate::store::search::escape_fts5_query(query);
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
         "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at, m.due_at
@@ -748,7 +751,7 @@ fn bm25_search_with_rowid(
          WHERE memory_fts MATCH ?1
          AND (m.expires_at IS NULL OR m.expires_at > ?3)
          AND NOT (m.entry_type = 'reminder' AND (m.due_at IS NULL OR m.due_at > ?3))
-         AND m.entry_type != 'prior'
+         -- priors are surfaced (gated by confidence in the hook); list/stats paths still exclude them
          ORDER BY bm25(memory_fts)
          LIMIT ?2"
     )?;
@@ -878,6 +881,10 @@ pub fn access_recency_score(
 /// otherwise search becomes a positive-feedback loop on itself.
 ///
 /// Falls back to BM25-only if no embeddings exist or embedding service is unavailable.
+///
+/// `query` is treated as raw text and escaped into a token-AND FTS5 expression.
+/// For pre-built FTS queries (e.g. recall's OR-expression) use
+/// [`search_entries_hybrid_fts`].
 pub fn search_entries_hybrid(
     conn: &Connection,
     query: &str,
@@ -886,21 +893,56 @@ pub fn search_entries_hybrid(
     access_recency_weight: f64,
     recency_half_life_secs: i64,
 ) -> Result<Vec<MemoryEntry>> {
+    let fts_query = crate::store::search::escape_fts5_query(query);
+    search_entries_hybrid_fts(
+        conn,
+        &fts_query,
+        query_embedding,
+        limit,
+        access_recency_weight,
+        recency_half_life_secs,
+    )
+}
+
+/// Hybrid search variant accepting a pre-built FTS5 query expression.
+///
+/// Same fusion/ranking as [`search_entries_hybrid`] but skips the default
+/// token-AND escaping, so callers can pass OR-expressions (recall) or other
+/// FTS5 operators. The embedding is the caller's responsibility and may be
+/// derived from the original prompt text rather than the FTS expression.
+pub fn search_entries_hybrid_fts(
+    conn: &Connection,
+    fts_query: &str,
+    query_embedding: Option<&[f32]>,
+    limit: usize,
+    access_recency_weight: f64,
+    recency_half_life_secs: i64,
+) -> Result<Vec<MemoryEntry>> {
     use crate::store::{hybrid, vectors};
 
     // BM25 search (get more for fusion)
-    let bm25_results = bm25_search_with_rowid(conn, query, limit * 2)?;
+    let bm25_results = bm25_search_with_rowid(conn, fts_query, limit * 2)?;
+
+    // BM25-only fallback: preserve BM25 order but stable-sort by the
+    // access-recency signal so frequently/recently used entries float up
+    // (mirrors the third RRF signal in the fused path below).
+    let bm25_fallback = |results: Vec<(i64, MemoryEntry)>| -> Vec<MemoryEntry> {
+        let mut entries: Vec<MemoryEntry> = results.into_iter().map(|(_, e)| e).collect();
+        if access_recency_weight > 0.0 {
+            let now = Utc::now().timestamp();
+            entries.sort_by(|a, b| {
+                let sa = access_recency_score(a.access_count, a.last_accessed, now, recency_half_life_secs);
+                let sb = access_recency_score(b.access_count, b.last_accessed, now, recency_half_life_secs);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        entries.into_iter().take(limit).collect()
+    };
 
     // If no embedding provided, fall back to BM25-only
     let query_embedding = match query_embedding {
         Some(emb) => emb,
-        None => {
-            return Ok(bm25_results
-                .into_iter()
-                .take(limit)
-                .map(|(_, e)| e)
-                .collect());
-        }
+        None => return Ok(bm25_fallback(bm25_results)),
     };
 
     // Vector search
@@ -908,11 +950,7 @@ pub fn search_entries_hybrid(
 
     // If no vector results, fall back to BM25-only
     if vector_results.is_empty() {
-        return Ok(bm25_results
-            .into_iter()
-            .take(limit)
-            .map(|(_, e)| e)
-            .collect());
+        return Ok(bm25_fallback(bm25_results));
     }
 
     // Build SearchResult wrappers for BM25 (RRF needs SearchResult with i64 id)

@@ -31,7 +31,7 @@ use crate::domain::SearchResult;
 use crate::metrics::{
     UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
 };
-use crate::store::memory::{access_recency_score, get_warmup_index, search_entries_fts};
+use crate::store::memory::{get_warmup_index, search_entries_fts};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::mcp_error;
@@ -2051,17 +2051,38 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
             None => return json!({}),
         };
         let limit = cfg.recall_limit.max(1);
-        results = match search_entries_fts(conn, q, limit) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("hook.user_prompt_submit: search_entries_fts failed: {e}");
-                Vec::new()
-            }
-        };
+        // `q` (build_recall_query) is a pre-built OR-expression: feed it to the
+        // FTS leg of hybrid via `_fts` (no re-escaping), but embed the raw
+        // prompt — embedding the FTS operators would be noise.
+        let query_embedding =
+            match crate::llm::get_cached_service().and_then(|s| s.embed_query(prompt)) {
+                Ok(emb) => Some(emb),
+                Err(e) => {
+                    tracing::warn!("recall falling back to BM25-only: {e}");
+                    None
+                }
+            };
+        results = memory::search_entries_hybrid_fts(
+            conn,
+            q,
+            query_embedding.as_deref(),
+            limit,
+            handle.config.search.memory.access_recency_weight,
+            handle.config.search.memory.recency_half_life_secs,
+        )
+        .unwrap_or_default();
         drop(ctx_guard);
+
+        // prior-specific gate: only high-confidence priors surface
+        let now = chrono::Utc::now().timestamp();
+        results.retain(|e| {
+            e.entry_type != crate::store::memory::EntryType::Prior || e.confidence_at(now) >= 0.7
+        });
+        results = apply_min_confidence(results, Some(cfg.min_recall_score));
 
         // Layer in ancestor stores (read-only): a nested project also recalls
         // its parent's memory. Primary entries win on id collision; capped.
+        // Ancestor FTS now includes priors too, so apply the same prior gate.
         let mut seen: std::collections::HashSet<String> =
             results.iter().map(|e| e.id.clone()).collect();
         for_each_ancestor_conn(&handle.root, |conn| {
@@ -2073,6 +2094,11 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
                     if results.len() >= limit {
                         break;
                     }
+                    if e.entry_type == crate::store::memory::EntryType::Prior
+                        && e.confidence_at(now) < 0.7
+                    {
+                        continue;
+                    }
                     if seen.insert(e.id.clone()) {
                         results.push(e);
                     }
@@ -2083,28 +2109,6 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
 
     if results.is_empty() && !wants_cg {
         return json!({});
-    }
-
-    if cfg.recall_half_life_secs > 0 && !results.is_empty() {
-        let now = chrono::Utc::now().timestamp();
-        let n = results.len() as f64;
-        let mut scored: Vec<(f64, usize)> = results
-            .iter()
-            .enumerate()
-            .map(|(rank, entry)| {
-                let bm25 = (n - rank as f64) / n;
-                let recency = access_recency_score(
-                    entry.access_count,
-                    entry.last_accessed,
-                    now,
-                    cfg.recall_half_life_secs,
-                );
-                (bm25 + recency, rank)
-            })
-            .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let orig = results.clone();
-        results = scored.into_iter().map(|(_, i)| orig[i].clone()).collect();
     }
 
     let mut body = String::new();
@@ -2662,6 +2666,83 @@ mod tests {
 
         // Guardrail: layered reads must never create a store anywhere.
         assert!(!nested_root.join("sub/.mdkb").exists());
+    }
+
+    /// Seed a `Prior` memory entry with explicit confirmations so the test can
+    /// control its confidence() above/below the recall gate.
+    async fn seed_prior_entry(handle: &RepoHandle, id: &str, confirmations: u32) {
+        ensure_handle_context(handle).await.expect("init ctx");
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let entry = crate::store::memory::MemoryEntry {
+            id: id.to_string(),
+            title: format!("Prior {id}"),
+            content: "Prefer ripgrep over grep for codebase searches.".to_string(),
+            entry_type: crate::store::memory::EntryType::Prior,
+            tags: vec!["search".to_string()],
+            status: crate::store::memory::EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations,
+            last_confirmed_at: Some(now),
+            source_type: crate::store::memory::SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed prior");
+    }
+
+    #[tokio::test]
+    async fn recall_surfaces_high_confidence_prior_and_gates_low_confidence() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        // High-confidence prior: many confirmations -> confidence() >= 0.7.
+        seed_prior_entry(&handle, "prior-proof-high", 5).await;
+        // Fresh prior: zero confirmations -> confidence() ~0.425, below the gate.
+        seed_prior_entry(&handle, "prior-proof-low", 0).await;
+
+        // Sanity-check the confidence math the gate relies on.
+        {
+            let ctx_guard = handle.ctx.lock().await;
+            let conn = &ctx_guard.as_ref().unwrap().conn;
+            let high = crate::store::memory::get_entry(conn, "prior-proof-high")
+                .unwrap()
+                .unwrap();
+            let low = crate::store::memory::get_entry(conn, "prior-proof-low")
+                .unwrap()
+                .unwrap();
+            assert!(
+                high.confidence() >= 0.7,
+                "high prior confidence below gate: {}",
+                high.confidence()
+            );
+            assert!(
+                low.confidence() < 0.7,
+                "low prior confidence not below gate: {}",
+                low.confidence()
+            );
+        }
+
+        let out =
+            hook_user_prompt_submit_impl(&handle, "should I use ripgrep or grep for searches").await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            body.contains("prior-proof-high"),
+            "high-confidence prior should surface in recall: {body}"
+        );
+        assert!(
+            !body.contains("prior-proof-low"),
+            "low-confidence prior must be gated out of recall: {body}"
+        );
     }
 
     /// Seed a document `project.md` with an `owner -> alice` frontmatter edge.
