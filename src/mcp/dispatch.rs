@@ -2626,6 +2626,44 @@ mod tests {
         assert!(!nested_root.join("sub/.mdkb").exists());
     }
 
+    #[tokio::test]
+    async fn recall_layers_ancestor_store_readonly_without_creating() {
+        let tmp = TempDir::new().unwrap();
+        // Parent store (the ancestor) with its own memory entry.
+        let parent = make_handle(&tmp);
+        seed_memory_entry(&parent, "parent-mem").await;
+
+        // Primary store nested under the parent.
+        let nested_root = tmp.path().join("nested-repo");
+        std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
+        let primary = Arc::new(RepoHandle::from_shared(
+            nested_root.clone(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Config::default(),
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        seed_memory_entry(&primary, "child-mem").await;
+
+        // Prompt terms match the seeded entries' content ("...about the topic.").
+        let out =
+            hook_user_prompt_submit_impl(&primary, "what do we know about the topic content").await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(body.contains("child-mem"), "primary recall entry missing: {body}");
+        assert!(
+            body.contains("parent-mem"),
+            "ancestor recall entry missing — recall layering broken: {body}"
+        );
+
+        // Guardrail: layered reads must never create a store anywhere.
+        assert!(!nested_root.join("sub/.mdkb").exists());
+    }
+
     /// Seed a document `project.md` with an `owner -> alice` frontmatter edge.
     /// Returns the document id.
     async fn seed_graph_doc(handle: &RepoHandle) -> i64 {
