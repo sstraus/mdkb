@@ -2959,6 +2959,40 @@ mod tests {
         );
     }
 
+    /// Regression guard for the original bug: a legacy low-confidence prior
+    /// (System B style — `prior-<hash>`, zero confirmations) must NOT leak into
+    /// recall even via ancestor layering. The confidence gate keeps it out.
+    #[tokio::test]
+    async fn recall_gates_legacy_prior_across_layers() {
+        let tmp = TempDir::new().unwrap();
+
+        // Ancestor holds a legacy, low-confidence prior (would have surfaced
+        // unconditionally under the old append merge).
+        let parent = make_handle(&tmp);
+        seed_prior_entry(&parent, "prior-deadbeefdeadbeef", 0).await;
+
+        // Child has a genuine matching entry.
+        let primary = nested_primary(&tmp, "nested-legacy");
+        seed_topic_with_content(
+            &primary,
+            "child-real",
+            "Prefer ripgrep over grep for codebase searches.",
+            0,
+        )
+        .await;
+
+        let out =
+            hook_user_prompt_submit_impl(&primary, "should I use ripgrep or grep for searches").await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            !body.contains("prior-deadbeefdeadbeef"),
+            "legacy low-confidence prior leaked into recall across layers: {body}"
+        );
+    }
+
     /// Seed a document `project.md` with an `owner -> alice` frontmatter edge.
     /// Returns the document id.
     async fn seed_graph_doc(handle: &RepoHandle) -> i64 {
