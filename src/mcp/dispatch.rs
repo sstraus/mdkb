@@ -31,7 +31,7 @@ use crate::domain::SearchResult;
 use crate::metrics::{
     UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
 };
-use crate::store::memory::{get_warmup_index, search_entries_fts};
+use crate::store::memory::{get_warmup_entries, search_entries_fts};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::mcp_error;
@@ -1918,14 +1918,98 @@ fn for_each_ancestor_conn<F: FnMut(&rusqlite::Connection)>(primary_root: &std::p
     }
 }
 
-/// Extract the memory id from a warmup line (`[type] id: title #tags`).
-fn warmup_line_id(line: &str) -> &str {
-    line.split_once("] ")
-        .map(|(_, rest)| rest)
-        .unwrap_or(line)
-        .split_once(':')
-        .map(|(id, _)| id.trim())
-        .unwrap_or(line)
+/// Minimum confidence for a prior to be treated as "curated" — the threshold
+/// the recall gate and the warmup reserved-prior slot both key off.
+const PRIOR_CONFIDENCE_GATE: f64 = 0.7;
+
+/// True when `entry` is a `Prior` whose confidence at `now` clears the gate.
+fn is_high_confidence_prior(entry: &crate::store::memory::MemoryEntry, now: i64) -> bool {
+    entry.entry_type == crate::store::memory::EntryType::Prior
+        && entry.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
+}
+
+/// Merge ancestor-store entries into an already-populated primary `merged` Vec.
+///
+/// Cross-store global ranking: candidates are gathered from every ancestor
+/// WITHOUT per-store truncation, deduped by id (primary entries already in
+/// `merged` win — their ids seed `seen`), and `keep` decides per-entry
+/// eligibility. The caller ranks and truncates the combined Vec afterwards, so
+/// a high-confidence ancestor entry can never be starved by a full primary set.
+fn merge_ancestor_entries<F>(
+    primary_root: &std::path::Path,
+    fts_query: &str,
+    fetch_limit: usize,
+    merged: &mut Vec<crate::store::memory::MemoryEntry>,
+    keep: F,
+) where
+    F: Fn(&crate::store::memory::MemoryEntry) -> bool,
+{
+    let mut seen: std::collections::HashSet<String> =
+        merged.iter().map(|e| e.id.clone()).collect();
+    for_each_ancestor_conn(primary_root, |conn| {
+        if let Ok(anc) = search_entries_fts(conn, fts_query, fetch_limit) {
+            for e in anc {
+                if !keep(&e) {
+                    continue;
+                }
+                if seen.insert(e.id.clone()) {
+                    merged.push(e);
+                }
+            }
+        }
+    });
+}
+
+/// Rank merged warmup entries: drop sub-floor entries (when `min_confidence`
+/// > 0.0), order by `access_count DESC` with `confidence_at` as tie-breaker,
+/// reserve at most one slot for the single highest-confidence curated prior
+/// (confidence >= gate) so it can appear without crowding out hot entries, then
+/// truncate to `limit`.
+fn rank_warmup_entries(
+    mut entries: Vec<crate::store::memory::MemoryEntry>,
+    limit: usize,
+    min_confidence: f64,
+    now: i64,
+) -> Vec<crate::store::memory::MemoryEntry> {
+    if min_confidence > 0.0 {
+        entries.retain(|e| e.confidence_at(now) >= min_confidence);
+    }
+
+    // Primary sort: access_count DESC, confidence_at as tie-breaker.
+    entries.sort_by(|a, b| {
+        b.access_count.cmp(&a.access_count).then_with(|| {
+            b.confidence_at(now)
+                .partial_cmp(&a.confidence_at(now))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    });
+
+    if entries.len() <= limit {
+        return entries;
+    }
+
+    // Reserve at most one slot for the single highest-confidence curated prior:
+    // if it would be truncated away, swap it into the last kept slot so a
+    // curated prior surfaces without displacing more than one hot entry.
+    let best_prior = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| is_high_confidence_prior(e, now))
+        .max_by(|(_, a), (_, b)| {
+            a.confidence_at(now)
+                .partial_cmp(&b.confidence_at(now))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|(idx, _)| idx);
+
+    if let Some(idx) = best_prior {
+        if idx >= limit {
+            entries.swap(limit - 1, idx);
+        }
+    }
+
+    entries.truncate(limit);
+    entries
 }
 
 pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
@@ -1942,34 +2026,40 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
         None => return json!({}),
     };
     let limit = cfg.warmup_limit.max(1);
-    let mut lines = match get_warmup_index(conn, limit) {
-        Ok(l) => l,
+    let (due_lines, mut entries) = match get_warmup_entries(conn, limit) {
+        Ok(v) => v,
         Err(e) => {
-            tracing::warn!("hook.session_start: get_warmup_index failed: {e}");
+            tracing::warn!("hook.session_start: get_warmup_entries failed: {e}");
             return json!({});
         }
     };
     drop(ctx_guard);
 
     // Layer in ancestor stores (read-only): a nested project inherits its
-    // parent's warmup. Primary entries win on id collision; result is capped.
+    // parent's warmup. Gather primary + every ancestor's entries into ONE Vec
+    // with NO per-store truncation, deduped by id (primary wins). Ranking and
+    // truncation happen globally below, so a high-confidence ancestor entry is
+    // never starved by a full primary set. Due reminders are handled separately.
     let mut seen: std::collections::HashSet<String> =
-        lines.iter().map(|l| warmup_line_id(l).to_string()).collect();
+        entries.iter().map(|e| e.id.clone()).collect();
     for_each_ancestor_conn(&handle.root, |conn| {
-        if lines.len() >= limit {
-            return;
-        }
-        if let Ok(anc_lines) = get_warmup_index(conn, limit) {
-            for line in anc_lines {
-                if lines.len() >= limit {
-                    break;
-                }
-                if seen.insert(warmup_line_id(&line).to_string()) {
-                    lines.push(line);
+        if let Ok((_, anc_entries)) = get_warmup_entries(conn, limit) {
+            for e in anc_entries {
+                if seen.insert(e.id.clone()) {
+                    entries.push(e);
                 }
             }
         }
     });
+
+    // Global rank: confidence floor (off at 0.0), access_count DESC primary with
+    // confidence tie-break, one reserved slot for the top curated prior.
+    let now = chrono::Utc::now().timestamp();
+    let ranked = rank_warmup_entries(entries, limit, cfg.warmup_min_confidence, now);
+
+    // Due reminders lead (preserved verbatim); ranked entries follow.
+    let mut lines = due_lines;
+    lines.extend(ranked.iter().map(crate::store::memory::format_warmup_line));
 
     if lines.is_empty() {
         return json!({});
@@ -2076,35 +2166,27 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
         // prior-specific gate: only high-confidence priors surface
         let now = chrono::Utc::now().timestamp();
         results.retain(|e| {
-            e.entry_type != crate::store::memory::EntryType::Prior || e.confidence_at(now) >= 0.7
+            e.entry_type != crate::store::memory::EntryType::Prior
+                || e.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
         });
         results = apply_min_confidence(results, Some(cfg.min_recall_score));
 
         // Layer in ancestor stores (read-only): a nested project also recalls
-        // its parent's memory. Primary entries win on id collision; capped.
-        // Ancestor FTS now includes priors too, so apply the same prior gate.
-        let mut seen: std::collections::HashSet<String> =
-            results.iter().map(|e| e.id.clone()).collect();
-        for_each_ancestor_conn(&handle.root, |conn| {
-            if results.len() >= limit {
-                return;
-            }
-            if let Ok(anc) = search_entries_fts(conn, q, limit) {
-                for e in anc {
-                    if results.len() >= limit {
-                        break;
-                    }
-                    if e.entry_type == crate::store::memory::EntryType::Prior
-                        && e.confidence_at(now) < 0.7
-                    {
-                        continue;
-                    }
-                    if seen.insert(e.id.clone()) {
-                        results.push(e);
-                    }
-                }
-            }
+        // its parent's memory. Gather primary + every ancestor's matches into
+        // ONE Vec with NO per-store truncation, deduped by id (primary wins),
+        // then rank globally and truncate — so a high-confidence ancestor prior
+        // is never starved by a full primary set. Ancestor FTS includes priors,
+        // so the same prior gate applies to ancestor entries.
+        merge_ancestor_entries(&handle.root, q, limit, &mut results, |e| {
+            e.entry_type != crate::store::memory::EntryType::Prior
+                || e.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
         });
+
+        // Global rank: float high-confidence priors to the top WITHOUT
+        // scrambling the rest (stable sort on a boolean key preserves the
+        // existing relevance order within each group). THEN truncate to limit.
+        results.sort_by_key(|e| !is_high_confidence_prior(e, now));
+        results.truncate(limit);
     }
 
     if results.is_empty() && !wants_cg {
@@ -2742,6 +2824,138 @@ mod tests {
         assert!(
             !body.contains("prior-proof-low"),
             "low-confidence prior must be gated out of recall: {body}"
+        );
+    }
+
+    /// Seed a Topic entry with caller-supplied content (so it can match a
+    /// recall/warmup query) and an explicit `access_count` (so warmup ranking
+    /// can be exercised deterministically).
+    async fn seed_topic_with_content(
+        handle: &RepoHandle,
+        id: &str,
+        content: &str,
+        access_count: u64,
+    ) {
+        ensure_handle_context(handle).await.expect("init ctx");
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let entry = crate::store::memory::MemoryEntry {
+            id: id.to_string(),
+            title: format!("Title for {id}"),
+            content: content.to_string(),
+            entry_type: crate::store::memory::EntryType::Topic,
+            tags: vec![],
+            status: crate::store::memory::EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count,
+            last_accessed: Some(now),
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: crate::store::memory::SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed topic");
+    }
+
+    /// Build a primary store nested under `parent_tmp` and return its handle.
+    fn nested_primary(parent_tmp: &TempDir, name: &str) -> Arc<RepoHandle> {
+        let nested_root = parent_tmp.path().join(name);
+        std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
+        Arc::new(RepoHandle::from_shared(
+            nested_root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Config::default(),
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ))
+    }
+
+    /// Starvation proof: a curated high-confidence prior living ONLY in the
+    /// ancestor store must still surface even when the child's own entries
+    /// already fill the recall quota. Under the old append-then-cap merge the
+    /// ancestor prior was dropped; global cross-store ranking floats it up.
+    #[tokio::test]
+    async fn recall_surfaces_ancestor_prior_despite_full_child_quota() {
+        let tmp = TempDir::new().unwrap();
+
+        // Parent (ancestor) holds the curated high-confidence prior.
+        let parent = make_handle(&tmp);
+        seed_prior_entry(&parent, "ancestor-curated-prior", 8).await;
+
+        // Child fills the entire recall quota with matching entries.
+        let primary = nested_primary(&tmp, "nested-repo");
+        let limit = primary.config.hooks.recall_limit.max(1);
+        for i in 0..(limit + 2) {
+            seed_topic_with_content(
+                &primary,
+                &format!("child-topic-{i}"),
+                "Use ripgrep or grep for codebase searches.",
+                0,
+            )
+            .await;
+        }
+
+        let out = hook_user_prompt_submit_impl(
+            &primary,
+            "should I use ripgrep or grep for codebase searches",
+        )
+        .await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            body.contains("ancestor-curated-prior"),
+            "ancestor prior starved by full child quota — global rank broken: {body}"
+        );
+    }
+
+    /// Warmup counterpart: with a confidence floor configured, a curated
+    /// ancestor prior is reserved into warmup even when the child has hotter
+    /// (higher access_count) entries that would otherwise fill the limit.
+    #[tokio::test]
+    async fn warmup_reserves_ancestor_prior_under_confidence_floor() {
+        let tmp = TempDir::new().unwrap();
+
+        // Parent (ancestor) holds the curated high-confidence prior.
+        let parent = make_handle(&tmp);
+        seed_prior_entry(&parent, "ancestor-warmup-prior", 8).await;
+
+        // Child: warmup_limit hot entries (high access_count) that would fill
+        // every slot, plus a tight warmup_limit and a confidence floor.
+        let nested_root = tmp.path().join("warmup-nested");
+        std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
+        let mut cfg = Config::default();
+        cfg.hooks.warmup_limit = 3;
+        cfg.hooks.warmup_min_confidence = 0.3;
+        let primary = Arc::new(RepoHandle::from_shared(
+            nested_root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            cfg,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        for i in 0..5 {
+            seed_topic_with_content(&primary, &format!("hot-{i}"), "hot entry content", 100).await;
+        }
+
+        let out = hook_session_start_impl(&primary).await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            body.contains("ancestor-warmup-prior"),
+            "curated ancestor prior missing from warmup reserved slot: {body}"
         );
     }
 

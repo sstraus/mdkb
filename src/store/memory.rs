@@ -1061,15 +1061,24 @@ pub fn get_rowid(conn: &Connection, id: &str) -> Result<Option<i64>> {
 /// Max due reminders shown inline before collapsing into a summary line.
 const DUE_REMINDER_CAP: usize = 10;
 
-/// Get warmup index - compact list of top entries by access count.
-///
-/// Due reminders (entry_type='reminder' AND due_at <= now) are surfaced first,
-/// sorted oldest-first, capped at DUE_REMINDER_CAP with an overflow summary line.
-/// Standard entries follow, excluding reminders entirely (future reminders are
-/// silent, surfaced reminders are already rendered above).
-pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> {
-    let now = Utc::now().timestamp();
+/// Render a single warmup entry into the `[type] id: title #tags` line used by
+/// both the formatted index and the hook body.
+pub fn format_warmup_line(entry: &MemoryEntry) -> String {
+    let tags_str = entry
+        .tags
+        .iter()
+        .map(|t| format!("#{t}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!(
+        "[{}] {}: {} {}",
+        entry.entry_type, entry.id, entry.title, tags_str
+    )
+}
 
+/// Build the due-reminder warmup lines: active reminders past their `due_at`,
+/// oldest-first, capped at `DUE_REMINDER_CAP` with an overflow summary line.
+fn due_reminder_lines(conn: &Connection, now: i64) -> Result<Vec<String>> {
     let mut due_stmt = conn.prepare(
         "SELECT id, title, tags FROM memory_entries
          WHERE status = 'active'
@@ -1109,31 +1118,35 @@ pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> 
             "[reminder:DUE] ...and {extra} more overdue — use memory_list to see all"
         ));
     }
+    Ok(due_lines)
+}
+
+/// Warmup candidates as structured entries (priors INCLUDED) plus the
+/// pre-rendered due-reminder lines. Standard entries are ordered by
+/// `access_count DESC`, exclude reminders, and carry the confidence-relevant
+/// columns so callers can apply a confidence floor / reserved-prior policy.
+///
+/// The hook layer ranks and truncates these; `get_warmup_index` formats the
+/// non-prior subset into the legacy string contract.
+pub fn get_warmup_entries(
+    conn: &Connection,
+    limit: usize,
+) -> Result<(Vec<String>, Vec<MemoryEntry>)> {
+    let now = Utc::now().timestamp();
+    let due_lines = due_reminder_lines(conn, now)?;
 
     let mut stmt = conn.prepare(
-        "SELECT id, title, entry_type, tags FROM memory_entries
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
+         FROM memory_entries
          WHERE status = 'active'
-         AND entry_type NOT IN ('reminder', 'prior')
+         AND entry_type != 'reminder'
          AND (expires_at IS NULL OR expires_at > ?2)
          ORDER BY access_count DESC
          LIMIT ?1",
     )?;
 
-    let mut index: Vec<String> = due_lines;
-    let standard: Vec<String> = stmt
-        .query_map(params![limit as i64, now], |row| {
-            let id: String = row.get(0)?;
-            let title: String = row.get(1)?;
-            let entry_type: String = row.get(2)?;
-            let tags_json: String = row.get(3)?;
-            let tags: Vec<String> = serde_json::from_str(&tags_json).unwrap_or_default();
-            let tags_str = tags
-                .iter()
-                .map(|t| format!("#{t}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            Ok(format!("[{entry_type}] {id}: {title} {tags_str}"))
-        })?
+    let entries: Vec<MemoryEntry> = stmt
+        .query_map(params![limit as i64, now], row_to_entry)?
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
@@ -1142,8 +1155,25 @@ pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> 
             }
         })
         .collect();
-    index.extend(standard);
 
+    Ok((due_lines, entries))
+}
+
+/// Get warmup index - compact list of top entries by access count.
+///
+/// Due reminders (entry_type='reminder' AND due_at <= now) are surfaced first,
+/// sorted oldest-first, capped at DUE_REMINDER_CAP with an overflow summary line.
+/// Standard entries follow, excluding reminders AND priors (future reminders are
+/// silent, surfaced reminders are already rendered above; priors surface only
+/// through the confidence-gated hook path via `get_warmup_entries`).
+pub fn get_warmup_index(conn: &Connection, limit: usize) -> Result<Vec<String>> {
+    let (mut index, entries) = get_warmup_entries(conn, limit)?;
+    index.extend(
+        entries
+            .iter()
+            .filter(|e| e.entry_type != EntryType::Prior)
+            .map(format_warmup_line),
+    );
     Ok(index)
 }
 

@@ -358,6 +358,10 @@ pub struct HooksConfig {
     /// Minimum hybrid score for a recall result to be injected.
     pub min_recall_score: f64,
 
+    /// Minimum confidence for a warmup entry to be injected. `0.0` (default)
+    /// disables the floor — every access-ranked entry is eligible.
+    pub warmup_min_confidence: f64,
+
     /// Half-life for access-recency re-ranking in seconds (default 7 days).
     ///
     /// Controls how quickly the recency signal decays. Entries accessed more
@@ -381,6 +385,7 @@ impl Default for HooksConfig {
             recall_limit: 5,
             latency_budget_ms: 200,
             min_recall_score: 0.3,
+            warmup_min_confidence: 0.0,
             recall_half_life_secs: 7 * 24 * 60 * 60, // 7 days
             daemon_required: false,
         }
