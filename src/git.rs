@@ -421,14 +421,8 @@ mod tests {
         std::fs::create_dir_all(&drifted).unwrap();
 
         // No store, no git: hint (launch dir) wins over the drifted cwd.
-        assert_eq!(
-            resolve_project_root(&drifted, Some(&launch)),
-            launch
-        );
+        assert_eq!(resolve_project_root(&drifted, Some(&launch)), launch);
         // No hint either: fall back to cwd as-is.
-        assert_eq!(
-            resolve_project_root(&drifted, None),
-            drifted
-        );
+        assert_eq!(resolve_project_root(&drifted, None), drifted);
     }
 }

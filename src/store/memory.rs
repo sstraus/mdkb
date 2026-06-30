@@ -931,8 +931,18 @@ pub fn search_entries_hybrid_fts(
         if access_recency_weight > 0.0 {
             let now = Utc::now().timestamp();
             entries.sort_by(|a, b| {
-                let sa = access_recency_score(a.access_count, a.last_accessed, now, recency_half_life_secs);
-                let sb = access_recency_score(b.access_count, b.last_accessed, now, recency_half_life_secs);
+                let sa = access_recency_score(
+                    a.access_count,
+                    a.last_accessed,
+                    now,
+                    recency_half_life_secs,
+                );
+                let sb = access_recency_score(
+                    b.access_count,
+                    b.last_accessed,
+                    now,
+                    recency_half_life_secs,
+                );
                 sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
             });
         }
