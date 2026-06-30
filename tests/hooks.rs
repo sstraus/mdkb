@@ -14,3 +14,6 @@ mod user_prompt_submit_test;
 
 #[path = "hooks/post_tool_use_test.rs"]
 mod post_tool_use_test;
+
+#[path = "hooks/pre_tool_use_test.rs"]
+mod pre_tool_use_test;

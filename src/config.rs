@@ -372,6 +372,15 @@ pub struct HooksConfig {
     /// fallback (MDKB_NO_DAEMON=1). The generated shell command will NOT
     /// include the `if ! ...; then MDKB_NO_DAEMON=1 ...; fi` wrapper.
     pub daemon_required: bool,
+
+    /// On a definition Grep/Bash search (`fn X`, `struct X`, …), inject the real
+    /// `file:line` hits from the code index instead of a "use mdkb" suggestion.
+    /// Falls back to the suggestion when the symbol is not indexed.
+    pub code_hits_in_pretooluse: bool,
+
+    /// When the prompt names a document (path or `.md`), inject up to 3 one-hop
+    /// frontmatter graph neighbors (paths + relation labels) in UserPromptSubmit.
+    pub doc_graph_in_recall: bool,
 }
 
 impl Default for HooksConfig {
@@ -388,6 +397,8 @@ impl Default for HooksConfig {
             warmup_min_confidence: 0.0,
             recall_half_life_secs: 7 * 24 * 60 * 60, // 7 days
             daemon_required: false,
+            code_hits_in_pretooluse: true,
+            doc_graph_in_recall: true,
         }
     }
 }

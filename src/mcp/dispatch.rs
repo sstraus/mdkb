@@ -1902,16 +1902,17 @@ const MAX_ANCESTOR_LAYERS: usize = 4;
 /// surfaces stores a human/`init` already created above the primary (e.g. a
 /// nested git repo inheriting its parent repo's memory). Per-ancestor errors
 /// are logged and skipped so a missing/old ancestor can never break a read.
-fn for_each_ancestor_conn<F: FnMut(&rusqlite::Connection)>(primary_root: &std::path::Path, mut f: F) {
+fn for_each_ancestor_conn<F: FnMut(&rusqlite::Connection)>(
+    primary_root: &std::path::Path,
+    mut f: F,
+) {
     for anc in crate::git::discover_ancestor_stores(primary_root, MAX_ANCESTOR_LAYERS) {
         let db = anc.join(".mdkb/index.sqlite");
         if !db.exists() {
             continue;
         }
-        match rusqlite::Connection::open_with_flags(
-            &db,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        ) {
+        match rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        {
             Ok(conn) => f(&conn),
             Err(e) => tracing::debug!("layer: skipping ancestor {}: {e}", anc.display()),
         }
@@ -1944,8 +1945,7 @@ fn merge_ancestor_entries<F>(
 ) where
     F: Fn(&crate::store::memory::MemoryEntry) -> bool,
 {
-    let mut seen: std::collections::HashSet<String> =
-        merged.iter().map(|e| e.id.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = merged.iter().map(|e| e.id.clone()).collect();
     for_each_ancestor_conn(primary_root, |conn| {
         if let Ok(anc) = search_entries_fts(conn, fts_query, fetch_limit) {
             for e in anc {
@@ -2097,7 +2097,7 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
                 let age_days = (now - ts) / 86_400;
                 if age_days >= 7 {
                     body.push_str(&format!(
-                        "\n**⚠️ Code index is {age_days} days stale.** Run `{bin} code index --incremental` to refresh.\n"
+                        "\n**⚠️ Code index is {age_days} days stale.** Run `{bin} code index` to refresh.\n"
                     ));
                 }
             }
@@ -2125,8 +2125,17 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
 
     let wants_cg = prompt_wants_call_graph(prompt);
     let fts_query = build_recall_query(prompt);
+    // DEFERRED (2026-06-30) — memory→memory 1-hop expansion. Memories aren't in
+    // the graph (edges.source_doc_id FKs documents.id; memory ids are TEXT slugs
+    // with no documents row), so a memory_edges table + post-recall expansion is
+    // needed. Low yield at ~12 entries; revisit as the corpus grows.
+    let path_tokens = if cfg.doc_graph_in_recall {
+        crate::cli::hook_logic::path_like_tokens(prompt)
+    } else {
+        Vec::new()
+    };
 
-    if fts_query.is_none() && !wants_cg {
+    if fts_query.is_none() && !wants_cg && path_tokens.is_empty() {
         return json!({});
     }
 
@@ -2189,7 +2198,25 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
         results.truncate(limit);
     }
 
-    if results.is_empty() && !wants_cg {
+    // D — doc-graph neighbors: when the prompt names a document, surface its
+    // 1-hop frontmatter neighbors. Independent of memory recall, deduped against
+    // the (now finalized) memory ids about to be injected.
+    let mut related: Vec<String> = Vec::new();
+    if !path_tokens.is_empty() {
+        // The FTS leg already initialized the context if it ran; only ensure when
+        // it didn't (path-only prompt) so we don't re-acquire on the hot path.
+        let ctx_ready = fts_query.is_some() || ensure_handle_context(handle).await.is_ok();
+        if ctx_ready {
+            let ctx_guard = handle.ctx.lock().await;
+            if let Some(c) = ctx_guard.as_ref() {
+                let seen: std::collections::HashSet<String> =
+                    results.iter().map(|e| e.id.clone()).collect();
+                related = doc_graph_neighbors(&c.conn, &path_tokens, &seen, 3);
+            }
+        }
+    }
+
+    if results.is_empty() && related.is_empty() && !wants_cg {
         return json!({});
     }
 
@@ -2203,6 +2230,17 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
             body.push_str(&format!("- [{}] {} — {}\n", entry.id, entry.title, snippet));
         }
         body.push_str("\nIf your work corroborates any entry above, use `memory_confirm(id, outcome=\"confirmed\")` instead of writing a new one.\n");
+    }
+
+    if !related.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("## mdkb: related docs\n\n");
+        for line in &related {
+            body.push_str(line);
+            body.push('\n');
+        }
     }
 
     if wants_cg {
@@ -2221,6 +2259,61 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
             "additionalContext": body,
         }
     })
+}
+
+/// Resolve doc-path `tokens` to their 1-hop *frontmatter* graph neighbors that
+/// point at real documents, formatted as `- <path> (<relation>)` lines, capped
+/// at `cap`. Soft wikilink edges are skipped (frontmatter relations are the
+/// strong, curated signal) and so are non-document targets (entity tags like
+/// `themes`/`owner`). Neighbors whose canonical path is in `seen`
+/// (already-injected memory ids) or already emitted are de-duplicated.
+fn doc_graph_neighbors(
+    conn: &rusqlite::Connection,
+    tokens: &[String],
+    seen: &std::collections::HashSet<String>,
+    cap: usize,
+) -> Vec<String> {
+    use crate::store::graph;
+    let mut out: Vec<String> = Vec::new();
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for tok in tokens {
+        if out.len() >= cap {
+            break;
+        }
+        let Ok(Some(doc_id)) = graph::resolve_ref_to_doc(conn, tok) else {
+            continue;
+        };
+        let edges = match graph::get_outgoing(conn, doc_id, None) {
+            Ok(e) => e,
+            Err(e) => {
+                // Degrade silently (hooks must not block) but stay observable.
+                tracing::debug!("doc_graph_neighbors: get_outgoing({doc_id}) failed: {e}");
+                continue;
+            }
+        };
+        for edge in edges {
+            if out.len() >= cap {
+                break;
+            }
+            if edge.source_kind != graph::KIND_FRONTMATTER {
+                continue;
+            }
+            // Only emit targets that resolve to an actual indexed document, with
+            // their canonical path (so `[[b]]`, `b`, and `b.md` collapse to one
+            // node). Frontmatter also carries entity relations (owner, themes, …)
+            // whose targets are tags, not navigable docs — `resolve_to_path`
+            // returns None for those, keeping the "related docs" block honest.
+            // One resolution pass per edge.
+            let Ok(Some(path)) = graph::resolve_to_path(conn, &edge.target_ref) else {
+                continue;
+            };
+            if seen.contains(&path) || !emitted.insert(path.clone()) {
+                continue;
+            }
+            out.push(format!("- {} ({})", path, edge.relation));
+        }
+    }
+    out
 }
 
 pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
@@ -2252,7 +2345,7 @@ pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Valu
     json!({"queued": true})
 }
 
-pub fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
+pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
     if !handle.config.hooks.pre_tool_use_enabled {
         return json!({});
     }
@@ -2291,11 +2384,26 @@ pub fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
         _ => return json!({}),
     };
 
-    // DEFERRED (2026-06-07) — inject actual symbol hits (file:line) inline
-    // instead of a suggestion ("act, not suggest"). Gated on conversion data
-    // from the `mdkb_invocation` telemetry: only worth the code-index lookup on
-    // this hot-path hook if the plain suggestion proves not to convert.
-    match suggestion {
+    // "Act, not suggest": on a definition-classified search, inject the real
+    // code-index hits (file:line) and fall back to the suggestion only when the
+    // symbol is not indexed. Gated behind a flag and a cheap existence check so
+    // the hot path never opens/creates an index for non-definition searches.
+    let hits = if handle.config.hooks.code_hits_in_pretooluse {
+        match crate::cli::hook_logic::extract_definition_symbol(tool_name, tool_input) {
+            Some(sym) => code_index_hits(handle, &sym, 5).await,
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let text = match (hits, suggestion) {
+        (Some(block), _) => Some(block), // act
+        (None, Some(s)) => Some(s),      // fall back to suggest
+        (None, None) => None,
+    };
+
+    match text {
         Some(text) => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -2305,6 +2413,47 @@ pub fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
         }),
         None => json!({}),
     }
+}
+
+/// Up to `limit` indexed definitions of `symbol`, formatted as a PreToolUse
+/// context block of `file:line` hits. Returns `None` when the code index is
+/// absent or the symbol is unknown — the caller then falls back to the
+/// suggestion. The `.exists()` guard keeps the common "no code index" path free
+/// of DB initialization, so a project that never indexed code pays nothing here.
+/// (`acquire_handle_code_index` can still create the DB if it loses a race with a
+/// concurrent delete between the check and the open; that empty DB is benign —
+/// `find_symbols_by_name` returns nothing and we fall back to the suggestion.)
+async fn code_index_hits(handle: &RepoHandle, symbol: &str, limit: usize) -> Option<String> {
+    if !handle.root.join(".mdkb/code.sqlite").exists() {
+        return None;
+    }
+    let idx_guard = match acquire_handle_code_index(handle).await {
+        Ok(g) => g,
+        Err(e) => {
+            // Existing-but-unreadable index (corrupt/IO). Degrade to the
+            // suggestion, but stay observable rather than silently dead.
+            tracing::debug!("code_index_hits: failed to open code index for `{symbol}`: {e}");
+            return None;
+        }
+    };
+    let facade = idx_guard.as_ref()?;
+    let mut symbols = facade.find_symbols_by_name(symbol);
+    if symbols.is_empty() {
+        return None;
+    }
+    symbols.truncate(limit);
+    let mut block = format!("mdkb code index — `{symbol}` defined at:\n");
+    for s in &symbols {
+        // Stored ranges are 0-based (tree-sitter rows); display 1-based lines.
+        block.push_str(&format!(
+            "- {}:{} ({})\n",
+            s.file_path,
+            s.range.start_line + 1,
+            s.kind
+        ));
+    }
+    block.push_str("Read the definition directly instead of grepping.\n");
+    Some(block)
 }
 
 pub async fn dispatch_call(
@@ -2541,7 +2690,7 @@ pub async fn dispatch_call(
         }
         "hook.pre_tool_use" => {
             let t0 = std::time::Instant::now();
-            let result = hook_pre_tool_use_impl(&handle, &params);
+            let result = hook_pre_tool_use_impl(&handle, &params).await;
             let ms = t0.elapsed().as_millis() as u64;
             // "mdkb_invocation" is the conversion signal: a Bash command that
             // actually runs mdkb. Tracking it against "fired" measures whether
@@ -2740,7 +2889,10 @@ mod tests {
             .pointer("/hookSpecificOutput/additionalContext")
             .and_then(Value::as_str)
             .unwrap_or("");
-        assert!(body.contains("child-mem"), "primary recall entry missing: {body}");
+        assert!(
+            body.contains("child-mem"),
+            "primary recall entry missing: {body}"
+        );
         assert!(
             body.contains("parent-mem"),
             "ancestor recall entry missing — recall layering broken: {body}"
@@ -2812,7 +2964,8 @@ mod tests {
         }
 
         let out =
-            hook_user_prompt_submit_impl(&handle, "should I use ripgrep or grep for searches").await;
+            hook_user_prompt_submit_impl(&handle, "should I use ripgrep or grep for searches")
+                .await;
         let body = out
             .pointer("/hookSpecificOutput/additionalContext")
             .and_then(Value::as_str)
@@ -2982,7 +3135,8 @@ mod tests {
         .await;
 
         let out =
-            hook_user_prompt_submit_impl(&primary, "should I use ripgrep or grep for searches").await;
+            hook_user_prompt_submit_impl(&primary, "should I use ripgrep or grep for searches")
+                .await;
         let body = out
             .pointer("/hookSpecificOutput/additionalContext")
             .and_then(Value::as_str)
@@ -4039,7 +4193,7 @@ mod tests {
             "tool_name": "Grep",
             "tool_input": {"pattern": "handle_session_start"},
         });
-        let result = hook_pre_tool_use_impl(&handle, &event);
+        let result = hook_pre_tool_use_impl(&handle, &event).await;
         assert!(
             result.get("hookSpecificOutput").is_some(),
             "must suggest alternative for plain identifier"
@@ -4054,7 +4208,7 @@ mod tests {
             "tool_name": "Read",
             "tool_input": {"file_path": "src/lib.rs"},
         });
-        let result = hook_pre_tool_use_impl(&handle, &event);
+        let result = hook_pre_tool_use_impl(&handle, &event).await;
         assert_eq!(result, json!({}));
     }
 

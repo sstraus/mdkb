@@ -293,20 +293,128 @@ pub const DEF_KEYWORDS: &[&str] = &[
     "pub async fn ",
 ];
 
-pub fn classify_definition_search(pattern: &str, bin: &str) -> Option<String> {
+/// The bare symbol of a definition-search pattern (`fn Foo` -> `Foo`), or `None`
+/// when the pattern is not a definition search. Shared by the suggestion
+/// classifier and the code-index injector so both agree on what counts.
+pub fn definition_symbol(pattern: &str) -> Option<String> {
     let lower = pattern.to_lowercase();
     for kw in DEF_KEYWORDS {
         if lower.starts_with(kw) {
             let symbol = pattern[kw.len()..].trim();
             if symbol.len() >= 2 && symbol.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                return Some(format!(
-                    "Use `{} search --scope symbols \"{}\"` via Bash.",
-                    bin, symbol
-                ));
+                return Some(symbol.to_string());
             }
         }
     }
     None
+}
+
+pub fn classify_definition_search(pattern: &str, bin: &str) -> Option<String> {
+    definition_symbol(pattern).map(|symbol| {
+        format!(
+            "Use `{} search --scope symbols \"{}\"` via Bash.",
+            bin, symbol
+        )
+    })
+}
+
+/// Extract the bare definition symbol from a `Bash` `grep`/`rg` command's source
+/// stage (e.g. `rg "fn Foo" src/` -> `Foo`). Mirrors [`classify_bash_search`]'s
+/// pipeline/source parsing but yields the symbol rather than a suggestion.
+pub fn bash_definition_symbol(command: &str) -> Option<String> {
+    let unwrapped = unwrap_shell_c(command);
+    let command = unwrapped.as_deref().unwrap_or(command);
+    for source in pipeline_sources(command) {
+        let source = source.trim();
+        if source.is_empty() {
+            continue;
+        }
+        let mut tokens = tokenize_shell(source);
+        if tokens.first().map(String::as_str) == Some("rtk") && tokens.len() > 1 {
+            tokens.remove(0);
+        }
+        let Some((pattern, _path)) = extract_grep_pattern(&tokens) else {
+            continue;
+        };
+        if let Some(sym) = definition_symbol(&pattern) {
+            return Some(sym);
+        }
+    }
+    None
+}
+
+/// The indexed symbol a definition-classified Grep/Bash search is looking for,
+/// used to inject real `file:line` hits. Returns `None` for non-definition
+/// searches and non-search tools.
+pub fn extract_definition_symbol(tool_name: &str, tool_input: &Value) -> Option<String> {
+    match tool_name {
+        "Grep" => definition_symbol(tool_input.get("pattern")?.as_str()?),
+        "Bash" => bash_definition_symbol(tool_input.get("command")?.as_str()?),
+        _ => None,
+    }
+}
+
+/// Path-like tokens in a prompt that may name an indexed document: tokens
+/// ending in `.md`, containing a `/`, or written as a `[[wikilink]]`. Bare words
+/// are intentionally excluded — resolving every noun to a doc would be noise.
+pub fn path_like_tokens(prompt: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: &str| {
+        let s = s.trim();
+        if s.len() >= 3 && !out.iter().any(|e| e == s) {
+            out.push(s.to_string());
+        }
+    };
+
+    // `[[wikilink]]` targets resolve even without a `/` or `.md`.
+    for link in crate::domain::links::extract_wiki_links(prompt) {
+        push(&link.target);
+    }
+
+    // Whitespace tokens that look like a relative path or a `.md` file. Strip
+    // surrounding punctuation (quotes, backticks, parens, commas) while keeping
+    // the path characters.
+    for raw in prompt.split_whitespace() {
+        // A path token starts and ends with an alphanumeric (filenames/dirs do),
+        // so trimming every boundary non-alphanumeric strips wrapping quotes,
+        // backticks, parens, and trailing sentence punctuation while keeping the
+        // interior `/ . _ -`.
+        let tok = raw.trim_matches(|c: char| !c.is_alphanumeric());
+        if looks_like_doc_ref(tok) {
+            push(tok);
+            // Prompt paths are usually repo-root-relative (`docs/a.md`) while
+            // stored doc paths are collection-relative (`a.md`). Offer the
+            // basename as a fallback candidate so resolution bridges the gap.
+            if let Some(base) = tok.rsplit('/').next() {
+                if base != tok {
+                    push(base);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Whether a whitespace token plausibly names a markdown document: a `.md` file,
+/// or a `/`-path whose last component is extensionless (`docs/architecture`).
+/// A `/`-path with a non-markdown extension (`src/main.rs`) is rejected so prose
+/// that mentions source files doesn't trigger doc-graph resolution on the hot
+/// path. Documents are markdown, so this loses nothing.
+fn looks_like_doc_ref(tok: &str) -> bool {
+    if tok.ends_with(".md") {
+        return true;
+    }
+    if !tok.contains('/') {
+        return false;
+    }
+    match tok
+        .rsplit('/')
+        .next()
+        .and_then(|last| last.rsplit_once('.'))
+    {
+        Some((_, ext)) => ext.eq_ignore_ascii_case("md"),
+        None => true, // extensionless last component, e.g. `docs/architecture`
+    }
 }
 
 /// Minimal shell tokenizer: splits on whitespace, respecting single and double
@@ -878,5 +986,87 @@ mod tests {
         // Substring, not the command — must not false-positive.
         assert!(!is_mdkb_invocation("cat mdkb-notes.txt"));
         assert!(!is_mdkb_invocation("echo mdkb"));
+    }
+
+    // ── definition_symbol / extract_definition_symbol ─────────────────────
+
+    #[test]
+    fn definition_symbol_extracts_bare_name() {
+        assert_eq!(
+            definition_symbol("fn handle_auth").as_deref(),
+            Some("handle_auth")
+        );
+        assert_eq!(
+            definition_symbol("pub struct RepoHandle").as_deref(),
+            Some("RepoHandle")
+        );
+        assert_eq!(definition_symbol("async fn run").as_deref(), Some("run"));
+    }
+
+    #[test]
+    fn definition_symbol_rejects_non_definitions() {
+        // No definition keyword.
+        assert_eq!(definition_symbol("handle_auth"), None);
+        // Keyword but non-identifier remainder (regex/callsite).
+        assert_eq!(definition_symbol("fn foo("), None);
+        // Single-char symbol below the threshold.
+        assert_eq!(definition_symbol("fn x"), None);
+    }
+
+    #[test]
+    fn extract_definition_symbol_grep_and_bash() {
+        let grep = serde_json::json!({"pattern": "fn handle_auth"});
+        assert_eq!(
+            extract_definition_symbol("Grep", &grep).as_deref(),
+            Some("handle_auth")
+        );
+        let bash = serde_json::json!({"command": "rg \"struct Foo\" src/"});
+        assert_eq!(
+            extract_definition_symbol("Bash", &bash).as_deref(),
+            Some("Foo")
+        );
+        // A pipe-filter (stdin) grep is not a codebase search.
+        let pipe = serde_json::json!({"command": "cat x | grep \"fn Foo\""});
+        assert_eq!(extract_definition_symbol("Bash", &pipe), None);
+        // Non-search tool.
+        let read = serde_json::json!({"file_path": "src/lib.rs"});
+        assert_eq!(extract_definition_symbol("Read", &read), None);
+    }
+
+    // ── path_like_tokens ──────────────────────────────────────────────────
+
+    #[test]
+    fn path_like_tokens_detects_paths_and_md() {
+        let toks = path_like_tokens("please open docs/architecture.md now");
+        assert!(toks.contains(&"docs/architecture.md".to_string()));
+        // Basename fallback for collection-relative stored paths.
+        assert!(toks.contains(&"architecture.md".to_string()));
+    }
+
+    #[test]
+    fn path_like_tokens_handles_wikilinks_and_punctuation() {
+        let toks = path_like_tokens("see [[design/auth]] and `notes.md`.");
+        assert!(toks.contains(&"design/auth".to_string()));
+        assert!(toks.contains(&"notes.md".to_string()));
+    }
+
+    #[test]
+    fn path_like_tokens_ignores_bare_words() {
+        // Plain prose has no path/.md tokens — must not resolve nouns to docs.
+        assert!(path_like_tokens("how does the authentication system work").is_empty());
+    }
+
+    #[test]
+    fn path_like_tokens_excludes_non_markdown_code_paths() {
+        // Source-file mentions must NOT become doc-resolution candidates.
+        let toks = path_like_tokens("edit src/main.rs and pkg/handler.go to fix it");
+        assert!(
+            toks.is_empty(),
+            "non-markdown code paths must be excluded, got: {toks:?}"
+        );
+        // …but an extensionless path is still a plausible doc reference.
+        let toks = path_like_tokens("see docs/architecture for the overview");
+        assert!(toks.contains(&"docs/architecture".to_string()));
+        assert!(toks.contains(&"architecture".to_string()));
     }
 }

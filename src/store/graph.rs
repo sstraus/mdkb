@@ -204,6 +204,18 @@ fn doc_relative_path(conn: &Connection, doc_id: i64) -> Result<Option<String>> {
     Ok(path)
 }
 
+/// Resolve `reference` to the canonical `relative_path` of an indexed document,
+/// or `None` when it does not resolve to a real document (dangling reference or
+/// an entity tag like `themes`/`owner`). One resolution pass — callers that need
+/// "is this a real doc, and what's its path?" should use this instead of pairing
+/// [`resolve_ref_to_doc`] with [`canonical_key`] (which would resolve twice).
+pub fn resolve_to_path(conn: &Connection, reference: &str) -> Result<Option<String>> {
+    match resolve_ref_to_doc(conn, reference)? {
+        Some(doc_id) => doc_relative_path(conn, doc_id),
+        None => Ok(None),
+    }
+}
+
 /// The canonical node key for a reference: a resolved document's `relative_path`,
 /// or the raw reference for a dangling target. Canonical keying lets traversal
 /// treat `[[projects/x]]` and `projects/x.md` as the same node.

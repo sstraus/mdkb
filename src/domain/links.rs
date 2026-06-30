@@ -1,6 +1,21 @@
 //! Wiki-link parsing and normalization.
 
+use std::sync::OnceLock;
+
 use regex::Regex;
+
+/// Compiled once: `[[target]]` / `[[target|display]]`. `extract_wiki_links` runs
+/// on the UserPromptSubmit hot path, so the regexes must not recompile per call.
+fn link_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\[\[([^\]\|]+)(?:\|([^\]]+))?\]\]").unwrap())
+}
+
+/// Compiled once: inline-code spans to strip before link extraction.
+fn inline_code_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"`[^`]+`").unwrap())
+}
 
 /// A parsed wiki-link from markdown content.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +34,7 @@ pub struct WikiLink {
 pub fn extract_wiki_links(content: &str) -> Vec<WikiLink> {
     let mut links = Vec::new();
 
-    // Regex for wiki-links: [[target]] or [[target|display]]
-    let link_regex = Regex::new(r"\[\[([^\]\|]+)(?:\|([^\]]+))?\]\]").unwrap();
+    let link_regex = link_regex();
 
     // Track code blocks and inline code to skip them
     let mut in_code_block = false;
@@ -61,8 +75,7 @@ pub fn extract_wiki_links(content: &str) -> Vec<WikiLink> {
 
 /// Remove inline code (backtick-wrapped) from a line.
 fn remove_inline_code(line: &str) -> String {
-    let inline_code_regex = Regex::new(r"`[^`]+`").unwrap();
-    inline_code_regex.replace_all(line, "").to_string()
+    inline_code_regex().replace_all(line, "").to_string()
 }
 
 /// Normalize a wiki-link target to a relative path.

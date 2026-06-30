@@ -13,10 +13,12 @@ from stale training data. Hooks make recall proactive:
 - **SessionStart** — inject a warmup block listing recently-accessed
   memory entries as soon as a session opens.
 - **UserPromptSubmit** — match the user's prompt against the memory FTS
-  index and inject the top-N entries before the assistant replies.
-- **PreToolUse** — intercept `Grep` calls and suggest `mdkb search` /
-  `mdkb code` CLI commands when the pattern looks like an identifier or
-  definition search. Works without MCP.
+  index and inject the top-N entries before the assistant replies; when the
+  prompt names a document, also inject its 1-hop frontmatter doc-graph
+  neighbors.
+- **PreToolUse** — intercept `Grep`/`Bash` searches; on a definition search for
+  an indexed symbol inject the real `file:line` from the code index, otherwise
+  suggest `mdkb search` / `mdkb code` CLI commands. Works without MCP.
 - **PostToolUse** — when `Edit` / `Write` / `MultiEdit` / `NotebookEdit`
   touches a file, append it to `.mdkb/reindex-queue.jsonl` so the next
   `mdkb update` pass picks it up.
@@ -102,6 +104,21 @@ Output (when matches are found):
 }
 ```
 
+**Doc-graph neighbors.** When the prompt names a document — a `.md` token, a
+`/`-path, or a `[[wikilink]]` — the handler resolves it and appends up to 3
+one-hop **frontmatter** graph neighbors that resolve to real documents, as a
+compact `## mdkb: related docs` block (paths + relation labels only, no bodies).
+Soft body-wikilink edges and non-document targets (e.g. `themes`, `owner` tags)
+are skipped, and neighbors already surfaced as memory results are de-duplicated.
+Controlled by `doc_graph_in_recall` (default `true`).
+
+```
+## mdkb: related docs
+
+- data-model.md (related)
+- auth-design.md (related)
+```
+
 ### PreToolUse
 
 Input (either the `Grep` tool or a `Bash` command):
@@ -131,25 +148,30 @@ skipped.
 
 The extracted pattern is then classified:
 
+- **Definition search** (e.g. `fn handle_auth`, `struct RepoHandle`) → if the
+  symbol is in the code index, injects the real `file:line` hits ("act, not
+  suggest"); otherwise falls back to suggesting `mdkb search --scope symbols`.
+  Controlled by `code_hits_in_pretooluse` (default `true`).
 - **Pure identifier** (e.g. `handleAuth`) → suggests `mdkb search --scope symbols`
-- **Definition search** (e.g. `func handleAuth`, `fn handle_auth`) →
-  suggests `mdkb code callers`
 - **Callsite pattern** (e.g. `handleAuth(`) → suggests `mdkb code callers`
 - **Other patterns** (regex, alternation, single-file) → no suggestion (returns `{}`)
 
-Output (when a suggestion applies):
+Output (definition search, symbol indexed — the "act" case):
 
 ```json
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
-    "additionalContext": "Use '/path/to/mdkb search --scope symbols \"handleAuth\"' via Bash.\n"
+    "permissionDecision": "allow",
+    "additionalContext": "mdkb code index — `handle_auth` defined at:\n- src/auth.rs:42 (Function)\nRead the definition directly instead of grepping.\n"
   }
 }
 ```
 
-The binary path is resolved via `current_exe()` so suggestions work
-regardless of installation location.
+The code-index lookup only fires for definition-classified searches and is
+skipped entirely when `.mdkb/code.sqlite` is absent, so non-symbol searches
+never pay for a DB open. The binary path is resolved via `current_exe()` so
+fallback suggestions work regardless of installation location.
 
 ### PostToolUse
 
@@ -193,11 +215,22 @@ latency_budget_ms = 200
 
 # Minimum hybrid score for a recall result to be injected.
 min_recall_score = 0.3
+
+# PreToolUse: inject real code-index file:line hits for definition
+# searches (fn/struct/…) instead of a suggestion. Falls back to the
+# suggestion when the symbol is not indexed.
+code_hits_in_pretooluse = true
+
+# UserPromptSubmit: inject up to 3 one-hop frontmatter doc-graph
+# neighbors when the prompt names a document.
+doc_graph_in_recall = true
 ```
 
 Defaults are safe for interactive use; tune `recall_limit` higher if
 you want more context, lower if the assistant is getting too much
-noise on every prompt.
+noise on every prompt. `code_hits_in_pretooluse` and
+`doc_graph_in_recall` independently kill the two graph/index injectors
+if you want the plain suggestion / memory-only behavior.
 
 ## Opt out
 
