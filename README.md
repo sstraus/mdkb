@@ -10,6 +10,14 @@ mdkb indexes your project's docs, source code, and persistent knowledge into a l
 
 No cloud APIs. No token-heavy context dumps. Just fast, local, relevant retrieval.
 
+## Why mdkb
+
+- **Persistent across sessions, not a snapshot** — decisions, problems, and behavioral `prior`s carry over between conversations, with Bayesian confidence that decays over time and is reinforced on access. The knowledge graph captures *what your project is now*; mdkb also remembers *what you learned and decided*.
+- **Proactive — no tool call required** — relevant context is injected automatically at session start, on each prompt, and before code searches via lifecycle hooks. Value doesn't depend on the AI remembering to query a tool.
+- **Fully local, nothing leaves the machine** — no cloud APIs, no query logging, SQLite on disk, relative paths only. Safe for private and regulated repos.
+- **Code intelligence is a graph, not just text** — tree-sitter call graphs answer callers / callees / impact across 13 languages, deterministically and offline.
+- **One Rust binary, zero config** — auto-indexes on startup, watches for changes, self-repairs the index. No runtime, no daemon to babysit.
+
 ## What it does
 
 - **Hybrid search** — BM25 + semantic vectors over your markdown docs
