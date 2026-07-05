@@ -81,8 +81,12 @@ permissionDecision/caps/wikilink). The following were deferred:
 - **Complexity:** M.
 - **Priority:** P3 (validate demand via telemetry first).
 
-## 3. Memory→memory graph edges (the original option B)
+## 3. Memory→memory graph edges (the original option B) — ✅ DONE
 
+- **Status:** Shipped via `plans/memory-edges-phase23.md` (schema v14 `memory_edges`, typed edges,
+  `memory_write` `relates`/`on_conflict`, `graph scope=memory`, CLI `memory link`, provenance,
+  post-recall 1-hop expansion, `[STALE-DEP]` flag). The `DEFERRED (2026-06-30)` comment in
+  `hook_user_prompt_submit_impl` is lifted.
 - **Problem:** Memories are not nodes in the doc graph (`edges.source_doc_id` FKs `documents.id`;
   memory ids are TEXT slugs with no `documents` row), so 1-hop memory→memory expansion in recall
   is impossible without new storage. Marked `DEFERRED (2026-06-30)` in

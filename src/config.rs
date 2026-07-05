@@ -42,6 +42,9 @@ pub struct Config {
 
     /// Database maintenance.
     pub db: DbConfig,
+
+    /// AI-distilled behavioral-prior mining.
+    pub priors: PriorsConfig,
 }
 
 /// Indexing settings.
@@ -313,6 +316,7 @@ impl Default for Config {
             graph: GraphConfig::default(),
             hooks: HooksConfig::default(),
             db: DbConfig::default(),
+            priors: PriorsConfig::default(),
         }
     }
 }
@@ -329,6 +333,49 @@ impl Default for DbConfig {
     fn default() -> Self {
         Self {
             optimize_interval_calls: 200,
+        }
+    }
+}
+
+/// AI-distilled behavioral-prior mining settings.
+///
+/// The whole subsystem is a kill-switched opt-in: `mining_enabled` gates the
+/// Stop-hook episode→candidate→distill→promote pipeline, and it stays off until
+/// a `distiller_program` is configured (mdkb ships ONNX embeddings only, no chat
+/// model, so distillation requires an external agent CLI). Injection of already
+/// promoted priors is a separate, cheaper toggle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PriorsConfig {
+    /// Master kill switch for the mining pipeline (Stop-hook distillation). Off
+    /// by default: no episode is distilled until a human opts in.
+    pub mining_enabled: bool,
+
+    /// External agent CLI that distills a candidate episode into a prior (e.g.
+    /// `claude`). The prompt is piped on stdin. `None` disables mining even when
+    /// `mining_enabled` is true — there is no built-in chat model to fall back to.
+    pub distiller_program: Option<String>,
+
+    /// Arguments passed to `distiller_program` (e.g. `["-p"]` for headless mode).
+    pub distiller_args: Vec<String>,
+
+    /// Surface promoted, trigger-matched priors at PreToolUse / UserPromptSubmit.
+    /// Independent of `mining_enabled` so already-mined priors keep helping even
+    /// if further mining is paused.
+    pub injection_enabled: bool,
+
+    /// Hard cap on promoted priors injected into a single hook invocation.
+    pub max_injected_per_hook: usize,
+}
+
+impl Default for PriorsConfig {
+    fn default() -> Self {
+        Self {
+            mining_enabled: false,
+            distiller_program: None,
+            distiller_args: Vec::new(),
+            injection_enabled: true,
+            max_injected_per_hook: 1,
         }
     }
 }
@@ -1102,6 +1149,37 @@ threshold = 0.5
         config.code.semantic_search.threshold = -0.1;
         let result = config.validate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_priors_config_defaults_are_off_and_safe() {
+        let config = Config::default();
+        // Mining is a kill-switched opt-in: off, and no distiller wired.
+        assert!(!config.priors.mining_enabled);
+        assert!(config.priors.distiller_program.is_none());
+        assert!(config.priors.distiller_args.is_empty());
+        // Injecting already-promoted priors is safe/cheap and on by default,
+        // hard-capped so a hook can never flood context.
+        assert!(config.priors.injection_enabled);
+        assert_eq!(config.priors.max_injected_per_hook, 1);
+    }
+
+    #[test]
+    fn test_priors_config_roundtrips_through_toml() {
+        let toml = r#"
+[priors]
+mining_enabled = true
+distiller_program = "claude"
+distiller_args = ["-p"]
+max_injected_per_hook = 3
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.priors.mining_enabled);
+        assert_eq!(config.priors.distiller_program.as_deref(), Some("claude"));
+        assert_eq!(config.priors.distiller_args, vec!["-p".to_string()]);
+        assert_eq!(config.priors.max_injected_per_hook, 3);
+        // Unset field falls back to its default.
+        assert!(config.priors.injection_enabled);
     }
 
     #[test]

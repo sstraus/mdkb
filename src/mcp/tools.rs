@@ -110,6 +110,18 @@ pub struct MemoryWriteParams {
     #[serde(default)]
     pub due_in: Option<u64>,
 
+    /// Typed edges from this entry (max 10): [{relation, target, target_kind}].
+    #[serde(default)]
+    pub relates: Vec<RelatesInput>,
+
+    /// Authoring agent recorded as provenance (e.g. "claude", "codex").
+    #[serde(default)]
+    pub agent: Option<String>,
+
+    /// On near-duplicate conflict: omitted rejects (default); "contradicts" writes the entry and links it to the similar one with a contradicts edge.
+    #[serde(default)]
+    pub on_conflict: Option<String>,
+
     /// When true, validate and report the action without persisting.
     #[serde(default)]
     pub dry_run: bool,
@@ -121,6 +133,24 @@ fn default_entry_type() -> String {
 
 fn default_source_type() -> String {
     "user_statement".to_string()
+}
+
+fn default_target_kind() -> String {
+    "memory".to_string()
+}
+
+/// A typed relation to attach to a memory entry at write time.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct RelatesInput {
+    /// Relation: supports, contradicts, supersedes, derived_from, or relates_to.
+    pub relation: String,
+
+    /// Target: a memory entry slug, or a document relative path when target_kind is "doc".
+    pub target: String,
+
+    /// Target kind: "memory" (default) or "doc".
+    #[serde(default = "default_target_kind")]
+    pub target_kind: String,
 }
 
 /// A single memory entry within a batch write.
@@ -159,6 +189,18 @@ pub struct MemoryWriteBatchEntry {
     /// Reminder due time in seconds from now. Use with entry_type="reminder". Omit for non-reminders.
     #[serde(default)]
     pub due_in: Option<u64>,
+
+    /// Typed edges from this entry (max 10): [{relation, target, target_kind}].
+    #[serde(default)]
+    pub relates: Vec<RelatesInput>,
+
+    /// Authoring agent recorded as provenance (e.g. "claude", "codex").
+    #[serde(default)]
+    pub agent: Option<String>,
+
+    /// On near-duplicate conflict: omitted rejects (default); "contradicts" writes the entry and links it to the similar one with a contradicts edge.
+    #[serde(default)]
+    pub on_conflict: Option<String>,
 }
 
 /// Parameters for batch memory write.
@@ -286,6 +328,10 @@ pub struct GraphParams {
     /// Traversal depth when direction is "neighbors" (default: 1).
     #[serde(default = "default_graph_depth")]
     pub depth: u32,
+
+    /// Scope: "doc" (default, the document graph) or "memory" (the memory-entry graph).
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 fn default_graph_direction() -> String {

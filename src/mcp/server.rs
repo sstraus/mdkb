@@ -534,6 +534,13 @@ impl McpServer {
     }
 
     /// Record a tool call to persistent stats.
+    /// The current session id as a provenance string, or `None` before a session
+    /// is established (session_id == 0).
+    fn session_provenance(&self) -> Option<String> {
+        let id = self.session_id.load(Ordering::Relaxed);
+        (id > 0).then(|| id.to_string())
+    }
+
     async fn record_persistent_call(
         &self,
         tool_name: &str,
@@ -672,8 +679,14 @@ impl McpServer {
             source_type: params.source_type,
             ttl: params.ttl,
             due_in: params.due_in,
+            relates: params.relates,
+            agent: params.agent,
+            on_conflict: params.on_conflict,
         };
-        let output = super::dispatch::memory_write_impl(&handle, &entry, params.dry_run).await?;
+        let session = self.session_provenance();
+        let output =
+            super::dispatch::memory_write_impl(&handle, &entry, session.as_deref(), params.dry_run)
+                .await?;
 
         let tokens = count_tokens(&output);
         self.record_persistent_call("memory_write", tokens, 1, false)
@@ -692,9 +705,14 @@ impl McpServer {
         Parameters(params): Parameters<MemoryWriteBatchParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
-        let (output, count) =
-            super::dispatch::memory_write_batch_impl(&handle, &params.entries, params.dry_run)
-                .await?;
+        let session = self.session_provenance();
+        let (output, count) = super::dispatch::memory_write_batch_impl(
+            &handle,
+            &params.entries,
+            session.as_deref(),
+            params.dry_run,
+        )
+        .await?;
 
         let tokens = count_tokens(&output);
         self.record_persistent_call("memory_write_batch", tokens, count, false)
@@ -2232,6 +2250,9 @@ mod tests {
                 source_type: "user_statement".to_string(),
                 ttl: None,
                 due_in: None,
+                relates: vec![],
+                agent: None,
+                on_conflict: None,
                 root: None,
                 dry_run: false,
             }))
@@ -2320,6 +2341,9 @@ mod tests {
                 source_type: "user_statement".to_string(),
                 ttl: None,
                 due_in: None,
+                relates: vec![],
+                agent: None,
+                on_conflict: None,
                 root: None,
                 dry_run: false,
             })),
@@ -2560,6 +2584,9 @@ mod tests {
                 source_type: "user_statement".to_string(),
                 ttl: None,
                 due_in: None,
+                relates: vec![],
+                agent: None,
+                on_conflict: None,
                 root: None,
                 dry_run: false,
             }))
@@ -2577,6 +2604,9 @@ mod tests {
                 source_type: "user_statement".to_string(),
                 ttl: None,
                 due_in: None,
+                relates: vec![],
+                agent: None,
+                on_conflict: None,
                 root: None,
                 dry_run: false,
             }))
@@ -3412,6 +3442,9 @@ if (require.main === module) {
                 source_type: "user_statement".to_string(),
                 ttl: None,
                 due_in: None,
+                relates: vec![],
+                agent: None,
+                on_conflict: None,
                 root: None,
                 dry_run: false,
             }))
@@ -3440,6 +3473,9 @@ if (require.main === module) {
                 source_type: "user_statement".to_string(),
                 ttl: None,
                 due_in: None,
+                relates: vec![],
+                agent: None,
+                on_conflict: None,
                 root: None,
                 dry_run: false,
             }))
@@ -3915,6 +3951,9 @@ if (require.main === module) {
                         source_type: "user_statement".to_string(),
                         ttl: None,
                         due_in: None,
+                        relates: vec![],
+                        agent: None,
+                        on_conflict: None,
                     },
                     MemoryWriteBatchEntry {
                         id: "batch-b".to_string(),
@@ -3926,6 +3965,9 @@ if (require.main === module) {
                         source_type: "user_statement".to_string(),
                         ttl: None,
                         due_in: None,
+                        relates: vec![],
+                        agent: None,
+                        on_conflict: None,
                     },
                 ],
                 root: None,
@@ -3996,6 +4038,9 @@ if (require.main === module) {
                 source_type: "user_statement".to_string(),
                 ttl: None,
                 due_in: None,
+                relates: vec![],
+                agent: None,
+                on_conflict: None,
             })
             .collect();
 

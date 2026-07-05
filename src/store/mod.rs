@@ -9,6 +9,8 @@ pub mod hybrid;
 pub mod maintenance;
 pub mod memory;
 pub mod memory_file;
+pub mod memory_graph;
+pub mod priors;
 pub mod schema;
 pub mod search;
 pub mod stats;

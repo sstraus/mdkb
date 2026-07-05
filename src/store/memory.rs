@@ -88,6 +88,19 @@ pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &st
     Ok(())
 }
 
+/// Detect a mechanically-generated behavioral-prior "episode" — a raw tool
+/// chain with no distilled lesson, e.g. content like
+/// `Pattern: fix|tools:Edit->Bash->Bash|files:none|error_in:none`.
+///
+/// These carry zero reusable signal yet cost tokens on every injection. The
+/// caller rejects them at write time for `entry_type=prior`, superseding the
+/// legacy mechanical miner regardless of which producer emits them. Detection
+/// keys on the producer's signature segments (`|tools:` AND `error_in:`), which
+/// do not co-occur in a genuine, human/AI-authored prior.
+pub fn is_mechanical_prior_noise(content: &str) -> bool {
+    content.contains("|tools:") && content.contains("error_in:")
+}
+
 /// Source type for confidence weighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -367,6 +380,42 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Persist authorship provenance (session id, agent) for an entry.
+///
+/// Uses `COALESCE` so a `None` argument never clears an already-recorded value —
+/// callers pass only the fields they know. A call with both `None` is a no-op.
+pub fn set_provenance(
+    conn: &Connection,
+    id: &str,
+    session: Option<&str>,
+    agent: Option<&str>,
+) -> Result<()> {
+    if session.is_none() && agent.is_none() {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE memory_entries
+         SET created_session = COALESCE(?1, created_session),
+             created_agent   = COALESCE(?2, created_agent)
+         WHERE id = ?3",
+        params![session, agent, id],
+    )?;
+    Ok(())
+}
+
+/// Read authorship provenance `(created_session, created_agent)` for an entry.
+/// Returns `(None, None)` when the entry does not exist or has no provenance.
+pub fn get_provenance(conn: &Connection, id: &str) -> Result<(Option<String>, Option<String>)> {
+    let row = conn
+        .query_row(
+            "SELECT created_session, created_agent FROM memory_entries WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(row.unwrap_or((None, None)))
 }
 
 /// Confirm a memory entry — positive confidence signal.
@@ -2633,6 +2682,23 @@ mod tests {
     }
 
     #[test]
+    fn test_is_mechanical_prior_noise() {
+        // The legacy hud miner's signature: raw tool chain + error_in segment.
+        assert!(is_mechanical_prior_noise(
+            "Pattern: fix|tools:Edit->Bash->Bash|files:none|error_in:none\nOutcome: fix"
+        ));
+        assert!(is_mechanical_prior_noise(
+            "clean|tools:Read->Read|files:none|error_in:none"
+        ));
+        // A genuine distilled lesson must NOT be flagged.
+        assert!(!is_mechanical_prior_noise(
+            "Before editing src/generated/**, change the generator template and regenerate."
+        ));
+        // Mentioning one segment alone is not the mechanical signature.
+        assert!(!is_mechanical_prior_noise("The build tools: cargo, rustc."));
+    }
+
+    #[test]
     fn test_validate_entry_empty_id() {
         let err = validate_entry_input("", "Title", &[], "content").unwrap_err();
         assert!(err.to_string().contains("ID must be"), "{err}");
@@ -2972,6 +3038,43 @@ mod tests {
             expires_at: None,
             due_at: None,
         }
+    }
+
+    #[test]
+    fn test_provenance_roundtrip_and_coalesce() {
+        let conn = setup_db();
+        let entry = make_entry_at(1000, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        // Fresh entry has no provenance.
+        assert_eq!(get_provenance(&conn, "test").unwrap(), (None, None));
+
+        // Set both fields.
+        set_provenance(&conn, "test", Some("sess-42"), Some("wiz")).unwrap();
+        assert_eq!(
+            get_provenance(&conn, "test").unwrap(),
+            (Some("sess-42".to_string()), Some("wiz".to_string()))
+        );
+
+        // A later call with None for session must not clear the stored value (COALESCE).
+        set_provenance(&conn, "test", None, Some("codex")).unwrap();
+        assert_eq!(
+            get_provenance(&conn, "test").unwrap(),
+            (Some("sess-42".to_string()), Some("codex".to_string()))
+        );
+
+        // Both-None is a no-op.
+        set_provenance(&conn, "test", None, None).unwrap();
+        assert_eq!(
+            get_provenance(&conn, "test").unwrap(),
+            (Some("sess-42".to_string()), Some("codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_provenance_missing_entry_returns_none() {
+        let conn = setup_db();
+        assert_eq!(get_provenance(&conn, "nope").unwrap(), (None, None));
     }
 
     #[test]

@@ -150,6 +150,10 @@ fn user_prompt_submit_injects_relevant_memory() {
         ctx_block.contains("jwt-refresh-strategy"),
         "matching memory id must appear, got: {ctx_block}"
     );
+    assert!(
+        ctx_block.contains("(just now)"),
+        "recall lines must show relative age so stale context is visible, got: {ctx_block}"
+    );
     assert_eq!(
         parsed
             .get("hookSpecificOutput")

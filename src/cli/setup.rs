@@ -299,6 +299,7 @@ pub const HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
         Some("Edit|Write|NotebookEdit|MultiEdit"),
     ),
     ("PreToolUse", "pre-tool-use", Some("Grep|Bash")),
+    ("Stop", "stop", None),
 ];
 
 /// Single-quote shell escaping: wraps `s` in single quotes, escaping any
@@ -375,6 +376,7 @@ pub fn parse_disabled_events(raw: &str) -> std::collections::HashSet<String> {
             // DEFERRED (2026-04-20) — "pretooluse"/"pre-tool-use" not in HOOK_EVENTS yet;
             // alias kept so --disable pre-tool-use is silently accepted without error.
             "pretooluse" | "pre-tool-use" => "PreToolUse".to_string(),
+            "stop" => "Stop".to_string(),
             other => other.to_string(),
         })
         .collect()

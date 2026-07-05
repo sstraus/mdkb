@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 11;
+pub const SCHEMA_VERSION: i32 = 14;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -101,7 +101,9 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     last_confirmed_at INTEGER,        -- Timestamp of last confirmation
     source_type TEXT DEFAULT 'user_statement',  -- official_docs, user_statement, inference
     expires_at INTEGER,                        -- Unix timestamp; NULL = permanent
-    due_at INTEGER                             -- Unix timestamp; surfaces reminders at/after this time
+    due_at INTEGER,                            -- Unix timestamp; surfaces reminders at/after this time
+    created_session TEXT,                      -- session id that authored this entry (provenance)
+    created_agent TEXT                         -- agent/tool that authored this entry (provenance)
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
@@ -186,6 +188,63 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_doc_id);
 CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_ref);
 CREATE INDEX IF NOT EXISTS idx_edges_relation ON edges(relation);
+
+-- Behavioral prior clusters: deduped, promotable "when X do Y" lessons mined
+-- from sessions. A cluster accumulates recurrence evidence across sessions and
+-- is promoted into memory_entries (entry_type=prior) once it clears the gate.
+CREATE TABLE IF NOT EXISTS prior_clusters (
+    id TEXT PRIMARY KEY,                     -- canonical trigger-key hash
+    canonical_trigger_key TEXT NOT NULL,     -- normalized trigger identity (dedup key)
+    trigger_kind TEXT NOT NULL,              -- prompt|pre_tool|post_tool|stop|repo
+    trigger_matcher TEXT NOT NULL,           -- JSON: machine-matchable condition
+    lesson TEXT NOT NULL,                    -- imperative lesson, <=160 chars
+    scope TEXT NOT NULL,                     -- JSON: {repo, languages, paths}
+    evidence_count INTEGER NOT NULL DEFAULT 0,
+    distinct_sessions INTEGER NOT NULL DEFAULT 0,
+    injected_count INTEGER NOT NULL DEFAULT 0,
+    confirmed_count INTEGER NOT NULL DEFAULT 0,
+    refuted_count INTEGER NOT NULL DEFAULT 0,
+    state TEXT NOT NULL DEFAULT 'candidate',  -- candidate|promoted|refuted|expired
+    promoted_memory_id TEXT,                 -- memory_entries.id once promoted
+    created_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    FOREIGN KEY(promoted_memory_id) REFERENCES memory_entries(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prior_clusters_trigger ON prior_clusters(canonical_trigger_key);
+CREATE INDEX IF NOT EXISTS idx_prior_clusters_state ON prior_clusters(state);
+
+-- Individual observed episodes (one per session) feeding a cluster. Never
+-- injected directly; they accumulate into a cluster which may be promoted.
+CREATE TABLE IF NOT EXISTS prior_candidates (
+    id TEXT PRIMARY KEY,
+    cluster_id TEXT,                         -- assigned when merged into a cluster
+    state TEXT NOT NULL DEFAULT 'candidate',
+    trigger_kind TEXT NOT NULL,
+    trigger_matcher TEXT NOT NULL,           -- JSON
+    lesson TEXT NOT NULL,
+    scope TEXT NOT NULL,                     -- JSON
+    evidence_failure TEXT,
+    evidence_fix TEXT,
+    source_session TEXT,
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(cluster_id) REFERENCES prior_clusters(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prior_candidates_cluster ON prior_candidates(cluster_id);
+
+-- Typed memory graph edges: a relation from a memory entry to another memory
+-- entry or a document. source is always an existing memory (FK, cascade delete);
+-- target_ref is free text (memory slug or doc relative path) resolved at query
+-- time, dangling-tolerant like the doc `edges` table.
+CREATE TABLE IF NOT EXISTS memory_edges (
+    source_id   TEXT NOT NULL REFERENCES memory_entries(id) ON DELETE CASCADE,
+    target_ref  TEXT NOT NULL,                    -- memory slug or doc relative path
+    target_kind TEXT NOT NULL DEFAULT 'memory',   -- 'memory' | 'doc'
+    relation    TEXT NOT NULL,                    -- supports|contradicts|supersedes|derived_from|relates_to
+    created_at  INTEGER NOT NULL,
+    PRIMARY KEY (source_id, target_ref, relation)
+);
+CREATE INDEX IF NOT EXISTS idx_memedges_source ON memory_edges(source_id);
+CREATE INDEX IF NOT EXISTS idx_memedges_target ON memory_edges(target_ref);
 "#;
 
 /// SQL for setting BM25 column weights (title 10x, body 1x).
@@ -431,6 +490,56 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // Migration from v10 to v11: knowledge-graph edges table.
     // Table + indexes are created by SCHEMA_SQL with IF NOT EXISTS (runs on every
     // open), so existing databases pick it up here without an explicit DDL step.
+
+    // Migration from v11 to v12: purge legacy "System B" behavioral priors.
+    //
+    // A removed prior-generator minted one durable `prior` per session with a
+    // transcript-hash id (`prior-<16 hex>`) and a useless title/body
+    // (`fix: fix|tools:Edit->Bash->...`). The writer is gone, but the rows
+    // linger — many with no `expires_at`, so they never age out and get
+    // re-injected into every session's context, burning tokens for zero signal.
+    // This purge runs once per database on upgrade.
+    //
+    // The id pattern MUST be exactly `^prior-[0-9a-f]{16}$` (GLOB anchors the
+    // whole string, so the 16 char-classes also fix the length). This spares
+    // System-A priors (`prior-proof-*`) and hand-authored priors with slug ids
+    // (e.g. `canvas-terminal-dont-reinvent-xterm`). Deletes cascade to FTS,
+    // embeddings, and revisions via existing triggers/foreign keys.
+    if from_version < 12 {
+        conn.execute(
+            "DELETE FROM memory_entries
+             WHERE entry_type = 'prior'
+             AND id GLOB 'prior-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'",
+            [],
+        )?;
+    }
+
+    // Migration from v12 to v13: behavioral-prior mining tables (prior_clusters,
+    // prior_candidates). Created by SCHEMA_SQL with IF NOT EXISTS (runs on every
+    // open), so existing databases pick them up here without an explicit DDL step.
+
+    // Migration from v13 to v14: typed memory graph.
+    // The `memory_edges` table + indexes are created by SCHEMA_SQL with IF NOT
+    // EXISTS (runs on every open), so they are already present here. The
+    // provenance columns need explicit ALTER guarded on pragma_table_info.
+    if from_version < 14 {
+        let has_provenance: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'created_session'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !has_provenance {
+            conn.execute_batch(
+                r#"
+                ALTER TABLE memory_entries ADD COLUMN created_session TEXT;
+                ALTER TABLE memory_entries ADD COLUMN created_agent TEXT;
+                "#,
+            )?;
+        }
+    }
 
     // Update schema version
     conn.execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION])?;
@@ -1748,5 +1857,282 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM documents", [], |row| row.get(0))
             .unwrap();
         assert_eq!(doc_count, 1, "documents must survive the v10→v11 upgrade");
+    }
+
+    #[test]
+    fn test_migrate_v12_to_v13_creates_prior_tables() {
+        // Simulate a v12 database: initialise, drop the prior-mining tables, and
+        // roll the recorded version back to 12. Re-running init_schema must
+        // recreate them (via SCHEMA_SQL IF NOT EXISTS) and bump to 13.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).expect("initial init_schema failed");
+
+        conn.execute_batch(
+            "DROP TABLE prior_candidates; DROP TABLE prior_clusters;
+             UPDATE schema_version SET version = 12;",
+        )
+        .unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(12));
+
+        init_schema(&conn).expect("v12→v13 init_schema failed");
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        for table in ["prior_clusters", "prior_candidates"] {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+                    [table],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            assert!(exists, "{table} must exist after v12→v13 upgrade");
+        }
+    }
+
+    #[test]
+    fn test_migrate_v11_to_v12_purges_legacy_priors() {
+        // A v11 database polluted with legacy "System B" priors must have exactly
+        // those rows removed on upgrade — while System-A priors, hand-authored
+        // slug-id priors, and every non-prior entry survive untouched.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).expect("initial init_schema failed");
+
+        let insert = |id: &str, entry_type: &str| {
+            conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
+                 VALUES (?1, 'title', 'content', ?2, 1, 1)",
+                rusqlite::params![id, entry_type],
+            )
+            .unwrap();
+        };
+
+        // Legacy System-B garbage — must be purged (ids: prior-<16 hex>).
+        insert("prior-2720158528794be7", "prior");
+        insert("prior-0db3f4bb4dca1250", "prior");
+        insert("prior-abcdef0123456789", "prior");
+        // Survivors: System-A, hand-authored slug prior, and non-prior entries.
+        insert("prior-proof-fix-fix", "prior");
+        insert("canvas-terminal-dont-reinvent-xterm", "prior");
+        insert("prior-read-mdkb-hook-context-first", "prior"); // slug, not 16-hex
+        insert("prior-abcdef0123456789ff", "prior"); // 18 hex — too long, not System-B
+        insert("some-decision", "decision");
+
+        // Roll the recorded version back to 11 to exercise the real upgrade path.
+        conn.execute_batch("UPDATE schema_version SET version = 11;")
+            .unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(11));
+
+        init_schema(&conn).expect("v11→v12 init_schema failed");
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        let surviving: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT id FROM memory_entries ORDER BY id")
+                .unwrap();
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            ids
+        };
+
+        assert_eq!(
+            surviving,
+            vec![
+                "canvas-terminal-dont-reinvent-xterm".to_string(),
+                "prior-abcdef0123456789ff".to_string(),
+                "prior-proof-fix-fix".to_string(),
+                "prior-read-mdkb-hook-context-first".to_string(),
+                "some-decision".to_string(),
+            ],
+            "only the three legacy prior-<16 hex> rows should be purged"
+        );
+    }
+
+    // ==================== Schema v14: memory_edges + provenance ====================
+
+    #[test]
+    fn test_fresh_db_reports_v14_with_memory_edges() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(14));
+
+        let has_edges: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_edges'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_edges, "fresh DB should have memory_edges table");
+    }
+
+    #[test]
+    fn test_memory_edges_indexes_exist() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        let indexes: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_memedges_%'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert!(
+            indexes.iter().any(|i| i.contains("source")),
+            "should have idx_memedges_source index"
+        );
+        assert!(
+            indexes.iter().any(|i| i.contains("target")),
+            "should have idx_memedges_target index"
+        );
+    }
+
+    #[test]
+    fn test_memory_entries_has_provenance_columns() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+
+        for col in ["created_session", "created_agent"] {
+            let has: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = ?1",
+                    [col],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            assert!(has, "memory_entries should have {col} column");
+        }
+    }
+
+    #[test]
+    fn test_memory_edges_fk_and_columns() {
+        // A memory_edge referencing a non-existent memory must fail the FK, proving
+        // the FK is wired; insert a memory entry first, then a valid edge.
+        let conn = setup_db();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_schema(&conn).expect("init_schema failed");
+
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
+             VALUES ('src-mem', 'Src', 'Content', 'topic', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        // FK violation: source_id points at a memory that does not exist.
+        let bad = conn.execute(
+            "INSERT INTO memory_edges (source_id, target_ref, target_kind, relation, created_at)
+             VALUES ('missing', 'src-mem', 'memory', 'supports', 1)",
+            [],
+        );
+        assert!(
+            bad.is_err(),
+            "FK on source_id should reject dangling source"
+        );
+
+        // Valid edge: dangling target_ref is allowed (resolved at query time).
+        conn.execute(
+            "INSERT INTO memory_edges (source_id, target_ref, target_kind, relation, created_at)
+             VALUES ('src-mem', 'not-yet-indexed', 'memory', 'relates_to', 1)",
+            [],
+        )
+        .expect("valid edge with dangling target should insert");
+
+        let (target_ref, kind, relation): (String, String, String) = conn
+            .query_row(
+                "SELECT target_ref, target_kind, relation FROM memory_edges WHERE source_id = 'src-mem'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(target_ref, "not-yet-indexed");
+        assert_eq!(kind, "memory");
+        assert_eq!(relation, "relates_to");
+    }
+
+    #[test]
+    fn test_migrate_v13_to_v14_adds_edges_and_provenance() {
+        // Simulate a v13 database: initialise fully, drop memory_edges, remove the
+        // provenance columns is impossible pre-3.35 DROP COLUMN, so instead we
+        // rebuild memory_entries without them and roll the version back to 13.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_schema(&conn).expect("initial init_schema failed");
+
+        // Pre-existing entry must survive the upgrade with NULL provenance.
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('pre-v14', 'Pre', 'Content', 'topic', '[]', 1000, 1000)",
+            [],
+        )
+        .unwrap();
+
+        // Roll back to a v13 shape: drop the new table + record version 13. The
+        // provenance columns are added by an ALTER guarded on pragma_table_info,
+        // so leaving them present would make the migration a no-op for columns —
+        // to exercise the ALTER path we must remove them. SQLite ≥3.35 supports
+        // DROP COLUMN; use it to get a genuine v13 memory_entries shape.
+        conn.execute_batch(
+            "DROP TABLE memory_edges;
+             ALTER TABLE memory_entries DROP COLUMN created_session;
+             ALTER TABLE memory_entries DROP COLUMN created_agent;
+             UPDATE schema_version SET version = 13;",
+        )
+        .unwrap();
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(13));
+
+        let has_edges_before: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_edges'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(!has_edges_before, "v13 db should not have memory_edges");
+
+        // Real upgrade path: init_schema runs SCHEMA_SQL (recreates edges) then migrates.
+        init_schema(&conn).expect("v13→v14 init_schema failed");
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        let has_edges: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='memory_edges'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_edges, "memory_edges should exist after v13→v14 upgrade");
+
+        for col in ["created_session", "created_agent"] {
+            let has: bool = conn
+                .query_row(
+                    "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = ?1",
+                    [col],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            assert!(has, "{col} should exist after v13→v14 migration");
+        }
+
+        // Pre-existing row survives with NULL provenance.
+        let (title, sess): (String, Option<String>) = conn
+            .query_row(
+                "SELECT title, created_session FROM memory_entries WHERE id = 'pre-v14'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(title, "Pre");
+        assert!(
+            sess.is_none(),
+            "migrated entry should have NULL created_session"
+        );
     }
 }

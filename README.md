@@ -178,8 +178,20 @@ Persistent AI knowledge that survives across sessions — decisions, patterns, s
 - **Duplicate detection** — near-duplicate entries are rejected before writing
 - **Revision tracking** — manual entries track up to 3 revision diffs
 - **TTL (time-to-live)** — pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Expired entries are filtered from searches and listings but remain accessible via `get(id)` with an `[EXPIRED]` marker, so they can be inspected or renewed. Omit `ttl` for permanent entries.
+- **Provenance** — `memory_write` records the authoring session and (optional) `agent`; both surface in `get(id)` and via `mdkb memory link ... --agent <name>`.
 
 Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices), `reminder` (time-bound — see below), `prior` (behavioral patterns — 30-day TTL default, excluded from default searches), `handoff` (session handover — no default TTL).
+
+#### Memory graph (typed edges)
+
+Memory entries are graph nodes: a `memory_edges` table (schema v14) records typed relations between memories, or from a memory to a document. Relations are a closed set — `supports`, `contradicts`, `supersedes`, `derived_from`, `relates_to` — and unknown values are rejected with the valid set listed.
+
+- **Create edges at write time** — pass `relates` to `memory_write`: `relates=[{relation, target, target_kind}]` (up to 10, `target_kind` is `memory` (default) or `doc`). The entry and its edges are written in one transaction. Or link an existing entry from the CLI: `mdkb memory link <id> <relation> <target> [--doc] [--agent <name>]`.
+- **`supersedes`** keeps the scalar `superseded_by` and `superseded` status in lockstep with the edge (single write path).
+- **Traverse** — `graph(entity, direction="links"|"backlinks", scope="memory")` (MCP) walks the memory graph; targets are dangling-tolerant and resolved at query time, mirroring the document graph.
+- **`on_conflict="contradicts"`** — when a `memory_write` hits the near-duplicate gate, instead of rejecting it writes the new entry and links it to the similar one with a `contradicts` edge (returning both ids). Omitting `on_conflict` keeps the default rejection.
+- **Recall expansion** — a recalled entry's active 1-hop neighbors are surfaced (capped), annotated `(via <relation>)`.
+- **`[STALE-DEP]` marker** — at injection time, an entry whose `derived_from`/`supports` target is superseded or net-refuted is prefixed `[STALE-DEP]` in warmup and recall. This is a read-only flag — it never mutates stored confidence.
 
 #### Reminders
 

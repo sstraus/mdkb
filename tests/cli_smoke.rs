@@ -354,6 +354,53 @@ fn smoke_memory_lifecycle() {
 }
 
 #[test]
+fn smoke_memory_link() {
+    let repo = Repo::new();
+
+    for (id, title) in [("link-src", "Source"), ("link-dst", "Dest")] {
+        let out = run(
+            &["memory", "add", id, "-t", title, "-c", "content"],
+            &repo.root,
+        );
+        assert_ok(&out, "memory add for link");
+    }
+
+    // Happy path: source supports dst.
+    let out = run(
+        &["memory", "link", "link-src", "supports", "link-dst"],
+        &repo.root,
+    );
+    assert_ok(&out, "memory link");
+
+    // --doc + --agent variant.
+    let out = run(
+        &[
+            "memory",
+            "link",
+            "link-src",
+            "derived_from",
+            "docs/spec.md",
+            "--doc",
+            "--agent",
+            "scout",
+        ],
+        &repo.root,
+    );
+    assert_ok(&out, "memory link --doc --agent");
+
+    // Invalid relation must exit non-zero and list the closed set.
+    let out = run(
+        &["memory", "link", "link-src", "mentions", "link-dst"],
+        &repo.root,
+    );
+    assert!(
+        !out.status.success(),
+        "invalid relation must exit non-zero, got stdout: {}",
+        stdout(&out)
+    );
+}
+
+#[test]
 fn smoke_memory_import_export_roundtrip() {
     let repo = Repo::new();
 
@@ -657,9 +704,24 @@ fn smoke_hook_post_tool_use() {
 }
 
 #[test]
+fn smoke_hook_stop() {
+    let repo = Repo::new();
+    // Mining is off by default → the hook is silent and exits clean.
+    let payload = r#"{"transcript_path":"/nonexistent","session_id":"s1"}"#;
+    let out = run_stdin(&["hook", "stop"], &repo.root, payload);
+    assert_ok(&out, "hook stop");
+    assert_hook_output_valid(&out, "hook stop");
+}
+
+#[test]
 fn smoke_hook_events_tolerate_empty_stdin() {
     let repo = Repo::new();
-    for event in &["session-start", "user-prompt-submit", "post-tool-use"] {
+    for event in &[
+        "session-start",
+        "user-prompt-submit",
+        "post-tool-use",
+        "stop",
+    ] {
         let out = run_stdin(&["hook", event], &repo.root, "");
         assert_ok(&out, &format!("hook {event} (empty stdin)"));
     }
@@ -799,6 +861,7 @@ fn smoke_help_all_subcommands() {
         &["collection", "add", "--help"],
         &["memory", "--help"],
         &["memory", "add", "--help"],
+        &["memory", "link", "--help"],
         &["memory", "export", "--help"],
         &["memory", "import", "--help"],
         &["evolve", "--help"],

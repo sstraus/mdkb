@@ -290,6 +290,9 @@ pub enum HookCommand {
     /// Lifecycle event: before tool execution (advisory).
     PreToolUse,
 
+    /// Lifecycle event: agent stopped (end of episode — feeds prior mining).
+    Stop,
+
     /// Trigger an index refresh via the daemon.
     Reindex {
         /// Restrict reindex to these files (absolute or repo-relative).
@@ -583,6 +586,26 @@ pub enum MemoryCommand {
     Show {
         /// Entry ID
         id: String,
+    },
+
+    /// Link a memory entry to another entry or document via a typed relation
+    Link {
+        /// Source entry ID (slug)
+        id: String,
+
+        /// Relation: supports, contradicts, supersedes, derived_from, relates_to
+        relation: String,
+
+        /// Target: a memory slug, or a doc relative path with --doc
+        target: String,
+
+        /// Treat target as a document path instead of a memory slug
+        #[arg(long)]
+        doc: bool,
+
+        /// Record this agent as provenance on the source entry
+        #[arg(long)]
+        agent: Option<String>,
     },
 
     /// List memory entries

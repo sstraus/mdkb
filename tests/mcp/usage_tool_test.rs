@@ -42,6 +42,9 @@ async fn server_with_activity() -> (tempfile::TempDir, McpServer) {
             source_type: "user_statement".to_string(),
             ttl: None,
             due_in: None,
+            relates: vec![],
+            agent: None,
+            on_conflict: None,
             dry_run: false,
         }))
         .await

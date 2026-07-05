@@ -155,6 +155,9 @@ const HOOK_TIMEOUT_SESSION_START: Duration = Duration::from_secs(2);
 const HOOK_TIMEOUT_USER_PROMPT_SUBMIT: Duration = Duration::from_secs(1);
 const HOOK_TIMEOUT_POST_TOOL_USE: Duration = Duration::from_millis(500);
 const HOOK_TIMEOUT_PRE_TOOL_USE: Duration = Duration::from_millis(300);
+// Stop returns immediately: distillation is spawned as a detached background
+// task in the daemon, so the socket only has to cover the enqueue.
+const HOOK_TIMEOUT_STOP: Duration = Duration::from_millis(500);
 
 /// Return the per-event socket timeout for a hook method.
 fn hook_timeout(method: &str) -> Duration {
@@ -163,6 +166,7 @@ fn hook_timeout(method: &str) -> Duration {
         "hook.user_prompt_submit" => HOOK_TIMEOUT_USER_PROMPT_SUBMIT,
         "hook.post_tool_use" => HOOK_TIMEOUT_POST_TOOL_USE,
         "hook.pre_tool_use" => HOOK_TIMEOUT_PRE_TOOL_USE,
+        "hook.stop" => HOOK_TIMEOUT_STOP,
         _ => CALL_TIMEOUT,
     }
 }

@@ -32,6 +32,7 @@ use crate::metrics::{
     UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
 };
 use crate::store::memory::{get_warmup_entries, search_entries_fts};
+use crate::store::memory_graph::{self, MemoryRelation, TargetKind};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::mcp_error;
@@ -41,8 +42,8 @@ use super::server::{
     resolve_document, truncate_text,
 };
 use super::tools::{
-    CodeFindParams, CodeGraphParams, GetParams, GraphParams, MemoryWriteBatchEntry, SearchParams,
-    SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
+    CodeFindParams, CodeGraphParams, GetParams, GraphParams, MemoryWriteBatchEntry, RelatesInput,
+    SearchParams, SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
 };
 
 /// Daemon-global state shared across all dispatched tool calls.
@@ -60,6 +61,13 @@ impl std::fmt::Debug for DispatchContext {
             .field("session_id", &self.session_id.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
+}
+
+/// The current session id as a provenance string, or `None` before a session is
+/// established (session_id == 0).
+fn session_provenance(dctx: &DispatchContext) -> Option<String> {
+    let id = dctx.session_id.load(Ordering::Relaxed);
+    (id > 0).then(|| id.to_string())
 }
 
 impl DispatchContext {
@@ -322,6 +330,10 @@ fn write_single_memory(
     due_in: Option<u64>,
     embedding: Option<Vec<f32>>,
     source_path: Option<&str>,
+    relates: &[RelatesInput],
+    session: Option<&str>,
+    agent: Option<&str>,
+    on_conflict: Option<&str>,
     dry_run: bool,
 ) -> Result<String, McpError> {
     memory::validate_entry_input(id, title, tags, content).map_err(|e| mcp_error(e.to_string()))?;
@@ -337,6 +349,27 @@ fn write_single_memory(
 
     let source_type: memory::SourceType =
         source_type_str.parse().map_err(|e: String| mcp_error(e))?;
+
+    // Validate all relations up front so an invalid relation rejects the whole
+    // write (no partial edges) — even in dry-run. Parsed triples are applied
+    // inside the transaction below.
+    if relates.len() > 10 {
+        return Err(mcp_error("max 10 relations per entry"));
+    }
+    let parsed_relates: Vec<(String, TargetKind, MemoryRelation)> = relates
+        .iter()
+        .map(|r| {
+            let rel = r.relation.parse::<MemoryRelation>().map_err(mcp_error)?;
+            let kind = r.target_kind.parse::<TargetKind>().map_err(mcp_error)?;
+            Ok((r.target.clone(), kind, rel))
+        })
+        .collect::<Result<_, McpError>>()?;
+
+    if entry_type == memory::EntryType::Prior && memory::is_mechanical_prior_noise(content) {
+        return Err(mcp_error(
+            "Rejected mechanical tool-chain prior (no reusable lesson). Priors must carry a distilled, trigger-scoped lesson.".to_string(),
+        ));
+    }
 
     if dry_run {
         let action = if existing.is_some() {
@@ -362,12 +395,21 @@ fn write_single_memory(
     // Pre-write duplicate check: reject if a near-identical entry exists (new entries only).
     // L2 distance < 0.32 ≈ cosine similarity > 0.95 — very high bar, minimizes false positives.
     // Uses the pre-computed embedding passed in by the async caller (computed outside the lock).
+    //
+    // With `on_conflict="contradicts"`, a conflict is NOT rejected: the new entry is
+    // written and linked to the similar one with a `contradicts` edge (recorded below,
+    // inside the transaction). The default (param absent) keeps today's rejection verbatim.
+    let mut contradicts_target: Option<String> = None;
     if is_new {
         if let Some(ref emb) = embedding {
             if let Ok(similar) = crate::store::vectors::memory_vector_search(conn, emb, 3) {
                 for (rowid, distance) in &similar {
                     if *distance < 0.32 {
                         if let Ok(Some(dup)) = memory::get_entry_by_rowid(conn, *rowid) {
+                            if on_conflict == Some("contradicts") {
+                                contradicts_target = Some(dup.id);
+                                break;
+                            }
                             let similarity = 1.0 - (*distance as f64 * *distance as f64 / 2.0);
                             return Err(mcp_error(format!(
                                 "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
@@ -383,9 +425,15 @@ fn write_single_memory(
         }
     }
 
+    // Entry write + typed edges + provenance are one atomic unit per item: a bad
+    // edge or provenance write rolls back the entry too.
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| mcp_error(format!("Failed to begin transaction: {e}")))?;
+
     let mut output = if let Some(mut existing_entry) = existing {
         if let Err(e) = memory::save_revision(
-            conn,
+            &tx,
             id,
             &existing_entry.content,
             content,
@@ -402,10 +450,10 @@ fn write_single_memory(
         if due_in.is_some() {
             existing_entry.due_at = due_at;
         }
-        memory::update_entry(conn, &existing_entry)
+        memory::update_entry(&tx, &existing_entry)
             .map_err(|e| mcp_error(format!("Failed to update memory entry: {e}")))?;
 
-        let rev_info = memory::get_revision_summary(conn, id)
+        let rev_info = memory::get_revision_summary(&tx, id)
             .map(|s| {
                 if s.count > 0 {
                     format!(" ({} revisions)", s.count)
@@ -435,10 +483,33 @@ fn write_single_memory(
             expires_at,
             due_at,
         };
-        memory::add_entry(conn, &entry)
+        memory::add_entry(&tx, &entry)
             .map_err(|e| mcp_error(format!("Failed to create memory entry: {e}")))?;
         format!("Created memory entry: {id}")
     };
+
+    for (target, kind, rel) in &parsed_relates {
+        memory_graph::add_edge_in(&tx, id, target, *kind, *rel)
+            .map_err(|e| mcp_error(format!("Failed to add relation: {e}")))?;
+    }
+    if let Some(target) = &contradicts_target {
+        memory_graph::add_edge_in(
+            &tx,
+            id,
+            target,
+            TargetKind::Memory,
+            MemoryRelation::Contradicts,
+        )
+        .map_err(|e| mcp_error(format!("Failed to record contradicts edge: {e}")))?;
+        output.push_str(&format!(
+            " — conflict with '{target}' recorded as a contradicts edge (resolve via memory_confirm)"
+        ));
+    }
+    memory::set_provenance(&tx, id, session, agent)
+        .map_err(|e| mcp_error(format!("Failed to record provenance: {e}")))?;
+
+    tx.commit()
+        .map_err(|e| mcp_error(format!("Failed to commit memory write: {e}")))?;
 
     // Store the pre-computed embedding and append similarity warnings.
     // The embedding was computed outside the lock by the async caller to avoid
@@ -473,6 +544,7 @@ fn write_single_memory(
 pub async fn memory_write_impl(
     handle: &RepoHandle,
     entry: &MemoryWriteBatchEntry,
+    session: Option<&str>,
     dry_run: bool,
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
@@ -511,6 +583,10 @@ pub async fn memory_write_impl(
         entry.due_in,
         embedding,
         source_path.as_deref(),
+        &entry.relates,
+        session,
+        entry.agent.as_deref(),
+        entry.on_conflict.as_deref(),
         dry_run,
     )
 }
@@ -525,6 +601,7 @@ pub async fn memory_write_impl(
 pub async fn memory_write_batch_impl(
     handle: &RepoHandle,
     entries: &[MemoryWriteBatchEntry],
+    session: Option<&str>,
     dry_run: bool,
 ) -> Result<(String, usize), McpError> {
     if entries.is_empty() {
@@ -586,6 +663,10 @@ pub async fn memory_write_batch_impl(
             entry.due_in,
             embedding,
             source_path.as_deref(),
+            &entry.relates,
+            session,
+            entry.agent.as_deref(),
+            entry.on_conflict.as_deref(),
             dry_run,
         )?;
         results.push(result);
@@ -1360,8 +1441,31 @@ pub async fn get_impl(
             }
             None => String::new(),
         };
+        let prov_line = match memory::get_provenance(&ctx.conn, &entry.id) {
+            Ok((session, agent)) if session.is_some() || agent.is_some() => {
+                let mut parts = Vec::new();
+                if let Some(s) = session {
+                    parts.push(format!("session {s}"));
+                }
+                if let Some(a) = agent {
+                    parts.push(format!("agent {a}"));
+                }
+                format!("\nProvenance: {}", parts.join(", "))
+            }
+            _ => String::new(),
+        };
+        let edges_line = match memory_graph::outgoing(&ctx.conn, &entry.id, None) {
+            Ok(edges) if !edges.is_empty() => {
+                let rels: Vec<String> = edges
+                    .iter()
+                    .map(|e| format!("{} {}", e.relation, e.target_ref))
+                    .collect();
+                format!("\nEdges: {}", rels.join(", "))
+            }
+            _ => String::new(),
+        };
         let output = format!(
-            "# {}{} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}{}{}\n\n{}",
+            "# {}{} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}{}{}{}{}\n\n{}",
             entry.title,
             expired_marker,
             entry.id,
@@ -1376,6 +1480,8 @@ pub async fn get_impl(
             conf_line,
             rev_line,
             ttl_line,
+            prov_line,
+            edges_line,
             body
         );
         return Ok((output, 1, false));
@@ -1573,6 +1679,35 @@ pub async fn graph_impl(handle: &RepoHandle, params: &GraphParams) -> Result<Str
     let relation = params.relation.as_deref();
     let entity = &params.entity;
 
+    // Memory scope: traverse the memory-entry graph (memory_edges) instead of the
+    // document graph. Only links/backlinks are meaningful here.
+    if params.scope.as_deref() == Some("memory") {
+        let rel = params
+            .relation
+            .as_deref()
+            .map(|r| r.parse::<MemoryRelation>())
+            .transpose()
+            .map_err(mcp_error)?;
+        let output = match params.direction.as_str() {
+            "links" => {
+                let edges = memory_graph::outgoing(&ctx.conn, entity, rel)
+                    .map_err(|e| mcp_error(e.to_string()))?;
+                format_memory_graph_edges(entity, "links", &edges)
+            }
+            "backlinks" => {
+                let edges = memory_graph::incoming(&ctx.conn, entity, rel)
+                    .map_err(|e| mcp_error(e.to_string()))?;
+                format_memory_graph_edges(entity, "backlinks", &edges)
+            }
+            other => {
+                return Err(mcp_error(format!(
+                    "scope=memory supports links and backlinks, not '{other}'."
+                )));
+            }
+        };
+        return Ok(output);
+    }
+
     let output = match params.direction.as_str() {
         "links" => {
             let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
@@ -1611,6 +1746,30 @@ pub async fn graph_impl(handle: &RepoHandle, params: &GraphParams) -> Result<Str
         }
     };
     Ok(output)
+}
+
+fn format_memory_graph_edges(
+    entity: &str,
+    label: &str,
+    edges: &[crate::store::memory_graph::MemoryEdge],
+) -> String {
+    if edges.is_empty() {
+        return format!("No {label} for {entity}.");
+    }
+    let mut out = format!("{label} for {entity}:");
+    for e in edges {
+        // links: show where this entry points; backlinks: show who points here.
+        let other = if label == "links" {
+            &e.target_ref
+        } else {
+            &e.source_id
+        };
+        out.push_str(&format!(
+            "\n- {} (via {}, {})",
+            other, e.relation, e.target_kind
+        ));
+    }
+    out
 }
 
 fn format_graph_edges(entity: &str, label: &str, edges: &[crate::store::graph::Edge]) -> String {
@@ -2059,7 +2218,29 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
 
     // Due reminders lead (preserved verbatim); ranked entries follow.
     let mut lines = due_lines;
-    lines.extend(ranked.iter().map(crate::store::memory::format_warmup_line));
+
+    // STALE-DEP marker (read-only): flag ranked entries whose derived_from/supports
+    // dependency is superseded or net-refuted in the primary store. Never mutates
+    // stored confidence.
+    let mut stale_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if ensure_handle_context(handle).await.is_ok() {
+        let ctx_guard = handle.ctx.lock().await;
+        if let Some(c) = ctx_guard.as_ref() {
+            for e in &ranked {
+                if memory_graph::has_stale_dependency(&c.conn, &e.id).unwrap_or(false) {
+                    stale_ids.insert(e.id.clone());
+                }
+            }
+        }
+    }
+    lines.extend(ranked.iter().map(|e| {
+        let prefix = if stale_ids.contains(&e.id) {
+            "[STALE-DEP] "
+        } else {
+            ""
+        };
+        format!("{}{}", prefix, crate::store::memory::format_warmup_line(e))
+    }));
 
     if lines.is_empty() {
         return json!({});
@@ -2110,6 +2291,44 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
             "additionalContext": body,
         }
     })
+}
+
+/// Post-recall 1-hop expansion: for the top recalled seeds, surface active memory
+/// neighbors reachable by an outgoing edge, formatted `- [id] title (via relation)`.
+/// Capped at `EXPAND_RECALL_SEEDS` seeds and `EXPAND_RECALL_NEIGHBORS` neighbors
+/// total; already-recalled ids are skipped and superseded/expired/dangling targets
+/// are excluded via `resolve_active` — bounded work on the recall hot path.
+fn expand_recall_neighbors(
+    conn: &rusqlite::Connection,
+    results: &[memory::MemoryEntry],
+) -> Vec<String> {
+    const EXPAND_RECALL_SEEDS: usize = 2;
+    const EXPAND_RECALL_NEIGHBORS: usize = 3;
+
+    let seen: std::collections::HashSet<&str> = results.iter().map(|e| e.id.as_str()).collect();
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for seed in results.iter().take(EXPAND_RECALL_SEEDS) {
+        if out.len() >= EXPAND_RECALL_NEIGHBORS {
+            break;
+        }
+        let edges = memory_graph::outgoing(conn, &seed.id, None).unwrap_or_default();
+        for edge in edges {
+            if out.len() >= EXPAND_RECALL_NEIGHBORS {
+                break;
+            }
+            if edge.target_kind != TargetKind::Memory.as_str() {
+                continue;
+            }
+            if seen.contains(edge.target_ref.as_str()) || !emitted.insert(edge.target_ref.clone()) {
+                continue;
+            }
+            if let Ok(Some(n)) = memory_graph::resolve_active(conn, &edge.target_ref) {
+                out.push(format!("- [{}] {} (via {})", n.id, n.title, edge.relation));
+            }
+        }
+    }
+    out
 }
 
 pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> Value {
@@ -2198,6 +2417,23 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
         results.truncate(limit);
     }
 
+    // Post-recall enrichment in a single re-lock (both read-only, capped):
+    //  · 1-hop memory-edge expansion — surface active neighbors of the top seeds.
+    //  · stale-dependency flags — mark entries whose basis is superseded/refuted.
+    let mut expanded: Vec<String> = Vec::new();
+    let mut stale_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if !results.is_empty() && ensure_handle_context(handle).await.is_ok() {
+        let ctx_guard = handle.ctx.lock().await;
+        if let Some(c) = ctx_guard.as_ref() {
+            expanded = expand_recall_neighbors(&c.conn, &results);
+            for e in &results {
+                if memory_graph::has_stale_dependency(&c.conn, &e.id).unwrap_or(false) {
+                    stale_ids.insert(e.id.clone());
+                }
+            }
+        }
+    }
+
     // D — doc-graph neighbors: when the prompt names a document, surface its
     // 1-hop frontmatter neighbors. Independent of memory recall, deduped against
     // the (now finalized) memory ids about to be injected.
@@ -2216,7 +2452,10 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
         }
     }
 
-    if results.is_empty() && related.is_empty() && !wants_cg {
+    // Trigger-matched behavioral priors whose prompt pattern fires here.
+    let prior_block = prompt_prior_block(handle, prompt).await;
+
+    if results.is_empty() && related.is_empty() && prior_block.is_none() && !wants_cg {
         return json!({});
     }
 
@@ -2227,7 +2466,24 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
         for entry in &results {
             let snippet_raw = entry.content.trim().replace('\n', " ");
             let snippet: String = snippet_raw.chars().take(160).collect();
-            body.push_str(&format!("- [{}] {} — {}\n", entry.id, entry.title, snippet));
+            let stale = if stale_ids.contains(&entry.id) {
+                "[STALE-DEP] "
+            } else {
+                ""
+            };
+            body.push_str(&format!(
+                "- {}[{}] {} ({}) — {}\n",
+                stale,
+                entry.id,
+                entry.title,
+                relative_time_ago(entry.updated_at),
+                snippet
+            ));
+        }
+        // 1-hop edge-expanded neighbors, annotated `(via <relation>)`.
+        for line in &expanded {
+            body.push_str(line);
+            body.push('\n');
         }
         body.push_str("\nIf your work corroborates any entry above, use `memory_confirm(id, outcome=\"confirmed\")` instead of writing a new one.\n");
     }
@@ -2241,6 +2497,15 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
             body.push_str(line);
             body.push('\n');
         }
+    }
+
+    if let Some(prior) = prior_block {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("## mdkb: priors\n\n");
+        body.push_str(&prior);
+        body.push('\n');
     }
 
     if wants_cg {
@@ -2259,6 +2524,37 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
             "additionalContext": body,
         }
     })
+}
+
+/// Promoted priors whose `prompt`-kind trigger matches the submitted prompt,
+/// formatted as `mdkb prior: <lesson>` lines (and recorded as injected). `None`
+/// when injection is disabled, the store is unavailable, or nothing matches.
+async fn prompt_prior_block(handle: &RepoHandle, prompt: &str) -> Option<String> {
+    use crate::store::priors::{TriggerContext, match_injectable, record_injection};
+
+    if !handle.config.priors.injection_enabled {
+        return None;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let max = handle.config.priors.max_injected_per_hook;
+
+    if ensure_handle_context(handle).await.is_err() {
+        return None;
+    }
+    let ctx_guard = handle.ctx.lock().await;
+    let conn = &ctx_guard.as_ref()?.conn;
+
+    let tctx = TriggerContext::Prompt { text: prompt };
+    let hits = match_injectable(conn, &tctx, now, max).ok()?;
+    if hits.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(hits.len());
+    for c in &hits {
+        let _ = record_injection(conn, &c.id, now);
+        lines.push(format!("mdkb prior: {}", c.lesson));
+    }
+    Some(lines.join("\n"))
 }
 
 /// Resolve doc-path `tokens` to their 1-hop *frontmatter* graph neighbors that
@@ -2316,6 +2612,125 @@ fn doc_graph_neighbors(
     out
 }
 
+/// Number of trailing transcript lines that form the mined episode window.
+const STOP_EPISODE_WINDOW_LINES: usize = 800;
+
+/// `hook.stop` — end-of-episode boundary that feeds behavioral-prior mining.
+///
+/// Returns `{}` immediately. Mining is kill-switched off by default and, when
+/// on, spawns an external agent CLI to distill — far too slow for the hook
+/// budget — so the actual work is detached into a background task. The hook
+/// itself only gates and enqueues.
+fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value) -> Value {
+    let cfg = &handle.config.priors;
+    if !cfg.mining_enabled {
+        return json!({});
+    }
+    // No built-in chat model: without a configured distiller there is nothing to
+    // mine with, so stay off even when the master flag is on.
+    let Some(program) = cfg.distiller_program.clone() else {
+        return json!({});
+    };
+    let args = cfg.distiller_args.clone();
+    let Some(transcript_path) = event
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+    else {
+        return json!({});
+    };
+    let session = event
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    tokio::spawn(mine_episode(
+        handle,
+        transcript_path,
+        session,
+        program,
+        args,
+    ));
+    json!({})
+}
+
+/// The awaitable core of prior mining: read the transcript tail → parse the raw
+/// episode → gate on the cheap candidate detector → distill via the external CLI
+/// → validate → persist as a candidate and promote on recurrence. Best-effort:
+/// every failure degrades to a debug log and an early return (a background task
+/// must never surface errors). Kept as a standalone async fn (not inlined into
+/// the detached spawn) so it can be awaited directly in tests.
+async fn mine_episode(
+    handle: Arc<RepoHandle>,
+    transcript_path: String,
+    session: String,
+    program: String,
+    args: Vec<String>,
+) {
+    use crate::domain::prior_detect::detect_candidate;
+    use crate::domain::prior_distill::{build_distill_prompt, parse_distilled, run_distiller_cli};
+    use crate::domain::prior_episode::parse_episode;
+    use crate::store::priors::integrate_distilled;
+
+    // Read the transcript tail off the async runtime.
+    let jsonl = match tokio::task::spawn_blocking(move || std::fs::read_to_string(&transcript_path))
+        .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::debug!("prior mining: read transcript failed: {e}");
+            return;
+        }
+        Err(_) => return,
+    };
+    let window = tail_lines(&jsonl, STOP_EPISODE_WINDOW_LINES);
+
+    let episode = parse_episode(&window);
+    let Some(sig) = detect_candidate(&episode) else {
+        return; // the cheap gate: most episodes teach nothing, no LLM call
+    };
+    let prompt = build_distill_prompt(&episode, &sig);
+
+    // Spawn the external distiller off the async runtime (blocking process).
+    let raw = match tokio::task::spawn_blocking(move || run_distiller_cli(&program, &args, &prompt))
+        .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::debug!("prior mining: distiller spawn failed: {e}");
+            return;
+        }
+        Err(_) => return,
+    };
+    let distilled = match parse_distilled(&raw) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::debug!("prior mining: distiller output rejected: {e}");
+            return;
+        }
+    };
+
+    if ensure_handle_context(&handle).await.is_err() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let guard = handle.ctx.lock().await;
+    if let Some(c) = guard.as_ref() {
+        if let Err(e) = integrate_distilled(&c.conn, &distilled, &session, now) {
+            tracing::debug!("prior mining: integrate_distilled failed: {e}");
+        }
+    }
+}
+
+/// The last `n` lines of `s`, joined with `\n`. The mined episode is the tail of
+/// the transcript; older turns are noise for a single end-of-session lesson.
+fn tail_lines(s: &str, n: usize) -> String {
+    let lines: Vec<&str> = s.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
+}
+
 pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
     if !handle.config.hooks.post_tool_use_enabled {
         return json!({});
@@ -2365,23 +2780,24 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
     // Grep tool calls arrive with a clean pattern; Bash calls carry a raw shell
     // command we parse for a `grep`/`rg` filesystem search. Both feed the same
     // redirection classifiers. Claude searches code via Bash far more than the
-    // Grep tool, so matching Bash is where the redirect actually reaches it.
+    // Grep tool, so matching Bash is where the redirect actually reaches it. Other
+    // tools (Edit/Write/…) get no search suggestion, but STILL flow through to the
+    // trigger-matched prior injection below — a path-scoped prior on Edit is the
+    // headline case, so this must not early-return.
     let suggestion = match tool_name {
-        "Grep" => {
-            let Some(pattern) = tool_input.get("pattern").and_then(|v| v.as_str()) else {
-                return json!({});
-            };
-            let path = tool_input.get("path").and_then(|v| v.as_str());
-            classify_definition_search(pattern, &bin)
-                .or_else(|| classify_grep_pattern(pattern, path, &bin))
-        }
-        "Bash" => {
-            let Some(command) = tool_input.get("command").and_then(|v| v.as_str()) else {
-                return json!({});
-            };
-            classify_bash_search(command, &bin)
-        }
-        _ => return json!({}),
+        "Grep" => tool_input
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .and_then(|pattern| {
+                let path = tool_input.get("path").and_then(|v| v.as_str());
+                classify_definition_search(pattern, &bin)
+                    .or_else(|| classify_grep_pattern(pattern, path, &bin))
+            }),
+        "Bash" => tool_input
+            .get("command")
+            .and_then(|v| v.as_str())
+            .and_then(|command| classify_bash_search(command, &bin)),
+        _ => None,
     };
 
     // "Act, not suggest": on a definition-classified search, inject the real
@@ -2397,9 +2813,21 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
         None
     };
 
-    let text = match (hits, suggestion) {
+    let search_block = match (hits, suggestion) {
         (Some(block), _) => Some(block), // act
         (None, Some(s)) => Some(s),      // fall back to suggest
+        (None, None) => None,
+    };
+
+    // Trigger-matched behavioral priors are complementary to the search
+    // redirect: surface any promoted prior whose trigger matches this tool call,
+    // appended after the search block.
+    let prior_block = pretool_prior_block(handle, tool_name, tool_input).await;
+
+    let text = match (search_block, prior_block) {
+        (Some(s), Some(p)) => Some(format!("{s}\n\n{p}")),
+        (Some(s), None) => Some(s),
+        (None, Some(p)) => Some(p),
         (None, None) => None,
     };
 
@@ -2413,6 +2841,57 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
         }),
         None => json!({}),
     }
+}
+
+/// Promoted priors whose trigger matches this PreToolUse call, formatted as a
+/// context block (and recorded as injected). `None` when injection is disabled,
+/// the memory store is unavailable, or nothing matches.
+async fn pretool_prior_block(
+    handle: &RepoHandle,
+    tool: &str,
+    tool_input: &Value,
+) -> Option<String> {
+    use crate::store::priors::{TriggerContext, match_injectable, record_injection};
+
+    if !handle.config.priors.injection_enabled {
+        return None;
+    }
+    // Repo-relative path gives clean `src/generated/**`-style glob matching.
+    let path = tool_input
+        .get("file_path")
+        .and_then(|v| v.as_str())
+        .map(|p| {
+            std::path::Path::new(p)
+                .strip_prefix(&handle.root)
+                .map(|r| r.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| p.to_string())
+        });
+    let command = tool_input.get("command").and_then(|v| v.as_str());
+    let now = chrono::Utc::now().timestamp();
+    let max = handle.config.priors.max_injected_per_hook;
+
+    // Read from the ALREADY-open context only — the PreToolUse hot path must
+    // never force a DB open (the same reason `code_index_hits` guards on
+    // `.exists()`). In the daemon the context is warm after SessionStart, so
+    // priors fire; a cold one-shot invocation skips them (best-effort).
+    let ctx_guard = handle.ctx.lock().await;
+    let conn = &ctx_guard.as_ref()?.conn;
+
+    let tctx = TriggerContext::PreTool {
+        tool,
+        path: path.as_deref(),
+        command,
+    };
+    let hits = match_injectable(conn, &tctx, now, max).ok()?;
+    if hits.is_empty() {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(hits.len());
+    for c in &hits {
+        let _ = record_injection(conn, &c.id, now);
+        lines.push(format!("mdkb prior: {}", c.lesson));
+    }
+    Some(lines.join("\n"))
 }
 
 /// Up to `limit` indexed definitions of `symbol`, formatted as a PreToolUse
@@ -2508,7 +2987,8 @@ pub async fn dispatch_call(
                 .unwrap_or(false);
             let entry: MemoryWriteBatchEntry = serde_json::from_value(params)
                 .map_err(|e| mcp_error(format!("memory_write: invalid params: {e}")))?;
-            let text = memory_write_impl(&handle, &entry, dry_run).await?;
+            let session = session_provenance(&dctx);
+            let text = memory_write_impl(&handle, &entry, session.as_deref(), dry_run).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "memory_write", tokens, 1, false)
                 .await;
@@ -2525,7 +3005,9 @@ pub async fn dispatch_call(
                 .ok_or_else(|| mcp_error("memory_write_batch: missing 'entries'"))?;
             let entries: Vec<MemoryWriteBatchEntry> = serde_json::from_value(entries_value)
                 .map_err(|e| mcp_error(format!("memory_write_batch: invalid 'entries': {e}")))?;
-            let (text, count) = memory_write_batch_impl(&handle, &entries, dry_run).await?;
+            let session = session_provenance(&dctx);
+            let (text, count) =
+                memory_write_batch_impl(&handle, &entries, session.as_deref(), dry_run).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "memory_write_batch", tokens, count, false)
                 .await;
@@ -2714,6 +3196,19 @@ pub async fn dispatch_call(
             tokio::task::spawn_blocking(move || {
                 log_hook_event(root, "pre_tool_use", outcome, ms, budget)
             });
+            Ok(result)
+        }
+        "hook.stop" => {
+            // Returns immediately; distillation is detached inside hook_stop_impl.
+            let result = hook_stop_impl(Arc::clone(&handle), &params);
+            let outcome = if result == json!({}) {
+                "skipped"
+            } else {
+                "fired"
+            };
+            let root = handle.root.clone();
+            let budget = handle.config.hooks.latency_budget_ms;
+            tokio::task::spawn_blocking(move || log_hook_event(root, "stop", outcome, 0, budget));
             Ok(result)
         }
         other => Err(McpError {
@@ -2980,6 +3475,255 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn recall_expands_one_hop_memory_neighbors_excluding_superseded() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        // Seed A (matches the prompt); B and C do NOT match the prompt, so they can
+        // only appear via edge expansion.
+        seed_topic_with_content(
+            &handle,
+            "zephyr-runbook",
+            "Zephyr calibration runbook steps",
+            0,
+        )
+        .await;
+        seed_topic_with_content(
+            &handle,
+            "bolt-detail",
+            "Bolt torque is four newton meters",
+            0,
+        )
+        .await;
+        seed_topic_with_content(&handle, "dead-detail", "Retired coolant mixture ratio", 0).await;
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            memory_graph::add_edge(
+                conn,
+                "zephyr-runbook",
+                "bolt-detail",
+                TargetKind::Memory,
+                MemoryRelation::Supports,
+            )
+            .unwrap();
+            memory_graph::add_edge(
+                conn,
+                "zephyr-runbook",
+                "dead-detail",
+                TargetKind::Memory,
+                MemoryRelation::RelatesTo,
+            )
+            .unwrap();
+            // dead-detail is superseded → must be excluded from expansion.
+            conn.execute(
+                "UPDATE memory_entries SET status='superseded' WHERE id='dead-detail'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = hook_user_prompt_submit_impl(&handle, "zephyr calibration runbook").await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            body.contains("zephyr-runbook"),
+            "seed A should recall: {body}"
+        );
+        assert!(
+            body.contains("bolt-detail"),
+            "neighbor B should be expanded: {body}"
+        );
+        assert!(
+            body.contains("(via supports)"),
+            "neighbor annotated with relation: {body}"
+        );
+        assert!(
+            !body.contains("dead-detail"),
+            "superseded neighbor must be excluded: {body}"
+        );
+    }
+
+    /// Seed `n` entries (`n0`..) where `n0` has 3 outgoing edges, then return the
+    /// MINIMUM per-call expansion time over many iterations. The min (least-
+    /// preempted run) reflects true CPU cost and is stable under parallel test
+    /// load, unlike an absolute p95 which flakes when the suite saturates cores.
+    fn min_expand_us(conn: &rusqlite::Connection, n: usize) -> u128 {
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
+                 VALUES (?1, ?2, 'body', 'topic', 1, 1)",
+                rusqlite::params![format!("n{i}"), format!("Title {i}")],
+            )
+            .unwrap();
+        }
+        for j in 1..=3 {
+            memory_graph::add_edge(
+                conn,
+                "n0",
+                &format!("n{j}"),
+                TargetKind::Memory,
+                MemoryRelation::Supports,
+            )
+            .unwrap();
+        }
+        let seeds = vec![memory::get_entry(conn, "n0").unwrap().unwrap()];
+        let mut best = u128::MAX;
+        for _ in 0..50 {
+            let t = std::time::Instant::now();
+            let out = expand_recall_neighbors(conn, &seeds);
+            best = best.min(t.elapsed().as_micros());
+            assert_eq!(out.len(), 3, "must expand exactly the 3 capped neighbors");
+        }
+        best
+    }
+
+    #[tokio::test]
+    async fn recall_expansion_is_o1_in_corpus_size_and_fast() {
+        // Expansion is bounded (≤2 seeds × one indexed outgoing SELECT + ≤3 PK
+        // resolves), so its cost must not scale with corpus size and must sit well
+        // under the 10ms recall budget.
+        let big_tmp = TempDir::new().unwrap();
+        let big = make_handle(&big_tmp);
+        ensure_handle_context(&big).await.expect("ctx");
+        let big_us = {
+            let g = big.ctx.lock().await;
+            min_expand_us(&g.as_ref().unwrap().conn, 1000)
+        };
+
+        let small_tmp = TempDir::new().unwrap();
+        let small = make_handle(&small_tmp);
+        ensure_handle_context(&small).await.expect("ctx");
+        let small_us = {
+            let g = small.ctx.lock().await;
+            min_expand_us(&g.as_ref().unwrap().conn, 10)
+        };
+
+        // Absolute backstop: real per-call cost is tens of µs; the min stays far
+        // under the 10ms budget even on a saturated CI box.
+        assert!(
+            big_us < 10_000,
+            "expansion min = {big_us}us exceeds the 10ms budget on a 1k corpus"
+        );
+        // O(1) in corpus size: the 1k-corpus min is not materially larger than the
+        // 10-entry min. A size-dependent (O(n)) scan would blow this by ~100x; the
+        // generous factor + floor absorb measurement noise.
+        assert!(
+            big_us <= small_us.max(1) * 10 + 200,
+            "expansion appears to scale with corpus size: 1k={big_us}us vs 10={small_us}us"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_marks_stale_dependency_and_leaves_healthy_clean() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        seed_topic_with_content(
+            &handle,
+            "gizmo-derived",
+            "Gizmo handshake uses protocol alpha",
+            0,
+        )
+        .await;
+        seed_topic_with_content(&handle, "gizmo-base", "Protocol alpha internal notes", 0).await;
+        seed_topic_with_content(&handle, "gizmo-clean", "Gizmo handshake retry policy", 0).await;
+        seed_topic_with_content(&handle, "clean-base", "Retry backoff internal notes", 0).await;
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            memory_graph::add_edge(
+                conn,
+                "gizmo-derived",
+                "gizmo-base",
+                TargetKind::Memory,
+                MemoryRelation::DerivedFrom,
+            )
+            .unwrap();
+            memory_graph::add_edge(
+                conn,
+                "gizmo-clean",
+                "clean-base",
+                TargetKind::Memory,
+                MemoryRelation::DerivedFrom,
+            )
+            .unwrap();
+            // Supersede only gizmo-base → gizmo-derived becomes STALE-DEP; gizmo-clean stays clean.
+            conn.execute(
+                "UPDATE memory_entries SET status='superseded' WHERE id='gizmo-base'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = hook_user_prompt_submit_impl(&handle, "gizmo handshake protocol retry").await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            body.contains("[STALE-DEP] [gizmo-derived]"),
+            "stale dep must be flagged: {body}"
+        );
+        assert!(
+            !body.contains("[STALE-DEP] [gizmo-clean]"),
+            "healthy dep must render clean: {body}"
+        );
+
+        // The flag is read-only: stored status/confidence of the flagged entry is untouched.
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let e = memory::get_entry(conn, "gizmo-derived").unwrap().unwrap();
+        assert_eq!(
+            e.status,
+            memory::EntryStatus::Active,
+            "STALE-DEP must not mutate status"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_marks_stale_dependency() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        seed_topic_with_content(&handle, "warm-derived", "Deployment checklist", 100).await;
+        seed_topic_with_content(&handle, "warm-base", "Old deploy step", 0).await;
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            memory_graph::add_edge(
+                conn,
+                "warm-derived",
+                "warm-base",
+                TargetKind::Memory,
+                MemoryRelation::DerivedFrom,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memory_entries SET status='superseded' WHERE id='warm-base'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let out = hook_session_start_impl(&handle).await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            body.contains("[STALE-DEP]"),
+            "warmup must flag the stale entry: {body}"
+        );
+        assert!(
+            body.contains("warm-derived"),
+            "flagged entry present: {body}"
+        );
+    }
+
     /// Seed a Topic entry with caller-supplied content (so it can match a
     /// recall/warmup query) and an explicit `access_count` (so warmup ranking
     /// can be exercised deterministically).
@@ -3200,6 +3944,7 @@ mod tests {
                 direction: "links".to_string(),
                 relation: None,
                 depth: 1,
+                scope: None,
             },
         )
         .await
@@ -3217,6 +3962,7 @@ mod tests {
                 direction: "backlinks".to_string(),
                 relation: None,
                 depth: 1,
+                scope: None,
             },
         )
         .await
@@ -3236,6 +3982,7 @@ mod tests {
                 direction: "neighbors".to_string(),
                 relation: None,
                 depth: 1,
+                scope: None,
             },
         )
         .await
@@ -3252,6 +3999,7 @@ mod tests {
                 direction: "path".to_string(),
                 relation: None,
                 depth: 1,
+                scope: None,
             },
         )
         .await
@@ -3275,6 +4023,7 @@ mod tests {
                 direction: "path".to_string(),
                 relation: None,
                 depth: 1,
+                scope: None,
             },
         )
         .await
@@ -3297,6 +4046,7 @@ mod tests {
                 direction: "sideways".to_string(),
                 relation: None,
                 depth: 1,
+                scope: None,
             },
         )
         .await
@@ -3503,6 +4253,9 @@ mod tests {
             source_type: "user_statement".to_string(),
             ttl: None,
             due_in: None,
+            relates: vec![],
+            agent: None,
+            on_conflict: None,
         }
     }
 
@@ -3511,7 +4264,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
 
-        let created = memory_write_impl(&handle, &entry_input("w-1"), false)
+        let created = memory_write_impl(&handle, &entry_input("w-1"), None, false)
             .await
             .expect("write impl");
         assert!(
@@ -3521,7 +4274,7 @@ mod tests {
 
         let mut second = entry_input("w-1");
         second.content = "Updated content body".to_string();
-        let updated = memory_write_impl(&handle, &second, false)
+        let updated = memory_write_impl(&handle, &second, None, false)
             .await
             .expect("write impl update");
         assert!(
@@ -3531,11 +4284,202 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_write_creates_edges_and_memory_scope_graph() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        // Seed the target, then write a source entry carrying a `relates` edge to it.
+        memory_write_impl(&handle, &entry_input("edge-b"), None, false)
+            .await
+            .expect("write b");
+        let mut a = entry_input("edge-a");
+        a.relates = vec![RelatesInput {
+            relation: "supports".to_string(),
+            target: "edge-b".to_string(),
+            target_kind: "memory".to_string(),
+        }];
+        memory_write_impl(&handle, &a, None, false)
+            .await
+            .expect("write a");
+
+        // graph scope=memory: links from edge-a surface edge-b via supports.
+        let links = graph_impl(
+            &handle,
+            &GraphParams {
+                entity: "edge-a".to_string(),
+                root: None,
+                to: None,
+                direction: "links".to_string(),
+                relation: None,
+                depth: 1,
+                scope: Some("memory".to_string()),
+            },
+        )
+        .await
+        .expect("mem links");
+        assert!(links.contains("edge-b"), "links: {links}");
+        assert!(links.contains("supports"), "links: {links}");
+
+        // backlinks from edge-b surface edge-a.
+        let back = graph_impl(
+            &handle,
+            &GraphParams {
+                entity: "edge-b".to_string(),
+                root: None,
+                to: None,
+                direction: "backlinks".to_string(),
+                relation: None,
+                depth: 1,
+                scope: Some("memory".to_string()),
+            },
+        )
+        .await
+        .expect("mem backlinks");
+        assert!(back.contains("edge-a"), "backlinks: {back}");
+    }
+
+    #[tokio::test]
+    async fn memory_write_invalid_relation_is_rejected_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let mut a = entry_input("bad-rel");
+        a.relates = vec![RelatesInput {
+            relation: "mentions".to_string(),
+            target: "x".to_string(),
+            target_kind: "memory".to_string(),
+        }];
+        let err = memory_write_impl(&handle, &a, None, false)
+            .await
+            .unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("supports"),
+            "error should list closed set: {msg}"
+        );
+
+        // Validation happens before the write, so the entry must not persist.
+        let got = get_impl(&handle, &get_params("bad-rel")).await;
+        assert!(got.is_err(), "entry must not persist on invalid relation");
+    }
+
+    #[tokio::test]
+    async fn get_impl_shows_provenance_and_edges() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        memory_write_impl(&handle, &entry_input("prov-b"), None, false)
+            .await
+            .expect("b");
+        let mut a = entry_input("prov-a");
+        a.agent = Some("codex".to_string());
+        a.relates = vec![RelatesInput {
+            relation: "derived_from".to_string(),
+            target: "prov-b".to_string(),
+            target_kind: "memory".to_string(),
+        }];
+        memory_write_impl(&handle, &a, Some("sess-9"), false)
+            .await
+            .expect("a");
+
+        let (text, _, _) = get_impl(&handle, &get_params("prov-a")).await.expect("get");
+        assert!(text.contains("Provenance:"), "text: {text}");
+        assert!(text.contains("codex"), "text: {text}");
+        assert!(text.contains("sess-9"), "text: {text}");
+        assert!(text.contains("Edges:"), "text: {text}");
+        assert!(text.contains("derived_from prov-b"), "text: {text}");
+    }
+
+    #[tokio::test]
+    async fn memory_write_on_conflict_contradicts_records_edge() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.expect("init ctx");
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+
+        let emb = vec![0.1f32; crate::store::vectors::EMBEDDING_DIM];
+
+        // Original entry with a stored embedding.
+        write_single_memory(
+            conn,
+            "orig-dup",
+            "Orig",
+            "Auth notes",
+            "topic",
+            "user_statement",
+            &[],
+            None,
+            None,
+            Some(emb.clone()),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect("orig write");
+
+        // Near-identical embedding + on_conflict=contradicts: writes the entry AND
+        // records a contradicts edge to the similar one, returning both ids.
+        let out = write_single_memory(
+            conn,
+            "new-dup",
+            "New",
+            "Auth notes v2",
+            "topic",
+            "user_statement",
+            &[],
+            None,
+            None,
+            Some(emb.clone()),
+            None,
+            &[],
+            None,
+            None,
+            Some("contradicts"),
+            false,
+        )
+        .expect("contradicts write");
+        assert!(out.contains("new-dup"), "new id in output: {out}");
+        assert!(out.contains("orig-dup"), "conflicting id in output: {out}");
+
+        let edges =
+            memory_graph::outgoing(conn, "new-dup", Some(MemoryRelation::Contradicts)).unwrap();
+        assert_eq!(edges.len(), 1, "contradicts edge missing");
+        assert_eq!(edges[0].target_ref, "orig-dup");
+
+        // Default (on_conflict absent): a near-duplicate is rejected verbatim.
+        let err = write_single_memory(
+            conn,
+            "third-dup",
+            "Third",
+            "Auth notes v3",
+            "topic",
+            "user_statement",
+            &[],
+            None,
+            None,
+            Some(emb.clone()),
+            None,
+            &[],
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:?}").contains("Near-duplicate"),
+            "default must still reject: {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn memory_write_impl_dry_run_does_not_persist() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
 
-        let preview = memory_write_impl(&handle, &entry_input("dry-w"), true)
+        let preview = memory_write_impl(&handle, &entry_input("dry-w"), None, true)
             .await
             .expect("dry-run write");
         assert_eq!(preview, "dry-run: would create memory entry 'dry-w'");
@@ -3570,7 +4514,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
 
-        let err = memory_write_batch_impl(&handle, &[], false)
+        let err = memory_write_batch_impl(&handle, &[], None, false)
             .await
             .expect_err("must reject");
         assert!(
@@ -3586,7 +4530,7 @@ mod tests {
         let handle = make_handle(&tmp);
         let entries: Vec<_> = (0..21).map(|i| entry_input(&format!("b-{i}"))).collect();
 
-        let err = memory_write_batch_impl(&handle, &entries, false)
+        let err = memory_write_batch_impl(&handle, &entries, None, false)
             .await
             .expect_err("must reject");
         assert!(
@@ -3610,7 +4554,7 @@ mod tests {
         c.title = "Frontend build config".to_string();
         c.content = "Vite chunk splitting and tree shaking knobs".to_string();
 
-        let (text, count) = memory_write_batch_impl(&handle, &[a, b, c], false)
+        let (text, count) = memory_write_batch_impl(&handle, &[a, b, c], None, false)
             .await
             .expect("batch impl");
 
@@ -4154,6 +5098,230 @@ mod tests {
         // Empty DB → no results
         let result = hook_user_prompt_submit_impl(&handle, "find authentication bug").await;
         assert_eq!(result, json!({}));
+    }
+
+    // ── Phase 7: trigger-matched prior injection ──────────────────────────────
+
+    /// Seed a promoted, injectable cluster directly into the handle's store.
+    async fn seed_promoted_prior(handle: &RepoHandle, kind: &str, matcher: &str, lesson: &str) {
+        use crate::store::priors::{
+            PriorCluster, canonical_trigger_key, cluster_id_for_key, upsert_cluster,
+        };
+        ensure_handle_context(handle).await.unwrap();
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let key = canonical_trigger_key(kind, matcher);
+        let now = chrono::Utc::now().timestamp();
+        upsert_cluster(
+            conn,
+            &PriorCluster {
+                id: cluster_id_for_key(&key),
+                canonical_trigger_key: key,
+                trigger_kind: kind.into(),
+                trigger_matcher: matcher.into(),
+                lesson: lesson.into(),
+                scope: r#"{"repo":"current"}"#.into(),
+                evidence_count: 2,
+                distinct_sessions: 2, // clears the injection score threshold
+                injected_count: 0,
+                confirmed_count: 0,
+                refuted_count: 0,
+                state: "promoted".into(),
+                promoted_memory_id: None,
+                created_at: now,
+                last_seen_at: now, // maximally fresh
+            },
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn hook_pre_tool_use_injects_trigger_matched_prior_on_edit() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_promoted_prior(
+            &handle,
+            "pre_tool",
+            r#"{"pattern":"src/generated/**"}"#,
+            "Do not edit generated files; edit the generator instead.",
+        )
+        .await;
+
+        // Edit is neither Grep nor Bash — the prior must still fire.
+        let path = tmp.path().join("src/generated/api.rs");
+        let event = json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": path.to_string_lossy()}
+        });
+        let result = hook_pre_tool_use_impl(&handle, &event).await;
+        let ctx = result["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(ctx.contains("mdkb prior:"), "expected prior, got: {result}");
+        assert!(ctx.contains("Do not edit generated files"));
+    }
+
+    #[tokio::test]
+    async fn hook_pre_tool_use_silent_when_prior_trigger_does_not_match() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_promoted_prior(
+            &handle,
+            "pre_tool",
+            r#"{"pattern":"src/generated/**"}"#,
+            "Do not edit generated files.",
+        )
+        .await;
+
+        let path = tmp.path().join("src/handwritten.rs");
+        let event = json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": path.to_string_lossy()}
+        });
+        let result = hook_pre_tool_use_impl(&handle, &event).await;
+        assert_eq!(result, json!({}), "non-matching path must not inject");
+    }
+
+    #[tokio::test]
+    async fn hook_pre_tool_use_prior_suppressed_when_injection_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let mut cfg = Config::default();
+        cfg.priors.injection_enabled = false;
+        let handle = Arc::new(RepoHandle::from_shared(
+            root.clone(),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            cfg,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        seed_promoted_prior(
+            &handle,
+            "pre_tool",
+            r#"{"pattern":"src/generated/**"}"#,
+            "Do not edit generated files.",
+        )
+        .await;
+
+        let path = root.join("src/generated/api.rs");
+        let event = json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": path.to_string_lossy()}
+        });
+        let result = hook_pre_tool_use_impl(&handle, &event).await;
+        assert_eq!(result, json!({}), "flag off → no prior injection");
+    }
+
+    #[tokio::test]
+    async fn hook_user_prompt_submit_injects_prompt_matched_prior() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_promoted_prior(
+            &handle,
+            "prompt",
+            r#"{"pattern":"ripgrep"}"#,
+            "Prefer ripgrep over grep for repository search.",
+        )
+        .await;
+
+        let result =
+            hook_user_prompt_submit_impl(&handle, "should I use ripgrep for searching?").await;
+        let ctx = result["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or("");
+        assert!(ctx.contains("## mdkb: priors"), "got: {result}");
+        assert!(ctx.contains("Prefer ripgrep over grep"));
+    }
+
+    // ── Phase 3+5: Stop hook + async distiller ────────────────────────────────
+
+    #[tokio::test]
+    async fn hook_stop_noop_when_mining_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp); // mining_enabled=false by default
+        let event = json!({"transcript_path": "/nonexistent", "session_id": "s1"});
+        assert_eq!(hook_stop_impl(handle, &event), json!({}));
+    }
+
+    #[tokio::test]
+    async fn hook_stop_noop_when_no_distiller_configured() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let mut cfg = Config::default();
+        cfg.priors.mining_enabled = true; // on, but no distiller_program → still off
+        let handle = Arc::new(RepoHandle::from_shared(
+            root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            cfg,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let event = json!({"transcript_path": "/nonexistent", "session_id": "s1"});
+        assert_eq!(hook_stop_impl(handle, &event), json!({}));
+    }
+
+    /// A transcript where a Bash error is followed by a corrective Edit and a
+    /// clean result — the candidate detector's ErrorFixed signal.
+    const MINE_FIX_TRANSCRIPT: &str = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"refactor the parser"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"error[E0433]: failed to resolve"}]}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"src/lib.rs"}}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+    );
+
+    #[tokio::test]
+    async fn mine_episode_persists_candidate_via_fake_distiller() {
+        use crate::store::priors::{canonical_trigger_key, cluster_id_for_key, get_cluster};
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+
+        // Fake distiller: consume stdin (the prompt), emit a valid distilled prior.
+        // JSON uses only double quotes so it survives single-quote shell wrapping.
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let program = "sh".to_string();
+        let args = vec![
+            "-c".to_string(),
+            format!("cat >/dev/null; printf '%s' '{distilled}'"),
+        ];
+
+        mine_episode(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "sess-1".to_string(),
+            program,
+            args,
+        )
+        .await;
+
+        // One session → a candidate cluster exists (not yet promoted).
+        ensure_handle_context(&handle).await.unwrap();
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let key = canonical_trigger_key(
+            "pre_tool",
+            r#"{"pattern":"src/generated/**","when":"editing generated code"}"#,
+        );
+        let cluster = get_cluster(conn, &cluster_id_for_key(&key))
+            .unwrap()
+            .expect("mining created a candidate cluster");
+        assert_eq!(cluster.state, "candidate");
+        assert_eq!(cluster.distinct_sessions, 1);
+        assert!(cluster.lesson.contains("Do not edit generated files"));
     }
 
     #[tokio::test]

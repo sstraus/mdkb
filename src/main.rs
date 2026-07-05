@@ -24,10 +24,11 @@ use mdkb::cli::handlers::{
     handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
     handle_graph_links, handle_graph_neighbors, handle_graph_path, handle_history,
     handle_hybrid_search, handle_init, handle_memory_add, handle_memory_export,
-    handle_memory_import, handle_memory_import_dir, handle_memory_list, handle_memory_prune,
-    handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
-    handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
-    handle_session_index, handle_superseded_by, handle_update_files_force, handle_update_force,
+    handle_memory_import, handle_memory_import_dir, handle_memory_link, handle_memory_list,
+    handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show,
+    handle_memory_warmup, handle_metrics_export, handle_metrics_latency, handle_metrics_show,
+    handle_mget, handle_session_index, handle_superseded_by, handle_update_files_force,
+    handle_update_force,
 };
 #[cfg(unix)]
 use mdkb::cli::hook_client;
@@ -558,6 +559,15 @@ async fn run_cli(cli: Cli) -> Result<()> {
                         println!("Memory entry '{id}' not found");
                     }
                 }
+                MemoryCommand::Link {
+                    id,
+                    relation,
+                    target,
+                    doc,
+                    agent,
+                } => {
+                    handle_memory_link(&ctx, &id, &relation, &target, doc, agent.as_deref())?;
+                }
                 MemoryCommand::List { limit, status } => {
                     let entries = handle_memory_list(&ctx, limit, status.as_deref())?;
                     format_memory_list(&entries, cli.format);
@@ -839,6 +849,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
 {0} memory add <id> --title T --content C              # create (default: topic)
 {0} memory add <id> --title T --content C --entry-type prior --tags t1,t2
 {0} memory add <id> --title T --content C --entry-type reminder --due-in 3600
+{0} memory link <id> <relation> <target>              # typed edge (supports|contradicts|supersedes|derived_from|relates_to)
+{0} memory link <id> derived_from <path> --doc        # link to a document; --agent records provenance
 {0} memory rm <id>                                     # delete
 {0} memory list                                        # list active entries
 
@@ -1085,6 +1097,14 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     let cwd = std::env::current_dir()?;
                     if !hook_logic::mdkbignore_hooks_present(&cwd) {
                         hook_client::call_hook_event("hook.pre_tool_use", event, None).await?;
+                    }
+                }
+                HookCommand::Stop => {
+                    let input = hook_logic::read_stdin_best_effort();
+                    let event = hook_logic::parse_event(&input);
+                    let cwd = std::env::current_dir()?;
+                    if !hook_logic::mdkbignore_hooks_present(&cwd) {
+                        hook_client::call_hook_event("hook.stop", event, None).await?;
                     }
                 }
                 HookCommand::Reindex { files, root } => {

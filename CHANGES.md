@@ -1,5 +1,55 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Memory graph — typed edges between memory entries (schema v14).** A new
+  `memory_edges` table records typed relations (`supports`, `contradicts`,
+  `supersedes`, `derived_from`, `relates_to`) from a memory entry to another
+  memory or a document. Targets are dangling-tolerant and resolved at query time,
+  mirroring the document graph.
+  - `memory_write` accepts `relates=[{relation, target, target_kind}]` (max 10) —
+    entry and edges are written in one transaction. A `supersedes` memory edge
+    keeps the `superseded_by` scalar and `superseded` status in lockstep (single
+    write path).
+  - `graph(entity, direction="links"|"backlinks", scope="memory")` traverses the
+    memory graph. CLI: `mdkb memory link <id> <relation> <target> [--doc]
+    [--agent <name>]`; invalid relations are rejected listing the closed set.
+  - `memory_write(on_conflict="contradicts")` records a near-duplicate conflict as
+    a `contradicts` edge to the similar entry instead of rejecting the write
+    (default behavior unchanged when omitted).
+  - **Authorship provenance** — `memory_write` records the authoring session and
+    optional `agent`; both surface in `get(id)`.
+- **Post-recall 1-hop expansion.** A recalled entry's active memory neighbors are
+  surfaced (≤2 seeds, ≤3 neighbors), annotated `(via <relation>)`;
+  superseded/expired/dangling neighbors are excluded.
+- **`[STALE-DEP]` marker.** At injection time (warmup + recall), an entry whose
+  `derived_from`/`supports` dependency is superseded or net-refuted is prefixed
+  `[STALE-DEP]`. Read-only — it never mutates stored confidence.
+- **AI-distilled behavioral priors (schema v13).** Replaces the mechanical
+  tool-chain "prior" miner with a recurrence-gated, trigger-matched subsystem
+  owned by mdkb. New `prior_candidates`/`prior_clusters` tables; a write-time gate
+  rejects mechanical tool-chain priors.
+  - **Mining (opt-in, kill-switched).** A new `Stop` hook feeds the end-of-episode
+    transcript to a cheap no-LLM candidate detector (error→fix→clean, or explicit
+    user correction). Only flagged episodes are distilled — by an external agent
+    CLI (`[priors].distiller_program`, prompt piped on stdin, run off the hook
+    budget in a detached task) into strict JSON (falsifiable ≤160-char lesson,
+    machine-matchable trigger, scope, evidence). Untrusted transcript evidence is
+    secret-redacted before it leaves the process. Off by default
+    (`[priors].mining_enabled=false`, and inert without a configured distiller).
+  - **Recurrence gate + promotion.** A distilled prior is clustered by canonical
+    trigger key; a cluster promotes to a `memory_entries` prior only after
+    recurring across ≥2 distinct sessions. Injection scoring
+    (`recurrence × freshness × belief`) is decoupled from per-entry source
+    authority, so an honestly-tagged AI prior can finally surface.
+  - **Trigger-matched injection.** Promoted priors surface at PreToolUse
+    (tool / path-glob / command match) and UserPromptSubmit (prompt match) — never
+    unconditionally at SessionStart. `[priors].injection_enabled` (on) and
+    `max_injected_per_hook` (1) bound the per-turn cost; the PreToolUse path reads
+    only an already-warm context so it never opens a DB on the hot path.
+
 ## 3.4.0 (2026-06-09)
 
 ### Added

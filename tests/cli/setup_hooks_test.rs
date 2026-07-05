@@ -112,13 +112,14 @@ fn disable_skips_named_events() {
         None,
     )
     .expect("setup hooks ok");
-    assert_eq!(result.events_registered.len(), 2);
+    assert_eq!(result.events_registered.len(), 3);
     assert!(
         result
             .events_registered
             .contains(&"UserPromptSubmit".to_string())
     );
     assert!(result.events_registered.contains(&"PreToolUse".to_string()));
+    assert!(result.events_registered.contains(&"Stop".to_string()));
     assert_eq!(result.events_skipped.len(), 2);
     assert!(result.events_skipped.contains(&"SessionStart".to_string()));
     assert!(result.events_skipped.contains(&"PostToolUse".to_string()));
@@ -128,6 +129,7 @@ fn disable_skips_named_events() {
     assert!(mdkb_entries(&v, "PostToolUse").is_empty());
     assert_eq!(mdkb_entries(&v, "UserPromptSubmit").len(), 1);
     assert_eq!(mdkb_entries(&v, "PreToolUse").len(), 1);
+    assert_eq!(mdkb_entries(&v, "Stop").len(), 1);
 }
 
 #[test]

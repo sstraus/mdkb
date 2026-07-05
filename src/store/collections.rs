@@ -4,10 +4,23 @@ use crate::domain::Collection;
 use crate::error::{ErrorKind, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 
-/// Add a new collection.
+/// Add a collection, idempotently.
+///
+/// Uses an upsert on the `name` primary key: re-adding an existing collection
+/// updates its path/pattern/source (keeping the original `created_at`) instead of
+/// failing on the UNIQUE constraint. This makes the write safe against the race
+/// between an explicit `collection add` and the served process's best-effort
+/// convention auto-registration (`apply_conventions`) — both target the same name
+/// and would otherwise collide under concurrency.
 pub fn add_collection(conn: &Connection, collection: &Collection) -> Result<()> {
     conn.execute(
-        "INSERT INTO collections (name, path, pattern, source, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO collections (name, path, pattern, source, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(name) DO UPDATE SET
+             path = excluded.path,
+             pattern = excluded.pattern,
+             source = excluded.source,
+             updated_at = excluded.updated_at",
         params![
             collection.name,
             collection.path,
@@ -139,14 +152,31 @@ mod tests {
     }
 
     #[test]
-    fn test_add_duplicate_collection_fails() {
+    fn test_add_duplicate_collection_is_idempotent_upsert() {
+        // Re-adding an existing collection name must NOT error (it would race the
+        // served process's convention auto-registration). Instead it upserts:
+        // path/pattern/source update in place, created_at is preserved, one row.
         let conn = setup_db();
-        let coll = make_collection("docs", "./docs");
 
-        add_collection(&conn, &coll).expect("first add should succeed");
-        let result = add_collection(&conn, &coll);
+        let mut first = make_collection("docs", "./docs");
+        first.created_at = 1000;
+        first.updated_at = 1000;
+        add_collection(&conn, &first).expect("first add should succeed");
 
-        assert!(result.is_err());
+        let mut second = make_collection("docs", "./documentation");
+        second.pattern = "**/*.mdx".to_string();
+        second.created_at = 2000; // must be ignored — created_at is preserved
+        second.updated_at = 2000;
+        add_collection(&conn, &second).expect("re-add must be idempotent, not error");
+
+        let all = list_collections(&conn).unwrap();
+        assert_eq!(all.len(), 1, "upsert must not create a duplicate row");
+
+        let got = get_collection(&conn, "docs").unwrap().unwrap();
+        assert_eq!(got.path, "./documentation", "path should update");
+        assert_eq!(got.pattern, "**/*.mdx", "pattern should update");
+        assert_eq!(got.created_at, 1000, "created_at must be preserved");
+        assert_eq!(got.updated_at, 2000, "updated_at should refresh");
     }
 
     #[test]

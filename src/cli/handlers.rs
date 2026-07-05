@@ -1322,6 +1322,13 @@ pub fn handle_memory_add(
 
     memory::validate_entry_input(id, title, &tags, content)?;
 
+    if entry_type == EntryType::Prior && memory::is_mechanical_prior_noise(content) {
+        return Err(ErrorKind::InvalidQuery(
+            "Rejected mechanical tool-chain prior (no reusable lesson). Priors must carry a distilled, trigger-scoped lesson.".to_string(),
+        )
+        .into());
+    }
+
     let now = chrono::Utc::now().timestamp();
     let expires_at = ttl.map(|s| now + s as i64);
     let due_at = due_in.map(|s| now + s as i64);
@@ -1389,6 +1396,41 @@ pub fn handle_memory_add(
 /// Handle `mdkb memory show` command.
 pub fn handle_memory_show(ctx: &Context, id: &str) -> Result<Option<MemoryEntry>> {
     memory::get_entry(&ctx.conn, id)
+}
+
+/// Handle `mdkb memory link` command: add a typed graph edge from an existing
+/// memory entry to another memory slug or a document path.
+pub fn handle_memory_link(
+    ctx: &Context,
+    id: &str,
+    relation: &str,
+    target: &str,
+    doc: bool,
+    agent: Option<&str>,
+) -> Result<()> {
+    use crate::store::memory_graph::{self, MemoryRelation, TargetKind};
+    use std::str::FromStr;
+
+    let rel = MemoryRelation::from_str(relation)
+        .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
+
+    if memory::get_entry(&ctx.conn, id)?.is_none() {
+        return Err(ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")).into());
+    }
+
+    let kind = if doc {
+        TargetKind::Doc
+    } else {
+        TargetKind::Memory
+    };
+    memory_graph::add_edge(&ctx.conn, id, target, kind, rel)?;
+
+    if let Some(agent) = agent {
+        memory::set_provenance(&ctx.conn, id, None, Some(agent))?;
+    }
+
+    println!("Linked {id} --{relation}--> {target}");
+    Ok(())
 }
 
 /// Handle `mdkb memory list` command.
@@ -2653,6 +2695,140 @@ mod tests {
     }
 
     #[test]
+    fn test_memory_add_rejects_mechanical_prior() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        let err = handle_memory_add(
+            &ctx,
+            "prior-deadbeefdeadbeef",
+            "fix: fix|tools:Edit->Bash",
+            "prior",
+            Some("prior,fix"),
+            "Pattern: fix|tools:Edit->Bash->Bash|files:none|error_in:none\nOutcome: fix",
+            None,
+            None,
+            None,
+        )
+        .expect_err("mechanical tool-chain prior must be rejected");
+        assert!(
+            err.to_string().contains("mechanical tool-chain prior"),
+            "{err}"
+        );
+
+        // A non-prior entry with the same text is NOT rejected (guard is prior-scoped).
+        handle_memory_add(
+            &ctx,
+            "topic-tools",
+            "Tooling",
+            "topic",
+            None,
+            "Pattern: fix|tools:Edit->Bash|files:none|error_in:none",
+            None,
+            None,
+            None,
+        )
+        .expect("non-prior entry must not be rejected");
+    }
+
+    #[test]
+    fn test_memory_link_roundtrip() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        for id in ["a", "b"] {
+            handle_memory_add(
+                &ctx, id, "Title", "topic", None, "content", None, None, None,
+            )
+            .expect("add should succeed");
+        }
+
+        handle_memory_link(&ctx, "a", "supports", "b", false, None).expect("link should succeed");
+
+        let out = crate::store::memory_graph::outgoing(&ctx.conn, "a", None)
+            .expect("outgoing should succeed");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].target_ref, "b");
+        assert_eq!(out[0].relation, "supports");
+        assert_eq!(out[0].target_kind, "memory");
+    }
+
+    #[test]
+    fn test_memory_link_invalid_relation_lists_closed_set() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        handle_memory_add(
+            &ctx, "a", "Title", "topic", None, "content", None, None, None,
+        )
+        .expect("add should succeed");
+
+        let err = handle_memory_link(&ctx, "a", "mentions", "b", false, None)
+            .expect_err("invalid relation must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("supports"),
+            "error must list the closed set: {msg}"
+        );
+        assert!(
+            msg.contains("relates_to"),
+            "error must list the closed set: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_memory_link_missing_source_errors() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        let err = handle_memory_link(&ctx, "ghost", "supports", "b", false, None)
+            .expect_err("missing source must be rejected");
+        assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn test_memory_link_records_agent_provenance() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        handle_memory_add(
+            &ctx, "a", "Title", "topic", None, "content", None, None, None,
+        )
+        .expect("add should succeed");
+
+        handle_memory_link(&ctx, "a", "relates_to", "b", false, Some("scout"))
+            .expect("link with agent should succeed");
+
+        let (_, agent) = memory::get_provenance(&ctx.conn, "a").expect("provenance read");
+        assert_eq!(agent.as_deref(), Some("scout"));
+    }
+
+    #[test]
+    fn test_memory_link_doc_target_kind() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        handle_memory_add(
+            &ctx, "a", "Title", "topic", None, "content", None, None, None,
+        )
+        .expect("add should succeed");
+
+        handle_memory_link(&ctx, "a", "derived_from", "docs/spec.md", true, None)
+            .expect("doc link should succeed");
+
+        let out = crate::store::memory_graph::outgoing(&ctx.conn, "a", None)
+            .expect("outgoing should succeed");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].target_kind, "doc");
+    }
+
+    #[test]
     fn test_memory_add_existing_id_upserts() {
         // Writing the same id twice must update in place, not fail with a
         // UNIQUE constraint violation (the CLI/bridge memory-write path).
@@ -2924,15 +3100,25 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_collection_add_duplicate_fails() {
+    fn test_handle_collection_add_duplicate_is_idempotent() {
+        // Re-adding the same collection name upserts in place (no error): this keeps
+        // an explicit `collection add` from racing the served process's convention
+        // auto-registration of the same name.
         let temp = setup_temp_dir();
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
         handle_collection_add(&ctx, "docs", "./docs", "**/*.md").unwrap();
-        let result = handle_collection_add(&ctx, "docs", "./other", "**/*.md");
+        handle_collection_add(&ctx, "docs", "./other", "**/*.mdx")
+            .expect("re-add must be idempotent, not error");
 
-        assert!(result.is_err());
+        let all = crate::store::collections::list_collections(&ctx.conn).unwrap();
+        assert_eq!(all.len(), 1, "upsert must not create a duplicate row");
+        let got = crate::store::collections::get_collection(&ctx.conn, "docs")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.path, "./other", "path should update on re-add");
+        assert_eq!(got.pattern, "**/*.mdx", "pattern should update on re-add");
     }
 
     #[test]
