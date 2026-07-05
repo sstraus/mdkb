@@ -43,6 +43,14 @@ pub struct DaemonConfig {
     /// Pre-registered repositories.
     #[serde(default)]
     pub repos: Vec<RepoEntry>,
+
+    /// Global `[priors]` layer applied as the base for every repo. The distiller
+    /// (program/args/model) is a machine-wide choice, so it belongs here — set it
+    /// once instead of per-repo. A repo's `.mdkb/config.toml` `[priors]` overrides
+    /// this field-by-field. Kept as a raw table so a repo can override individual
+    /// keys without restating the whole section.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub priors: toml::Table,
 }
 
 /// A pre-registered repository entry.
@@ -59,6 +67,7 @@ impl Default for DaemonConfig {
             max_active_repos: DEFAULT_MAX_ACTIVE_REPOS,
             whitelist_dirs: Vec::new(),
             repos: Vec::new(),
+            priors: toml::Table::new(),
         }
     }
 }
@@ -192,6 +201,7 @@ mod tests {
                     root: "/Users/me/Gits/projectB".to_string(),
                 },
             ],
+            priors: toml::from_str("mining_enabled = true\ndistiller_program = \"codex\"").unwrap(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -202,6 +212,12 @@ mod tests {
         assert_eq!(parsed.whitelist_dirs.len(), 2);
         assert_eq!(parsed.repos.len(), 2);
         assert_eq!(parsed.repos[0].root, "/Users/me/Gits/projectA");
+        // The global priors table survives a serialize→parse roundtrip (proves it
+        // is emitted in a valid position relative to the array-of-tables `repos`).
+        assert_eq!(
+            parsed.priors.get("distiller_program"),
+            Some(&toml::Value::String("codex".to_string()))
+        );
     }
 
     #[test]
@@ -242,6 +258,7 @@ whitelist_dirs = ["~/Code"]
             repos: vec![RepoEntry {
                 root: "/foo/bar".to_string(),
             }],
+            priors: toml::Table::new(),
         };
         config.save(&path).unwrap();
 

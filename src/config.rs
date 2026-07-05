@@ -344,7 +344,7 @@ impl Default for DbConfig {
 /// a `distiller_program` is configured (mdkb ships ONNX embeddings only, no chat
 /// model, so distillation requires an external agent CLI). Injection of already
 /// promoted priors is a separate, cheaper toggle.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PriorsConfig {
     /// Master kill switch for the mining pipeline (Stop-hook distillation). Off
@@ -376,6 +376,41 @@ impl Default for PriorsConfig {
             distiller_args: Vec::new(),
             injection_enabled: true,
             max_injected_per_hook: 1,
+        }
+    }
+}
+
+/// The raw `[priors]` table declared in a TOML config file, or `None` when the
+/// file is absent, unparseable, or omits the section. Only keys the user set
+/// explicitly are returned, so a layered merge can distinguish "unset" from
+/// "set to the default value".
+pub fn raw_priors_layer(path: impl AsRef<Path>) -> Option<toml::Table> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let table: toml::Table = toml::from_str(&content).ok()?;
+    match table.get("priors") {
+        Some(toml::Value::Table(t)) => Some(t.clone()),
+        _ => None,
+    }
+}
+
+/// Merge a global `[priors]` base with an optional per-repo override, the repo's
+/// keys winning field-by-field, then deserialize into a typed [`PriorsConfig`]
+/// (any key set in neither layer falls back to its default). This is the single
+/// definition of priors layering: `default < global daemon.toml < per-repo
+/// config.toml`. A type-invalid merged value degrades to defaults with a warning
+/// rather than aborting a repo open.
+pub fn merge_priors(global: &toml::Table, repo: Option<&toml::Table>) -> PriorsConfig {
+    let mut merged = global.clone();
+    if let Some(r) = repo {
+        for (k, v) in r {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    match toml::Value::Table(merged).try_into() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            tracing::warn!("invalid [priors] config, using defaults: {e}");
+            PriorsConfig::default()
         }
     }
 }
@@ -1180,6 +1215,71 @@ max_injected_per_hook = 3
         assert_eq!(config.priors.max_injected_per_hook, 3);
         // Unset field falls back to its default.
         assert!(config.priors.injection_enabled);
+    }
+
+    #[test]
+    fn merge_priors_repo_overrides_global_field_by_field() {
+        // Global sets the machine-wide distiller and turns mining on.
+        let global: toml::Table = toml::from_str(
+            r#"mining_enabled = true
+distiller_program = "codex"
+distiller_args = ["exec", "-m", "gpt-5-mini"]"#,
+        )
+        .unwrap();
+        // Repo overrides only mining_enabled; everything else must be inherited.
+        let repo: toml::Table = toml::from_str("mining_enabled = false").unwrap();
+
+        let merged = merge_priors(&global, Some(&repo));
+        assert!(!merged.mining_enabled, "repo key wins");
+        assert_eq!(
+            merged.distiller_program.as_deref(),
+            Some("codex"),
+            "distiller inherited from global"
+        );
+        assert_eq!(merged.distiller_args, vec!["exec", "-m", "gpt-5-mini"]);
+        // A key set in neither layer keeps its default.
+        assert!(merged.injection_enabled);
+    }
+
+    #[test]
+    fn merge_priors_no_repo_layer_yields_global() {
+        let global: toml::Table = toml::from_str(r#"distiller_program = "codex""#).unwrap();
+        let merged = merge_priors(&global, None);
+        assert_eq!(merged.distiller_program.as_deref(), Some("codex"));
+        assert!(!merged.mining_enabled, "unset stays default-off");
+    }
+
+    #[test]
+    fn merge_priors_empty_global_is_all_defaults() {
+        let merged = merge_priors(&toml::Table::new(), None);
+        assert_eq!(merged, PriorsConfig::default());
+    }
+
+    #[test]
+    fn raw_priors_layer_returns_only_present_sections() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let with = dir.path().join("with.toml");
+        std::fs::write(
+            &with,
+            "[priors]\nmining_enabled = true\n[hooks]\nstop = false\n",
+        )
+        .unwrap();
+        let layer = raw_priors_layer(&with).expect("priors section present");
+        assert_eq!(
+            layer.get("mining_enabled"),
+            Some(&toml::Value::Boolean(true))
+        );
+        assert!(
+            !layer.contains_key("stop"),
+            "only the priors table is lifted"
+        );
+
+        let without = dir.path().join("without.toml");
+        std::fs::write(&without, "[hooks]\nstop = false\n").unwrap();
+        assert!(raw_priors_layer(&without).is_none());
+
+        assert!(raw_priors_layer(dir.path().join("missing.toml")).is_none());
     }
 
     #[test]

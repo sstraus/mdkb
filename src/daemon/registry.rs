@@ -53,10 +53,15 @@ impl std::fmt::Debug for RepoHandle {
 
 impl RepoHandle {
     /// Open (or create) a repo handle for the given root path.
-    pub fn open(root: &Path) -> Result<Self> {
+    ///
+    /// `global_priors` is the daemon-wide `[priors]` base (from `~/.mdkb/daemon.toml`);
+    /// the repo's own `[priors]` overrides it field-by-field. Passing it in (rather
+    /// than reading `daemon.toml` here) keeps `open` free of hidden global state so
+    /// tests stay deterministic.
+    pub fn open(root: &Path, global_priors: &toml::Table) -> Result<Self> {
         let root = canonicalize_root(root)?;
         let config_path = root.join(".mdkb/config.toml");
-        let config = if config_path.exists() {
+        let mut config = if config_path.exists() {
             match Config::load(&config_path) {
                 Ok(c) => c,
                 Err(e) => {
@@ -70,6 +75,9 @@ impl RepoHandle {
         } else {
             Config::default()
         };
+        // Layer the global [priors] base under any per-repo override.
+        let repo_priors = crate::config::raw_priors_layer(&config_path);
+        config.priors = crate::config::merge_priors(global_priors, repo_priors.as_ref());
         let code_ignore_patterns = config.code.indexing.ignore_patterns.clone();
 
         let (reindex_tx, reindex_rx) = mpsc::channel(64);
@@ -200,7 +208,7 @@ impl RepoRegistry {
         }
 
         // Open new handle
-        let handle = Arc::new(RepoHandle::open(&canonical)?);
+        let handle = Arc::new(RepoHandle::open(&canonical, &self.daemon_config.priors)?);
         self.handles.insert(canonical.clone(), Arc::clone(&handle));
         tracing::info!("Registered repo: {}", canonical.display());
 
@@ -362,15 +370,41 @@ mod tests {
     fn test_repo_handle_open() {
         let tmp = TempDir::new().unwrap();
         let root = make_repo(&tmp);
-        let handle = RepoHandle::open(&root).unwrap();
+        let handle = RepoHandle::open(&root, &toml::Table::new()).unwrap();
         assert_eq!(handle.root, root.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn open_layers_global_priors_under_repo_override() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        // Repo opts out of mining but says nothing about the distiller.
+        std::fs::write(
+            root.join(".mdkb/config.toml"),
+            "[priors]\nmining_enabled = false\n",
+        )
+        .unwrap();
+        // Global base wires the machine-wide distiller and turns mining on.
+        let global: toml::Table =
+            toml::from_str("mining_enabled = true\ndistiller_program = \"codex\"\n").unwrap();
+
+        let handle = RepoHandle::open(&root, &global).unwrap();
+        assert!(
+            !handle.config.priors.mining_enabled,
+            "repo override wins over global"
+        );
+        assert_eq!(
+            handle.config.priors.distiller_program.as_deref(),
+            Some("codex"),
+            "distiller inherited from global base"
+        );
     }
 
     #[test]
     fn test_repo_handle_touch() {
         let tmp = TempDir::new().unwrap();
         let root = make_repo(&tmp);
-        let handle = RepoHandle::open(&root).unwrap();
+        let handle = RepoHandle::open(&root, &toml::Table::new()).unwrap();
         let t1 = handle.last_access_time();
         handle.touch();
         let t2 = handle.last_access_time();
