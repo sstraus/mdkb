@@ -209,6 +209,7 @@ async fn run_hook_in_process(method: &str, params: Value, root: &Path) -> Result
         session_id: Arc::new(AtomicI64::new(0)),
         persistent_call_count: Arc::new(AtomicU64::new(0)),
         optimize_interval_calls: 200,
+        hook_dedup: Arc::new(std::sync::Mutex::new(Default::default())),
     };
 
     match registry.get_or_open(root) {
@@ -265,6 +266,7 @@ async fn run_in_process(method: &str, params: Value, root: &Path) -> Result<()> 
         session_id: Arc::new(AtomicI64::new(0)),
         persistent_call_count: Arc::new(AtomicU64::new(0)),
         optimize_interval_calls: 200,
+        hook_dedup: Arc::new(std::sync::Mutex::new(Default::default())),
     };
 
     match registry.get_or_open(root) {

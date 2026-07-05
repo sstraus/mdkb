@@ -107,6 +107,14 @@ Restart the host CLI after setup. Re-running is idempotent: existing hook entrie
 
 `mdkb setup mcp …` and `mdkb setup hooks …` hard-code the absolute path of the binary that ran the setup. If you later move or rebuild the binary, the recorded command breaks. For stable global installs, first run `cargo install --path .` (binary lands in `~/.cargo/bin/mdkb`), then run setup from that binary.
 
+For local development builds that back active MCP/hooks, prefer:
+
+```bash
+scripts/local-release.sh
+```
+
+It builds `target/release/mdkb`, stops stale `mdkb mcp` processes, restarts the daemon, and reports which process holds the rebuilt binary.
+
 ### Uninstalling
 
 ```bash

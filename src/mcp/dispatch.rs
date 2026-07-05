@@ -2474,6 +2474,18 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         return json!({});
     }
 
+    // Opt-in sigil: when enabled, only prompts starting with `*` get injection.
+    // Strip the `*` (and following whitespace) so it never reaches FTS, the
+    // embedder, or the model; a prompt without it is left untouched.
+    let prompt = if cfg.user_prompt_submit_require_sigil {
+        match prompt.trim_start().strip_prefix('*') {
+            Some(rest) => rest.trim_start(),
+            None => return json!({}),
+        }
+    } else {
+        prompt
+    };
+
     let prompt_repeat = dedup
         .as_ref()
         .map(|(dctx, key)| dctx.remember_hook_prompt(key, &prompt_fingerprint(prompt)))
@@ -3679,6 +3691,43 @@ mod tests {
         assert!(
             !body.contains("parent-mem"),
             "ancestor recall entry leaked into hook context: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_sigil_gates_injection_to_star_prefixed_prompts() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let mut config = Config::default();
+        config.hooks.user_prompt_submit_require_sigil = true;
+        let handle = Arc::new(RepoHandle::from_shared(
+            root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            config,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        seed_memory_entry(&handle, "sigil-mem").await;
+
+        // Same recall-worthy prompt WITHOUT the sigil: no injection at all.
+        let plain =
+            hook_user_prompt_submit_impl(&handle, "what do we know about the topic content").await;
+        assert_eq!(
+            plain,
+            json!({}),
+            "sigil-less prompt must not inject: {plain}"
+        );
+
+        // WITH the `*` sigil: recall fires and the sigil never leaks into output.
+        let opted =
+            hook_user_prompt_submit_impl(&handle, "* what do we know about the topic content").await;
+        let body = additional_context(&opted);
+        assert!(
+            body.contains("sigil-mem"),
+            "sigil-prefixed prompt should surface recall: {body}"
         );
     }
 

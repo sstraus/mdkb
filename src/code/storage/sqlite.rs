@@ -160,6 +160,21 @@ impl CodeDb {
         Ok(map)
     }
 
+    /// Record that a code index scan completed successfully.
+    pub fn mark_index_scan_completed(&self) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO code_metadata (key, value) VALUES (?1, unixepoch()) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            [schema::LAST_INDEX_SCAN_KEY],
+        )?;
+        Ok(())
+    }
+
+    /// Timestamp of the last completed code index scan.
+    pub fn last_index_scan_at(&self) -> rusqlite::Result<Option<i64>> {
+        schema::last_index_scan_at(&self.conn)
+    }
+
     /// Look up file token estimates for a set of relative paths.
     ///
     /// Returns a map containing only paths with a known (non-NULL) estimate.

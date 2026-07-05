@@ -1,5 +1,6 @@
 name: agent-dx-cli-scale
-description: A scoring scale for evaluating how well a CLI is designed for AI agents, based on the "Rewrite Your CLI for AI Agents" principles.
+
+A scoring scale for evaluating how well a CLI is designed for AI agents, based on the "Rewrite Your CLI for AI Agents" principles.
 
 # Agent DX CLI Scale
 

@@ -2551,6 +2551,7 @@ async fn run_daemon() -> Result<()> {
         session_id: Arc::new(AtomicI64::new(0)),
         persistent_call_count: Arc::new(AtomicU64::new(0)),
         optimize_interval_calls: 200,
+        hook_dedup: Arc::new(std::sync::Mutex::new(Default::default())),
     });
 
     let shutdown = CancellationToken::new();

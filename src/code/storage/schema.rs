@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS code_relationships (
     to_col INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS code_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_symbols_name ON code_symbols(name);
 CREATE INDEX IF NOT EXISTS idx_symbols_file ON code_symbols(file_id);
 CREATE INDEX IF NOT EXISTS idx_symbols_kind ON code_symbols(kind);
@@ -63,6 +68,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS code_symbols_fts USING fts5(
     tokenize='trigram case_sensitive 0'
 );
 "#;
+
+pub const LAST_INDEX_SCAN_KEY: &str = "last_index_scan_at";
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///
@@ -120,6 +127,36 @@ pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Timestamp for the last completed code index scan.
+///
+/// Older databases do not have `code_metadata`, so callers fall back to the
+/// newest per-file `indexed_at` value until the database is opened and migrated.
+pub fn last_index_scan_at(conn: &rusqlite::Connection) -> rusqlite::Result<Option<i64>> {
+    use rusqlite::OptionalExtension;
+
+    let has_metadata: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_metadata')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_metadata {
+        let scan_at: Option<i64> = conn
+            .query_row(
+                "SELECT CAST(value AS INTEGER) FROM code_metadata WHERE key=?1",
+                [LAST_INDEX_SCAN_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if scan_at.is_some() {
+            return Ok(scan_at);
+        }
+    }
+
+    conn.query_row("SELECT MAX(indexed_at) FROM code_files", [], |row| {
+        row.get::<_, Option<i64>>(0)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -130,8 +167,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
 
-        // Verify all three tables exist
-        for table in &["code_files", "code_symbols", "code_relationships"] {
+        // Verify all tables exist
+        for table in &[
+            "code_files",
+            "code_symbols",
+            "code_relationships",
+            "code_metadata",
+        ] {
             let exists: bool = conn
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",

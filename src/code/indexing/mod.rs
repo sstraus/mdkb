@@ -119,6 +119,7 @@ impl IndexFacade {
             }
 
             if changed.is_empty() {
+                self.db.mark_index_scan_completed()?;
                 return Ok(IndexStats {
                     files_discovered: discovered.len() as u32,
                     ..IndexStats::default()
@@ -134,6 +135,7 @@ impl IndexFacade {
         };
 
         self.generate_symbol_embeddings();
+        self.db.mark_index_scan_completed()?;
         Ok(stats)
     }
 
@@ -160,6 +162,7 @@ impl IndexFacade {
     pub fn index_files(&mut self, root: &Path, paths: &[PathBuf]) -> anyhow::Result<IndexStats> {
         let stats = pipeline::index_files(paths, root, &self.db, &self.config)?;
         self.generate_symbol_embeddings_for_files(paths, root);
+        self.db.mark_index_scan_completed()?;
         Ok(stats)
     }
 
@@ -261,6 +264,7 @@ impl IndexFacade {
         }
 
         if changed.is_empty() && deleted.is_empty() {
+            self.db.mark_index_scan_completed()?;
             return Ok(IndexStats::default());
         }
 
@@ -277,6 +281,7 @@ impl IndexFacade {
 
         // Re-index changed files
         if changed.is_empty() {
+            self.db.mark_index_scan_completed()?;
             return Ok(IndexStats::default());
         }
 
@@ -647,6 +652,61 @@ pub fn world() {
         assert!(stats.symbols_indexed >= 2);
         assert!(facade.symbol_count() >= 2);
         assert_eq!(facade.file_count(), 1);
+    }
+
+    #[test]
+    fn test_index_directory_no_changes_marks_scan_completed() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("main.rs"), "pub fn hello() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        facade
+            .db
+            .conn()
+            .execute(
+                "UPDATE code_metadata SET value='1' WHERE key=?1",
+                [crate::code::storage::schema::LAST_INDEX_SCAN_KEY],
+            )
+            .unwrap();
+
+        let stats = facade.index_directory(src_dir.path()).unwrap();
+
+        assert_eq!(stats.files_indexed, 0);
+        let scan_at = facade.db.last_index_scan_at().unwrap().unwrap();
+        assert!(
+            scan_at > 1,
+            "no-op index scan must refresh scan marker, got {scan_at}"
+        );
+    }
+
+    #[test]
+    fn test_reindex_files_no_changes_marks_scan_completed() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let path = src_dir.path().join("main.rs");
+        fs::write(&path, "pub fn hello() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        facade
+            .db
+            .conn()
+            .execute(
+                "UPDATE code_metadata SET value='1' WHERE key=?1",
+                [crate::code::storage::schema::LAST_INDEX_SCAN_KEY],
+            )
+            .unwrap();
+
+        let stats = facade.reindex_files(src_dir.path(), &[path]).unwrap();
+
+        assert_eq!(stats.files_indexed, 0);
+        let scan_at = facade.db.last_index_scan_at().unwrap().unwrap();
+        assert!(
+            scan_at > 1,
+            "no-op reindex_files must refresh scan marker, got {scan_at}"
+        );
     }
 
     #[test]

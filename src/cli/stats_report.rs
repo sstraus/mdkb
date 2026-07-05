@@ -314,11 +314,7 @@ fn collect_code(mdkb_dir: &Path) -> CodeSummary {
     let files = scalar_count(&conn, "SELECT COUNT(*) FROM code_files");
     let symbols = scalar_count(&conn, "SELECT COUNT(*) FROM code_symbols");
     let relations = scalar_count(&conn, "SELECT COUNT(*) FROM code_relationships");
-    let last_indexed: Option<i64> = conn
-        .query_row("SELECT MAX(indexed_at) FROM code_files", [], |r| {
-            r.get::<_, Option<i64>>(0)
-        })
-        .unwrap_or(None);
+    let last_indexed = crate::code::storage::schema::last_index_scan_at(&conn).unwrap_or(None);
 
     let languages = query_rows(
         &conn,

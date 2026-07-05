@@ -106,6 +106,12 @@ fn index_document_inner(conn: &Connection, doc: &Document, content: &str) -> Res
             if let Err(e) = vectors::delete_chunk_embeddings(conn, id) {
                 tracing::warn!("Failed to invalidate chunk embeddings for id={id}: {e}");
             }
+            // The old body is now unreferenced by this document — garbage-collect
+            // it unless another document shares the same content. Without this the
+            // content table grows without bound: every edit of a file (especially
+            // large, append-only ones like session transcripts) strands a full
+            // copy of the previous version forever.
+            delete_content_if_orphaned(conn, &old_hash)?;
         }
 
         Ok(id)
@@ -125,6 +131,39 @@ fn index_document_inner(conn: &Connection, doc: &Document, content: &str) -> Res
         )?;
         Ok(conn.last_insert_rowid())
     }
+}
+
+/// Delete a content row if no document references its hash anymore.
+///
+/// Content is stored content-addressably (deduplicated by hash) and shared
+/// across documents with identical bodies, so a body may only be reclaimed once
+/// the LAST document pointing at it is gone. Deleting a still-shared body would
+/// strand the FTS/body lookups of the sharing documents. Called on the write and
+/// delete paths so the `content` table never accumulates dead rows.
+fn delete_content_if_orphaned(conn: &Connection, hash: &str) -> Result<()> {
+    let still_referenced: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE hash = ?1)",
+        params![hash],
+        |row| row.get(0),
+    )?;
+    if !still_referenced {
+        conn.execute("DELETE FROM content WHERE hash = ?1", params![hash])?;
+    }
+    Ok(())
+}
+
+/// Remove every content row no longer referenced by any document (backlog GC).
+///
+/// Orphaning is prevented incrementally on the write/delete paths, but databases
+/// created before that fix accumulated dead rows — a growing file left a full
+/// copy of every prior version. This sweep reclaims that backlog; it is a no-op
+/// once the table is clean. Returns the number of rows reclaimed.
+pub fn gc_orphaned_content(conn: &Connection) -> Result<usize> {
+    let n = conn.execute(
+        "DELETE FROM content WHERE hash NOT IN (SELECT hash FROM documents)",
+        [],
+    )?;
+    Ok(n)
 }
 
 /// Store content without transaction (for use within existing transactions).
@@ -200,7 +239,19 @@ pub fn get_document_by_path(
 
 /// Delete a document by ID.
 pub fn delete_document(conn: &Connection, id: i64) -> Result<bool> {
+    // Capture the content hash before the row (and, via trigger, its FTS entry)
+    // is gone, so the body can be reclaimed if it becomes orphaned.
+    let hash: Option<String> = conn
+        .query_row(
+            "SELECT hash FROM documents WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
     let rows_affected = conn.execute("DELETE FROM documents WHERE id = ?1", params![id])?;
+    if let Some(hash) = hash {
+        delete_content_if_orphaned(conn, &hash)?;
+    }
     Ok(rows_affected > 0)
 }
 
@@ -539,6 +590,106 @@ mod tests {
 
         let deleted = delete_document(&conn, 99999).expect("delete should succeed");
         assert!(!deleted);
+    }
+
+    // ==================== Content GC Tests ====================
+
+    fn content_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM content", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn update_reclaims_old_content_when_orphaned() {
+        let conn = setup_db_with_collection("docs");
+        let doc = make_doc("docs", "readme.md", None);
+        index_document(&conn, &doc, "# Version 1").unwrap();
+        let old_hash = compute_hash("# Version 1");
+        assert!(get_content(&conn, &old_hash).unwrap().is_some());
+
+        // Re-index the same document with new content.
+        index_document(&conn, &doc, "# Version 2").unwrap();
+
+        // The old body is unreferenced now → reclaimed; the new body remains.
+        assert!(
+            get_content(&conn, &old_hash).unwrap().is_none(),
+            "stale content must be garbage-collected on update"
+        );
+        assert!(
+            get_content(&conn, &compute_hash("# Version 2"))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(content_count(&conn), 1, "exactly one live body remains");
+    }
+
+    #[test]
+    fn update_keeps_old_content_when_shared_by_another_doc() {
+        let conn = setup_db_with_collection("docs");
+        let shared = "# Shared body";
+        index_document(&conn, &make_doc("docs", "a.md", None), shared).unwrap();
+        index_document(&conn, &make_doc("docs", "b.md", None), shared).unwrap();
+        let shared_hash = compute_hash(shared);
+
+        // Change a.md; b.md still points at the shared, deduplicated body.
+        index_document(&conn, &make_doc("docs", "a.md", None), "# A changed").unwrap();
+
+        assert!(
+            get_content(&conn, &shared_hash).unwrap().is_some(),
+            "a body still referenced by another document must survive"
+        );
+    }
+
+    #[test]
+    fn delete_reclaims_orphaned_content() {
+        let conn = setup_db_with_collection("docs");
+        let id = index_document(&conn, &make_doc("docs", "readme.md", None), "# Body").unwrap();
+        let hash = compute_hash("# Body");
+
+        delete_document(&conn, id).unwrap();
+
+        assert!(
+            get_content(&conn, &hash).unwrap().is_none(),
+            "a deleted document's orphaned body must be reclaimed"
+        );
+        assert_eq!(content_count(&conn), 0);
+    }
+
+    #[test]
+    fn delete_keeps_content_shared_by_another_doc() {
+        let conn = setup_db_with_collection("docs");
+        let shared = "# Shared";
+        let id_a = index_document(&conn, &make_doc("docs", "a.md", None), shared).unwrap();
+        index_document(&conn, &make_doc("docs", "b.md", None), shared).unwrap();
+        let hash = compute_hash(shared);
+
+        delete_document(&conn, id_a).unwrap();
+
+        assert!(
+            get_content(&conn, &hash).unwrap().is_some(),
+            "body still referenced by b.md must survive"
+        );
+    }
+
+    #[test]
+    fn gc_orphaned_content_reclaims_backlog_only() {
+        let conn = setup_db_with_collection("docs");
+        // One referenced document + its body.
+        index_document(&conn, &make_doc("docs", "live.md", None), "# Live").unwrap();
+        // Simulate the pre-fix backlog: content rows no document points at.
+        store_content(&conn, "# Orphan 1").unwrap();
+        store_content(&conn, "# Orphan 2").unwrap();
+        assert_eq!(content_count(&conn), 3);
+
+        let reclaimed = gc_orphaned_content(&conn).unwrap();
+
+        assert_eq!(reclaimed, 2, "both orphans reclaimed");
+        assert_eq!(content_count(&conn), 1, "the live body is kept");
+        assert!(
+            get_content(&conn, &compute_hash("# Live"))
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

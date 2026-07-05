@@ -630,6 +630,9 @@ pub fn handle_update_force(
 
     with_transaction(&ctx.conn, || {
         update_all_collections(ctx, root, &config, &collections, force, &mut result)?;
+        // Reclaim content rows stranded by prior updates/removes (and the
+        // pre-fix backlog). No-op once the table is clean.
+        documents::gc_orphaned_content(&ctx.conn)?;
         Ok(())
     })?;
     Ok(result)

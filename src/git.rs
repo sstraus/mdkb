@@ -118,23 +118,52 @@ pub fn find_git_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Walk up from `start` to `boundary` (both inclusive) looking for a directory
+/// that contains a `.mdkb/` store. Never ascends above `boundary`, so the search
+/// cannot escape the current git repository and attach to a parent directory's
+/// store.
+fn find_store_within(start: &Path, boundary: &Path) -> Option<PathBuf> {
+    let mut current = Some(start);
+    while let Some(dir) = current {
+        if dir.join(".mdkb").is_dir() {
+            return Some(dir.to_path_buf());
+        }
+        if dir == boundary {
+            break;
+        }
+        current = dir.parent();
+    }
+    None
+}
+
 /// Resolve the directory to anchor a `.mdkb/` store at, host-agnostically.
 ///
 /// Priority:
-///  1. nearest existing `.mdkb/` ancestor — attach, never create a duplicate;
-///  2. nearest git repository root — one store per repo;
+///  1. inside a git repo — the nearest existing `.mdkb/` at or below the repo
+///     root, else the repo root itself. The upward search is bounded by the git
+///     root so a store is NEVER borrowed from a parent directory above the repo
+///     (which would anchor the whole parent tree and reindex thousands of
+///     unrelated files — including sibling repos and vendored dependencies);
+///  2. outside a git repo — the nearest existing `.mdkb/` ancestor;
 ///  3. `project_hint` (e.g. `CLAUDE_PROJECT_DIR`, the stable launch dir) when set;
 ///  4. `cwd` itself.
 ///
 /// The chosen directory is then collapsed to the main worktree so that all
 /// worktrees of a repo share a single store. This makes the anchor immune to
-/// working-directory drift: `cwd` only matters as a starting point for the
-/// upward walk and as the last-resort fallback.
+/// working-directory drift within the repo: `cwd` only matters as a starting
+/// point for the bounded upward walk and as the last-resort fallback.
 pub fn resolve_project_root(cwd: &Path, project_hint: Option<&Path>) -> PathBuf {
-    let chosen = find_existing_store(cwd)
-        .or_else(|| find_git_root(cwd))
-        .or_else(|| project_hint.map(Path::to_path_buf))
-        .unwrap_or_else(|| cwd.to_path_buf());
+    let chosen = match find_git_root(cwd) {
+        // Inside a repo: a repo owns exactly one store, at (or below) its own
+        // root. Rediscover a drifted sub-path's store, but never climb past the
+        // repo boundary.
+        Some(git_root) => find_store_within(cwd, &git_root).unwrap_or(git_root),
+        // Not a git repo: no boundary to respect — fall back to any ancestor
+        // store, then the launch hint, then cwd.
+        None => find_existing_store(cwd)
+            .or_else(|| project_hint.map(Path::to_path_buf))
+            .unwrap_or_else(|| cwd.to_path_buf()),
+    };
     resolve_main_worktree(&chosen)
 }
 
@@ -411,6 +440,26 @@ mod tests {
         // cap at 2 → only the two nearest ancestors (l2, l1), not l0.
         let got = discover_ancestor_stores(&primary, 2);
         assert_eq!(got, vec![l2.clone(), l1.clone()]);
+    }
+
+    #[test]
+    fn resolve_project_root_never_climbs_above_git_root() {
+        // Regression: a parent directory with a stray `.mdkb/` (e.g. ~/Gits)
+        // must NOT hijack a repo below it. Anchoring to the parent makes the
+        // daemon index the entire parent tree (sibling repos, vendored deps) —
+        // the 100% CPU spike root cause.
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path();
+        std::fs::create_dir_all(parent.join(".mdkb")).unwrap(); // stray parent store
+        let repo = parent.join("myrepo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap(); // real repo, no own store
+        let deep = repo.join("src/inner");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        // Must anchor to the repo's own git root, not the parent's store.
+        assert_eq!(resolve_project_root(&deep, None), repo);
+        // Sanity: the unbounded walk WOULD have returned the parent.
+        assert_eq!(find_existing_store(&deep), Some(parent.to_path_buf()));
     }
 
     #[test]
