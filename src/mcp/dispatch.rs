@@ -3735,7 +3735,8 @@ mod tests {
 
         // WITH the `*` sigil: recall fires and the sigil never leaks into output.
         let opted =
-            hook_user_prompt_submit_impl(&handle, "* what do we know about the topic content").await;
+            hook_user_prompt_submit_impl(&handle, "* what do we know about the topic content")
+                .await;
         let body = additional_context(&opted);
         assert!(
             body.contains("sigil-mem"),
