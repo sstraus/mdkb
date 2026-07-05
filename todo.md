@@ -125,7 +125,7 @@ Deferred:
 - **Priority:** P3 (revisit when the memory corpus is large enough that hybrid recall stops being
   near-total).
 
-## 4. Session transcript indexing re-embeds the whole file on every append (story 036)
+## 4. Session transcript indexing re-embeds the whole file on every append (story 036) — ✅ DONE
 
 - **Problem/opportunity:** `handle_session_index` (`src/cli/handlers.rs:4732`) dedups session
   chunks by **file mtime** (`existing_doc.file_modified_at == file_mtime`). A Claude transcript
@@ -148,4 +148,13 @@ Deferred:
   to variable/end-anchored boundaries, the stable-key assumption breaks and needs revisiting.
 - **Complexity:** S (dedup predicate swap; no schema change — `documents.hash` already exists).
 - **Priority:** P3 (per story), but high value/low risk once the direction is confirmed.
-- **Status:** `[HUMAN]`-gated — awaiting Boss's direction (incremental / summarized / drop).
+- **Status:** ✅ Shipped (commit `f2e213b`). Boss chose incremental; `handle_session_index`
+  now dedups by `documents::compute_hash(sdoc.content)` vs `existing_doc.hash` (not file mtime),
+  so an append re-embeds only the changed tail. Regression + delta-bounded cost tests added
+  (`test_handle_session_index_append_skips_unchanged_chunks_despite_mtime_bump`,
+  `_append_cost_is_delta_bounded`). Noise-stripping confirmed already handled in
+  `domain/sessions.rs` (user/assistant text blocks only).
+- **Remaining (not blocking):** the final partial chunk still re-embeds as it grows (one chunk);
+  and `<system-reminder>`/`<local-command-*>` wrappers embedded as plain text inside user blocks
+  are still indexed (a small `extract_text` strip pass would remove them) — Boss judged this low
+  priority.
