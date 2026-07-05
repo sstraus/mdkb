@@ -9,8 +9,9 @@
 //! Story 3 of `plans/daemon-ipc-socket.md` — initial slice wires `status`
 //! only. Remaining 10 tools land in follow-up commits under #007-16f7.
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use futures::future::join_all;
 use rmcp::ErrorData as McpError;
@@ -31,7 +32,7 @@ use crate::domain::SearchResult;
 use crate::metrics::{
     UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
 };
-use crate::store::memory::{get_warmup_entries, search_entries_fts};
+use crate::store::memory::get_warmup_entries;
 use crate::store::memory_graph::{self, MemoryRelation, TargetKind};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 
@@ -46,6 +47,21 @@ use super::tools::{
     SearchParams, SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
 };
 
+const MAX_HOOK_PROMPT_FINGERPRINTS: usize = 32;
+
+#[derive(Debug, Default)]
+pub struct HookDedupState {
+    sessions: HashMap<String, HookSessionState>,
+}
+
+#[derive(Debug, Default)]
+struct HookSessionState {
+    memory_ids: HashSet<String>,
+    prior_ids: HashSet<String>,
+    related_lines: HashSet<String>,
+    prompt_fingerprints: VecDeque<String>,
+}
+
 /// Daemon-global state shared across all dispatched tool calls.
 #[derive(Clone)]
 pub struct DispatchContext {
@@ -53,6 +69,7 @@ pub struct DispatchContext {
     pub session_id: Arc<AtomicI64>,
     pub persistent_call_count: Arc<AtomicU64>,
     pub optimize_interval_calls: u64,
+    pub hook_dedup: Arc<StdMutex<HookDedupState>>,
 }
 
 impl std::fmt::Debug for DispatchContext {
@@ -63,6 +80,37 @@ impl std::fmt::Debug for DispatchContext {
     }
 }
 
+fn hook_session_key(handle: &RepoHandle, params: &Value) -> String {
+    if let Some(session_id) = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return format!("{}|session:{session_id}", handle.root.display());
+    }
+
+    if let Some(transcript_path) = params
+        .get("transcript_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return format!("{}|transcript:{transcript_path}", handle.root.display());
+    }
+
+    format!("{}|repo", handle.root.display())
+}
+
+fn prompt_fingerprint(prompt: &str) -> String {
+    prompt
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The current session id as a provenance string, or `None` before a session is
 /// established (session_id == 0).
 fn session_provenance(dctx: &DispatchContext) -> Option<String> {
@@ -71,6 +119,72 @@ fn session_provenance(dctx: &DispatchContext) -> Option<String> {
 }
 
 impl DispatchContext {
+    fn with_hook_session<R>(&self, key: &str, f: impl FnOnce(&mut HookSessionState) -> R) -> R {
+        let mut state = self
+            .hook_dedup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let session = state.sessions.entry(key.to_string()).or_default();
+        f(session)
+    }
+
+    fn reset_hook_session(&self, key: &str) {
+        let mut state = self
+            .hook_dedup
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.sessions.remove(key);
+    }
+
+    fn remember_hook_prompt(&self, key: &str, fingerprint: &str) -> bool {
+        if fingerprint.is_empty() {
+            return false;
+        }
+        self.with_hook_session(key, |session| {
+            let repeated = session
+                .prompt_fingerprints
+                .iter()
+                .any(|seen| seen == fingerprint);
+            if !repeated {
+                session
+                    .prompt_fingerprints
+                    .push_back(fingerprint.to_string());
+                while session.prompt_fingerprints.len() > MAX_HOOK_PROMPT_FINGERPRINTS {
+                    session.prompt_fingerprints.pop_front();
+                }
+            }
+            repeated
+        })
+    }
+
+    fn retain_new_hook_memories(&self, key: &str, results: &mut Vec<memory::MemoryEntry>) {
+        self.with_hook_session(key, |session| {
+            results.retain(|entry| !session.memory_ids.contains(&entry.id));
+            for entry in results {
+                session.memory_ids.insert(entry.id.clone());
+            }
+        });
+    }
+
+    fn hook_prior_seen(&self, key: &str, prior_id: &str) -> bool {
+        self.with_hook_session(key, |session| session.prior_ids.contains(prior_id))
+    }
+
+    fn record_hook_prior(&self, key: &str, prior_id: &str) {
+        self.with_hook_session(key, |session| {
+            session.prior_ids.insert(prior_id.to_string());
+        });
+    }
+
+    fn retain_new_hook_related_lines(&self, key: &str, related: &mut Vec<String>) {
+        self.with_hook_session(key, |session| {
+            related.retain(|line| !session.related_lines.contains(line));
+            for line in related {
+                session.related_lines.insert(line.clone());
+            }
+        });
+    }
+
     /// Record a tool call against per-repo stats. No-op when session not yet
     /// established (session_id == 0). Uses `handle.ctx` so it works in both
     /// standalone and global daemon mode.
@@ -2052,32 +2166,6 @@ fn log_hook_event(
     }
 }
 
-/// Max ancestor stores layered into a read (keeps fan-out bounded; nested
-/// projects rarely sit more than a couple of levels under a parent store).
-const MAX_ANCESTOR_LAYERS: usize = 4;
-
-/// Run `f` against each existing ancestor store's `index.sqlite`, opened
-/// READ-ONLY. Never migrates, never creates, never spawns a watcher — it only
-/// surfaces stores a human/`init` already created above the primary (e.g. a
-/// nested git repo inheriting its parent repo's memory). Per-ancestor errors
-/// are logged and skipped so a missing/old ancestor can never break a read.
-fn for_each_ancestor_conn<F: FnMut(&rusqlite::Connection)>(
-    primary_root: &std::path::Path,
-    mut f: F,
-) {
-    for anc in crate::git::discover_ancestor_stores(primary_root, MAX_ANCESTOR_LAYERS) {
-        let db = anc.join(".mdkb/index.sqlite");
-        if !db.exists() {
-            continue;
-        }
-        match rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        {
-            Ok(conn) => f(&conn),
-            Err(e) => tracing::debug!("layer: skipping ancestor {}: {e}", anc.display()),
-        }
-    }
-}
-
 /// Minimum confidence for a prior to be treated as "curated" — the threshold
 /// the recall gate and the warmup reserved-prior slot both key off.
 const PRIOR_CONFIDENCE_GATE: f64 = 0.7;
@@ -2086,37 +2174,6 @@ const PRIOR_CONFIDENCE_GATE: f64 = 0.7;
 fn is_high_confidence_prior(entry: &crate::store::memory::MemoryEntry, now: i64) -> bool {
     entry.entry_type == crate::store::memory::EntryType::Prior
         && entry.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
-}
-
-/// Merge ancestor-store entries into an already-populated primary `merged` Vec.
-///
-/// Cross-store global ranking: candidates are gathered from every ancestor
-/// WITHOUT per-store truncation, deduped by id (primary entries already in
-/// `merged` win — their ids seed `seen`), and `keep` decides per-entry
-/// eligibility. The caller ranks and truncates the combined Vec afterwards, so
-/// a high-confidence ancestor entry can never be starved by a full primary set.
-fn merge_ancestor_entries<F>(
-    primary_root: &std::path::Path,
-    fts_query: &str,
-    fetch_limit: usize,
-    merged: &mut Vec<crate::store::memory::MemoryEntry>,
-    keep: F,
-) where
-    F: Fn(&crate::store::memory::MemoryEntry) -> bool,
-{
-    let mut seen: std::collections::HashSet<String> = merged.iter().map(|e| e.id.clone()).collect();
-    for_each_ancestor_conn(primary_root, |conn| {
-        if let Ok(anc) = search_entries_fts(conn, fts_query, fetch_limit) {
-            for e in anc {
-                if !keep(&e) {
-                    continue;
-                }
-                if seen.insert(e.id.clone()) {
-                    merged.push(e);
-                }
-            }
-        }
-    });
 }
 
 /// Rank merged warmup entries: drop sub-floor entries (when `min_confidence`
@@ -2171,6 +2228,81 @@ fn rank_warmup_entries(
     entries
 }
 
+fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
+    if !handle.config.code.enabled {
+        return false;
+    }
+    if handle
+        .code_reindex_active
+        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return true;
+    }
+
+    let root = handle.root.clone();
+    let code_index = Arc::clone(&handle.code_index);
+    let code_reindex_active = Arc::clone(&handle.code_reindex_active);
+    let ignore_patterns = handle.code_ignore_patterns.clone();
+    let respect_gitignore = handle.config.code.indexing.respect_gitignore;
+
+    tokio::spawn(async move {
+        let mut idx_guard = code_index.lock().await;
+        if idx_guard.is_none() {
+            let index_path = root.join(".mdkb/code.sqlite");
+            match IndexFacade::open_or_create(&index_path) {
+                Ok(facade) => {
+                    let pipeline_config = crate::code::indexing::pipeline::PipelineConfig {
+                        ignore_patterns: ignore_patterns.clone(),
+                        respect_gitignore,
+                        ..Default::default()
+                    };
+                    *idx_guard = Some(facade.with_config(pipeline_config));
+                }
+                Err(e) => {
+                    tracing::error!("SessionStart code refresh: failed to open code index: {e}");
+                    code_reindex_active.store(false, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+
+        let Some(mut facade) = idx_guard.take() else {
+            code_reindex_active.store(false, Ordering::Relaxed);
+            return;
+        };
+        drop(idx_guard);
+
+        let result = if facade.file_count() == 0 {
+            facade.reindex(&root)
+        } else {
+            let all_files = crate::code::indexing::walker::discover_files(
+                &root,
+                &ignore_patterns,
+                respect_gitignore,
+            );
+            facade.reindex_files(&root, &all_files)
+        };
+        crate::llm::release_cached_service();
+        match result {
+            Ok(stats) => {
+                tracing::info!(
+                    "SessionStart code refresh: {} files, {} symbols",
+                    stats.files_indexed,
+                    stats.symbols_indexed
+                );
+            }
+            Err(e) => tracing::error!("SessionStart code refresh failed: {e}"),
+        }
+
+        let mut idx_guard = code_index.lock().await;
+        *idx_guard = Some(facade);
+        code_reindex_active.store(false, Ordering::Relaxed);
+    });
+
+    true
+}
+
 pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
@@ -2185,7 +2317,7 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
         None => return json!({}),
     };
     let limit = cfg.warmup_limit.max(1);
-    let (due_lines, mut entries) = match get_warmup_entries(conn, limit) {
+    let (due_lines, entries) = match get_warmup_entries(conn, limit) {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!("hook.session_start: get_warmup_entries failed: {e}");
@@ -2193,23 +2325,6 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
         }
     };
     drop(ctx_guard);
-
-    // Layer in ancestor stores (read-only): a nested project inherits its
-    // parent's warmup. Gather primary + every ancestor's entries into ONE Vec
-    // with NO per-store truncation, deduped by id (primary wins). Ranking and
-    // truncation happen globally below, so a high-confidence ancestor entry is
-    // never starved by a full primary set. Due reminders are handled separately.
-    let mut seen: std::collections::HashSet<String> =
-        entries.iter().map(|e| e.id.clone()).collect();
-    for_each_ancestor_conn(&handle.root, |conn| {
-        if let Ok((_, anc_entries)) = get_warmup_entries(conn, limit) {
-            for e in anc_entries {
-                if seen.insert(e.id.clone()) {
-                    entries.push(e);
-                }
-            }
-        }
-    });
 
     // Global rank: confidence floor (off at 0.0), access_count DESC primary with
     // confidence tie-break, one reserved slot for the top curated prior.
@@ -2261,25 +2376,28 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
         "\n**mdkb CLI** (semantic search — not available via Grep/Glob). Run `{bin} cheatsheet` for full syntax.\n"
     ));
 
-    // Check code index staleness
+    // Check code index staleness. If stale, kick a detached refresh instead of
+    // asking the user to run a manual command from a latency-sensitive hook.
     let code_db = handle.root.join(".mdkb/code.sqlite");
-    if code_db.exists() {
+    if handle.config.code.enabled && code_db.exists() {
         if let Ok(conn) = rusqlite::Connection::open_with_flags(
             &code_db,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
         ) {
-            let last: Option<i64> = conn
-                .query_row("SELECT MAX(indexed_at) FROM code_files", [], |r| {
-                    r.get::<_, Option<i64>>(0)
-                })
-                .unwrap_or(None);
+            let last = crate::code::storage::schema::last_index_scan_at(&conn).unwrap_or(None);
             if let Some(ts) = last {
                 let now = chrono::Utc::now().timestamp();
                 let age_days = (now - ts) / 86_400;
                 if age_days >= 7 {
-                    body.push_str(&format!(
-                        "\n**⚠️ Code index is {age_days} days stale.** Run `{bin} code index` to refresh.\n"
-                    ));
+                    if schedule_code_index_refresh(handle) {
+                        body.push_str(&format!(
+                            "\n**⚠️ Code index is {age_days} days stale; refreshing in background.** Retry code lookups shortly.\n"
+                        ));
+                    } else {
+                        body.push_str(&format!(
+                            "\n**⚠️ Code index is {age_days} days stale.** Run `{bin} code index` to refresh.\n"
+                        ));
+                    }
                 }
             }
         }
@@ -2332,16 +2450,34 @@ fn expand_recall_neighbors(
 }
 
 pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> Value {
+    hook_user_prompt_submit_impl_with_dedup(handle, prompt, None).await
+}
+
+async fn hook_user_prompt_submit_impl_with_dedup(
+    handle: &RepoHandle,
+    prompt: &str,
+    dedup: Option<(&DispatchContext, String)>,
+) -> Value {
     use crate::cli::hook_logic::prompt_wants_call_graph;
 
     let cfg = &handle.config.hooks;
     if !cfg.user_prompt_submit_enabled {
         return json!({});
     }
-    if prompt.trim().is_empty() || prompt_is_wrapup(prompt) {
+    if prompt.trim().is_empty() {
+        return json!({});
+    }
+    if prompt_is_wrapup(prompt) {
+        if let Some((dctx, key)) = &dedup {
+            dctx.reset_hook_session(key);
+        }
         return json!({});
     }
 
+    let prompt_repeat = dedup
+        .as_ref()
+        .map(|(dctx, key)| dctx.remember_hook_prompt(key, &prompt_fingerprint(prompt)))
+        .unwrap_or(false);
     let wants_cg = prompt_wants_call_graph(prompt);
     let fts_query = build_recall_query(prompt);
     // DEFERRED (2026-06-30) — memory→memory 1-hop expansion. Memories aren't in
@@ -2399,22 +2535,14 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
         });
         results = apply_min_confidence(results, Some(cfg.min_recall_score));
 
-        // Layer in ancestor stores (read-only): a nested project also recalls
-        // its parent's memory. Gather primary + every ancestor's matches into
-        // ONE Vec with NO per-store truncation, deduped by id (primary wins),
-        // then rank globally and truncate — so a high-confidence ancestor prior
-        // is never starved by a full primary set. Ancestor FTS includes priors,
-        // so the same prior gate applies to ancestor entries.
-        merge_ancestor_entries(&handle.root, q, limit, &mut results, |e| {
-            e.entry_type != crate::store::memory::EntryType::Prior
-                || e.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
-        });
-
         // Global rank: float high-confidence priors to the top WITHOUT
         // scrambling the rest (stable sort on a boolean key preserves the
         // existing relevance order within each group). THEN truncate to limit.
         results.sort_by_key(|e| !is_high_confidence_prior(e, now));
         results.truncate(limit);
+        if let Some((dctx, key)) = &dedup {
+            dctx.retain_new_hook_memories(key, &mut results);
+        }
     }
 
     // Post-recall enrichment in a single re-lock (both read-only, capped):
@@ -2450,12 +2578,18 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
                 related = doc_graph_neighbors(&c.conn, &path_tokens, &seen, 3);
             }
         }
+        if let Some((dctx, key)) = &dedup {
+            dctx.retain_new_hook_related_lines(key, &mut related);
+        }
     }
 
     // Trigger-matched behavioral priors whose prompt pattern fires here.
-    let prior_block = prompt_prior_block(handle, prompt).await;
+    let prior_block = prompt_prior_block(handle, prompt, dedup.as_ref()).await;
 
     if results.is_empty() && related.is_empty() && prior_block.is_none() && !wants_cg {
+        return json!({});
+    }
+    if prompt_repeat && results.is_empty() && related.is_empty() && prior_block.is_none() {
         return json!({});
     }
 
@@ -2529,7 +2663,11 @@ pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> 
 /// Promoted priors whose `prompt`-kind trigger matches the submitted prompt,
 /// formatted as `mdkb prior: <lesson>` lines (and recorded as injected). `None`
 /// when injection is disabled, the store is unavailable, or nothing matches.
-async fn prompt_prior_block(handle: &RepoHandle, prompt: &str) -> Option<String> {
+async fn prompt_prior_block(
+    handle: &RepoHandle,
+    prompt: &str,
+    dedup: Option<&(&DispatchContext, String)>,
+) -> Option<String> {
     use crate::store::priors::{TriggerContext, match_injectable, record_injection};
 
     if !handle.config.priors.injection_enabled {
@@ -2551,8 +2689,19 @@ async fn prompt_prior_block(handle: &RepoHandle, prompt: &str) -> Option<String>
     }
     let mut lines = Vec::with_capacity(hits.len());
     for c in &hits {
+        if let Some((dctx, key)) = dedup {
+            if dctx.hook_prior_seen(key, &c.id) {
+                continue;
+            }
+        }
         let _ = record_injection(conn, &c.id, now);
+        if let Some((dctx, key)) = dedup {
+            dctx.record_hook_prior(key, &c.id);
+        }
         lines.push(format!("mdkb prior: {}", c.lesson));
+    }
+    if lines.is_empty() {
+        return None;
     }
     Some(lines.join("\n"))
 }
@@ -2711,13 +2860,32 @@ async fn mine_episode(
         }
     };
 
+    // Embed the lesson (off the async runtime — ONNX inference is blocking) so
+    // integrate_distilled can merge semantically-equivalent clusters. Best-effort:
+    // a missing embedder just falls back to exact-trigger-key clustering.
+    let lesson = distilled.lesson.clone();
+    let lesson_embedding = tokio::task::spawn_blocking(move || {
+        crate::llm::get_cached_service()
+            .ok()
+            .and_then(|s| s.embed_query(&lesson).ok())
+    })
+    .await
+    .ok()
+    .flatten();
+
     if ensure_handle_context(&handle).await.is_err() {
         return;
     }
     let now = chrono::Utc::now().timestamp();
     let guard = handle.ctx.lock().await;
     if let Some(c) = guard.as_ref() {
-        if let Err(e) = integrate_distilled(&c.conn, &distilled, &session, now) {
+        if let Err(e) = integrate_distilled(
+            &c.conn,
+            &distilled,
+            &session,
+            now,
+            lesson_embedding.as_deref(),
+        ) {
             tracing::debug!("prior mining: integrate_distilled failed: {e}");
         }
     }
@@ -3119,6 +3287,8 @@ pub async fn dispatch_call(
             Ok(json!({ "text": text, "tokens": tokens }))
         }
         "hook.session_start" => {
+            let key = hook_session_key(&handle, &params);
+            dctx.reset_hook_session(&key);
             let t0 = std::time::Instant::now();
             let result = hook_session_start_impl(&handle).await;
             let ms = t0.elapsed().as_millis() as u64;
@@ -3139,8 +3309,10 @@ pub async fn dispatch_call(
                 .get("prompt")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
+            let key = hook_session_key(&handle, &params);
             let t0 = std::time::Instant::now();
-            let result = hook_user_prompt_submit_impl(&handle, prompt).await;
+            let result =
+                hook_user_prompt_submit_impl_with_dedup(&handle, prompt, Some((dctx, key))).await;
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) {
                 "skipped"
@@ -3199,8 +3371,10 @@ pub async fn dispatch_call(
             Ok(result)
         }
         "hook.stop" => {
+            let key = hook_session_key(&handle, &params);
             // Returns immediately; distillation is detached inside hook_stop_impl.
             let result = hook_stop_impl(Arc::clone(&handle), &params);
+            dctx.reset_hook_session(&key);
             let outcome = if result == json!({}) {
                 "skipped"
             } else {
@@ -3247,7 +3421,15 @@ mod tests {
             session_id: Arc::new(AtomicI64::new(0)),
             persistent_call_count: Arc::new(AtomicU64::new(0)),
             optimize_interval_calls: 200,
+            hook_dedup: Arc::new(StdMutex::new(Default::default())),
         }
+    }
+
+    fn additional_context(result: &Value) -> &str {
+        result
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("")
     }
 
     #[tokio::test]
@@ -3321,7 +3503,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn warmup_layers_ancestor_store_readonly_without_creating() {
+    async fn user_prompt_submit_dedups_memory_within_same_hook_session() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        seed_memory_entry(&handle, "dedup-topic").await;
+
+        let params = json!({
+            "prompt": "what do we know about the topic content",
+            "session_id": "s1"
+        });
+        let first = dispatch_call(
+            "hook.user_prompt_submit",
+            params.clone(),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .expect("first hook");
+        assert!(
+            additional_context(&first).contains("dedup-topic"),
+            "first hook should inject memory: {first}"
+        );
+
+        let second = dispatch_call("hook.user_prompt_submit", params, handle, &dctx)
+            .await
+            .expect("second hook");
+        assert_eq!(second, json!({}), "same session must not reinject memory");
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_allows_same_memory_in_different_hook_session() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        seed_memory_entry(&handle, "cross-session-topic").await;
+
+        for session_id in ["s1", "s2"] {
+            let result = dispatch_call(
+                "hook.user_prompt_submit",
+                json!({
+                    "prompt": "what do we know about the topic content",
+                    "session_id": session_id
+                }),
+                Arc::clone(&handle),
+                &dctx,
+            )
+            .await
+            .expect("hook");
+            assert!(
+                additional_context(&result).contains("cross-session-topic"),
+                "session {session_id} should inject memory: {result}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_clear_resets_session_dedup() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        seed_memory_entry(&handle, "clear-topic").await;
+
+        let params = json!({
+            "prompt": "what do we know about the topic content",
+            "session_id": "s1"
+        });
+        let first = dispatch_call(
+            "hook.user_prompt_submit",
+            params.clone(),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .expect("first hook");
+        assert!(
+            additional_context(&first).contains("clear-topic"),
+            "first hook should inject memory: {first}"
+        );
+
+        let repeated = dispatch_call(
+            "hook.user_prompt_submit",
+            params.clone(),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .expect("repeat hook");
+        assert_eq!(repeated, json!({}), "repeat should be silent before clear");
+
+        let clear = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt": "/clear", "session_id": "s1"}),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .expect("clear hook");
+        assert_eq!(clear, json!({}), "clear command should remain silent");
+
+        let after_clear = dispatch_call("hook.user_prompt_submit", params, handle, &dctx)
+            .await
+            .expect("after clear hook");
+        assert!(
+            additional_context(&after_clear).contains("clear-topic"),
+            "memory should be eligible again after clear: {after_clear}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_does_not_layer_ancestor_store() {
         let tmp = TempDir::new().unwrap();
         // Parent store (the ancestor) with its own memory entry.
         let parent = make_handle(&tmp);
@@ -3348,16 +3639,13 @@ mod tests {
             .unwrap_or("");
         assert!(body.contains("child-mem"), "primary entry missing: {body}");
         assert!(
-            body.contains("parent-mem"),
-            "ancestor entry missing — layering broken: {body}"
+            !body.contains("parent-mem"),
+            "ancestor entry leaked into warmup: {body}"
         );
-
-        // Guardrail: layered reads must never create a store anywhere.
-        assert!(!nested_root.join("sub/.mdkb").exists());
     }
 
     #[tokio::test]
-    async fn recall_layers_ancestor_store_readonly_without_creating() {
+    async fn recall_does_not_layer_ancestor_store() {
         let tmp = TempDir::new().unwrap();
         // Parent store (the ancestor) with its own memory entry.
         let parent = make_handle(&tmp);
@@ -3389,12 +3677,9 @@ mod tests {
             "primary recall entry missing: {body}"
         );
         assert!(
-            body.contains("parent-mem"),
-            "ancestor recall entry missing — recall layering broken: {body}"
+            !body.contains("parent-mem"),
+            "ancestor recall entry leaked into hook context: {body}"
         );
-
-        // Guardrail: layered reads must never create a store anywhere.
-        assert!(!nested_root.join("sub/.mdkb").exists());
     }
 
     /// Seed a `Prior` memory entry with explicit confirmations so the test can
@@ -3774,12 +4059,10 @@ mod tests {
         ))
     }
 
-    /// Starvation proof: a curated high-confidence prior living ONLY in the
-    /// ancestor store must still surface even when the child's own entries
-    /// already fill the recall quota. Under the old append-then-cap merge the
-    /// ancestor prior was dropped; global cross-store ranking floats it up.
+    /// Isolation proof: a curated high-confidence prior living ONLY in an
+    /// ancestor store must not surface in a child repo's automatic recall.
     #[tokio::test]
-    async fn recall_surfaces_ancestor_prior_despite_full_child_quota() {
+    async fn recall_ignores_ancestor_prior_despite_full_child_quota() {
         let tmp = TempDir::new().unwrap();
 
         // Parent (ancestor) holds the curated high-confidence prior.
@@ -3809,16 +4092,15 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
-            body.contains("ancestor-curated-prior"),
-            "ancestor prior starved by full child quota — global rank broken: {body}"
+            !body.contains("ancestor-curated-prior"),
+            "ancestor prior leaked into child recall: {body}"
         );
     }
 
     /// Warmup counterpart: with a confidence floor configured, a curated
-    /// ancestor prior is reserved into warmup even when the child has hotter
-    /// (higher access_count) entries that would otherwise fill the limit.
+    /// ancestor prior still must not be injected into the child repo.
     #[tokio::test]
-    async fn warmup_reserves_ancestor_prior_under_confidence_floor() {
+    async fn warmup_ignores_ancestor_prior_under_confidence_floor() {
         let tmp = TempDir::new().unwrap();
 
         // Parent (ancestor) holds the curated high-confidence prior.
@@ -3851,16 +4133,16 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
-            body.contains("ancestor-warmup-prior"),
-            "curated ancestor prior missing from warmup reserved slot: {body}"
+            !body.contains("ancestor-warmup-prior"),
+            "ancestor prior leaked into child warmup: {body}"
         );
     }
 
     /// Regression guard for the original bug: a legacy low-confidence prior
     /// (System B style — `prior-<hash>`, zero confirmations) must NOT leak into
-    /// recall even via ancestor layering. The confidence gate keeps it out.
+    /// recall from an ancestor store.
     #[tokio::test]
-    async fn recall_gates_legacy_prior_across_layers() {
+    async fn recall_ignores_legacy_prior_from_ancestor_store() {
         let tmp = TempDir::new().unwrap();
 
         // Ancestor holds a legacy, low-confidence prior (would have surfaced
@@ -3887,7 +4169,7 @@ mod tests {
             .unwrap_or("");
         assert!(
             !body.contains("prior-deadbeefdeadbeef"),
-            "legacy low-confidence prior leaked into recall across layers: {body}"
+            "legacy low-confidence prior leaked into recall from ancestor store: {body}"
         );
     }
 
@@ -5056,6 +5338,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hook_session_start_refreshes_stale_code_index_in_background() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "warmup-entry").await;
+
+        let code_db = handle.root.join(".mdkb/code.sqlite");
+        let conn = rusqlite::Connection::open(&code_db).unwrap();
+        crate::code::storage::schema::init_schema(&conn).unwrap();
+        let old = chrono::Utc::now().timestamp() - 8 * 86_400;
+        conn.execute(
+            "INSERT INTO code_metadata (key, value) VALUES (?1, ?2)",
+            rusqlite::params![
+                crate::code::storage::schema::LAST_INDEX_SCAN_KEY,
+                old.to_string(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = hook_session_start_impl(&handle).await;
+        let body = result
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            body.contains("refreshing in background"),
+            "stale code index must auto-refresh: {body}"
+        );
+        assert!(
+            !body.contains(" code index` to refresh"),
+            "must not ask for manual refresh when background refresh is scheduled: {body}"
+        );
+
+        for _ in 0..50 {
+            if !handle.code_reindex_active.load(Ordering::Relaxed) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !handle.code_reindex_active.load(Ordering::Relaxed),
+            "background refresh did not finish"
+        );
+        let conn = rusqlite::Connection::open(&code_db).unwrap();
+        let scan_at = crate::code::storage::schema::last_index_scan_at(&conn)
+            .unwrap()
+            .unwrap();
+        assert!(scan_at > old, "scan marker was not refreshed");
+    }
+
+    #[tokio::test]
     async fn hook_session_start_disabled_returns_empty() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().to_path_buf();
@@ -5234,6 +5567,42 @@ mod tests {
             .unwrap_or("");
         assert!(ctx.contains("## mdkb: priors"), "got: {result}");
         assert!(ctx.contains("Prefer ripgrep over grep"));
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_dedups_prompt_prior_within_same_hook_session() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        seed_promoted_prior(
+            &handle,
+            "prompt",
+            r#"{"pattern":"ripgrep"}"#,
+            "Prefer ripgrep over grep for repository search.",
+        )
+        .await;
+
+        let params = json!({
+            "prompt": "should I use ripgrep for searching?",
+            "session_id": "s1"
+        });
+        let first = dispatch_call(
+            "hook.user_prompt_submit",
+            params.clone(),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .expect("first hook");
+        assert!(
+            additional_context(&first).contains("Prefer ripgrep over grep"),
+            "first hook should inject prior: {first}"
+        );
+
+        let second = dispatch_call("hook.user_prompt_submit", params, handle, &dctx)
+            .await
+            .expect("second hook");
+        assert_eq!(second, json!({}), "same session must not reinject prior");
     }
 
     // ── Phase 3+5: Stop hook + async distiller ────────────────────────────────

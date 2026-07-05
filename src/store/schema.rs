@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 14;
+pub const SCHEMA_VERSION: i32 = 15;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -208,6 +208,7 @@ CREATE TABLE IF NOT EXISTS prior_clusters (
     promoted_memory_id TEXT,                 -- memory_entries.id once promoted
     created_at INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL,
+    embedding BLOB,                          -- lesson embedding (f32 LE) for semantic cluster-merge
     FOREIGN KEY(promoted_memory_id) REFERENCES memory_entries(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_prior_clusters_trigger ON prior_clusters(canonical_trigger_key);
@@ -538,6 +539,35 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 ALTER TABLE memory_entries ADD COLUMN created_agent TEXT;
                 "#,
             )?;
+        }
+    }
+
+    // Migration from v14 to v15: lesson embedding on prior_clusters for semantic
+    // cluster-merge (equivalent lessons from a non-deterministic distiller land on
+    // different canonical trigger keys; the embedding lets them merge so recurrence
+    // can promote). Nullable BLOB, added by explicit ALTER on existing databases.
+    if from_version < 15 {
+        // On a real open SCHEMA_SQL runs first, so prior_clusters exists (created
+        // fresh WITH the column, or pre-existing WITHOUT it). Migration unit tests
+        // call migrate_schema directly with no SCHEMA_SQL, so the table may be
+        // absent — guard on its existence before ALTER.
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prior_clusters'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        let has_embedding: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('prior_clusters') WHERE name = 'embedding'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if table_exists && !has_embedding {
+            conn.execute("ALTER TABLE prior_clusters ADD COLUMN embedding BLOB", [])?;
         }
     }
 
@@ -1957,7 +1987,7 @@ mod tests {
         let conn = setup_db();
         init_schema(&conn).expect("init_schema failed");
 
-        assert_eq!(get_schema_version(&conn).unwrap(), Some(14));
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
 
         let has_edges: bool = conn
             .query_row(
@@ -1967,6 +1997,47 @@ mod tests {
             )
             .unwrap_or(false);
         assert!(has_edges, "fresh DB should have memory_edges table");
+    }
+
+    #[test]
+    fn test_fresh_db_v15_has_prior_cluster_embedding_column() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+        let has_embedding: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('prior_clusters') WHERE name = 'embedding'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(
+            has_embedding,
+            "fresh v15 DB should have prior_clusters.embedding for semantic merge"
+        );
+    }
+
+    #[test]
+    fn test_migrate_v14_to_v15_adds_prior_cluster_embedding() {
+        // A v14 database already has prior_clusters (created by SCHEMA_SQL) but
+        // without the embedding column; init_schema must ALTER it in.
+        let conn = setup_db();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute("ALTER TABLE prior_clusters DROP COLUMN embedding", [])
+            .unwrap();
+        conn.execute_batch("INSERT INTO schema_version (version) VALUES (14);")
+            .unwrap();
+
+        init_schema(&conn).expect("v14→v15 migration failed");
+
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+        let has_embedding: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('prior_clusters') WHERE name = 'embedding'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_embedding, "migration must add the embedding column");
     }
 
     #[test]

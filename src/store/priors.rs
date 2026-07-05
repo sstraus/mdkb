@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::prior_distill::DistilledPrior;
 use crate::error::Result;
+use crate::llm::cosine_similarity;
 use crate::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
 
 /// A deduped, promotable behavioral lesson accumulating recurrence evidence.
@@ -347,21 +348,111 @@ fn find_cluster_by_key(conn: &Connection, canonical_key: &str) -> Result<Option<
     }
 }
 
-/// Merge a candidate into its cluster (creating the cluster on first sight),
-/// then recompute recurrence evidence from the cluster's linked candidates.
-/// Returns the cluster id. The candidate row is (re)persisted with its
-/// `cluster_id` set. Does NOT promote or write to `memory_entries` — that is a
-/// separate, explicit step gated by [`should_promote`].
-pub fn integrate_candidate(conn: &Connection, cand: &PriorCandidate, now: i64) -> Result<String> {
-    let key = canonical_trigger_key(&cand.trigger_kind, &cand.trigger_matcher);
-    let cluster_id = cluster_id_for_key(&key);
+/// Cosine-similarity threshold above which two clusters' lesson embeddings are
+/// treated as the same behavioral prior and merged. The distiller is
+/// non-deterministic, so equivalent lessons land on different canonical trigger
+/// keys; without semantic merge a recurring lesson would never accumulate the
+/// ≥2 distinct sessions that gate promotion. 0.85 is high enough to keep
+/// genuinely distinct lessons apart.
+const PRIOR_MERGE_SIMILARITY: f32 = 0.85;
 
-    // Create the cluster on first observation of this trigger.
-    if find_cluster_by_key(conn, &key)?.is_none() {
+/// Encode an embedding as little-endian f32 bytes for BLOB storage.
+fn encode_embedding(embedding: &[f32]) -> Vec<u8> {
+    embedding.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Decode a little-endian f32 BLOB back into an embedding vector.
+fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Persist a cluster's lesson embedding for later semantic merge. Kept off the
+/// [`PriorCluster`] struct (and its round-trip) since it is only ever read by
+/// [`find_cluster_by_embedding`], never surfaced.
+fn set_cluster_embedding(conn: &Connection, cluster_id: &str, embedding: &[f32]) -> Result<()> {
+    conn.execute(
+        "UPDATE prior_clusters SET embedding = ?2 WHERE id = ?1",
+        params![cluster_id, encode_embedding(embedding)],
+    )?;
+    Ok(())
+}
+
+/// The id of the nearest live cluster whose stored lesson embedding is within
+/// `threshold` cosine of `embedding`, if any. Refuted/expired clusters are
+/// excluded so a suppressed lesson is never resurrected by a near-duplicate.
+/// Brute-force cosine over embedded clusters — their count is small (one per
+/// distinct lesson), so a linear scan beats a vector index.
+fn find_cluster_by_embedding(
+    conn: &Connection,
+    embedding: &[f32],
+    threshold: f32,
+) -> Result<Option<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, embedding FROM prior_clusters
+         WHERE embedding IS NOT NULL AND state NOT IN ('refuted', 'expired')",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let id: String = row.get(0)?;
+        let blob: Vec<u8> = row.get(1)?;
+        Ok((id, blob))
+    })?;
+
+    let mut best: Option<(String, f32)> = None;
+    for row in rows {
+        let (id, blob) = row?;
+        let sim = cosine_similarity(embedding, &decode_embedding(&blob));
+        if sim >= threshold && best.as_ref().map(|(_, b)| sim > *b).unwrap_or(true) {
+            best = Some((id, sim));
+        }
+    }
+    Ok(best.map(|(id, _)| id))
+}
+
+/// Merge a candidate into its cluster (creating the cluster on first sight),
+/// then recompute recurrence evidence. Exact-key-only; callers with an embedding
+/// should use [`integrate_candidate_with_embedding`] to enable semantic merge.
+pub fn integrate_candidate(conn: &Connection, cand: &PriorCandidate, now: i64) -> Result<String> {
+    integrate_candidate_with_embedding(conn, cand, now, None)
+}
+
+/// Merge a candidate into its cluster, then recompute recurrence evidence from
+/// the cluster's linked candidates. Returns the cluster id. The candidate row is
+/// (re)persisted with its `cluster_id` set. Does NOT promote or write to
+/// `memory_entries` — that is a separate, explicit step gated by
+/// [`should_promote`].
+///
+/// Cluster resolution tries, in order: (1) exact canonical-trigger-key match;
+/// (2) with `embedding` present, the nearest live cluster within
+/// [`PRIOR_MERGE_SIMILARITY`] — the semantic merge that lets an equivalent
+/// lesson phrased with a different trigger accumulate recurrence; (3) otherwise
+/// a new cluster, seeded with the embedding so future candidates can merge into
+/// it.
+pub fn integrate_candidate_with_embedding(
+    conn: &Connection,
+    cand: &PriorCandidate,
+    now: i64,
+    embedding: Option<&[f32]>,
+) -> Result<String> {
+    let key = canonical_trigger_key(&cand.trigger_kind, &cand.trigger_matcher);
+
+    let cluster_id = if let Some(existing) = find_cluster_by_key(conn, &key)? {
+        existing.id
+    } else if let Some(sim_id) = match embedding {
+        Some(e) => find_cluster_by_embedding(conn, e, PRIOR_MERGE_SIMILARITY)?,
+        None => None,
+    } {
+        // Semantically equivalent to an existing cluster under a different
+        // trigger key — merge into it rather than fragmenting the evidence.
+        sim_id
+    } else {
+        let id = cluster_id_for_key(&key);
         upsert_cluster(
             conn,
             &PriorCluster {
-                id: cluster_id.clone(),
+                id: id.clone(),
                 canonical_trigger_key: key.clone(),
                 trigger_kind: cand.trigger_kind.clone(),
                 trigger_matcher: cand.trigger_matcher.clone(),
@@ -378,9 +469,13 @@ pub fn integrate_candidate(conn: &Connection, cand: &PriorCandidate, now: i64) -
                 last_seen_at: now,
             },
         )?;
-    }
+        if let Some(e) = embedding {
+            set_cluster_embedding(conn, &id, e)?;
+        }
+        id
+    };
 
-    // Link the candidate to the cluster.
+    // Link the candidate to the resolved cluster.
     let mut linked = cand.clone();
     linked.cluster_id = Some(cluster_id.clone());
     upsert_candidate(conn, &linked)?;
@@ -650,11 +745,17 @@ fn candidate_id_for(canonical_key: &str, session: &str) -> String {
 /// it is unit-testable with a fixture `DistilledPrior` (no live model). Returns
 /// the promoted `memory_entries.id` when this observation tipped the cluster over
 /// the recurrence gate (or it was already promoted), else `None`.
+///
+/// `lesson_embedding` (the distilled lesson embedded by the caller) enables
+/// semantic cluster-merge: two sessions that teach the same lesson but whose
+/// distiller emitted different triggers still converge on one cluster and can
+/// promote. Pass `None` to fall back to exact-trigger-key clustering only.
 pub fn integrate_distilled(
     conn: &Connection,
     d: &DistilledPrior,
     session: &str,
     now: i64,
+    lesson_embedding: Option<&[f32]>,
 ) -> Result<Option<String>> {
     let key = canonical_trigger_key(&d.trigger_kind, &d.trigger_matcher);
     let cand = PriorCandidate {
@@ -670,7 +771,7 @@ pub fn integrate_distilled(
         source_session: Some(session.to_string()),
         created_at: now,
     };
-    let cluster_id = integrate_candidate(conn, &cand, now)?;
+    let cluster_id = integrate_candidate_with_embedding(conn, &cand, now, lesson_embedding)?;
     promote_cluster(conn, &cluster_id, now)
 }
 
@@ -1128,12 +1229,12 @@ mod tests {
 
         // First session: candidate stored, not yet promoted.
         assert_eq!(
-            integrate_distilled(&conn, &d, "sess-1", 1000).unwrap(),
+            integrate_distilled(&conn, &d, "sess-1", 1000, None).unwrap(),
             None,
             "one session must not promote"
         );
         // Second, distinct session: recurrence gate cleared → promoted.
-        let mem = integrate_distilled(&conn, &d, "sess-2", 2000)
+        let mem = integrate_distilled(&conn, &d, "sess-2", 2000, None)
             .unwrap()
             .expect("two distinct sessions promote");
 
@@ -1148,13 +1249,13 @@ mod tests {
         let conn = conn();
         let d = sample_distilled();
         assert_eq!(
-            integrate_distilled(&conn, &d, "sess-1", 1000).unwrap(),
+            integrate_distilled(&conn, &d, "sess-1", 1000, None).unwrap(),
             None
         );
         // Same session re-emitting the same trigger: deterministic candidate id
         // upserts, so distinct_sessions stays 1 — no self-promotion.
         assert_eq!(
-            integrate_distilled(&conn, &d, "sess-1", 1500).unwrap(),
+            integrate_distilled(&conn, &d, "sess-1", 1500, None).unwrap(),
             None,
             "one session cannot promote itself by repeating"
         );
@@ -1164,6 +1265,78 @@ mod tests {
             .unwrap();
         assert_eq!(cluster.distinct_sessions, 1);
         assert_eq!(cluster.evidence_count, 1, "same candidate id upserted once");
+    }
+
+    fn cluster_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM prior_clusters", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn integrate_distilled_merges_semantically_similar_across_sessions() {
+        let conn = conn();
+
+        // Session 1: the distiller emits a pre_tool trigger for the lesson.
+        let d1 = sample_distilled(); // trigger {"pattern":"src/generated/**"}
+        let emb1 = [1.0_f32, 0.0, 0.0];
+        assert_eq!(
+            integrate_distilled(&conn, &d1, "sess-1", 1000, Some(&emb1)).unwrap(),
+            None,
+            "one session must not promote"
+        );
+
+        // Session 2: SAME lesson, but the non-deterministic distiller emits a
+        // DIFFERENT trigger (kind + matcher) → different canonical key. The
+        // near-identical lesson embedding must merge it into cluster 1.
+        let d2 = DistilledPrior {
+            trigger_kind: "post_tool".into(),
+            trigger_matcher: r#"{"pattern":"src/generated/*","when":"after editing generated"}"#
+                .into(),
+            lesson: "Regenerate generated sources; never hand-edit auto-generated files.".into(),
+            scope: r#"{"repo":"current"}"#.into(),
+            evidence_failure: "Manual edit overwritten on rebuild.".into(),
+            evidence_fix: "Ran the generator instead.".into(),
+            ttl_days: Some(30),
+        };
+        let emb2 = [0.96_f32, 0.28, 0.0]; // cosine ~0.96 with emb1 → merges
+        let mem = integrate_distilled(&conn, &d2, "sess-2", 2000, Some(&emb2))
+            .unwrap()
+            .expect("semantically equivalent second session promotes the merged cluster");
+
+        assert_eq!(
+            cluster_count(&conn),
+            1,
+            "equivalent lessons form ONE cluster"
+        );
+        use crate::store::memory::{EntryType, get_entry_without_tracking};
+        let entry = get_entry_without_tracking(&conn, &mem).unwrap().unwrap();
+        assert_eq!(entry.entry_type, EntryType::Prior);
+    }
+
+    #[test]
+    fn integrate_distilled_keeps_dissimilar_lessons_in_separate_clusters() {
+        let conn = conn();
+        let d1 = sample_distilled();
+        let emb1 = [1.0_f32, 0.0, 0.0];
+        integrate_distilled(&conn, &d1, "sess-1", 1000, Some(&emb1)).unwrap();
+
+        // A different trigger AND an orthogonal embedding: must NOT merge.
+        let d2 = DistilledPrior {
+            trigger_kind: "prompt".into(),
+            trigger_matcher: r#"{"pattern":"deploy"}"#.into(),
+            lesson: "Always run the smoke test before deploying to production.".into(),
+            scope: r#"{"repo":"current"}"#.into(),
+            evidence_failure: "Broken deploy reached prod.".into(),
+            evidence_fix: "Added a pre-deploy smoke test.".into(),
+            ttl_days: Some(30),
+        };
+        let emb2 = [0.0_f32, 1.0, 0.0]; // cosine 0.0 with emb1 → distinct
+        assert_eq!(
+            integrate_distilled(&conn, &d2, "sess-2", 2000, Some(&emb2)).unwrap(),
+            None,
+            "an unrelated lesson from a second session must not promote either cluster"
+        );
+        assert_eq!(cluster_count(&conn), 2, "distinct lessons stay separate");
     }
 
     #[test]
