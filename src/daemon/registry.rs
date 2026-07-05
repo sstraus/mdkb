@@ -38,6 +38,10 @@ pub struct RepoHandle {
     pub reindex_tx: mpsc::Sender<PathBuf>,
     /// Receiver consumed once by spawn_watcher_for_handle; None after the watcher starts.
     reindex_rx: std::sync::Mutex<Option<mpsc::Receiver<PathBuf>>>,
+    /// One-shot guard so a dead/backpressured reindex channel is logged once per
+    /// failure episode instead of on every post_tool_use (was 571 repeats).
+    /// Cleared on the next successful send so a recovered channel can warn again.
+    pub reindex_send_warned: AtomicBool,
     /// Handle to the spawned file watcher task. Aborted on drop to prevent
     /// orphan watcher threads (notify-rs debouncer + fsevents) after LRU eviction.
     watcher_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -92,6 +96,7 @@ impl RepoHandle {
             code_reindex_active: Arc::new(AtomicBool::new(false)),
             reindex_tx,
             reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
+            reindex_send_warned: AtomicBool::new(false),
             watcher_handle: std::sync::Mutex::new(None),
         })
     }
@@ -119,6 +124,7 @@ impl RepoHandle {
             code_reindex_active,
             reindex_tx,
             reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
+            reindex_send_warned: AtomicBool::new(false),
             watcher_handle: std::sync::Mutex::new(None),
         }
     }

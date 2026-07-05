@@ -34,6 +34,31 @@ permissionDecision/caps/wikilink). The following were deferred:
   pure graph logic; only the `- path (relation)` formatting is a dispatch concern. Splitting query from
   formatting would let `canonical_key` stay private and keep the storage API cohesive. Complexity S. P3.
 
+## From code-index reliability work (stories 033/034/035, 2026-07-05)
+
+High-value/low-risk fixes shipped inline: FK root-cause (`insert_file` upsert rowid via `RETURNING id`
++ loud pipeline map-miss), incremental `IndexFacade::update` (no-op reindex 165s→0.85s live), file
+size cap (`MAX_INDEXABLE_FILE_BYTES`), watcher no longer exits on late ctx + bounded send-failure log.
+Deferred:
+
+- **`MAX_INDEXABLE_FILE_BYTES` is a hardcoded const (P3, configurability).** The 1 MiB parse cap lives
+  in `pipeline.rs`. Some repos legitimately have >1 MiB generated source they DO want indexed (or want a
+  tighter cap). Surface it as `[code.indexing].max_file_bytes` in config, defaulting to the const.
+  Complexity S. Priority P3.
+- **`max AST depth exceeded` warning doesn't name the file (P3, DX).** `check_recursion_depth(depth, node)`
+  logs only `row:col` (`parser.rs:78`), so a pathological file is unidentifiable from the log — the exact
+  gap story 035's criterion #3 hit. The file path isn't in scope at the ~30 recursive call sites across
+  all language parsers; threading it through is invasive. Cleaner: have `stage_parse` (which knows the
+  path) tag the warning, or return a per-file "depth-exceeded" flag up to the pipeline. Complexity M. P3.
+- **FSEvents stream death has no auto-restart (P2, resilience).** When `watcher.recv()` returns `None`
+  (backend died) the watcher now logs an actionable error and exits, but recovery still needs a daemon
+  restart. A supervised respawn (recreate the FileWatcher, keep the same `reindex_rx`) would self-heal.
+  Requires care around the consumed receiver. Complexity M. Priority P2.
+- **Consume injected reindex paths independent of ctx (P3, robustness).** During the ctx-wait the watcher
+  buffers injected paths (channel cap 64) but doesn't drain them until ctx arrives; a burst of >64 edits
+  before the first client request would drop the overflow. Restructure so the injected-path branch runs
+  before/without the collection-list resolution (which is the only thing that needs ctx). Complexity M. P3.
+
 ## 0. Pin the Rust toolchain so `cargo fmt --check` is deterministic
 
 - **Problem:** There is no `rust-toolchain.toml`. CI uses `dtolnay/rust-toolchain@stable`,
@@ -99,3 +124,28 @@ permissionDecision/caps/wikilink). The following were deferred:
 - **Complexity:** M–L.
 - **Priority:** P3 (revisit when the memory corpus is large enough that hybrid recall stops being
   near-total).
+
+## 4. Session transcript indexing re-embeds the whole file on every append (story 036)
+
+- **Problem/opportunity:** `handle_session_index` (`src/cli/handlers.rs:4732`) dedups session
+  chunks by **file mtime** (`existing_doc.file_modified_at == file_mtime`). A Claude transcript
+  (`~/.claude/projects/<proj>/*.jsonl`, 10–20 MB, append-only) bumps its mtime on every growth, so
+  ALL of its chunks fail the mtime check and get re-embedded — even chunks whose content is
+  byte-identical. This was a primary driver of the content-table leak and reindex CPU. Crucially,
+  chunk boundaries are **stable from turn 0** (`parse_session_file`, `src/domain/sessions.rs:216`:
+  fixed stride `chunk_size - overlap = 8`, key `{sid}-chunk-{NNN}`), so on append only the tail
+  chunk(s) actually change — the earlier chunks are unchanged content under a stable key.
+- **Proposed solution (recommended: incremental / content-hash dedup):** Switch the skip condition
+  from file-mtime to the **per-chunk content hash** the document layer already computes
+  (`index_document_in_tx`). Compute the hash of `sdoc.content` up front and skip when it equals
+  `existing_doc.hash`. Append-only growth then re-embeds only the genuinely new/changed tail chunks.
+  Alternatives considered: (b) summarize/truncate — lossy, needs a summarizer, hurts recall value;
+  (c) drop `claude_sessions` — cheapest but loses session recall entirely; (d) keep full — the bug.
+- **Benefits:** Bounds re-embedding to the delta; lossless; consistent with the code-index
+  content-hash philosophy (stories 033/035); kills the leak/CPU driver.
+- **Trade-offs:** Hash-per-chunk cost on each pass (cheap vs. re-embedding); the final partial chunk
+  still re-embeds each time its content grows (acceptable — it's one chunk). If chunking ever moves
+  to variable/end-anchored boundaries, the stable-key assumption breaks and needs revisiting.
+- **Complexity:** S (dedup predicate swap; no schema change — `documents.hash` already exists).
+- **Priority:** P3 (per story), but high value/low risk once the direction is confirmed.
+- **Status:** `[HUMAN]`-gated — awaiting Boss's direction (incremental / summarized / drop).

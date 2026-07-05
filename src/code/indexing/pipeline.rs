@@ -53,6 +53,13 @@ const BATCH_SIZE: usize = 5000;
 /// Number of reader threads (I/O-bound).
 const READ_THREADS: usize = 4;
 
+/// Skip parsing files larger than this. Hand-written source is virtually never
+/// this big; multi-MB files are minified bundles, vendored blobs, or generated
+/// code whose deeply-nested ASTs dominate parse CPU (the driver of the ~165s
+/// reindex) while yielding little useful symbol signal. Skipped files are logged
+/// so an unexpectedly-large source file is discoverable, not silently dropped.
+const MAX_INDEXABLE_FILE_BYTES: u64 = 1024 * 1024;
+
 // ---------------------------------------------------------------------------
 // Pipeline configuration
 // ---------------------------------------------------------------------------
@@ -214,6 +221,19 @@ fn stage_discover(
 /// Read file content and compute hashes, sending results downstream.
 fn stage_read(rx: &Receiver<PathBuf>, tx: &Sender<FileContent>) {
     while let Ok(path) = rx.recv() {
+        // Cheaply skip oversized files by metadata before reading them into memory.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > MAX_INDEXABLE_FILE_BYTES {
+                tracing::warn!(
+                    "Skipping {} ({} bytes > {} cap): likely minified/generated; \
+                     not indexed to bound parse cost.",
+                    path.display(),
+                    meta.len(),
+                    MAX_INDEXABLE_FILE_BYTES,
+                );
+                continue;
+            }
+        }
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -623,10 +643,16 @@ fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyho
     let mut symbol_id_map: HashMap<u32, i64> = HashMap::with_capacity(batch.symbols.len());
 
     for (symbol, _path) in &batch.symbols {
-        let real_file_id = file_id_map
-            .get(&symbol.file_id.value())
-            .copied()
-            .unwrap_or(i64::from(symbol.file_id.value()));
+        // A missing entry means the file was not registered in this batch — a
+        // pipeline invariant break. Fall-back to the raw pipeline id would write a
+        // non-existent file_id and raise a FK violation; fail loudly instead.
+        let real_file_id = *file_id_map.get(&symbol.file_id.value()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "symbol {:?} references file_id {} not registered in this batch",
+                symbol.as_name(),
+                symbol.file_id.value(),
+            )
+        })?;
         let scope_json = symbol
             .scope_context
             .as_ref()
@@ -652,10 +678,14 @@ fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyho
 
     // Write relationships, remapping both file_id and from_symbol_id
     for rel in &batch.unresolved_relationships {
-        let real_file_id = file_id_map
-            .get(&rel.file_id.value())
-            .copied()
-            .unwrap_or(i64::from(rel.file_id.value()));
+        let real_file_id = *file_id_map.get(&rel.file_id.value()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "relationship {}->{} references file_id {} not registered in this batch",
+                rel.from_name,
+                rel.to_name,
+                rel.file_id.value(),
+            )
+        })?;
         let real_from_id = rel
             .from_id
             .and_then(|id| symbol_id_map.get(&id.value()).copied());
@@ -710,6 +740,32 @@ mod tests {
 
         assert_eq!(stats.symbols_indexed, 0);
         assert_eq!(db.file_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn oversized_file_is_skipped_smaller_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A normal file indexes; an oversized sibling is skipped by the size cap.
+        fs::write(dir.path().join("small.rs"), "pub fn small_fn() {}").unwrap();
+        let big = format!(
+            "pub fn big_fn() {{}}\n// {}",
+            "x".repeat(MAX_INDEXABLE_FILE_BYTES as usize + 1)
+        );
+        fs::write(dir.path().join("big.rs"), big).unwrap();
+
+        let (_db_dir, db) = temp_db();
+        index_directory(dir.path(), &db, &test_config()).unwrap();
+
+        assert_eq!(
+            db.file_count().unwrap(),
+            1,
+            "only the small file should be indexed"
+        );
+        assert!(
+            db.find_symbols_by_name("big_fn").unwrap().is_empty(),
+            "symbol from the oversized file must not be indexed"
+        );
+        assert!(!db.find_symbols_by_name("small_fn").unwrap().is_empty());
     }
 
     #[test]

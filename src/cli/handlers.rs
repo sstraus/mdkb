@@ -4218,7 +4218,7 @@ mod tests {
     }
 
     #[test]
-    fn test_handle_session_index_dedup_by_mtime() {
+    fn test_handle_session_index_dedup_unchanged_content() {
         let temp = setup_temp_dir();
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
@@ -4239,11 +4239,106 @@ mod tests {
             handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
         assert!(r1.added > 0);
 
-        // Second index without modification — should skip via mtime
+        // Second index without modification — content hash matches, so skip.
         let r2 =
             handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
         assert_eq!(r2.added, 0);
         assert!(r2.unchanged > 0);
+    }
+
+    /// Regression for story 036: an append-only transcript must re-embed only the
+    /// grown tail, not its whole body. Chunk keys are stable from turn 0, so after
+    /// an append the earlier chunks are byte-identical and MUST be skipped by
+    /// content hash — even though the file mtime bumped. The prior mtime-based
+    /// dedup skipped nothing whenever the mtime changed, re-embedding the entire
+    /// multi-MB file on every growth (the leak/CPU driver this story fixes).
+    #[test]
+    fn test_handle_session_index_append_skips_unchanged_chunks_despite_mtime_bump() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let sessions_base = temp.path().join("sessions");
+        let encoded = crate::domain::sessions::encode_project_path(&temp.path().to_string_lossy());
+        let session_dir = sessions_base.join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let file = session_dir.join("grow.jsonl");
+
+        // 8 user turns = 16 records → multiple stable chunks (size 10, stride 8):
+        // chunk-000 = records[0..10], chunk-001 = records[8..16].
+        std::fs::write(&file, make_session_jsonl("grow", 8)).unwrap();
+        let r1 =
+            handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
+        assert!(r1.added > 0, "first index writes the initial chunks");
+
+        // Append more turns. The content is deterministic per turn index, so the
+        // first 16 records are byte-identical → chunk-000 (records[0..10]) is
+        // unchanged; the tail grows and adds new chunks.
+        std::fs::write(&file, make_session_jsonl("grow", 14)).unwrap();
+        // Force mtime forward so the OLD mtime-dedup would reprocess EVERY chunk;
+        // content-hash dedup must still skip the identical earlier chunk(s).
+        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
+
+        let r2 =
+            handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
+
+        assert!(
+            r2.unchanged > 0,
+            "byte-identical earlier chunks MUST be skipped by content hash despite \
+             the bumped mtime (mtime dedup would give unchanged=0, re-embedding all)"
+        );
+        assert!(
+            r2.added > 0,
+            "the appended tail introduces at least one new chunk"
+        );
+    }
+
+    /// Story 036 AC#3 — quantified before/after: on a large session, an append
+    /// re-processes only the tail, not the whole body. `unchanged` (skipped, zero
+    /// embedding cost) must dominate `added + updated` (re-embedded). Under the old
+    /// mtime dedup, an mtime-bumping append gave unchanged=0 and reprocessed ALL
+    /// chunks — the cost this story removes.
+    #[test]
+    fn test_handle_session_index_append_cost_is_delta_bounded() {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+
+        let sessions_base = temp.path().join("sessions");
+        let encoded = crate::domain::sessions::encode_project_path(&temp.path().to_string_lossy());
+        let session_dir = sessions_base.join(&encoded);
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let file = session_dir.join("big.jsonl");
+
+        // 50 user turns = 100 records → ~12 chunks (size 10, stride 8).
+        std::fs::write(&file, make_session_jsonl("big", 50)).unwrap();
+        handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
+
+        // Append 2 turns; force mtime forward (worst case for the old dedup).
+        std::fs::write(&file, make_session_jsonl("big", 52)).unwrap();
+        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(bumped)
+            .unwrap();
+
+        let r = handle_session_index(&ctx, &sessions_base, &temp.path().to_string_lossy()).unwrap();
+        let reprocessed = r.added + r.updated;
+        assert!(
+            r.unchanged >= 3 * reprocessed,
+            "append must skip the bulk of chunks: unchanged={} should dominate \
+             reprocessed(added+updated)={} (old mtime dedup: unchanged=0)",
+            r.unchanged,
+            reprocessed
+        );
     }
 
     #[test]
@@ -4811,9 +4906,15 @@ pub fn handle_session_index(
         for sdoc in &session_docs {
             let existing = existing_docs.get(&sdoc.relative_path);
 
-            // Skip if mtime hasn't changed
+            // Content-hash dedup (NOT file mtime). A transcript is append-only, so
+            // its mtime bumps on every growth while all but the tail chunk keep
+            // byte-identical content under a stable `{sid}-chunk-NNN` key. Skipping
+            // on file mtime therefore re-embedded the ENTIRE multi-MB file on every
+            // append; skipping on the per-chunk content hash re-embeds only the
+            // new/changed tail. `documents.hash` is the same SHA-256 the document
+            // layer stores, so this is exact, not heuristic.
             if let Some(existing_doc) = existing {
-                if existing_doc.file_modified_at == file_mtime {
+                if existing_doc.hash == documents::compute_hash(&sdoc.content) {
                     result.unchanged += 1;
                     continue;
                 }

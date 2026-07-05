@@ -210,3 +210,86 @@ async fn injected_path_triggers_code_reindex() {
 
     watcher_handle.abort();
 }
+
+/// Story 034-62a0: a watcher whose context initializes LATE must not exit and
+/// orphan `reindex_rx`. A path injected while ctx is still `None` has to survive
+/// the wait and get incrementally reindexed once ctx appears — otherwise every
+/// post_tool_use send fails with "channel closed" forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn late_ctx_still_reindexes_injected_file() {
+    let tmp = canonical_tempdir();
+    let root = tmp.path().to_path_buf();
+
+    // Set up .mdkb + a real source file, but DON'T hand ctx to the watcher yet.
+    let ctx = Context::init(&root).expect("Context::init");
+    let src_dir = root.join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    std::fs::write(src_dir.join("lib.rs"), "pub fn late_ctx_fn() {}").unwrap();
+
+    // ctx starts as None — the daemon lazily fills it on the first client request.
+    let ctx_arc: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(None));
+
+    let db_path = root.join(".mdkb").join("code.sqlite");
+    let facade = IndexFacade::create(db_path).expect("IndexFacade::create");
+    let code_index: Arc<Mutex<Option<IndexFacade>>> = Arc::new(Mutex::new(Some(facade)));
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<PathBuf>(64);
+    let code_before = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
+
+    // Spawn the watcher with ctx == None. No `ready` notify: it only fires after
+    // the ctx-wait completes, which is exactly what we're delaying.
+    let watcher_root = root.clone();
+    let watcher_ctx = Arc::clone(&ctx_arc);
+    let watcher_code = Arc::clone(&code_index);
+    let watcher_handle = tokio::spawn(async move {
+        let _ = run_file_watcher_inner(
+            watcher_root,
+            watcher_ctx,
+            watcher_code,
+            true,
+            vec![],
+            true,
+            200,
+            None,
+            Some(rx),
+        )
+        .await;
+    });
+
+    // Inject a path while ctx is still None. Old behavior: watcher eventually
+    // exits and this send starts failing. New behavior: it buffers, then drains.
+    let injected = src_dir.join("lib.rs");
+    tx.send(injected).await.expect("send injected path");
+
+    // Give the watcher a moment stuck in the ctx-wait, proving it hasn't exited.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !watcher_handle.is_finished(),
+        "watcher must keep waiting for late ctx, not exit and drop reindex_rx"
+    );
+
+    // Context becomes available late (as the first client request would do).
+    *ctx_arc.lock().await = Some(ctx);
+
+    // The buffered path must now be reindexed.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if CODE_REINDEX_COUNT.load(Ordering::Relaxed) > code_before {
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("late-ctx injected path was never reindexed");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    // Prove the actual symbol landed in the index, not just a counter bump.
+    let guard = code_index.lock().await;
+    let facade = guard.as_ref().unwrap();
+    assert!(
+        facade.get_symbol_by_name("late_ctx_fn").is_some(),
+        "the file edited before ctx was ready must be indexed once ctx arrives"
+    );
+
+    watcher_handle.abort();
+}

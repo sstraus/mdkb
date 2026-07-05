@@ -1609,8 +1609,11 @@ pub async fn get_impl(
     Err(mcp_error(format!("Not found: '{}'.", params.id)))
 }
 
-/// `update` — three-phase differential reindex: documents, code, sessions.
-/// Returns the human-readable summary aggregated from each phase.
+/// `update` — incremental refresh of documents, code, and sessions.
+///
+/// Each phase diffs against what is already indexed (documents by hash, code by
+/// content-hash via `IndexFacade::update`, sessions by hash) and only re-processes
+/// what changed. Returns the human-readable summary aggregated from each phase.
 pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
@@ -1630,7 +1633,7 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
     let code_output = {
         let mut idx_guard = acquire_handle_code_index(handle).await?;
         if let Some(facade) = idx_guard.as_mut() {
-            match facade.reindex(&handle.root) {
+            match facade.update(&handle.root) {
                 Ok(stats) => format!(
                     "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
                     stats.files_indexed, stats.symbols_indexed, stats.relationships_collected
@@ -2273,16 +2276,8 @@ fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
         };
         drop(idx_guard);
 
-        let result = if facade.file_count() == 0 {
-            facade.reindex(&root)
-        } else {
-            let all_files = crate::code::indexing::walker::discover_files(
-                &root,
-                &ignore_patterns,
-                respect_gitignore,
-            );
-            facade.reindex_files(&root, &all_files)
-        };
+        // Content-hash incremental refresh (full build only on empty index).
+        let result = facade.update(&root);
         crate::llm::release_cached_service();
         match result {
             Ok(stats) => {
@@ -2934,9 +2929,26 @@ pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Valu
         }
     };
     if let Err(e) = handle.reindex_tx.try_send(path) {
-        tracing::warn!("hook.post_tool_use: reindex_tx send failed: {e}");
+        // Bounded logging: warn once per failure episode, not on every edit (the
+        // old path logged 571 identical "channel closed" lines). The edit is not
+        // lost long-term — the FSEvents watcher and the next `update` still pick
+        // it up; only the fast-path injection is skipped this once.
+        if !handle
+            .reindex_send_warned
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "hook.post_tool_use: reindex path injection unavailable ({e}); \
+                 falling back to watcher/update. Further failures are suppressed \
+                 until the channel recovers."
+            );
+        }
         return json!({});
     }
+    // A prior failure episode (if any) has recovered; re-arm the one-shot warning.
+    handle
+        .reindex_send_warned
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     json!({"queued": true})
 }
 

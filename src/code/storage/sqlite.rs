@@ -105,16 +105,23 @@ impl CodeDb {
             "DELETE FROM code_files WHERE rel_path = ?1 AND path != ?2",
             params![rel_path, path],
         )?;
-        self.conn.execute(
+        // RETURNING id yields the affected row's rowid for BOTH the INSERT and the
+        // ON CONFLICT DO UPDATE path. `last_insert_rowid()` must NOT be used here:
+        // on an UPDATE it is unchanged, so it returns a stale rowid from an earlier
+        // insert on this connection, poisoning the caller's file_id map and raising
+        // "FOREIGN KEY constraint failed" (or silently misattributing symbols).
+        let id: i64 = self.conn.query_row(
             "INSERT INTO code_files (path, rel_path, hash, language, mtime, indexed_at, token_estimate) \
              VALUES (?1, ?2, ?3, ?4, ?5, unixepoch(), ?6) \
              ON CONFLICT(path) DO UPDATE SET \
              rel_path=excluded.rel_path, hash=excluded.hash, \
              language=excluded.language, mtime=excluded.mtime, \
-             indexed_at=unixepoch(), token_estimate=excluded.token_estimate",
+             indexed_at=unixepoch(), token_estimate=excluded.token_estimate \
+             RETURNING id",
             params![path, rel_path, hash, language, mtime, token_estimate],
+            |row| row.get(0),
         )?;
-        Ok(self.conn.last_insert_rowid())
+        Ok(id)
     }
 
     /// Delete a file and all its symbols/relationships (via CASCADE).
@@ -745,17 +752,45 @@ mod tests {
         assert_eq!(hashes.get("main.rs").unwrap(), "hash2");
     }
 
+    /// Root cause of the incremental-reindex FK violation: `insert_file` must
+    /// return the *existing* row's rowid when the `ON CONFLICT(path) DO UPDATE`
+    /// upsert fires. `last_insert_rowid()` does NOT change on an UPDATE, so after
+    /// any other insert on the same connection it returns a stale, wrong rowid.
+    /// That poisoned file_id then flows into `code_symbols.file_id` /
+    /// `code_relationships.file_id` (both FK → `code_files(id)`) and raises
+    /// "FOREIGN KEY constraint failed".
+    #[test]
+    fn insert_file_upsert_returns_existing_rowid_not_last_insert() {
+        let (_dir, db) = temp_db();
+        let id_a = db
+            .insert_file("a.rs", "a.rs", "h1", None, None, None)
+            .unwrap();
+        // A second insert advances last_insert_rowid past `id_a`.
+        let id_b = db
+            .insert_file("b.rs", "b.rs", "h2", None, None, None)
+            .unwrap();
+        assert_ne!(id_a, id_b, "distinct files get distinct rowids");
+
+        // Upsert `a.rs` again — an UPDATE, not an INSERT. Must still return id_a.
+        let id_a2 = db
+            .insert_file("a.rs", "a.rs", "h1-updated", None, None, None)
+            .unwrap();
+        assert_eq!(
+            id_a2, id_a,
+            "upsert of an existing file must return its real rowid, not last_insert_rowid ({id_b})"
+        );
+    }
+
     #[test]
     fn test_insert_file_deduplicates_legacy_absolute_path() {
         let (_dir, db) = temp_db();
         // Simulate legacy row with absolute path
         db.insert_file("/abs/path/main.rs", "main.rs", "old_hash", None, None, None)
             .unwrap();
-        let sym_id = db
-            .insert_symbol(
-                "old_fn", "Function", 1, "main.rs", 1, None, None, None, 0, None, None, None, None,
-            )
-            .unwrap();
+        db.insert_symbol(
+            "old_fn", "Function", 1, "main.rs", 1, None, None, None, 0, None, None, None, None,
+        )
+        .unwrap();
         assert_eq!(db.file_count().unwrap(), 1);
         assert_eq!(db.symbol_count().unwrap(), 1);
 

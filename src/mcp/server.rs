@@ -1062,16 +1062,8 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
             }; // lock released immediately
 
             if let Some(mut facade) = taken_facade {
-                let result = if facade.file_count() == 0 {
-                    facade.reindex(&startup_root)
-                } else {
-                    let all_files = crate::code::indexing::walker::discover_files(
-                        &startup_root,
-                        &startup_server.code_ignore_patterns,
-                        startup_server.full_config.code.indexing.respect_gitignore,
-                    );
-                    facade.reindex_files(&startup_root, &all_files)
-                };
+                // Content-hash incremental refresh (full build only on empty index).
+                let result = facade.update(&startup_root);
                 crate::llm::release_cached_service();
                 match result {
                     Ok(stats) => {
@@ -1247,19 +1239,29 @@ pub async fn run_file_watcher_inner(
     let mut watcher = FileWatcher::new(config)?;
 
     // Wait for context initialization (driven by first client request via
-    // ensure_handle_context). Without this poll the watcher would race against
-    // the dispatch path and exit immediately when ctx is still None.
+    // ensure_handle_context). This MUST NOT exit on a timeout: returning here
+    // drops `reindex_rx`, after which every post_tool_use path injection fails
+    // with "channel closed" forever (the watcher never respawns). The task is
+    // aborted when the handle is dropped (RepoHandle::Drop), so waiting
+    // indefinitely is bounded by handle lifetime and cannot leak. We only warn
+    // once, actionably, if ctx is unusually slow to appear.
     let collection_list = {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(CTX_WAIT_SECS);
+        let warn_after =
+            tokio::time::Instant::now() + std::time::Duration::from_secs(CTX_WAIT_SECS);
+        let mut warned = false;
         loop {
             let ctx_guard = ctx.lock().await;
             if let Some(ctx_ref) = ctx_guard.as_ref() {
                 break collections::list_collections(&ctx_ref.conn)?;
             }
             drop(ctx_guard);
-            if tokio::time::Instant::now() >= deadline {
-                tracing::debug!("Watcher: context never initialized, exiting");
-                return Ok(());
+            if !warned && tokio::time::Instant::now() >= warn_after {
+                warned = true;
+                tracing::warn!(
+                    "Watcher: context still uninitialized after {CTX_WAIT_SECS}s; \
+                     continuing to wait. Reindex is on hold until the first client \
+                     request initializes the repo context."
+                );
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -1372,7 +1374,13 @@ pub async fn run_file_watcher_inner(
             // No pending work — block until next event from either source.
             tokio::select! {
                 change = watcher.recv() => {
-                    let Some(change) = change else { break };
+                    let Some(change) = change else {
+                        tracing::error!(
+                            "Watcher: FSEvents stream closed; file-change watching stopped \
+                             for this repo (restart the daemon to restore it)."
+                        );
+                        break;
+                    };
                     tracing::debug!("File change detected: {:?}", change.path);
                     let (is_code, is_doc) = classify_change(&change.path, &collection_paths, &code_excludes);
                     if is_code { code_batch.push(change.path.clone()); }
@@ -1399,7 +1407,13 @@ pub async fn run_file_watcher_inner(
                                 tracing::debug!("Ignoring non-code, non-doc change: {:?}", change.path);
                             }
                         }
-                        None => break,
+                        None => {
+                            tracing::error!(
+                                "Watcher: FSEvents stream closed; file-change watching stopped \
+                                 for this repo (restart the daemon to restore it)."
+                            );
+                            break;
+                        }
                     }
                 }
                 path = recv_injected!() => {

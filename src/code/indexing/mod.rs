@@ -139,6 +139,26 @@ impl IndexFacade {
         Ok(stats)
     }
 
+    /// Incrementally refresh the whole index for `root`.
+    ///
+    /// Content-hash diff over all discovered files: only changed/new files are
+    /// re-parsed and re-embedded and deleted files are dropped — the index is
+    /// NOT wiped. On an empty index it falls through to a full build. This is the
+    /// cheap path for the `update` command: a no-change refresh reindexes zero
+    /// files instead of clearing and re-parsing everything. Mirrors the
+    /// SessionStart code-refresh idiom.
+    pub fn update(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
+        if self.file_count() == 0 {
+            return self.reindex(root);
+        }
+        let all_files = walker::discover_files(
+            root,
+            &self.config.ignore_patterns,
+            self.config.respect_gitignore,
+        );
+        self.reindex_files(root, &all_files)
+    }
+
     /// Re-index a directory (full reindex, discarding previous data).
     pub fn reindex(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
         // Roll back any dangling transaction from a previous failed reindex.
@@ -1012,6 +1032,106 @@ pub fn world() {
             facade.symbol_count(),
             2,
             "Should have exactly 2 symbols after double index"
+        );
+    }
+
+    #[test]
+    fn update_is_noop_when_nothing_changed() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        assert_eq!(facade.symbol_count(), 2);
+
+        // No file changed → update must reindex zero files AND keep the index.
+        let stats = facade.update(src_dir.path()).unwrap();
+        assert_eq!(
+            stats.files_indexed, 0,
+            "no-change update must not re-parse any file (was a full wipe+rebuild)"
+        );
+        assert_eq!(
+            facade.symbol_count(),
+            2,
+            "no-change update must not clear the index"
+        );
+        assert!(facade.get_symbol_by_name("aaa").is_some());
+        assert!(facade.get_symbol_by_name("bbb").is_some());
+    }
+
+    #[test]
+    fn update_reindexes_only_changed_file() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        // Change only b.rs.
+        fs::write(src_dir.path().join("b.rs"), "pub fn ccc() {}").unwrap();
+        let stats = facade.update(src_dir.path()).unwrap();
+        assert_eq!(stats.files_indexed, 1, "only the changed file is reindexed");
+        assert!(facade.get_symbol_by_name("aaa").is_some());
+        assert!(facade.get_symbol_by_name("bbb").is_none());
+        assert!(facade.get_symbol_by_name("ccc").is_some());
+    }
+
+    #[test]
+    fn update_builds_from_empty() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        // Empty index → update falls through to a full build.
+        let stats = facade.update(src_dir.path()).unwrap();
+        assert_eq!(stats.files_indexed, 1);
+        assert!(facade.get_symbol_by_name("aaa").is_some());
+    }
+
+    /// Re-indexing a file whose row already exists (i.e. a delete-miss, the live
+    /// daemon condition behind the ~149 "Code reindex failed: FOREIGN KEY
+    /// constraint failed" logs) must not corrupt file ids. `index_files` does not
+    /// delete first, so the second pass exercises `insert_file`'s upsert path: a
+    /// stale `last_insert_rowid()` would hand symbols/relationships a `file_id`
+    /// with no matching `code_files` row and raise a FK violation.
+    #[test]
+    fn reindex_file_with_relationships_does_not_violate_fk() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn helper() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn caller() { helper(); }").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        assert!(facade.get_symbol_by_name("caller").is_some());
+        let rels_before = facade.relationship_count();
+        assert!(rels_before > 0, "caller() -> helper() should be recorded");
+
+        // Re-index b.rs without deleting its existing row first (delete-miss).
+        let b_path = src_dir.path().join("b.rs");
+        let result = facade.index_files(src_dir.path(), &[b_path]);
+        assert!(
+            result.is_ok(),
+            "re-index over an existing file row must not raise FK violation: {:?}",
+            result.err()
+        );
+
+        // Integrity preserved: no duplicate symbols, relationship intact.
+        assert!(facade.get_symbol_by_name("caller").is_some());
+        assert!(facade.get_symbol_by_name("helper").is_some());
+        assert_eq!(
+            facade.symbol_count(),
+            2,
+            "re-index must not duplicate symbols"
+        );
+        assert!(
+            facade.relationship_count() > 0,
+            "caller() -> helper() relationship must survive re-index"
         );
     }
 }
