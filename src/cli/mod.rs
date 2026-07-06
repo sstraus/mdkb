@@ -121,7 +121,12 @@ pub enum Command {
     },
 
     /// Generate embeddings for documents
-    Embed,
+    Embed {
+        /// Embed only this collection. Required to embed `claude_sessions`,
+        /// which is excluded from the default (all-collections) embed.
+        #[arg(long)]
+        collection: Option<String>,
+    },
 
     /// Start MCP server (stdio by default, --http or --https for network transport)
     Serve {
@@ -231,7 +236,22 @@ pub enum Command {
     Code(CodeCommand),
 
     /// Reclaim disk space by vacuuming index.sqlite and code.sqlite
-    Compact,
+    Compact {
+        /// Hard-delete archived session transcripts whose source jsonl is gone.
+        /// Requires --older-than. Without this flag, compact only vacuums.
+        #[arg(long)]
+        prune_sessions: bool,
+
+        /// Age cutoff for --prune-sessions, e.g. 90d, 12h, 2w. Only archived
+        /// sessions older than this are deleted. Required with --prune-sessions.
+        #[arg(long)]
+        older_than: Option<String>,
+
+        /// Write each pruned transcript as markdown to this directory before
+        /// deleting it, so the archive is never silently lost.
+        #[arg(long)]
+        export: Option<std::path::PathBuf>,
+    },
 
     /// Compact command reference for AI consumption
     Cheatsheet,
@@ -579,6 +599,13 @@ pub enum MemoryCommand {
         /// Reminder due time in seconds from now. Use with --entry-type reminder.
         #[arg(long)]
         due_in: Option<u64>,
+
+        /// Provenance/trust of this entry (default: user_statement on insert;
+        /// preserved on re-write unless given). Drives the confidence authority
+        /// multiplier: official_docs (1.0) > user_statement (0.85) >
+        /// auto_extracted (0.70) > inference (0.65).
+        #[arg(long)]
+        source_type: Option<String>,
     },
 
     /// Show a memory entry
@@ -586,6 +613,17 @@ pub enum MemoryCommand {
     Show {
         /// Entry ID
         id: String,
+    },
+
+    /// Record a confirmation signal against an entry (raises/lowers confidence).
+    /// Runs in-process — no daemon required.
+    Confirm {
+        /// Entry ID (slug)
+        id: String,
+
+        /// confirmed (+1) or refuted (-1, floor 0)
+        #[arg(long)]
+        outcome: String,
     },
 
     /// Link a memory entry to another entry or document via a typed relation

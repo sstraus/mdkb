@@ -343,6 +343,100 @@ fn smoke_memory_lifecycle() {
     let out = run(&["memory", "history", "smoke-test-entry"], &repo.root);
     assert_ok(&out, "memory history");
 
+    // confirm (+1) — reachable in-process, no daemon.
+    let out = run(
+        &[
+            "memory",
+            "confirm",
+            "smoke-test-entry",
+            "--outcome",
+            "confirmed",
+        ],
+        &repo.root,
+    );
+    assert_ok(&out, "memory confirm");
+    assert!(
+        stdout(&out).contains("Confirmed"),
+        "confirm must report success: {}",
+        stdout(&out)
+    );
+
+    // confirm --format json exposes the new confirmation count.
+    let out = run(
+        &[
+            "--format",
+            "json",
+            "memory",
+            "confirm",
+            "smoke-test-entry",
+            "--outcome",
+            "confirmed",
+        ],
+        &repo.root,
+    );
+    assert_ok(&out, "memory confirm --format json");
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("confirm json");
+    assert_eq!(v["confirmations"], 2, "two confirms → count 2");
+
+    // refuted below zero floors at 0 rather than going negative.
+    for _ in 0..5 {
+        let out = run(
+            &[
+                "memory",
+                "confirm",
+                "smoke-test-entry",
+                "--outcome",
+                "refuted",
+            ],
+            &repo.root,
+        );
+        assert_ok(&out, "memory confirm refuted");
+    }
+    let out = run(
+        &[
+            "--format",
+            "json",
+            "memory",
+            "confirm",
+            "smoke-test-entry",
+            "--outcome",
+            "refuted",
+        ],
+        &repo.root,
+    );
+    assert_ok(&out, "memory confirm refuted floor");
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("confirm json");
+    assert_eq!(v["confirmations"], 0, "confirmations floor at 0");
+
+    // Unknown id is a clean non-zero error, not a panic.
+    let out = run(
+        &[
+            "memory",
+            "confirm",
+            "no-such-entry",
+            "--outcome",
+            "confirmed",
+        ],
+        &repo.root,
+    );
+    assert!(
+        !out.status.success(),
+        "confirming an unknown id must fail cleanly"
+    );
+
+    // Invalid outcome rejected.
+    let out = run(
+        &[
+            "memory",
+            "confirm",
+            "smoke-test-entry",
+            "--outcome",
+            "maybe",
+        ],
+        &repo.root,
+    );
+    assert!(!out.status.success(), "invalid outcome must be rejected");
+
     let out = run(&["memory", "prune", "--dry-run"], &repo.root);
     assert_ok(&out, "memory prune --dry-run");
 

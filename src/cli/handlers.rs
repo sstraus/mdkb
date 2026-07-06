@@ -103,6 +103,10 @@ impl Context {
         // exist even on databases created by older versions.
         schema::init_schema(&conn)?;
         vectors::init_vector_schema(&conn)?;
+        // Stats tables (sessions/call_log/query_events) so hook-call telemetry
+        // and query_events work on every transport, including the daemon-less
+        // in-process CLI hook path (previously only the MCP server created them).
+        crate::store::stats::init_stats_schema(&conn)?;
         maintenance::ensure_incremental_autovacuum(&conn)?;
 
         Ok(Self {
@@ -605,6 +609,55 @@ pub fn handle_update(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResu
     handle_update_force(ctx, root, false)
 }
 
+/// Remove vestigial artifacts from earlier mdkb versions and warn on dead config
+/// keys. Best-effort: a failed delete is logged, never fatal to `update`.
+///
+/// - `.mdkb/mdkb.sqlite` — a 0-byte orphan (never opened; deleted only when empty
+///   so a future real DB at that path is never clobbered).
+/// - `.mdkb/code-index/` — legacy tantivy index dir, superseded by `code.sqlite`.
+/// - `.mdkb/reindex-queue.jsonl` — the file-based reindex queue; the daemon now
+///   uses an in-process channel, so it has no writer.
+/// - dead `[models]` embedding keys — the embedder is fixed to all-MiniLM-L6-v2.
+fn housekeeping(root: &Path) {
+    let mdkb_dir = root.join(".mdkb");
+
+    // 0-byte orphan mdkb.sqlite (never delete a non-empty file at that path).
+    let orphan = mdkb_dir.join("mdkb.sqlite");
+    if orphan.metadata().map(|m| m.len() == 0).unwrap_or(false) {
+        if let Err(e) = std::fs::remove_file(&orphan) {
+            tracing::warn!("housekeeping: failed to remove orphan mdkb.sqlite: {e}");
+        }
+    }
+
+    // Legacy tantivy code-index directory.
+    let legacy_index = mdkb_dir.join("code-index");
+    if legacy_index.is_dir() {
+        if let Err(e) = std::fs::remove_dir_all(&legacy_index) {
+            tracing::warn!("housekeeping: failed to remove legacy code-index dir: {e}");
+        }
+    }
+
+    // Writer-less reindex queue.
+    let queue = mdkb_dir.join("reindex-queue.jsonl");
+    if queue.exists() {
+        if let Err(e) = std::fs::remove_file(&queue) {
+            tracing::warn!("housekeeping: failed to remove stale reindex-queue.jsonl: {e}");
+        }
+    }
+
+    // Warn (do not silently accept) dead [models] embedding keys.
+    let config_path = mdkb_dir.join("config.toml");
+    if let Ok(raw) = std::fs::read_to_string(&config_path) {
+        let dead = crate::config::detect_dead_model_keys(&raw);
+        if !dead.is_empty() {
+            eprintln!(
+                "warning: [models] {} ignored: the embedder is fixed (all-MiniLM-L6-v2)",
+                dead.join(", ")
+            );
+        }
+    }
+}
+
 /// Like [`handle_update`], but `force` reindexes every file regardless of mtime.
 pub fn handle_update_force(
     ctx: &Context,
@@ -612,6 +665,9 @@ pub fn handle_update_force(
     force: bool,
 ) -> Result<UpdateResult> {
     let root = root.as_ref();
+
+    // Remove vestigial artifacts / warn on dead config before indexing.
+    housekeeping(root);
 
     // Detect and register convention-based collections before processing
     apply_conventions(ctx, root)?;
@@ -635,6 +691,38 @@ pub fn handle_update_force(
         documents::gc_orphaned_content(&ctx.conn)?;
         Ok(())
     })?;
+
+    // Backfill embeddings for memory entries written without one (CLI cold-model
+    // writes, or entries that predate embed-on-write). Runs after the index
+    // commit so ONNX inference never holds the write lock. Failure is logged,
+    // never fatal to `update` — the count surfaces in `mdkb stats`.
+    match memory::backfill_memory_embeddings(&ctx.conn) {
+        Ok(n) => result.memory_embeddings_backfilled = n,
+        Err(e) => tracing::warn!("memory embedding backfill failed: {e}"),
+    }
+
+    // Reconcile the markdown projection with the DB (source of truth): backfill
+    // files for DB-only entries, archive entries whose file was deleted.
+    match sync_memory_files(ctx) {
+        Ok(s) => {
+            result.memory_files_projected = s.projected;
+            result.memory_entries_archived = s.archived;
+            result.memory_entries_archive_skipped = s.archive_skipped;
+        }
+        Err(e) => tracing::warn!("memory file sync failed: {e}"),
+    }
+
+    // Auto-embed changed documents (scoped: docs yes, claude_sessions no) so
+    // hybrid search never silently degrades to BM25. Off via
+    // `[search] auto_embed_docs = false`. Runs after commit; failure (e.g. cold
+    // model) is logged, never fatal.
+    if config.search.auto_embed_docs {
+        match handle_embed(ctx, None) {
+            Ok(r) => result.doc_embeddings_generated = r.generated,
+            Err(e) => tracing::warn!("auto-embed on update failed: {e}"),
+        }
+    }
+
     Ok(result)
 }
 
@@ -1085,30 +1173,78 @@ fn index_specified_files(
     Ok(())
 }
 
-/// Generate embeddings for all documents that don't have them.
-/// This is a separate operation that can be run after update.
+/// A doc embedding taking longer than this is logged to `hook-slow.jsonl`.
+const EMBED_SLOW_MS: u64 = 1000;
+
+/// Whether a collection should be embedded given the `--collection` filter and
+/// the `auto_embed_sessions` setting.
 ///
-/// Uses batch content retrieval to avoid N+1 queries.
-/// Uses cached model to avoid 2-5 second load time per request.
-pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
+/// - `filter = Some(name)`: embed only that collection (the only way to embed
+///   `claude_sessions`).
+/// - `filter = None`: embed everything except `claude_sessions`, unless
+///   `include_sessions` (from `[search] auto_embed_sessions`) is set.
+fn should_embed_collection(coll_name: &str, filter: Option<&str>, include_sessions: bool) -> bool {
+    match filter {
+        Some(name) => coll_name == name,
+        None => include_sessions || coll_name != crate::domain::COLLECTION_CLAUDE_SESSIONS,
+    }
+}
+
+/// Append a slow-embedding record to `.mdkb/hook-slow.jsonl` (best-effort,
+/// size-rotated via [`crate::mcp::dispatch::append_hook_log`]).
+fn log_slow_embed(mdkb_dir: &Path, doc_path: &str, elapsed_ms: u64) {
+    let ts = chrono::Utc::now().timestamp();
+    let mut line = serde_json::json!({
+        "ts": ts,
+        "event": "embed",
+        "doc": doc_path,
+        "elapsed_ms": elapsed_ms,
+    })
+    .to_string();
+    line.push('\n');
+    crate::mcp::dispatch::append_hook_log(&mdkb_dir.join("hook-slow.jsonl"), &line);
+}
+
+/// Generate embeddings for documents that don't have them (the `has_embedding`
+/// gate is the hash gate: content changes invalidate the old embedding, so only
+/// new/changed docs are re-embedded; unchanged docs are skipped).
+///
+/// `collection = Some(name)` embeds only that collection — the explicit path for
+/// large transcript collections. `None` embeds every collection except
+/// `claude_sessions` (unless `[search] auto_embed_sessions`).
+///
+/// Uses batch content retrieval to avoid N+1 queries and the cached model to
+/// avoid 2-5 second load time per request. Per-doc timing over 1s is logged to
+/// `hook-slow.jsonl`.
+pub fn handle_embed(ctx: &Context, collection: Option<&str>) -> Result<EmbedResult> {
     let mut result = EmbedResult::default();
 
     // Use cached service to avoid reloading
     let service = crate::llm::get_cached_service()?;
 
-    // Load chunking config once
-    let chunking_config = crate::config::Config::load_or_default(&ctx.config_path).chunking;
+    // Load config once (chunking + session-embed policy)
+    let config = crate::config::Config::load_or_default(&ctx.config_path);
+    let chunking_config = config.chunking.clone();
+    let include_sessions = config.search.auto_embed_sessions;
+    let mdkb_dir = ctx.db_path.parent().map(|p| p.to_path_buf());
 
     // Get all documents
     let all_collections = collections::list_collections(&ctx.conn)?;
 
+    // Which docs already have an embedding — fetched once as a set instead of one
+    // `has_embedding` query per document (PERF-1: this path runs on every flush).
+    let embedded_ids = vectors::embedded_document_ids(&ctx.conn)?;
+
     for coll in &all_collections {
+        if !should_embed_collection(&coll.name, collection, include_sessions) {
+            continue;
+        }
         let docs = documents::list_documents(&ctx.conn, &coll.name)?;
 
         // Filter to docs that need embedding
         let mut docs_needing_embedding = Vec::new();
         for doc in docs {
-            if vectors::has_embedding(&ctx.conn, doc.id)? {
+            if embedded_ids.contains(&doc.id) {
                 result.skipped += 1;
             } else {
                 docs_needing_embedding.push(doc);
@@ -1132,6 +1268,8 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
                 result.errors.push(format!("No content for doc {}", doc.id));
                 continue;
             };
+
+            let embed_start = std::time::Instant::now();
 
             // Split into chunks using configured strategy
             let chunks = crate::store::chunks::split(content, &chunking_config);
@@ -1178,6 +1316,13 @@ pub fn handle_embed(ctx: &Context) -> Result<EmbedResult> {
                             e
                         ));
                     }
+                }
+            }
+
+            let elapsed_ms = embed_start.elapsed().as_millis() as u64;
+            if elapsed_ms > EMBED_SLOW_MS {
+                if let Some(dir) = &mdkb_dir {
+                    log_slow_embed(dir, &doc.relative_path, elapsed_ms);
                 }
             }
         }
@@ -1292,6 +1437,103 @@ fn save_entry_to_disk(ctx: &Context, entry: &MemoryEntry) -> Result<()> {
     Ok(())
 }
 
+/// Outcome of [`sync_memory_files`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MemorySyncSummary {
+    /// Entries that had no markdown file and were backfilled (DB → file).
+    pub projected: usize,
+    /// Entries whose (previously-projected) file was manually deleted and were
+    /// therefore archived (file deletion → DB archive).
+    pub archived: usize,
+    /// Archival candidates NOT archived because too many projected files vanished
+    /// at once (suspected bulk loss — git checkout/clean, backup restore — rather
+    /// than deliberate per-entry deletion). See [`MEMORY_SYNC_BULK_ARCHIVE_CAP`].
+    pub archive_skipped: usize,
+}
+
+/// Maximum entries `sync_memory_files` will archive in a single pass. Above this,
+/// a vanished *set* of projected files is far more consistent with directory loss
+/// (a `git checkout`/`stash`/`clean`, a partial restore, a mount blip) than with a
+/// human deliberately deleting that many entries by hand — so we refuse to archive
+/// and warn loudly instead of silently retiring a large slice of the memory corpus
+/// (DATA-2). A human who really wants a bulk prune can re-run; nothing is lost by
+/// waiting, everything is lost by archiving a corpus that's about to reappear.
+const MEMORY_SYNC_BULK_ARCHIVE_CAP: usize = 10;
+
+/// Reconcile the markdown projection with the DB, which is the source of truth.
+///
+/// Single documented direction: **DB → files**. Every active entry gets a
+/// markdown file (backfilling the DB-only entries that MCP writes never
+/// persisted), so a rebuild-from-files can never silently drop them. The one
+/// file → DB signal honored is deletion: a *previously-projected* entry whose
+/// file a human has since removed is archived (they asked for it gone). An entry
+/// that was never projected is backfilled, never archived — that distinction is
+/// what `projected_at` records.
+pub fn sync_memory_files(ctx: &Context) -> Result<MemorySyncSummary> {
+    let entries_dir = ctx.memory_dir().join("entries");
+    std::fs::create_dir_all(&entries_dir)?;
+
+    let now = chrono::Utc::now().timestamp();
+    let mut summary = MemorySyncSummary::default();
+
+    // Classify first, mutate second: the archival candidates (previously-projected
+    // entries whose file is now gone) must be counted as a *set* before any are
+    // archived, so the bulk circuit breaker below can veto them all at once.
+    let mut to_project: Vec<String> = Vec::new();
+    let mut to_mark: Vec<String> = Vec::new();
+    let mut to_archive: Vec<String> = Vec::new();
+
+    for (id, projected_at) in memory::list_active_projection_state(&ctx.conn)? {
+        let file = entries_dir.join(format!("{id}.md"));
+        match (file.exists(), projected_at) {
+            // File exists but we hadn't recorded the projection (the 12 legacy
+            // file-backed entries) — mark it, don't rewrite.
+            (true, None) => to_mark.push(id),
+            (true, Some(_)) => {} // already projected and present — nothing to do
+            // Never projected (DB-only) → backfill the markdown file.
+            (false, None) => to_project.push(id),
+            // Was projected, file now gone → archival candidate (subject to the cap).
+            (false, Some(_)) => to_archive.push(id),
+        }
+    }
+
+    // DATA-2 guard: refuse to archive a large batch in one pass. A vanished set of
+    // projected files is almost always directory loss, not intent — and archiving
+    // the whole corpus silently (the count isn't even shown in the default update
+    // output) is exactly the failure this rail prevents.
+    if to_archive.len() > MEMORY_SYNC_BULK_ARCHIVE_CAP {
+        tracing::warn!(
+            "memory sync: {} projected entry files are missing at once (> cap {}) — \
+             suspected bulk loss (git checkout/clean, backup restore), NOT archiving. \
+             Restore .mdkb/memory/entries/ or re-run `mdkb update` once the files return.",
+            to_archive.len(),
+            MEMORY_SYNC_BULK_ARCHIVE_CAP,
+        );
+        summary.archive_skipped = to_archive.len();
+        to_archive.clear();
+    }
+
+    for id in &to_mark {
+        memory::set_projected_at(&ctx.conn, id, now)?;
+    }
+    for id in &to_project {
+        if let Some(entry) = memory::get_entry_without_tracking(&ctx.conn, id)? {
+            save_entry_to_disk(ctx, &entry)?;
+            memory::set_projected_at(&ctx.conn, id, now)?;
+            summary.projected += 1;
+        }
+    }
+    for id in &to_archive {
+        memory::set_status(&ctx.conn, id, EntryStatus::Archived)?;
+        summary.archived += 1;
+    }
+
+    if summary.projected > 0 || summary.archived > 0 {
+        generate_memory_index(ctx)?;
+    }
+    Ok(summary)
+}
+
 /// Move an entry to archive directory.
 fn archive_entry_on_disk(ctx: &Context, id: &str) -> Result<()> {
     let entry_path = ctx.memory_dir().join("entries").join(format!("{}.md", id));
@@ -1304,6 +1546,7 @@ fn archive_entry_on_disk(ctx: &Context, id: &str) -> Result<()> {
 }
 
 /// Handle `mdkb memory add` command.
+#[allow(clippy::too_many_arguments)]
 pub fn handle_memory_add(
     ctx: &Context,
     id: &str,
@@ -1314,9 +1557,17 @@ pub fn handle_memory_add(
     source_path: Option<&str>,
     ttl: Option<u64>,
     due_in: Option<u64>,
+    source_type: Option<&str>,
 ) -> Result<()> {
     let entry_type: EntryType = entry_type
         .parse()
+        .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
+
+    // Parse the explicit source_type (if any); default applied at insert only so
+    // a defaulted re-write never silently downgrades an official_docs entry.
+    let parsed_source_type: Option<memory::SourceType> = source_type
+        .map(|s| s.parse())
+        .transpose()
         .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
 
     let tags: Vec<String> = tags
@@ -1351,7 +1602,7 @@ pub fn handle_memory_add(
         source_path: source_path.map(String::from),
         confirmations: 0,
         last_confirmed_at: None,
-        source_type: memory::SourceType::UserStatement,
+        source_type: parsed_source_type.unwrap_or_default(),
         expires_at,
         due_at,
     };
@@ -1377,6 +1628,11 @@ pub fn handle_memory_add(
         if due_in.is_some() {
             existing.due_at = entry.due_at;
         }
+        // Only override provenance when the caller explicitly passed --source-type;
+        // a defaulted re-write preserves the existing trust level.
+        if let Some(st) = parsed_source_type {
+            existing.source_type = st;
+        }
         existing.updated_at = now;
         memory::update_entry(&ctx.conn, &existing)?;
         existing
@@ -1393,12 +1649,57 @@ pub fn handle_memory_add(
         tracing::warn!("Failed to regenerate memory index: {e}");
     }
 
+    // Embed (or re-embed) so CLI/bridge writes are searchable by vector like the
+    // MCP path. A cold model or embed failure leaves the entry pending — never
+    // fails the write — and `mdkb update` backfills it (count in `mdkb stats`).
+    // Gated by `[search] auto_embed_memory` (default on): off skips the ONNX call
+    // entirely, leaving the entry pending for backfill (TEST-1 hermetic switch).
+    if crate::config::Config::load_or_default(&ctx.config_path)
+        .search
+        .auto_embed_memory
+    {
+        if let Err(e) = memory::embed_entry(&ctx.conn, id, &persisted.title, &persisted.content) {
+            tracing::warn!("Failed to store embedding for '{id}': {e}");
+        }
+    }
+
     Ok(())
 }
 
 /// Handle `mdkb memory show` command.
 pub fn handle_memory_show(ctx: &Context, id: &str) -> Result<Option<MemoryEntry>> {
     memory::get_entry(&ctx.conn, id)
+}
+
+/// Outcome of a `mdkb memory confirm` command.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConfirmResult {
+    pub id: String,
+    pub outcome: String,
+    /// Confirmation count after applying the signal.
+    pub confirmations: u32,
+    pub message: String,
+}
+
+/// Handle `mdkb memory confirm <id> --outcome confirmed|refuted`.
+///
+/// Runs fully in-process against the local DB — no daemon required — so the
+/// confirm loop is reachable on every transport (this is what the UPS recall
+/// nudge points at). Confirmations live in the DB (source of truth for the
+/// confidence signal); the markdown projection is refreshed on the next write.
+pub fn handle_memory_confirm(ctx: &Context, id: &str, outcome: &str) -> Result<ConfirmResult> {
+    let delta = memory::outcome_to_delta(outcome)?;
+    let message = memory::confirm_entry(&ctx.conn, id, delta)?;
+    // Re-read the persisted count so JSON callers get the exact new value.
+    let confirmations = memory::get_entry_without_tracking(&ctx.conn, id)?
+        .map(|e| e.confirmations)
+        .unwrap_or(0);
+    Ok(ConfirmResult {
+        id: id.to_string(),
+        outcome: outcome.to_string(),
+        confirmations,
+        message,
+    })
 }
 
 /// Handle `mdkb memory link` command: add a typed graph edge from an existing
@@ -1722,9 +2023,22 @@ pub fn handle_memory_import_dir(
             Ok(())
         })?;
 
+        // Gated by `[search] auto_embed_memory` (default on); loaded once, not per entry.
+        let embed = crate::config::Config::load_or_default(&ctx.config_path)
+            .search
+            .auto_embed_memory;
         for entry in &entries_to_insert {
             if let Err(e) = save_entry_to_disk(ctx, entry) {
                 tracing::warn!("Failed to save imported entry {} to disk: {e}", entry.id);
+            }
+            // Embed so imported entries are vector-searchable; a cold model
+            // leaves them pending for `mdkb update` backfill (never fatal).
+            if embed {
+                if let Err(e) =
+                    memory::embed_entry(&ctx.conn, &entry.id, &entry.title, &entry.content)
+                {
+                    tracing::warn!("Failed to embed imported entry {}: {e}", entry.id);
+                }
             }
             result.imported += 1;
         }
@@ -1844,9 +2158,22 @@ pub fn handle_memory_import(
             Ok(())
         })?;
 
+        // Gated by `[search] auto_embed_memory` (default on); loaded once, not per entry.
+        let embed = crate::config::Config::load_or_default(&ctx.config_path)
+            .search
+            .auto_embed_memory;
         for entry in &entries_to_insert {
             if let Err(e) = save_entry_to_disk(ctx, entry) {
                 tracing::warn!("Failed to save imported entry {} to disk: {e}", entry.id);
+            }
+            // Embed so imported entries are vector-searchable; a cold model
+            // leaves them pending for `mdkb update` backfill (never fatal).
+            if embed {
+                if let Err(e) =
+                    memory::embed_entry(&ctx.conn, &entry.id, &entry.title, &entry.content)
+                {
+                    tracing::warn!("Failed to embed imported entry {}: {e}", entry.id);
+                }
             }
             result.imported += 1;
         }
@@ -2636,6 +2963,100 @@ mod tests {
         tempfile::tempdir().expect("failed to create temp dir")
     }
 
+    // ==================== Memory confirm ====================
+
+    fn confirm_test_ctx() -> (TempDir, Context) {
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init");
+        let ctx = Context::open(temp.path()).expect("open");
+        handle_memory_add(
+            &ctx, "c1", "Title", "topic", None, "content", None, None, None, None,
+        )
+        .expect("add");
+        (temp, ctx)
+    }
+
+    #[test]
+    fn confirm_increments_and_reports_count() {
+        let (_t, ctx) = confirm_test_ctx();
+        let r = handle_memory_confirm(&ctx, "c1", "confirmed").expect("confirm");
+        assert_eq!(r.confirmations, 1);
+        assert!(r.message.contains("Confirmed"));
+        let r2 = handle_memory_confirm(&ctx, "c1", "confirmed").expect("confirm2");
+        assert_eq!(r2.confirmations, 2, "double confirm accumulates");
+    }
+
+    #[test]
+    fn confirm_refuted_floors_at_zero() {
+        let (_t, ctx) = confirm_test_ctx();
+        let r = handle_memory_confirm(&ctx, "c1", "refuted").expect("refute");
+        assert_eq!(r.confirmations, 0, "refute below zero floors at 0");
+    }
+
+    #[test]
+    fn confirm_unknown_id_errors_cleanly() {
+        let (_t, ctx) = confirm_test_ctx();
+        let err = handle_memory_confirm(&ctx, "ghost", "confirmed").expect_err("unknown id");
+        assert!(err.to_string().contains("ghost"), "{err}");
+    }
+
+    #[test]
+    fn confirm_invalid_outcome_rejected() {
+        let (_t, ctx) = confirm_test_ctx();
+        let err = handle_memory_confirm(&ctx, "c1", "sideways").expect_err("bad outcome");
+        assert!(err.to_string().contains("outcome"), "{err}");
+    }
+
+    // ==================== Embed scoping ====================
+
+    #[test]
+    fn embed_scope_default_excludes_sessions() {
+        // filter=None, include_sessions=false → docs yes, claude_sessions no.
+        assert!(should_embed_collection("docs", None, false));
+        assert!(should_embed_collection("plans", None, false));
+        assert!(!should_embed_collection("claude_sessions", None, false));
+    }
+
+    #[test]
+    fn embed_scope_include_sessions_covers_all() {
+        assert!(should_embed_collection("docs", None, true));
+        assert!(should_embed_collection("claude_sessions", None, true));
+    }
+
+    #[test]
+    fn log_slow_embed_writes_record_to_hook_slow() {
+        let dir = setup_temp_dir();
+        log_slow_embed(dir.path(), "docs/big.md", 1500);
+        let raw = std::fs::read_to_string(dir.path().join("hook-slow.jsonl"))
+            .expect("hook-slow.jsonl written");
+        let v: serde_json::Value = serde_json::from_str(raw.trim()).expect("valid json line");
+        assert_eq!(v["event"], "embed");
+        assert_eq!(v["doc"], "docs/big.md");
+        assert_eq!(v["elapsed_ms"], 1500);
+        assert!(v["ts"].as_i64().is_some(), "ts recorded for stats cutoff");
+    }
+
+    #[test]
+    fn embed_scope_explicit_filter_targets_one_collection() {
+        // Explicit --collection embeds exactly that one, sessions included.
+        assert!(should_embed_collection(
+            "claude_sessions",
+            Some("claude_sessions"),
+            false
+        ));
+        assert!(!should_embed_collection(
+            "docs",
+            Some("claude_sessions"),
+            false
+        ));
+        assert!(should_embed_collection("docs", Some("docs"), false));
+        assert!(!should_embed_collection(
+            "claude_sessions",
+            Some("docs"),
+            false
+        ));
+    }
+
     // ==================== Init Tests ====================
 
     #[test]
@@ -2678,6 +3099,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("add memory should succeed");
 
@@ -2713,6 +3135,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect_err("mechanical tool-chain prior must be rejected");
         assert!(
@@ -2731,6 +3154,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("non-prior entry must not be rejected");
     }
@@ -2743,7 +3167,7 @@ mod tests {
 
         for id in ["a", "b"] {
             handle_memory_add(
-                &ctx, id, "Title", "topic", None, "content", None, None, None,
+                &ctx, id, "Title", "topic", None, "content", None, None, None, None,
             )
             .expect("add should succeed");
         }
@@ -2765,7 +3189,7 @@ mod tests {
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         handle_memory_add(
-            &ctx, "a", "Title", "topic", None, "content", None, None, None,
+            &ctx, "a", "Title", "topic", None, "content", None, None, None, None,
         )
         .expect("add should succeed");
 
@@ -2800,7 +3224,7 @@ mod tests {
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         handle_memory_add(
-            &ctx, "a", "Title", "topic", None, "content", None, None, None,
+            &ctx, "a", "Title", "topic", None, "content", None, None, None, None,
         )
         .expect("add should succeed");
 
@@ -2818,7 +3242,7 @@ mod tests {
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
         handle_memory_add(
-            &ctx, "a", "Title", "topic", None, "content", None, None, None,
+            &ctx, "a", "Title", "topic", None, "content", None, None, None, None,
         )
         .expect("add should succeed");
 
@@ -2849,6 +3273,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .expect("first write should succeed");
 
@@ -2860,6 +3285,7 @@ mod tests {
             "decision",
             Some("a,b"),
             "updated content",
+            None,
             None,
             None,
             None,
@@ -2893,6 +3319,7 @@ mod tests {
             "topic",
             None,
             "Content",
+            None,
             None,
             None,
             None,
@@ -4414,7 +4841,7 @@ mod tests {
 
         // Add an entry first
         handle_memory_add(
-            &ctx, "existing", "Existing", "topic", None, "Content", None, None, None,
+            &ctx, "existing", "Existing", "topic", None, "Content", None, None, None, None,
         )
         .unwrap();
 
@@ -4437,7 +4864,7 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
 
         handle_memory_add(
-            &ctx, "existing", "Existing", "topic", None, "Content", None, None, None,
+            &ctx, "existing", "Existing", "topic", None, "Content", None, None, None, None,
         )
         .unwrap();
 
@@ -4879,6 +5306,11 @@ pub fn handle_session_index(
 
     documents::begin_transaction(&ctx.conn)?;
 
+    // Relative paths still produced by live transcript files this pass. Any
+    // previously-indexed session doc NOT in this set has lost its source and is
+    // archived below.
+    let mut present_paths: HashSet<String> = HashSet::new();
+
     for entry in &entries {
         let path = entry.path();
         let file_name = match path.file_name().and_then(|n| n.to_str()) {
@@ -4904,6 +5336,7 @@ pub fn handle_session_index(
         };
 
         for sdoc in &session_docs {
+            present_paths.insert(sdoc.relative_path.clone());
             let existing = existing_docs.get(&sdoc.relative_path);
 
             // Content-hash dedup (NOT file mtime). A transcript is append-only, so
@@ -4943,9 +5376,141 @@ pub fn handle_session_index(
         }
     }
 
+    // Archive session docs whose source jsonl is gone (deleted/rotated). Kept
+    // searchable via explicit --collection claude_sessions; never hard-deleted
+    // here (see `mdkb compact --prune-sessions`).
+    result.sessions_archived = documents::archive_missing_sessions(&ctx.conn, &present_paths)?;
+
     documents::commit_transaction(&ctx.conn)?;
 
     Ok(result)
+}
+
+/// Parse a retention duration like `90d`, `12h`, or `2w` into seconds.
+pub fn parse_retention_secs(s: &str) -> Result<i64> {
+    let s = s.trim();
+    let split = s.find(|c: char| c.is_alphabetic()).ok_or_else(|| {
+        Error::other(format!(
+            "Invalid duration '{s}': expected <N><unit> like 90d"
+        ))
+    })?;
+    let (num, unit) = s.split_at(split);
+    let n: i64 = num
+        .trim()
+        .parse()
+        .map_err(|_| Error::other(format!("Invalid duration number in '{s}'")))?;
+    if n < 0 {
+        return Err(Error::other(format!(
+            "Duration must be non-negative: '{s}'"
+        )));
+    }
+    let mult = match unit.trim() {
+        "d" => 86_400,
+        "h" => 3_600,
+        "w" => 604_800,
+        other => {
+            return Err(Error::other(format!(
+                "Invalid duration unit '{other}' in '{s}': use d, h, or w"
+            )));
+        }
+    };
+    // Checked: a fat-fingered oversized value (extra digits) must NOT wrap to a
+    // small/negative number in release builds — that would corrupt the prune
+    // cutoff and make a destructive `--prune-sessions` delete far more than
+    // intended (SEC-1).
+    n.checked_mul(mult).ok_or_else(|| {
+        Error::other(format!(
+            "Duration '{s}' is too large (overflows). Use a smaller value."
+        ))
+    })
+}
+
+/// Outcome of a `mdkb compact --prune-sessions` run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PruneSessionsSummary {
+    pub pruned: usize,
+    pub exported: usize,
+    pub export_dir: Option<String>,
+}
+
+/// Hard-delete archived session documents whose `indexed_at <= cutoff_ts`.
+///
+/// When `export_dir` is set, each transcript is written as markdown BEFORE it
+/// is deleted, so mdkb never silently drops the only remaining copy. Only
+/// `archived` sessions (source jsonl already gone) are eligible — current
+/// transcripts are untouched.
+pub fn handle_prune_sessions(
+    ctx: &Context,
+    cutoff_ts: i64,
+    export_dir: Option<&Path>,
+) -> Result<PruneSessionsSummary> {
+    let candidates = documents::list_prunable_sessions(&ctx.conn, cutoff_ts)?;
+    let mut summary = PruneSessionsSummary {
+        pruned: 0,
+        exported: 0,
+        export_dir: export_dir.map(|p| p.display().to_string()),
+    };
+
+    if let Some(dir) = export_dir {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            Error::from(ErrorKind::Io {
+                path: dir.to_path_buf(),
+                operation: format!("create export dir: {e}"),
+            })
+        })?;
+    }
+
+    let hashes: Vec<&str> = candidates.iter().map(|c| c.hash.as_str()).collect();
+    let content_map = documents::get_content_batch(&ctx.conn, &hashes)?;
+
+    for c in &candidates {
+        // Export first — a delete before a successful write would lose the only
+        // copy. If `--export` is requested but the content body is missing, SKIP
+        // the delete (leave the candidate for a future run) rather than silently
+        // destroying an unexported transcript (DATA-1).
+        if let Some(dir) = export_dir {
+            let Some(body) = content_map.get(&c.hash) else {
+                tracing::warn!(
+                    "prune-sessions: content missing for '{}' (id {}) — skipping delete \
+                     to avoid destroying the only copy",
+                    c.relative_path,
+                    c.id
+                );
+                continue;
+            };
+            let safe: String = c
+                .relative_path
+                .chars()
+                .map(|ch| {
+                    if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            // Collision-proof: the lossy sanitizer above collapses distinct paths
+            // (`a/b.md`, `a_b.md`, `a:b.md`) to the same stem. Suffix with the unique
+            // document id (plus a hash prefix for human legibility) so two candidates
+            // can never overwrite each other's export — another silent-loss path.
+            let hash8 = c.hash.get(..8).unwrap_or(c.hash.as_str());
+            let fname = format!("{safe}-{}-{hash8}.md", c.id);
+            let path = dir.join(&fname);
+            let title = c.title.clone().unwrap_or_else(|| c.relative_path.clone());
+            let md = format!("# {title}\n\n{body}\n");
+            std::fs::write(&path, md).map_err(|e| {
+                Error::from(ErrorKind::Io {
+                    path: path.clone(),
+                    operation: format!("write export: {e}"),
+                })
+            })?;
+            summary.exported += 1;
+        }
+        if documents::delete_document(&ctx.conn, c.id)? {
+            summary.pruned += 1;
+        }
+    }
+    Ok(summary)
 }
 
 // ---------------------------------------------------------------------------

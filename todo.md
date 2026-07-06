@@ -158,3 +158,71 @@ Deferred:
   and `<system-reminder>`/`<local-command-*>` wrappers embedded as plain text inside user blocks
   are still indexed (a small `extract_text` strip pass would remove them) — Boss judged this low
   priority.
+
+## From mdkb×wiz synergy-audit implementation (stories 039-044, 2026-07-06)
+
+High-value/low-risk fixes shipped inline across these stories. Observations deferred:
+
+- **`update_entry` performs a partial-field UPDATE (P2, data-safety).** It writes only
+  title/content/entry_type/tags/status/superseded_by/expires_at/due_at/source_type (source_type
+  added in story 040). It silently omits `source_path`, `confirmations`, `last_confirmed_at`,
+  `access_count`, `last_accessed`. Those are intentionally owned by other paths (confirm_entry,
+  access tracking), so today it's safe-by-omission — but it's a footgun: any caller that reads an
+  entry, mutates one field, and calls `update_entry` expecting a full write would silently drop the
+  omitted columns. Proposed: split into `update_entry_content` (the current surgical set) vs a
+  full-row `upsert`, or document the contract loudly. Complexity S. Priority P2.
+- **CLI top-level errors render as verbose Debug (P3, DX).** `mdkb memory confirm ghost ...` prints
+  `Error { kind: InvalidQuery("Memory entry not found: ghost"), backtrace: <disabled> }` instead of
+  a clean one-line message. This is the `main()` error path (`{:?}` on the top-level error), affecting
+  every command. A `Display` impl or a `main` that formats `err` with `{}` would fix it globally.
+  Complexity S. Priority P3.
+- **`memory confirm` (and MCP `memory_confirm`) update the DB but not the on-disk `.md` projection
+  (P3, consistency).** Confirmations/last_confirmed_at live only in the DB after a confirm; the
+  markdown file's frontmatter goes stale until the next full write. DB is the source of truth for the
+  confidence signal so search/warmup are correct, but the file drifts. Story 048 (memory storage
+  reconciliation: DB source of truth, files projection) is the proper home for this. Complexity M. P3.
+
+- **One-shot CLI hook invocations spawn a file watcher (P2, waste + surprising I/O).**
+  `RepoRegistry::get_or_open` unconditionally calls `spawn_watcher_for_handle`, even from
+  `run_hook_in_process` (MDKB_NO_DAEMON=1), where the process exits milliseconds later. The watcher
+  is pointless there and can race to bootstrap `code.sqlite` if given enough wall-clock time (this
+  surfaced during story 045 as a hook creating the code index; worked around by not forcing a DB open
+  on the hook path). Proper fix: thread a `spawn_watcher: bool` (or `one_shot`) flag through
+  `get_or_open` so one-shot CLI paths skip the watcher entirely. Complexity M. Priority P2.
+
+- **`[models].inactivity_timeout_secs` is also dead (P3, cleanup).** After story 046 removed the
+  dead `embedding_repo`/`embedding_file` keys, `inactivity_timeout_secs` is the sole remaining
+  `[models]` field and has zero readers (model unload-on-idle was never wired; `release_cached_service`
+  is called explicitly, not on a timer). Either wire it to an actual idle-unload timer or drop the
+  whole `[models]` section. Left in place because removing the last field / the section is a broader
+  behavior change than story 046 scoped. Complexity S. Priority P3.
+
+## From mdkb-indexing-automation plan (stories 050-054, 2026-07-06)
+
+- **Clippy debt: 349 pre-existing warnings on committed `main` (P3, maintainability).**
+  Problem: `cargo clippy --lib --tests` on committed HEAD (524c84a) reports 349 warnings (e.g.
+  `let...else` candidates, unnested or-patterns, unreadable literals, `unused async for function
+  with no await` on `hook_post_tool_use_impl`). Measured, not assumed (via a `git worktree` at
+  HEAD). None are from the indexing-automation work (all new code verified clippy-clean per
+  line-range), but the baseline noise makes it impossible to enforce "clippy clean" as a CI gate.
+  Proposed: a dedicated clippy-cleanup pass (`cargo clippy --fix` for the mechanical ones, manual
+  for the rest), then wire `-D warnings` into CI. Benefit: real lints stop hiding in the noise; the
+  plan-checklist "clippy clean" item becomes truthfully enforceable. Trade-off: a large, mostly
+  mechanical diff that touches many files (review churn). Complexity M. Priority P3.
+
+- **Watcher spawn threads 9-10 positional params (P3, code-org).** `run_file_watcher` /
+  `run_file_watcher_inner` (src/mcp/server.rs) now carry `#[allow(clippy::too_many_arguments)]`
+  (matching the repo pattern; the inner fn was already 9/7 before this plan). Proposed: bundle the
+  code-watch tunables (`code_enabled`, `code_ignore_patterns`, `respect_gitignore`, `debounce_ms`,
+  `batch_idle_ms`) into a small `CodeWatchConfig` struct threaded through
+  `spawn_watcher_for_handle`. Benefit: drops the arg count under the lint threshold, removes both
+  `#[allow]`s, one cohesive type. Trade-off: touches registry + server + 3 test call sites. Left out
+  of story 053 as scope creep (the story was about config-driving two values, not restructuring the
+  watcher signature). Complexity S. Priority P3.
+
+- **Umbrella-store host cleanup still pending Boss (P3, hygiene).** Story 054's two [MANUAL] criteria
+  were rejected (destructive, outside the project working dir). All three stores confirmed present:
+  `~/Gits/.mdkb`, `~/Gits/LS/.mdkb`, `~/Gits/CC_Playground/.mdkb`. Story 052's nested-`.mdkb` prune
+  already stops them re-indexing sub-repos, so this is optional hygiene. To retire non-destructively:
+  `printf '' > ~/Gits/.mdkb/.mdkbignore-hooks` (per store); or remove: `rm -rf ~/Gits/.mdkb
+  ~/Gits/LS/.mdkb ~/Gits/CC_Playground/.mdkb`. Complexity S (manual). Priority P3.

@@ -18,7 +18,8 @@ pub fn init_stats_schema(conn: &Connection) -> Result<()> {
             ended_at INTEGER,
             total_calls INTEGER DEFAULT 0,
             total_tokens INTEGER DEFAULT 0,
-            truncation_count INTEGER DEFAULT 0
+            truncation_count INTEGER DEFAULT 0,
+            agent TEXT
         );
 
         -- Per-tool usage within a session
@@ -65,6 +66,10 @@ pub fn init_stats_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_query_events_hash ON query_events(query_hash);
         CREATE INDEX IF NOT EXISTS idx_query_events_type ON query_events(search_type);
         CREATE INDEX IF NOT EXISTS idx_query_events_session ON query_events(session_id);
+        -- `find_or_create_agent_session` runs on every hook dispatch and looks up
+        -- by `agent`; without this the query full-scans `sessions` on the hottest
+        -- path (PERF-2). Partial: most rows have agent = NULL (interactive sessions).
+        CREATE INDEX IF NOT EXISTS idx_sessions_agent ON sessions(agent) WHERE agent IS NOT NULL;
         "#,
     )?;
     Ok(())
@@ -96,6 +101,31 @@ pub fn create_session(conn: &Connection) -> Result<i64> {
     conn.execute(
         "INSERT INTO sessions (started_at) VALUES (?1)",
         params![now],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Find the reserved pseudo-session for `agent`, creating it on first use.
+///
+/// Hook traffic has no MCP session, so without this its call stats would be
+/// dropped (the `session_id == 0` guard). Attributing it to a stable
+/// `agent`-labelled session keeps the counts (never content) in `call_log`.
+pub fn find_or_create_agent_session(conn: &Connection, agent: &str) -> Result<i64> {
+    use rusqlite::OptionalExtension;
+    if let Some(id) = conn
+        .query_row(
+            "SELECT id FROM sessions WHERE agent = ?1 ORDER BY id LIMIT 1",
+            params![agent],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+    {
+        return Ok(id);
+    }
+    let now = chrono::Utc::now().timestamp();
+    conn.execute(
+        "INSERT INTO sessions (started_at, agent) VALUES (?1, ?2)",
+        params![now, agent],
     )?;
     Ok(conn.last_insert_rowid())
 }
@@ -379,14 +409,16 @@ pub fn hash_query(query: &str) -> String {
 pub fn record_query_event(conn: &Connection, event: &QueryEvent) -> Result<i64> {
     let now = chrono::Utc::now().timestamp();
 
+    // Privacy: query_text is NEVER persisted (queries can contain secrets/pasted
+    // code). Only the hash + aggregate metrics are stored. The column is kept for
+    // schema stability and always written empty, regardless of `event.query_text`.
     conn.execute(
         r#"
         INSERT INTO query_events (query_hash, query_text, search_type, result_count, latency_ms, top_score, session_id, created_at)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        VALUES (?1, '', ?2, ?3, ?4, ?5, ?6, ?7)
         "#,
         params![
             event.query_hash,
-            event.query_text,
             event.search_type,
             event.result_count,
             event.latency_ms,

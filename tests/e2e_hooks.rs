@@ -65,6 +65,7 @@ fn hooks_e2e_warmup_recall_and_reindex() {
         None,
         None,
         None,
+        None,
     )
     .expect("seed memory");
     drop(ctx);
@@ -161,6 +162,7 @@ fn hooks_e2e_respects_mdkbignore_marker() {
         "topic",
         None,
         "this should not surface because the project opted out of hooks",
+        None,
         None,
         None,
         None,

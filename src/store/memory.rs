@@ -423,6 +423,20 @@ pub fn get_provenance(conn: &Connection, id: &str) -> Result<(Option<String>, Op
 /// Increments confirmations counter, updates last_confirmed_at.
 /// Auto-restores archived entries to active (strong relevance signal).
 /// Returns error if entry is superseded.
+/// Map a confirmation outcome string to a Bayesian delta.
+/// `"confirmed"` → +1, `"refuted"` → -1 (floor 0). Any other value errors.
+/// Shared by the MCP `memory_confirm` tool and the CLI `memory confirm` command.
+pub fn outcome_to_delta(outcome: &str) -> Result<i32> {
+    match outcome {
+        "confirmed" => Ok(1),
+        "refuted" => Ok(-1),
+        other => Err(ErrorKind::InvalidQuery(format!(
+            "Invalid outcome '{other}'. Expected \"confirmed\" or \"refuted\"."
+        ))
+        .into()),
+    }
+}
+
 pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> {
     let entry = get_entry_without_tracking(conn, id)?
         .ok_or_else(|| ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")))?;
@@ -527,8 +541,8 @@ pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
 
     conn.execute(
         "UPDATE memory_entries
-         SET title = ?1, content = ?2, entry_type = ?3, tags = ?4, status = ?5, updated_at = ?6, superseded_by = ?7, expires_at = ?8, due_at = ?9
-         WHERE id = ?10",
+         SET title = ?1, content = ?2, entry_type = ?3, tags = ?4, status = ?5, updated_at = ?6, superseded_by = ?7, expires_at = ?8, due_at = ?9, source_type = ?10
+         WHERE id = ?11",
         params![
             entry.title,
             entry.content,
@@ -539,6 +553,7 @@ pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
             entry.superseded_by,
             entry.expires_at,
             entry.due_at,
+            entry.source_type.to_string(),
             entry.id,
         ],
     )?;
@@ -1117,8 +1132,182 @@ pub fn get_rowid(conn: &Connection, id: &str) -> Result<Option<i64>> {
     Ok(rowid)
 }
 
+/// Embed one entry's `title + content` and store its vector, so CLI/bridge
+/// writes are vector-searchable exactly like the MCP path.
+///
+/// Returns `Ok(true)` when embedded, `Ok(false)` when the model is unavailable
+/// (cold start) or the entry vanished — the entry is then left for
+/// [`backfill_memory_embeddings`]. Only a storage failure *after* a successful
+/// embed propagates as `Err`, so callers can log-and-continue without failing
+/// the underlying write.
+pub fn embed_entry(conn: &Connection, id: &str, title: &str, content: &str) -> Result<bool> {
+    let Some(rowid) = get_rowid(conn, id)? else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        embed_entry_by_rowid(conn, rowid, title, content)?,
+        EmbedOutcome::Embedded
+    ))
+}
+
+/// Result of one embed attempt. Lets the backfill loop tell a cold model (stop,
+/// retry the whole batch later) apart from a single bad row (skip it, keep going)
+/// so one poison-pill entry can't permanently starve every higher-rowid entry
+/// (BUG-1).
+enum EmbedOutcome {
+    Embedded,
+    /// The embedding service is unavailable (cold start, poisoned lock, missing
+    /// model asset) — nothing was embedded; the whole batch should stop and retry.
+    ModelUnavailable,
+    /// The model is up but this specific row failed to embed (e.g. pathological
+    /// content) — skip it and continue with the rest.
+    RowFailed,
+}
+
+/// Row-addressed embed used by both [`embed_entry`] and the backfill loop.
+fn embed_entry_by_rowid(
+    conn: &Connection,
+    rowid: i64,
+    title: &str,
+    content: &str,
+) -> Result<EmbedOutcome> {
+    let svc = match crate::llm::get_cached_service() {
+        Ok(svc) => svc,
+        Err(e) => {
+            // Cold model, poisoned lock, or missing asset — leave pending, retry
+            // later. Log so a persistent (non-transient) failure is diagnosable
+            // rather than an invisible stuck `pending_embeddings` count (FAIL-1).
+            tracing::debug!("embed: service unavailable for memory rowid {rowid}: {e}");
+            return Ok(EmbedOutcome::ModelUnavailable);
+        }
+    };
+    let text = format!("{title} {content}");
+    let embedding = match svc.embed_query(&text) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!("embed_query failed for memory rowid {rowid}: {e}");
+            return Ok(EmbedOutcome::RowFailed);
+        }
+    };
+    crate::store::vectors::store_memory_embedding(
+        conn,
+        rowid,
+        &embedding,
+        crate::llm::embeddings::MODEL_NAME,
+    )?;
+    Ok(EmbedOutcome::Embedded)
+}
+
+/// `(id, projected_at)` for every active entry — the input to file-projection
+/// sync. `projected_at IS NULL` means the entry has never had a markdown file
+/// written (a DB-only entry to backfill); a set value means the projection
+/// exists (so a now-missing file is a deliberate deletion to archive).
+pub fn list_active_projection_state(conn: &Connection) -> Result<Vec<(String, Option<i64>)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, projected_at FROM memory_entries WHERE status = 'active' ORDER BY id",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
+/// Record that an entry's markdown projection was written at `ts`.
+pub fn set_projected_at(conn: &Connection, id: &str, ts: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE memory_entries SET projected_at = ?1 WHERE id = ?2",
+        params![ts, id],
+    )?;
+    Ok(())
+}
+
+/// Set an entry's lifecycle status (e.g. archive it).
+pub fn set_status(conn: &Connection, id: &str, status: EntryStatus) -> Result<()> {
+    let now = Utc::now().timestamp();
+    conn.execute(
+        "UPDATE memory_entries SET status = ?1, updated_at = ?2 WHERE id = ?3",
+        params![status.to_string(), now, id],
+    )?;
+    Ok(())
+}
+
+/// Count entries missing a stored embedding (pending backfill). Surfaced in
+/// `mdkb stats` so a cold-model write leaves a visible, actionable count rather
+/// than silently degrading hybrid search to BM25.
+pub fn count_pending_embeddings(conn: &Connection) -> Result<usize> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memory_entries e
+         LEFT JOIN memory_embeddings m ON m.memory_rowid = e.rowid
+         WHERE m.memory_rowid IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(count as usize)
+}
+
+/// Embed every entry missing an embedding. Returns the count newly embedded.
+///
+/// Stops only when the model is *unavailable* (cold start) — leaving the
+/// remainder pending for the next `update`. A single row the model can't embed
+/// is skipped (logged), not treated as "model cold", so one poison-pill entry
+/// can't block every higher-rowid entry forever (BUG-1). Such a row is retried
+/// on each pass; that's a bounded, visible cost (a warn line + a nonzero
+/// `pending_embeddings`), not silent starvation.
+pub fn backfill_memory_embeddings(conn: &Connection) -> Result<usize> {
+    let rows: Vec<(i64, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT e.rowid, e.title, e.content FROM memory_entries e
+             LEFT JOIN memory_embeddings m ON m.memory_rowid = e.rowid
+             WHERE m.memory_rowid IS NULL
+             ORDER BY e.rowid",
+        )?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<_, _>>()?
+    };
+
+    drive_backfill(rows, |rowid, title, content| {
+        embed_entry_by_rowid(conn, rowid, title, content)
+    })
+}
+
+/// The backfill loop, factored out from its embed step so the stop/skip decision
+/// is testable without an embedding model: a `RowFailed` is skipped and the loop
+/// continues; only `ModelUnavailable` stops the batch (BUG-1).
+fn drive_backfill(
+    rows: Vec<(i64, String, String)>,
+    mut embed: impl FnMut(i64, &str, &str) -> Result<EmbedOutcome>,
+) -> Result<usize> {
+    let mut embedded = 0usize;
+    for (rowid, title, content) in rows {
+        match embed(rowid, &title, &content)? {
+            EmbedOutcome::Embedded => embedded += 1,
+            EmbedOutcome::RowFailed => continue, // skip poison row, keep going
+            EmbedOutcome::ModelUnavailable => break, // model cold — retry next pass
+        }
+    }
+    Ok(embedded)
+}
+
 /// Max due reminders shown inline before collapsing into a summary line.
 const DUE_REMINDER_CAP: usize = 10;
+
+/// Strip a leading YAML frontmatter fence (`---\n … \n---`) from `content`,
+/// returning the trimmed body. Content without a leading fence is returned
+/// trimmed and unchanged. Handoff entries persist their frontmatter inside the
+/// `content` column, so recall/warmup snippets would otherwise waste their
+/// character budget echoing `session_id:` YAML instead of the actual summary.
+pub fn strip_frontmatter(content: &str) -> &str {
+    let trimmed = content.trim_start();
+    if let Some(rest) = trimmed.strip_prefix("---\n") {
+        if let Some(pos) = rest.find("\n---") {
+            // Skip the closing fence (`\n---`) then any trailing newlines.
+            return rest[pos + 4..].trim_start();
+        }
+    }
+    trimmed
+}
 
 /// Render a single warmup entry into the `[type] id: title #tags` line used by
 /// both the formatted index and the hook body.
@@ -1371,6 +1560,65 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
 mod tests {
     use super::*;
     use crate::store::schema::init_schema;
+
+    #[test]
+    fn backfill_skips_failed_row_but_stops_on_cold_model() {
+        let rows = vec![
+            (1, "a".to_string(), String::new()),
+            (2, "b".to_string(), String::new()),
+            (3, "c".to_string(), String::new()),
+        ];
+
+        // A single row the model can't embed is skipped — the rest still embed.
+        // (This is the BUG-1 regression: previously a RowFailed broke the loop and
+        // starved every higher-rowid entry.)
+        let embedded = drive_backfill(rows.clone(), |rowid, _, _| {
+            Ok(if rowid == 2 {
+                EmbedOutcome::RowFailed
+            } else {
+                EmbedOutcome::Embedded
+            })
+        })
+        .unwrap();
+        assert_eq!(embedded, 2, "poison row skipped, rows 1 and 3 still embedded");
+
+        // A cold model stops the whole batch (leaving the remainder for next pass).
+        let embedded = drive_backfill(rows, |rowid, _, _| {
+            Ok(if rowid == 2 {
+                EmbedOutcome::ModelUnavailable
+            } else {
+                EmbedOutcome::Embedded
+            })
+        })
+        .unwrap();
+        assert_eq!(embedded, 1, "cold model stops after row 1, nothing forced through");
+    }
+
+    #[test]
+    fn strip_frontmatter_removes_leading_yaml_fence() {
+        let content = "---\nsession_id: abc123\ndone: [x]\n---\nActual summary body here.";
+        assert_eq!(strip_frontmatter(content), "Actual summary body here.");
+    }
+
+    #[test]
+    fn strip_frontmatter_passes_through_plain_content() {
+        assert_eq!(strip_frontmatter("just a body"), "just a body");
+        assert_eq!(strip_frontmatter("  leading space"), "leading space");
+    }
+
+    #[test]
+    fn strip_frontmatter_leaves_inline_dashes_alone() {
+        // A `---` not at the very start is not a frontmatter fence.
+        let content = "intro\n---\nmid";
+        assert_eq!(strip_frontmatter(content), "intro\n---\nmid");
+    }
+
+    #[test]
+    fn strip_frontmatter_unterminated_fence_is_left_intact() {
+        // No closing fence → treat as plain content (trimmed).
+        let content = "---\nsession_id: abc\nno closing fence";
+        assert_eq!(strip_frontmatter(content), content);
+    }
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

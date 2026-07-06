@@ -499,6 +499,126 @@ fn read_json_file(path: &Path, cmd: &str) -> Result<serde_json::Value> {
     Ok(v)
 }
 
+/// True when a hook-array `item` is an mdkb registration for `cli_event`.
+///
+/// Two cases: our own `_managedBy: "mdkb"` tag, and legacy untagged installs
+/// (pre-tag) whose command still invokes `mdkb hook <cli_event>`. Foreign hooks
+/// (rtk's `hook claude`, other tools) do not match — the marker is event-specific.
+fn is_mdkb_hook_entry(item: &serde_json::Value, cli_event: &str) -> bool {
+    if item.get("_managedBy").and_then(|v| v.as_str()) == Some("mdkb") {
+        return true;
+    }
+    let event_marker = format!("hook {cli_event}");
+    item.get("hooks")
+        .and_then(|h| h.as_array())
+        .is_some_and(|hooks| {
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(|c| c.contains(&event_marker))
+            })
+        })
+}
+
+/// Count mdkb registrations for one event in a single settings object.
+fn count_mdkb_entries(settings: &serde_json::Value, event_name: &str, cli_event: &str) -> usize {
+    settings
+        .get("hooks")
+        .and_then(|h| h.get(event_name))
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|i| is_mdkb_hook_entry(i, cli_event))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Divergence of on-disk hook registrations from the canonical mdkb set
+/// (exactly one entry per `HOOK_EVENTS` event). Both conditions cause real
+/// misbehavior: `duplicated` events double-fire (the audit's warmup/recall
+/// ran twice per turn); `missing` events silently never run (Stop → prior
+/// mining dead).
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct HookDrift {
+    /// Events registered more than once (double-fire).
+    pub duplicated: Vec<String>,
+    /// Canonical events with no registration (e.g. Stop never installed).
+    pub missing: Vec<String>,
+}
+
+impl HookDrift {
+    /// No drift — registrations match the canonical set exactly.
+    pub fn is_clean(&self) -> bool {
+        self.duplicated.is_empty() && self.missing.is_empty()
+    }
+
+    /// One-line actionable warning, or `None` when clean.
+    pub fn warning(&self) -> Option<String> {
+        if self.is_clean() {
+            return None;
+        }
+        let mut parts = Vec::new();
+        if !self.duplicated.is_empty() {
+            parts.push(format!(
+                "{} duplicated ({})",
+                self.duplicated.len(),
+                self.duplicated.join(", ")
+            ));
+        }
+        if !self.missing.is_empty() {
+            parts.push(format!(
+                "{} missing ({})",
+                self.missing.len(),
+                self.missing.join(", ")
+            ));
+        }
+        Some(format!(
+            "stale mdkb hook registrations: {} — run: mdkb setup hooks",
+            parts.join("; ")
+        ))
+    }
+}
+
+/// Detect drift by summing mdkb registrations across every provided settings
+/// object. Claude Code fires hooks from all scopes (user + local), so an event
+/// present in two scopes double-fires — summing across files is the correct
+/// double-fire semantic.
+pub fn detect_hook_drift(settings: &[&serde_json::Value]) -> HookDrift {
+    let mut drift = HookDrift::default();
+    for (event_name, cli_event, _) in HOOK_EVENTS {
+        let total: usize = settings
+            .iter()
+            .map(|s| count_mdkb_entries(s, event_name, cli_event))
+            .sum();
+        if total == 0 {
+            drift.missing.push((*event_name).to_string());
+        } else if total > 1 {
+            drift.duplicated.push((*event_name).to_string());
+        }
+    }
+    drift
+}
+
+/// Detect hook drift for a repo by reading both the user-scope
+/// (`~/.claude/settings.json`) and local-scope (`<cwd>/.claude/settings.local.json`)
+/// settings. Missing or unparseable files contribute nothing (treated as `{}`)
+/// so drift detection never fails a caller — it degrades to "no mdkb hooks seen".
+pub fn detect_hook_drift_for_repo(cwd: &Path, profile_dir: Option<&Path>) -> HookDrift {
+    let read = |path: Result<PathBuf>| -> serde_json::Value {
+        path.ok()
+            .filter(|p| p.exists())
+            .and_then(|p| std::fs::read_to_string(&p).ok())
+            .filter(|raw| !raw.trim().is_empty())
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({}))
+    };
+    let user = read(claude_settings_path(cwd, "user", profile_dir));
+    let local = read(claude_settings_path(cwd, "local", None));
+    detect_hook_drift(&[&user, &local])
+}
+
 /// Upsert mdkb hook entries into `settings` in-place, replacing any existing
 /// `_managedBy: "mdkb"` entries and skipping events in `disabled`.
 /// Returns `(registered_events, skipped_events)`.
@@ -545,26 +665,10 @@ fn upsert_hook_entries(
             entry_list.as_array_mut().unwrap()
         };
         // Drop any prior mdkb entry for this event so re-running setup replaces
-        // rather than duplicates. Two cases: our own `_managedBy: "mdkb"` tag,
-        // and legacy untagged installs (pre-tag) whose command still invokes
-        // `mdkb hook <event>`. rtk's `hook claude` and other hooks don't match.
-        let event_marker = format!("hook {cli_event}");
-        arr.retain(|item| {
-            if item.get("_managedBy").and_then(|v| v.as_str()) == Some("mdkb") {
-                return false;
-            }
-            let is_legacy_mdkb =
-                item.get("hooks")
-                    .and_then(|h| h.as_array())
-                    .is_some_and(|hooks| {
-                        hooks.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|c| c.as_str())
-                                .is_some_and(|c| c.contains(&event_marker))
-                        })
-                    });
-            !is_legacy_mdkb
-        });
+        // rather than duplicates. See `is_mdkb_hook_entry` for the two cases
+        // (tagged + legacy untagged). rtk's `hook claude` and other hooks don't
+        // match, so they survive.
+        arr.retain(|item| !is_mdkb_hook_entry(item, cli_event));
         arr.push(mdkb_entry);
         registered.push((*event_name).to_string());
     }
@@ -1182,6 +1286,88 @@ mod tests {
             })
         });
         assert!(rtk_preserved, "unrelated rtk hook must be preserved");
+    }
+
+    /// A canonical single-scope install (one mdkb entry per event) is clean.
+    #[test]
+    fn test_detect_drift_clean_canonical() {
+        use std::collections::HashSet;
+        let mut settings = serde_json::json!({});
+        upsert_hook_entries(&mut settings, "/usr/bin/mdkb", &HashSet::new(), false);
+        let drift = detect_hook_drift(&[&settings]);
+        assert!(
+            drift.is_clean(),
+            "canonical install has no drift: {drift:?}"
+        );
+        assert!(drift.warning().is_none());
+    }
+
+    /// The live audit shape: SessionStart/UPS/PostToolUse each registered twice
+    /// (tagged + legacy untagged absolute path), Stop entirely missing.
+    #[test]
+    fn test_detect_drift_live_shape_duplicates_and_missing_stop() {
+        let settings = serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook session-start"}]},
+                    {"hooks": [{"type": "command", "command": "/Users/x/.local/bin/mdkb hook session-start"}]}
+                ],
+                "UserPromptSubmit": [
+                    {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook user-prompt-submit"}]},
+                    {"hooks": [{"type": "command", "command": "/Users/x/.local/bin/mdkb hook user-prompt-submit"}]}
+                ],
+                "PostToolUse": [
+                    {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook post-tool-use"}]},
+                    {"hooks": [{"type": "command", "command": "/Users/x/.local/bin/mdkb hook post-tool-use"}]}
+                ],
+                "PreToolUse": [
+                    {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook pre-tool-use"}]}
+                ]
+            }
+        });
+        let drift = detect_hook_drift(&[&settings]);
+        assert!(!drift.is_clean());
+        assert_eq!(
+            drift.duplicated,
+            vec!["SessionStart", "UserPromptSubmit", "PostToolUse"],
+        );
+        assert_eq!(drift.missing, vec!["Stop"]);
+        let warning = drift.warning().expect("warning present");
+        assert!(warning.contains("3 duplicated"));
+        assert!(warning.contains("Stop"));
+        assert!(warning.contains("mdkb setup hooks"));
+    }
+
+    /// Same event registered in user AND local scope double-fires — summing
+    /// across settings objects catches the cross-scope case.
+    #[test]
+    fn test_detect_drift_cross_scope_double_fire() {
+        let user = serde_json::json!({
+            "hooks": {"SessionStart": [
+                {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook session-start"}]}
+            ]}
+        });
+        let local = serde_json::json!({
+            "hooks": {"SessionStart": [
+                {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook session-start"}]}
+            ]}
+        });
+        let drift = detect_hook_drift(&[&user, &local]);
+        assert!(drift.duplicated.contains(&"SessionStart".to_string()));
+    }
+
+    /// Foreign hooks (rtk `hook claude`) never count toward drift.
+    #[test]
+    fn test_detect_drift_ignores_foreign_hooks() {
+        let settings = serde_json::json!({
+            "hooks": {"PreToolUse": [
+                {"hooks": [{"type": "command", "command": "rtk hook claude"}]}
+            ]}
+        });
+        let drift = detect_hook_drift(&[&settings]);
+        // rtk doesn't count as an mdkb PreToolUse entry → PreToolUse reads missing.
+        assert!(drift.missing.contains(&"PreToolUse".to_string()));
+        assert!(!drift.duplicated.contains(&"PreToolUse".to_string()));
     }
 
     #[test]

@@ -2,7 +2,65 @@
 
 ## Unreleased
 
+## 3.7.0 (2026-07-06)
+
 ### Added
+
+- **Non-aggressive auto-indexing & embedding backfill.** mdkb now self-heals its
+  memory embeddings and stops umbrella stores from re-scanning sub-repos, without
+  the user running `mdkb update` by hand:
+  - **Automatic embedding backfill.** Pending memory embeddings left by a
+    cold-model `memory_write` now drain in the background on the next
+    session-start and stop hooks (`spawn_embedding_backfill`) — single-flight per
+    repo, gated on a cheap count, ONNX off the async runtime. The "N pending
+    embeddings — run `mdkb update`" warning clears on its own.
+  - **Nested-`.mdkb` boundary.** The index walk (both code and doc/collection
+    scanning) no longer descends into a subdirectory that owns its own `.mdkb`
+    store — a sub-repo indexes its own files, so an umbrella/parent store stops
+    re-walking every child. An explicitly configured collection rooted in a
+    sub-repo is still scanned (the walk root is exempt).
+  - **Config-driven watcher tunables.** `[code.indexing] debounce_ms` (default
+    raised 100→300) and `batch_idle_ms` (default 30000, unchanged — each flush
+    re-embeds changed code, so it stays coalesced) are now settable in
+    `.mdkb/config.toml`; the hardcoded literals are gone.
+
+- **mdkb×wiz synergy audit — self-learning loop revived, token economy, retention
+  (schema v16/v17).** Fixes the audit findings where the self-learning loop was
+  effectively dead and search silently degraded to BM25:
+  - **Embeddings on every write path.** CLI/bridge `memory add` and both import
+    paths now embed like the MCP path; `mdkb update` backfills any entry missing
+    an embedding. `mdkb update` also auto-embeds changed documents (`[search]
+    auto_embed_docs`, default on; `claude_sessions` excluded unless
+    `auto_embed_sessions`). `mdkb embed --collection <name>` embeds one collection
+    explicitly. Pending-embedding counts surface in `mdkb stats`.
+  - **`memory add --source-type`** (`official_docs|user_statement|inference|
+    auto_extracted`, default `user_statement`, preserved on re-write) so
+    synthesized entries stop being over-trusted. `update_entry` now persists
+    `source_type`.
+  - **Daemon-less `mdkb memory confirm <id> --outcome confirmed|refuted`** — the
+    confirm loop is reachable on every transport; the UPS recall nudge points at
+    this command.
+  - **Warmup token economy.** SessionStart warmup strips YAML frontmatter from
+    recall snippets, suppresses empty auto-handoffs (keeps the newest), applies a
+    confidence floor (`warmup_min_confidence` 0.25) and a ~300-token budget
+    (`warmup_token_budget`); `warmup_limit` 50→10.
+  - **`claude_sessions` retention.** `mdkb update` archives transcripts whose
+    source jsonl is gone (still searchable via `--collection claude_sessions`);
+    `mdkb compact --prune-sessions --older-than <dur> [--export <dir>]`
+    hard-deletes only archived transcripts, exporting markdown first.
+  - **Hook-call telemetry.** Hook invocations are counted under a reserved
+    `hooks` pseudo-session (schema v16 `sessions.agent`); opt-in `[telemetry]
+    query_events` records per-recall metrics and NEVER the query text.
+  - **Memory storage reconciliation (schema v17 `projected_at`).** `mdkb update`
+    projects every DB entry to a markdown file (DB is the source of truth); a
+    manually deleted, previously-projected file archives its entry.
+  - **Setup drift detection & prior-mining visibility in `mdkb stats`** — warns on
+    duplicated / missing (Stop) hook registrations; shows mining enabled/disabled
+    with reason using the effective merged (daemon.toml < repo) priors.
+  - **Housekeeping & log rotation.** `mdkb update` removes vestigial artifacts
+    (0-byte `mdkb.sqlite`, legacy `code-index/`, writer-less `reindex-queue.jsonl`)
+    and warns on dead `[models]` embedding keys (now removed); `hook-events.jsonl`
+    / `hook-slow.jsonl` are halved (newest kept) past 1 MiB.
 
 - **Memory graph — typed edges between memory entries (schema v14).** A new
   `memory_edges` table records typed relations (`supports`, `contradicts`,
@@ -49,6 +107,37 @@
     unconditionally at SessionStart. `[priors].injection_enabled` (on) and
     `max_injected_per_hook` (1) bound the per-turn cost; the PreToolUse path reads
     only an already-warm context so it never opens a DB on the hot path.
+
+### Fixed
+
+- **Data-safety guards on auto-run paths** (from the 2026-07-06 multi-agent
+  review + GPT-5.5 triage — none of these had shipped):
+  - **Bulk-archive circuit breaker.** `mdkb update`'s memory→file sync refuses to
+    archive when more than 10 previously-projected entry files vanish in one pass
+    (a `git checkout`/`stash`/`clean` or backup restore, not deliberate deletion),
+    warning loudly instead of silently retiring the corpus. `mdkb update` now also
+    prints archived / archive-skipped counts in its default output.
+  - **Nested-store validation.** The `.mdkb` walker boundary requires an
+    *initialized* store (`.mdkb/index.sqlite`); a bare or half-created `.mdkb`
+    directory no longer makes the parent hard-delete every previously-indexed doc
+    under it.
+  - **`compact --prune-sessions --export` never loses the only copy.** A transcript
+    whose content body is missing is skipped (not deleted), and export filenames
+    are collision-proof (`{stem}-{id}-{hash8}.md`) so two sessions can't overwrite
+    each other's export.
+  - **Overflow-checked retention.** `--older-than` parsing and the prune cutoff use
+    checked arithmetic, so an oversized value is rejected rather than wrapping to a
+    cutoff that over-deletes.
+  - **Backfill no longer stalls on a poison row.** A single un-embeddable memory
+    entry is skipped; only a cold model pauses the batch (previously one bad row
+    starved every later entry).
+- **`[search] auto_embed_memory`** (default on) — kill switch for embed-on-write on
+  `memory add` / `memory import`; off leaves entries pending for `mdkb update`.
+- **Performance.** Auto-embed / memory backfill / session indexing run off the
+  async runtime via `spawn_blocking` (no longer holding the repo lock across ONNX
+  work); the doc-embed pass replaces a per-document `has_embedding` query with one
+  set lookup; new partial index `idx_sessions_agent` for the per-hook session
+  lookup.
 
 ## 3.4.0 (2026-06-09)
 

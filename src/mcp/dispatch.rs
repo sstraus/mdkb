@@ -248,6 +248,69 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
     Ok(())
 }
 
+/// Drain pending memory embeddings in the background. Single-flight per handle
+/// (a second call while one is in flight is a no-op), gated on a cheap `COUNT(*)`,
+/// with ONNX inference pushed off the async runtime via `spawn_blocking`.
+///
+/// Best-effort: every failure degrades to a debug log — a background task must
+/// never surface errors. Returns the spawned task handle when this call won the
+/// single-flight guard, or `None` when a drain was already running. Hook callers
+/// ignore the handle; tests await it to observe the drain deterministically.
+pub fn spawn_embedding_backfill(handle: Arc<RepoHandle>) -> Option<tokio::task::JoinHandle<usize>> {
+    if handle.backfill_in_flight.swap(true, Ordering::AcqRel) {
+        return None; // another drain already in flight
+    }
+    Some(tokio::spawn(run_embedding_backfill(handle)))
+}
+
+/// Awaitable core of [`spawn_embedding_backfill`]: reset the single-flight guard
+/// on exit (even on panic), open the context, and — only when something is
+/// pending — drain it off the runtime. Returns the number of entries embedded.
+/// Standalone (not inlined into the spawn) so tests can await it directly.
+async fn run_embedding_backfill(handle: Arc<RepoHandle>) -> usize {
+    // RAII reset so a panicking drain can't wedge the guard permanently.
+    struct FlightGuard(Arc<RepoHandle>);
+    impl Drop for FlightGuard {
+        fn drop(&mut self) {
+            self.0.backfill_in_flight.store(false, Ordering::Release);
+        }
+    }
+    let _guard = FlightGuard(Arc::clone(&handle));
+
+    if let Err(e) = ensure_handle_context(&handle).await {
+        tracing::debug!("embedding backfill: context open failed: {e}");
+        return 0;
+    }
+    let ctx = Arc::clone(&handle.ctx);
+    let drained = tokio::task::spawn_blocking(move || {
+        let guard = ctx.blocking_lock();
+        let ctx = guard.as_ref()?;
+        // Cheap indexed COUNT(*): only a positive count is worth loading the model.
+        match crate::store::memory::count_pending_embeddings(&ctx.conn) {
+            Ok(0) => Some(0),
+            Ok(_) => match crate::store::memory::backfill_memory_embeddings(&ctx.conn) {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    tracing::debug!("embedding backfill: backfill failed: {e}");
+                    Some(0)
+                }
+            },
+            Err(e) => {
+                tracing::debug!("embedding backfill: pending count failed: {e}");
+                Some(0)
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or(0);
+    if drained > 0 {
+        tracing::debug!("embedding backfill: drained {drained} pending memory embeddings");
+    }
+    drained
+}
+
 /// Acquire (and lazily initialize) the code index on a repo handle.
 pub async fn acquire_handle_code_index(
     handle: &RepoHandle,
@@ -378,15 +441,7 @@ pub async fn memory_confirm_impl(
     id: &str,
     outcome: &str,
 ) -> Result<String, McpError> {
-    let delta: i32 = match outcome {
-        "confirmed" => 1,
-        "refuted" => -1,
-        other => {
-            return Err(mcp_error(format!(
-                "Invalid outcome '{other}'. Expected \"confirmed\" or \"refuted\"."
-            )));
-        }
-    };
+    let delta = memory::outcome_to_delta(outcome).map_err(|e| mcp_error(e.to_string()))?;
 
     ensure_handle_context(handle).await?;
 
@@ -1617,17 +1672,39 @@ pub async fn get_impl(
 pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
+    // Run the synchronous update (SQLite + filesystem + ONNX) on a blocking thread,
+    // taking the lock there rather than holding an async guard across it (PERF-1).
     let doc_output = {
-        let mut ctx_guard = handle.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_mut()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-        let result = handle_update(ctx, &handle.root)
-            .map_err(|e| mcp_error(format!("Document update failed: {e}")))?;
-        format!(
+        let ctx = Arc::clone(&handle.ctx);
+        let root = handle.root.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut ctx_guard = ctx.blocking_lock();
+            let ctx = ctx_guard
+                .as_mut()
+                .ok_or_else(|| "Database not initialized".to_string())?;
+            handle_update(ctx, &root).map_err(|e| format!("Document update failed: {e}"))
+        })
+        .await
+        .map_err(|e| mcp_error(format!("Document update task panicked: {e}")))?
+        .map_err(mcp_error)?;
+
+        let mut out = format!(
             "## Documents\n\nAdded: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
             result.added, result.updated, result.removed, result.unchanged
-        )
+        );
+        if result.memory_embeddings_backfilled > 0 {
+            out.push_str(&format!(
+                "\nMemory embeddings backfilled: {}",
+                result.memory_embeddings_backfilled
+            ));
+        }
+        if result.doc_embeddings_generated > 0 {
+            out.push_str(&format!(
+                "\nDoc embeddings generated: {}",
+                result.doc_embeddings_generated
+            ));
+        }
+        out
     };
 
     let code_output = {
@@ -1657,21 +1734,34 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
             let sessions_base = home.join(".claude/projects");
             let project_root = handle.root.to_string_lossy().to_string();
 
-            let mut ctx_guard = handle.ctx.lock().await;
-            if let Some(ctx) = ctx_guard.as_mut() {
-                match handle_session_index(ctx, &sessions_base, &project_root) {
-                    Ok(sr) if sr.added > 0 || sr.updated > 0 => format!(
-                        "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}",
-                        sr.added, sr.updated, sr.unchanged
-                    ),
-                    Ok(_) => String::new(),
-                    Err(e) => {
-                        tracing::warn!("Session indexing failed: {e}");
-                        String::new()
-                    }
+            // Session indexing is likewise synchronous — run it off the async
+            // worker with the lock taken on the blocking thread (PERF-1).
+            let ctx = Arc::clone(&handle.ctx);
+            let indexed = tokio::task::spawn_blocking(move || {
+                let mut ctx_guard = ctx.blocking_lock();
+                ctx_guard
+                    .as_mut()
+                    .map(|ctx| handle_session_index(ctx, &sessions_base, &project_root))
+            })
+            .await;
+            match indexed {
+                Ok(Some(Ok(sr)))
+                    if sr.added > 0 || sr.updated > 0 || sr.sessions_archived > 0 =>
+                {
+                    format!(
+                        "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}\nArchived: {}",
+                        sr.added, sr.updated, sr.unchanged, sr.sessions_archived
+                    )
                 }
-            } else {
-                String::new()
+                Ok(Some(Ok(_))) | Ok(None) => String::new(),
+                Ok(Some(Err(e))) => {
+                    tracing::warn!("Session indexing failed: {e}");
+                    String::new()
+                }
+                Err(e) => {
+                    tracing::warn!("Session indexing task panicked: {e}");
+                    String::new()
+                }
             }
         }
     };
@@ -2121,14 +2211,46 @@ pub async fn usage_impl(
         .map_err(|e| mcp_error(format!("Failed to serialize usage: {e}")))
 }
 
-/// Dispatch a tool call by method name. Returns a JSON value — callers are
-/// responsible for the transport envelope.
-///
-/// Unknown methods return an `McpError`; the JSON-RPC caller maps that into
-/// a `-32601 Method not found` response.
 // ── Hook dispatch impls ───────────────────────────────────────────────────────
 // These return raw hook envelopes (hookSpecificOutput) rather than {text:...}.
 // Called from dispatch_call "hook.*" arms and from hook_client's no-daemon path.
+
+/// Hook log files (`hook-events.jsonl`, `hook-slow.jsonl`) are rotated once they
+/// exceed this size: the oldest half of the lines is dropped on the next append,
+/// keeping the log bounded without an external logrotate.
+pub const HOOK_LOG_CAP_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+/// Append `line` (which must already end in `\n`) to `path`. If the file exceeds
+/// [`HOOK_LOG_CAP_BYTES`], the oldest half of its lines is dropped first so the
+/// newest history is retained. Best-effort — I/O errors are swallowed.
+pub fn append_hook_log(path: &std::path::Path, line: &str) {
+    use std::io::Write as _;
+
+    if std::fs::metadata(path)
+        .map(|m| m.len() > HOOK_LOG_CAP_BYTES)
+        .unwrap_or(false)
+    {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let lines: Vec<&str> = content.lines().collect();
+            // Keep the newest half (drop the older half).
+            let kept = lines[lines.len() / 2..].join("\n");
+            let rewritten = if kept.is_empty() {
+                String::new()
+            } else {
+                format!("{kept}\n")
+            };
+            let _ = std::fs::write(path, rewritten);
+        }
+    }
+
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
 
 /// Append one line to `.mdkb/hook-events.jsonl`; also `.mdkb/hook-slow.jsonl`
 /// when elapsed exceeds the configured budget. Best-effort — silently drops on
@@ -2140,7 +2262,6 @@ fn log_hook_event(
     elapsed_ms: u64,
     slow_threshold_ms: u64,
 ) {
-    use std::io::Write as _;
     let ts = chrono::Utc::now().timestamp();
     let mut line = serde_json::json!({
         "ts": ts,
@@ -2151,21 +2272,9 @@ fn log_hook_event(
     .to_string();
     line.push('\n');
     let mdkb_dir = root.join(".mdkb");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(mdkb_dir.join("hook-events.jsonl"))
-    {
-        let _ = f.write_all(line.as_bytes());
-    }
+    append_hook_log(&mdkb_dir.join("hook-events.jsonl"), &line);
     if elapsed_ms > slow_threshold_ms {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(mdkb_dir.join("hook-slow.jsonl"))
-        {
-            let _ = f.write_all(line.as_bytes());
-        }
+        append_hook_log(&mdkb_dir.join("hook-slow.jsonl"), &line);
     }
 }
 
@@ -2184,12 +2293,36 @@ fn is_high_confidence_prior(entry: &crate::store::memory::MemoryEntry, now: i64)
 /// reserve at most one slot for the single highest-confidence curated prior
 /// (confidence >= gate) so it can appear without crowding out hot entries, then
 /// truncate to `limit`.
+/// A handoff whose stripped body is shorter than this is "empty" (an auto-handoff
+/// that captured no real state) and is suppressed from warmup unless it is the
+/// single most-recent handoff.
+const HANDOFF_MIN_BODY_CHARS: usize = 80;
+
 fn rank_warmup_entries(
     mut entries: Vec<crate::store::memory::MemoryEntry>,
     limit: usize,
     min_confidence: f64,
     now: i64,
 ) -> Vec<crate::store::memory::MemoryEntry> {
+    // Suppress empty auto-handoffs: keep the single most-recent handoff (as a
+    // "where did I leave off" anchor) plus any older handoffs carrying real
+    // content; drop the rest so 3 near-empty auto-handoffs don't crowd warmup.
+    use crate::store::memory::{EntryType, strip_frontmatter};
+    let newest_handoff_id = entries
+        .iter()
+        .filter(|e| e.entry_type == EntryType::Handoff)
+        .max_by_key(|e| e.updated_at)
+        .map(|e| e.id.clone());
+    entries.retain(|e| {
+        if e.entry_type != EntryType::Handoff {
+            return true;
+        }
+        if Some(&e.id) == newest_handoff_id.as_ref() {
+            return true;
+        }
+        strip_frontmatter(&e.content).chars().count() >= HANDOFF_MIN_BODY_CHARS
+    });
+
     if min_confidence > 0.0 {
         entries.retain(|e| e.confidence_at(now) >= min_confidence);
     }
@@ -2298,7 +2431,7 @@ fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
     true
 }
 
-pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
+pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
         return json!({});
@@ -2352,6 +2485,13 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
         format!("{}{}", prefix, crate::store::memory::format_warmup_line(e))
     }));
 
+    // Drain any prior-session pending memory embeddings in the background. Placed
+    // here — after the function's last await, before the empty-warmup early return
+    // — so it fires independently of whether warmup produced any output (a repo
+    // with pending embeddings but an empty/filtered warmup still gets drained).
+    // Single-flight + best-effort; the ctx lock is already released.
+    spawn_embedding_backfill(Arc::clone(handle));
+
     if lines.is_empty() {
         return json!({});
     }
@@ -2361,11 +2501,24 @@ pub async fn hook_session_start_impl(handle: &RepoHandle) -> Value {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "mdkb".to_string());
 
+    // Emit lines until the token budget (≈4 chars/token) would be exceeded.
+    // Never truncate a line mid-way — stop before it — so every emitted line
+    // keeps its id+type+title+tags. The first line always emits (a single
+    // over-budget line still beats an empty warmup).
     let mut body = String::from("## mdkb memory warmup\n\n");
+    let budget = cfg.warmup_token_budget;
+    let mut used_tokens = 0usize;
+    let mut emitted = 0usize;
     for line in &lines {
+        let cost = line.chars().count() / 4 + 1;
+        if emitted > 0 && used_tokens + cost > budget {
+            break;
+        }
         body.push_str("- ");
         body.push_str(line);
         body.push('\n');
+        used_tokens += cost;
+        emitted += 1;
     }
     body.push_str(&format!(
         "\n**mdkb CLI** (semantic search — not available via Grep/Glob). Run `{bin} cheatsheet` for full syntax.\n"
@@ -2523,6 +2676,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
                     None
                 }
             };
+        let search_t0 = std::time::Instant::now();
         results = memory::search_entries_hybrid_fts(
             conn,
             q,
@@ -2532,6 +2686,23 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             handle.config.search.memory.recency_half_life_secs,
         )
         .unwrap_or_default();
+
+        // Opt-in, privacy-safe telemetry: record the recall's shape (hash +
+        // latency + count) but NEVER the prompt text. Off by default.
+        if handle.config.telemetry.query_events {
+            let ev = stats::QueryEvent {
+                query_hash: crate::store::documents::compute_hash(prompt),
+                query_text: String::new(),
+                search_type: "recall".to_string(),
+                result_count: results.len() as i64,
+                latency_ms: search_t0.elapsed().as_millis() as i64,
+                top_score: None,
+                session_id: None,
+            };
+            if let Err(e) = stats::record_query_event(conn, &ev) {
+                tracing::warn!("record_query_event failed: {e}");
+            }
+        }
         drop(ctx_guard);
 
         // prior-specific gate: only high-confidence priors surface
@@ -2605,7 +2776,8 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     if !results.is_empty() {
         body.push_str("## mdkb: relevant context\n\n");
         for entry in &results {
-            let snippet_raw = entry.content.trim().replace('\n', " ");
+            let snippet_raw =
+                crate::store::memory::strip_frontmatter(&entry.content).replace('\n', " ");
             let snippet: String = snippet_raw.chars().take(160).collect();
             let stale = if stale_ids.contains(&entry.id) {
                 "[STALE-DEP] "
@@ -2626,7 +2798,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             body.push_str(line);
             body.push('\n');
         }
-        body.push_str("\nIf your work corroborates any entry above, use `memory_confirm(id, outcome=\"confirmed\")` instead of writing a new one.\n");
+        body.push_str("\nIf your work corroborates any entry above, run `mdkb memory confirm <id> --outcome confirmed` instead of writing a new one.\n");
     }
 
     if !related.is_empty() {
@@ -2778,6 +2950,11 @@ const STOP_EPISODE_WINDOW_LINES: usize = 800;
 /// budget — so the actual work is detached into a background task. The hook
 /// itself only gates and enqueues.
 fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value) -> Value {
+    // Drain mid-session cold-model `memory_write`s in the background. Independent
+    // of prior mining — must run even when mining is kill-switched off — so it
+    // goes before the mining gate. Single-flight + best-effort.
+    spawn_embedding_backfill(Arc::clone(&handle));
+
     let cfg = &handle.config.priors;
     if !cfg.mining_enabled {
         return json!({});
@@ -3127,6 +3304,37 @@ async fn code_index_hits(handle: &RepoHandle, symbol: &str, limit: usize) -> Opt
     Some(block)
 }
 
+/// Attribute a completed hook invocation to the reserved `hooks` pseudo-session
+/// in `call_log`. Records counts only — never prompt or tool content.
+///
+/// Best-effort from the ALREADY-open context: it must NEVER force a DB open on
+/// the hook hot path (the same principle as `code_index_hits`/priors — forcing
+/// an open here also gives the file watcher a wall-clock window to bootstrap the
+/// code index in one-shot CLI invocations). Called AFTER the hook impl, so
+/// session_start (which warms the ctx) is counted; a cold pre_tool_use one-shot
+/// skips. In the daemon the ctx stays warm, so all hook traffic is counted.
+/// `record_call` is three tiny local-SQLite writes (sub-millisecond).
+async fn record_hook_call(handle: &RepoHandle, method: &str) {
+    let event = method.strip_prefix("hook.").unwrap_or(method);
+    let ctx_guard = handle.ctx.lock().await;
+    let Some(ctx) = ctx_guard.as_ref() else {
+        return;
+    };
+    match stats::find_or_create_agent_session(&ctx.conn, "hooks") {
+        Ok(sid) => {
+            if let Err(e) = stats::record_call(&ctx.conn, sid, event, 0, 0, false) {
+                tracing::warn!("record hook call: {e}");
+            }
+        }
+        Err(e) => tracing::warn!("hooks pseudo-session: {e}"),
+    }
+}
+
+/// Dispatch a tool call by method name. Returns a JSON value — callers are
+/// responsible for the transport envelope.
+///
+/// Unknown methods return an `McpError`; the JSON-RPC caller maps that into
+/// a `-32601 Method not found` response.
 pub async fn dispatch_call(
     tool_name: &str,
     params: Value,
@@ -3326,6 +3534,7 @@ pub async fn dispatch_call(
             tokio::task::spawn_blocking(move || {
                 log_hook_event(root, "session_start", outcome, ms, budget)
             });
+            record_hook_call(&handle, tool_name).await;
             Ok(result)
         }
         "hook.user_prompt_submit" => {
@@ -3348,6 +3557,7 @@ pub async fn dispatch_call(
             tokio::task::spawn_blocking(move || {
                 log_hook_event(root, "user_prompt_submit", outcome, ms, budget)
             });
+            record_hook_call(&handle, tool_name).await;
             Ok(result)
         }
         "hook.post_tool_use" => {
@@ -3364,6 +3574,7 @@ pub async fn dispatch_call(
             tokio::task::spawn_blocking(move || {
                 log_hook_event(root, "post_tool_use", outcome, ms, budget)
             });
+            record_hook_call(&handle, tool_name).await;
             Ok(json!({}))
         }
         "hook.pre_tool_use" => {
@@ -3392,6 +3603,7 @@ pub async fn dispatch_call(
             tokio::task::spawn_blocking(move || {
                 log_hook_event(root, "pre_tool_use", outcome, ms, budget)
             });
+            record_hook_call(&handle, tool_name).await;
             Ok(result)
         }
         "hook.stop" => {
@@ -3407,6 +3619,7 @@ pub async fn dispatch_call(
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || log_hook_event(root, "stop", outcome, 0, budget));
+            record_hook_call(&handle, tool_name).await;
             Ok(result)
         }
         other => Err(McpError {
@@ -3437,6 +3650,157 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ))
+    }
+
+    /// Build a warmup candidate entry with controllable type/content/age.
+    fn warmup_entry(
+        id: &str,
+        ty: crate::store::memory::EntryType,
+        content: &str,
+        source_type: crate::store::memory::SourceType,
+        access_count: u64,
+        age_days: i64,
+        now: i64,
+    ) -> crate::store::memory::MemoryEntry {
+        let ts = now - age_days * 86_400;
+        crate::store::memory::MemoryEntry {
+            id: id.to_string(),
+            title: format!("Title {id}"),
+            content: content.to_string(),
+            entry_type: ty,
+            tags: vec!["t".to_string()],
+            status: crate::store::memory::EntryStatus::Active,
+            created_at: ts,
+            updated_at: ts,
+            superseded_by: None,
+            access_count,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type,
+            expires_at: None,
+            due_at: None,
+        }
+    }
+
+    #[test]
+    fn rank_suppresses_empty_older_handoffs_keeps_newest() {
+        use crate::store::memory::{EntryType, SourceType};
+        let now = 1_000_000_000;
+        let entries = vec![
+            warmup_entry(
+                "h-old",
+                EntryType::Handoff,
+                "---\ns: 1\n---\n",
+                SourceType::UserStatement,
+                5,
+                3,
+                now,
+            ),
+            warmup_entry(
+                "h-mid",
+                EntryType::Handoff,
+                "---\ns: 2\n---\n",
+                SourceType::UserStatement,
+                5,
+                2,
+                now,
+            ),
+            warmup_entry(
+                "h-new",
+                EntryType::Handoff,
+                "---\ns: 3\n---\n",
+                SourceType::UserStatement,
+                5,
+                1,
+                now,
+            ),
+            warmup_entry(
+                "topic",
+                EntryType::Topic,
+                "real content",
+                SourceType::UserStatement,
+                5,
+                0,
+                now,
+            ),
+        ];
+        let ranked = rank_warmup_entries(entries, 10, 0.0, now);
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"h-new"), "newest handoff kept: {ids:?}");
+        assert!(!ids.contains(&"h-old"), "empty older handoff dropped");
+        assert!(!ids.contains(&"h-mid"), "empty older handoff dropped");
+        assert!(ids.contains(&"topic"));
+    }
+
+    #[test]
+    fn rank_keeps_older_handoff_with_real_content() {
+        use crate::store::memory::{EntryType, SourceType};
+        let now = 1_000_000_000;
+        let long_body = "x".repeat(200);
+        let entries = vec![
+            warmup_entry(
+                "h-new",
+                EntryType::Handoff,
+                "---\ns: 3\n---\n",
+                SourceType::UserStatement,
+                5,
+                1,
+                now,
+            ),
+            warmup_entry(
+                "h-rich",
+                EntryType::Handoff,
+                &long_body,
+                SourceType::UserStatement,
+                5,
+                5,
+                now,
+            ),
+        ];
+        let ranked = rank_warmup_entries(entries, 10, 0.0, now);
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        assert!(
+            ids.contains(&"h-rich"),
+            "older handoff with body is retained"
+        );
+        assert!(ids.contains(&"h-new"));
+    }
+
+    #[test]
+    fn rank_confidence_floor_excludes_low_signal_entries() {
+        use crate::store::memory::{EntryType, SourceType};
+        let now = 1_000_000_000;
+        let entries = vec![
+            // Fresh user_statement → confidence ~0.425 ≥ 0.25 → kept.
+            warmup_entry(
+                "fresh",
+                EntryType::Topic,
+                "c",
+                SourceType::UserStatement,
+                0,
+                0,
+                now,
+            ),
+            // Old inference (~40 days) → confidence < 0.25 → dropped.
+            warmup_entry(
+                "stale",
+                EntryType::Topic,
+                "c",
+                SourceType::Inference,
+                0,
+                40,
+                now,
+            ),
+        ];
+        let ranked = rank_warmup_entries(entries, 10, 0.25, now);
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        assert!(ids.contains(&"fresh"));
+        assert!(
+            !ids.contains(&"stale"),
+            "low-confidence entry excluded: {ids:?}"
+        );
     }
 
     fn make_dctx() -> DispatchContext {
@@ -5675,6 +6039,65 @@ mod tests {
         let handle = make_handle(&tmp); // mining_enabled=false by default
         let event = json!({"transcript_path": "/nonexistent", "session_id": "s1"});
         assert_eq!(hook_stop_impl(handle, &event), json!({}));
+    }
+
+    #[tokio::test]
+    async fn stop_hook_triggers_backfill_even_when_mining_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp); // mining disabled by default
+        assert!(!handle.backfill_in_flight.load(Ordering::Acquire));
+
+        let event = json!({"transcript_path": "/nonexistent", "session_id": "s1"});
+        let out = hook_stop_impl(Arc::clone(&handle), &event);
+        assert_eq!(out, json!({}), "stop still no-ops the mining path");
+
+        // The drain must be scheduled regardless of the mining kill-switch: the
+        // single-flight guard is held by the just-spawned (not-yet-polled) task.
+        // hook_stop_impl is sync with no await after the spawn, so this is
+        // deterministic under the current-thread test runtime.
+        assert!(
+            handle.backfill_in_flight.load(Ordering::Acquire),
+            "stop hook must trigger a backfill even when mining is disabled"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_hook_triggers_backfill() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        assert!(!handle.backfill_in_flight.load(Ordering::Acquire));
+
+        let _ = hook_session_start_impl(&handle).await;
+
+        // The spawn is the last statement before the return (no trailing await),
+        // so the guard is still held when control returns here.
+        assert!(
+            handle.backfill_in_flight.load(Ordering::Acquire),
+            "session_start hook must trigger a backfill"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_start_disabled_skips_backfill() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let mut cfg = Config::default();
+        cfg.hooks.session_start_enabled = false;
+        let handle = Arc::new(RepoHandle::from_shared(
+            root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            cfg,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let _ = hook_session_start_impl(&handle).await;
+        assert!(
+            !handle.backfill_in_flight.load(Ordering::Acquire),
+            "a disabled session_start must not trigger a backfill"
+        );
     }
 
     #[tokio::test]

@@ -23,12 +23,12 @@ use mdkb::cli::handlers::{
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
     handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
     handle_graph_links, handle_graph_neighbors, handle_graph_path, handle_history,
-    handle_hybrid_search, handle_init, handle_memory_add, handle_memory_export,
-    handle_memory_import, handle_memory_import_dir, handle_memory_link, handle_memory_list,
-    handle_memory_prune, handle_memory_rm, handle_memory_search, handle_memory_show,
-    handle_memory_warmup, handle_metrics_export, handle_metrics_latency, handle_metrics_show,
-    handle_mget, handle_session_index, handle_superseded_by, handle_update_files_force,
-    handle_update_force,
+    handle_hybrid_search, handle_init, handle_memory_add, handle_memory_confirm,
+    handle_memory_export, handle_memory_import, handle_memory_import_dir, handle_memory_link,
+    handle_memory_list, handle_memory_prune, handle_memory_rm, handle_memory_search,
+    handle_memory_show, handle_memory_warmup, handle_metrics_export, handle_metrics_latency,
+    handle_metrics_show, handle_mget, handle_prune_sessions, handle_session_index,
+    handle_superseded_by, handle_update_files_force, handle_update_force, parse_retention_secs,
 };
 #[cfg(unix)]
 use mdkb::cli::hook_client;
@@ -302,10 +302,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
                         let sessions_base = home.join(".claude/projects");
                         let project_root = cwd.to_string_lossy().to_string();
                         match handle_session_index(&ctx, &sessions_base, &project_root) {
-                            Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+                            Ok(sr)
+                                if sr.added > 0 || sr.updated > 0 || sr.sessions_archived > 0 =>
+                            {
                                 println!(
-                                    "\nSessions: {} added, {} updated, {} unchanged",
-                                    sr.added, sr.updated, sr.unchanged
+                                    "\nSessions: {} added, {} updated, {} unchanged, {} archived",
+                                    sr.added, sr.updated, sr.unchanged, sr.sessions_archived
                                 );
                             }
                             Ok(_) => {}
@@ -336,9 +338,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Embed => {
+        Command::Embed { collection } => {
             let ctx = Context::open(&cwd)?;
-            let result = handle_embed(&ctx)?;
+            let result = handle_embed(&ctx, collection.as_deref())?;
             format_embed_result(&result, cli.format);
         }
         Command::Serve {
@@ -465,9 +467,42 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Compact => {
+        Command::Compact {
+            prune_sessions,
+            older_than,
+            export,
+        } => {
             let ctx = Context::open(&cwd)?;
             let mdkb_dir = ctx.db_path.parent().expect("db_path has parent");
+
+            if prune_sessions {
+                let raw = older_than.ok_or_else(|| {
+                    mdkb::Error::other(
+                        "--prune-sessions requires --older-than <e.g. 90d> to avoid deleting recent archives",
+                    )
+                })?;
+                let secs = parse_retention_secs(&raw)?;
+                // Checked: `now - secs` must not wrap for a valid-but-huge `secs`.
+                // A wrapped (future) cutoff would make every archived session
+                // prunable — the opposite of a retention rail (SEC-1).
+                let cutoff = chrono::Utc::now()
+                    .timestamp()
+                    .checked_sub(secs)
+                    .ok_or_else(|| {
+                        mdkb::Error::other(format!(
+                            "--older-than '{raw}' is too large to compute a cutoff"
+                        ))
+                    })?;
+                let summary = handle_prune_sessions(&ctx, cutoff, export.as_deref())?;
+                if let Some(dir) = &summary.export_dir {
+                    eprintln!(
+                        "Pruned {} archived session(s); exported {} to {}",
+                        summary.pruned, summary.exported, dir
+                    );
+                } else {
+                    eprintln!("Pruned {} archived session(s)", summary.pruned);
+                }
+            }
 
             // Vacuum index.sqlite
             ctx.conn.execute_batch("VACUUM;")?;
@@ -516,6 +551,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     file,
                     ttl,
                     due_in,
+                    source_type,
                 } => {
                     let (content, source_path) = if let Some(ref path) = file {
                         let text = std::fs::read_to_string(path).map_err(|e| {
@@ -549,6 +585,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                         source_path.as_deref(),
                         ttl,
                         due_in,
+                        source_type.as_deref(),
                     )?;
                     println!("Added memory entry '{id}'");
                 }
@@ -557,6 +594,15 @@ async fn run_cli(cli: Cli) -> Result<()> {
                         format_memory_entry(&entry, cli.format);
                     } else {
                         println!("Memory entry '{id}' not found");
+                    }
+                }
+                MemoryCommand::Confirm { id, outcome } => {
+                    let result = handle_memory_confirm(&ctx, &id, &outcome)?;
+                    match cli.format {
+                        mdkb::cli::OutputFormat::Json => {
+                            println!("{}", serde_json::to_string_pretty(&result)?);
+                        }
+                        _ => println!("{}", result.message),
                     }
                 }
                 MemoryCommand::Link {
@@ -847,8 +893,10 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
 # Memory (--entry-type: topic, problem, decision, reminder, prior)
 {0} memory add <id> --title T --content C              # create (default: topic)
+{0} memory add <id> --title T --content C --source-type official_docs  # provenance/trust
 {0} memory add <id> --title T --content C --entry-type prior --tags t1,t2
 {0} memory add <id> --title T --content C --entry-type reminder --due-in 3600
+{0} memory confirm <id> --outcome confirmed            # raise confidence (or refuted) — daemon-less
 {0} memory link <id> <relation> <target>              # typed edge (supports|contradicts|supersedes|derived_from|relates_to)
 {0} memory link <id> derived_from <path> --doc        # link to a document; --agent records provenance
 {0} memory rm <id>                                     # delete
@@ -861,9 +909,11 @@ async fn run_cli(cli: Cli) -> Result<()> {
 {0} code search <query>                                # fuzzy symbol search
 
 # Maintenance
-{0} update                                             # reindex all
-{0} stats                                              # index health, hooks, sessions
+{0} update                                             # reindex all (auto-embeds docs + backfills memory)
+{0} embed --collection claude_sessions                # embed a specific collection (sessions excluded by default)
+{0} stats                                              # index health, hooks, mining, sessions
 {0} compact                                            # vacuum both databases
+{0} compact --prune-sessions --older-than 90d --export dir  # hard-delete archived transcripts (exports first)
 ",
                 bin
             );
@@ -1234,6 +1284,32 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
             println!("Updated:   {}", result.updated);
             println!("Removed:   {}", result.removed);
             println!("Unchanged: {}", result.unchanged);
+            if result.memory_embeddings_backfilled > 0 {
+                println!(
+                    "Memory embeddings backfilled: {}",
+                    result.memory_embeddings_backfilled
+                );
+            }
+            if result.doc_embeddings_generated > 0 {
+                println!(
+                    "Doc embeddings generated: {}",
+                    result.doc_embeddings_generated
+                );
+            }
+            if result.memory_entries_archived > 0 {
+                println!(
+                    "Memory entries archived (file deleted): {}",
+                    result.memory_entries_archived
+                );
+            }
+            if result.memory_entries_archive_skipped > 0 {
+                println!(
+                    "⚠ Memory archival SKIPPED — {} projected files missing at once \
+                     (suspected bulk loss, e.g. git checkout/clean). Restore \
+                     .mdkb/memory/entries/ and re-run `mdkb update`.",
+                    result.memory_entries_archive_skipped
+                );
+            }
             if !result.errors.is_empty() {
                 println!("Errors:    {}", result.errors.len());
                 for err in &result.errors {

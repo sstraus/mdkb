@@ -42,6 +42,10 @@ pub struct RepoHandle {
     /// failure episode instead of on every post_tool_use (was 571 repeats).
     /// Cleared on the next successful send so a recovered channel can warn again.
     pub reindex_send_warned: AtomicBool,
+    /// Single-flight guard for the background memory-embedding backfill. Set while
+    /// a drain is in flight so concurrent hook triggers (session-start + stop)
+    /// don't stack redundant ONNX passes; reset via an RAII guard even on panic.
+    pub backfill_in_flight: AtomicBool,
     /// Handle to the spawned file watcher task. Aborted on drop to prevent
     /// orphan watcher threads (notify-rs debouncer + fsevents) after LRU eviction.
     watcher_handle: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -97,6 +101,7 @@ impl RepoHandle {
             reindex_tx,
             reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
             reindex_send_warned: AtomicBool::new(false),
+            backfill_in_flight: AtomicBool::new(false),
             watcher_handle: std::sync::Mutex::new(None),
         })
     }
@@ -125,6 +130,7 @@ impl RepoHandle {
             reindex_tx,
             reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
             reindex_send_warned: AtomicBool::new(false),
+            backfill_in_flight: AtomicBool::new(false),
             watcher_handle: std::sync::Mutex::new(None),
         }
     }
@@ -316,6 +322,8 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
     let code_enabled = handle.config.code.enabled;
     let code_ignore_patterns = handle.code_ignore_patterns.clone();
     let respect_gitignore = handle.config.code.indexing.respect_gitignore;
+    let debounce_ms = handle.config.code.indexing.debounce_ms;
+    let batch_idle_ms = handle.config.code.indexing.batch_idle_ms;
     // Take the receiver exactly once; subsequent calls (same handle) yield None.
     let reindex_rx = handle
         .reindex_rx
@@ -330,6 +338,8 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
             code_enabled,
             code_ignore_patterns,
             respect_gitignore,
+            debounce_ms,
+            batch_idle_ms,
             reindex_rx,
         )
         .await

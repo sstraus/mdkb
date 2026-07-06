@@ -83,6 +83,7 @@ async fn two_clients_single_reindex() {
             true, // needed to watch root recursively
             vec![],
             true, // respect_gitignore
+            50,   // debounce_ms — fast for test
             500,  // 500ms batch idle for fast test flush
             Some(ready_clone),
             None,
@@ -172,6 +173,7 @@ async fn injected_path_triggers_code_reindex() {
             true,
             vec![],
             true, // respect_gitignore
+            50,   // debounce_ms — fast for test
             200,  // fast flush for test
             Some(ready_clone),
             Some(rx),
@@ -249,6 +251,7 @@ async fn late_ctx_still_reindexes_injected_file() {
             true,
             vec![],
             true,
+            50,  // debounce_ms — fast for test
             200,
             None,
             Some(rx),

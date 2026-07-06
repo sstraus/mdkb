@@ -45,7 +45,22 @@ pub struct Config {
 
     /// AI-distilled behavioral-prior mining.
     pub priors: PriorsConfig,
+
+    /// Usage telemetry (opt-in, privacy-safe).
+    pub telemetry: TelemetryConfig,
 }
+
+/// Usage telemetry settings. Hook-call counts are always recorded (counts, not
+/// content); richer per-query events are opt-in and never store query text.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TelemetryConfig {
+    /// Record a `query_events` row per recall search (hash + latency + result
+    /// count — NEVER the query text). Off by default: it is the input for the
+    /// self-evaluation roadmap, opt-in until that ships.
+    pub query_events: bool,
+}
+
 
 /// Indexing settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +125,22 @@ pub struct SearchConfig {
     /// Vector weight in hybrid search.
     pub vector_weight: f64,
 
+    /// Auto-embed changed documents during `mdkb update` so hybrid search never
+    /// silently degrades to BM25. Killable if the ONNX cost is unwanted.
+    pub auto_embed_docs: bool,
+
+    /// Include the `claude_sessions` collection in auto-embed / `mdkb embed`.
+    /// Off by default: transcripts are large, high-churn, and excluded from
+    /// default search — embed them explicitly with `mdkb embed --collection`.
+    pub auto_embed_sessions: bool,
+
+    /// Embed memory entries on write (`memory add`, `memory import`) so they are
+    /// vector-searchable immediately, like the MCP path. On by default. Set false
+    /// to make writes never touch the ONNX model — the entry is left pending and
+    /// `mdkb update` backfills it. Also the hermetic switch for tests that write
+    /// memory but don't exercise embeddings.
+    pub auto_embed_memory: bool,
+
     /// Memory-scope search tuning.
     pub memory: SearchMemoryConfig,
 }
@@ -165,14 +196,30 @@ pub struct MemoryConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelsConfig {
-    /// HuggingFace repo for embedding model.
-    pub embedding_repo: String,
-
-    /// Embedding model filename.
-    pub embedding_file: String,
-
     /// Inactivity timeout before unloading models (seconds).
     pub inactivity_timeout_secs: u64,
+}
+
+/// Dead `[models]` keys that once selected the embedding model. The embedder is
+/// now fixed to all-MiniLM-L6-v2 (384-dim), so these are ignored if present —
+/// [`detect_dead_model_keys`] surfaces a warning rather than silently accepting
+/// them (they were never functional).
+pub const DEAD_MODEL_KEYS: &[&str] = &["embedding_repo", "embedding_file"];
+
+/// Return any dead `[models]` embedding keys present in raw config TOML so the
+/// caller can warn the user they are ignored (the embedder is fixed).
+pub fn detect_dead_model_keys(raw_toml: &str) -> Vec<&'static str> {
+    let Ok(value) = raw_toml.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let Some(models) = value.get("models").and_then(|m| m.as_table()) else {
+        return Vec::new();
+    };
+    DEAD_MODEL_KEYS
+        .iter()
+        .filter(|k| models.contains_key(**k))
+        .copied()
+        .collect()
 }
 
 /// Convention-based auto-collection detection settings.
@@ -251,6 +298,17 @@ pub struct CodeIndexingConfig {
     /// annotation remains active in this mode. When false, gitignore is
     /// ignored and `.mdkbignore` is read instead.
     pub respect_gitignore: bool,
+
+    /// File-watcher debounce interval (ms). Rapid filesystem events within this
+    /// window collapse into one. Raised from the historical 100ms to a gentler
+    /// 300ms default so editor save-storms don't wake the reindexer repeatedly.
+    pub debounce_ms: u64,
+
+    /// Idle window (ms) the watcher waits after the last change before flushing
+    /// an incremental reindex, coalescing an editing session into a single pass.
+    /// Kept long (30s) by default because each flush re-embeds changed code
+    /// symbols; lower it for a fresher index at the cost of more ONNX passes.
+    pub batch_idle_ms: u64,
 }
 
 /// Semantic code search settings.
@@ -288,6 +346,8 @@ impl Default for CodeIndexingConfig {
                 .collect(),
             batch_size: DEFAULT_CODE_BATCH_SIZE,
             respect_gitignore: true,
+            debounce_ms: DEFAULT_CODE_DEBOUNCE_MS,
+            batch_idle_ms: DEFAULT_CODE_BATCH_IDLE_MS,
         }
     }
 }
@@ -317,6 +377,7 @@ impl Default for Config {
             hooks: HooksConfig::default(),
             db: DbConfig::default(),
             priors: PriorsConfig::default(),
+            telemetry: TelemetryConfig::default(),
         }
     }
 }
@@ -428,8 +489,14 @@ pub struct HooksConfig {
     pub post_tool_use_enabled: bool,
     pub pre_tool_use_enabled: bool,
 
-    /// Maximum number of entries injected on SessionStart (warmup).
+    /// Maximum number of entries injected on SessionStart (warmup). Secondary
+    /// bound — `warmup_token_budget` is the primary cap.
     pub warmup_limit: usize,
+
+    /// Approximate token budget for the warmup block (≈4 chars/token). Emission
+    /// stops before a line that would exceed it — lines are never truncated
+    /// mid-way, so every injected line keeps its id+type+title+tags.
+    pub warmup_token_budget: usize,
 
     /// Maximum number of recall results injected on UserPromptSubmit.
     pub recall_limit: usize,
@@ -479,11 +546,12 @@ impl Default for HooksConfig {
             user_prompt_submit_enabled: true,
             post_tool_use_enabled: true,
             pre_tool_use_enabled: true,
-            warmup_limit: 50,
+            warmup_limit: 10,
+            warmup_token_budget: 300,
             recall_limit: 5,
             latency_budget_ms: 200,
             min_recall_score: 0.3,
-            warmup_min_confidence: 0.0,
+            warmup_min_confidence: 0.25,
             recall_half_life_secs: 7 * 24 * 60 * 60, // 7 days
             daemon_required: false,
             code_hits_in_pretooluse: true,
@@ -544,6 +612,9 @@ impl Default for SearchConfig {
             rrf_k: DEFAULT_RRF_K,
             bm25_weight: DEFAULT_BM25_WEIGHT,
             vector_weight: DEFAULT_VECTOR_WEIGHT,
+            auto_embed_docs: true,
+            auto_embed_sessions: false,
+            auto_embed_memory: true,
             memory: SearchMemoryConfig::default(),
         }
     }
@@ -565,8 +636,6 @@ impl Default for MemoryConfig {
 impl Default for ModelsConfig {
     fn default() -> Self {
         Self {
-            embedding_repo: "nomic-ai/nomic-embed-text-v1.5-GGUF".to_string(),
-            embedding_file: "nomic-embed-text-v1.5.Q4_K_M.gguf".to_string(),
             inactivity_timeout_secs: DEFAULT_INACTIVITY_TIMEOUT_SECS,
         }
     }
@@ -667,6 +736,18 @@ const DEFAULT_CODE_IGNORE_PATTERNS: &[&str] = &[
 /// Batch size for pipeline commits during code indexing.
 /// 500 balances memory usage with commit overhead.
 const DEFAULT_CODE_BATCH_SIZE: usize = 500;
+
+/// Default file-watcher debounce (ms) for code indexing. 300ms coalesces an
+/// editor's rapid save/temp-file churn without a perceptible freshness lag.
+const DEFAULT_CODE_DEBOUNCE_MS: u64 = 300;
+
+/// Default idle window (ms) before flushing a coalesced incremental reindex.
+/// 30s lets a whole editing session accumulate into one batch: each flush of the
+/// code index re-embeds the changed symbols (an ONNX pass), so a short window
+/// would re-run inference on every stop-start pause. The live PostToolUse path
+/// still injects edited files directly, so the index isn't actually 30s stale in
+/// practice. Now config-driven via `[code.indexing] batch_idle_ms`.
+const DEFAULT_CODE_BATCH_IDLE_MS: u64 = 30_000;
 
 /// Default embedding model for semantic code search.
 /// AllMiniLML6V2 is a fast, lightweight model (384 dimensions).
@@ -855,9 +936,12 @@ mod tests {
     #[test]
     fn test_hooks_config_defaults() {
         let cfg = HooksConfig::default();
-        // warmup_limit controls session-start; recall_limit controls user-prompt-submit
-        assert_eq!(cfg.warmup_limit, 50);
+        // warmup_limit is the secondary bound; warmup_token_budget is primary.
+        assert_eq!(cfg.warmup_limit, 10);
+        assert_eq!(cfg.warmup_token_budget, 300);
         assert_eq!(cfg.recall_limit, 5);
+        // Confidence floor on by default so low-signal entries stay out of warmup.
+        assert_eq!(cfg.warmup_min_confidence, 0.25);
     }
 
     #[test]
@@ -869,27 +953,85 @@ mod tests {
         assert_eq!(config.hooks.recall_limit, parsed.hooks.recall_limit);
     }
 
+    // ==================== Code Indexing Watcher Tests ====================
+
+    #[test]
+    fn test_code_indexing_watcher_gentle_defaults() {
+        let cfg = Config::default();
+        assert_eq!(
+            cfg.code.indexing.debounce_ms, 300,
+            "gentle debounce default"
+        );
+        assert_eq!(
+            cfg.code.indexing.batch_idle_ms, 30_000,
+            "batch-idle stays long: each flush re-embeds changed code (ONNX cost)"
+        );
+    }
+
+    #[test]
+    fn test_code_indexing_watcher_overrides_parse() {
+        let toml_str = "[code.indexing]\ndebounce_ms = 1000\nbatch_idle_ms = 5000\n";
+        let cfg: Config = toml::from_str(toml_str).expect("parse [code.indexing] overrides");
+        assert_eq!(cfg.code.indexing.debounce_ms, 1000);
+        assert_eq!(cfg.code.indexing.batch_idle_ms, 5000);
+        // Unspecified sibling fields keep their defaults (serde(default)).
+        assert!(cfg.code.indexing.respect_gitignore);
+    }
+
+    #[test]
+    fn test_code_indexing_watcher_partial_override_keeps_other_default() {
+        // Only debounce set → batch_idle stays at the gentle default.
+        let cfg: Config =
+            toml::from_str("[code.indexing]\ndebounce_ms = 200\n").expect("partial parse");
+        assert_eq!(cfg.code.indexing.debounce_ms, 200);
+        assert_eq!(cfg.code.indexing.batch_idle_ms, 30_000);
+    }
+
+    #[test]
+    fn test_code_indexing_watcher_roundtrip() {
+        let config = Config::default();
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            config.code.indexing.debounce_ms,
+            parsed.code.indexing.debounce_ms
+        );
+        assert_eq!(
+            config.code.indexing.batch_idle_ms,
+            parsed.code.indexing.batch_idle_ms
+        );
+    }
+
     // ==================== Models Config Tests ====================
 
     #[test]
     fn test_models_config_defaults() {
         let config = Config::default();
         assert_eq!(
-            config.models.embedding_repo,
-            "nomic-ai/nomic-embed-text-v1.5-GGUF"
-        );
-        assert_eq!(
-            config.models.embedding_file,
-            "nomic-embed-text-v1.5.Q4_K_M.gguf"
+            config.models.inactivity_timeout_secs,
+            DEFAULT_INACTIVITY_TIMEOUT_SECS
         );
     }
 
     #[test]
-    fn test_models_config_serialization() {
-        let config = Config::default();
-        let toml_str = toml::to_string_pretty(&config).unwrap();
-        assert!(toml_str.contains("[models]"));
-        assert!(toml_str.contains("embedding_repo"));
+    fn test_dead_model_keys_detected() {
+        let raw = "[models]\nembedding_repo = \"x\"\nembedding_file = \"y\"\n";
+        let dead = detect_dead_model_keys(raw);
+        assert!(dead.contains(&"embedding_repo"));
+        assert!(dead.contains(&"embedding_file"));
+    }
+
+    #[test]
+    fn test_no_dead_model_keys_when_absent() {
+        assert!(detect_dead_model_keys("[models]\ninactivity_timeout_secs = 60\n").is_empty());
+        assert!(detect_dead_model_keys("").is_empty());
+        // Legacy config with dead keys still parses (keys ignored, not an error).
+        let cfg: Config =
+            toml::from_str("[models]\nembedding_repo = \"x\"\n").expect("legacy config parses");
+        assert_eq!(
+            cfg.models.inactivity_timeout_secs,
+            DEFAULT_INACTIVITY_TIMEOUT_SECS
+        );
     }
 
     // ==================== Validation Tests ====================

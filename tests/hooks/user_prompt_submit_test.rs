@@ -121,6 +121,52 @@ fn seed_project_with_memory(id: &str, title: &str, content: &str, tags: &[&str])
 }
 
 #[test]
+fn user_prompt_submit_recall_snippet_strips_frontmatter() {
+    // Handoff entries persist YAML frontmatter inside `content`; the recall
+    // snippet must show the body, never `---`/`session_id:` YAML.
+    let tmp = seed_project_with_memory(
+        "handoff-frontmatter",
+        "Kafka rebalance handoff",
+        "---\nsession_id: deadbeef\ndone: [x]\n---\nInvestigated kafka consumer rebalance storm mitigation",
+        &["kafka", "rebalance"],
+    );
+
+    let event = r#"{"prompt":"kafka consumer rebalance storm mitigation investigation"}"#;
+    let (code, stdout) = run_user_prompt_submit_in(tmp.path(), event);
+    assert_eq!(code, 0);
+
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    let ctx_block = parsed
+        .get("hookSpecificOutput")
+        .and_then(|h| h.get("additionalContext"))
+        .and_then(|v| v.as_str())
+        .expect("recall context present");
+
+    assert!(
+        ctx_block.contains("handoff-frontmatter"),
+        "handoff entry must be recalled: {ctx_block}"
+    );
+    assert!(
+        ctx_block.contains("Investigated kafka"),
+        "snippet must show the body: {ctx_block}"
+    );
+    assert!(
+        !ctx_block.contains("session_id:"),
+        "snippet must NOT leak frontmatter: {ctx_block}"
+    );
+    // The recall line title still legitimately uses the entry title; ensure the
+    // leaked YAML fence specifically is gone from the snippet portion.
+    let recall_line = ctx_block
+        .lines()
+        .find(|l| l.contains("handoff-frontmatter"))
+        .expect("recall line");
+    assert!(
+        !recall_line.contains("---"),
+        "recall line must not contain a YAML fence: {recall_line}"
+    );
+}
+
+#[test]
 fn user_prompt_submit_injects_relevant_memory() {
     let tmp = seed_project_with_memory(
         "jwt-refresh-strategy",

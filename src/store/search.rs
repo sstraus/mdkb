@@ -39,6 +39,13 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
     // Build status filter clause
     let status_filter = if query.include_superseded {
         "" // No filter - include all statuses
+    } else if query.collection.as_deref() == Some(crate::domain::COLLECTION_CLAUDE_SESSIONS) {
+        // Only the claude_sessions collection uses `archived` status (transcripts
+        // whose source jsonl was rotated away) — surface those when explicitly
+        // scoped, while still hiding superseded/retracted. Scoped to this
+        // collection specifically so a future `archived` use elsewhere doesn't
+        // silently leak into other `--collection` searches (ARCH-2).
+        "AND (d.status IS NULL OR d.status IN ('current', 'archived'))"
     } else {
         // Default: only current documents (status IS NULL for legacy, or 'current')
         "AND (d.status IS NULL OR d.status = 'current')"

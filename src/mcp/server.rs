@@ -1172,15 +1172,6 @@ fn classify_change(
     (is_code, is_doc)
 }
 
-/// Batch window for collecting rapid-fire code changes before reindexing.
-/// Idle timeout before flushing accumulated code changes as a batch reindex.
-///
-/// During active development, files change in rapid succession. A short timeout
-/// triggers frequent reindexes — each loading the ONNX model, generating
-/// embeddings, and allocating memory arenas. 30 seconds lets file saves
-/// accumulate into a single efficient batch while still feeling responsive.
-const CODE_BATCH_IDLE_MS: u64 = 30_000;
-
 /// How long the watcher waits for context initialization before giving up.
 const CTX_WAIT_SECS: u64 = 60;
 
@@ -1199,6 +1190,7 @@ pub static CODE_REINDEX_COUNT: AtomicU64 = AtomicU64::new(0);
 ///
 /// Spawned only from `RepoRegistry::get_or_open` when a new `RepoHandle` is
 /// created (daemon mode). Never spawned in standalone MCP stdio sessions.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_file_watcher(
     root: PathBuf,
     ctx: Arc<Mutex<Option<Context>>>,
@@ -1206,6 +1198,8 @@ pub async fn run_file_watcher(
     code_enabled: bool,
     code_ignore_patterns: Vec<String>,
     respect_gitignore: bool,
+    debounce_ms: u64,
+    batch_idle_ms: u64,
     reindex_rx: Option<tokio::sync::mpsc::Receiver<PathBuf>>,
 ) -> crate::error::Result<()> {
     run_file_watcher_inner(
@@ -1215,14 +1209,16 @@ pub async fn run_file_watcher(
         code_enabled,
         code_ignore_patterns,
         respect_gitignore,
-        CODE_BATCH_IDLE_MS,
+        debounce_ms,
+        batch_idle_ms,
         None,
         reindex_rx,
     )
     .await
 }
 
-/// Configurable batch idle + optional ready signal for tests.
+/// Configurable debounce + batch idle + optional ready signal for tests.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_file_watcher_inner(
     root: PathBuf,
     ctx: Arc<Mutex<Option<Context>>>,
@@ -1230,13 +1226,13 @@ pub async fn run_file_watcher_inner(
     code_enabled: bool,
     code_ignore_patterns: Vec<String>,
     respect_gitignore: bool,
+    debounce_ms: u64,
     batch_idle_ms: u64,
     ready: Option<Arc<tokio::sync::Notify>>,
     mut reindex_rx: Option<tokio::sync::mpsc::Receiver<PathBuf>>,
 ) -> crate::error::Result<()> {
     WATCHER_SPAWN_COUNT.fetch_add(1, Ordering::Relaxed);
-    let config = WatcherConfig::default();
-    let mut watcher = FileWatcher::new(config)?;
+    let mut watcher = FileWatcher::new(WatcherConfig { debounce_ms })?;
 
     // Wait for context initialization (driven by first client request via
     // ensure_handle_context). This MUST NOT exit on a timeout: returning here
@@ -1466,22 +1462,32 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
         return;
     }
     *needs_update = false;
-    let mut ctx_guard = ctx.lock().await;
-    if let Some(ctx_ref) = ctx_guard.as_mut() {
-        match handle_update(ctx_ref, root) {
-            Ok(result) => {
-                DOC_REINDEX_COUNT.fetch_add(1, Ordering::Relaxed);
-                if result.added > 0 || result.updated > 0 || result.removed > 0 {
-                    tracing::info!(
-                        "Reindexed: {} added, {} updated, {} removed",
-                        result.added,
-                        result.updated,
-                        result.removed
-                    );
-                }
+    // `handle_update` is fully synchronous (SQLite writes, filesystem walks, and —
+    // via auto-embed/memory-backfill — ONNX inference). Run it on a blocking thread
+    // and take the lock there (`blocking_lock`), so it never blocks the tokio worker
+    // or holds an async guard across seconds of work (PERF-1).
+    let ctx = Arc::clone(ctx);
+    let root = root.to_path_buf();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut guard = ctx.blocking_lock();
+        guard.as_mut().map(|ctx_ref| handle_update(ctx_ref, &root))
+    })
+    .await;
+    match outcome {
+        Ok(Some(Ok(result))) => {
+            DOC_REINDEX_COUNT.fetch_add(1, Ordering::Relaxed);
+            if result.added > 0 || result.updated > 0 || result.removed > 0 {
+                tracing::info!(
+                    "Reindexed: {} added, {} updated, {} removed",
+                    result.added,
+                    result.updated,
+                    result.removed
+                );
             }
-            Err(e) => tracing::error!("Doc reindex failed: {}", e),
         }
+        Ok(Some(Err(e))) => tracing::error!("Doc reindex failed: {}", e),
+        Ok(None) => {} // ctx not initialized — nothing to do
+        Err(e) => tracing::error!("Doc reindex task panicked: {}", e),
     }
 }
 

@@ -158,6 +158,17 @@ fn discover_forced_files(
 /// See [`WalkOptions`] for gitignore vs `.mdkbignore` semantics. The
 /// `ignore_patterns` globs are applied as additional exclusions in both modes.
 /// Hidden files and directories (starting with `.`) are always skipped.
+/// A directory is a nested-store boundary only if it contains an *initialized*
+/// mdkb store — `.mdkb/index.sqlite`. A bare or half-created `.mdkb` directory
+/// (aborted `mdkb init`, a name collision, a stray fixture, a partially-extracted
+/// archive) is NOT a boundary: pruning the subtree on its mere presence would make
+/// the parent treat every previously-indexed doc underneath as deleted and
+/// hard-delete it on the next `update`. Match the runtime store check in
+/// `mcp::server` (`root.join(".mdkb/index.sqlite").exists()`).
+fn is_nested_store(dir: &Path) -> bool {
+    dir.join(".mdkb").join("index.sqlite").is_file()
+}
+
 pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let WalkOptions {
         root,
@@ -173,6 +184,16 @@ pub fn walk_files(opts: WalkOptions<'_>, accept: impl Fn(&Path) -> bool) -> Vec<
         .git_exclude(respect_gitignore)
         .follow_links(false)
         .require_git(false); // respect .gitignore even outside git repos
+
+    // Stop at nested-store boundaries: any directory below the root that owns an
+    // *initialized* `.mdkb` store is a distinct repo that indexes its own files.
+    // Descending into it is the "aggressive umbrella store" behavior — an ancestor
+    // store re-walking every sub-repo. Prune the whole subtree. The walk root
+    // (depth 0) is exempt: it owns *this* store's `.mdkb` and must be traversed.
+    builder.filter_entry(|entry| {
+        entry.depth() == 0
+            || !(entry.file_type().is_some_and(|ft| ft.is_dir()) && is_nested_store(entry.path()))
+    });
 
     if !respect_gitignore {
         // .mdkbignore substitutes for .gitignore in "ignore-gitignore" mode.
@@ -292,6 +313,55 @@ mod tests {
         assert!(names.contains(&"app.go"));
         assert!(names.contains(&"index.ts"));
         assert!(names.contains(&"script.py"));
+    }
+
+    #[test]
+    fn test_prunes_nested_mdkb_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Root owns *this* store — its files are indexed.
+        fs::create_dir_all(root.join(".mdkb")).unwrap();
+        fs::write(root.join("a.rs"), "fn a() {}").unwrap();
+
+        // A nested sub-repo with its own *initialized* store owns its files — the
+        // parent walk must not descend into it. The store is real: it has
+        // `.mdkb/index.sqlite`, not just a bare `.mdkb` directory.
+        fs::create_dir_all(root.join("child/.mdkb")).unwrap();
+        fs::write(root.join("child/.mdkb/index.sqlite"), b"").unwrap();
+        fs::write(root.join("child/b.rs"), "fn b() {}").unwrap();
+
+        // A plain nested dir with no store IS traversed normally.
+        fs::create_dir_all(root.join("plain")).unwrap();
+        fs::write(root.join("plain/c.rs"), "fn c() {}").unwrap();
+
+        // A *bare* `.mdkb` directory with no `index.sqlite` (aborted init / stray
+        // fixture) is NOT a store boundary — its files must still be traversed, or
+        // the parent would hard-delete previously-indexed docs under it (DATA-3).
+        fs::create_dir_all(root.join("stray/.mdkb")).unwrap();
+        fs::write(root.join("stray/d.rs"), "fn d() {}").unwrap();
+
+        let names: Vec<String> = discover(root)
+            .iter()
+            .map(|p| p.strip_prefix(root).unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            names.iter().any(|n| n == "a.rs"),
+            "root-owned file must be indexed: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("c.rs")),
+            "storeless nested dir must still be traversed: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.ends_with("b.rs")),
+            "file inside a nested .mdkb store must be pruned: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n.ends_with("d.rs")),
+            "file under a bare .mdkb dir (no index.sqlite) must NOT be pruned: {names:?}"
+        );
     }
 
     #[test]

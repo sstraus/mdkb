@@ -313,6 +313,18 @@ pub fn has_embedding(conn: &Connection, document_id: i64) -> Result<bool> {
     Ok(count > 0)
 }
 
+/// Every `document_id` that currently has a stored embedding, as a set — one
+/// query instead of a [`has_embedding`] call per document. The auto-embed path
+/// runs on every doc-watcher flush and previously issued one query per doc across
+/// the whole corpus just to find the few missing an embedding (PERF-1).
+pub fn embedded_document_ids(conn: &Connection) -> Result<std::collections::HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT document_id FROM embeddings")?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<std::collections::HashSet<i64>, _>>()?;
+    Ok(ids)
+}
+
 /// Count total embeddings.
 pub fn count_embeddings(conn: &Connection) -> Result<usize> {
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))?;

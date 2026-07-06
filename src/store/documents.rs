@@ -255,6 +255,73 @@ pub fn delete_document(conn: &Connection, id: i64) -> Result<bool> {
     Ok(rows_affected > 0)
 }
 
+/// Mark `claude_sessions` documents whose source transcript is gone as
+/// `archived`. `present_paths` is the set of relative paths still produced by
+/// live transcript files this indexing pass. Returns the number newly archived.
+///
+/// Archived transcripts drop out of default search but stay retrievable via an
+/// explicit `--collection claude_sessions` query — mdkb is often the only
+/// remaining copy once Claude Code rotates the on-disk jsonl away, so this
+/// never deletes; hard removal is opt-in via `mdkb compact --prune-sessions`.
+pub fn archive_missing_sessions(
+    conn: &Connection,
+    present_paths: &std::collections::HashSet<String>,
+) -> Result<usize> {
+    let coll = crate::domain::COLLECTION_CLAUDE_SESSIONS;
+    let mut stmt = conn.prepare(
+        "SELECT id, relative_path FROM documents
+         WHERE collection = ?1 AND (status IS NULL OR status = 'current')",
+    )?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map(params![coll], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+
+    let mut archived = 0;
+    for (id, rel) in rows {
+        if !present_paths.contains(&rel) {
+            conn.execute(
+                "UPDATE documents SET status = 'archived' WHERE id = ?1",
+                params![id],
+            )?;
+            archived += 1;
+        }
+    }
+    Ok(archived)
+}
+
+/// A pruning candidate: an archived session document older than the cutoff.
+#[derive(Debug, Clone)]
+pub struct PrunableSession {
+    pub id: i64,
+    pub relative_path: String,
+    pub hash: String,
+    pub title: Option<String>,
+    pub indexed_at: i64,
+}
+
+/// List archived `claude_sessions` documents whose `indexed_at` is at or before
+/// `cutoff_ts` — the hard-delete candidates for `mdkb compact --prune-sessions`.
+pub fn list_prunable_sessions(conn: &Connection, cutoff_ts: i64) -> Result<Vec<PrunableSession>> {
+    let coll = crate::domain::COLLECTION_CLAUDE_SESSIONS;
+    let mut stmt = conn.prepare(
+        "SELECT id, relative_path, hash, title, indexed_at FROM documents
+         WHERE collection = ?1 AND status = 'archived' AND indexed_at <= ?2
+         ORDER BY indexed_at ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![coll, cutoff_ts], |r| {
+            Ok(PrunableSession {
+                id: r.get(0)?,
+                relative_path: r.get(1)?,
+                hash: r.get(2)?,
+                title: r.get(3)?,
+                indexed_at: r.get(4)?,
+            })
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(rows)
+}
+
 /// List all documents in a collection.
 pub fn list_documents(conn: &Connection, collection: &str) -> Result<Vec<Document>> {
     let mut stmt = conn.prepare(

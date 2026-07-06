@@ -69,6 +69,9 @@ pub struct MemorySummary {
     pub reminders_due: usize,
     /// Reminders due within the next 7 days (but not yet due).
     pub reminders_upcoming_7d: usize,
+    /// Entries missing a stored embedding (hybrid search degrades to BM25 for
+    /// these). Cleared by `mdkb update`'s backfill.
+    pub pending_embeddings: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -130,6 +133,21 @@ pub struct HooksSummary {
     pub slow_events_7d: usize,
     /// Per-event invocation stats (last 7 days, from hook-events.jsonl).
     pub events: Vec<HookEventStats>,
+    /// Divergence of the live settings.json hook registrations from the
+    /// canonical mdkb set (duplicated → double-fire; missing → never runs).
+    pub drift: crate::cli::setup::HookDrift,
+    /// Behavioral-prior mining status (Stop-hook distillation).
+    pub mining: MiningStatus,
+}
+
+/// Whether prior mining is active, and why not when it isn't. Makes an
+/// otherwise-invisible pipeline observable to operators.
+#[derive(Debug, Serialize)]
+pub struct MiningStatus {
+    pub enabled: bool,
+    pub reason: String,
+    /// Total distilled candidates recorded so far.
+    pub candidate_count: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -158,7 +176,7 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
         memory: collect_memory(ctx)?,
         code: collect_code(mdkb_dir),
         sessions: collect_sessions(ctx)?,
-        hooks: collect_hooks(mdkb_dir),
+        hooks: collect_hooks(mdkb_dir, root, collect_mining(ctx)),
     })
 }
 
@@ -268,11 +286,14 @@ fn collect_memory(ctx: &Context) -> Result<MemorySummary> {
         )
         .unwrap_or(0);
 
+    let pending_embeddings = memory::count_pending_embeddings(&ctx.conn).unwrap_or(0);
+
     Ok(MemorySummary {
         active_count,
         counts_by_type,
         reminders_due: reminders_due as usize,
         reminders_upcoming_7d: reminders_upcoming_7d as usize,
+        pending_embeddings,
     })
 }
 
@@ -440,15 +461,67 @@ fn collect_sessions(ctx: &Context) -> Result<SessionsSummary> {
     })
 }
 
-fn collect_hooks(mdkb_dir: &Path) -> HooksSummary {
+fn collect_hooks(mdkb_dir: &Path, repo_root: &Path, mining: MiningStatus) -> HooksSummary {
     let cutoff = chrono::Utc::now().timestamp() - 7 * 86_400;
 
     let slow_events_7d = count_slow_events(mdkb_dir, cutoff);
     let events = collect_hook_event_stats(mdkb_dir, cutoff);
+    let drift = crate::cli::setup::detect_hook_drift_for_repo(repo_root, None);
 
     HooksSummary {
         slow_events_7d,
         events,
+        drift,
+        mining,
+    }
+}
+
+/// Behavioral-prior mining status: on only when the master switch AND a distiller
+/// are both configured. The reason makes the common "silently off" states
+/// (no distiller, kill-switch off) visible instead of leaving operators guessing.
+fn collect_mining(ctx: &Context) -> MiningStatus {
+    // Report the EFFECTIVE priors the daemon actually mines with: the global
+    // daemon.toml layer merged under any per-repo override — the same merge
+    // `RepoHandle::open` performs. Reading only the repo config would show
+    // "disabled" even when daemon.toml turned mining on.
+    let global = match crate::daemon::config::DaemonConfig::load_or_default(
+        &crate::daemon::config::DaemonConfig::config_path(),
+    ) {
+        Ok(c) => c.priors,
+        Err(e) => {
+            // A corrupt daemon.toml would otherwise silently read as "mining
+            // disabled" — surface the real cause instead of a misleading status
+            // (FAIL-1).
+            tracing::warn!("stats: daemon.toml failed to load, priors defaulted: {e}");
+            toml::Table::new()
+        }
+    };
+    let repo = crate::config::raw_priors_layer(&ctx.config_path);
+    let priors = crate::config::merge_priors(&global, repo.as_ref());
+
+    let candidate_count = ctx
+        .conn
+        .query_row("SELECT COUNT(*) FROM prior_candidates", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    let (enabled, reason) = if !priors.mining_enabled {
+        (false, "mining_enabled = false".to_string())
+    } else if priors.distiller_program.is_none() {
+        (false, "no distiller_program configured".to_string())
+    } else {
+        (
+            true,
+            format!(
+                "active (distiller: {})",
+                priors.distiller_program.as_deref().unwrap_or("?")
+            ),
+        )
+    };
+
+    MiningStatus {
+        enabled,
+        reason,
+        candidate_count,
     }
 }
 
@@ -832,6 +905,7 @@ mod tests {
                 counts_by_type: HashMap::new(),
                 reminders_due: 0,
                 reminders_upcoming_7d: 0,
+                pending_embeddings: 0,
             },
             code: empty_code_summary(),
             sessions: SessionsSummary {
@@ -842,6 +916,12 @@ mod tests {
             hooks: HooksSummary {
                 slow_events_7d: 0,
                 events: vec![],
+                drift: crate::cli::setup::HookDrift::default(),
+                mining: MiningStatus {
+                    enabled: false,
+                    reason: "mining_enabled = false".to_string(),
+                    candidate_count: 0,
+                },
             },
         }
     }

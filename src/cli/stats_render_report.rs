@@ -99,6 +99,13 @@ fn render_memory(out: &mut String, m: &MemorySummary) {
     if lines.is_empty() {
         lines.push("  (no entries)".to_string());
     }
+    if m.pending_embeddings > 0 {
+        lines.push(format!(
+            "  ⚠ {} pending embedding{} — run: mdkb update",
+            m.pending_embeddings,
+            if m.pending_embeddings == 1 { "" } else { "s" }
+        ));
+    }
 
     out.push_str(&frame("Memory", &lines.join("\n"), WIDTH));
 }
@@ -236,6 +243,30 @@ fn render_hooks(out: &mut String, h: &HooksSummary) {
         }
     }
 
+    let _ = write!(
+        body,
+        "\n\n  mining           {}",
+        if h.mining.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    let _ = write!(body, "\n    reason         {}", h.mining.reason);
+    if h.mining.candidate_count > 0 {
+        let _ = write!(body, "\n    candidates     {}", h.mining.candidate_count);
+    }
+
+    if !h.drift.is_clean() {
+        body.push_str("\n\n  ⚠ stale hook registrations — run: mdkb setup hooks");
+        if !h.drift.duplicated.is_empty() {
+            let _ = write!(body, "\n     duplicated: {}", h.drift.duplicated.join(", "));
+        }
+        if !h.drift.missing.is_empty() {
+            let _ = write!(body, "\n     missing:    {}", h.drift.missing.join(", "));
+        }
+    }
+
     out.push_str(&frame("Hooks", &body, WIDTH));
 }
 
@@ -279,6 +310,7 @@ mod tests {
                 },
                 reminders_due: 1,
                 reminders_upcoming_7d: 2,
+                pending_embeddings: 0,
             },
             code: CodeSummary {
                 files: 12,
@@ -339,6 +371,12 @@ mod tests {
             hooks: HooksSummary {
                 slow_events_7d: 3,
                 events: vec![],
+                drift: crate::cli::setup::HookDrift::default(),
+                mining: crate::cli::stats_report::MiningStatus {
+                    enabled: false,
+                    reason: "mining_enabled = false".to_string(),
+                    candidate_count: 0,
+                },
             },
         }
     }
@@ -393,6 +431,57 @@ mod tests {
     fn render_hooks_shows_slow_count() {
         let out = render(&fixture_report(), false);
         assert!(out.contains('3')); // slow_events_7d
+    }
+
+    #[test]
+    fn render_hooks_shows_drift_warning_when_present() {
+        let mut r = fixture_report();
+        r.hooks.drift = crate::cli::setup::HookDrift {
+            duplicated: vec!["SessionStart".to_string()],
+            missing: vec!["Stop".to_string()],
+        };
+        let out = render(&r, false);
+        assert!(
+            out.contains("stale hook registrations"),
+            "warning header missing"
+        );
+        assert!(out.contains("mdkb setup hooks"), "remediation hint missing");
+        assert!(out.contains("SessionStart"), "duplicated event listed");
+        assert!(out.contains("Stop"), "missing event listed");
+    }
+
+    #[test]
+    fn render_hooks_clean_drift_shows_no_warning() {
+        let out = render(&fixture_report(), false);
+        assert!(!out.contains("stale hook registrations"));
+    }
+
+    #[test]
+    fn render_hooks_shows_mining_status_and_reason() {
+        let out = render(&fixture_report(), false);
+        assert!(out.contains("mining"), "mining status line present");
+        assert!(out.contains("disabled"), "fixture mining is disabled");
+        assert!(
+            out.contains("mining_enabled = false"),
+            "the reason must be shown: {out}"
+        );
+    }
+
+    #[test]
+    fn render_hooks_shows_mining_enabled() {
+        let mut r = fixture_report();
+        r.hooks.mining = crate::cli::stats_report::MiningStatus {
+            enabled: true,
+            reason: "active (distiller: codex)".to_string(),
+            candidate_count: 3,
+        };
+        let out = render(&r, false);
+        assert!(out.contains("enabled"));
+        assert!(out.contains("codex"));
+        assert!(
+            out.contains("candidates"),
+            "candidate count surfaced when > 0"
+        );
     }
 
     #[test]

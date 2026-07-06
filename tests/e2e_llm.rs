@@ -199,14 +199,14 @@ fn test_handle_embed_generates_embeddings() {
     let (temp, ctx) = setup_test_env();
 
     // Generate embeddings for all documents
-    let result = handle_embed(&ctx).expect("embed failed");
+    let result = handle_embed(&ctx, None).expect("embed failed");
 
     assert_eq!(result.generated, 3, "should generate embeddings for 3 docs");
     assert_eq!(result.skipped, 0, "no docs should be skipped on first run");
     assert!(result.errors.is_empty(), "should have no errors");
 
     // Running again should skip all
-    let result2 = handle_embed(&ctx).expect("second embed failed");
+    let result2 = handle_embed(&ctx, None).expect("second embed failed");
     assert_eq!(result2.generated, 0, "should generate 0 on second run");
     assert_eq!(result2.skipped, 3, "should skip all 3 on second run");
 
@@ -219,7 +219,7 @@ fn test_vsearch_finds_semantically_related() {
     let (temp, ctx) = setup_test_env();
 
     // Generate embeddings first
-    handle_embed(&ctx).expect("embed failed");
+    handle_embed(&ctx, None).expect("embed failed");
 
     // Search for memory safety - should find Rust doc
     let results = handle_vsearch(&ctx, "memory safety without garbage collection", 10, None)
@@ -254,7 +254,7 @@ fn test_vsearch_with_collection_filter() {
 
     handle_collection_add(&ctx, "notes", "notes", "**/*.md").unwrap();
     handle_update(&ctx, temp.path()).unwrap();
-    handle_embed(&ctx).expect("embed failed");
+    handle_embed(&ctx, None).expect("embed failed");
 
     // Search with collection filter
     let results = handle_vsearch(&ctx, "memory safety", 10, Some("docs")).expect("vsearch failed");
@@ -277,7 +277,7 @@ fn test_hybrid_search_combines_bm25_and_vector() {
     let (temp, ctx) = setup_test_env();
 
     // Generate embeddings
-    handle_embed(&ctx).expect("embed failed");
+    handle_embed(&ctx, None).expect("embed failed");
 
     // Hybrid search should find results
     let results = handle_hybrid_search(&ctx, "error handling in programming", 10, None, false)
@@ -305,7 +305,7 @@ fn test_hybrid_search_with_exact_term() {
     let (temp, ctx) = setup_test_env();
 
     // Generate embeddings
-    handle_embed(&ctx).expect("embed failed");
+    handle_embed(&ctx, None).expect("embed failed");
 
     // Search for exact term that only appears in one doc
     let results = handle_hybrid_search(&ctx, "CSRF anti-CSRF tokens", 10, None, false)
@@ -329,7 +329,7 @@ fn test_hybrid_search_with_exact_term() {
 fn test_vsearch_respects_limit() {
     let (temp, ctx) = setup_test_env();
 
-    handle_embed(&ctx).expect("embed failed");
+    handle_embed(&ctx, None).expect("embed failed");
 
     let results = handle_vsearch(&ctx, "programming", 2, None).expect("vsearch failed");
 

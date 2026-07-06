@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 15;
+pub const SCHEMA_VERSION: i32 = 17;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     expires_at INTEGER,                        -- Unix timestamp; NULL = permanent
     due_at INTEGER,                            -- Unix timestamp; surfaces reminders at/after this time
     created_session TEXT,                      -- session id that authored this entry (provenance)
-    created_agent TEXT                         -- agent/tool that authored this entry (provenance)
+    created_agent TEXT,                        -- agent/tool that authored this entry (provenance)
+    projected_at INTEGER                       -- when the markdown projection was last written; NULL = never
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
@@ -568,6 +569,50 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
 
         if table_exists && !has_embedding {
             conn.execute("ALTER TABLE prior_clusters ADD COLUMN embedding BLOB", [])?;
+        }
+    }
+
+    // Migration from v15 to v16: `sessions.agent` labels a session's origin so
+    // hook traffic (which has no MCP session) can be attributed to a reserved
+    // `agent='hooks'` pseudo-session instead of being dropped from call stats.
+    if from_version < 16 {
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        let has_agent: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'agent'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if table_exists && !has_agent {
+            conn.execute("ALTER TABLE sessions ADD COLUMN agent TEXT", [])?;
+        }
+    }
+
+    // Migration from v16 to v17: `memory_entries.projected_at` marks when an
+    // entry's markdown projection was last written. NULL = never projected (a
+    // DB-only entry to backfill); set = projected (so a subsequently-missing
+    // file is a deliberate deletion, archived on next sync). Distinguishes the
+    // two so file sync never wrongly archives never-projected DB entries.
+    if from_version < 17 {
+        let has_projected: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'projected_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_projected {
+            conn.execute(
+                "ALTER TABLE memory_entries ADD COLUMN projected_at INTEGER",
+                [],
+            )?;
         }
     }
 

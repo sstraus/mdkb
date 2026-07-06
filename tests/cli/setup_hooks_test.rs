@@ -3,7 +3,7 @@
 use std::fs;
 use std::sync::MutexGuard;
 
-use mdkb::cli::setup::{HOOK_EVENTS, handle_setup_hooks_claude};
+use mdkb::cli::setup::{HOOK_EVENTS, detect_hook_drift_for_repo, handle_setup_hooks_claude};
 use tempfile::TempDir;
 
 use super::common::env_lock;
@@ -274,6 +274,136 @@ fn concurrent_invocations_preserve_each_others_entries() {
             "event {event_name} must have exactly one mdkb entry after {N} concurrent writes"
         );
     }
+}
+
+/// Regression for the live audit shape: SessionStart/UserPromptSubmit/PostToolUse
+/// each registered twice (a tagged `mdkb` entry + a legacy untagged absolute-path
+/// entry), Stop missing entirely, alongside a foreign rtk hook. Re-running setup
+/// must collapse each event to exactly one mdkb entry, register the missing Stop,
+/// and leave the rtk hook untouched.
+#[test]
+fn live_shape_dedupes_to_one_per_event_and_registers_stop() {
+    let (_guard, project, _home) = isolated_project();
+    let settings_path = local_settings_path(project.path());
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+
+    let live = serde_json::json!({
+        "hooks": {
+            "SessionStart": [
+                {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook session-start"}]},
+                {"hooks": [{"type": "command", "command": "/Users/x/.local/bin/mdkb hook session-start"}]}
+            ],
+            "UserPromptSubmit": [
+                {"_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook user-prompt-submit"}]},
+                {"hooks": [{"type": "command", "command": "/Users/x/.local/bin/mdkb hook user-prompt-submit"}]}
+            ],
+            "PostToolUse": [
+                {"matcher": "Edit", "_managedBy": "mdkb", "hooks": [{"type": "command", "command": "mdkb hook post-tool-use"}]},
+                {"matcher": "Edit", "hooks": [{"type": "command", "command": "/Users/x/.local/bin/mdkb hook post-tool-use"}]}
+            ],
+            "PreToolUse": [
+                {"matcher": "Grep", "hooks": [{"type": "command", "command": "/Users/x/.local/bin/mdkb hook pre-tool-use"}]},
+                {"matcher": "Bash", "hooks": [{"type": "command", "command": "rtk hook claude"}]}
+            ]
+        }
+    });
+    fs::write(&settings_path, serde_json::to_string_pretty(&live).unwrap()).unwrap();
+
+    // Pre-condition: drift detection sees 3 duplicated events + Stop missing.
+    let before = detect_hook_drift_for_repo(project.path(), None);
+    assert!(!before.is_clean(), "seeded live shape must report drift");
+    assert_eq!(
+        before.duplicated,
+        vec!["SessionStart", "UserPromptSubmit", "PostToolUse"]
+    );
+    assert_eq!(before.missing, vec!["Stop"]);
+
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("setup hooks ok");
+
+    let v = read_json(&settings_path);
+    for (event_name, ..) in HOOK_EVENTS {
+        assert_eq!(
+            mdkb_entries(&v, event_name).len(),
+            1,
+            "event {event_name} must collapse to exactly one mdkb entry"
+        );
+    }
+
+    // rtk survives untouched.
+    let pre = v
+        .get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|a| a.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let rtk = pre.iter().filter(|i| {
+        i.get("hooks")
+            .and_then(|h| h.as_array())
+            .and_then(|a| a.first())
+            .and_then(|e| e.get("command"))
+            .and_then(|c| c.as_str())
+            == Some("rtk hook claude")
+    });
+    assert_eq!(rtk.count(), 1, "foreign rtk hook must survive");
+
+    // Post-condition: no drift after setup.
+    let after = detect_hook_drift_for_repo(project.path(), None);
+    assert!(after.is_clean(), "setup must clear all drift: {after:?}");
+}
+
+/// An empty settings file (whitespace only) is treated as `{}` and gets the
+/// full canonical set — never an error, never a clobber-to-null.
+#[test]
+fn empty_settings_file_gets_full_canonical_set() {
+    let (_guard, project, _home) = isolated_project();
+    let settings_path = local_settings_path(project.path());
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    fs::write(&settings_path, "   \n").unwrap();
+
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("setup hooks ok");
+
+    let v = read_json(&settings_path);
+    for (event_name, ..) in HOOK_EVENTS {
+        assert_eq!(mdkb_entries(&v, event_name).len(), 1, "{event_name}");
+    }
+    assert!(detect_hook_drift_for_repo(project.path(), None).is_clean());
+}
+
+/// Running setup on already-canonical settings is a no-op (still one per event).
+#[test]
+fn already_clean_settings_stay_clean() {
+    let (_guard, project, _home) = isolated_project();
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("first run");
+    let first = fs::read_to_string(local_settings_path(project.path())).unwrap();
+
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("second run");
+    let second = fs::read_to_string(local_settings_path(project.path())).unwrap();
+
+    assert_eq!(
+        first, second,
+        "re-running on clean settings must be byte-stable"
+    );
+    assert!(detect_hook_drift_for_repo(project.path(), None).is_clean());
+}
+
+/// Corrupted JSON must error out WITHOUT clobbering the file — the user's
+/// (broken but recoverable) settings survive for manual repair.
+#[test]
+fn corrupted_json_errors_without_clobbering() {
+    let (_guard, project, _home) = isolated_project();
+    let settings_path = local_settings_path(project.path());
+    fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    let corrupt = "{ \"hooks\": { broken";
+    fs::write(&settings_path, corrupt).unwrap();
+
+    let result = handle_setup_hooks_claude(project.path(), "local", "", false, None);
+    assert!(
+        result.is_err(),
+        "corrupted settings must error, not silently overwrite"
+    );
+
+    let after = fs::read_to_string(&settings_path).unwrap();
+    assert_eq!(after, corrupt, "corrupted file must be left untouched");
 }
 
 /// Generated command must route through the daemon (`mdkb hook <event>`)
