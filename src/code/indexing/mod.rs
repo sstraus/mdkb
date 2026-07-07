@@ -92,8 +92,10 @@ impl IndexFacade {
         let indexed_mtimes = self.db.get_file_mtimes()?;
 
         let stats = if indexed_mtimes.is_empty() {
-            // Fresh index — no dedup needed
-            pipeline::index_directory(root, &self.db, &self.config)?
+            // Fresh index — no dedup needed. Embed the whole symbol table.
+            let stats = pipeline::index_directory(root, &self.db, &self.config)?;
+            self.generate_symbol_embeddings();
+            stats
         } else {
             // Incremental — discover files, filter by mtime, delete stale, re-index.
             // Uses mtime comparison (filesystem metadata) to avoid reading file contents.
@@ -131,10 +133,14 @@ impl IndexFacade {
                 self.delete_by_file(path, root)?;
             }
 
-            pipeline::index_files(&changed, root, &self.db, &self.config)?
+            let stats = pipeline::index_files(&changed, root, &self.db, &self.config)?;
+            // Re-embed ONLY the changed files' symbols, reusing existing vectors
+            // for everything else — a 1-file change must not re-run ONNX over the
+            // entire symbol table (PERF-D3).
+            self.generate_symbol_embeddings_for_files(&changed, root);
+            stats
         };
 
-        self.generate_symbol_embeddings();
         self.db.mark_index_scan_completed()?;
         Ok(stats)
     }
@@ -1135,6 +1141,61 @@ pub fn world() {
         assert!(facade.get_symbol_by_name("aaa").is_some());
         assert!(facade.get_symbol_by_name("bbb").is_none());
         assert!(facade.get_symbol_by_name("ccc").is_some());
+    }
+
+    #[test]
+    #[ignore] // requires ONNX model download (see tests/e2e_llm.rs convention)
+    fn incremental_update_reembeds_only_changed_symbols() {
+        // PERF-D3: an incremental update of one file must re-embed only that
+        // file's symbols, reusing the stored vectors for everything else. We
+        // plant a sentinel embedding on an UNCHANGED symbol; if the buggy full
+        // re-embed path ran, it would overwrite the sentinel with a fresh vector.
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        let bbb_id = facade
+            .find_symbols_by_name("bbb")
+            .first()
+            .expect("bbb indexed")
+            .id
+            .value();
+
+        // Overwrite the store so bbb's vector is a recognisable sentinel, keeping
+        // every other symbol's real embedding.
+        {
+            let semantic = facade.ensure_semantic().expect("semantic (model present)");
+            let mut all = semantic.store_load_filtered(|_| true);
+            for (id, vec) in &mut all {
+                if *id == bbb_id {
+                    vec.iter_mut().for_each(|v| *v = 0.5); // sentinel
+                }
+            }
+            semantic
+                .generate_embeddings_incremental(&all, &[])
+                .expect("seed sentinel");
+        }
+
+        // Change only a.rs — bbb is untouched.
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa_v2() {}").unwrap();
+        facade.update(src_dir.path()).unwrap();
+
+        let bbb_after = facade
+            .ensure_semantic()
+            .unwrap()
+            .store_load_filtered(|id| id == bbb_id);
+        assert_eq!(bbb_after.len(), 1, "bbb embedding must still be present");
+        assert!(
+            bbb_after[0].1.iter().all(|&v| (v - 0.5).abs() < f32::EPSILON),
+            "bbb's sentinel embedding must be preserved — a 1-file change must not \
+             re-embed unchanged symbols"
+        );
+        // The changed symbol is freshly embedded and searchable.
+        assert!(facade.get_symbol_by_name("aaa_v2").is_some());
     }
 
     #[test]
