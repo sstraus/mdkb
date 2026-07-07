@@ -158,7 +158,7 @@ fn session_start_warmup_economy_caps_and_filters() {
         &ctx,
         "handoff-new",
         EntryType::Handoff,
-        "---\ns: 3\n---\n",
+        "---\ns: 3\n---\n# Session Handoff\n\nPending: a carried-forward work item that must survive into the next session.",
         SourceType::UserStatement,
         100,
         1,
@@ -196,14 +196,18 @@ fn session_start_warmup_economy_caps_and_filters() {
         lines.len()
     );
     let joined = lines.join("\n");
-    assert!(joined.contains("handoff-new"), "newest handoff kept");
+    // Handoffs never appear in the compact list — mdkb injects the newest one's
+    // full body as a dedicated block instead of a truncated title-line.
     assert!(
-        !joined.contains("handoff-old"),
-        "empty older handoff suppressed"
+        !joined.contains("handoff-new")
+            && !joined.contains("handoff-mid")
+            && !joined.contains("handoff-old"),
+        "no handoff title-line may appear in the compact list: {joined}"
     );
     assert!(
-        !joined.contains("handoff-mid"),
-        "empty older handoff suppressed"
+        stdout.contains("## Last session handoff")
+            && stdout.contains("a carried-forward work item that must survive"),
+        "newest handoff body injected as a dedicated block: {stdout}"
     );
     assert!(
         !joined.contains("stale-inference"),

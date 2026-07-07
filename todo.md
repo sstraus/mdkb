@@ -273,6 +273,21 @@ that must be re-tested, or is a cross-cutting refactor. Full detail + confidence
       in recursive self-call, `0` at every non-recursive caller. Criterion 3 reads
       "all recursive traversals in EVERY language module", so all 31 are in scope.
       Complexity S (mechanical), Priority P2.
+- [ ] WIZ-SIDE (companion to story 073) — **wiz `session-start.js:1741` must STOP injecting the
+      handoff body** ("Last Session Handoff" / "Your Previous Context"). mdkb now owns handoff
+      injection (story 073: `hook_session_start_impl` emits `## Last session handoff` with the full
+      newest-handoff body and excludes handoffs from the compact list). Leaving wiz's injection on
+      double-injects the body. File is in the wiz plugin cache (outside this repo) — Boss patches the
+      wiz plugin source. Priority P1 (do together with the 073 release).
+- [ ] WIZ-SIDE (handoff title truncation) — wiz `journal-cli.js:1383` writes
+      `title: input.summary.substring(0, 50)` → cuts mid-word, no ellipsis (the "hermetic f" ugliness).
+      The full text is safe in the entry body (`content`); only the label is truncated. Fix in the wiz
+      plugin: truncate at a word boundary + "…", or generate a real short title. Outside this repo.
+      Priority P2 (cosmetic; mdkb now shows the body block for the newest handoff regardless).
+- [ ] 072 (P2, in_progress) — Warmup line rendering: for the remaining (non-handoff) compact entries,
+      drop the redundant `[type]` label when the id starts with `<type>-`, and filter `#<type>` and
+      `#session-*` noise tags in `format_warmup_line` (src/store/memory.rs). Handoffs are already out of
+      the list (073), so this now mainly cleans tags on topic/problem/decision/reminder entries.
 - [ ] 060 (P1) — Integration coverage for priors mining + memory graph: NOT STARTED.
       Needs an E2E test with mining_enabled + a stub distiller driving a Stop hook
       (assert promoted prior injected), run_distiller_cli failure-mode unit tests

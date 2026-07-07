@@ -2411,9 +2411,9 @@ fn is_high_confidence_prior(entry: &crate::store::memory::MemoryEntry, now: i64)
 /// reserve at most one slot for the single highest-confidence curated prior
 /// (confidence >= gate) so it can appear without crowding out hot entries, then
 /// truncate to `limit`.
-/// A handoff whose stripped body is shorter than this is "empty" (an auto-handoff
-/// that captured no real state) and is suppressed from warmup unless it is the
-/// single most-recent handoff.
+/// A handoff whose stripped body is shorter than this is treated as "empty" (an
+/// auto-handoff that captured no real state): its body is not injected as the
+/// session-start handoff block.
 const HANDOFF_MIN_BODY_CHARS: usize = 80;
 
 fn rank_warmup_entries(
@@ -2422,31 +2422,10 @@ fn rank_warmup_entries(
     min_confidence: f64,
     now: i64,
 ) -> Vec<crate::store::memory::MemoryEntry> {
-    // Handoff policy: always keep the single most-recent handoff (the "where did
-    // I leave off" anchor — guaranteed into the output against truncation below),
-    // plus at most ONE older handoff and only if it carries real content. Capping
-    // at two stops a run of substantive handoffs from crowding topic/problem/
-    // decision out of warmup.
-    use crate::store::memory::{EntryType, strip_frontmatter};
-    let mut handoffs: Vec<&crate::store::memory::MemoryEntry> = entries
-        .iter()
-        .filter(|e| e.entry_type == EntryType::Handoff)
-        .collect();
-    handoffs.sort_by_key(|e| std::cmp::Reverse(e.updated_at));
-    let newest_handoff_id = handoffs.first().map(|e| e.id.clone());
-    let kept_older_handoff_id = handoffs
-        .iter()
-        .skip(1)
-        .find(|e| strip_frontmatter(&e.content).chars().count() >= HANDOFF_MIN_BODY_CHARS)
-        .map(|e| e.id.clone());
-    entries.retain(|e| {
-        if e.entry_type != EntryType::Handoff {
-            return true;
-        }
-        Some(&e.id) == newest_handoff_id.as_ref()
-            || Some(&e.id) == kept_older_handoff_id.as_ref()
-    });
-
+    // Handoffs never appear here: the newest one is injected in full as a body
+    // block by hook_session_start_impl, and the caller strips all handoffs before
+    // ranking. This operates purely on topic/problem/decision/reminder/prior
+    // entries, so a truncated handoff title-line can never crowd the list.
     if min_confidence > 0.0 {
         entries.retain(|e| e.confidence_at(now) >= min_confidence);
     }
@@ -2464,11 +2443,9 @@ fn rank_warmup_entries(
         return entries;
     }
 
-    // Reserve tail slots for entries that must survive truncation even when they
-    // aren't "hot" (low access_count): the newest handoff (session-start anchor —
-    // must always inject) takes priority, then the single highest-confidence
-    // curated prior. Each is swapped into a distinct tail slot only if it would
-    // otherwise be truncated, so at most two hot entries are displaced.
+    // Reserve one tail slot for the single highest-confidence curated prior: if
+    // it would be truncated away, swap it into the last kept slot so a curated
+    // prior surfaces without displacing more than one hot entry.
     let best_prior = entries
         .iter()
         .enumerate()
@@ -2479,16 +2456,9 @@ fn rank_warmup_entries(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(idx, _)| idx);
-    let newest_handoff_idx = newest_handoff_id
-        .as_ref()
-        .and_then(|id| entries.iter().position(|e| &e.id == id));
-
-    // Handoff first so its guarantee wins when only one slot can be reserved.
-    let mut next_slot = limit;
-    for idx in [newest_handoff_idx, best_prior].into_iter().flatten() {
-        if idx >= limit && next_slot > 0 {
-            next_slot -= 1;
-            entries.swap(next_slot, idx);
+    if let Some(idx) = best_prior {
+        if idx >= limit {
+            entries.swap(limit - 1, idx);
         }
     }
 
@@ -2600,6 +2570,43 @@ fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
     true
 }
 
+/// Split the newest handoff's body out of the warmup entry set.
+///
+/// Returns the frontmatter-stripped body of the single most-recent handoff (the
+/// session-start "where did I leave off" anchor, injected in full) and the
+/// remaining non-handoff entries for the compact list. ALL handoffs are dropped
+/// from the returned entries so a truncated handoff title-line never surfaces.
+/// The body is `None` when there is no handoff, or the newest one is effectively
+/// empty (an auto-handoff whose stripped body is shorter than
+/// [`HANDOFF_MIN_BODY_CHARS`]).
+fn take_newest_handoff_body(
+    entries: Vec<crate::store::memory::MemoryEntry>,
+) -> (Option<String>, Vec<crate::store::memory::MemoryEntry>) {
+    use crate::store::memory::{EntryType, strip_frontmatter};
+    let newest_idx = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.entry_type == EntryType::Handoff)
+        .max_by_key(|(_, e)| e.updated_at)
+        .map(|(i, _)| i);
+    let mut body = None;
+    let mut rest = Vec::with_capacity(entries.len());
+    for (i, e) in entries.into_iter().enumerate() {
+        if e.entry_type == EntryType::Handoff {
+            if Some(i) == newest_idx {
+                let stripped = strip_frontmatter(&e.content).trim().to_string();
+                if stripped.chars().count() >= HANDOFF_MIN_BODY_CHARS {
+                    body = Some(stripped);
+                }
+            }
+            // every handoff is dropped from the compact list
+        } else {
+            rest.push(e);
+        }
+    }
+    (body, rest)
+}
+
 pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
@@ -2622,6 +2629,11 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
         }
     };
     drop(ctx_guard);
+
+    // mdkb owns handoff injection: pull the newest handoff's full body out for a
+    // dedicated block and drop ALL handoffs from the ranked compact list — a
+    // 50-char truncated handoff title-line is useless for context restoration.
+    let (handoff_body, entries) = take_newest_handoff_body(entries);
 
     // Global rank: confidence floor (off at 0.0), access_count DESC primary with
     // confidence tie-break, one reserved slot for the top curated prior.
@@ -2658,7 +2670,7 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
     // Single-flight + best-effort; the ctx lock is already released.
     spawn_embedding_backfill(Arc::clone(handle));
 
-    if lines.is_empty() {
+    if lines.is_empty() && handoff_body.is_none() {
         return json!({});
     }
 
@@ -2667,24 +2679,35 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_else(|| "mdkb".to_string());
 
-    // Emit lines until the token budget (≈4 chars/token) would be exceeded.
-    // Never truncate a line mid-way — stop before it — so every emitted line
-    // keeps its id+type+title+tags. The first line always emits (a single
-    // over-budget line still beats an empty warmup).
-    let mut body = String::from("## mdkb memory warmup\n\n");
-    let budget = cfg.warmup_token_budget;
-    let mut used_tokens = 0usize;
-    let mut emitted = 0usize;
-    for line in &lines {
-        let cost = line.chars().count() / 4 + 1;
-        if emitted > 0 && used_tokens + cost > budget {
-            break;
+    // The newest handoff body is injected in full — it IS the session-restoration
+    // anchor — exempt from the compact-list token budget.
+    let mut body = String::new();
+    if let Some(hb) = &handoff_body {
+        body.push_str("## Last session handoff\n\n");
+        body.push_str(hb);
+        body.push_str("\n\n");
+    }
+
+    // Emit compact lines until the token budget (≈4 chars/token) would be
+    // exceeded. Never truncate a line mid-way — stop before it — so every emitted
+    // line keeps its id+type+title+tags. The first line always emits (a single
+    // over-budget line still beats an empty list).
+    if !lines.is_empty() {
+        body.push_str("## mdkb memory warmup\n\n");
+        let budget = cfg.warmup_token_budget;
+        let mut used_tokens = 0usize;
+        let mut emitted = 0usize;
+        for line in &lines {
+            let cost = line.chars().count() / 4 + 1;
+            if emitted > 0 && used_tokens + cost > budget {
+                break;
+            }
+            body.push_str("- ");
+            body.push_str(line);
+            body.push('\n');
+            used_tokens += cost;
+            emitted += 1;
         }
-        body.push_str("- ");
-        body.push_str(line);
-        body.push('\n');
-        used_tokens += cost;
-        emitted += 1;
     }
     body.push_str(&format!(
         "\n**mdkb CLI** (semantic search — not available via Grep/Glob). Run `{bin} cheatsheet` for full syntax.\n"
@@ -3848,32 +3871,25 @@ mod tests {
     }
 
     #[test]
-    fn rank_suppresses_empty_older_handoffs_keeps_newest() {
+    fn take_newest_handoff_body_extracts_newest_and_drops_all_handoffs() {
         use crate::store::memory::{EntryType, SourceType};
         let now = 1_000_000_000;
+        let newest_body = format!("---\ns: 3\n---\n{}", "full newest handoff body ".repeat(5));
+        let older_body = format!("---\ns: 2\n---\n{}", "older handoff body ".repeat(5));
         let entries = vec![
             warmup_entry(
                 "h-old",
                 EntryType::Handoff,
-                "---\ns: 1\n---\n",
+                &older_body,
                 SourceType::UserStatement,
                 5,
                 3,
                 now,
             ),
             warmup_entry(
-                "h-mid",
-                EntryType::Handoff,
-                "---\ns: 2\n---\n",
-                SourceType::UserStatement,
-                5,
-                2,
-                now,
-            ),
-            warmup_entry(
                 "h-new",
                 EntryType::Handoff,
-                "---\ns: 3\n---\n",
+                &newest_body,
                 SourceType::UserStatement,
                 5,
                 1,
@@ -3889,135 +3905,82 @@ mod tests {
                 now,
             ),
         ];
-        let ranked = rank_warmup_entries(entries, 10, 0.0, now);
-        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
-        assert!(ids.contains(&"h-new"), "newest handoff kept: {ids:?}");
-        assert!(!ids.contains(&"h-old"), "empty older handoff dropped");
-        assert!(!ids.contains(&"h-mid"), "empty older handoff dropped");
-        assert!(ids.contains(&"topic"));
+        let (body, rest) = take_newest_handoff_body(entries);
+        let body = body.expect("newest handoff body extracted");
+        assert!(
+            body.starts_with("full newest handoff body"),
+            "frontmatter stripped and newest chosen: {body}"
+        );
+        assert!(!body.contains("---"), "frontmatter removed: {body}");
+        let ids: Vec<&str> = rest.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["topic"],
+            "every handoff dropped, non-handoff retained: {ids:?}"
+        );
     }
 
     #[test]
-    fn rank_keeps_older_handoff_with_real_content() {
+    fn take_newest_handoff_body_none_when_no_handoff() {
         use crate::store::memory::{EntryType, SourceType};
         let now = 1_000_000_000;
-        let long_body = "x".repeat(200);
         let entries = vec![
             warmup_entry(
-                "h-new",
+                "topic",
+                EntryType::Topic,
+                "content",
+                SourceType::UserStatement,
+                5,
+                0,
+                now,
+            ),
+            warmup_entry(
+                "prob",
+                EntryType::Problem,
+                "content",
+                SourceType::UserStatement,
+                5,
+                0,
+                now,
+            ),
+        ];
+        let (body, rest) = take_newest_handoff_body(entries);
+        assert!(body.is_none(), "no handoff means no body block");
+        assert_eq!(rest.len(), 2, "non-handoff entries untouched");
+    }
+
+    #[test]
+    fn take_newest_handoff_body_skips_empty_body_but_still_drops_handoff() {
+        use crate::store::memory::{EntryType, SourceType};
+        let now = 1_000_000_000;
+        // An auto-handoff whose body is only frontmatter (< HANDOFF_MIN_BODY_CHARS).
+        let entries = vec![
+            warmup_entry(
+                "h-empty",
                 EntryType::Handoff,
-                "---\ns: 3\n---\n",
+                "---\ns: 1\n---\n",
                 SourceType::UserStatement,
                 5,
                 1,
                 now,
             ),
             warmup_entry(
-                "h-rich",
-                EntryType::Handoff,
-                &long_body,
-                SourceType::UserStatement,
-                5,
-                5,
-                now,
-            ),
-        ];
-        let ranked = rank_warmup_entries(entries, 10, 0.0, now);
-        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
-        assert!(
-            ids.contains(&"h-rich"),
-            "older handoff with body is retained"
-        );
-        assert!(ids.contains(&"h-new"));
-    }
-
-    #[test]
-    fn rank_guarantees_newest_handoff_survives_truncation() {
-        use crate::store::memory::{EntryType, SourceType};
-        let now = 1_000_000_000;
-        // A fresh handoff (access_count 0) plus four hot topics (access 100).
-        // With limit=2 the sort ranks the topics first and would truncate the
-        // handoff away — the reserved slot must guarantee it survives.
-        let mut entries = vec![warmup_entry(
-            "h-new",
-            EntryType::Handoff,
-            "---\ns: 1\n---\n",
-            SourceType::UserStatement,
-            0,
-            1,
-            now,
-        )];
-        for i in 0..4 {
-            entries.push(warmup_entry(
-                &format!("topic{i}"),
+                "topic",
                 EntryType::Topic,
                 "real content",
                 SourceType::UserStatement,
-                100,
+                5,
                 0,
-                now,
-            ));
-        }
-        let ranked = rank_warmup_entries(entries, 2, 0.0, now);
-        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(ranked.len(), 2, "truncated to limit: {ids:?}");
-        assert!(
-            ids.contains(&"h-new"),
-            "newest handoff guaranteed despite low access_count: {ids:?}"
-        );
-    }
-
-    #[test]
-    fn rank_caps_handoffs_at_two_keeping_two_newest() {
-        use crate::store::memory::{EntryType, SourceType};
-        let now = 1_000_000_000;
-        let body = "x".repeat(200); // every handoff is substantive (> 80 chars)
-        // Three substantive handoffs with a generous limit: only the newest and
-        // the single most-recent older one may survive; the third is capped out.
-        let entries = vec![
-            warmup_entry(
-                "h-new",
-                EntryType::Handoff,
-                &body,
-                SourceType::UserStatement,
-                5,
-                1,
-                now,
-            ),
-            warmup_entry(
-                "h-mid",
-                EntryType::Handoff,
-                &body,
-                SourceType::UserStatement,
-                5,
-                2,
-                now,
-            ),
-            warmup_entry(
-                "h-old",
-                EntryType::Handoff,
-                &body,
-                SourceType::UserStatement,
-                5,
-                3,
                 now,
             ),
         ];
-        let ranked = rank_warmup_entries(entries, 10, 0.0, now);
-        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
-        let handoffs = ranked
-            .iter()
-            .filter(|e| e.entry_type == EntryType::Handoff)
-            .count();
-        assert_eq!(handoffs, 2, "at most two handoffs survive warmup: {ids:?}");
-        assert!(ids.contains(&"h-new"), "newest handoff kept: {ids:?}");
-        assert!(
-            ids.contains(&"h-mid"),
-            "most-recent older substantive handoff kept: {ids:?}"
-        );
-        assert!(
-            !ids.contains(&"h-old"),
-            "third substantive handoff dropped by cap: {ids:?}"
+        let (body, rest) = take_newest_handoff_body(entries);
+        assert!(body.is_none(), "empty handoff body is not injected");
+        let ids: Vec<&str> = rest.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["topic"],
+            "handoff still dropped from the compact list: {ids:?}"
         );
     }
 
@@ -4689,6 +4652,73 @@ mod tests {
         assert!(
             body.contains("warm-derived"),
             "flagged entry present: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_injects_newest_handoff_body_and_excludes_handoff_from_list() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        // A substantive handoff (full body) plus a topic for the compact list.
+        let handoff_body = format!(
+            "---\nsession: abc\n---\n# Session Handoff\n\n{}",
+            "Pending: finish the warmup body injection work. ".repeat(4)
+        );
+        {
+            ensure_handle_context(&handle).await.expect("init ctx");
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            let now = chrono::Utc::now().timestamp();
+            let handoff = crate::store::memory::MemoryEntry {
+                id: "handoff-2026-07-07-deadbeef".into(),
+                // A deliberately truncated title (as journal-cli.js writes it) —
+                // it must NOT surface; the full body must.
+                title: "Committed KG stories: wiz compact-guard hermetic f".into(),
+                content: handoff_body.clone(),
+                entry_type: crate::store::memory::EntryType::Handoff,
+                tags: vec!["handoff".into(), "session-abc".into()],
+                status: crate::store::memory::EntryStatus::Active,
+                created_at: now,
+                updated_at: now,
+                superseded_by: None,
+                access_count: 0,
+                last_accessed: Some(now),
+                source_path: None,
+                confirmations: 0,
+                last_confirmed_at: None,
+                source_type: crate::store::memory::SourceType::UserStatement,
+                expires_at: None,
+                due_at: None,
+            };
+            crate::store::memory::add_entry(conn, &handoff).expect("seed handoff");
+        }
+        seed_topic_with_content(&handle, "topic-x", "Deployment checklist", 50).await;
+
+        let out = hook_session_start_impl(&handle).await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            body.contains("## Last session handoff"),
+            "newest handoff body block injected: {body}"
+        );
+        assert!(
+            body.contains("Pending: finish the warmup body injection work"),
+            "full handoff body present (not the truncated title): {body}"
+        );
+        assert!(
+            !body.contains("[handoff]"),
+            "handoff must not appear as a compact title-line: {body}"
+        );
+        assert!(
+            !body.contains("handoff-2026-07-07-deadbeef"),
+            "handoff id excluded from compact list: {body}"
+        );
+        assert!(
+            body.contains("topic-x"),
+            "non-handoff entry still listed: {body}"
         );
     }
 
