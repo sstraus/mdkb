@@ -214,11 +214,13 @@ fn session_start_warmup_economy_caps_and_filters() {
         "sub-floor entry excluded: {joined}"
     );
 
-    // Every emitted line carries the `[type] id: title` shape (id+type+title).
+    // Every emitted line carries the `- <id>: <title>` shape. The `[type]` label
+    // is dropped when the id already begins with the type (these seeded topics
+    // use `topic-NN` ids), so the `id: title` separator is the invariant.
     for l in &lines {
         assert!(
-            l.contains('[') && l.contains(']') && l.contains(':'),
-            "line missing id+type+title structure: {l}"
+            l.starts_with("- ") && l.contains(": "),
+            "line missing id: title structure: {l}"
         );
     }
 

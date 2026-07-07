@@ -1312,16 +1312,34 @@ pub fn strip_frontmatter(content: &str) -> &str {
 /// Render a single warmup entry into the `[type] id: title #tags` line used by
 /// both the formatted index and the hook body.
 pub fn format_warmup_line(entry: &MemoryEntry) -> String {
+    let type_str = entry.entry_type.to_string();
+    // The `[type]` label is redundant when the id already begins with `<type>-`:
+    // the type shows once, via the id, while the full id stays copy-pasteable for
+    // `mdkb memory get`. Slug ids without a type prefix keep the label.
+    let label = if entry.id.starts_with(&format!("{type_str}-")) {
+        String::new()
+    } else {
+        format!("[{type_str}] ")
+    };
+    // Drop zero-signal tags — the entry_type itself (already conveyed by the
+    // label/id) and ephemeral per-session tags. The model can search if it wants
+    // the rest; every warmup token is charged on every turn.
     let tags_str = entry
         .tags
         .iter()
+        .filter(|t| {
+            !t.eq_ignore_ascii_case(&type_str)
+                && !t.starts_with("session-")
+                && !t.starts_with("session_")
+        })
         .map(|t| format!("#{t}"))
         .collect::<Vec<_>>()
         .join(" ");
-    format!(
-        "[{}] {}: {} {}",
-        entry.entry_type, entry.id, entry.title, tags_str
-    )
+    if tags_str.is_empty() {
+        format!("{label}{}: {}", entry.id, entry.title)
+    } else {
+        format!("{label}{}: {} {}", entry.id, entry.title, tags_str)
+    }
 }
 
 /// Build the due-reminder warmup lines: active reminders past their `due_at`,
@@ -1878,7 +1896,9 @@ mod tests {
             "future reminder must not appear"
         );
         assert!(
-            warmup.iter().any(|l| l.starts_with("[topic] topic-one:")),
+            // id already begins with the type, so the redundant [topic] label is
+            // dropped (see format_warmup_line).
+            warmup.iter().any(|l| l.starts_with("topic-one:")),
             "regular topic must follow"
         );
         assert!(
@@ -3975,5 +3995,63 @@ mod tests {
         assert!(one_hl > two_hl);
         // 1 half-life → ~ half of fresh
         assert!((one_hl / fresh - 0.5).abs() < 1e-6);
+    }
+
+    fn warmup_line_entry(id: &str, entry_type: EntryType, tags: &[&str]) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            title: "A concise title".to_string(),
+            content: "body".to_string(),
+            entry_type,
+            tags: tags.iter().map(|t| t.to_string()).collect(),
+            status: EntryStatus::Active,
+            created_at: 0,
+            updated_at: 0,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        }
+    }
+
+    #[test]
+    fn format_warmup_line_drops_type_label_for_type_prefixed_id_and_noise_tags() {
+        // A handoff-shaped id already begins with the type; the [type] label is
+        // redundant. #handoff duplicates the type; #session-* is ephemeral noise.
+        let e = warmup_line_entry(
+            "handoff-2026-07-05-eb45505c",
+            EntryType::Handoff,
+            &["handoff", "session-576f58ee", "kg"],
+        );
+        assert_eq!(
+            format_warmup_line(&e),
+            "handoff-2026-07-05-eb45505c: A concise title #kg"
+        );
+    }
+
+    #[test]
+    fn format_warmup_line_keeps_label_for_slug_id_and_real_tags() {
+        let e = warmup_line_entry(
+            "mdkb-injection-low-conversion",
+            EntryType::Problem,
+            &["mcp", "injection"],
+        );
+        assert_eq!(
+            format_warmup_line(&e),
+            "[problem] mdkb-injection-low-conversion: A concise title #mcp #injection"
+        );
+    }
+
+    #[test]
+    fn format_warmup_line_no_trailing_space_when_all_tags_filtered() {
+        // Every tag is noise → no tag segment, and no trailing space. Slug id
+        // (not "topic-…") keeps the [type] label.
+        let e = warmup_line_entry("deploy-notes", EntryType::Topic, &["topic", "session-abc"]);
+        assert_eq!(format_warmup_line(&e), "[topic] deploy-notes: A concise title");
     }
 }
