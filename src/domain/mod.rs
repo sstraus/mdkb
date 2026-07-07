@@ -10,7 +10,6 @@ pub mod prior_detect;
 pub mod prior_distill;
 pub mod prior_episode;
 pub mod sessions;
-pub mod traits;
 
 use serde::{Deserialize, Serialize};
 
