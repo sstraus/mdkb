@@ -146,6 +146,12 @@ pub enum Command {
         #[arg(long, env = "MDKB_TOKEN")]
         token: Option<String>,
 
+        /// Allow starting --http/--https with no token, disabling authentication.
+        /// Off by default: a tokenless network server accepts every request, so
+        /// starting one is a hard error unless you opt in explicitly.
+        #[arg(long)]
+        allow_no_auth: bool,
+
         /// Global mode: serve multiple repos, discover roots via MCP roots/list protocol.
         /// Config loaded from ~/.mdkb/daemon.toml (whitelist, max_active_repos).
         #[arg(long)]

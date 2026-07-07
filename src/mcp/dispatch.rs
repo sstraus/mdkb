@@ -454,10 +454,25 @@ pub async fn memory_confirm_impl(
         .map_err(|e| mcp_error(format!("Failed to confirm memory entry: {e}")))
 }
 
+/// Generic error returned for any `source_file` rejection (missing,
+/// out-of-root, oversized, or permission-denied). Kept identical across all
+/// causes so the response never leaks OS file-existence/permission info.
+const SOURCE_FILE_ERROR: &str = "source_file is invalid or inaccessible";
+
+/// Maximum size (in bytes) of a `source_file` that `memory_write` will read.
+/// Enforced against file metadata length before any content is read, so an
+/// oversized file is rejected without ever being loaded into memory.
+const MAX_SOURCE_FILE_BYTES: u64 = 1024 * 1024;
+
 /// Core logic for writing a single memory entry. Used by both
 /// Resolve `source_file` → content. Returns `(content, source_path)`.
 /// Errors if both content and source_file are provided.
+///
+/// `root` is the repo root the caller is scoped to; `source_file` must
+/// canonicalize to a path under it (symlink escapes included) or the read is
+/// rejected with a generic error.
 fn resolve_source_file(
+    root: &std::path::Path,
     content: &str,
     source_file: Option<&str>,
 ) -> Result<(String, Option<String>), McpError> {
@@ -466,11 +481,21 @@ fn resolve_source_file(
             "Cannot specify both content and source_file — use one or the other",
         )),
         Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .map_err(|e| mcp_error(format!("Failed to read source_file {path}: {e}")))?;
+            let canonical_root = root
+                .canonicalize()
+                .map_err(|_| mcp_error(SOURCE_FILE_ERROR))?;
             let abs = std::path::Path::new(path)
                 .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from(path));
+                .map_err(|_| mcp_error(SOURCE_FILE_ERROR))?;
+            if !abs.starts_with(&canonical_root) {
+                return Err(mcp_error(SOURCE_FILE_ERROR));
+            }
+            let metadata = std::fs::metadata(&abs).map_err(|_| mcp_error(SOURCE_FILE_ERROR))?;
+            if metadata.len() > MAX_SOURCE_FILE_BYTES {
+                return Err(mcp_error(SOURCE_FILE_ERROR));
+            }
+            let text =
+                std::fs::read_to_string(&abs).map_err(|_| mcp_error(SOURCE_FILE_ERROR))?;
             Ok((text, Some(abs.to_string_lossy().to_string())))
         }
         None if content.is_empty() => {
@@ -718,7 +743,8 @@ pub async fn memory_write_impl(
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
-    let (content, source_path) = resolve_source_file(&entry.content, entry.source_file.as_deref())?;
+    let (content, source_path) =
+        resolve_source_file(&handle.root, &entry.content, entry.source_file.as_deref())?;
 
     // Pre-compute embedding outside the lock — ONNX is CPU-bound. Skipped for
     // dry-run, which returns before any embedding or write happens.
@@ -785,7 +811,7 @@ pub async fn memory_write_batch_impl(
     // Resolve source_file → content for all entries before computing embeddings.
     let resolved: Vec<(String, Option<String>)> = entries
         .iter()
-        .map(|e| resolve_source_file(&e.content, e.source_file.as_deref()))
+        .map(|e| resolve_source_file(&handle.root, &e.content, e.source_file.as_deref()))
         .collect::<Result<_, _>>()?;
 
     // Pre-compute embeddings for all entries outside the lock — ONNX is CPU-bound.
@@ -4974,6 +5000,100 @@ mod tests {
             agent: None,
             on_conflict: None,
         }
+    }
+
+    #[test]
+    fn resolve_source_file_rejects_path_outside_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        std::fs::write(&outside, "secret data outside root").unwrap();
+
+        let err = resolve_source_file(&root, "", Some(outside.to_str().unwrap()))
+            .expect_err("must reject path outside root");
+        assert_eq!(err.message, SOURCE_FILE_ERROR);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_source_file_rejects_symlink_escape() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = tmp.path().join("secret.txt");
+        std::fs::write(&outside, "secret data outside root").unwrap();
+        let link = root.join("escape.txt");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let err = resolve_source_file(&root, "", Some(link.to_str().unwrap()))
+            .expect_err("must reject symlink escape");
+        assert_eq!(err.message, SOURCE_FILE_ERROR);
+    }
+
+    #[test]
+    fn resolve_source_file_rejects_oversized_file() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let big = root.join("big.txt");
+        // One byte over the cap; write via metadata-length check, no need to
+        // actually allocate the whole cap in memory for the test to be valid.
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_SOURCE_FILE_BYTES + 1).unwrap();
+
+        let err = resolve_source_file(&root, "", Some(big.to_str().unwrap()))
+            .expect_err("must reject oversized file");
+        assert_eq!(err.message, SOURCE_FILE_ERROR);
+    }
+
+    #[test]
+    fn resolve_source_file_rejects_missing_file_with_generic_error() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let missing = root.join("does-not-exist.txt");
+
+        let err = resolve_source_file(&root, "", Some(missing.to_str().unwrap()))
+            .expect_err("must reject missing file");
+        assert_eq!(err.message, SOURCE_FILE_ERROR);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_source_file_rejects_permission_denied_with_generic_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Skip when running as root (e.g. some CI/container setups), where
+        // permission bits are not enforced.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let unreadable = root.join("unreadable.txt");
+        std::fs::write(&unreadable, "top secret").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = resolve_source_file(&root, "", Some(unreadable.to_str().unwrap()));
+
+        // Restore permissions so TempDir cleanup can remove the file.
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let err = result.expect_err("must reject permission-denied file");
+        assert_eq!(err.message, SOURCE_FILE_ERROR);
+    }
+
+    #[test]
+    fn resolve_source_file_accepts_file_under_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        let file = root.join("note.txt");
+        std::fs::write(&file, "hello from repo").unwrap();
+
+        let (content, source_path) = resolve_source_file(&root, "", Some(file.to_str().unwrap()))
+            .expect("must accept file under root");
+        assert_eq!(content, "hello from repo");
+        assert!(source_path.is_some());
     }
 
     #[tokio::test]

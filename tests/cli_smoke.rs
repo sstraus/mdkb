@@ -119,6 +119,26 @@ fn smoke_init_already_initialised_exits_nonzero() {
 }
 
 #[test]
+fn smoke_serve_http_without_token_refused() {
+    let repo = Repo::new();
+    // A tokenless network server authenticates nothing; starting one must be a
+    // hard error (SEC-2). It fails before binding, so the process exits
+    // immediately rather than blocking on the accept loop.
+    for flag in ["--http", "--https"] {
+        let out = run(&["serve", flag], &repo.root);
+        assert!(
+            !out.status.success(),
+            "serve {flag} with no token should exit non-zero"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("--token") && stderr.contains("--allow-no-auth"),
+            "serve {flag} error should point to --token/--allow-no-auth: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn smoke_update() {
     let repo = Repo::new();
     let out = run(&["update"], &repo.root);

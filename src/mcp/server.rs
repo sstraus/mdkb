@@ -510,14 +510,7 @@ impl McpServer {
             let sig = sym
                 .signature
                 .as_ref()
-                .map(|s| {
-                    let s = s.trim();
-                    if s.len() > 60 {
-                        format!(" `{}…`", &s[..57])
-                    } else {
-                        format!(" `{s}`")
-                    }
-                })
+                .map(|s| format!(" `{}`", truncate_text(s.trim(), 60)))
                 .unwrap_or_default();
             msg.push_str(&format!(
                 "  sym#{} - {:?} {} in {} ({}){}{}\n",
@@ -1823,6 +1816,31 @@ mod tests {
         let hint = ood_hint(0, None);
         assert!(hint.is_some());
         assert!(hint.unwrap().contains("No results"));
+    }
+
+    #[test]
+    fn disambiguation_error_truncates_multibyte_signature_without_panic() {
+        use crate::code::symbol::Symbol;
+        use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
+
+        // Signature whose byte 57 lands inside a multi-byte char: raw `&s[..57]`
+        // slicing would panic here. Prefix pads past the 60-byte truncation
+        // threshold so truncation actually engages on the multi-byte tail.
+        let sig = format!("fn f(x: {}) -> ()", "パラメータ".repeat(8));
+        assert!(!sig.is_char_boundary(57), "test setup: byte 57 must split a char");
+
+        let sym = Symbol::new(
+            SymbolId::new(1).unwrap(),
+            "f",
+            SymbolKind::Function,
+            FileId::new(1).unwrap(),
+            Range::new(1, 0, 1, 0),
+        )
+        .with_signature(sig);
+
+        // Must not panic; the truncated signature is char-boundary safe.
+        let err = McpServer::disambiguation_error("f", std::slice::from_ref(&sym));
+        assert!(err.message.contains("Multiple symbols match 'f'"));
     }
 
     #[test]

@@ -348,10 +348,20 @@ async fn run_cli(cli: Cli) -> Result<()> {
             https,
             bind,
             token,
+            allow_no_auth,
             global,
             daemon,
             detach,
         } => {
+            // A network transport with no token authenticates nothing — every
+            // request is accepted. Refuse to start rather than silently expose
+            // the repo; --allow-no-auth is the explicit opt-out.
+            if (http || https) && token.is_none() && !allow_no_auth {
+                return Err(mdkb::Error::other(
+                    "--http/--https require --token; pass --allow-no-auth to run without \
+                     authentication (accepts all requests).",
+                ));
+            }
             if daemon {
                 let _ = detach;
                 #[cfg(unix)]
