@@ -4,7 +4,7 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
+use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -545,29 +545,22 @@ impl CSharpParser {
 
 // ── Free helpers ────────────────────────────────────────────────────────
 
-fn node_range(node: Node) -> Range {
-    Range::new(
-        node.start_position().row as u32,
-        node.start_position().column as u16,
-        node.end_position().row as u32,
-        node.end_position().column as u16,
-    )
-}
-
 fn determine_csharp_visibility(node: Node, code: &str) -> Visibility {
-    let text = &code[node.byte_range()];
-    let first_line = text.lines().next().unwrap_or("");
-    if first_line.contains("public") {
-        Visibility::Public
-    } else if first_line.contains("internal") {
-        Visibility::Crate
-    } else if first_line.contains("protected") {
-        Visibility::Module
-    } else if first_line.contains("private") {
-        Visibility::Private
-    } else {
-        Visibility::Private // C# default is private
+    // Inspect the declaration's `modifier` AST children rather than substring-
+    // matching the whole text (BUG-C1): `private string publicKey;` must not be
+    // read as Public. tree-sitter-c-sharp emits each modifier as a `modifier` node.
+    for child in node.children(&mut node.walk()) {
+        if child.kind() == "modifier" {
+            match &code[child.byte_range()] {
+                "public" => return Visibility::Public,
+                "internal" => return Visibility::Crate,
+                "protected" => return Visibility::Module,
+                "private" => return Visibility::Private,
+                _ => {}
+            }
+        }
     }
+    Visibility::Private // C# default is private
 }
 
 fn extract_csharp_doc(node: &Node, code: &str) -> Option<String> {
@@ -680,6 +673,37 @@ namespace MyApp {
         );
         assert!(symbols.iter().any(|s| s.name.as_ref() == "Calculator.Calculator"
             && s.kind == SymbolKind::Method));
+    }
+
+    #[test]
+    fn csharp_visibility_ignores_keyword_substring_in_identifier() {
+        // BUG-C1: a private member whose name contains "public" must not be read
+        // as Public. The public sibling proves the modifier-node lookup works.
+        let mut parser = CSharpParser::new().unwrap();
+        let code = r#"
+namespace N {
+    class C {
+        private int publicCount() { return 0; }
+        public int Real() { return 1; }
+    }
+}
+"#;
+        let symbols =
+            parser.parse_symbols(code, FileId::new(1).unwrap(), &mut SymbolCounter::new());
+        let pc = symbols
+            .iter()
+            .find(|s| s.name.as_ref().ends_with("publicCount"))
+            .expect("publicCount method");
+        assert_eq!(
+            pc.visibility,
+            Visibility::Private,
+            "an identifier containing 'public' must not be classified Public"
+        );
+        let real = symbols
+            .iter()
+            .find(|s| s.name.as_ref().ends_with("Real"))
+            .expect("Real method");
+        assert_eq!(real.visibility, Visibility::Public);
     }
 
     #[test]

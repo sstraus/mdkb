@@ -1,7 +1,6 @@
 //! Method call representation and per-file resolution data.
 
 use crate::code::types::Range;
-use std::collections::HashMap;
 
 /// A method call with caller context, receiver, and source location.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,64 +64,6 @@ impl MethodCall {
     }
 }
 
-/// Per-file storage for variable types and method calls.
-///
-/// Populated during parsing, consumed during relationship resolution.
-#[derive(Debug, Default)]
-pub struct MethodCallResolver {
-    variable_types: HashMap<String, String>,
-    method_calls: Vec<MethodCall>,
-}
-
-impl MethodCallResolver {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn register_variable_type(&mut self, var: &str, type_name: &str) {
-        self.variable_types
-            .insert(var.to_string(), type_name.to_string());
-    }
-
-    /// Returns `true` if added, `false` if duplicate.
-    pub fn add_method_call(&mut self, call: MethodCall) -> bool {
-        let exists = self.method_calls.iter().any(|mc| {
-            mc.caller == call.caller
-                && mc.method_name == call.method_name
-                && mc.range.start_line == call.range.start_line
-                && mc.range.start_column == call.range.start_column
-        });
-        if exists {
-            return false;
-        }
-        self.method_calls.push(call);
-        true
-    }
-
-    pub fn variable_types(&self) -> &HashMap<String, String> {
-        &self.variable_types
-    }
-
-    pub fn find_method_call(&self, caller: &str, method_name: &str) -> Option<&MethodCall> {
-        self.method_calls
-            .iter()
-            .find(|mc| mc.caller == caller && mc.method_name == method_name)
-    }
-
-    pub fn method_calls(&self) -> &[MethodCall] {
-        &self.method_calls
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.method_calls.is_empty() && self.variable_types.is_empty()
-    }
-
-    pub fn clear(&mut self) {
-        self.variable_types.clear();
-        self.method_calls.clear();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,23 +102,4 @@ mod tests {
         assert!(call.is_self_call());
     }
 
-    #[test]
-    fn test_resolver_deduplication() {
-        let mut resolver = MethodCallResolver::new();
-        let call1 = MethodCall::new("process", "add", Range::new(5, 4, 5, 14));
-        let call2 = MethodCall::new("process", "add", Range::new(5, 4, 5, 14));
-        assert!(resolver.add_method_call(call1));
-        assert!(!resolver.add_method_call(call2));
-        assert_eq!(resolver.method_calls().len(), 1);
-    }
-
-    #[test]
-    fn test_resolver_variable_types() {
-        let mut resolver = MethodCallResolver::new();
-        resolver.register_variable_type("calc", "Calculator");
-        assert_eq!(
-            resolver.variable_types().get("calc"),
-            Some(&"Calculator".to_string())
-        );
-    }
 }

@@ -4,7 +4,7 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
+use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -383,7 +383,7 @@ impl CParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -392,8 +392,12 @@ impl CParser {
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
+        depth: usize,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         let fn_ctx = if node.kind() == "function_definition" {
             node.child_by_field_name("declarator")
                 .and_then(|d| extract_declarator_name(d, code))
@@ -412,21 +416,12 @@ impl CParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 }
 
 // ── Free helpers ────────────────────────────────────────────────────────
-
-fn node_range(node: Node) -> Range {
-    Range::new(
-        node.start_position().row as u32,
-        node.start_position().column as u16,
-        node.end_position().row as u32,
-        node.end_position().column as u16,
-    )
-}
 
 /// Extract the name from a C declarator (handles pointer declarators, function declarators, etc).
 fn extract_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
@@ -450,15 +445,7 @@ fn extract_c_doc(node: &Node, code: &str) -> Option<String> {
     }
     let text = &code[sibling.byte_range()];
     if text.starts_with("/**") {
-        let inner = text
-            .trim_start_matches("/**")
-            .trim_end_matches("*/")
-            .lines()
-            .map(|l| l.trim().trim_start_matches('*').trim())
-            .filter(|l| !l.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if inner.is_empty() { None } else { Some(inner) }
+        crate::code::parsing::parser::strip_block_doc_comment(text)
     } else if text.starts_with("///") {
         let inner = text.trim_start_matches("///").trim();
         if inner.is_empty() {

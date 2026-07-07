@@ -140,11 +140,9 @@ impl fmt::Display for Symbol {
             write!(f, "\n  Module: {module}")?;
         }
         if let Some(doc) = &self.doc_comment {
-            let truncated = if doc.len() > 100 {
-                format!("{}...", &doc[..100])
-            } else {
-                doc.to_string()
-            };
+            // Char-boundary-safe: raw &doc[..100] panics on a multibyte char at
+            // byte 100 (BUG-C3). Reuse the shared truncation helper.
+            let truncated = crate::code::parsing::parser::truncate_for_display(doc, 100);
             write!(f, "\n  Doc: {truncated}")?;
         }
         Ok(())

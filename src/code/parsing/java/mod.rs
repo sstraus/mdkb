@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::method_call::MethodCall;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
+use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -731,15 +731,6 @@ impl JavaParser {
 
 // ── Free helpers ────────────────────────────────────────────────────────
 
-fn node_range(node: Node) -> Range {
-    Range::new(
-        node.start_position().row as u32,
-        node.start_position().column as u16,
-        node.end_position().row as u32,
-        node.end_position().column as u16,
-    )
-}
-
 /// Extract package path from the program root.
 fn extract_package_path(root: Node, code: &str) -> Option<String> {
     for child in root.children(&mut root.walk()) {
@@ -835,15 +826,7 @@ fn extract_javadoc(node: &Node, code: &str) -> Option<String> {
     if !text.starts_with("/**") {
         return None;
     }
-    let inner = text
-        .trim_start_matches("/**")
-        .trim_end_matches("*/")
-        .lines()
-        .map(|l| l.trim().trim_start_matches('*').trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if inner.is_empty() { None } else { Some(inner) }
+    crate::code::parsing::parser::strip_block_doc_comment(text)
 }
 
 /// Extract type identifiers from a type list (super_interfaces, extends_interfaces).

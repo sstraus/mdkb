@@ -87,6 +87,68 @@ pub fn check_recursion_depth(depth: usize, node: Node) -> bool {
     true
 }
 
+/// Convert a tree-sitter node's span to a [`Range`].
+///
+/// Columns are saturated into `u16` rather than truncated with `as u16`: a
+/// pathological line wider than 65_535 columns (minified/generated code) would
+/// otherwise wrap to a bogus small value (DATA-C1). This is the single shared
+/// implementation for all 13 language parsers.
+#[inline]
+pub fn node_range(node: Node) -> Range {
+    let start = node.start_position();
+    let end = node.end_position();
+    Range::new(
+        start.row as u32,
+        start.column.min(u16::MAX as usize) as u16,
+        end.row as u32,
+        end.column.min(u16::MAX as usize) as u16,
+    )
+}
+
+/// Strip a `/** ... */` block doc comment to its text: drops the delimiters and
+/// the leading `*` on each line, removes blank lines. Returns `None` if empty.
+///
+/// Shared by the C, C++, Java, Kotlin, PHP, and TypeScript doc extractors, which
+/// each carried a byte-identical copy of this (SIMPLE-C duplication).
+pub fn strip_block_doc_comment(text: &str) -> Option<String> {
+    let inner = text
+        .trim_start_matches("/**")
+        .trim_end_matches("*/")
+        .lines()
+        .map(|l| l.trim().trim_start_matches('*').trim())
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if inner.is_empty() { None } else { Some(inner) }
+}
+
+/// Find a visibility/access keyword among a declaration node's modifier child
+/// nodes, checking a `modifiers` container one level deep.
+///
+/// Matches only exact modifier *token* text — never a substring of an identifier
+/// or comment (BUG-C1: `private string publicKey;` must not read as Public).
+/// Grammar-agnostic: it accepts any child whose kind contains `modifier`
+/// (`modifier`, `modifiers`, `visibility_modifier`, `accessibility_modifier`, …).
+pub fn find_modifier_keyword<'a>(node: Node, code: &'a str, keywords: &[&str]) -> Option<&'a str> {
+    for child in node.children(&mut node.walk()) {
+        if !child.kind().contains("modifier") {
+            continue;
+        }
+        let text = &code[child.byte_range()];
+        if keywords.contains(&text) {
+            return Some(text);
+        }
+        // A `modifiers` container holds the individual modifier tokens.
+        for grandchild in child.children(&mut child.walk()) {
+            let gtext = &code[grandchild.byte_range()];
+            if keywords.contains(&gtext) {
+                return Some(gtext);
+            }
+        }
+    }
+    None
+}
+
 /// Safely truncate a UTF-8 string at a character boundary.
 #[inline]
 pub fn safe_truncate_str(s: &str, max_bytes: usize) -> &str {

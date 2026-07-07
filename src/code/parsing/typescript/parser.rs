@@ -7,7 +7,9 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::method_call::MethodCall;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, find_modifier_keyword, node_range,
+};
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -1222,15 +1224,6 @@ impl TypeScriptParser {
 
 // ── Free helpers ────────────────────────────────────────────────────────
 
-fn node_range(node: Node) -> Range {
-    Range::new(
-        node.start_position().row as u32,
-        node.start_position().column as u16,
-        node.end_position().row as u32,
-        node.end_position().column as u16,
-    )
-}
-
 /// Determine export-based visibility for top-level declarations.
 fn determine_ts_visibility(node: Node, _code: &str) -> Visibility {
     // Walk up to 3 ancestors looking for export_statement
@@ -1250,13 +1243,17 @@ fn determine_ts_visibility(node: Node, _code: &str) -> Visibility {
 
 /// Determine visibility for class members (private/protected/public).
 fn determine_member_visibility(node: Node, code: &str) -> Visibility {
-    let sig = &code[node.byte_range()];
-    if sig.contains("private ") || sig.starts_with('#') {
-        Visibility::Private
-    } else if sig.contains("protected ") {
-        Visibility::Module
-    } else {
-        Visibility::Public
+    // `#name` is an ECMAScript hard-private field — detect it by the name token,
+    // not a substring of the whole member.
+    if code[node.byte_range()].trim_start().starts_with('#') {
+        return Visibility::Private;
+    }
+    // Otherwise inspect the accessibility_modifier AST node (BUG-C1): a member
+    // whose name contains "private"/"protected" must not be misclassified.
+    match find_modifier_keyword(node, code, &["private", "protected", "public"]) {
+        Some("private") => Visibility::Private,
+        Some("protected") => Visibility::Module,
+        _ => Visibility::Public,
     }
 }
 
@@ -1281,15 +1278,7 @@ fn extract_jsdoc(node: &Node, code: &str) -> Option<String> {
     if !text.starts_with("/**") {
         return None;
     }
-    let inner = text
-        .trim_start_matches("/**")
-        .trim_end_matches("*/")
-        .lines()
-        .map(|l| l.trim().trim_start_matches('*').trim())
-        .filter(|l| !l.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n");
-    if inner.is_empty() { None } else { Some(inner) }
+    crate::code::parsing::parser::strip_block_doc_comment(text)
 }
 
 fn extract_ts_function_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
@@ -1598,6 +1587,37 @@ if (require.main === module) {
             "Top-level call to getStories should have <module> as caller: {:?}",
             calls
         );
+    }
+
+    #[test]
+    fn ts_member_visibility_ignores_keyword_substring_in_identifier() {
+        // BUG-C1: a private member whose name contains "protected" must stay
+        // Private; a plain member with no modifier defaults to Public.
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = r#"
+class C {
+    private protectedThing(): void {}
+    plainMethod(): void {}
+    protected realProtected(): void {}
+}
+"#;
+        let symbols =
+            parser.parse_symbols(code, FileId::new(1).unwrap(), &mut SymbolCounter::new());
+        let pt = symbols
+            .iter()
+            .find(|s| s.name.as_ref().ends_with("protectedThing"))
+            .expect("protectedThing method");
+        assert_eq!(pt.visibility, Visibility::Private);
+        let plain = symbols
+            .iter()
+            .find(|s| s.name.as_ref().ends_with("plainMethod"))
+            .expect("plainMethod");
+        assert_eq!(plain.visibility, Visibility::Public);
+        let rp = symbols
+            .iter()
+            .find(|s| s.name.as_ref().ends_with("realProtected"))
+            .expect("realProtected method");
+        assert_eq!(rp.visibility, Visibility::Module);
     }
 
     #[test]

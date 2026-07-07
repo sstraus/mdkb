@@ -4,7 +4,9 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, find_modifier_keyword, node_range,
+};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -306,7 +308,7 @@ impl SwiftParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -315,8 +317,12 @@ impl SwiftParser {
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
+        depth: usize,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         let fn_ctx = if node.kind() == "function_declaration" {
             node.child_by_field_name("name")
                 .map(|n| &code[n.byte_range()])
@@ -335,7 +341,7 @@ impl SwiftParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
@@ -364,28 +370,18 @@ impl SwiftParser {
 
 // ── Free helpers ────────────────────────────────────────────────────────
 
-fn node_range(node: Node) -> Range {
-    Range::new(
-        node.start_position().row as u32,
-        node.start_position().column as u16,
-        node.end_position().row as u32,
-        node.end_position().column as u16,
-    )
-}
-
 fn determine_swift_visibility(node: Node, code: &str) -> Visibility {
-    let text = &code[node.byte_range()];
-    let first_line = text.lines().next().unwrap_or("");
-    if first_line.contains("public") || first_line.contains("open") {
-        Visibility::Public
-    } else if first_line.contains("internal") {
-        Visibility::Crate
-    } else if first_line.contains("fileprivate") {
-        Visibility::Module
-    } else if first_line.contains("private") {
-        Visibility::Private
-    } else {
-        Visibility::Crate // Swift default is internal
+    // Inspect modifier AST nodes, not substrings of the declaration text (BUG-C1).
+    match find_modifier_keyword(
+        node,
+        code,
+        &["public", "open", "internal", "fileprivate", "private"],
+    ) {
+        Some("public") | Some("open") => Visibility::Public,
+        Some("internal") => Visibility::Crate,
+        Some("fileprivate") => Visibility::Module,
+        Some("private") => Visibility::Private,
+        _ => Visibility::Crate, // Swift default is internal
     }
 }
 
@@ -496,6 +492,30 @@ public class Calculator {
                 .iter()
                 .any(|s| s.name.as_ref() == "Calculator.add" && s.kind == SymbolKind::Method)
         );
+    }
+
+    #[test]
+    fn swift_visibility_ignores_keyword_substring_in_identifier() {
+        // BUG-C1: a private member whose name contains "public" must stay Private.
+        let mut parser = SwiftParser::new().unwrap();
+        let code = r#"
+class C {
+    private func publicHelper() {}
+    public func real() {}
+}
+"#;
+        let symbols =
+            parser.parse_symbols(code, FileId::new(1).unwrap(), &mut SymbolCounter::new());
+        let ph = symbols
+            .iter()
+            .find(|s| s.name.as_ref().ends_with("publicHelper"))
+            .expect("publicHelper method");
+        assert_eq!(ph.visibility, Visibility::Private);
+        let real = symbols
+            .iter()
+            .find(|s| s.name.as_ref().ends_with("real"))
+            .expect("real method");
+        assert_eq!(real.visibility, Visibility::Public);
     }
 
     #[test]

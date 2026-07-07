@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::method_call::MethodCall;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
+use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -741,20 +741,6 @@ impl RustParser {
 
     // ── Containing function helper ──────────────────────────────────────
 
-    fn find_containing_function<'a>(&self, mut node: Node, code: &'a str) -> Option<&'a str> {
-        loop {
-            if node.kind() == "function_item" {
-                if let Some(n) = node.child_by_field_name("name") {
-                    return Some(&code[n.byte_range()]);
-                }
-            }
-            match node.parent() {
-                Some(p) => node = p,
-                None => return None,
-            }
-        }
-    }
-
     // ── Calls ───────────────────────────────────────────────────────────
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
@@ -763,7 +749,7 @@ impl RustParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(tree.root_node(), code, &mut calls);
+        self.find_calls_in_node(tree.root_node(), code, None, 0, &mut calls);
         calls
     }
 
@@ -771,9 +757,22 @@ impl RustParser {
         &self,
         node: Node,
         code: &'a str,
+        current_fn: Option<&'a str>,
+        depth: usize,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
-        let containing_fn = self.find_containing_function(node, code);
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+        // Thread the innermost enclosing function name down the walk instead of
+        // re-walking ancestors to the root at every node (PERF-C1: O(n) not O(n·depth)).
+        let current_fn = if node.kind() == "function_item" {
+            node.child_by_field_name("name")
+                .map(|n| &code[n.byte_range()])
+                .or(current_fn)
+        } else {
+            current_fn
+        };
 
         if node.kind() == "call_expression" {
             if let Some(fn_node) = node.child_by_field_name("function") {
@@ -786,20 +785,14 @@ impl RustParser {
                     _ => None,
                 };
 
-                if let (Some(target), Some(caller)) = (target, containing_fn) {
-                    let range = Range::new(
-                        node.start_position().row as u32,
-                        node.start_position().column as u16,
-                        node.end_position().row as u32,
-                        node.end_position().column as u16,
-                    );
-                    calls.push((caller, target, range));
+                if let (Some(target), Some(caller)) = (target, current_fn) {
+                    calls.push((caller, target, node_range(node)));
                 }
             }
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(child, code, calls);
+            self.find_calls_in_node(child, code, current_fn, depth + 1, calls);
         }
     }
 
@@ -811,23 +804,34 @@ impl RustParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_method_calls_in_node(tree.root_node(), code, &mut calls);
+        self.find_method_calls_in_node(tree.root_node(), code, None, 0, &mut calls);
         calls
     }
 
-    fn find_method_calls_in_node(&self, node: Node, code: &str, calls: &mut Vec<MethodCall>) {
-        let containing_fn = self.find_containing_function(node, code);
+    fn find_method_calls_in_node<'a>(
+        &self,
+        node: Node,
+        code: &'a str,
+        current_fn: Option<&'a str>,
+        depth: usize,
+        calls: &mut Vec<MethodCall>,
+    ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+        let current_fn = if node.kind() == "function_item" {
+            node.child_by_field_name("name")
+                .map(|n| &code[n.byte_range()])
+                .or(current_fn)
+        } else {
+            current_fn
+        };
 
         if node.kind() == "call_expression" {
             if let Some(fn_node) = node.child_by_field_name("function") {
-                let range = Range::new(
-                    node.start_position().row as u32,
-                    node.start_position().column as u16,
-                    node.end_position().row as u32,
-                    node.end_position().column as u16,
-                );
+                let range = node_range(node);
 
-                if let Some(caller) = containing_fn {
+                if let Some(caller) = current_fn {
                     match fn_node.kind() {
                         "identifier" => {
                             let name = &code[fn_node.byte_range()];
@@ -864,7 +868,7 @@ impl RustParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_method_calls_in_node(child, code, calls);
+            self.find_method_calls_in_node(child, code, current_fn, depth + 1, calls);
         }
     }
 

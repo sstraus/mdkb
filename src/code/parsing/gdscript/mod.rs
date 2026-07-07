@@ -4,7 +4,7 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth};
+use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -286,7 +286,7 @@ impl GdscriptParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -295,8 +295,12 @@ impl GdscriptParser {
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
+        depth: usize,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         let fn_ctx = if node.kind() == "function_definition" {
             node.child_by_field_name("name")
                 .map(|n| &code[n.byte_range()])
@@ -315,21 +319,12 @@ impl GdscriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 }
 
 // ── Free helpers ────────────────────────────────────────────────────────
-
-fn node_range(node: Node) -> Range {
-    Range::new(
-        node.start_position().row as u32,
-        node.start_position().column as u16,
-        node.end_position().row as u32,
-        node.end_position().column as u16,
-    )
-}
 
 fn extract_gdscript_class_name(root: Node, code: &str) -> Option<String> {
     for child in root.children(&mut root.walk()) {
