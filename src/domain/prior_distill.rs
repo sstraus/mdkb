@@ -447,4 +447,43 @@ mod tests {
         assert!(p.contains("is_reusable"));
         assert!(p.contains("no, edit the generator"));
     }
+
+    // ── run_distiller_cli failure modes ─────────────────────────────────────
+    // The distiller is an external process on the mining path. A missing binary
+    // or a non-zero exit must degrade to an Err/empty-output the caller swallows,
+    // never a panic or a hang that would wedge the Stop hook.
+
+    #[test]
+    fn run_distiller_cli_missing_binary_returns_err() {
+        // A program that cannot be spawned surfaces the spawn error as Err(...)
+        // (which mine_episode logs and drops) rather than panicking or blocking.
+        let result = run_distiller_cli(
+            "mdkb-nonexistent-distiller-binary-xyz",
+            &[],
+            "distill this episode",
+        );
+        assert!(
+            result.is_err(),
+            "missing distiller binary must return Err, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn run_distiller_cli_nonzero_exit_yields_rejectable_output() {
+        // A distiller that exits non-zero without emitting JSON returns Ok with
+        // whatever it wrote to stdout (empty here); parse_distilled then rejects
+        // it as NotJson. The hook proceeds — no crash, no block.
+        let out = run_distiller_cli("sh", &["-c".into(), "exit 1".into()], "prompt")
+            .expect("spawn of sh must succeed even though the script exits non-zero");
+        assert_eq!(parse_distilled(&out), Err(DistillReject::NotJson));
+    }
+
+    #[test]
+    fn run_distiller_cli_pipes_prompt_on_stdin() {
+        // The prompt is delivered on stdin (never argv) and stdout is captured.
+        // `cat` echoes stdin back, proving the round-trip does not deadlock.
+        let out = run_distiller_cli("sh", &["-c".into(), "cat".into()], "hello-prompt")
+            .expect("cat stub must run");
+        assert_eq!(out, "hello-prompt");
+    }
 }
