@@ -993,46 +993,57 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 }
             };
 
-            if let Some(mut ctx) = taken_ctx {
-                match handle_update(&mut ctx, &startup_root) {
-                    Ok(result) => {
-                        if result.added > 0 || result.updated > 0 || result.removed > 0 {
-                            tracing::info!(
-                                "Startup index: {} added, {} updated, {} removed docs",
-                                result.added,
-                                result.updated,
-                                result.removed
-                            );
+            // Doc reindex phase. init_and_take_for_reindex already set
+            // doc_reindex_active; the RAII guard clears it on ANY exit (including
+            // a panic in handle_update/session_index), scoped so it clears before
+            // the code phase. catch_unwind restores ctx to the mutex even on panic
+            // — a lost ctx would wedge every tool call (ARCH-A1).
+            {
+                let _doc_guard = super::dispatch::ActiveFlagGuard::from_armed(
+                    startup_server.doc_reindex_active.clone(),
+                );
+                if let Some(mut ctx) = taken_ctx {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        match handle_update(&mut ctx, &startup_root) {
+                            Ok(result) => {
+                                if result.added > 0 || result.updated > 0 || result.removed > 0 {
+                                    tracing::info!(
+                                        "Startup index: {} added, {} updated, {} removed docs",
+                                        result.added,
+                                        result.updated,
+                                        result.removed
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::error!("Startup doc reindex failed: {}", e),
                         }
-                    }
-                    Err(e) => tracing::error!("Startup doc reindex failed: {}", e),
-                }
 
-                let sessions_base =
-                    std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                        .join(".claude/projects");
-                let project_root = startup_root.to_string_lossy().to_string();
-                match handle_session_index(&ctx, &sessions_base, &project_root) {
-                    Ok(sr) if sr.added > 0 || sr.updated > 0 => {
-                        tracing::info!(
-                            "Startup session index: {} added, {} updated",
-                            sr.added,
-                            sr.updated
-                        );
+                        let sessions_base =
+                            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                                .join(".claude/projects");
+                        let project_root = startup_root.to_string_lossy().to_string();
+                        match handle_session_index(&ctx, &sessions_base, &project_root) {
+                            Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+                                tracing::info!(
+                                    "Startup session index: {} added, {} updated",
+                                    sr.added,
+                                    sr.updated
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("Session indexing failed: {}", e),
+                        }
+                    }));
+                    if outcome.is_err() {
+                        tracing::error!("Startup doc reindex panicked; restoring context");
                     }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("Session indexing failed: {}", e),
-                }
 
-                // Put ctx back so tool calls can proceed
-                {
+                    // Put ctx back so tool calls can proceed (also on the panic path).
                     let mut ctx_guard = startup_server.ctx.lock().await;
                     *ctx_guard = Some(ctx);
                 }
+                // _doc_guard drops here → doc_reindex_active cleared.
             }
-            startup_server
-                .doc_reindex_active
-                .store(false, Ordering::Relaxed);
 
             // Run code reindex (incremental if index already exists).
             // Respects code.enabled — skip entirely when the user disabled code intelligence.
@@ -1054,12 +1065,19 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 }
             }; // lock released immediately
 
+            // Guard clears code_reindex_active on ANY exit (incl. panic).
+            let _code_guard = super::dispatch::ActiveFlagGuard::from_armed(
+                startup_server.code_reindex_active.clone(),
+            );
             if let Some(mut facade) = taken_facade {
                 // Content-hash incremental refresh (full build only on empty index).
-                let result = facade.update(&startup_root);
+                // catch_unwind so the facade is always restored, never left None.
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    facade.update(&startup_root)
+                }));
                 crate::llm::release_cached_service();
-                match result {
-                    Ok(stats) => {
+                match outcome {
+                    Ok(Ok(stats)) => {
                         if stats.symbols_indexed > 0 || stats.files_indexed > 0 {
                             tracing::info!(
                                 "Startup index: {} files, {} symbols",
@@ -1068,16 +1086,17 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                             );
                         }
                     }
-                    Err(e) => tracing::error!("Startup code reindex failed: {}", e),
+                    Ok(Err(e)) => tracing::error!("Startup code reindex failed: {}", e),
+                    Err(_) => {
+                        tracing::error!("Startup code reindex panicked; restoring index handle")
+                    }
                 }
 
-                // Put the facade back and clear the flag
+                // Put the facade back (also on the panic path).
                 let mut idx_guard = startup_server.code_index.lock().await;
                 *idx_guard = Some(facade);
             }
-            startup_server
-                .code_reindex_active
-                .store(false, Ordering::Relaxed);
+            // _code_guard drops here → code_reindex_active cleared.
         });
     }
 

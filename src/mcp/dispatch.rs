@@ -10,7 +10,7 @@
 //! only. Remaining 10 tools land in follow-up commits under #007-16f7.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use futures::future::join_all;
@@ -2482,25 +2482,57 @@ fn rank_warmup_entries(
     entries
 }
 
+/// RAII guard that clears an in-flight `AtomicBool` on drop — including on a
+/// panic unwind. A reindex task takes its resource out of a mutex and only
+/// restores it (and clears the flag) after the blocking work returns; if that
+/// work panics, the naive code leaves the flag stuck `true` and the resource
+/// `None` forever, wedging the handle until a daemon restart (ARCH-A1). This
+/// generalizes the local `FlightGuard`.
+pub(crate) struct ActiveFlagGuard(Arc<AtomicBool>);
+
+impl ActiveFlagGuard {
+    /// Mark the flag active, returning the guard. `None` if another holder is
+    /// already active (the flag was already `true`).
+    pub(crate) fn arm(flag: Arc<AtomicBool>) -> Option<Self> {
+        if flag
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return None;
+        }
+        Some(Self(flag))
+    }
+
+    /// Wrap a flag the caller already set to `true`, guaranteeing it is cleared
+    /// on drop (including panic).
+    pub(crate) fn from_armed(flag: Arc<AtomicBool>) -> Self {
+        Self(flag)
+    }
+}
+
+impl Drop for ActiveFlagGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
     if !handle.config.code.enabled {
         return false;
     }
-    if handle
-        .code_reindex_active
-        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
-        .is_err()
-    {
+    let Some(active_guard) = ActiveFlagGuard::arm(Arc::clone(&handle.code_reindex_active)) else {
         return true;
-    }
+    };
 
     let root = handle.root.clone();
     let code_index = Arc::clone(&handle.code_index);
-    let code_reindex_active = Arc::clone(&handle.code_reindex_active);
     let ignore_patterns = handle.code_ignore_patterns.clone();
     let respect_gitignore = handle.config.code.indexing.respect_gitignore;
 
     tokio::spawn(async move {
+        // Clears code_reindex_active on ANY exit, including a panic below.
+        let _active_guard = active_guard;
+
         let mut idx_guard = code_index.lock().await;
         if idx_guard.is_none() {
             let index_path = root.join(".mdkb/code.sqlite");
@@ -2515,35 +2547,40 @@ fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
                 }
                 Err(e) => {
                     tracing::error!("SessionStart code refresh: failed to open code index: {e}");
-                    code_reindex_active.store(false, Ordering::Relaxed);
                     return;
                 }
             }
         }
 
         let Some(mut facade) = idx_guard.take() else {
-            code_reindex_active.store(false, Ordering::Relaxed);
             return;
         };
         drop(idx_guard);
 
         // Content-hash incremental refresh (full build only on empty index).
-        let result = facade.update(&root);
+        // Catch a panic so the facade is always restored to the mutex — a lost
+        // facade would leave code_index None (recoverable, but the flag+resource
+        // guard keeps the handle usable regardless).
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| facade.update(&root)));
         crate::llm::release_cached_service();
-        match result {
-            Ok(stats) => {
+        match outcome {
+            Ok(Ok(stats)) => {
                 tracing::info!(
                     "SessionStart code refresh: {} files, {} symbols",
                     stats.files_indexed,
                     stats.symbols_indexed
                 );
             }
-            Err(e) => tracing::error!("SessionStart code refresh failed: {e}"),
+            Ok(Err(e)) => tracing::error!("SessionStart code refresh failed: {e}"),
+            Err(_) => {
+                tracing::error!("SessionStart code refresh panicked; restoring index handle")
+            }
         }
 
         let mut idx_guard = code_index.lock().await;
         *idx_guard = Some(facade);
-        code_reindex_active.store(false, Ordering::Relaxed);
+        // _active_guard drops here (or on the early returns / panic) → flag cleared.
     });
 
     true
@@ -6472,6 +6509,41 @@ mod tests {
     }
 
     // ── PERF-A1: query embedding runs off the ctx lock (story 056) ──────
+
+    // ── ARCH-A1: RAII guard for reindex flags (story 066) ───────────────
+
+    #[test]
+    fn active_flag_guard_clears_flag_on_panic() {
+        // The reindex wedge: a panic mid-reindex must not leave the in-flight
+        // flag stuck true (which would make every future reindex a no-op).
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag_for_closure = Arc::clone(&flag);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = ActiveFlagGuard::arm(flag_for_closure).expect("arm");
+            panic!("simulated reindex panic");
+        }));
+        assert!(result.is_err(), "panic should propagate to catch_unwind");
+        assert!(
+            !flag.load(Ordering::Relaxed),
+            "guard must clear the flag on a panic unwind, not leave the handle wedged"
+        );
+    }
+
+    #[test]
+    fn active_flag_guard_is_single_flight_and_rearmable() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let g1 = ActiveFlagGuard::arm(Arc::clone(&flag));
+        assert!(g1.is_some(), "first arm succeeds");
+        assert!(
+            ActiveFlagGuard::arm(Arc::clone(&flag)).is_none(),
+            "second arm is blocked while the first is active"
+        );
+        drop(g1);
+        assert!(
+            ActiveFlagGuard::arm(Arc::clone(&flag)).is_some(),
+            "re-armable once the guard drops"
+        );
+    }
 
     // ── PERF-A3: hook_dedup eviction (story 067) ────────────────────────
 
