@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 use mdkb::cli::handlers::{Context, handle_init};
 use mdkb::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
+use mdkb::store::memory_graph::{self, MemoryRelation, TargetKind};
 use tempfile::TempDir;
 
 fn mdkb_bin() -> Command {
@@ -612,5 +613,140 @@ fn user_prompt_submit_dedups_neighbor_against_memory_id() {
     assert!(
         !block.contains("b.md (related)"),
         "neighbor already injected as a memory must be deduped, got: {block}"
+    );
+}
+
+/// A plain topic entry with strong FTS content, seeded directly into the store.
+fn topic_entry(id: &str, title: &str, content: &str) -> MemoryEntry {
+    let now = chrono::Utc::now().timestamp();
+    MemoryEntry {
+        id: id.to_string(),
+        title: title.to_string(),
+        content: content.to_string(),
+        entry_type: EntryType::Topic,
+        tags: vec![],
+        status: EntryStatus::Active,
+        created_at: now,
+        updated_at: now,
+        superseded_by: None,
+        access_count: 5,
+        last_accessed: Some(now),
+        source_path: None,
+        confirmations: 1,
+        last_confirmed_at: Some(now),
+        source_type: SourceType::UserStatement,
+        expires_at: None,
+        due_at: None,
+    }
+}
+
+#[test]
+fn user_prompt_submit_expands_one_hop_memory_neighbor() {
+    // Recall matches seed A on FTS; B shares no keywords with the prompt, so it
+    // can ONLY surface through the one-hop `supports` edge expansion. This drives
+    // the whole recall→expand path through the real `mdkb hook` binary — the
+    // in-module test at dispatch.rs exercises the same logic below the hook edge.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    handle_init(&root).expect("init");
+    {
+        let ctx = Context::open(&root).expect("open ctx");
+        add_entry(
+            &ctx.conn,
+            &topic_entry(
+                "orbital-decoder",
+                "Orbital telemetry decoder",
+                "Orbital telemetry decoder frame sync algorithm",
+            ),
+        )
+        .expect("seed A");
+        add_entry(
+            &ctx.conn,
+            &topic_entry(
+                "checksum-detail",
+                "Checksum trailer",
+                "CRC32 bytes appended after the payload region",
+            ),
+        )
+        .expect("seed B");
+        memory_graph::add_edge(
+            &ctx.conn,
+            "orbital-decoder",
+            "checksum-detail",
+            TargetKind::Memory,
+            MemoryRelation::Supports,
+        )
+        .expect("add edge");
+    }
+
+    let event = r#"{"prompt":"orbital telemetry decoder frame sync"}"#;
+    let (code, stdout) = run_user_prompt_submit_in(&root, event);
+
+    assert_eq!(code, 0, "hook must always exit 0");
+    let block =
+        additional_context(&stdout).unwrap_or_else(|| panic!("expected recall, got: {stdout}"));
+    assert!(
+        block.contains("orbital-decoder"),
+        "the FTS-matched seed must recall: {block}"
+    );
+    assert!(
+        block.contains("checksum-detail") && block.contains("(via supports)"),
+        "the one-hop neighbor must expand, annotated with its relation: {block}"
+    );
+}
+
+#[test]
+fn user_prompt_submit_marks_stale_dependency_on_superseded_base() {
+    // The recalled entry derives from a base that has been superseded, so its
+    // dependency is stale — the recall line must carry the [STALE-DEP] marker.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path().to_path_buf();
+    handle_init(&root).expect("init");
+    {
+        let ctx = Context::open(&root).expect("open ctx");
+        add_entry(
+            &ctx.conn,
+            &topic_entry(
+                "payload-migration",
+                "Payload schema migration",
+                "Payload schema migration uses versioned envelopes",
+            ),
+        )
+        .expect("seed derived");
+        add_entry(
+            &ctx.conn,
+            &topic_entry(
+                "envelope-base",
+                "Envelope format base",
+                "Envelope byte layout internal notes",
+            ),
+        )
+        .expect("seed base");
+        memory_graph::add_edge(
+            &ctx.conn,
+            "payload-migration",
+            "envelope-base",
+            TargetKind::Memory,
+            MemoryRelation::DerivedFrom,
+        )
+        .expect("add edge");
+        // Supersede the base → the derived entry's dependency is now stale.
+        ctx.conn
+            .execute(
+                "UPDATE memory_entries SET status='superseded' WHERE id='envelope-base'",
+                [],
+            )
+            .expect("supersede base");
+    }
+
+    let event = r#"{"prompt":"payload schema migration versioned envelopes"}"#;
+    let (code, stdout) = run_user_prompt_submit_in(&root, event);
+
+    assert_eq!(code, 0, "hook must always exit 0");
+    let block =
+        additional_context(&stdout).unwrap_or_else(|| panic!("expected recall, got: {stdout}"));
+    assert!(
+        block.contains("[STALE-DEP] [payload-migration]"),
+        "a derived entry with a superseded base must be flagged STALE-DEP: {block}"
     );
 }

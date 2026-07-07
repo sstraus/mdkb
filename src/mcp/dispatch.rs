@@ -6559,6 +6559,99 @@ mod tests {
         assert!(cluster.lesson.contains("Do not edit generated files"));
     }
 
+    /// The full flagship loop: two independent sessions distill the same lesson,
+    /// the cluster crosses the promotion gate, and a trigger-matching PreToolUse
+    /// injects it. This lives in-module (not a `tests/` binary) on purpose: the
+    /// Stop hook detaches `mine_episode` via `tokio::spawn` and returns before it
+    /// finishes, and `pretool_prior_block` reads only an ALREADY-open context — so
+    /// a one-shot CLI invocation can neither await mining nor warm the ctx. The
+    /// end-to-end promote→inject path is only observable with a live handle.
+    #[tokio::test]
+    async fn mine_episode_promotes_across_two_sessions_and_injects_matched_prior() {
+        use crate::store::priors::{canonical_trigger_key, cluster_id_for_key, get_cluster};
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+
+        // Fake distiller: consume the prompt on stdin, emit a valid pre_tool prior
+        // whose glob targets generated files. Identical output both sessions → one
+        // trigger key → one cluster whose distinct_sessions climbs to the promotion
+        // gate (PROMOTION_MIN_SESSIONS = 2).
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template instead.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let program = "sh".to_string();
+        let args = vec![
+            "-c".to_string(),
+            format!("cat >/dev/null; printf '%s' '{distilled}'"),
+        ];
+
+        for session in ["sess-1", "sess-2"] {
+            mine_episode(
+                Arc::clone(&handle),
+                transcript.to_string_lossy().into_owned(),
+                session.to_string(),
+                program.clone(),
+                args.clone(),
+            )
+            .await;
+        }
+
+        // Two distinct sessions crossed the gate: the cluster is promoted and has
+        // minted a backing memory id.
+        let key = canonical_trigger_key(
+            "pre_tool",
+            r#"{"pattern":"src/generated/**","when":"editing generated code"}"#,
+        );
+        let cluster_id = cluster_id_for_key(&key);
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            let cluster = get_cluster(conn, &cluster_id)
+                .unwrap()
+                .expect("mining created a cluster");
+            assert_eq!(
+                cluster.state, "promoted",
+                "two distinct sessions must promote the cluster"
+            );
+            assert_eq!(cluster.distinct_sessions, 2);
+            assert!(
+                cluster.promoted_memory_id.is_some(),
+                "promotion mints a backing memory id"
+            );
+        }
+
+        // A PreToolUse whose repo-relative path matches the prior's glob injects
+        // the lesson verbatim.
+        let edit_path = tmp.path().join("src/generated/schema.rs");
+        let hit = pretool_prior_block(
+            &handle,
+            "Edit",
+            &json!({"file_path": edit_path.to_string_lossy()}),
+        )
+        .await
+        .expect("promoted prior must inject on a matching PreToolUse");
+        assert!(
+            hit.contains("mdkb prior: Do not edit generated files"),
+            "injected block must carry the lesson: {hit}"
+        );
+
+        // A path outside the glob surfaces nothing — injection is trigger-scoped,
+        // never global.
+        let unrelated_path = tmp.path().join("src/hand_written.rs");
+        let unrelated = pretool_prior_block(
+            &handle,
+            "Edit",
+            &json!({"file_path": unrelated_path.to_string_lossy()}),
+        )
+        .await;
+        assert!(
+            unrelated.is_none(),
+            "a path outside the glob must not inject the prior: {unrelated:?}"
+        );
+    }
+
     #[tokio::test]
     async fn hook_post_tool_use_ignores_unknown_tool() {
         let tmp = TempDir::new().unwrap();
