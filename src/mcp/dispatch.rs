@@ -3641,11 +3641,16 @@ mod tests {
     fn make_handle(tmp: &TempDir) -> Arc<RepoHandle> {
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        // Recall tests exercise the injection mechanics, not the sigil gate; the
+        // gate now defaults on, so disable it here to keep prompts un-prefixed.
+        // The gate itself is covered by `require_sigil_gates_injection_*`.
+        let mut config = Config::default();
+        config.hooks.user_prompt_submit_require_sigil = false;
         Arc::new(RepoHandle::from_shared(
             root,
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
-            Config::default(),
+            config,
             Vec::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -4009,11 +4014,13 @@ mod tests {
         // Primary store nested under the parent.
         let nested_root = tmp.path().join("nested-repo");
         std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
+        let mut primary_config = Config::default();
+        primary_config.hooks.user_prompt_submit_require_sigil = false;
         let primary = Arc::new(RepoHandle::from_shared(
             nested_root.clone(),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
-            Config::default(),
+            primary_config,
             Vec::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
@@ -4042,11 +4049,13 @@ mod tests {
         // Primary store nested under the parent.
         let nested_root = tmp.path().join("nested-repo");
         std::fs::create_dir_all(nested_root.join(".mdkb")).unwrap();
+        let mut primary_config = Config::default();
+        primary_config.hooks.user_prompt_submit_require_sigil = false;
         let primary = Arc::new(RepoHandle::from_shared(
             nested_root.clone(),
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
-            Config::default(),
+            primary_config,
             Vec::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),

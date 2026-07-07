@@ -139,10 +139,11 @@ fn query_events_off_by_default_records_nothing() {
 #[test]
 fn query_events_on_records_hash_but_never_text() {
     let tmp = seed_repo();
-    // Opt in via config.
+    // Opt in via config. Also disable the sigil gate (default on) so the plain
+    // prompt below triggers recall — the query_event this test asserts on.
     std::fs::write(
         tmp.path().join(".mdkb/config.toml"),
-        "[telemetry]\nquery_events = true\n",
+        "[telemetry]\nquery_events = true\n\n[hooks]\nuser_prompt_submit_require_sigil = false\n",
     )
     .expect("write config");
 

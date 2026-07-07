@@ -4,6 +4,15 @@
 
 ## 3.7.0 (2026-07-06)
 
+### Changed
+
+- **UserPromptSubmit recall is now opt-in by default.**
+  `[hooks] user_prompt_submit_require_sigil` now defaults to `true`: mdkb injects
+  context (recall, related docs, priors, call-graph hint) only for prompts that
+  begin with `*`. The `*` is stripped before recall and stopwords are already
+  dropped from the FTS query, so suggestions key off the meaningful prompt terms.
+  Set `user_prompt_submit_require_sigil = false` to restore the always-on behavior.
+
 ### Added
 
 - **Non-aggressive auto-indexing & embedding backfill.** mdkb now self-heals its

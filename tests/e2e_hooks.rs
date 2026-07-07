@@ -93,7 +93,9 @@ fn hooks_e2e_warmup_recall_and_reindex() {
     );
 
     // --- UserPromptSubmit: relevant memory injection --------------------
-    let prompt_payload = r#"{"prompt": "Explain the hook dispatcher architecture and events"}"#;
+    // Recall is opt-in via the `*` sigil (default); a user triggers it by
+    // prefixing the prompt. The `*` is stripped before recall runs.
+    let prompt_payload = r#"{"prompt": "* Explain the hook dispatcher architecture and events"}"#;
     let (stdout, stderr, code) = run_hook("user-prompt-submit", &root, prompt_payload);
     assert_eq!(
         code, 0,

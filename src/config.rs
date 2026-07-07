@@ -531,11 +531,12 @@ pub struct HooksConfig {
     /// frontmatter graph neighbors (paths + relation labels) in UserPromptSubmit.
     pub doc_graph_in_recall: bool,
 
-    /// Opt-in gate for UserPromptSubmit injection. When true, context (recall,
+    /// Gate for UserPromptSubmit injection. When true (default), context (recall,
     /// related docs, priors, call-graph hint) is injected ONLY for prompts that
-    /// begin with `*`; every other prompt is left untouched. The leading `*` is
-    /// stripped before recall so it never reaches FTS or the model. Default
-    /// `false` keeps the always-on behavior.
+    /// begin with `*`; every other prompt is left untouched — mdkb stays quiet
+    /// unless you explicitly ask. The leading `*` is stripped before recall so it
+    /// never reaches FTS or the model (and stopwords are already dropped from the
+    /// recall query). Set `false` for the always-on behavior.
     pub user_prompt_submit_require_sigil: bool,
 }
 
@@ -556,7 +557,7 @@ impl Default for HooksConfig {
             daemon_required: false,
             code_hits_in_pretooluse: true,
             doc_graph_in_recall: true,
-            user_prompt_submit_require_sigil: false,
+            user_prompt_submit_require_sigil: true,
         }
     }
 }
