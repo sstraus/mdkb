@@ -12,7 +12,6 @@ use rusqlite::{Connection, params};
 
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
-use crate::store::maintenance;
 
 use super::schema;
 
@@ -45,7 +44,6 @@ impl CodeDb {
         }
         let conn = Connection::open(&path)?;
         schema::init_schema(&conn)?;
-        let _ = maintenance::ensure_incremental_autovacuum(&conn);
         Ok(Self { conn, path })
     }
 
@@ -54,7 +52,6 @@ impl CodeDb {
         let path = path.as_ref().to_path_buf();
         let conn = Connection::open(&path)?;
         schema::init_schema(&conn)?;
-        let _ = maintenance::ensure_incremental_autovacuum(&conn);
         Ok(Self { conn, path })
     }
 

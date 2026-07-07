@@ -560,12 +560,6 @@ impl McpServer {
                 if let Err(e) = crate::store::maintenance::run_optimize(&ctx.conn) {
                     tracing::warn!("PRAGMA optimize failed: {}", e);
                 }
-                if let Err(e) = crate::store::maintenance::maybe_incremental_vacuum(
-                    &ctx.conn,
-                    crate::store::maintenance::INCREMENTAL_VACUUM_THRESHOLD,
-                ) {
-                    tracing::warn!("incremental_vacuum failed: {}", e);
-                }
             }
         }
     }

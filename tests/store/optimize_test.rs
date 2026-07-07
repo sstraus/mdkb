@@ -1,40 +1,30 @@
-//! Integration test: incremental auto_vacuum conversion + runtime upkeep.
+//! Integration test: database runtime upkeep and vacuum-regression guard.
 //!
-//! The one-shot conversion VACUUMs (exclusive lock) so it runs only at first
-//! open, gated by a `PRAGMA user_version` marker. `PRAGMA optimize` (non-locking)
-//! and `incremental_vacuum` (cheap reclaim) are gated on a call-count drift
-//! counter at runtime.
+//! `PRAGMA optimize` (non-locking) is gated on a call-count drift counter at
+//! runtime. Automatic `auto_vacuum = INCREMENTAL` conversion was removed after it
+//! corrupted `index.sqlite` pointer-map pages, so a freshly-opened database must
+//! stay in the historical `auto_vacuum = NONE` (0) mode with no pointer-map pages.
 
 use mdkb::cli::handlers::{Context, handle_init};
-use mdkb::store::maintenance::{
-    AUTOVAC_DONE_FLAG, ensure_incremental_autovacuum, run_optimize, should_optimize,
-};
+use mdkb::store::maintenance::{run_optimize, should_optimize};
 
 #[test]
-fn incremental_autovacuum_runs_once_and_sets_marker() {
+fn fresh_db_is_auto_vacuum_none() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().to_path_buf();
     handle_init(&root).expect("init mdkb");
 
     let ctx = Context::open(&root).expect("open ctx");
 
-    let version: i64 = ctx
-        .conn
-        .query_row("PRAGMA user_version", [], |r| r.get(0))
-        .expect("read user_version");
-    assert!(
-        version & AUTOVAC_DONE_FLAG != 0,
-        "conversion marker must be set after first open, got user_version={version}"
-    );
-
     let mode: i64 = ctx
         .conn
         .query_row("PRAGMA auto_vacuum", [], |r| r.get(0))
         .expect("read auto_vacuum");
-    assert_eq!(mode, 2, "database must be in INCREMENTAL auto_vacuum mode");
-
-    let ran = ensure_incremental_autovacuum(&ctx.conn).expect("second call");
-    assert!(!ran, "second call must be a no-op (marker already set)");
+    assert_eq!(
+        mode, 0,
+        "database must stay in auto_vacuum=NONE — INCREMENTAL introduces the \
+         pointer-map pages that were being corrupted"
+    );
 }
 
 #[test]

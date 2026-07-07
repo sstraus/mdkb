@@ -11,7 +11,6 @@ use crate::error::{Error, ErrorKind, Result};
 use crate::store::collections;
 use crate::store::documents;
 use crate::store::hybrid;
-use crate::store::maintenance;
 use crate::store::schema;
 use crate::store::search;
 use crate::store::stats;
@@ -66,6 +65,10 @@ pub struct Context {
     pub config_path: PathBuf,
     /// Database path.
     pub db_path: PathBuf,
+    /// True when [`Context::open`] found the index structurally corrupt,
+    /// quarantined it, and built this connection on a fresh empty database.
+    /// The caller should trigger a reindex to repopulate it.
+    pub rebuilt_from_corruption: bool,
 }
 
 impl std::fmt::Debug for Context {
@@ -86,6 +89,12 @@ impl Context {
     /// the migrations that run right after also benefit). WAL +
     /// `synchronous = NORMAL` match the code-index DB and the intent of the
     /// otherwise-unused `Store::setup_pragmas`.
+    ///
+    /// Deliberately no `mmap_size`: a 256 MiB persistent memory-map on the
+    /// long-lived daemon connection, combined with page relocation/truncation
+    /// from a concurrent connection's `VACUUM`/`incremental_vacuum`, tore
+    /// `index.sqlite` pointer-map pages. `code.sqlite` never mapped and never
+    /// corrupted; the marginal read speedup is not worth the data-loss risk.
     fn configure_connection(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "
@@ -93,7 +102,6 @@ impl Context {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA temp_store = memory;
-            PRAGMA mmap_size = 268435456;
             PRAGMA foreign_keys = ON;
             ",
         )?;
@@ -117,6 +125,24 @@ impl Context {
         // Initialize sqlite-vec extension before opening connection
         vectors::init_sqlite_vec();
 
+        // Autoheal: quarantine a structurally-corrupt index before we build on
+        // it, so the `Connection::open` below lands on a clean file. Throttled,
+        // so this is cheap on the hot open path.
+        let rebuilt_from_corruption = match crate::store::heal::ensure_sound(&db_path)? {
+            crate::store::heal::Heal::Sound => false,
+            crate::store::heal::Heal::Quarantined { corrupt_path } => {
+                tracing::warn!(
+                    corrupt = %corrupt_path.display(),
+                    "index.sqlite was structurally corrupt; quarantined it and rebuilding an empty index — content will re-index from source"
+                );
+                eprintln!(
+                    "mdkb: index.sqlite was corrupt — quarantined to {} and rebuilt empty; run `mdkb update` to re-index",
+                    corrupt_path.display()
+                );
+                true
+            }
+        };
+
         let conn = Connection::open(&db_path)?;
         Self::configure_connection(&conn)?;
 
@@ -129,12 +155,12 @@ impl Context {
         // and query_events work on every transport, including the daemon-less
         // in-process CLI hook path (previously only the MCP server created them).
         crate::store::stats::init_stats_schema(&conn)?;
-        maintenance::ensure_incremental_autovacuum(&conn)?;
 
         Ok(Self {
             conn,
             config_path,
             db_path,
+            rebuilt_from_corruption,
         })
     }
 
@@ -168,12 +194,12 @@ impl Context {
         Self::configure_connection(&conn)?;
         schema::init_schema(&conn)?;
         vectors::init_vector_schema(&conn)?;
-        maintenance::ensure_incremental_autovacuum(&conn)?;
 
         Ok(Self {
             conn,
             config_path,
             db_path,
+            rebuilt_from_corruption: false,
         })
     }
 

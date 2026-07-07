@@ -5,6 +5,7 @@ pub mod collections;
 pub mod documents;
 pub mod evolution;
 pub mod graph;
+pub mod heal;
 pub mod hybrid;
 pub mod maintenance;
 pub mod memory;
@@ -69,6 +70,9 @@ impl Store {
     ///
     /// Kept consistent with the production `Context::configure_connection`
     /// (busy_timeout for cross-process write-lock contention, WAL, NORMAL sync).
+    /// No `mmap_size`: a large persistent memory-map on the long-lived daemon
+    /// connection, combined with file truncation from another connection,
+    /// corrupted `index.sqlite` — see `Context::configure_connection`.
     fn setup_pragmas(&self) -> Result<()> {
         self.conn.execute_batch(
             "
@@ -76,7 +80,6 @@ impl Store {
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA temp_store = memory;
-            PRAGMA mmap_size = 268435456;
             PRAGMA foreign_keys = ON;
             ",
         )?;

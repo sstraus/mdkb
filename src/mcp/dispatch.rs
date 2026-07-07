@@ -273,12 +273,6 @@ impl DispatchContext {
             if let Err(e) = crate::store::maintenance::run_optimize(&ctx.conn) {
                 tracing::warn!("PRAGMA optimize failed: {e}");
             }
-            if let Err(e) = crate::store::maintenance::maybe_incremental_vacuum(
-                &ctx.conn,
-                crate::store::maintenance::INCREMENTAL_VACUUM_THRESHOLD,
-            ) {
-                tracing::warn!("incremental_vacuum failed: {e}");
-            }
         }
     }
 }
@@ -299,6 +293,14 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
             }
             Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
         };
+        // Autoheal rebuilt an empty index — schedule a reindex to repopulate it
+        // from source. Best-effort: a full channel means a reindex is already
+        // queued, which is exactly what we want.
+        if ctx.rebuilt_from_corruption {
+            if let Err(e) = handle.reindex_tx.try_send(handle.root.clone()) {
+                tracing::warn!("failed to schedule post-heal reindex: {e}");
+            }
+        }
         *ctx_guard = Some(ctx);
     }
     Ok(())
