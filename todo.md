@@ -226,3 +226,111 @@ High-value/low-risk fixes shipped inline across these stories. Observations defe
   already stops them re-indexing sub-repos, so this is optional hygiene. To retire non-destructively:
   `printf '' > ~/Gits/.mdkb/.mdkbignore-hooks` (per store); or remove: `rm -rf ~/Gits/.mdkb
   ~/Gits/LS/.mdkb ~/Gits/CC_Playground/.mdkb`. Complexity S (manual). Priority P3.
+
+## From full-codebase /wiz:review (segmented, 2026-07-07)
+
+Full audit of `src/` + `tests/` on `main` (6 blocks × specialized reviewers + 5 validators). Nothing
+was fixed inline — this was an audit, and every item needs a decision, touches a per-turn hot path
+that must be re-tested, or is a cross-cutting refactor. Full detail + confidence/validator verdicts in
+`ALL-review.md`. Summary of deferred items by severity.
+
+**Status tracker** (`[ ]` = not started, `[x]` = done & verified). Findings 055-070 are now wiz stories
+(`wiz-run stories-cli.js list`); the items below are what remains OUTSIDE those stories, tracked here:
+
+- [x] ARCH-G1 — promoted to story **069-7256** (decision: DELETE `domain/traits.rs`)
+- [x] SEC-3 — promoted to story **070-8f30** (decision: default-deny whitelist in `--global`)
+- [x] ARCH-A1 — promoted to story **066-e75b** (RAII guard for reindex take/restore)
+- [x] PERF-A3 — promoted to story **067-b2d7** (`hook_dedup` TTL/LRU eviction)
+- [x] DATA-B1 — promoted to story **068-2b35** (`busy_timeout`/WAL in `Context::open`)
+- [x] BUG-A1 — folded into story **055-68ec** as an extra criterion (plan open-question default):
+      char-boundary-safe truncation in `server.rs` disambiguation_error
+- [ ] BUG-A2 — `GetParams.format = "summary"` silently ignored for document retrieval
+      (`dispatch.rs:1482-1665`, `tools.rs:67-69`, conf 70). Proposed: implement summary for documents
+      or document format as memory-only. Benefit: API honesty — callers asking for summary get one.
+      Trade-off: summary quality for arbitrary docs vs. a doc-comment fix. Complexity S. Priority P3
+      (plan open-question default: not storified this cycle)
+- [ ] ARCH-E2 — file split (`handlers.rs`/`main.rs`/`mod.rs`) — dedicated refactor story when scheduled
+- [ ] PERF-A4 / PERF-D4 / PERF-F1 — spawn_blocking + transaction cluster (fold into story 056/057 or a later story)
+- [ ] P3 batch: TLS hardening, missing SAVEPOINTs, FK/UNIQUE, embedding-dim migration gap, ~430 lines
+      dead code, test hygiene (all low/trivial complexity)
+
+(Note: `[x]` above means "triaged into a story", not "fix shipped". Implementation status lives on the
+stories themselves.) The severity summary below is the full finding list as reviewed:
+
+### P1 (block-merge)
+
+- **SEC-1 — Arbitrary file read via `memory_write.source_file` (P1).** `resolve_source_file`
+  (`dispatch.rs:460`) reads any caller path (no allowlist/size cap) and persists it into the searchable
+  memory DB → exfiltration primitive. Fix: canonicalize + `starts_with(root)`, size cap, generic error.
+  Not inline: security-sensitive, needs threat-model confirmation on legit out-of-repo reads. Value:
+  closes a prompt-injection/network exfil path. Complexity S. Validator-confirmed 90.
+- **SEC-2 — HTTP/HTTPS runs unauthenticated (P1).** `--token` documented as required but never enforced;
+  `auth_middleware` allows all when token is None. Fix: hard-error on `--http/--https` without a token
+  (`--allow-no-auth` opt-out). Not inline: a behavior change that breaks tokenless setups. Complexity S.
+  Validator-confirmed 80.
+- **PERF-A1 — ONNX embed under the async ctx mutex on the per-turn path (P1).** `embed_query` runs sync
+  inside `ctx.lock().await` in `hook_user_prompt_submit` + 3 search sites. Fix: `spawn_blocking` before
+  the lock (pattern already in `memory_write_impl`). Not inline: hot-path change, must be benchmarked.
+  Value: removes per-turn stall + cross-call serialization. Complexity S. Validator-confirmed 88.
+- **DATA-D1 — Transient DB error → silent destructive index wipe (P1).** `file_count().unwrap_or(0)`
+  makes any error look "empty"; `update()` → `reindex()` → `db.clear()`. Fix: count helpers return
+  `Result`, `update()` propagates. Not inline: touches the index-refresh contract. Complexity M.
+  Validator-confirmed 65.
+- **ARCH-D1 + BUG-D1 — Pipeline threads never joined; parser-construction failures swallowed (P1).**
+  Stage panics/errors look like clean channel closes → partial index reports success; a whole language
+  can vanish. Fix: join stage handles, surface panics, log parser failures, fold `errors` into stats.
+  Not inline: concurrency restructure needing care. Complexity M. Validator-confirmed 78/75.
+- **PERF-D2 — Missing `code_files.rel_path` index → O(n²) indexing (P1).** `insert_file` runs unindexed
+  `rel_path` DELETEs per file. Fix: add the index (or gate the legacy cleanup). Not inline: schema
+  change + reindex, wanted a batched decision. Value: O(n²)→O(n log n). Complexity trivial.
+  Validator-confirmed 85.
+- **PERF-D3 — Incremental reindex re-embeds the whole symbol table (P1).** `index_directory` calls the
+  full `generate_symbol_embeddings()` for a 1-file change. Fix: use the existing
+  `generate_symbol_embeddings_for_files`. Not inline: hot-path behavior change. Value: incremental cost
+  ∝ change set, not repo size. Complexity S. Validator-confirmed 82.
+- **TEST-1 + TEST-2 — No integration coverage for priors-mining + memory-graph (P1).** The two flagship
+  3.7.0 subsystems have zero E2E tests; `run_distiller_cli` failure modes untested. Fix: E2E tests with
+  stub distiller + memory-graph edge/contradicts/STALE-DEP/expansion assertions. Not inline: fixture
+  effort beyond an audit. Value: protects the release's headline features. Complexity M. Confidence 90/88.
+
+### P2 (this cycle)
+
+- **PERF-A2/A4/F1 — companion blocking-under-lock sites.** `resolve_source_file` read, `incremental_vacuum`,
+  cold repo-open on `open_gate`. Fix: `spawn_blocking` / move I/O off the gate. Complexity L-M. P2.
+- **Block-C parser template drift (BUG-C1/C2/C3, PERF-C1, DATA-C1, SIMPLE-C).** Substring visibility
+  misclassification, inconsistent recursion guards, Rust per-node ancestor walk (O(n·depth)), unchecked
+  `as u16` column truncation, UTF-8 slice panic in `Symbol::Display`, ~285 duplicated lines. Fix: extract
+  shared helpers into `parsing/parser.rs`. One refactor closes 6 findings. Complexity M. P2.
+- **N+1 / unbatched DB access (PERF-B1, PERF-A5/A6, PERF-D4, DATA writes).** Batch with `IN (...)`, single
+  `GROUP BY`, transaction-wrap delete loops, `prepare_cached`. Complexity L-M. P2.
+- **DATA-B1 (retargeted) — `Context::open` sets no `busy_timeout`/WAL.** The real production DB-open path
+  (not the dead `Store::setup_pragmas`) sets only `foreign_keys=ON`; concurrent daemon+CLI writers get
+  immediate SQLITE_BUSY. Fix: add `PRAGMA busy_timeout` in `Context::open`. Complexity trivial. P2.
+- **BUG-B1 — `get_document_status` swallows real DB errors** (`.ok()` → treated as not-found). Fix:
+  `.optional()?`. Complexity trivial. P2.
+- **ARCH-A1 — no panic-safety around reindex take/restore** (wedges the handle forever on panic). Fix:
+  RAII guard generalizing `FlightGuard`. Complexity L-M. P2.
+- **BUG-E1/E2 + PERF-E1 — CLI exit-code 0 on all-fail `get`; double collection scan; multi-thread runtime
+  for one-shot hooks.** Fix: `had_error` non-zero exit; single scan; `new_current_thread()` for
+  non-serve. Complexity S. P2.
+- **BUG-F1 + ARCH-F1 — watcher drops events under backpressure; shutdown doesn't drain connections.**
+  Fix: warn-once + rescan flag; `JoinSet` drain with grace period. Complexity M. P2.
+- **ARCH-G1 — `domain/traits.rs` is a dead abstraction (~280 lines, test-only impl).** Decide with Boss:
+  wire `Store` to the ports, or delete. Needs a decision. Complexity S(delete)/H(wire). P2.
+- **PERF-G1/G2/G3 — regex recompiled per document; unbatched doc embedding; `Config` re-parsed per
+  handler call.** Fix: `OnceLock` regexes, batch `embed_documents`, cache `Config` in `Context`.
+  Complexity S. P2.
+- **ARCH-E1/E2 — hand-built `DispatchContext` ×3 (public `Arc<Mutex>` + magic const); `handlers.rs`
+  ~3800 / `main.rs` ~2718 / `mod.rs` ~1085 lines.** Fix: constructor; extract by domain. Complexity M. P2.
+
+### P3 (nice-to-have, batched)
+
+TLS hardening (SEC-A4); `root` default-deny whitelist (SEC-3); missing SAVEPOINTs/FK/UNIQUE
+(DATA-B3..6); embedding-dimension migration gap (ARCH-B1); store micro-perf (graph BFS per-edge queries,
+`prepare_cached`, `merge_small_chunks` O(n²), `query_events(created_at)` index); silent-failure logging
+(SILENT-D/E: unlogged mtime/autovacuum, bulk-command exit codes, `memory condense` masking, VACUUM
+"0 KB"); dead code (`Config::from_env_with_defaults`, `TokenCounter`, `mcp.include_token_count`,
+`MethodCallResolver`, ~430 lines); style (duplicate `mcp_error`, `&PathBuf` args, `_debouncer`,
+diverging pid-path fallbacks, symlink-following chmod, no hook-socket read timeout); test hygiene
+(FTS5 special-char coverage, `smoke_hook_stop` mining path, flaky p50 assertion, two 1s mtime sleeps →
+`filetime`, stale `cli_smoke` count in CLAUDE.md). Each low/trivial complexity.
