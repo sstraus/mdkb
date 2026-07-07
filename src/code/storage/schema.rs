@@ -60,6 +60,9 @@ CREATE INDEX IF NOT EXISTS idx_rels_from ON code_relationships(from_symbol_id);
 CREATE INDEX IF NOT EXISTS idx_rels_to_name ON code_relationships(to_name);
 CREATE INDEX IF NOT EXISTS idx_rels_file ON code_relationships(file_id);
 CREATE INDEX IF NOT EXISTS idx_files_hash ON code_files(hash);
+-- insert_file DELETEs the legacy absolute-path row by rel_path on every insert;
+-- without this index each DELETE is a full table scan, making a full index O(n²).
+CREATE INDEX IF NOT EXISTS idx_files_rel_path ON code_files(rel_path);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS code_symbols_fts USING fts5(
     name, doc_comment, signature,
@@ -336,6 +339,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(doc, "new", "last insert should win");
+    }
+
+    #[test]
+    fn rel_path_delete_uses_index_not_full_scan() {
+        // PERF-D2: insert_file runs two DELETEs filtered on rel_path for every
+        // file. Without an index on rel_path each is a full table scan, making a
+        // full index O(n²). Assert the query planner uses idx_files_rel_path.
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        let plan: Vec<String> = conn
+            .prepare("EXPLAIN QUERY PLAN DELETE FROM code_files WHERE rel_path = ?1 AND path != ?2")
+            .unwrap()
+            .query_map(["x", "y"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let detail = plan.join(" | ");
+
+        assert!(
+            detail.contains("idx_files_rel_path"),
+            "rel_path DELETE should use idx_files_rel_path, plan was: {detail}"
+        );
+        assert!(
+            !detail.contains("SCAN code_files"),
+            "rel_path DELETE should not full-scan code_files, plan was: {detail}"
+        );
     }
 
     #[test]
