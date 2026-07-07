@@ -521,8 +521,12 @@ pub fn handle_get(ctx: &Context, id_or_path: &str, lines: Option<&str>) -> Resul
         }
     }
 
-    // Try path resolution across collections
-    if id_or_path.contains('/') || id_or_path.contains('.') {
+    // Path resolution across collections. The path-like branch and the old
+    // fallback both scanned every collection with the same call, so a not-found
+    // path-like id (contains '/' or '.') scanned twice (BUG-E2). Run the scan
+    // exactly once: for path-like ids here, for the rest in the fallback below.
+    let path_like = id_or_path.contains('/') || id_or_path.contains('.');
+    if path_like {
         let all_colls = collections::list_collections(&ctx.conn)?;
         for coll in &all_colls {
             if let Some(doc) = documents::get_document_by_path(&ctx.conn, &coll.name, id_or_path)? {
@@ -537,12 +541,14 @@ pub fn handle_get(ctx: &Context, id_or_path: &str, lines: Option<&str>) -> Resul
         return Ok(GetResult::Memory(entry));
     }
 
-    // Fallback: try all collections without path hint
-    let all_colls = collections::list_collections(&ctx.conn)?;
-    for coll in &all_colls {
-        if let Some(doc) = documents::get_document_by_path(&ctx.conn, &coll.name, id_or_path)? {
-            let content = get_document_content(ctx, &doc, lines)?;
-            return Ok(GetResult::Document(doc, content));
+    // Fallback for non-path-like ids: try all collections without a path hint.
+    if !path_like {
+        let all_colls = collections::list_collections(&ctx.conn)?;
+        for coll in &all_colls {
+            if let Some(doc) = documents::get_document_by_path(&ctx.conn, &coll.name, id_or_path)? {
+                let content = get_document_content(ctx, &doc, lines)?;
+                return Ok(GetResult::Document(doc, content));
+            }
         }
     }
 
@@ -2996,6 +3002,41 @@ mod tests {
         )
         .expect("add");
         (temp, ctx)
+    }
+
+    #[test]
+    fn handle_get_resolves_path_memory_and_errors_once_on_missing() {
+        // BUG-E2 correctness: after gating the collection scan to run once, a
+        // path-like doc still resolves, a memory slug still resolves, and a
+        // not-found path-like id returns DocumentNotFound (no double scan / panic).
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let docs = temp.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("guide.md"), "# Guide\n\nbody text").unwrap();
+
+        let ctx = Context::open(temp.path()).unwrap();
+        handle_collection_add(&ctx, "docs", "./docs", "**/*.md").unwrap();
+        handle_update(&ctx, temp.path()).unwrap();
+
+        match handle_get(&ctx, "guide.md", None).expect("path-like doc resolves") {
+            GetResult::Document(doc, _) => assert!(doc.relative_path.ends_with("guide.md")),
+            other => panic!("expected a document, got {other:?}"),
+        }
+
+        assert!(
+            handle_get(&ctx, "missing/thing.md", None).is_err(),
+            "a not-found path-like id must return an error"
+        );
+
+        handle_memory_add(
+            &ctx, "slug1", "T", "topic", None, "c", None, None, None, None,
+        )
+        .unwrap();
+        match handle_get(&ctx, "slug1", None).expect("memory slug resolves") {
+            GetResult::Memory(e) => assert_eq!(e.id, "slug1"),
+            other => panic!("expected a memory entry, got {other:?}"),
+        }
     }
 
     #[test]

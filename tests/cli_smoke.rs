@@ -1057,6 +1057,30 @@ fn smoke_get_nonexistent() {
 }
 
 #[test]
+fn smoke_get_comma_all_fail_exits_nonzero() {
+    // BUG-E1: `get a,b` with per-id errors must exit non-zero, not 0.
+    let repo = Repo::new();
+    run(&["update"], &repo.root);
+    let out = run(&["get", "nope1.md,nope2.md"], &repo.root);
+    assert!(
+        !out.status.success(),
+        "comma-separated get where every id fails must exit non-zero"
+    );
+}
+
+#[test]
+fn smoke_get_comma_partial_success_exits_nonzero() {
+    // A valid id mixed with a bad one still fails overall (the bad id errored).
+    let repo = Repo::new();
+    run(&["update"], &repo.root);
+    let out = run(&["get", "guide.md,does-not-exist.md"], &repo.root);
+    assert!(
+        !out.status.success(),
+        "batch get must exit non-zero if any id fails, even with a partial success"
+    );
+}
+
+#[test]
 fn smoke_memory_show_nonexistent() {
     let repo = Repo::new();
     let out = run(&["memory", "show", "does-not-exist"], &repo.root);

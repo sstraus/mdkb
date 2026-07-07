@@ -53,11 +53,31 @@ fn main() -> Result<()> {
     if should_detach_from_argv() {
         mdkb::cli::daemon::detach_current_process()?;
     }
-    let rt = tokio::runtime::Builder::new_multi_thread()
+    // Only the long-lived servers (`serve`, `mcp`) need a multi-thread runtime.
+    // One-shot subcommands (hook, get, search, …) do a single round-trip and
+    // start faster on a current-thread runtime with no worker-pool spin-up
+    // (PERF-E1). spawn_blocking still uses the separate blocking pool.
+    let mut builder = if wants_multi_thread_runtime_from_argv() {
+        tokio::runtime::Builder::new_multi_thread()
+    } else {
+        tokio::runtime::Builder::new_current_thread()
+    };
+    let rt = builder
         .enable_all()
         .build()
         .map_err(|e| mdkb::Error::other(format!("build tokio runtime: {e}")))?;
     rt.block_on(run())
+}
+
+/// True iff the invocation is a long-lived server (`serve` or `mcp`) that
+/// benefits from a multi-thread runtime. Every other subcommand is one-shot.
+fn wants_multi_thread_runtime_from_argv() -> bool {
+    is_server_invocation(env::args().skip(1))
+}
+
+/// Pure form of [`wants_multi_thread_runtime_from_argv`] over an arg iterator.
+fn is_server_invocation<I: IntoIterator<Item = String>>(args: I) -> bool {
+    args.into_iter().any(|arg| arg == "serve" || arg == "mcp")
 }
 
 /// True iff the invocation is `mdkb serve --daemon --detach` in any argv
@@ -242,6 +262,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             // Detect comma-separated list (e.g., "42,43,44")
             else if id.contains(',') {
                 let ids: Vec<&str> = id.split(',').map(|s| s.trim()).collect();
+                let mut had_error = false;
                 for single_id in ids {
                     match handle_get(&ctx, single_id, lines.as_deref()) {
                         Ok(GetResult::Document(doc, content)) => {
@@ -252,8 +273,16 @@ async fn run_cli(cli: Cli) -> Result<()> {
                         }
                         Err(e) => {
                             eprintln!("Error getting '{}': {}", single_id, e);
+                            had_error = true;
                         }
                     }
+                }
+                // Non-zero exit if any id failed — a batch get that printed only
+                // per-id errors previously still exited 0 (BUG-E1).
+                if had_error {
+                    return Err(mdkb::Error::other(
+                        "one or more requested ids could not be retrieved",
+                    ));
                 }
             }
             // Single ID/path/slug
@@ -2729,5 +2758,38 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         tokio::signal::ctrl_c()
             .await
             .map_err(|e| mdkb::Error::other(format!("signal handler: {e}")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_server_invocation;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn server_subcommands_use_multi_thread_runtime() {
+        assert!(is_server_invocation(args(&["serve"])));
+        assert!(is_server_invocation(args(&["serve", "--http", "--token", "x"])));
+        assert!(is_server_invocation(args(&["mcp"])));
+        assert!(is_server_invocation(args(&["serve", "--daemon"])));
+    }
+
+    #[test]
+    fn one_shot_subcommands_use_current_thread_runtime() {
+        for one_shot in [
+            args(&["hook", "user-prompt-submit"]),
+            args(&["get", "42"]),
+            args(&["search", "query"]),
+            args(&["update"]),
+            args(&["daemon", "restart"]),
+        ] {
+            assert!(
+                !is_server_invocation(one_shot.clone()),
+                "one-shot invocation must not select the multi-thread runtime: {one_shot:?}"
+            );
+        }
     }
 }
