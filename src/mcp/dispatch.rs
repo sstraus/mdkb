@@ -49,17 +49,42 @@ use super::tools::{
 
 const MAX_HOOK_PROMPT_FINGERPRINTS: usize = 32;
 
+/// Drop a session's dedup state after this long untouched. Sessions are only
+/// explicitly reset on a same-session Stop/wrapup; one that ends abnormally
+/// (client crash, kill, no Stop hook) would otherwise leak forever. An hour is
+/// far longer than any real session's inter-hook gap.
+const HOOK_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Hard cap on live sessions as a safety net against a burst of distinct keys
+/// within the TTL window. When exceeded, the least-recently-touched session is
+/// evicted (its only cost is re-showing already-injected context once).
+const MAX_HOOK_SESSIONS: usize = 256;
+
 #[derive(Debug, Default)]
 pub struct HookDedupState {
     sessions: HashMap<String, HookSessionState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct HookSessionState {
     memory_ids: HashSet<String>,
     prior_ids: HashSet<String>,
     related_lines: HashSet<String>,
     prompt_fingerprints: VecDeque<String>,
+    /// Last time this session's dedup state was accessed; drives TTL/LRU eviction.
+    last_touched: std::time::Instant,
+}
+
+impl HookSessionState {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            memory_ids: HashSet::new(),
+            prior_ids: HashSet::new(),
+            related_lines: HashSet::new(),
+            prompt_fingerprints: VecDeque::new(),
+            last_touched: now,
+        }
+    }
 }
 
 /// Daemon-global state shared across all dispatched tool calls.
@@ -124,7 +149,38 @@ impl DispatchContext {
             .hook_dedup
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let session = state.sessions.entry(key.to_string()).or_default();
+        let now = std::time::Instant::now();
+
+        // TTL sweep: drop sessions untouched past the TTL so abnormally-ended
+        // sessions can't leak. Cheap — the map is bounded by MAX_HOOK_SESSIONS.
+        state
+            .sessions
+            .retain(|_, s| now.duration_since(s.last_touched) < HOOK_SESSION_TTL);
+
+        state
+            .sessions
+            .entry(key.to_string())
+            .or_insert_with(|| HookSessionState::new(now))
+            .last_touched = now;
+
+        // LRU safety net: if a burst of distinct keys exceeds the cap within the
+        // TTL, evict the oldest session other than the one we just touched.
+        if state.sessions.len() > MAX_HOOK_SESSIONS {
+            if let Some(oldest) = state
+                .sessions
+                .iter()
+                .filter(|(k, _)| k.as_str() != key)
+                .min_by_key(|(_, s)| s.last_touched)
+                .map(|(k, _)| k.clone())
+            {
+                state.sessions.remove(&oldest);
+            }
+        }
+
+        let session = state
+            .sessions
+            .get_mut(key)
+            .expect("session was just inserted");
         f(session)
     }
 
@@ -6422,6 +6478,57 @@ mod tests {
     }
 
     // ── PERF-A1: query embedding runs off the ctx lock (story 056) ──────
+
+    // ── PERF-A3: hook_dedup eviction (story 067) ────────────────────────
+
+    #[test]
+    fn hook_dedup_lru_caps_session_count() {
+        // Many short-lived, distinct sessions (e.g. abnormally-ended clients that
+        // never send a Stop) must not grow the map without bound.
+        let dctx = make_dctx();
+        for i in 0..(MAX_HOOK_SESSIONS + 100) {
+            dctx.with_hook_session(&format!("repo|session:{i}"), |s| {
+                s.memory_ids.insert("m".to_string());
+            });
+        }
+        let count = dctx.hook_dedup.lock().unwrap().sessions.len();
+        assert!(
+            count <= MAX_HOOK_SESSIONS,
+            "session map must stay bounded by the LRU cap, got {count}"
+        );
+    }
+
+    #[test]
+    fn hook_dedup_ttl_evicts_stale_sessions() {
+        let dctx = make_dctx();
+        dctx.with_hook_session("repo|session:stale", |s| {
+            s.memory_ids.insert("m".to_string());
+        });
+
+        // Backdate the stale session beyond the TTL, then touch a different one:
+        // the TTL sweep in with_hook_session must drop the stale entry.
+        {
+            let mut state = dctx.hook_dedup.lock().unwrap();
+            let stale = state.sessions.get_mut("repo|session:stale").unwrap();
+            stale.last_touched = std::time::Instant::now()
+                .checked_sub(HOOK_SESSION_TTL + std::time::Duration::from_secs(1))
+                .expect("instant underflow");
+        }
+
+        dctx.with_hook_session("repo|session:fresh", |s| {
+            s.memory_ids.insert("m".to_string());
+        });
+
+        let state = dctx.hook_dedup.lock().unwrap();
+        assert!(
+            !state.sessions.contains_key("repo|session:stale"),
+            "a session untouched past the TTL must be evicted"
+        );
+        assert!(
+            state.sessions.contains_key("repo|session:fresh"),
+            "the freshly-touched session must remain"
+        );
+    }
 
     #[tokio::test]
     async fn embed_query_off_lock_completes_without_hanging() {
