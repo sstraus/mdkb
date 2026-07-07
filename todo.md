@@ -249,7 +249,14 @@ that must be re-tested, or is a cross-cutting refactor. Full detail + confidence
       or document format as memory-only. Benefit: API honesty — callers asking for summary get one.
       Trade-off: summary quality for arbitrary docs vs. a doc-comment fix. Complexity S. Priority P3
       (plan open-question default: not storified this cycle)
-- [ ] ARCH-E2 — file split (`handlers.rs`/`main.rs`/`mod.rs`) — dedicated refactor story when scheduled
+- [ ] TEST-STALE-EMBED — `tests/e2e_llm.rs::test_handle_embed_generates_embeddings` (ignore-gated)
+      asserts `generated == 3, skipped == 0`, but `setup_test_env` now runs `handle_update`, which
+      auto-embeds docs (the 3.7.0 non-aggressive auto-embed feature). By the time `handle_embed` runs
+      the docs are already embedded, so the real result is `generated == 0, skipped == 3`. Confirmed
+      pre-existing (fails identically without the story-064 changes). Proposed: update the assertion to
+      the post-auto-embed contract (or seed docs without triggering auto-embed). Benefit: the ignored
+      LLM suite reflects current behavior. Complexity trivial. Priority P3 (test hygiene). Not fixed in
+      064 to avoid silently rewriting a test expectation outside the story's scope.
 - [ ] PERF-A4 / PERF-D4 / PERF-F1 — spawn_blocking + transaction cluster (fold into story 056/057 or a later story)
 - [ ] P3 batch: TLS hardening, missing SAVEPOINTs, FK/UNIQUE, embedding-dim migration gap, ~430 lines
       dead code, test hygiene (all low/trivial complexity)

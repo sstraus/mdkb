@@ -1204,6 +1204,10 @@ fn index_specified_files(
 /// A doc embedding taking longer than this is logged to `hook-slow.jsonl`.
 const EMBED_SLOW_MS: u64 = 1000;
 
+/// Single-chunk documents are embedded in groups of this size (PERF-G2) to bound
+/// the peak result vector; `embed_documents` also batches to the model internally.
+const SINGLE_DOC_EMBED_BATCH: usize = 256;
+
 /// Whether a collection should be embedded given the `--collection` filter and
 /// the `auto_embed_sessions` setting.
 ///
@@ -1290,60 +1294,49 @@ pub fn handle_embed(ctx: &Context, collection: Option<&str>) -> Result<EmbedResu
             .collect();
         let content_map = documents::get_content_batch(&ctx.conn, &hashes)?;
 
-        for doc in docs_needing_embedding {
+        // Single-chunk docs (the common case for memory/small docs) are collected
+        // and embedded in batches via embed_documents instead of one embed_query
+        // call each (PERF-G2). Multi-chunk docs are embedded per-doc as before.
+        let mut singles: Vec<(i64, &str)> = Vec::new();
+
+        for doc in &docs_needing_embedding {
             // Get content from batch result
             let Some(content) = content_map.get(&doc.hash) else {
                 result.errors.push(format!("No content for doc {}", doc.id));
                 continue;
             };
 
-            let embed_start = std::time::Instant::now();
-
             // Split into chunks using configured strategy
             let chunks = crate::store::chunks::split(content, &chunking_config);
 
             if chunks.len() <= 1 {
-                // Small doc: single embedding (no chunking overhead)
-                match service.embed_query(content) {
-                    Ok(embedding) => {
-                        vectors::store_embedding(
-                            &ctx.conn,
-                            doc.id,
-                            &embedding,
-                            crate::llm::embeddings::MODEL_NAME,
-                        )?;
-                        result.generated += 1;
-                    }
-                    Err(e) => {
-                        result.errors.push(format!(
-                            "Failed to embed doc {} ({}): {}",
-                            doc.id, doc.relative_path, e
-                        ));
-                    }
+                // Small doc: defer to the batched pass below.
+                singles.push((doc.id, content.as_str()));
+                continue;
+            }
+
+            // Multi-chunk doc: embed each chunk (already a batched call).
+            let embed_start = std::time::Instant::now();
+            let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+            match service.embed_documents(&texts) {
+                Ok(embeddings) => {
+                    vectors::store_chunk_embeddings(
+                        &ctx.conn,
+                        doc.id,
+                        &chunks,
+                        &embeddings,
+                        crate::llm::embeddings::MODEL_NAME,
+                    )?;
+                    result.generated += chunks.len();
                 }
-            } else {
-                // Multi-chunk doc: embed each chunk
-                let texts: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
-                match service.embed_documents(&texts) {
-                    Ok(embeddings) => {
-                        vectors::store_chunk_embeddings(
-                            &ctx.conn,
-                            doc.id,
-                            &chunks,
-                            &embeddings,
-                            crate::llm::embeddings::MODEL_NAME,
-                        )?;
-                        result.generated += chunks.len();
-                    }
-                    Err(e) => {
-                        result.errors.push(format!(
-                            "Failed to embed doc {} ({}, {} chunks): {}",
-                            doc.id,
-                            doc.relative_path,
-                            chunks.len(),
-                            e
-                        ));
-                    }
+                Err(e) => {
+                    result.errors.push(format!(
+                        "Failed to embed doc {} ({}, {} chunks): {}",
+                        doc.id,
+                        doc.relative_path,
+                        chunks.len(),
+                        e
+                    ));
                 }
             }
 
@@ -1351,6 +1344,33 @@ pub fn handle_embed(ctx: &Context, collection: Option<&str>) -> Result<EmbedResu
             if elapsed_ms > EMBED_SLOW_MS {
                 if let Some(dir) = &mdkb_dir {
                     log_slow_embed(dir, &doc.relative_path, elapsed_ms);
+                }
+            }
+        }
+
+        // Batched embedding for all single-chunk docs in this collection. Grouped
+        // to bound the peak result vector; embed_documents also batches to the
+        // model internally. Results are distributed back to docs by index.
+        for batch in singles.chunks(SINGLE_DOC_EMBED_BATCH) {
+            let texts: Vec<&str> = batch.iter().map(|(_, text)| *text).collect();
+            match service.embed_documents(&texts) {
+                Ok(embeddings) => {
+                    for ((doc_id, _), embedding) in batch.iter().zip(embeddings) {
+                        vectors::store_embedding(
+                            &ctx.conn,
+                            *doc_id,
+                            &embedding,
+                            crate::llm::embeddings::MODEL_NAME,
+                        )?;
+                        result.generated += 1;
+                    }
+                }
+                Err(e) => {
+                    for (doc_id, _) in batch {
+                        result
+                            .errors
+                            .push(format!("Failed to embed doc {doc_id}: {e}"));
+                    }
                 }
             }
         }

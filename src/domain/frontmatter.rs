@@ -1,9 +1,30 @@
 //! Frontmatter (YAML) parsing from markdown files.
 
+use std::sync::OnceLock;
+
 use gray_matter::{Matter, engine::YAML};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Compiled once: first-H1 title extraction. Recompiling per document during
+/// `mdkb update` showed up as hot-path regex churn (PERF-G1).
+fn h1_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^#\s+(.+)$").unwrap())
+}
+
+/// Compiled once: `**bold**` stripping.
+fn bold_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\*\*(.+?)\*\*").unwrap())
+}
+
+/// Compiled once: `*italic*` stripping.
+fn italic_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"\*(.+?)\*").unwrap())
+}
 
 /// An evolution reference from frontmatter (supersedes/updates).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,9 +102,8 @@ pub fn extract_title(frontmatter: Option<&Value>, body: &str) -> Option<String> 
     }
 
     // Fall back to first H1 in body
-    let h1_regex = Regex::new(r"^#\s+(.+)$").unwrap();
     for line in body.lines() {
-        if let Some(caps) = h1_regex.captures(line) {
+        if let Some(caps) = h1_regex().captures(line) {
             let raw_title = caps.get(1).map(|m| m.as_str()).unwrap_or("");
             // Strip markdown formatting
             let cleaned = strip_markdown_formatting(raw_title);
@@ -96,12 +116,9 @@ pub fn extract_title(frontmatter: Option<&Value>, body: &str) -> Option<String> 
 
 /// Strip basic markdown formatting (bold, italic) from text.
 fn strip_markdown_formatting(text: &str) -> String {
-    // Remove **bold** and *italic*
-    let bold_regex = Regex::new(r"\*\*(.+?)\*\*").unwrap();
-    let italic_regex = Regex::new(r"\*(.+?)\*").unwrap();
-
-    let text = bold_regex.replace_all(text, "$1");
-    let text = italic_regex.replace_all(&text, "$1");
+    // Remove **bold** and *italic* using the process-cached regexes.
+    let text = bold_regex().replace_all(text, "$1");
+    let text = italic_regex().replace_all(&text, "$1");
 
     text.to_string()
 }
@@ -328,6 +345,15 @@ This has --- dashes in the body.
         let body = "No heading here\n\nJust content.";
         let title = extract_title(None, body);
         assert!(title.is_none());
+    }
+
+    #[test]
+    fn title_regexes_are_compiled_once() {
+        // PERF-G1: the H1/bold/italic regexes must be cached, not recompiled per
+        // document. The OnceLock accessors return the same instance every call.
+        assert!(std::ptr::eq(h1_regex(), h1_regex()));
+        assert!(std::ptr::eq(bold_regex(), bold_regex()));
+        assert!(std::ptr::eq(italic_regex(), italic_regex()));
     }
 
     #[test]
