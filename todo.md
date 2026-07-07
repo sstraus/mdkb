@@ -257,6 +257,21 @@ that must be re-tested, or is a cross-cutting refactor. Full detail + confidence
       the post-auto-embed contract (or seed docs without triggering auto-embed). Benefit: the ignored
       LLM suite reflects current behavior. Complexity trivial. Priority P3 (test hygiene). Not fixed in
       064 to avoid silently rewriting a test expectation outside the story's scope.
+- [ ] 061 REMAINDER (criterion 3) — add recursion-depth guards to the secondary
+      call/relationship walks (`find_calls_in_node`, `find_method_calls_in_node`,
+      `find_implementations_in_node`, `find_defines_in_node`, `find_uses_in_node`)
+      in **cpp, csharp, java, kotlin** (~16 fns). Same mechanical transform already
+      applied to rust/c_lang/php/swift/lua/gdscript: add `depth: usize` param,
+      `if !check_recursion_depth(depth, *node) { return; }` at the top, `depth + 1`
+      in the recursive self-call, `0` at the `_impl` caller. Main `extract_symbols`
+      walks are already guarded in all 13; this closes the drift on the secondary
+      walks (stack-overflow safety for pathological ASTs). Complexity S, Priority P2.
+- [ ] 060 (P1) — Integration coverage for priors mining + memory graph: NOT STARTED.
+      Needs an E2E test with mining_enabled + a stub distiller driving a Stop hook
+      (assert promoted prior injected), run_distiller_cli failure-mode unit tests
+      (missing binary, non-zero exit), and memory-graph tests (relates edges via
+      graph scope=memory, on_conflict=contradicts, STALE-DEP marker, capped 1-hop
+      expansion). Large fixture effort. Priority P1.
 - [ ] PERF-A4 / PERF-D4 / PERF-F1 — spawn_blocking + transaction cluster (fold into story 056/057 or a later story)
 - [ ] P3 batch: TLS hardening, missing SAVEPOINTs, FK/UNIQUE, embedding-dim migration gap, ~430 lines
       dead code, test hygiene (all low/trivial complexity)
