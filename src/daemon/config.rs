@@ -130,34 +130,56 @@ impl DaemonConfig {
     /// Both the candidate and whitelist paths are canonicalized before comparison
     /// to handle symlinks, trailing slashes, and ~ expansion.
     ///
+    /// Default-deny (SEC-3): an empty `whitelist_dirs` confines the daemon to the
+    /// user's home directory rather than allowing any path on the system. In
+    /// `--global` mode the daemon auto-creates `.mdkb/` (DB + config) and spawns a
+    /// file watcher at any allowed root, so allow-all let a client point the daemon
+    /// at arbitrary directories. Explicit `whitelist_dirs` override the default.
+    /// This path is only reached in daemon/global mode; single-repo local usage
+    /// opens its own `Context` and never consults the whitelist.
+    ///
     /// Returns Ok(()) if allowed, or an error with a model-friendly message.
     pub fn check_whitelist(&self, path: &Path) -> Result<()> {
-        if self.whitelist_dirs.is_empty() {
-            return Ok(());
-        }
+        let effective: Vec<PathBuf> = if self.whitelist_dirs.is_empty() {
+            match home_dir() {
+                Ok(home) => vec![home],
+                Err(_) => {
+                    return Err(Error::config(
+                        "Daemon root whitelist is empty and the home directory could not be \
+                         determined; refusing to open an arbitrary root. Set whitelist_dirs in \
+                         ~/.mdkb/daemon.toml.",
+                    ));
+                }
+            }
+        } else {
+            self.whitelist_dirs.iter().map(|d| expand_tilde(d)).collect()
+        };
 
         let canonical = match path.canonicalize() {
             Ok(p) => p,
             Err(_) => path.to_path_buf(),
         };
 
-        for dir in &self.whitelist_dirs {
-            let whitelist_path = expand_tilde(dir);
+        for whitelist_path in &effective {
             let canonical_whitelist = match whitelist_path.canonicalize() {
                 Ok(p) => p,
-                Err(_) => whitelist_path,
+                Err(_) => whitelist_path.clone(),
             };
             if canonical.starts_with(&canonical_whitelist) {
                 return Ok(());
             }
         }
 
+        let shown = if self.whitelist_dirs.is_empty() {
+            "<home> (default-deny; set whitelist_dirs to widen)".to_string()
+        } else {
+            self.whitelist_dirs.join(", ")
+        };
         Err(Error::config(format!(
             "Repo at {} is not in the daemon whitelist. \
              Add one of its parent directories to whitelist_dirs in ~/.mdkb/daemon.toml. \
-             Current whitelist: [{}]",
+             Current whitelist: [{shown}]",
             path.display(),
-            self.whitelist_dirs.join(", ")
         )))
     }
 }
@@ -293,9 +315,13 @@ whitelist_dirs = ["~/Code"]
     }
 
     #[test]
-    fn test_daemon_whitelist_empty_allows_all() {
+    fn test_daemon_whitelist_empty_defaults_to_home() {
+        // SEC-3: an empty whitelist is default-deny (confined to home), NOT
+        // allow-all. A path under home is permitted; arbitrary paths are not.
         let config = DaemonConfig::default();
-        assert!(config.check_whitelist(Path::new("/any/path")).is_ok());
+        let home = home_dir().expect("home dir");
+        assert!(config.check_whitelist(&home).is_ok());
+        assert!(config.check_whitelist(Path::new("/any/path")).is_err());
     }
 
     #[test]

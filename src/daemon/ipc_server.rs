@@ -360,7 +360,14 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_registry() -> Arc<RepoRegistry> {
-        Arc::new(RepoRegistry::new(DaemonConfig::default()))
+        // Whitelist the system temp dir so repos created under TempDir (outside
+        // home) pass the default-deny whitelist (SEC-3); these tests exercise IPC
+        // routing, not the whitelist.
+        let config = DaemonConfig {
+            whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
+            ..DaemonConfig::default()
+        };
+        Arc::new(RepoRegistry::new(config))
     }
 
     fn make_dctx() -> Arc<DispatchContext> {

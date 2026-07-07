@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Security
+
+- **Daemon root whitelist is now default-deny in global mode.** An empty
+  `whitelist_dirs` in `~/.mdkb/daemon.toml` no longer means allow-all; it now
+  confines the daemon to the user's home directory. A client can no longer point
+  the `--global` daemon at an arbitrary path to force `.mdkb/` creation, indexing,
+  or a file watcher. Set `whitelist_dirs` to widen or narrow the allowed roots.
+  Single-repo (non-global) local usage is unaffected — it never consults the
+  whitelist.
+
 ## 3.7.0 (2026-07-06)
 
 ### Changed

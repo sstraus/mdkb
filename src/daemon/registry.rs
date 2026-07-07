@@ -382,6 +382,18 @@ mod tests {
         root
     }
 
+    /// Config that whitelists the system temp dir so repos created under a
+    /// `TempDir` (outside home) pass the default-deny whitelist. These tests
+    /// exercise registry mechanics, not the whitelist — which has its own tests
+    /// in `config.rs`. Mirrors real usage where the operator lists the repo's
+    /// parent in `daemon.toml`.
+    fn allow_temp_config() -> DaemonConfig {
+        DaemonConfig {
+            whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
+            ..DaemonConfig::default()
+        }
+    }
+
     #[test]
     fn test_repo_handle_open() {
         let tmp = TempDir::new().unwrap();
@@ -431,8 +443,7 @@ mod tests {
     fn test_registry_get_or_open() {
         let tmp = TempDir::new().unwrap();
         let root = make_repo(&tmp);
-        let config = DaemonConfig::default(); // empty whitelist = allow all
-        let registry = RepoRegistry::new(config);
+        let registry = RepoRegistry::new(allow_temp_config());
 
         let handle = registry.get_or_open(&root).unwrap();
         assert_eq!(handle.root, root.canonicalize().unwrap());
@@ -482,7 +493,7 @@ mod tests {
 
         let config = DaemonConfig {
             max_active_repos: 2,
-            ..Default::default()
+            ..allow_temp_config()
         };
         let registry = RepoRegistry::new(config);
 
@@ -510,8 +521,7 @@ mod tests {
     fn test_registry_list() {
         let tmp = TempDir::new().unwrap();
         let root = make_repo(&tmp);
-        let config = DaemonConfig::default();
-        let registry = RepoRegistry::new(config);
+        let registry = RepoRegistry::new(allow_temp_config());
 
         registry.get_or_open(&root).unwrap();
         let entries = registry.list();
@@ -526,8 +536,7 @@ mod tests {
         let root1 = make_repo(&tmp1);
         let root2 = make_repo(&tmp2);
 
-        let config = DaemonConfig::default();
-        let registry = RepoRegistry::new(config);
+        let registry = RepoRegistry::new(allow_temp_config());
 
         registry.get_or_open(&root1).unwrap();
         registry.get_or_open(&root2).unwrap();
@@ -652,7 +661,7 @@ mod tests {
         // --- Half 2: registry.get_or_open x2 on same root spawns 1 watcher. ---
         let tmp_daemon = TempDir::new().unwrap();
         let root_daemon = make_repo(&tmp_daemon);
-        let registry = RepoRegistry::new(DaemonConfig::default());
+        let registry = RepoRegistry::new(allow_temp_config());
         let before_daemon = WATCHER_SPAWN_COUNT.load(Ordering::Relaxed);
 
         let _h1 = registry.get_or_open(&root_daemon).unwrap();
@@ -687,7 +696,7 @@ mod tests {
 
         let config = DaemonConfig {
             max_active_repos: 2,
-            ..Default::default()
+            ..allow_temp_config()
         };
         let registry = RepoRegistry::new(config);
 
@@ -721,8 +730,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = make_repo(&tmp);
 
-        let config = DaemonConfig::default();
-        let registry = RepoRegistry::new(config);
+        let registry = RepoRegistry::new(allow_temp_config());
 
         // Open with raw path
         registry.get_or_open(&root).unwrap();
@@ -753,8 +761,7 @@ mod tests {
         )
         .unwrap();
 
-        let config = DaemonConfig::default();
-        let registry = RepoRegistry::new(config);
+        let registry = RepoRegistry::new(allow_temp_config());
 
         // Opening via worktree should resolve to main repo
         let handle = registry.get_or_open(&wt_root).unwrap();
@@ -789,7 +796,7 @@ mod tests {
             .unwrap();
         }
 
-        let registry = RepoRegistry::new(DaemonConfig::default());
+        let registry = RepoRegistry::new(allow_temp_config());
 
         let ha = registry.get_or_open(&wt_a).unwrap();
         let hb = registry.get_or_open(&wt_b).unwrap();
