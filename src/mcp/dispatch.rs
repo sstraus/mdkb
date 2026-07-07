@@ -2587,11 +2587,8 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
     if ensure_handle_context(handle).await.is_ok() {
         let ctx_guard = handle.ctx.lock().await;
         if let Some(c) = ctx_guard.as_ref() {
-            for e in &ranked {
-                if memory_graph::has_stale_dependency(&c.conn, &e.id).unwrap_or(false) {
-                    stale_ids.insert(e.id.clone());
-                }
-            }
+            let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+            stale_ids = memory_graph::stale_dependency_ids(&c.conn, &ids).unwrap_or_default();
         }
     }
     lines.extend(ranked.iter().map(|e| {
@@ -2845,11 +2842,8 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         let ctx_guard = handle.ctx.lock().await;
         if let Some(c) = ctx_guard.as_ref() {
             expanded = expand_recall_neighbors(&c.conn, &results);
-            for e in &results {
-                if memory_graph::has_stale_dependency(&c.conn, &e.id).unwrap_or(false) {
-                    stale_ids.insert(e.id.clone());
-                }
-            }
+            let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
+            stale_ids = memory_graph::stale_dependency_ids(&c.conn, &ids).unwrap_or_default();
         }
     }
 

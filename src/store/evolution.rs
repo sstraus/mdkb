@@ -4,7 +4,7 @@
 //! update, correct, retract, or extend other documents.
 
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -236,6 +236,9 @@ pub fn get_document_status(
     conn: &Connection,
     doc_id: i64,
 ) -> Result<Option<(DocumentStatus, Option<String>)>> {
+    // `.optional()?` so a genuine SQLite error surfaces as Err; only an absent
+    // row becomes None. `.ok()` here collapsed real errors into "not found",
+    // silently defaulting callers to DocumentStatus::Current (BUG-B1).
     let result = conn
         .query_row(
             "SELECT status, status_reason FROM documents WHERE id = ?1",
@@ -249,7 +252,7 @@ pub fn get_document_status(
                 Ok((status, reason))
             },
         )
-        .ok();
+        .optional()?;
 
     Ok(result)
 }
@@ -452,6 +455,26 @@ mod tests {
             RelationshipType::Extends
         );
         assert!("invalid".parse::<RelationshipType>().is_err());
+    }
+
+    #[test]
+    fn get_document_status_missing_row_is_none() {
+        let conn = setup_db();
+        // A doc id that doesn't exist is genuinely not-found → Ok(None).
+        assert!(get_document_status(&conn, 999_999).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_document_status_surfaces_db_error() {
+        // BUG-B1: a real DB error must not masquerade as not-found (which would
+        // default callers to DocumentStatus::Current). Dropping the table makes
+        // the query fail; get_document_status must return Err, not Ok(None).
+        let conn = setup_db();
+        conn.execute_batch("DROP TABLE documents").unwrap();
+        assert!(
+            get_document_status(&conn, 1).is_err(),
+            "a query error must surface as Err, not be swallowed to None"
+        );
     }
 
     #[test]

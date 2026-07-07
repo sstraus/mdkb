@@ -319,6 +319,48 @@ pub fn has_stale_dependency(conn: &Connection, id: &str) -> Result<bool> {
     Ok(false)
 }
 
+/// Batched form of [`has_stale_dependency`]: given many entry ids, return the
+/// subset that have a stale dependency, in a single query with a `JOIN` instead
+/// of `2 + N_edges` round-trips per id.
+///
+/// Used by recall/warmup, which check every injected entry — the per-id form
+/// was O(entries × edges) queries per hook. Returns an empty set for empty input.
+pub fn stale_dependency_ids(
+    conn: &Connection,
+    ids: &[&str],
+) -> Result<std::collections::HashSet<String>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let placeholders = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // An entry is stale if it has an outgoing derived_from/supports edge to a
+    // memory target that is superseded or net-refuted (corrections > confirmations).
+    let sql = format!(
+        "SELECT DISTINCT e.source_id \
+         FROM memory_edges e \
+         JOIN memory_entries t ON t.id = e.target_ref \
+         WHERE e.source_id IN ({placeholders}) \
+           AND e.relation IN ('derived_from', 'supports') \
+           AND e.target_kind = 'memory' \
+           AND (t.status = 'superseded' \
+                OR COALESCE(t.corrections, 0) > t.confirmations)"
+    );
+
+    let params: Vec<&dyn rusqlite::ToSql> =
+        ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
+    let mut stale = std::collections::HashSet::new();
+    for row in rows {
+        stale.insert(row?);
+    }
+    Ok(stale)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,6 +697,55 @@ mod tests {
         )
         .unwrap();
         assert!(has_stale_dependency(&conn, "child").unwrap());
+    }
+
+    #[test]
+    fn stale_dependency_ids_batches_and_matches_per_id() {
+        let conn = setup_db();
+        // Two stale entries (superseded / net-refuted bases), one healthy, one
+        // with only a weak relates_to edge, plus an id with no edges at all.
+        for id in ["stale_a", "stale_b", "healthy", "weak", "no_edges"] {
+            insert_memory(&conn, id);
+        }
+        insert_memory(&conn, "sup_base");
+        insert_memory(&conn, "refuted_base");
+        insert_memory(&conn, "live_base");
+        conn.execute(
+            "UPDATE memory_entries SET status = 'superseded' WHERE id = 'sup_base'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE memory_entries SET confirmations = 1, corrections = 3 WHERE id = 'refuted_base'",
+            [],
+        )
+        .unwrap();
+
+        add_edge(&conn, "stale_a", "sup_base", TargetKind::Memory, MemoryRelation::DerivedFrom).unwrap();
+        add_edge(&conn, "stale_b", "refuted_base", TargetKind::Memory, MemoryRelation::Supports).unwrap();
+        add_edge(&conn, "healthy", "live_base", TargetKind::Memory, MemoryRelation::DerivedFrom).unwrap();
+        add_edge(&conn, "weak", "sup_base", TargetKind::Memory, MemoryRelation::RelatesTo).unwrap();
+
+        let ids = ["stale_a", "stale_b", "healthy", "weak", "no_edges"];
+        let batched = stale_dependency_ids(&conn, &ids).unwrap();
+
+        // The batched result must equal the per-id result for every id.
+        for id in ids {
+            assert_eq!(
+                batched.contains(id),
+                has_stale_dependency(&conn, id).unwrap(),
+                "batched and per-id stale check disagree for {id}"
+            );
+        }
+        let mut got: Vec<&str> = batched.iter().map(|s| s.as_str()).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec!["stale_a", "stale_b"], "only truly-stale ids flagged");
+    }
+
+    #[test]
+    fn stale_dependency_ids_empty_input_is_empty() {
+        let conn = setup_db();
+        assert!(stale_dependency_ids(&conn, &[]).unwrap().is_empty());
     }
 
     #[test]
