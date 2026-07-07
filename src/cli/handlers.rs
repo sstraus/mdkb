@@ -78,6 +78,28 @@ impl std::fmt::Debug for Context {
 }
 
 impl Context {
+    /// Apply the connection pragmas for the main index DB.
+    ///
+    /// The daemon and one-shot CLI processes open this same file as independent
+    /// connections. `busy_timeout` makes ordinary write-lock contention wait
+    /// briefly instead of failing immediately with `SQLITE_BUSY` (set first, so
+    /// the migrations that run right after also benefit). WAL +
+    /// `synchronous = NORMAL` match the code-index DB and the intent of the
+    /// otherwise-unused `Store::setup_pragmas`.
+    fn configure_connection(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "
+            PRAGMA busy_timeout = 5000;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            PRAGMA temp_store = memory;
+            PRAGMA mmap_size = 268435456;
+            PRAGMA foreign_keys = ON;
+            ",
+        )?;
+        Ok(())
+    }
+
     /// Open or create context at the given root.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
@@ -96,7 +118,7 @@ impl Context {
         vectors::init_sqlite_vec();
 
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Self::configure_connection(&conn)?;
 
         // Run schema migrations and vector table creation on every open.
         // This ensures tables added in newer versions (e.g. vec_memory)
@@ -143,7 +165,7 @@ impl Context {
 
         // Create and initialize database
         let conn = Connection::open(&db_path)?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Self::configure_connection(&conn)?;
         schema::init_schema(&conn)?;
         vectors::init_vector_schema(&conn)?;
         maintenance::ensure_incremental_autovacuum(&conn)?;

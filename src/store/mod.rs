@@ -65,10 +65,14 @@ impl Store {
         Ok(store)
     }
 
-    /// Configure SQLite pragmas for performance.
+    /// Configure SQLite pragmas for performance and concurrency.
+    ///
+    /// Kept consistent with the production `Context::configure_connection`
+    /// (busy_timeout for cross-process write-lock contention, WAL, NORMAL sync).
     fn setup_pragmas(&self) -> Result<()> {
         self.conn.execute_batch(
             "
+            PRAGMA busy_timeout = 5000;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
             PRAGMA temp_store = memory;
