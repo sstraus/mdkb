@@ -2422,23 +2422,29 @@ fn rank_warmup_entries(
     min_confidence: f64,
     now: i64,
 ) -> Vec<crate::store::memory::MemoryEntry> {
-    // Suppress empty auto-handoffs: keep the single most-recent handoff (as a
-    // "where did I leave off" anchor) plus any older handoffs carrying real
-    // content; drop the rest so 3 near-empty auto-handoffs don't crowd warmup.
+    // Handoff policy: always keep the single most-recent handoff (the "where did
+    // I leave off" anchor — guaranteed into the output against truncation below),
+    // plus at most ONE older handoff and only if it carries real content. Capping
+    // at two stops a run of substantive handoffs from crowding topic/problem/
+    // decision out of warmup.
     use crate::store::memory::{EntryType, strip_frontmatter};
-    let newest_handoff_id = entries
+    let mut handoffs: Vec<&crate::store::memory::MemoryEntry> = entries
         .iter()
         .filter(|e| e.entry_type == EntryType::Handoff)
-        .max_by_key(|e| e.updated_at)
+        .collect();
+    handoffs.sort_by_key(|e| std::cmp::Reverse(e.updated_at));
+    let newest_handoff_id = handoffs.first().map(|e| e.id.clone());
+    let kept_older_handoff_id = handoffs
+        .iter()
+        .skip(1)
+        .find(|e| strip_frontmatter(&e.content).chars().count() >= HANDOFF_MIN_BODY_CHARS)
         .map(|e| e.id.clone());
     entries.retain(|e| {
         if e.entry_type != EntryType::Handoff {
             return true;
         }
-        if Some(&e.id) == newest_handoff_id.as_ref() {
-            return true;
-        }
-        strip_frontmatter(&e.content).chars().count() >= HANDOFF_MIN_BODY_CHARS
+        Some(&e.id) == newest_handoff_id.as_ref()
+            || Some(&e.id) == kept_older_handoff_id.as_ref()
     });
 
     if min_confidence > 0.0 {
@@ -2458,9 +2464,11 @@ fn rank_warmup_entries(
         return entries;
     }
 
-    // Reserve at most one slot for the single highest-confidence curated prior:
-    // if it would be truncated away, swap it into the last kept slot so a
-    // curated prior surfaces without displacing more than one hot entry.
+    // Reserve tail slots for entries that must survive truncation even when they
+    // aren't "hot" (low access_count): the newest handoff (session-start anchor —
+    // must always inject) takes priority, then the single highest-confidence
+    // curated prior. Each is swapped into a distinct tail slot only if it would
+    // otherwise be truncated, so at most two hot entries are displaced.
     let best_prior = entries
         .iter()
         .enumerate()
@@ -2471,10 +2479,16 @@ fn rank_warmup_entries(
                 .unwrap_or(std::cmp::Ordering::Equal)
         })
         .map(|(idx, _)| idx);
+    let newest_handoff_idx = newest_handoff_id
+        .as_ref()
+        .and_then(|id| entries.iter().position(|e| &e.id == id));
 
-    if let Some(idx) = best_prior {
-        if idx >= limit {
-            entries.swap(limit - 1, idx);
+    // Handoff first so its guarantee wins when only one slot can be reserved.
+    let mut next_slot = limit;
+    for idx in [newest_handoff_idx, best_prior].into_iter().flatten() {
+        if idx >= limit && next_slot > 0 {
+            next_slot -= 1;
+            entries.swap(next_slot, idx);
         }
     }
 
@@ -3915,6 +3929,96 @@ mod tests {
             "older handoff with body is retained"
         );
         assert!(ids.contains(&"h-new"));
+    }
+
+    #[test]
+    fn rank_guarantees_newest_handoff_survives_truncation() {
+        use crate::store::memory::{EntryType, SourceType};
+        let now = 1_000_000_000;
+        // A fresh handoff (access_count 0) plus four hot topics (access 100).
+        // With limit=2 the sort ranks the topics first and would truncate the
+        // handoff away — the reserved slot must guarantee it survives.
+        let mut entries = vec![warmup_entry(
+            "h-new",
+            EntryType::Handoff,
+            "---\ns: 1\n---\n",
+            SourceType::UserStatement,
+            0,
+            1,
+            now,
+        )];
+        for i in 0..4 {
+            entries.push(warmup_entry(
+                &format!("topic{i}"),
+                EntryType::Topic,
+                "real content",
+                SourceType::UserStatement,
+                100,
+                0,
+                now,
+            ));
+        }
+        let ranked = rank_warmup_entries(entries, 2, 0.0, now);
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ranked.len(), 2, "truncated to limit: {ids:?}");
+        assert!(
+            ids.contains(&"h-new"),
+            "newest handoff guaranteed despite low access_count: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn rank_caps_handoffs_at_two_keeping_two_newest() {
+        use crate::store::memory::{EntryType, SourceType};
+        let now = 1_000_000_000;
+        let body = "x".repeat(200); // every handoff is substantive (> 80 chars)
+        // Three substantive handoffs with a generous limit: only the newest and
+        // the single most-recent older one may survive; the third is capped out.
+        let entries = vec![
+            warmup_entry(
+                "h-new",
+                EntryType::Handoff,
+                &body,
+                SourceType::UserStatement,
+                5,
+                1,
+                now,
+            ),
+            warmup_entry(
+                "h-mid",
+                EntryType::Handoff,
+                &body,
+                SourceType::UserStatement,
+                5,
+                2,
+                now,
+            ),
+            warmup_entry(
+                "h-old",
+                EntryType::Handoff,
+                &body,
+                SourceType::UserStatement,
+                5,
+                3,
+                now,
+            ),
+        ];
+        let ranked = rank_warmup_entries(entries, 10, 0.0, now);
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        let handoffs = ranked
+            .iter()
+            .filter(|e| e.entry_type == EntryType::Handoff)
+            .count();
+        assert_eq!(handoffs, 2, "at most two handoffs survive warmup: {ids:?}");
+        assert!(ids.contains(&"h-new"), "newest handoff kept: {ids:?}");
+        assert!(
+            ids.contains(&"h-mid"),
+            "most-recent older substantive handoff kept: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"h-old"),
+            "third substantive handoff dropped by cap: {ids:?}"
+        );
     }
 
     #[test]
