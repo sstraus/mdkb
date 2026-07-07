@@ -199,11 +199,21 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
     Ok(())
 }
 
+/// Daemon config for the in-process (`MDKB_NO_DAEMON`) fallback. The `root` here
+/// is locally resolved (the user's own repo), not a client-supplied path, so it
+/// is added to the whitelist: the default-deny confinement (SEC-3, story 070)
+/// targets the networked/global daemon serving arbitrary client roots, not this
+/// trusted single-repo in-process path.
+fn in_process_config(root: &Path) -> Result<DaemonConfig> {
+    let mut config = DaemonConfig::load_or_default(&DaemonConfig::config_path())?;
+    config.whitelist_dirs.push(root.to_string_lossy().to_string());
+    Ok(config)
+}
+
 /// In-process fallback for `MDKB_NO_DAEMON=1`. Same logic as `run_in_process`
 /// but uses `emit_hook_response`.
 async fn run_hook_in_process(method: &str, params: Value, root: &Path) -> Result<()> {
-    let daemon_config = DaemonConfig::load_or_default(&DaemonConfig::config_path())?;
-    let registry = Arc::new(RepoRegistry::new(daemon_config));
+    let registry = Arc::new(RepoRegistry::new(in_process_config(root)?));
     let dctx = DispatchContext {
         metrics: Arc::new(UsageMetrics::new()),
         session_id: Arc::new(AtomicI64::new(0)),
@@ -259,8 +269,7 @@ async fn run(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<(
 /// `RepoRegistry` in the current process and routes the call through
 /// `dispatch_call` — identical code path to the daemon, no IPC.
 async fn run_in_process(method: &str, params: Value, root: &Path) -> Result<()> {
-    let daemon_config = DaemonConfig::load_or_default(&DaemonConfig::config_path())?;
-    let registry = Arc::new(RepoRegistry::new(daemon_config));
+    let registry = Arc::new(RepoRegistry::new(in_process_config(root)?));
     let dctx = DispatchContext {
         metrics: Arc::new(UsageMetrics::new()),
         session_id: Arc::new(AtomicI64::new(0)),
