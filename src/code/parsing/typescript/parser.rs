@@ -964,9 +964,13 @@ impl TypeScriptParser {
         &self,
         node: Node,
         code: &'a str,
+        depth: usize,
         results: &mut Vec<(&'a str, &'a str, Range)>,
         extends_only: bool,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
         match node.kind() {
             "class_declaration" | "abstract_class_declaration" => {
                 let class_name = node
@@ -1004,7 +1008,7 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(child, code, results, extends_only);
+            self.find_implementations_in_node(child, code, depth + 1, results, extends_only);
         }
     }
 
@@ -1374,7 +1378,7 @@ impl LanguageParser for TypeScriptParser {
             None => return Vec::new(),
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(tree.root_node(), code, &mut results, false);
+        self.find_implementations_in_node(tree.root_node(), code, 0, &mut results, false);
         results
     }
 
@@ -1384,7 +1388,7 @@ impl LanguageParser for TypeScriptParser {
             None => return Vec::new(),
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(tree.root_node(), code, &mut results, true);
+        self.find_implementations_in_node(tree.root_node(), code, 0, &mut results, true);
         results
     }
 

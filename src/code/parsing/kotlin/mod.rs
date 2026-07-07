@@ -584,7 +584,7 @@ impl KotlinParser {
             None => return Vec::new(),
         };
         let mut imports = Vec::new();
-        self.find_imports_in_node(tree.root_node(), code, file_id, &mut imports);
+        self.find_imports_in_node(tree.root_node(), code, file_id, 0, &mut imports);
         imports
     }
 
@@ -593,8 +593,13 @@ impl KotlinParser {
         node: Node,
         code: &str,
         file_id: FileId,
+        depth: usize,
         imports: &mut Vec<Import>,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+
         if node.kind() == "import_header" {
             let text = code[node.byte_range()].trim();
             let is_glob = find_child_by_kind(node, "wildcard_import").is_some();
@@ -622,7 +627,7 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_imports_in_node(child, code, file_id, imports);
+            self.find_imports_in_node(child, code, file_id, depth + 1, imports);
         }
     }
 
@@ -634,7 +639,7 @@ impl KotlinParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -643,8 +648,13 @@ impl KotlinParser {
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
+        depth: usize,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         let fn_ctx = match node.kind() {
             "function_declaration" => find_simple_identifier_ref(*node, code).or(current_fn),
             "secondary_constructor" => Some("constructor"),
@@ -669,7 +679,7 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
@@ -681,7 +691,7 @@ impl KotlinParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -690,8 +700,13 @@ impl KotlinParser {
         node: &Node,
         code: &str,
         current_fn: Option<&str>,
+        depth: usize,
         calls: &mut Vec<MethodCall>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         let fn_ctx = match node.kind() {
             "function_declaration" => find_simple_identifier_ref(*node, code).or(current_fn),
             "secondary_constructor" => Some("constructor"),
@@ -734,7 +749,7 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_method_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
@@ -744,8 +759,13 @@ impl KotlinParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         results: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         if node.kind() == "class_declaration" || node.kind() == "object_declaration" {
             let name_opt = if node.kind() == "class_declaration" {
                 find_type_identifier_ref(*node, code)
@@ -764,7 +784,7 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, results);
+            self.find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 
@@ -774,8 +794,13 @@ impl KotlinParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         defines: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         if node.kind() == "class_declaration" || node.kind() == "object_declaration" {
             let type_name = if node.kind() == "class_declaration" {
                 find_type_identifier_ref(*node, code)
@@ -802,7 +827,7 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_defines_in_node(&child, code, defines);
+            self.find_defines_in_node(&child, code, depth + 1, defines);
         }
     }
 
@@ -812,8 +837,13 @@ impl KotlinParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         uses: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         if node.kind() == "function_declaration" {
             let ctx = find_simple_identifier_ref(*node, code).unwrap_or("anonymous");
 
@@ -837,7 +867,7 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_uses_in_node(&child, code, uses);
+            self.find_uses_in_node(&child, code, depth + 1, uses);
         }
     }
 
@@ -1134,7 +1164,7 @@ impl LanguageParser for KotlinParser {
             None => return Vec::new(),
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, &mut results);
+        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 
@@ -1144,7 +1174,7 @@ impl LanguageParser for KotlinParser {
             None => return Vec::new(),
         };
         let mut uses = Vec::new();
-        self.find_uses_in_node(&tree.root_node(), code, &mut uses);
+        self.find_uses_in_node(&tree.root_node(), code, 0, &mut uses);
         uses
     }
 
@@ -1154,7 +1184,7 @@ impl LanguageParser for KotlinParser {
             None => return Vec::new(),
         };
         let mut defines = Vec::new();
-        self.find_defines_in_node(&tree.root_node(), code, &mut defines);
+        self.find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
         defines
     }
 

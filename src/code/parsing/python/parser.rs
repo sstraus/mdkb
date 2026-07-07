@@ -387,7 +387,7 @@ impl PythonParser {
             None => return Vec::new(),
         };
         let mut imports = Vec::new();
-        self.find_imports_in_node(tree.root_node(), code, file_id, &mut imports);
+        self.find_imports_in_node(tree.root_node(), code, file_id, &mut imports, 0);
         imports
     }
 
@@ -397,7 +397,12 @@ impl PythonParser {
         code: &str,
         file_id: FileId,
         imports: &mut Vec<Import>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+
         match node.kind() {
             "import_statement" => {
                 self.process_import_statement(node, code, file_id, imports);
@@ -407,7 +412,7 @@ impl PythonParser {
             }
             _ => {
                 for child in node.children(&mut node.walk()) {
-                    self.find_imports_in_node(child, code, file_id, imports);
+                    self.find_imports_in_node(child, code, file_id, imports, depth + 1);
                 }
             }
         }
@@ -534,8 +539,13 @@ impl PythonParser {
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
+        depth: usize,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         let fn_ctx = match node.kind() {
             "function_definition" => node
                 .child_by_field_name("name")
@@ -555,7 +565,7 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
@@ -565,7 +575,7 @@ impl PythonParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -576,8 +586,13 @@ impl PythonParser {
         node: &Node,
         code: &str,
         current_fn: Option<&str>,
+        depth: usize,
         calls: &mut Vec<MethodCall>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         let fn_ctx = match node.kind() {
             "function_definition" => node
                 .child_by_field_name("name")
@@ -613,7 +628,7 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_method_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
@@ -623,7 +638,7 @@ impl PythonParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -633,8 +648,13 @@ impl PythonParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         results: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         if node.kind() == "class_definition" {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let class_name = &code[name_node.byte_range()];
@@ -645,7 +665,7 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, results);
+            self.find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 
@@ -655,8 +675,13 @@ impl PythonParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         defines: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         if node.kind() == "class_definition" {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let class_name = &code[name_node.byte_range()];
@@ -689,7 +714,7 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_defines_in_node(&child, code, defines);
+            self.find_defines_in_node(&child, code, depth + 1, defines);
         }
     }
 
@@ -699,8 +724,13 @@ impl PythonParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         types: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         if node.kind() == "assignment" {
             if let Some(type_node) = node.child_by_field_name("type") {
                 let var_name = node
@@ -714,7 +744,7 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_variable_types_in_node(&child, code, types);
+            self.find_variable_types_in_node(&child, code, depth + 1, types);
         }
     }
 }
@@ -940,7 +970,7 @@ impl LanguageParser for PythonParser {
             None => return Vec::new(),
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, &mut results);
+        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 
@@ -954,7 +984,7 @@ impl LanguageParser for PythonParser {
             None => return Vec::new(),
         };
         let mut defines = Vec::new();
-        self.find_defines_in_node(&tree.root_node(), code, &mut defines);
+        self.find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
         defines
     }
 
@@ -968,7 +998,7 @@ impl LanguageParser for PythonParser {
             None => return Vec::new(),
         };
         let mut types = Vec::new();
-        self.find_variable_types_in_node(&tree.root_node(), code, &mut types);
+        self.find_variable_types_in_node(&tree.root_node(), code, 0, &mut types);
         types
     }
 }
@@ -1191,7 +1221,7 @@ class Calculator:
 
         let tree = parser.parser.parse_cached(code).unwrap();
         let mut defines = Vec::new();
-        parser.find_defines_in_node(&tree.root_node(), code, &mut defines);
+        parser.find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
 
         assert!(
             defines

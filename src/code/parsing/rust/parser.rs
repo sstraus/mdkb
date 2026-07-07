@@ -54,7 +54,7 @@ impl RustParser {
             None => return Vec::new(),
         };
         let mut imports = Vec::new();
-        self.extract_imports_from_node(tree.root_node(), code, file_id, &mut imports);
+        self.extract_imports_from_node(tree.root_node(), code, file_id, 0, &mut imports);
         imports
     }
 
@@ -63,15 +63,19 @@ impl RustParser {
         node: Node,
         code: &str,
         file_id: FileId,
+        depth: usize,
         imports: &mut Vec<Import>,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
         if node.kind() == "use_declaration" {
             if let Some(arg_node) = node.child_by_field_name("argument") {
                 self.extract_import_from_node(arg_node, code, file_id, imports);
             }
         } else {
             for child in node.children(&mut node.walk()) {
-                self.extract_imports_from_node(child, code, file_id, imports);
+                self.extract_imports_from_node(child, code, file_id, depth + 1, imports);
             }
         }
     }
@@ -704,7 +708,7 @@ impl RustParser {
 
     fn extract_inner_doc_comments(&self, node: &Node, code: &str) -> Option<String> {
         let mut parts = Vec::new();
-        self.collect_inner_docs(node, code, &mut parts);
+        self.collect_inner_docs(node, code, 0, &mut parts);
         if parts.is_empty() {
             None
         } else {
@@ -712,7 +716,16 @@ impl RustParser {
         }
     }
 
-    fn collect_inner_docs<'a>(&self, node: &Node, code: &'a str, parts: &mut Vec<&'a str>) {
+    fn collect_inner_docs<'a>(
+        &self,
+        node: &Node,
+        code: &'a str,
+        depth: usize,
+        parts: &mut Vec<&'a str>,
+    ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         for child in node.children(&mut node.walk()) {
             if matches!(child.kind(), "line_comment" | "block_comment") {
                 if let Ok(text) = child.utf8_text(code.as_bytes()) {
@@ -734,7 +747,7 @@ impl RustParser {
                     }
                 }
             } else {
-                self.collect_inner_docs(&child, code, parts);
+                self.collect_inner_docs(&child, code, depth + 1, parts);
             }
         }
     }
@@ -880,7 +893,7 @@ impl RustParser {
             None => return Vec::new(),
         };
         let mut impls = Vec::new();
-        self.find_implementations_in_node(tree.root_node(), code, &mut impls);
+        self.find_implementations_in_node(tree.root_node(), code, 0, &mut impls);
         impls
     }
 
@@ -888,8 +901,12 @@ impl RustParser {
         &self,
         node: Node,
         code: &'a str,
+        depth: usize,
         impls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
         if node.kind() == "impl_item" {
             if let Some(trait_node) = node.child_by_field_name("trait") {
                 if let Some(type_node) = node.child_by_field_name("type") {
@@ -909,7 +926,7 @@ impl RustParser {
             }
         }
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(child, code, impls);
+            self.find_implementations_in_node(child, code, depth + 1, impls);
         }
     }
 
@@ -921,7 +938,7 @@ impl RustParser {
             None => return Vec::new(),
         };
         let mut uses = Vec::new();
-        self.find_uses_in_node(tree.root_node(), code, &mut uses);
+        self.find_uses_in_node(tree.root_node(), code, 0, &mut uses);
         uses
     }
 
@@ -929,8 +946,12 @@ impl RustParser {
         &self,
         node: Node,
         code: &'a str,
+        depth: usize,
         uses: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
         match node.kind() {
             "struct_item" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
@@ -992,7 +1013,7 @@ impl RustParser {
             _ => {}
         }
         for child in node.children(&mut node.walk()) {
-            self.find_uses_in_node(child, code, uses);
+            self.find_uses_in_node(child, code, depth + 1, uses);
         }
     }
 
@@ -1004,7 +1025,7 @@ impl RustParser {
             None => return Vec::new(),
         };
         let mut defines = Vec::new();
-        self.find_defines_in_node(tree.root_node(), code, &mut defines);
+        self.find_defines_in_node(tree.root_node(), code, 0, &mut defines);
         defines
     }
 
@@ -1012,8 +1033,12 @@ impl RustParser {
         &self,
         node: Node,
         code: &'a str,
+        depth: usize,
         defines: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
         match node.kind() {
             "trait_item" => {
                 if let Some(trait_name_node) = node.child_by_field_name("name") {
@@ -1061,7 +1086,7 @@ impl RustParser {
             _ => {}
         }
         for child in node.children(&mut node.walk()) {
-            self.find_defines_in_node(child, code, defines);
+            self.find_defines_in_node(child, code, depth + 1, defines);
         }
     }
 
@@ -1073,7 +1098,7 @@ impl RustParser {
             None => return Vec::new(),
         };
         let mut bindings = Vec::new();
-        self.find_variable_types_in_node(tree.root_node(), code, &mut bindings);
+        self.find_variable_types_in_node(tree.root_node(), code, 0, &mut bindings);
         bindings
     }
 
@@ -1081,8 +1106,12 @@ impl RustParser {
         &self,
         node: Node,
         code: &'a str,
+        depth: usize,
         bindings: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
         if node.kind() == "let_declaration" {
             if let Some(pat) = node.child_by_field_name("pattern") {
                 if pat.kind() == "identifier" {
@@ -1102,7 +1131,7 @@ impl RustParser {
             }
         }
         for child in node.children(&mut node.walk()) {
-            self.find_variable_types_in_node(child, code, bindings);
+            self.find_variable_types_in_node(child, code, depth + 1, bindings);
         }
     }
 
@@ -1130,7 +1159,7 @@ impl RustParser {
             None => return Vec::new(),
         };
         let mut methods = Vec::new();
-        self.find_inherent_methods_in_node(tree.root_node(), code, &mut methods);
+        self.find_inherent_methods_in_node(tree.root_node(), code, 0, &mut methods);
         methods
     }
 
@@ -1138,8 +1167,12 @@ impl RustParser {
         &self,
         node: Node,
         code: &str,
+        depth: usize,
         methods: &mut Vec<(String, String, Range)>,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
         if node.kind() == "impl_item" && node.child_by_field_name("trait").is_none() {
             if let Some(type_node) = node.child_by_field_name("type") {
                 let type_name = self.extract_full_type_name(type_node, code);
@@ -1165,7 +1198,7 @@ impl RustParser {
             }
         }
         for child in node.children(&mut node.walk()) {
-            self.find_inherent_methods_in_node(child, code, methods);
+            self.find_inherent_methods_in_node(child, code, depth + 1, methods);
         }
     }
 }

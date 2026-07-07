@@ -258,14 +258,21 @@ that must be re-tested, or is a cross-cutting refactor. Full detail + confidence
       LLM suite reflects current behavior. Complexity trivial. Priority P3 (test hygiene). Not fixed in
       064 to avoid silently rewriting a test expectation outside the story's scope.
 - [ ] 061 REMAINDER (criterion 3) — add recursion-depth guards to the secondary
-      call/relationship walks (`find_calls_in_node`, `find_method_calls_in_node`,
-      `find_implementations_in_node`, `find_defines_in_node`, `find_uses_in_node`)
-      in **cpp, csharp, java, kotlin** (~16 fns). Same mechanical transform already
-      applied to rust/c_lang/php/swift/lua/gdscript: add `depth: usize` param,
-      `if !check_recursion_depth(depth, *node) { return; }` at the top, `depth + 1`
-      in the recursive self-call, `0` at the `_impl` caller. Main `extract_symbols`
-      walks are already guarded in all 13; this closes the drift on the secondary
-      walks (stack-overflow safety for pathological ASTs). Complexity S, Priority P2.
+      call/relationship walks. A full naming-agnostic audit found the real scope is
+      **31 unguarded self-recursive walkers across 8 files** (not the ~16 in
+      cpp/csharp/java/kotlin previously noted): cpp(2), csharp(2), go(1:
+      extract_imports_from_node), java(6), kotlin(6), python(6: all find_*_in_node +
+      find_variable_types_in_node), rust(7: extract_imports_from_node,
+      collect_inner_docs, find_implementations/uses/defines/variable_types/inherent_methods_in_node),
+      typescript(1: find_implementations_in_node). The prior session's worklog said
+      rust/c_lang/php/swift/lua/gdscript were done but only guarded the PRIMARY
+      find_calls/find_method_calls walks — rust's own uses/defines/impls/inherent
+      walks, all of python, and one go/typescript walk were still unbounded.
+      Mechanical transform: add `depth: usize` param, guard
+      `if !check_recursion_depth(depth, *node|node) { return; }` at top, `depth + 1`
+      in recursive self-call, `0` at every non-recursive caller. Criterion 3 reads
+      "all recursive traversals in EVERY language module", so all 31 are in scope.
+      Complexity S (mechanical), Priority P2.
 - [ ] 060 (P1) — Integration coverage for priors mining + memory graph: NOT STARTED.
       Needs an E2E test with mining_enabled + a stub distiller driving a Stop hook
       (assert promoted prior injected), run_distiller_cli failure-mode unit tests

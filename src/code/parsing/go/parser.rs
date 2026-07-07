@@ -1062,7 +1062,7 @@ impl GoParser {
             None => return Vec::new(),
         };
         let mut imports = Vec::new();
-        self.extract_imports_from_node(tree.root_node(), code, file_id, &mut imports);
+        self.extract_imports_from_node(tree.root_node(), code, file_id, &mut imports, 0);
         imports
     }
 
@@ -1072,12 +1072,16 @@ impl GoParser {
         code: &str,
         file_id: FileId,
         imports: &mut Vec<Import>,
+        depth: usize,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
         if node.kind() == "import_declaration" {
             self.process_import_declaration(node, code, file_id, imports);
         } else {
             for child in node.children(&mut node.walk()) {
-                self.extract_imports_from_node(child, code, file_id, imports);
+                self.extract_imports_from_node(child, code, file_id, imports, depth + 1);
             }
         }
     }

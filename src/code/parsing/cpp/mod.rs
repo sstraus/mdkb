@@ -414,7 +414,7 @@ impl CppParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -423,8 +423,12 @@ impl CppParser {
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
+        depth: usize,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         let fn_ctx = if node.kind() == "function_definition" {
             node.child_by_field_name("declarator")
                 .and_then(|d| extract_cpp_declarator_name(d, code))
@@ -443,7 +447,7 @@ impl CppParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
@@ -451,8 +455,12 @@ impl CppParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         results: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         if matches!(node.kind(), "class_specifier" | "struct_specifier") {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let class_name = &code[name_node.byte_range()];
@@ -474,7 +482,7 @@ impl CppParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, results);
+            self.find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 
@@ -598,7 +606,7 @@ impl LanguageParser for CppParser {
             None => return Vec::new(),
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, &mut results);
+        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 

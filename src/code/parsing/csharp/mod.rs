@@ -482,7 +482,7 @@ impl CSharpParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -491,8 +491,12 @@ impl CSharpParser {
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
+        depth: usize,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         let fn_ctx = if node.kind() == "method_declaration" {
             node.child_by_field_name("name")
                 .map(|n| &code[n.byte_range()])
@@ -511,7 +515,7 @@ impl CSharpParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
@@ -519,8 +523,12 @@ impl CSharpParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         results: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
         if matches!(
             node.kind(),
             "class_declaration" | "struct_declaration" | "interface_declaration"
@@ -538,7 +546,7 @@ impl CSharpParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, results);
+            self.find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 }
@@ -618,7 +626,7 @@ impl LanguageParser for CSharpParser {
             None => return Vec::new(),
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, &mut results);
+        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 

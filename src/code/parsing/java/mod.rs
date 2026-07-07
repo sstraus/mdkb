@@ -459,7 +459,7 @@ impl JavaParser {
             None => return Vec::new(),
         };
         let mut imports = Vec::new();
-        self.find_imports_in_node(tree.root_node(), code, file_id, &mut imports);
+        self.find_imports_in_node(tree.root_node(), code, file_id, 0, &mut imports);
         imports
     }
 
@@ -468,8 +468,13 @@ impl JavaParser {
         node: Node,
         code: &str,
         file_id: FileId,
+        depth: usize,
         imports: &mut Vec<Import>,
     ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+
         if node.kind() == "import_declaration" {
             let text = code[node.byte_range()].trim();
             let is_glob = text.ends_with(".*;");
@@ -493,7 +498,7 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_imports_in_node(child, code, file_id, imports);
+            self.find_imports_in_node(child, code, file_id, depth + 1, imports);
         }
     }
 
@@ -505,7 +510,7 @@ impl JavaParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -514,8 +519,13 @@ impl JavaParser {
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
+        depth: usize,
         calls: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         let fn_ctx = match node.kind() {
             "method_declaration" | "constructor_declaration" => node
                 .child_by_field_name("name")
@@ -534,7 +544,7 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
@@ -546,7 +556,7 @@ impl JavaParser {
             None => return Vec::new(),
         };
         let mut calls = Vec::new();
-        self.find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), &mut calls);
+        self.find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -555,8 +565,13 @@ impl JavaParser {
         node: &Node,
         code: &str,
         current_fn: Option<&str>,
+        depth: usize,
         calls: &mut Vec<MethodCall>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         let fn_ctx = match node.kind() {
             "method_declaration" | "constructor_declaration" => node
                 .child_by_field_name("name")
@@ -588,7 +603,7 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_method_calls_in_node(&child, code, fn_ctx, calls);
+            self.find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
@@ -598,8 +613,13 @@ impl JavaParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         results: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         match node.kind() {
             "class_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
@@ -639,7 +659,7 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, results);
+            self.find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 
@@ -649,8 +669,13 @@ impl JavaParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         defines: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         match node.kind() {
             "class_declaration" | "interface_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
@@ -680,7 +705,7 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_defines_in_node(&child, code, defines);
+            self.find_defines_in_node(&child, code, depth + 1, defines);
         }
     }
 
@@ -690,8 +715,13 @@ impl JavaParser {
         &self,
         node: &Node,
         code: &'a str,
+        depth: usize,
         uses: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
+        if !check_recursion_depth(depth, *node) {
+            return;
+        }
+
         if node.kind() == "method_declaration" {
             let ctx = node
                 .child_by_field_name("name")
@@ -724,7 +754,7 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_uses_in_node(&child, code, uses);
+            self.find_uses_in_node(&child, code, depth + 1, uses);
         }
     }
 }
@@ -882,7 +912,7 @@ impl LanguageParser for JavaParser {
             None => return Vec::new(),
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, &mut results);
+        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 
@@ -892,7 +922,7 @@ impl LanguageParser for JavaParser {
             None => return Vec::new(),
         };
         let mut uses = Vec::new();
-        self.find_uses_in_node(&tree.root_node(), code, &mut uses);
+        self.find_uses_in_node(&tree.root_node(), code, 0, &mut uses);
         uses
     }
 
@@ -902,7 +932,7 @@ impl LanguageParser for JavaParser {
             None => return Vec::new(),
         };
         let mut defines = Vec::new();
-        self.find_defines_in_node(&tree.root_node(), code, &mut defines);
+        self.find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
         defines
     }
 
