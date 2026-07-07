@@ -1828,6 +1828,17 @@ pub(super) fn apply_line_range(content: &str, range: &str) -> Result<String, Mcp
 mod tests {
     use super::*;
 
+    /// Daemon config whitelisting the system temp dir, so global-mode tests that
+    /// open repos under a `TempDir` (outside home) pass the default-deny
+    /// whitelist (SEC-3, story 070). These tests exercise global routing, not the
+    /// whitelist — which has dedicated tests in `daemon::config`.
+    fn global_test_config() -> crate::daemon::config::DaemonConfig {
+        crate::daemon::config::DaemonConfig {
+            whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
+            ..crate::daemon::config::DaemonConfig::default()
+        }
+    }
+
     // --- OOD detection tests ---
 
     #[test]
@@ -3613,7 +3624,7 @@ if (require.main === module) {
 
     #[test]
     fn test_global_constructor() {
-        let config = crate::daemon::config::DaemonConfig::default();
+        let config = global_test_config();
         let registry = std::sync::Arc::new(RepoRegistry::new(config));
         let server = McpServer::global(registry);
         assert!(server.is_global());
@@ -3649,7 +3660,7 @@ if (require.main === module) {
         let root = temp_dir.path().to_path_buf();
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
 
-        let config = crate::daemon::config::DaemonConfig::default();
+        let config = global_test_config();
         let registry = Arc::new(RepoRegistry::new(config));
         registry.get_or_open(&root).unwrap();
 
@@ -3661,7 +3672,7 @@ if (require.main === module) {
 
     #[tokio::test]
     async fn test_resolve_handle_global_no_roots() {
-        let config = crate::daemon::config::DaemonConfig::default();
+        let config = global_test_config();
         let registry = Arc::new(RepoRegistry::new(config));
 
         let server = McpServer::global(registry);
@@ -3680,7 +3691,7 @@ if (require.main === module) {
         std::fs::create_dir_all(tmp1.path().join(".mdkb")).unwrap();
         std::fs::create_dir_all(tmp2.path().join(".mdkb")).unwrap();
 
-        let config = crate::daemon::config::DaemonConfig::default();
+        let config = global_test_config();
         let registry = Arc::new(RepoRegistry::new(config));
         registry.get_or_open(tmp1.path()).unwrap();
         registry.get_or_open(tmp2.path()).unwrap();
@@ -3701,7 +3712,7 @@ if (require.main === module) {
         std::fs::create_dir_all(tmp1.path().join(".mdkb")).unwrap();
         std::fs::create_dir_all(tmp2.path().join(".mdkb")).unwrap();
 
-        let config = crate::daemon::config::DaemonConfig::default();
+        let config = global_test_config();
         let registry = Arc::new(RepoRegistry::new(config));
         registry.get_or_open(tmp1.path()).unwrap();
         registry.get_or_open(tmp2.path()).unwrap();
@@ -3716,7 +3727,7 @@ if (require.main === module) {
 
     #[tokio::test]
     async fn test_resolve_handle_cross_repo_not_implemented() {
-        let config = crate::daemon::config::DaemonConfig::default();
+        let config = global_test_config();
         let registry = Arc::new(RepoRegistry::new(config));
         let server = McpServer::global(registry);
 
@@ -3814,7 +3825,7 @@ if (require.main === module) {
         }
 
         // Create global server with both repos
-        let config = crate::daemon::config::DaemonConfig::default();
+        let config = global_test_config();
         let registry = Arc::new(RepoRegistry::new(config));
         registry.get_or_open(&root1).unwrap();
         registry.get_or_open(&root2).unwrap();
@@ -3952,7 +3963,7 @@ if (require.main === module) {
             crate::cli::handlers::handle_update(&mut ctx, &root2).unwrap();
         }
 
-        let config = crate::daemon::config::DaemonConfig::default();
+        let config = global_test_config();
         let registry = Arc::new(RepoRegistry::new(config));
         registry.get_or_open(&root1).unwrap();
         registry.get_or_open(&root2).unwrap();
