@@ -148,7 +148,10 @@ impl IndexFacade {
     /// files instead of clearing and re-parsing everything. Mirrors the
     /// SessionStart code-refresh idiom.
     pub fn update(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
-        if self.file_count() == 0 {
+        // Use the Result-returning count directly: a transient DB error must NOT
+        // be treated as "empty", or reindex() below would clear() a populated
+        // index (DATA-D1 silent wipe). Propagate the error instead.
+        if self.db.file_count()? == 0 {
             return self.reindex(root);
         }
         let all_files = walker::discover_files(
@@ -480,19 +483,32 @@ impl IndexFacade {
     // Statistics
     // -----------------------------------------------------------------------
 
-    /// Total number of indexed symbols.
+    /// Total number of indexed symbols. Logs and reports 0 on a DB error, so a
+    /// query failure is visible rather than silently indistinguishable from an
+    /// empty index (callers that must not conflate the two use `db` directly).
     pub fn symbol_count(&self) -> u64 {
-        self.db.symbol_count().unwrap_or(0)
+        self.db.symbol_count().unwrap_or_else(|e| {
+            tracing::error!("symbol_count query failed: {e}; reporting 0");
+            0
+        })
     }
 
-    /// Total number of indexed files.
+    /// Total number of indexed files. Logs and reports 0 on a DB error (see
+    /// `symbol_count`); `update()` uses `db.file_count()` directly so it never
+    /// mistakes a failed count for an empty index.
     pub fn file_count(&self) -> u64 {
-        self.db.file_count().unwrap_or(0)
+        self.db.file_count().unwrap_or_else(|e| {
+            tracing::error!("file_count query failed: {e}; reporting 0");
+            0
+        })
     }
 
-    /// Total number of persisted relationships.
+    /// Total number of persisted relationships. Logs and reports 0 on a DB error.
     pub fn relationship_count(&self) -> usize {
-        self.db.relationship_count().unwrap_or(0) as usize
+        self.db.relationship_count().unwrap_or_else(|e| {
+            tracing::error!("relationship_count query failed: {e}; reporting 0");
+            0
+        }) as usize
     }
 
     // -----------------------------------------------------------------------
@@ -1059,6 +1075,47 @@ pub fn world() {
         );
         assert!(facade.get_symbol_by_name("aaa").is_some());
         assert!(facade.get_symbol_by_name("bbb").is_some());
+    }
+
+    #[test]
+    fn update_does_not_wipe_index_when_file_count_fails() {
+        // DATA-D1: a transient DB error on the file count must NOT be read as
+        // "empty index" and trigger reindex()->clear(). We simulate the error by
+        // renaming code_files (so `SELECT COUNT(*) FROM code_files` fails) while
+        // leaving code_symbols intact, then assert update() surfaces the error
+        // and the symbols are still there.
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        let symbols_before = facade.db.symbol_count().unwrap();
+        assert!(symbols_before > 0);
+
+        facade
+            .db
+            .conn()
+            .execute_batch("ALTER TABLE code_files RENAME TO code_files_tmp")
+            .unwrap();
+
+        let res = facade.update(src_dir.path());
+        assert!(
+            res.is_err(),
+            "update must surface the count error, not silently wipe + rebuild"
+        );
+
+        facade
+            .db
+            .conn()
+            .execute_batch("ALTER TABLE code_files_tmp RENAME TO code_files")
+            .unwrap();
+        assert_eq!(
+            facade.db.symbol_count().unwrap(),
+            symbols_before,
+            "index must NOT be wiped on a transient count error (clear() must not run)"
+        );
     }
 
     #[test]

@@ -126,4 +126,8 @@ pub struct IndexStats {
     pub files_indexed: u32,
     pub symbols_indexed: u32,
     pub relationships_collected: u32,
+    /// Files the PARSE stage could not handle: unsupported/unknown language or a
+    /// parser that failed to construct. Surfaced so a partial index is visible
+    /// rather than silently reported as a clean success.
+    pub parse_errors: u32,
 }

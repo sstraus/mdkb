@@ -2383,17 +2383,19 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
                 "files_indexed": stats.files_indexed,
                 "symbols_indexed": stats.symbols_indexed,
                 "relationships_collected": stats.relationships_collected,
+                "parse_errors": stats.parse_errors,
             });
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
         }
         OutputFormat::Csv => {
-            println!("files_discovered,files_indexed,symbols_indexed,relationships");
+            println!("files_discovered,files_indexed,symbols_indexed,relationships,parse_errors");
             println!(
-                "{},{},{},{}",
+                "{},{},{},{},{}",
                 stats.files_discovered,
                 stats.files_indexed,
                 stats.symbols_indexed,
                 stats.relationships_collected,
+                stats.parse_errors,
             );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
@@ -2401,6 +2403,10 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
             println!("Files indexed:    {}", stats.files_indexed);
             println!("Symbols indexed:  {}", stats.symbols_indexed);
             println!("Relationships:    {}", stats.relationships_collected);
+            // Only surface parse failures when there are any — a clean run stays quiet.
+            if stats.parse_errors > 0 {
+                println!("Parse errors:     {} (see logs)", stats.parse_errors);
+            }
         }
     }
 }

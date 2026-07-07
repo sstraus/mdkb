@@ -92,6 +92,39 @@ impl Default for PipelineConfig {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// JoinHandles for the spawned pipeline stages, so the driver can join them,
+/// surface a stage panic (otherwise seen only as a silent channel close that
+/// makes a partial index look like a clean success), and recover the PARSE
+/// error count.
+struct StageHandles {
+    discover: thread::JoinHandle<()>,
+    readers: Vec<thread::JoinHandle<()>>,
+    parse: thread::JoinHandle<u32>,
+    collect: thread::JoinHandle<CollectStats>,
+}
+
+impl StageHandles {
+    /// Join every stage, converting a panic into an error. Returns the number
+    /// of files the PARSE stage failed on.
+    fn join_all(self) -> anyhow::Result<u32> {
+        join_stage("DISCOVER", self.discover)?;
+        for reader in self.readers {
+            join_stage("READ", reader)?;
+        }
+        let parse_errors = join_stage("PARSE", self.parse)?;
+        join_stage("COLLECT", self.collect)?;
+        Ok(parse_errors)
+    }
+}
+
+/// Join one stage thread, turning a panic (an `Err` from `join`) into an
+/// `anyhow` error rather than letting it vanish as a clean channel close.
+fn join_stage<T>(name: &str, handle: thread::JoinHandle<T>) -> anyhow::Result<T> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("indexing {name} stage panicked"))
+}
+
 /// Run the full indexing pipeline on a directory, writing results to the given database.
 ///
 /// Returns statistics about the indexing run.
@@ -100,12 +133,8 @@ pub fn index_directory(
     db: &CodeDb,
     config: &PipelineConfig,
 ) -> anyhow::Result<IndexStats> {
-    let batch_rx = spawn_pipeline_stages(root, None, config)?;
-
-    // INDEX stage runs on this thread
-    let stats = stage_index(db, &batch_rx)?;
-
-    Ok(stats)
+    let (batch_rx, handles) = spawn_pipeline_stages(root, None, config)?;
+    run_index_stage(db, batch_rx, handles)
 }
 
 /// Run the indexing pipeline on specific files (not a full directory walk).
@@ -122,11 +151,27 @@ pub fn index_files(
         return Ok(IndexStats::default());
     }
 
-    let batch_rx = spawn_pipeline_stages(root, Some(paths), config)?;
+    let (batch_rx, handles) = spawn_pipeline_stages(root, Some(paths), config)?;
+    run_index_stage(db, batch_rx, handles)
+}
 
-    // INDEX stage runs on this thread
-    let stats = stage_index(db, &batch_rx)?;
+/// Drive the INDEX stage on this thread, then join the upstream stages so a
+/// panic surfaces as an error and the PARSE error count is folded into the
+/// stats. Joins even when INDEX failed (to reap threads); a stage panic takes
+/// precedence over the INDEX error as the more likely root cause.
+fn run_index_stage(
+    db: &CodeDb,
+    batch_rx: Receiver<IndexBatch>,
+    handles: StageHandles,
+) -> anyhow::Result<IndexStats> {
+    let index_result = stage_index(db, &batch_rx);
+    // Drop our receiver so any upstream stage blocked on a full channel unblocks
+    // (its send fails) and the threads can finish, keeping join_all from hanging.
+    drop(batch_rx);
 
+    let parse_errors = handles.join_all()?;
+    let mut stats = index_result?;
+    stats.parse_errors = parse_errors;
     Ok(stats)
 }
 
@@ -138,7 +183,7 @@ fn spawn_pipeline_stages(
     root: &Path,
     explicit_paths: Option<&[PathBuf]>,
     config: &PipelineConfig,
-) -> anyhow::Result<Receiver<IndexBatch>> {
+) -> anyhow::Result<(Receiver<IndexBatch>, StageHandles)> {
     let (path_tx, path_rx) = bounded::<PathBuf>(config.channel_size);
     let (content_tx, content_rx) = bounded::<FileContent>(config.channel_size);
     let (parsed_tx, parsed_rx) = bounded::<ParsedFile>(config.channel_size);
@@ -146,8 +191,8 @@ fn spawn_pipeline_stages(
 
     let root = root.to_path_buf();
 
-    // DISCOVER stage
-    if let Some(paths) = explicit_paths {
+    // DISCOVER stage — both branches return () so the handle type is uniform.
+    let discover = if let Some(paths) = explicit_paths {
         let paths_owned: Vec<PathBuf> = paths.to_vec();
         thread::spawn(move || {
             for path in paths_owned {
@@ -155,7 +200,7 @@ fn spawn_pipeline_stages(
                     break;
                 }
             }
-        });
+        })
     } else {
         let discover_root = root.clone();
         let discover_patterns = config.ignore_patterns.clone();
@@ -166,21 +211,22 @@ fn spawn_pipeline_stages(
                 &discover_patterns,
                 discover_respect_gitignore,
                 &path_tx,
-            )
-        });
-    }
+            );
+        })
+    };
 
     // READ stage (multiple I/O threads)
+    let mut readers = Vec::with_capacity(config.read_threads);
     for _ in 0..config.read_threads {
         let rx = path_rx.clone();
         let tx = content_tx.clone();
-        thread::spawn(move || stage_read(&rx, &tx));
+        readers.push(thread::spawn(move || stage_read(&rx, &tx)));
     }
     drop(path_rx);
     drop(content_tx);
 
     // PARSE stage — needs larger stack for deeply nested ASTs (e.g. minified JS)
-    thread::Builder::new()
+    let parse = thread::Builder::new()
         .name("mdkb-parse".into())
         .stack_size(16 * 1024 * 1024)
         .spawn(move || stage_parse(&content_rx, &parsed_tx))
@@ -188,9 +234,17 @@ fn spawn_pipeline_stages(
 
     // COLLECT stage
     let batch_size = config.batch_size;
-    thread::spawn(move || stage_collect(&root, &parsed_rx, &batch_tx, batch_size));
+    let collect = thread::spawn(move || stage_collect(&root, &parsed_rx, &batch_tx, batch_size));
 
-    Ok(batch_rx)
+    Ok((
+        batch_rx,
+        StageHandles {
+            discover,
+            readers,
+            parse,
+            collect,
+        },
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -265,48 +319,45 @@ fn stage_read(rx: &Receiver<PathBuf>, tx: &Sender<FileContent>) {
 // Stage 3: PARSE
 // ---------------------------------------------------------------------------
 
+/// Box a successfully-constructed parser, or log why construction failed.
+///
+/// A parser that fails to build (e.g. a tree-sitter grammar/query error) means a
+/// whole language silently vanishes from the index. Log the language + cause so
+/// the failure is diagnosable instead of an unexplained empty result.
+fn build_parser<P: LanguageParser + 'static>(
+    language: Language,
+    result: Result<P, String>,
+) -> Option<Box<dyn LanguageParser>> {
+    match result {
+        Ok(p) => Some(Box::new(p) as Box<dyn LanguageParser>),
+        Err(e) => {
+            tracing::error!(
+                "Failed to construct {language:?} parser: {e}. \
+                 Impact: {language:?} files will not be indexed."
+            );
+            None
+        }
+    }
+}
+
 /// Create a language parser for the given language.
 fn create_parser(language: Language) -> Option<Box<dyn LanguageParser>> {
     match language {
-        Language::Rust => RustParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Go => GoParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::TypeScript | Language::JavaScript => TypeScriptParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Python => PythonParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Java => JavaParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::C => CParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Cpp => CppParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::CSharp => CSharpParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Php => PhpParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Swift => SwiftParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Lua => LuaParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Gdscript => GdscriptParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
-        Language::Kotlin => KotlinParser::new()
-            .ok()
-            .map(|p| Box::new(p) as Box<dyn LanguageParser>),
+        Language::Rust => build_parser(language, RustParser::new()),
+        Language::Go => build_parser(language, GoParser::new()),
+        Language::TypeScript | Language::JavaScript => {
+            build_parser(language, TypeScriptParser::new())
+        }
+        Language::Python => build_parser(language, PythonParser::new()),
+        Language::Java => build_parser(language, JavaParser::new()),
+        Language::C => build_parser(language, CParser::new()),
+        Language::Cpp => build_parser(language, CppParser::new()),
+        Language::CSharp => build_parser(language, CSharpParser::new()),
+        Language::Php => build_parser(language, PhpParser::new()),
+        Language::Swift => build_parser(language, SwiftParser::new()),
+        Language::Lua => build_parser(language, LuaParser::new()),
+        Language::Gdscript => build_parser(language, GdscriptParser::new()),
+        Language::Kotlin => build_parser(language, KotlinParser::new()),
     }
 }
 
@@ -902,6 +953,45 @@ fn callee() {}
 
         assert!(stats.symbols_indexed >= 2);
         assert_eq!(db.file_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn parse_errors_folded_into_stats_for_unsupported_files() {
+        // BUG-D1 / ARCH-D1: a file the PARSE stage can't handle (unknown
+        // language) must be counted in IndexStats.parse_errors, not silently
+        // dropped. index_files bypasses the walker's language filter, so we can
+        // feed an unsupported extension directly.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("ok.rs"), "pub fn ok_fn() {}").unwrap();
+        fs::write(dir.path().join("notcode.unknownext"), "lorem ipsum").unwrap();
+
+        let (_db_dir, db) = temp_db();
+        let paths = vec![
+            dir.path().join("ok.rs"),
+            dir.path().join("notcode.unknownext"),
+        ];
+        let stats = index_files(&paths, dir.path(), &db, &test_config()).unwrap();
+
+        assert_eq!(
+            stats.parse_errors, 1,
+            "the unsupported file must be counted in parse_errors"
+        );
+        assert!(
+            stats.symbols_indexed >= 1,
+            "the supported file must still be indexed"
+        );
+    }
+
+    #[test]
+    fn join_stage_surfaces_a_panic_as_error() {
+        // ARCH-D1: a panicked stage thread must become an anyhow error rather
+        // than a silent clean channel close that reports partial data as success.
+        let handle = thread::spawn(|| panic!("boom"));
+        let err = join_stage("TEST", handle).unwrap_err();
+        assert!(
+            err.to_string().contains("TEST stage panicked"),
+            "panic should surface as a stage error, got: {err}"
+        );
     }
 
     #[test]
