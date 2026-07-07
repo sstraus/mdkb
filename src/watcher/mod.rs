@@ -3,6 +3,8 @@
 //! Watches collection paths and triggers reindexing on file changes.
 
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode};
@@ -10,6 +12,10 @@ use notify_debouncer_mini::{Debouncer, new_debouncer};
 use tokio::sync::mpsc;
 
 use crate::error::{ErrorKind, Result};
+
+/// Minimum gap between "dropped events" warnings, so a burst that overflows the
+/// channel logs once rather than per dropped path.
+const DROP_WARN_INTERVAL: Duration = Duration::from_secs(5);
 
 /// File change event.
 #[derive(Debug, Clone)]
@@ -48,6 +54,11 @@ pub struct FileWatcher {
     _debouncer: Debouncer<RecommendedWatcher>,
     /// Channel receiver for events.
     receiver: mpsc::Receiver<FileChange>,
+    /// Set when the debouncer had to drop an event because the channel was full
+    /// (a burst larger than the buffer while the consumer was mid-flush). The
+    /// consumer reads this via [`FileWatcher::take_missed_events`] and forces a
+    /// full rescan so silently-dropped changes are not lost.
+    missed_events: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for FileWatcher {
@@ -60,7 +71,10 @@ impl FileWatcher {
     /// Create a new file watcher.
     pub fn new(config: WatcherConfig) -> Result<Self> {
         let (tx, rx) = mpsc::channel(100);
+        let missed_events = Arc::new(AtomicBool::new(false));
 
+        let missed_for_closure = Arc::clone(&missed_events);
+        let mut last_warn: Option<std::time::Instant> = None;
         let debouncer = new_debouncer(
             Duration::from_millis(config.debounce_ms),
             move |result: std::result::Result<Vec<notify_debouncer_mini::DebouncedEvent>, _>| {
@@ -71,8 +85,23 @@ impl FileWatcher {
                             kind: ChangeKind::CreateOrModify,
                         };
 
-                        // Non-blocking send from non-tokio thread, drop if channel is full
-                        let _ = tx.try_send(change);
+                        // Non-blocking send from a non-tokio thread. On a full
+                        // channel (burst > buffer while the consumer flushes) the
+                        // event would be silently lost, leaving files stale; flag
+                        // it so the consumer forces a full rescan, and warn (rate-
+                        // limited) so the drop is visible.
+                        if tx.try_send(change).is_err() {
+                            missed_for_closure.store(true, Ordering::Release);
+                            let now = std::time::Instant::now();
+                            if last_warn.is_none_or(|t| now.duration_since(t) >= DROP_WARN_INTERVAL)
+                            {
+                                tracing::warn!(
+                                    "File watcher channel full — dropped change event(s); \
+                                     scheduling a full rescan to recover. (Rate-limited warning.)"
+                                );
+                                last_warn = Some(now);
+                            }
+                        }
                     }
                 }
             },
@@ -82,7 +111,15 @@ impl FileWatcher {
         Ok(Self {
             _debouncer: debouncer,
             receiver: rx,
+            missed_events,
         })
+    }
+
+    /// Returns and clears the "dropped events" flag. When true, the consumer
+    /// must run a full rescan because at least one change was dropped by
+    /// backpressure since the last check.
+    pub fn take_missed_events(&self) -> bool {
+        self.missed_events.swap(false, Ordering::AcqRel)
     }
 
     /// Watch a path for changes.
@@ -125,6 +162,23 @@ mod tests {
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir());
         tempfile::tempdir_in(base).expect("failed to create temp dir")
+    }
+
+    #[tokio::test]
+    async fn missed_events_flag_defaults_false_and_clears_on_take() {
+        // BUG-F1 flag contract: no drops on a fresh watcher; take_missed_events
+        // reports-and-clears so the consumer only rescans once per drop episode.
+        let config = WatcherConfig { debounce_ms: 50 };
+        let watcher = FileWatcher::new(config).expect("watcher creation should succeed");
+        assert!(!watcher.take_missed_events(), "no drops on a fresh watcher");
+
+        // Simulate a recorded drop, then confirm take reports true once and clears.
+        watcher.missed_events.store(true, Ordering::Release);
+        assert!(watcher.take_missed_events(), "first take sees the drop");
+        assert!(
+            !watcher.take_missed_events(),
+            "second take is false — the flag is cleared, so we rescan once not repeatedly"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

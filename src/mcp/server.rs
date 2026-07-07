@@ -1428,7 +1428,18 @@ pub async fn run_file_watcher_inner(
                     if let Some(p) = path { code_batch.push(p); }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(batch_idle_ms)) => {
-                    flush_code_batch(&code_index, &root, &mut code_batch).await;
+                    if watcher.take_missed_events() {
+                        // The watcher dropped events under backpressure; the batch
+                        // is an incomplete view, so rescan everything instead.
+                        tracing::warn!(
+                            "Watcher: recovering dropped change events with a full rescan"
+                        );
+                        code_batch.clear();
+                        full_code_rescan(&code_index, &root).await;
+                        needs_doc_update = true;
+                    } else {
+                        flush_code_batch(&code_index, &root, &mut code_batch).await;
+                    }
                     flush_doc_update(&ctx, &root, &mut needs_doc_update).await;
                 }
             }
@@ -1462,6 +1473,25 @@ async fn flush_code_batch(
                 }
             }
             Err(e) => tracing::error!("Code reindex failed: {}", e),
+        }
+        crate::llm::release_cached_service();
+        CODE_REINDEX_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Full code rescan (content-hash diff over all files), used to recover after
+/// the watcher dropped change events under backpressure — the specific dropped
+/// paths are unknown, so `update` re-checks everything.
+async fn full_code_rescan(code_index: &Arc<Mutex<Option<IndexFacade>>>, root: &Path) {
+    let mut idx_guard = code_index.lock().await;
+    if let Some(facade) = idx_guard.as_mut() {
+        match facade.update(root) {
+            Ok(stats) => tracing::info!(
+                "Watcher recovery rescan: {} files, {} symbols",
+                stats.files_indexed,
+                stats.symbols_indexed
+            ),
+            Err(e) => tracing::error!("Watcher recovery rescan failed: {}", e),
         }
         crate::llm::release_cached_service();
         CODE_REINDEX_COUNT.fetch_add(1, Ordering::Relaxed);

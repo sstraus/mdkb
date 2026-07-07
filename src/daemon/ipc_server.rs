@@ -29,6 +29,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::mcp::dispatch::{DispatchContext, dispatch_call};
 use crate::mcp::server::McpServer;
@@ -38,6 +39,11 @@ use super::registry::RepoRegistry;
 /// Names of the two sockets under the daemon base directory (`~/.mdkb`).
 pub const MCP_SOCKET_NAME: &str = "daemon.sock";
 pub const HOOK_SOCKET_NAME: &str = "daemon-hook.sock";
+
+/// Max time to wait for in-flight connection tasks to finish on shutdown before
+/// giving up and unlinking sockets. Bounds how long SIGTERM takes while still
+/// letting a mid-flight SQLite write complete instead of being hard-aborted.
+const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Errors raised while serving IPC.
 #[derive(Debug, thiserror::Error)]
@@ -109,9 +115,19 @@ pub async fn serve(
         hook_path.display()
     );
 
+    // Per-connection tasks are registered here so a SIGTERM can drain in-flight
+    // connections (possibly mid SQLite write) instead of hard-aborting them when
+    // the runtime tears down (ARCH-F1).
+    let conn_tracker = TaskTracker::new();
+
     let mcp_shutdown = shutdown.clone();
     let mcp_registry = Arc::clone(&registry);
-    let mcp_task = tokio::spawn(mcp_accept_loop(mcp_listener, mcp_shutdown, mcp_registry));
+    let mcp_task = tokio::spawn(mcp_accept_loop(
+        mcp_listener,
+        mcp_shutdown,
+        mcp_registry,
+        conn_tracker.clone(),
+    ));
 
     let hook_shutdown = shutdown.clone();
     let hook_task = tokio::spawn(hook_accept_loop(
@@ -120,14 +136,30 @@ pub async fn serve(
         Arc::clone(&registry),
         Arc::clone(&dctx),
         MAX_HOOK_CONNECTIONS,
+        conn_tracker.clone(),
     ));
 
     shutdown.cancelled().await;
-    tracing::info!("ipc: shutdown signalled, unlinking sockets");
+    tracing::info!("ipc: shutdown signalled, draining connections");
 
+    // Stop the accept loops first so no new connections are registered.
     let _ = mcp_task.await;
     let _ = hook_task.await;
 
+    // Drain in-flight connection tasks with a bounded grace period.
+    conn_tracker.close();
+    if tokio::time::timeout(SHUTDOWN_DRAIN_GRACE, conn_tracker.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "ipc: {} connection task(s) still running after {}s grace; unlinking anyway",
+            conn_tracker.len(),
+            SHUTDOWN_DRAIN_GRACE.as_secs(),
+        );
+    }
+
+    tracing::info!("ipc: unlinking sockets");
     let _ = std::fs::remove_file(&mcp_path);
     let _ = std::fs::remove_file(&hook_path);
     Ok(())
@@ -175,6 +207,7 @@ async fn mcp_accept_loop(
     listener: UnixListener,
     shutdown: CancellationToken,
     registry: Arc<RepoRegistry>,
+    conn_tracker: TaskTracker,
 ) {
     loop {
         tokio::select! {
@@ -182,7 +215,8 @@ async fn mcp_accept_loop(
             accepted = listener.accept() => match accepted {
                 Ok((stream, _addr)) => {
                     let registry = Arc::clone(&registry);
-                    tokio::spawn(handle_mcp_conn(stream, registry));
+                    // Registered in the tracker so shutdown can drain it.
+                    conn_tracker.spawn(handle_mcp_conn(stream, registry));
                 }
                 Err(e) => {
                     tracing::warn!("ipc accept failed (mcp): {e}");
@@ -224,6 +258,7 @@ async fn hook_accept_loop(
     registry: Arc<RepoRegistry>,
     dctx: Arc<DispatchContext>,
     max_connections: usize,
+    conn_tracker: TaskTracker,
 ) {
     let semaphore = Arc::new(Semaphore::new(max_connections));
     loop {
@@ -237,7 +272,8 @@ async fn hook_accept_loop(
                     };
                     let registry = Arc::clone(&registry);
                     let dctx = Arc::clone(&dctx);
-                    tokio::spawn(async move {
+                    // Registered in the tracker so shutdown can drain it.
+                    conn_tracker.spawn(async move {
                         handle_hook_conn(stream, registry, dctx).await;
                         drop(permit);
                     });
@@ -456,6 +492,55 @@ mod tests {
 
         shutdown.cancel();
         serve_handle.await.unwrap().unwrap();
+    }
+
+    /// ARCH-F1: on shutdown, serve() drains in-flight connection tasks (via the
+    /// TaskTracker) and only then unlinks the sockets and returns — it does not
+    /// hard-abort a connection that is mid-request.
+    #[tokio::test]
+    async fn shutdown_drains_in_flight_connection() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path().join("mdkb");
+        let shutdown = CancellationToken::new();
+        let registry = make_registry();
+        let dctx = make_dctx();
+
+        let shutdown_clone = shutdown.clone();
+        let base_clone = base.clone();
+        let serve_handle =
+            tokio::spawn(async move { serve(&base_clone, shutdown_clone, registry, dctx).await });
+
+        let hook_path = base.join(HOOK_SOCKET_NAME);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !hook_path.exists() {
+            assert!(std::time::Instant::now() < deadline, "socket not created");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Open a hook connection and complete one request, so a connection task
+        // is registered in the tracker (handle_hook_conn is now in its read loop).
+        let mut client = tokio::net::UnixStream::connect(&hook_path).await.unwrap();
+        let body = br#"{"jsonrpc":"2.0","id":1,"method":"ping","params":{}}"#;
+        client
+            .write_all(&(body.len() as u32).to_le_bytes())
+            .await
+            .unwrap();
+        client.write_all(body).await.unwrap();
+        let mut hdr = [0u8; 4];
+        client.read_exact(&mut hdr).await.unwrap();
+        let mut resp = vec![0u8; u32::from_le_bytes(hdr) as usize];
+        client.read_exact(&mut resp).await.unwrap();
+
+        // Client disconnects → the connection task ends → the tracker can drain it.
+        drop(client);
+        shutdown.cancel();
+
+        // serve() must return (drain completes well within the grace period) and
+        // unlink the sockets.
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), serve_handle).await;
+        assert!(result.is_ok(), "serve() did not return after shutdown drain");
+        result.unwrap().unwrap().unwrap();
+        assert!(!hook_path.exists(), "hook socket should be unlinked after drain");
     }
 
     #[tokio::test]
