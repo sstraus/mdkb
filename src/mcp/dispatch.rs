@@ -505,6 +505,30 @@ fn resolve_source_file(
     }
 }
 
+/// Compute a query embedding off the async runtime. ONNX inference is
+/// CPU-bound (10-100ms); running it while the per-repo `ctx` mutex is held
+/// stalls a tokio worker and serializes every call on that repo. This mirrors
+/// the `spawn_blocking`-before-lock pattern in `memory_write_impl`. On failure
+/// returns `None` (with a warn) so callers transparently fall back to BM25.
+async fn embed_query_off_lock(query: &str) -> Option<Vec<f32>> {
+    let query = query.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::llm::get_cached_service().and_then(|s| s.embed_query(&query))
+    })
+    .await;
+    match result {
+        Ok(Ok(emb)) => Some(emb),
+        Ok(Err(e)) => {
+            tracing::warn!("query embedding failed, falling back to BM25-only: {e}");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("query embedding task panicked, falling back to BM25-only: {e}");
+            None
+        }
+    }
+}
+
 /// `memory_write_impl` and `memory_write_batch_impl`. Synchronous because it
 /// runs against an already-locked `Connection`; embedding I/O is best-effort
 /// and falls back silently when the LLM service is unconfigured (tests).
@@ -743,8 +767,18 @@ pub async fn memory_write_impl(
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
-    let (content, source_path) =
-        resolve_source_file(&handle.root, &entry.content, entry.source_file.as_deref())?;
+    // Resolve source_file off the runtime — it does blocking fs canonicalize +
+    // read (up to MAX_SOURCE_FILE_BYTES), which shouldn't stall a tokio worker.
+    let (content, source_path) = {
+        let root = handle.root.clone();
+        let content_in = entry.content.clone();
+        let source_file_in = entry.source_file.clone();
+        tokio::task::spawn_blocking(move || {
+            resolve_source_file(&root, &content_in, source_file_in.as_deref())
+        })
+        .await
+        .map_err(|e| mcp_error(format!("source_file resolution task panicked: {e}")))??
+    };
 
     // Pre-compute embedding outside the lock — ONNX is CPU-bound. Skipped for
     // dry-run, which returns before any embedding or write happens.
@@ -808,11 +842,23 @@ pub async fn memory_write_batch_impl(
 
     ensure_handle_context(handle).await?;
 
-    // Resolve source_file → content for all entries before computing embeddings.
-    let resolved: Vec<(String, Option<String>)> = entries
-        .iter()
-        .map(|e| resolve_source_file(&handle.root, &e.content, e.source_file.as_deref()))
-        .collect::<Result<_, _>>()?;
+    // Resolve source_file → content for all entries before computing embeddings,
+    // off the runtime (blocking fs canonicalize + read per entry).
+    let resolved: Vec<(String, Option<String>)> = {
+        let root = handle.root.clone();
+        let inputs: Vec<(String, Option<String>)> = entries
+            .iter()
+            .map(|e| (e.content.clone(), e.source_file.clone()))
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            inputs
+                .iter()
+                .map(|(content, sf)| resolve_source_file(&root, content, sf.as_deref()))
+                .collect::<Result<_, _>>()
+        })
+        .await
+        .map_err(|e| mcp_error(format!("source_file resolution task panicked: {e}")))??
+    };
 
     // Pre-compute embeddings for all entries outside the lock — ONNX is CPU-bound.
     // Skipped for dry-run, which returns before any embedding or write happens.
@@ -960,18 +1006,11 @@ pub async fn search_impl(
             Ok((output, results.len()))
         }
         Some("memory") => {
+            let query_embedding = embed_query_off_lock(&params.query).await;
             let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
                 .ok_or_else(|| mcp_error("Database not initialized"))?;
-            let query_embedding =
-                match crate::llm::get_cached_service().and_then(|s| s.embed_query(&params.query)) {
-                    Ok(emb) => Some(emb),
-                    Err(e) => {
-                        tracing::warn!("Memory search falling back to BM25-only: {e}");
-                        None
-                    }
-                };
             let entries = memory::search_entries_hybrid(
                 &ctx.conn,
                 &params.query,
@@ -990,6 +1029,7 @@ pub async fn search_impl(
             Ok((output, entries.len()))
         }
         None => {
+            let query_embedding = embed_query_off_lock(&params.query).await;
             let ctx_guard = handle.ctx.lock().await;
             let ctx = ctx_guard
                 .as_ref()
@@ -1003,14 +1043,6 @@ pub async fn search_impl(
             )
             .map_err(|e| mcp_error(format!("Search failed: {e}")))?;
 
-            let query_embedding =
-                match crate::llm::get_cached_service().and_then(|s| s.embed_query(&params.query)) {
-                    Ok(emb) => Some(emb),
-                    Err(e) => {
-                        tracing::warn!("Memory search falling back to BM25-only: {e}");
-                        None
-                    }
-                };
             let mem_entries = memory::search_entries_hybrid(
                 &ctx.conn,
                 &params.query,
@@ -1191,6 +1223,13 @@ pub async fn cross_repo_search_impl(
                 );
                 return Vec::<SearchResult>::new();
             }
+            // Embed off the runtime before locking — memory scope only needs it.
+            let query_embedding = if scope == Some("memory") {
+                embed_query_off_lock(&query).await
+            } else {
+                None
+            };
+
             let ctx_guard = handle.ctx.lock().await;
             let ctx = match ctx_guard.as_ref() {
                 Some(ctx) => ctx,
@@ -1224,9 +1263,6 @@ pub async fn cross_repo_search_impl(
                     }
                 }
                 Some("memory") => {
-                    let query_embedding = crate::llm::get_cached_service()
-                        .and_then(|s| s.embed_query(&query))
-                        .ok();
                     match memory::search_entries_hybrid(
                         &ctx.conn,
                         &query,
@@ -2685,23 +2721,18 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         if ensure_handle_context(handle).await.is_err() {
             return json!({});
         }
+        // Embed the raw prompt off the runtime BEFORE locking — this is the
+        // per-turn UserPromptSubmit path, so holding the ctx mutex across
+        // CPU-bound ONNX inference would stall a worker every turn. `q`
+        // (build_recall_query) is a pre-built OR-expression fed to the FTS leg
+        // via `_fts`; embedding the FTS operators would be noise.
+        let query_embedding = embed_query_off_lock(prompt).await;
         let ctx_guard = handle.ctx.lock().await;
         let conn = match ctx_guard.as_ref() {
             Some(c) => &c.conn,
             None => return json!({}),
         };
         let limit = cfg.recall_limit.max(1);
-        // `q` (build_recall_query) is a pre-built OR-expression: feed it to the
-        // FTS leg of hybrid via `_fts` (no re-escaping), but embed the raw
-        // prompt — embedding the FTS operators would be noise.
-        let query_embedding =
-            match crate::llm::get_cached_service().and_then(|s| s.embed_query(prompt)) {
-                Ok(emb) => Some(emb),
-                Err(e) => {
-                    tracing::warn!("recall falling back to BM25-only: {e}");
-                    None
-                }
-            };
         let search_t0 = std::time::Instant::now();
         results = memory::search_entries_hybrid_fts(
             conn,
@@ -6388,5 +6419,49 @@ mod tests {
             .await
             .expect("must not error");
         assert!(result.get("hookSpecificOutput").is_some());
+    }
+
+    // ── PERF-A1: query embedding runs off the ctx lock (story 056) ──────
+
+    #[tokio::test]
+    async fn embed_query_off_lock_completes_without_hanging() {
+        // Deterministic + portable: the helper every recall/search site now
+        // calls before locking must complete (never hang/panic) whether or not
+        // an ONNX model is present. With a model it yields a non-empty vector;
+        // without one it degrades to None (BM25 fallback).
+        let out = embed_query_off_lock("hook dispatcher architecture").await;
+        if let Some(v) = out {
+            assert!(!v.is_empty(), "an embedding vector must be non-empty");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore] // requires ONNX model download (see tests/e2e_llm.rs convention)
+    async fn embeds_run_concurrently_off_the_runtime() {
+        // PERF-A1 proof: embedding is on the blocking pool, not serialized by
+        // the async runtime or a shared lock. N concurrent embeds must overlap,
+        // so wall-time stays far below N × single-embed latency. If a future
+        // change moved embedding back under a single held mutex, the calls would
+        // serialize and this margin would collapse.
+        crate::llm::release_cached_service();
+        let single_t0 = std::time::Instant::now();
+        embed_query_off_lock("warm up the model").await;
+        let single = single_t0.elapsed();
+
+        const N: usize = 8;
+        let all_t0 = std::time::Instant::now();
+        let handles: Vec<_> = (0..N)
+            .map(|i| tokio::spawn(async move { embed_query_off_lock(&format!("query {i}")).await }))
+            .collect();
+        for h in handles {
+            h.await.unwrap();
+        }
+        let concurrent = all_t0.elapsed();
+        assert!(
+            concurrent < single * (N as u32),
+            "concurrent embeds ({concurrent:?}) should overlap, not serialize \
+             to N×single ({:?})",
+            single * (N as u32)
+        );
     }
 }
