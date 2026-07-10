@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 3.7.2 (2026-07-07)
+
+### Fixed
+
+- **`index.sqlite` pointer-map corruption.** Dropped the `mmap` + `auto_vacuum`
+  combination that could corrupt the SQLite pointer map on the code index, and
+  added an autoheal path that detects and rebuilds a corrupted index on open
+  instead of failing the session.
+
+## 3.7.1 (2026-07-07)
+
+Full-codebase audit remediation (stories 055–070) plus warmup/handoff and parser
+hardening. No schema break; existing DBs gain the new index on next open.
 
 ### Security
 
@@ -11,6 +23,52 @@
   or a file watcher. Set `whitelist_dirs` to widen or narrow the allowed roots.
   Single-repo (non-global) local usage is unaffected — it never consults the
   whitelist.
+- **MCP `source_file` confined to the repo root** and **HTTP transport now
+  enforces authentication**, closing a path-traversal / unauthenticated-read gap
+  on the MCP boundary.
+
+### Performance
+
+- **Query embeddings computed off the context lock.** The per-turn semantic
+  search no longer holds the context mutex while running ONNX — the single
+  highest-impact per-turn latency fix.
+- **`idx_files_rel_path` kills O(n²) indexing.** `insert_file` runs a legacy
+  cleanup `DELETE ... WHERE rel_path = ?` per file; with `rel_path` unindexed
+  each was a full table scan, making a full reindex O(n²). The new index makes it
+  a lookup. Added via `CREATE INDEX IF NOT EXISTS`, so existing DBs gain it on
+  open. Also speeds `run_repairs`.
+- **Incremental reindex re-embeds only changed symbols** instead of the whole
+  file's symbol set.
+- **Frontmatter regexes cached** (compiled once) and single-chunk doc embedding
+  batched.
+
+### Fixed
+
+- **Honest code-index errors.** A failed update/reindex no longer silently wipes
+  the index; worker threads are joined, and parser failures are logged instead of
+  swallowed.
+- **`busy_timeout` + WAL set in the production `Context::open` path**, removing
+  the most common `SQLITE_BUSY` that previously triggered the silent wipe.
+- **RAII reindex guard** so a panic mid-reindex can no longer wedge the MCP
+  handle.
+- **Bounded daemon memory** — stale `hook_dedup` sessions are evicted (TTL + LRU).
+- **Watcher backpressure visibility + graceful shutdown drain** on the daemon.
+- **`get_document_status` errors surfaced**, and the recall stale-dependency check
+  batched.
+- **CLI `get`** returns a correct exit code, scans the collection once, and runs
+  on a one-shot current-thread runtime.
+- **Warmup handoff injection.** mdkb now owns handoff injection: the newest
+  handoff body is injected and handoffs are excluded from the compact list, with
+  a cap on warmup handoffs and noise tags filtered from warmup lines.
+
+### Changed
+
+- **Recursion-depth guards threaded through all recursive parser walks** (31
+  walks across the tree-sitter language backends) via shared helpers
+  (`node_range`, visibility extraction, doc-comment strip), removing the last
+  unbounded-recursion paths in parsing. Deleted the dead `domain/traits.rs`.
+
+
 
 ## 3.7.0 (2026-07-06)
 

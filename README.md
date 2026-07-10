@@ -28,10 +28,13 @@ No cloud APIs. No token-heavy context dumps. Just fast, local, relevant retrieva
 - **Unified diagnostics** — `mdkb stats` renders a static ASCII dashboard (index health, collections, memory, code, sessions, hooks)
 - **Zero config serving** — auto-indexes on startup, watches for file changes, auto-`VACUUM`s on drift
 
-### Recent highlights (3.1.0 / 3.0.0 / 2.2.0 / 2.0.0)
+### Recent highlights (3.7.x / 3.1.0 / 3.0.0)
 
 Full details in [CHANGES.md](CHANGES.md).
 
+- **3.7.2** — Fixed `index.sqlite` pointer-map corruption (dropped `mmap`+`auto_vacuum`); autoheal rebuilds a corrupted code index on open instead of failing the session.
+- **3.7.1** — Full-codebase audit remediation: default-deny daemon whitelist in global mode, `source_file` confinement + HTTP auth on the MCP boundary, query embeddings off the context lock, `idx_files_rel_path` (kills O(n²) reindex), incremental re-embed of only changed symbols, honest code-index errors (no silent wipe), and recursion-depth guards across all parser walks.
+- **3.7.0** — UserPromptSubmit recall is opt-in by default (`*` sigil); non-aggressive auto-indexing + embedding backfill; mdkb×wiz synergy audit (schema v16/v17) revives the self-learning loop with embeddings on every write path.
 - **3.1.0** — Automatic `code.sqlite` repair on open — idempotent integrity checks fix NULL kinds, orphaned rows, and desynced FTS without user intervention.
 - **3.0.0 (breaking)** — Hook dispatch via daemon IPC (Unix socket JSON-RPC instead of in-process execution); `reindex-queue.jsonl` removed (PostToolUse sends paths directly to daemon watcher channel); hook event logging to `hook-events.jsonl`; per-event configurable latency thresholds; `spawn_blocking` for CPU-bound hook work.
 - **2.2.0** — `prior` entry type for behavioral patterns (30d TTL default, excluded from searches); `mdkb cheatsheet` AI-friendly command reference; `--entry-type` filter on `mdkb search`; PreToolUse Grep hook suggests CLI commands (works without MCP); optimized injected text (~185 fewer tokens per turn).
