@@ -24,6 +24,10 @@ pub struct StatsReport {
     pub code: CodeSummary,
     pub sessions: SessionsSummary,
     pub hooks: HooksSummary,
+    /// Outstanding autoheal quarantines (a corrupt index was rebuilt). Non-empty
+    /// until the operator removes the `*.corrupt-*` files — a persistent, loud
+    /// data-loss warning.
+    pub quarantine: Vec<crate::store::heal::QuarantineReport>,
 }
 
 #[derive(Debug, Serialize)]
@@ -177,6 +181,7 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
         code: collect_code(mdkb_dir),
         sessions: collect_sessions(ctx)?,
         hooks: collect_hooks(mdkb_dir, root, collect_mining(ctx)),
+        quarantine: crate::store::heal::quarantine_reports(mdkb_dir),
     })
 }
 
@@ -923,6 +928,7 @@ mod tests {
                     candidate_count: 0,
                 },
             },
+            quarantine: vec![],
         }
     }
 

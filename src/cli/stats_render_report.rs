@@ -19,6 +19,7 @@ const WIDTH: usize = 72;
 /// on tty detection and the `--no-color` flag.
 pub fn render(report: &StatsReport, _color: bool) -> String {
     let mut out = String::with_capacity(4096);
+    render_quarantine(&mut out, &report.quarantine, report.index.document_count);
     render_header(&mut out, &report.header);
     render_index(&mut out, &report.index);
     render_collections(&mut out, &report.collections);
@@ -30,6 +31,35 @@ pub fn render(report: &StatsReport, _color: bool) -> String {
 }
 
 // ── Sections ─────────────────────────────────────────────────────────────────
+
+fn render_quarantine(
+    out: &mut String,
+    reports: &[crate::store::heal::QuarantineReport],
+    document_count: usize,
+) {
+    if reports.is_empty() {
+        return;
+    }
+    // `document_count` > 0 means a rebuild (automatic post-heal, or a manual
+    // `mdkb update`) already repopulated the (wiped) documents table — don't
+    // keep telling the operator to do work that's already done.
+    let docs_status = if document_count > 0 {
+        format!("docs already re-indexed ({document_count} currently indexed)")
+    } else {
+        "docs not yet re-indexed; run `mdkb update`".to_string()
+    };
+    let mut body = String::new();
+    for r in reports {
+        let date = chrono::DateTime::from_timestamp(r.quarantined_at, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        body.push_str(&format!(
+            "  {} ({}): salvaged {} memory entries, {} edges\n  {docs_status}; remove .mdkb/{} to clear\n",
+            r.corrupt_file, date, r.memory_entries_salvaged, r.memory_edges_salvaged, r.corrupt_file
+        ));
+    }
+    out.push_str(&frame("⚠ INDEX QUARANTINED (was corrupt)", body.trim_end(), WIDTH));
+}
 
 fn render_header(out: &mut String, h: &HeaderInfo) {
     let db_kb = h.db_size_bytes / 1024;
@@ -378,7 +408,56 @@ mod tests {
                     candidate_count: 0,
                 },
             },
+            quarantine: vec![],
         }
+    }
+
+    #[test]
+    fn render_surfaces_quarantine_warning_with_salvage_counts() {
+        let mut report = fixture_report();
+        report.quarantine = vec![crate::store::heal::QuarantineReport {
+            corrupt_file: "index.sqlite.corrupt-1700000000".to_string(),
+            quarantined_at: 1_700_000_000,
+            memory_entries_salvaged: 673,
+            memory_edges_salvaged: 12,
+        }];
+        // fixture_report()'s document_count (42) is > 0, meaning the docs table
+        // is already repopulated (auto-rebuild already ran) — the banner must
+        // not tell the operator to redo it.
+        let out = render(&report, false);
+        assert!(out.contains("QUARANTINED"), "quarantine banner present: {out}");
+        assert!(out.contains("673"), "salvaged entry count surfaced");
+        assert!(
+            out.contains("already re-indexed"),
+            "must not ask for a redundant `mdkb update` once docs are back: {out}"
+        );
+        assert!(
+            !out.contains("run `mdkb update`"),
+            "stale instruction survives an already-completed rebuild: {out}"
+        );
+    }
+
+    #[test]
+    fn render_quarantine_tells_operator_to_update_when_docs_still_empty() {
+        let mut report = fixture_report();
+        report.index.document_count = 0;
+        report.quarantine = vec![crate::store::heal::QuarantineReport {
+            corrupt_file: "index.sqlite.corrupt-1700000000".to_string(),
+            quarantined_at: 1_700_000_000,
+            memory_entries_salvaged: 673,
+            memory_edges_salvaged: 12,
+        }];
+        let out = render(&report, false);
+        assert!(
+            out.contains("run `mdkb update`"),
+            "docs still empty must surface the actionable next step: {out}"
+        );
+    }
+
+    #[test]
+    fn render_omits_quarantine_when_healthy() {
+        let out = render(&fixture_report(), false);
+        assert!(!out.contains("QUARANTINED"), "no banner on a healthy store");
     }
 
     #[test]

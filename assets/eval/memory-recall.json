@@ -1,0 +1,36 @@
+{
+  "_comment": "Synthetic recall/judge fixture. Seeds a fresh in-memory DB; independent of the live repo. Grow it as retrieval evolves — keep expected_ids referencing existing memory ids.",
+  "memories": [
+    { "id": "oauth-pkce", "title": "OAuth2 PKCE flow", "content": "authorization code exchange with PKCE code_verifier and code_challenge for public clients", "tags": ["auth", "security"] },
+    { "id": "jwt-rotation", "title": "JWT signing key rotation", "content": "rotate asymmetric signing keys with a kid header and overlapping validity windows", "tags": ["auth", "security"] },
+    { "id": "http-retry", "title": "HTTP retry with backoff", "content": "exponential backoff with jitter and a retry budget for idempotent requests", "tags": ["net", "resilience"] },
+    { "id": "circuit-breaker", "title": "Circuit breaker pattern", "content": "open the circuit after a failure threshold, half-open probe before closing again", "tags": ["net", "resilience"] },
+    { "id": "lru-cache", "title": "LRU cache eviction", "content": "least recently used eviction policy backed by a doubly linked list and a hash map", "tags": ["perf", "cache"] },
+    { "id": "bloom-filter", "title": "Bloom filter membership", "content": "probabilistic set membership with false positives but no false negatives using k hash functions", "tags": ["perf", "datastructure"] },
+    { "id": "pg-index", "title": "Postgres partial index", "content": "create a partial index with a where clause to shrink index size for selective queries", "tags": ["db", "postgres"] },
+    { "id": "pg-vacuum", "title": "Postgres autovacuum tuning", "content": "tune autovacuum scale factor and cost delay to reclaim dead tuples on hot tables", "tags": ["db", "postgres"] },
+    { "id": "idempotency-key", "title": "Idempotency keys for payments", "content": "store an idempotency key per payment request to make retries safe and avoid double charge", "tags": ["payments", "resilience"] },
+    { "id": "saga-pattern", "title": "Saga distributed transaction", "content": "coordinate long-lived transactions with compensating actions instead of two phase commit", "tags": ["distributed", "transaction"] },
+    { "id": "rate-limit", "title": "Token bucket rate limiting", "content": "token bucket refills at a fixed rate and requests consume tokens to smooth bursts", "tags": ["net", "throttling"] },
+    { "id": "grpc-stream", "title": "gRPC bidirectional streaming", "content": "bidirectional streaming lets client and server send message sequences over one connection", "tags": ["net", "grpc"] }
+  ],
+  "recall": [
+    { "query": "pkce code verifier challenge", "expected_ids": ["oauth-pkce"] },
+    { "query": "rotate signing keys kid header", "expected_ids": ["jwt-rotation"] },
+    { "query": "exponential backoff jitter retry", "expected_ids": ["http-retry"] },
+    { "query": "circuit breaker half-open probe", "expected_ids": ["circuit-breaker"] },
+    { "query": "least recently used eviction linked list", "expected_ids": ["lru-cache"] },
+    { "query": "probabilistic membership false positive hash", "expected_ids": ["bloom-filter"] },
+    { "query": "partial index where clause selective", "expected_ids": ["pg-index"] },
+    { "query": "autovacuum scale factor dead tuples", "expected_ids": ["pg-vacuum"] },
+    { "query": "idempotency key double charge payment", "expected_ids": ["idempotency-key"] },
+    { "query": "compensating actions long-lived transaction", "expected_ids": ["saga-pattern"] },
+    { "query": "token bucket refill smooth bursts", "expected_ids": ["rate-limit"] },
+    { "query": "bidirectional streaming one connection", "expected_ids": ["grpc-stream"] }
+  ],
+  "judge": [
+    { "question": "How do public clients secure the OAuth2 code exchange?", "expected_answer": "code exchange with PKCE" },
+    { "question": "How are retries made safe for payments?", "expected_answer": "idempotency key" },
+    { "question": "What eviction policy does the cache use?", "expected_answer": "least recently used" }
+  ]
+}

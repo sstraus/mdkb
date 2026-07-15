@@ -45,14 +45,14 @@ fn open_quarantines_corrupt_index_and_rebuilds_clean() {
         "open must report that it rebuilt from corruption"
     );
 
-    // The corrupt file was quarantined, not deleted.
+    // The corrupt file was quarantined, not deleted (the `.report.json` salvage
+    // sidecar shares the prefix but is a distinct artifact, not a second copy).
     let quarantined: Vec<_> = fs::read_dir(&mdkb_dir)
         .unwrap()
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("index.sqlite.corrupt-")
+            let name = e.file_name().to_string_lossy().into_owned();
+            name.starts_with("index.sqlite.corrupt-") && !name.ends_with(".report.json")
         })
         .collect();
     assert_eq!(
@@ -60,6 +60,16 @@ fn open_quarantines_corrupt_index_and_rebuilds_clean() {
         1,
         "exactly one quarantined copy of the corrupt index must remain for forensics"
     );
+
+    // A quarantine records a loud, persistent report sidecar so the data-loss
+    // event surfaces in stats/warmup until the operator cleans up.
+    let report = fs::read_dir(&mdkb_dir).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".report.json")
+    });
+    assert!(report, "quarantine must write a report sidecar");
 
     // The rebuilt database is clean and usable.
     let check: String = ctx

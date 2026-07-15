@@ -13,17 +13,44 @@ use std::collections::HashMap;
 /// - Hyphenated words like "anti-CSRF" being parsed as negation
 /// - ALL CAPS words being interpreted as operators or column names
 /// - Special characters in the query
-pub fn escape_fts5_query(query: &str) -> String {
-    // Split on whitespace and quote each term
+/// Split a query into whitespace terms, each safely double-quoted for FTS5.
+fn quote_fts5_terms(query: &str) -> Vec<String> {
     query
         .split_whitespace()
-        .map(|term| {
-            // Double any internal quotes and wrap in quotes
-            let escaped = term.replace('"', "\"\"");
-            format!("\"{}\"", escaped)
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect()
+}
+
+pub fn escape_fts5_query(query: &str) -> String {
+    // Terms joined by space → FTS5 implicit AND (every term must match).
+    quote_fts5_terms(query).join(" ")
+}
+
+/// Escape a natural-language query into an OR expression (any term may match).
+/// Use for QA-style retrieval where requiring every term (the default AND) is
+/// too strict — e.g. full-sentence questions. Empty query → empty string.
+pub fn escape_fts5_query_or(query: &str) -> String {
+    quote_fts5_terms(query).join(" OR ")
+}
+
+/// Actionable hint appended to empty search/get output when the index holds
+/// nothing — so a blank result reads as "unpopulated index" (e.g. right after an
+/// autoheal quarantine), not "your query matched nothing".
+pub const INDEX_EMPTY_HINT: &str =
+    "Index is empty (0 documents, 0 memory entries) — run `mdkb update` to populate it.";
+
+/// True when the index holds no documents and no memory entries.
+pub fn index_is_empty(conn: &Connection) -> bool {
+    let docs: i64 = conn
+        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+        .unwrap_or(0);
+    if docs > 0 {
+        return false;
+    }
+    let mem: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_entries", [], |r| r.get(0))
+        .unwrap_or(0);
+    mem == 0
 }
 
 /// Perform BM25 full-text search with optional evolution filtering.
@@ -480,6 +507,29 @@ mod tests {
         let status = get_status(&conn).expect("status should succeed");
         assert_eq!(status.collections, 1);
         assert_eq!(status.documents, 3);
+    }
+
+    #[test]
+    fn test_index_is_empty_gates_on_docs_and_memory() {
+        let conn = setup_db();
+        assert!(index_is_empty(&conn), "fresh store: no docs, no memory");
+
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
+             VALUES ('m', 't', 'c', 'topic', 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            !index_is_empty(&conn),
+            "a single memory entry makes the store non-empty (hint must not fire)"
+        );
+    }
+
+    #[test]
+    fn test_index_not_empty_with_docs() {
+        let conn = setup_db_with_docs();
+        assert!(!index_is_empty(&conn), "docs present → not empty");
     }
 
     // ==================== Evolution Filtering Tests ====================

@@ -161,7 +161,7 @@ full in-process server, sharing one daemon for file watching and indexing.
 | `search` | Hybrid search across docs+memory (default), or scoped to `docs`, `memory`, `code`, `symbols`. `scope="memory"` accepts `min_confidence` to filter decayed entries |
 | `get` | Retrieve by ID, path, memory slug, glob pattern, or comma-separated list |
 | `code_graph` | Call graph queries: `calls`, `callers`, or `impact` (transitive) |
-| `graph` | Knowledge-graph queries over frontmatter + wikilink edges: `links` (outgoing), `backlinks` (incoming), `neighbors` (adjacent), or `path` (shortest path to `to`) |
+| `graph` | Knowledge-graph queries over frontmatter + wikilink edges: `links` (outgoing), `backlinks` (incoming), `neighbors` (adjacent, each annotated with the `via` relation), or `path` (shortest path to `to`). Edge endpoints render as document paths, never numeric ids |
 | `status` | Index health, collections, and code index stats |
 | `update` | Differential reindex of all collections and source code |
 | `memory_write` | Create or update a memory entry (supports `ttl`, `due_in` for reminders, near-duplicate rejection) |
@@ -203,6 +203,13 @@ Memory entries are graph nodes: a `memory_edges` table (schema v14) records type
 - **`on_conflict="contradicts"`** — when a `memory_write` hits the near-duplicate gate, instead of rejecting it writes the new entry and links it to the similar one with a `contradicts` edge (returning both ids). Omitting `on_conflict` keeps the default rejection.
 - **Recall expansion** — a recalled entry's active 1-hop neighbors are surfaced (capped), annotated `(via <relation>)`.
 - **`[STALE-DEP]` marker** — at injection time, an entry whose `derived_from`/`supports` target is superseded or net-refuted is prefixed `[STALE-DEP]` in warmup and recall. This is a read-only flag — it never mutates stored confidence.
+
+#### Graph introspection & gardening (CLI)
+
+- **`mdkb graph dangling`** — lists references (with source doc + relation) that resolve to no indexed document. Full-table scan, explicit command only (never runs in hooks).
+- **`mdkb graph hubs [--relation R] [--limit N]`** — entities ranked by degree centrality (in/out-degree) with a per-relation breakdown. Full-table scan, explicit command only.
+- **`mdkb collection list`** — name, path, pattern, and document count per collection (`--format json` for stable output).
+- Graph refs accept collection-prefixed paths (`map/people/x.md` resolves like `people/x`); an unresolved ref lists the forms it tried.
 
 #### Reminders
 

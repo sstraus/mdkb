@@ -293,9 +293,11 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
             }
             Err(e) => return Err(mcp_error(format!("Failed to open database: {e}"))),
         };
-        // Autoheal rebuilt an empty index — schedule a reindex to repopulate it
-        // from source. Best-effort: a full channel means a reindex is already
-        // queued, which is exactly what we want.
+        // Autoheal rebuilt an empty index — schedule a full rebuild (docs +
+        // sessions + code) to repopulate it from source. Sending the repo root
+        // (a directory) is the watcher's full-rebuild signal, distinct from the
+        // file paths post_tool_use injects. Best-effort: a full channel means a
+        // rebuild is already queued, which is exactly what we want.
         if ctx.rebuilt_from_corruption {
             if let Err(e) = handle.reindex_tx.try_send(handle.root.clone()) {
                 tracing::warn!("failed to schedule post-heal reindex: {e}");
@@ -1032,6 +1034,18 @@ pub async fn memory_list_impl(
 /// "docs", "memory", "code", "symbols", or `None` (docs+memory). Returns
 /// `(rendered_text, result_count)`. Cross-repo (`root="*"`) lives in
 /// `cross_repo_search_impl`.
+/// Append the index-empty hint when a search returned nothing AND the store
+/// really is empty (0 docs, 0 memory) — so an empty result after autoheal
+/// quarantine reads as "run `mdkb update`", not "nothing matched".
+fn append_empty_index_hint(output: &mut String, count: usize, conn: &rusqlite::Connection) {
+    if count == 0 && crate::store::search::index_is_empty(conn) {
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        output.push_str(crate::store::search::INDEX_EMPTY_HINT);
+    }
+}
+
 pub async fn search_impl(
     handle: &RepoHandle,
     params: &SearchParams,
@@ -1061,6 +1075,7 @@ pub async fn search_impl(
             if let Some(hint) = ood_hint(results.len(), top_score) {
                 output.push_str(hint);
             }
+            append_empty_index_hint(&mut output, results.len(), &ctx.conn);
             Ok((output, results.len()))
         }
         Some("memory") => {
@@ -1084,6 +1099,7 @@ pub async fn search_impl(
             if let Some(hint) = ood_hint(entries.len(), None) {
                 output.push_str(hint);
             }
+            append_empty_index_hint(&mut output, entries.len(), &ctx.conn);
             Ok((output, entries.len()))
         }
         None => {
@@ -1133,6 +1149,7 @@ pub async fn search_impl(
             if let Some(hint) = ood_hint(total, top_score) {
                 output.push_str(hint);
             }
+            append_empty_index_hint(&mut output, total, &ctx.conn);
             Ok((output, total))
         }
         Some("code") | Some("symbols") => {
@@ -1554,7 +1571,9 @@ async fn get_glob_impl(
             .map_err(|e| mcp_error(format!("Glob retrieval failed: {e}")))?;
 
         if results.is_empty() {
-            return Ok(("No documents matched pattern.".to_string(), 0, false));
+            let mut msg = "No documents matched pattern.".to_string();
+            append_empty_index_hint(&mut msg, 0, &ctx.conn);
+            return Ok((msg, 0, false));
         }
 
         let mut output = format!("Found {} documents:\n\n", results.len());
@@ -2040,12 +2059,14 @@ pub async fn graph_impl(handle: &RepoHandle, params: &GraphParams) -> Result<Str
             let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
             let edges = graph::get_outgoing(&ctx.conn, doc.id, relation)
                 .map_err(|e| mcp_error(e.to_string()))?;
-            format_graph_edges(entity, "links", &edges)
+            let views = graph::edge_views(&ctx.conn, &edges).map_err(|e| mcp_error(e.to_string()))?;
+            format_graph_edges(entity, "links", &views)
         }
         "backlinks" => {
             let edges = graph::get_incoming(&ctx.conn, entity, relation)
                 .map_err(|e| mcp_error(e.to_string()))?;
-            format_graph_edges(entity, "backlinks", &edges)
+            let views = graph::edge_views(&ctx.conn, &edges).map_err(|e| mcp_error(e.to_string()))?;
+            format_graph_edges(entity, "backlinks", &views)
         }
         "neighbors" => {
             let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
@@ -2099,15 +2120,19 @@ fn format_memory_graph_edges(
     out
 }
 
-fn format_graph_edges(entity: &str, label: &str, edges: &[crate::store::graph::Edge]) -> String {
+fn format_graph_edges(
+    entity: &str,
+    label: &str,
+    edges: &[crate::store::graph::EdgeView],
+) -> String {
     if edges.is_empty() {
         return format!("No {label} for {entity}.");
     }
     let mut out = format!("{} {label} for {entity}:\n", edges.len());
     for e in edges {
         out.push_str(&format!(
-            "  [{}] --{}--> {} ({})\n",
-            e.source_doc_id, e.relation, e.target_ref, e.source_kind
+            "  {} --{}--> {} ({})\n",
+            e.source, e.relation, e.target_ref, e.source_kind
         ));
     }
     out
@@ -2119,7 +2144,12 @@ fn format_graph_neighbors(entity: &str, neighbors: &[crate::store::graph::Neighb
     }
     let mut out = format!("{} neighbors of {entity}:\n", neighbors.len());
     for n in neighbors {
-        out.push_str(&format!("  {} (depth {})\n", n.entity, n.depth));
+        out.push_str(&format!(
+            "  {} (depth {}, via {})\n",
+            n.entity,
+            n.depth,
+            n.via.join(", ")
+        ));
     }
     out
 }
@@ -2609,6 +2639,58 @@ fn take_newest_handoff_body(
     (body, rest)
 }
 
+/// Select warmup lines that fit within `budget` tokens (real tiktoken count,
+/// not a chars/4 estimate). The first line always emits — a single over-budget
+/// line still beats an empty warmup list; thereafter stop before the first line
+/// that would exceed the budget (never truncate mid-line).
+fn fit_warmup_lines(lines: &[String], budget: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut used = 0usize;
+    for line in lines {
+        let cost = crate::metrics::tokens::count_tokens(line);
+        if !out.is_empty() && used + cost > budget {
+            break;
+        }
+        out.push(line.clone());
+        used += cost;
+    }
+    out
+}
+
+/// A loud, non-silent SessionStart banner for any outstanding autoheal
+/// quarantine — one line per corrupt file still on disk. `None` when the store
+/// is healthy (the common case), so it costs nothing on a clean warmup.
+///
+/// `doc_count` is the CURRENT `documents` row count, checked so the banner
+/// doesn't keep telling the operator to run `mdkb update` after the daemon's
+/// own post-heal `full_rebuild_from_heal` has already repopulated it —
+/// otherwise the instruction reads as stale/wrong the moment recovery
+/// actually succeeds automatically.
+fn format_quarantine_banner(mdkb_dir: &std::path::Path, doc_count: i64) -> Option<String> {
+    let reports = crate::store::heal::quarantine_reports(mdkb_dir);
+    if reports.is_empty() {
+        return None;
+    }
+    let docs_status = if doc_count > 0 {
+        format!(
+            "Docs already re-indexed automatically ({doc_count} currently indexed) — no action needed."
+        )
+    } else {
+        "Docs not yet re-indexed — run `mdkb update`.".to_string()
+    };
+    let mut out = String::new();
+    for r in reports {
+        let date = chrono::DateTime::from_timestamp(r.quarantined_at, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "unknown date".to_string());
+        out.push_str(&format!(
+            "⚠️ mdkb index was CORRUPT and quarantined ({date}): salvaged {} memory entries, {} edges. {docs_status} Remove `.mdkb/{}` once verified to clear this warning.\n",
+            r.memory_entries_salvaged, r.memory_edges_salvaged, r.corrupt_file
+        ));
+    }
+    Some(out)
+}
+
 pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
@@ -2630,7 +2712,13 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
             return json!({});
         }
     };
+    let doc_count = crate::store::documents::count_documents(conn).unwrap_or(0);
     drop(ctx_guard);
+
+    // Data-loss banner: surface any outstanding autoheal quarantine loudly,
+    // computed before the empty-warmup early return so a freshly-rebuilt (empty)
+    // store still gets the warning instead of silence.
+    let quarantine_banner = format_quarantine_banner(&handle.root.join(".mdkb"), doc_count);
 
     // mdkb owns handoff injection: pull the newest handoff's full body out for a
     // dedicated block and drop ALL handoffs from the ranked compact list — a
@@ -2672,7 +2760,7 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
     // Single-flight + best-effort; the ctx lock is already released.
     spawn_embedding_backfill(Arc::clone(handle));
 
-    if lines.is_empty() && handoff_body.is_none() {
+    if lines.is_empty() && handoff_body.is_none() && quarantine_banner.is_none() {
         return json!({});
     }
 
@@ -2684,6 +2772,10 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
     // The newest handoff body is injected in full — it IS the session-restoration
     // anchor — exempt from the compact-list token budget.
     let mut body = String::new();
+    if let Some(banner) = &quarantine_banner {
+        body.push_str(banner);
+        body.push('\n');
+    }
     if let Some(hb) = &handoff_body {
         body.push_str("## Last session handoff\n\n");
         body.push_str(hb);
@@ -2696,19 +2788,10 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
     // over-budget line still beats an empty list).
     if !lines.is_empty() {
         body.push_str("## mdkb memory warmup\n\n");
-        let budget = cfg.warmup_token_budget;
-        let mut used_tokens = 0usize;
-        let mut emitted = 0usize;
-        for line in &lines {
-            let cost = line.chars().count() / 4 + 1;
-            if emitted > 0 && used_tokens + cost > budget {
-                break;
-            }
+        for line in fit_warmup_lines(&lines, cfg.warmup_token_budget) {
             body.push_str("- ");
-            body.push_str(line);
+            body.push_str(&line);
             body.push('\n');
-            used_tokens += cost;
-            emitted += 1;
         }
     }
     body.push_str(&format!(
@@ -2755,23 +2838,25 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
 /// Capped at `EXPAND_RECALL_SEEDS` seeds and `EXPAND_RECALL_NEIGHBORS` neighbors
 /// total; already-recalled ids are skipped and superseded/expired/dangling targets
 /// are excluded via `resolve_active` — bounded work on the recall hot path.
+/// `seeds` and `max_neighbors` are the configurable caps (`GraphConfig`); edges
+/// arrive `created_at DESC` from [`memory_graph::outgoing`], so candidates are
+/// ordered by recency before the cap truncates.
 fn expand_recall_neighbors(
     conn: &rusqlite::Connection,
     results: &[memory::MemoryEntry],
+    seeds: usize,
+    max_neighbors: usize,
 ) -> Vec<String> {
-    const EXPAND_RECALL_SEEDS: usize = 2;
-    const EXPAND_RECALL_NEIGHBORS: usize = 3;
-
     let seen: std::collections::HashSet<&str> = results.iter().map(|e| e.id.as_str()).collect();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
-    for seed in results.iter().take(EXPAND_RECALL_SEEDS) {
-        if out.len() >= EXPAND_RECALL_NEIGHBORS {
+    for seed in results.iter().take(seeds) {
+        if out.len() >= max_neighbors {
             break;
         }
         let edges = memory_graph::outgoing(conn, &seed.id, None).unwrap_or_default();
         for edge in edges {
-            if out.len() >= EXPAND_RECALL_NEIGHBORS {
+            if out.len() >= max_neighbors {
                 break;
             }
             if edge.target_kind != TargetKind::Memory.as_str() {
@@ -2917,7 +3002,12 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     if !results.is_empty() && ensure_handle_context(handle).await.is_ok() {
         let ctx_guard = handle.ctx.lock().await;
         if let Some(c) = ctx_guard.as_ref() {
-            expanded = expand_recall_neighbors(&c.conn, &results);
+            expanded = expand_recall_neighbors(
+                &c.conn,
+                &results,
+                handle.config.graph.expand_seeds,
+                handle.config.graph.expand_neighbors,
+            );
             let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
             stale_ids = memory_graph::stale_dependency_ids(&c.conn, &ids).unwrap_or_default();
         }
@@ -2936,7 +3026,12 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             if let Some(c) = ctx_guard.as_ref() {
                 let seen: std::collections::HashSet<String> =
                     results.iter().map(|e| e.id.clone()).collect();
-                related = doc_graph_neighbors(&c.conn, &path_tokens, &seen, 3);
+                related = doc_graph_neighbors(
+                    &c.conn,
+                    &path_tokens,
+                    &seen,
+                    handle.config.graph.doc_neighbor_cap,
+                );
             }
         }
         if let Some((dctx, key)) = &dedup {
@@ -3821,6 +3916,65 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
+    #[test]
+    fn fit_warmup_lines_respects_token_budget() {
+        let lines = vec![
+            "alpha beta gamma".to_string(),
+            "delta epsilon zeta".to_string(),
+            "eta theta iota".to_string(),
+        ];
+        // Budget 0: the first line still emits (over-budget single line beats empty).
+        assert_eq!(fit_warmup_lines(&lines, 0), vec![lines[0].clone()]);
+        // Ample budget: every line emits.
+        assert_eq!(fit_warmup_lines(&lines, 10_000), lines);
+        // Empty input: empty output.
+        assert!(fit_warmup_lines(&[], 100).is_empty());
+        // Budget = exactly the first line's tokens: the second would exceed → stop at one.
+        let t0 = crate::metrics::tokens::count_tokens(&lines[0]);
+        assert_eq!(fit_warmup_lines(&lines, t0), vec![lines[0].clone()]);
+    }
+
+    fn write_quarantine_report(dir: &std::path::Path) {
+        let corrupt = dir.join("index.sqlite.corrupt-1700000000");
+        std::fs::write(&corrupt, b"corrupt").unwrap();
+        crate::store::heal::write_report(
+            &corrupt,
+            crate::store::heal::Salvage {
+                entries: 673,
+                edges: 12,
+            },
+        );
+    }
+
+    #[test]
+    fn quarantine_banner_tells_operator_to_update_when_docs_still_empty() {
+        let tmp = TempDir::new().unwrap();
+        write_quarantine_report(tmp.path());
+
+        let banner = format_quarantine_banner(tmp.path(), 0).unwrap();
+        assert!(banner.contains("CORRUPT"));
+        assert!(banner.contains("run `mdkb update`"));
+    }
+
+    #[test]
+    fn quarantine_banner_omits_update_instruction_once_docs_are_back() {
+        let tmp = TempDir::new().unwrap();
+        write_quarantine_report(tmp.path());
+
+        // A post-heal auto-rebuild (or a prior manual `mdkb update`) already
+        // repopulated the documents table — the banner must not re-ask for it.
+        let banner = format_quarantine_banner(tmp.path(), 2405).unwrap();
+        assert!(banner.contains("already re-indexed automatically"));
+        assert!(banner.contains("2405"));
+        assert!(!banner.contains("run `mdkb update`"));
+    }
+
+    #[test]
+    fn quarantine_banner_is_none_on_healthy_store() {
+        let tmp = TempDir::new().unwrap();
+        assert!(format_quarantine_banner(tmp.path(), 0).is_none());
+    }
+
     fn make_handle(tmp: &TempDir) -> Arc<RepoHandle> {
         let root = tmp.path().to_path_buf();
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
@@ -4507,11 +4661,43 @@ mod tests {
         let mut best = u128::MAX;
         for _ in 0..50 {
             let t = std::time::Instant::now();
-            let out = expand_recall_neighbors(conn, &seeds);
+            let out = expand_recall_neighbors(conn, &seeds, 2, 3);
             best = best.min(t.elapsed().as_micros());
             assert_eq!(out.len(), 3, "must expand exactly the 3 capped neighbors");
         }
         best
+    }
+
+    #[test]
+    fn expand_recall_neighbors_respects_config_caps() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        for i in 0..4 {
+            conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
+                 VALUES (?1, ?2, 'body', 'topic', 1, 1)",
+                rusqlite::params![format!("n{i}"), format!("Title {i}")],
+            )
+            .unwrap();
+        }
+        for j in 1..=3 {
+            memory_graph::add_edge(
+                &conn,
+                "n0",
+                &format!("n{j}"),
+                TargetKind::Memory,
+                MemoryRelation::Supports,
+            )
+            .unwrap();
+        }
+        let seeds = vec![memory::get_entry(&conn, "n0").unwrap().unwrap()];
+
+        // Defaults (2 seeds, 3 neighbors) surface all three edges.
+        assert_eq!(expand_recall_neighbors(&conn, &seeds, 2, 3).len(), 3);
+        // A tighter neighbor cap truncates.
+        assert_eq!(expand_recall_neighbors(&conn, &seeds, 2, 1).len(), 1);
+        // Zero seeds disables expansion entirely.
+        assert_eq!(expand_recall_neighbors(&conn, &seeds, 0, 3).len(), 0);
     }
 
     #[tokio::test]

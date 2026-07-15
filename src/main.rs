@@ -17,11 +17,14 @@ use mdkb::Result;
 use mdkb::cli::CodeCommand;
 use mdkb::cli::daemon as daemon_cli;
 use mdkb::cli::handlers::{
-    Context, EmbedResult, EvolutionHistoryEntry, handle_collection_add, handle_collection_remove,
-    handle_collection_rename, handle_current, handle_embed, handle_evolve_corrects,
+    Context, EmbedResult, EvolutionHistoryEntry, handle_collection_add, handle_collection_list,
+    handle_collection_remove,
+    handle_collection_rename, handle_current, handle_embed, handle_eval_judge,
+    handle_eval_recall, handle_evolve_corrects,
     handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
     handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
+    handle_graph_dangling, handle_graph_hubs,
     handle_graph_links, handle_graph_neighbors, handle_graph_path, handle_history,
     handle_hybrid_search, handle_init, handle_memory_add, handle_memory_confirm,
     handle_memory_export, handle_memory_import, handle_memory_import_dir, handle_memory_link,
@@ -35,7 +38,8 @@ use mdkb::cli::hook_client;
 use mdkb::cli::hook_logic;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
-    Cli, CollectionCommand, Command, DaemonCommand, EvolveCommand, ExperimentCommand, GraphCommand,
+    Cli, CollectionCommand, Command, DaemonCommand, EvalCommand, EvolveCommand, ExperimentCommand,
+    GraphCommand,
     HookCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, RemoveHooksCommand,
     RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand, SetupMcpCommand,
     SetupRemoveCommand,
@@ -169,6 +173,10 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     handle_collection_rename(&ctx, &old_name, &new_name)?;
                     println!("Renamed collection '{old_name}' to '{new_name}'");
                 }
+                CollectionCommand::List => {
+                    let collections = handle_collection_list(&ctx)?;
+                    format_collection_list(&collections, cli.format);
+                }
             }
         }
         Command::Search {
@@ -221,6 +229,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     }
                     if results.is_empty() && entries.is_empty() {
                         println!("No results found.");
+                        if mdkb::store::search::index_is_empty(&ctx.conn) {
+                            println!("{}", mdkb::store::search::INDEX_EMPTY_HINT);
+                        }
                     }
                 }
                 Some("code") => {
@@ -513,6 +524,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
         } => {
             let ctx = Context::open(&cwd)?;
             let mdkb_dir = ctx.db_path.parent().expect("db_path has parent");
+            let _mutation_guard = mdkb::store::mutation_lock::acquire(&ctx.db_path, "compact")?;
+            mdkb::store::heal::invalidate_marker(&ctx.db_path);
 
             if prune_sessions {
                 let raw = older_than.ok_or_else(|| {
@@ -545,6 +558,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
 
             // Vacuum index.sqlite
             ctx.conn.execute_batch("VACUUM;")?;
+            mdkb::store::heal::verify_and_mark(&ctx.conn, &ctx.db_path)?;
             let idx_size = ctx.db_path.metadata().map(|m| m.len()).unwrap_or(0);
             eprintln!("index.sqlite vacuumed ({} KB)", idx_size / 1024);
 
@@ -576,6 +590,31 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     let events = handle_metrics_export(&ctx, period)?;
                     format_metrics_export(&events, cli.format);
                 }
+            }
+        }
+        Command::Eval(cmd) => {
+            let (report_json, summary) = match cmd {
+                EvalCommand::Recall { fixture, k } => {
+                    let r = handle_eval_recall(fixture.as_deref(), k)?;
+                    (
+                        serde_json::to_string_pretty(&r)?,
+                        format!(
+                            "recall@{}: {:.3}  MRR: {:.3}  (n={})",
+                            r.k, r.recall_at_k, r.mrr, r.n
+                        ),
+                    )
+                }
+                EvalCommand::Judge { fixture, k } => {
+                    let r = handle_eval_judge(fixture.as_deref(), k)?;
+                    (
+                        serde_json::to_string_pretty(&r)?,
+                        format!("judge accuracy: {:.3}  (n={}, k={})", r.accuracy, r.n, r.k),
+                    )
+                }
+            };
+            match cli.format {
+                OutputFormat::Json => println!("{report_json}"),
+                _ => println!("{summary}"),
             }
         }
         Command::Memory(cmd) => {
@@ -836,6 +875,14 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     let path = handle_graph_path(&ctx, &a, &b, max_hops)?;
                     format_graph_path(&path, cli.format);
                 }
+                GraphCommand::Dangling => {
+                    let dangling = handle_graph_dangling(&ctx)?;
+                    format_graph_dangling(&dangling, cli.format);
+                }
+                GraphCommand::Hubs { relation, limit } => {
+                    let hubs = handle_graph_hubs(&ctx, relation.as_deref(), limit)?;
+                    format_graph_hubs(&hubs, cli.format);
+                }
             }
         }
         Command::Experiment(cmd) => {
@@ -946,6 +993,18 @@ async fn run_cli(cli: Cli) -> Result<()> {
 {0} code calls <symbol>                                # what does this call?
 {0} code impact <symbol>                               # transitive dependency graph
 {0} code search <query>                                # fuzzy symbol search
+
+# Knowledge graph (frontmatter + wikilink edges; refs accept collection-prefixed paths)
+{0} graph links <entity>                               # outgoing edges (endpoints shown as paths, with 'via' relation)
+{0} graph backlinks <entity>                           # incoming edges
+{0} graph neighbors <entity> --depth 2                 # adjacent entities (undirected), each with 'via'
+{0} graph path <a> <b>                                 # shortest path between two entities
+{0} graph dangling                                     # refs resolving to no doc (full scan; explicit only)
+{0} graph hubs --relation owner --limit 20             # entities by degree centrality (full scan; explicit only)
+
+# Collections
+{0} collection list                                    # name, path, pattern, doc count per collection
+{0} collection add <name> <path> -p '**/*.md'          # register a collection
 
 # Maintenance
 {0} update                                             # reindex all (auto-embeds docs + backfills memory)
@@ -1308,9 +1367,10 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
             println!("{}", serde_json::to_string_pretty(result).unwrap());
         }
         OutputFormat::Csv => {
-            println!("added,updated,removed,unchanged,errors");
+            println!("docs_indexed,added,updated,removed,unchanged,errors");
             println!(
-                "{},{},{},{},{}",
+                "{},{},{},{},{},{}",
+                result.docs_indexed(),
                 result.added,
                 result.updated,
                 result.removed,
@@ -1319,10 +1379,18 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
             );
         }
         OutputFormat::Markdown | OutputFormat::Text => {
-            println!("Added:     {}", result.added);
-            println!("Updated:   {}", result.updated);
-            println!("Removed:   {}", result.removed);
+            // Honest doc-collection total up front, so a re-run on an unchanged
+            // store reads as "7 indexed" not the misleading "0" from code stats.
+            println!(
+                "Docs: {} indexed ({} new, {} changed)",
+                result.docs_indexed(),
+                result.added,
+                result.updated,
+            );
             println!("Unchanged: {}", result.unchanged);
+            if result.removed > 0 {
+                println!("Removed: {}", result.removed);
+            }
             if result.memory_embeddings_backfilled > 0 {
                 println!(
                     "Memory embeddings backfilled: {}",
@@ -1765,17 +1833,17 @@ fn format_evolution_history(history: &[EvolutionHistoryEntry], format: OutputFor
     }
 }
 
-fn format_graph_edges(edges: &[mdkb::store::graph::Edge], format: OutputFormat) {
+fn format_graph_edges(edges: &[mdkb::store::graph::EdgeView], format: OutputFormat) {
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(edges).unwrap());
         }
         OutputFormat::Csv => {
-            println!("source_doc_id,target_ref,relation,source_kind,scope");
+            println!("source,target_ref,relation,source_kind,scope");
             for e in edges {
                 println!(
                     "{},{},{},{},{}",
-                    e.source_doc_id,
+                    e.source,
                     e.target_ref,
                     e.relation,
                     e.source_kind,
@@ -1792,7 +1860,7 @@ fn format_graph_edges(edges: &[mdkb::store::graph::Edge], format: OutputFormat) 
                 for e in edges {
                     println!(
                         "| {} | {} | {} | {} |",
-                        e.source_doc_id, e.target_ref, e.relation, e.source_kind
+                        e.source, e.target_ref, e.relation, e.source_kind
                     );
                 }
             }
@@ -1803,8 +1871,8 @@ fn format_graph_edges(edges: &[mdkb::store::graph::Edge], format: OutputFormat) 
             } else {
                 for e in edges {
                     println!(
-                        "  [{}] --{}--> {} ({})",
-                        e.source_doc_id, e.relation, e.target_ref, e.source_kind
+                        "  {} --{}--> {} ({})",
+                        e.source, e.relation, e.target_ref, e.source_kind
                     );
                 }
             }
@@ -1818,19 +1886,19 @@ fn format_graph_neighbors(neighbors: &[mdkb::store::graph::Neighbor], format: Ou
             println!("{}", serde_json::to_string_pretty(neighbors).unwrap());
         }
         OutputFormat::Csv => {
-            println!("entity,depth");
+            println!("entity,depth,via");
             for n in neighbors {
-                println!("{},{}", n.entity, n.depth);
+                println!("{},{},{}", n.entity, n.depth, n.via.join("|"));
             }
         }
         OutputFormat::Markdown => {
             if neighbors.is_empty() {
                 println!("No neighbors found.");
             } else {
-                println!("| Entity | Depth |");
-                println!("|--------|-------|");
+                println!("| Entity | Depth | Via |");
+                println!("|--------|-------|-----|");
                 for n in neighbors {
-                    println!("| {} | {} |", n.entity, n.depth);
+                    println!("| {} | {} | {} |", n.entity, n.depth, n.via.join(", "));
                 }
             }
         }
@@ -1839,7 +1907,7 @@ fn format_graph_neighbors(neighbors: &[mdkb::store::graph::Neighbor], format: Ou
                 println!("No neighbors found.");
             } else {
                 for n in neighbors {
-                    println!("  {} (depth {})", n.entity, n.depth);
+                    println!("  {} (depth {}, via {})", n.entity, n.depth, n.via.join(", "));
                 }
             }
         }
@@ -1855,6 +1923,136 @@ fn format_graph_path(path: &Option<Vec<String>>, format: OutputFormat) {
             Some(nodes) => println!("{}", nodes.join(" -> ")),
             None => println!("No path found."),
         },
+    }
+}
+
+fn format_collection_list(collections: &[mdkb::cli::handlers::CollectionInfo], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(collections).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("name,path,pattern,doc_count");
+            for c in collections {
+                println!("{},{},{},{}", c.name, c.path, c.pattern, c.doc_count);
+            }
+        }
+        OutputFormat::Markdown => {
+            if collections.is_empty() {
+                println!("No collections.");
+            } else {
+                println!("| Name | Path | Pattern | Docs |");
+                println!("|------|------|---------|------|");
+                for c in collections {
+                    println!("| {} | {} | {} | {} |", c.name, c.path, c.pattern, c.doc_count);
+                }
+            }
+        }
+        OutputFormat::Text => {
+            if collections.is_empty() {
+                println!("No collections.");
+            } else {
+                for c in collections {
+                    println!(
+                        "  {} ({}, {}) — {} docs",
+                        c.name, c.path, c.pattern, c.doc_count
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn format_graph_dangling(dangling: &[mdkb::store::graph::DanglingRef], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(dangling).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("target_ref,relation,source");
+            for d in dangling {
+                println!("{},{},{}", d.target_ref, d.relation, d.source);
+            }
+        }
+        OutputFormat::Markdown => {
+            if dangling.is_empty() {
+                println!("No dangling references.");
+            } else {
+                println!("| Target | Relation | Source |");
+                println!("|--------|----------|--------|");
+                for d in dangling {
+                    println!("| {} | {} | {} |", d.target_ref, d.relation, d.source);
+                }
+            }
+        }
+        OutputFormat::Text => {
+            if dangling.is_empty() {
+                println!("No dangling references.");
+            } else {
+                for d in dangling {
+                    println!("  {} --{}--> {} (unresolved)", d.source, d.relation, d.target_ref);
+                }
+            }
+        }
+    }
+}
+
+fn format_graph_hubs(hubs: &[mdkb::store::graph::Hub], format: OutputFormat) {
+    let breakdown = |h: &mdkb::store::graph::Hub| {
+        h.by_relation
+            .iter()
+            .map(|(r, c)| format!("{r}:{c}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(hubs).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("entity,in_degree,out_degree,by_relation");
+            for h in hubs {
+                println!(
+                    "{},{},{},{}",
+                    h.entity,
+                    h.in_degree,
+                    h.out_degree,
+                    breakdown(h).replace(',', ";")
+                );
+            }
+        }
+        OutputFormat::Markdown => {
+            if hubs.is_empty() {
+                println!("No edges.");
+            } else {
+                println!("| Entity | In | Out | By relation |");
+                println!("|--------|----|-----|-------------|");
+                for h in hubs {
+                    println!(
+                        "| {} | {} | {} | {} |",
+                        h.entity,
+                        h.in_degree,
+                        h.out_degree,
+                        breakdown(h)
+                    );
+                }
+            }
+        }
+        OutputFormat::Text => {
+            if hubs.is_empty() {
+                println!("No edges.");
+            } else {
+                for h in hubs {
+                    println!(
+                        "  {} (in {}, out {}) [{}]",
+                        h.entity,
+                        h.in_degree,
+                        h.out_degree,
+                        breakdown(h)
+                    );
+                }
+            }
+        }
     }
 }
 

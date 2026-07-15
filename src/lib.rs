@@ -16,6 +16,7 @@ pub mod config;
 pub mod daemon;
 pub mod domain;
 pub mod error;
+pub mod eval;
 pub mod git;
 pub mod llm;
 pub mod mcp;

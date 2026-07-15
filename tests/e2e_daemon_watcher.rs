@@ -236,8 +236,6 @@ async fn late_ctx_still_reindexes_injected_file() {
     let code_index: Arc<Mutex<Option<IndexFacade>>> = Arc::new(Mutex::new(Some(facade)));
 
     let (tx, rx) = tokio::sync::mpsc::channel::<PathBuf>(64);
-    let code_before = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
-
     // Spawn the watcher with ctx == None. No `ready` notify: it only fires after
     // the ctx-wait completes, which is exactly what we're delaying.
     let watcher_root = root.clone();
@@ -274,10 +272,18 @@ async fn late_ctx_still_reindexes_injected_file() {
     // Context becomes available late (as the first client request would do).
     *ctx_arc.lock().await = Some(ctx);
 
-    // The buffered path must now be reindexed.
+    // The buffered path must now be reindexed. Poll the symbol itself rather
+    // than the process-global flush counter: these tests run concurrently, so a
+    // different watcher may increment that counter first and create a false
+    // positive wake-up.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        if CODE_REINDEX_COUNT.load(Ordering::Relaxed) > code_before {
+        let indexed = code_index
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|facade| facade.get_symbol_by_name("late_ctx_fn").is_some());
+        if indexed {
             break;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -286,7 +292,7 @@ async fn late_ctx_still_reindexes_injected_file() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    // Prove the actual symbol landed in the index, not just a counter bump.
+    // Prove the actual symbol remains queryable after the completed flush.
     let guard = code_index.lock().await;
     let facade = guard.as_ref().unwrap();
     assert!(

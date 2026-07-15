@@ -195,3 +195,12 @@ pub struct UpdateResult {
     /// Errors encountered during indexing.
     pub errors: Vec<String>,
 }
+
+impl UpdateResult {
+    /// Total documents currently indexed in the scanned collections after this
+    /// update: new + changed + unchanged (removed files are gone). Lets `update`
+    /// report an honest doc-collection total, not just the per-run delta.
+    pub fn docs_indexed(&self) -> usize {
+        self.added + self.updated + self.unchanged
+    }
+}

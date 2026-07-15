@@ -195,6 +195,10 @@ pub enum Command {
     #[command(subcommand)]
     Metrics(MetricsCommand),
 
+    /// Evaluate memory retrieval quality against a fixture
+    #[command(subcommand)]
+    Eval(EvalCommand),
+
     /// Manage memory entries for AI knowledge persistence
     #[command(subcommand)]
     Memory(MemoryCommand),
@@ -534,6 +538,33 @@ pub enum CollectionCommand {
 
         /// New name
         new_name: String,
+    },
+
+    /// List collections with their path, pattern, and document count
+    List,
+}
+
+/// Evaluation subcommands.
+#[derive(Subcommand, Debug)]
+pub enum EvalCommand {
+    /// Recall@k / MRR over a fixture (deterministic, BM25-only, no API)
+    Recall {
+        /// Path to a JSON fixture (defaults to the bundled synthetic corpus)
+        #[arg(short, long)]
+        fixture: Option<std::path::PathBuf>,
+        /// Cutoff rank k
+        #[arg(short, long, default_value = "5")]
+        k: usize,
+    },
+
+    /// Answer-support accuracy over a fixture (deterministic SubstringJudge)
+    Judge {
+        /// Path to a JSON fixture (defaults to the bundled synthetic corpus)
+        #[arg(short, long)]
+        fixture: Option<std::path::PathBuf>,
+        /// Cutoff rank k
+        #[arg(short, long, default_value = "5")]
+        k: usize,
     },
 }
 
@@ -879,6 +910,20 @@ pub enum GraphCommand {
         /// Maximum hops to search
         #[arg(long, default_value = "6")]
         max_hops: u32,
+    },
+
+    /// References pointing at no indexed document (full scan; explicit use only)
+    Dangling,
+
+    /// Entities ranked by degree centrality (full scan; explicit use only)
+    Hubs {
+        /// Filter to a single relation type
+        #[arg(short, long)]
+        relation: Option<String>,
+
+        /// Maximum number of entities to return (0 = all)
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
     },
 }
 
