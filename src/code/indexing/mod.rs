@@ -133,7 +133,12 @@ impl IndexFacade {
                 self.delete_by_file(path, root)?;
             }
 
-            let stats = pipeline::index_files(&changed, root, &self.db, &self.config)?;
+            let mut stats = pipeline::index_files(&changed, root, &self.db, &self.config)?;
+            // `index_files` scopes the DISCOVER stage to `changed`, so the pipeline
+            // reports files_discovered == files_indexed here. Override with the
+            // true repo-wide walk count so "discovered" means the same thing on
+            // every path (matches the no-change branch above).
+            stats.files_discovered = discovered.len() as u32;
             // Re-embed ONLY the changed files' symbols, reusing existing vectors
             // for everything else — a 1-file change must not re-run ONNX over the
             // entire symbol table (PERF-D3).
@@ -294,7 +299,10 @@ impl IndexFacade {
 
         if changed.is_empty() && deleted.is_empty() {
             self.db.mark_index_scan_completed()?;
-            return Ok(IndexStats::default());
+            return Ok(IndexStats {
+                files_discovered: paths.len() as u32,
+                ..IndexStats::default()
+            });
         }
 
         tracing::info!(
@@ -311,10 +319,19 @@ impl IndexFacade {
         // Re-index changed files
         if changed.is_empty() {
             self.db.mark_index_scan_completed()?;
-            return Ok(IndexStats::default());
+            return Ok(IndexStats {
+                files_discovered: paths.len() as u32,
+                ..IndexStats::default()
+            });
         }
 
-        self.index_files(root, &changed)
+        let mut stats = self.index_files(root, &changed)?;
+        // `index_files` scopes DISCOVER to `changed`, so it reports
+        // files_discovered == files_indexed. Override with the true repo-wide
+        // count (`paths`, the full walk `update()` passed in) so "discovered"
+        // means the same thing regardless of how much of the repo changed.
+        stats.files_discovered = paths.len() as u32;
+        Ok(stats)
     }
 
     // -----------------------------------------------------------------------
@@ -1138,6 +1155,11 @@ pub fn world() {
         fs::write(src_dir.path().join("b.rs"), "pub fn ccc() {}").unwrap();
         let stats = facade.update(src_dir.path()).unwrap();
         assert_eq!(stats.files_indexed, 1, "only the changed file is reindexed");
+        assert_eq!(
+            stats.files_discovered, 2,
+            "files_discovered must report the full repo walk (2 files), not just \
+             the 1 changed file the pipeline re-processed"
+        );
         assert!(facade.get_symbol_by_name("aaa").is_some());
         assert!(facade.get_symbol_by_name("bbb").is_none());
         assert!(facade.get_symbol_by_name("ccc").is_some());

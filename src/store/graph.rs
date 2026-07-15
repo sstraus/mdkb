@@ -10,7 +10,7 @@
 //! `source_kind`: allowlisted frontmatter keys ("frontmatter", strong relations)
 //! and body wikilinks ("wikilink", soft relations).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use chrono::Utc;
 use rusqlite::{Connection, params};
@@ -155,6 +155,60 @@ pub fn get_incoming(conn: &Connection, entity: &str, relation: Option<&str>) -> 
     Ok(edges)
 }
 
+/// An edge rendered for display: the numeric `source_doc_id` is resolved to the
+/// source document's `relative_path` so output never leaks opaque ids.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EdgeView {
+    pub source: String,
+    pub target_ref: String,
+    pub relation: String,
+    pub source_kind: String,
+    pub scope: Option<String>,
+}
+
+/// Resolve every edge's `source_doc_id` to its document `relative_path` in a
+/// single batched query, returning display-ready [`EdgeView`]s. A source that no
+/// longer resolves (should not happen — edges are dropped with their document)
+/// falls back to `#<id>` rather than a bare number.
+pub fn edge_views(conn: &Connection, edges: &[Edge]) -> Result<Vec<EdgeView>> {
+    let mut ids: Vec<i64> = edges.iter().map(|e| e.source_doc_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+
+    let mut paths: HashMap<i64, String> = HashMap::new();
+    if !ids.is_empty() {
+        let placeholders = (1..=ids.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT id, relative_path FROM documents WHERE id IN ({placeholders})");
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|i| i as &dyn rusqlite::ToSql).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params.as_slice(), |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (id, path) = row?;
+            paths.insert(id, path);
+        }
+    }
+
+    Ok(edges
+        .iter()
+        .map(|e| EdgeView {
+            source: paths
+                .get(&e.source_doc_id)
+                .cloned()
+                .unwrap_or_else(|| format!("#{}", e.source_doc_id)),
+            target_ref: e.target_ref.clone(),
+            relation: e.relation.clone(),
+            source_kind: e.source_kind.clone(),
+            scope: e.scope.clone(),
+        })
+        .collect())
+}
+
 /// The textual forms a reference may be written as: the raw string, with/without
 /// a `.md` extension, and with a leading `./` or `/` trimmed.
 pub fn ref_forms(reference: &str) -> Vec<String> {
@@ -179,6 +233,66 @@ pub fn ref_forms(reference: &str) -> Vec<String> {
 /// of its equivalent forms. Returns `None` for dangling references.
 pub fn resolve_ref_to_doc(conn: &Connection, reference: &str) -> Result<Option<i64>> {
     for form in ref_forms(reference) {
+        let id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM documents WHERE relative_path = ?1 LIMIT 1",
+                params![form],
+                |row| row.get(0),
+            )
+            .ok();
+        if id.is_some() {
+            return Ok(id);
+        }
+    }
+    Ok(None)
+}
+
+/// Directory prefixes a collection-qualified reference may carry: the basename of
+/// each collection's configured path (collection path `./map` → prefix `map`).
+/// Stripping these lets `graph links map/people/x.md` resolve like `people/x.md`.
+fn collection_prefixes(conn: &Connection) -> Vec<String> {
+    let mut prefixes = Vec::new();
+    let Ok(mut stmt) = conn.prepare("SELECT path FROM collections") else {
+        return prefixes;
+    };
+    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+        return prefixes;
+    };
+    for path in rows.flatten() {
+        let base = path
+            .trim_start_matches("./")
+            .trim_start_matches('/')
+            .trim_end_matches('/');
+        let name = base.rsplit('/').next().unwrap_or(base);
+        if !name.is_empty() && !prefixes.iter().any(|p| p == name) {
+            prefixes.push(name.to_string());
+        }
+    }
+    prefixes
+}
+
+/// Every textual form tried when resolving an entity reference, including
+/// collection-prefix stripped variants. Exposed so NotFound errors can enumerate
+/// what was attempted.
+pub fn resolvable_forms(conn: &Connection, reference: &str) -> Vec<String> {
+    let mut forms = ref_forms(reference);
+    for prefix in collection_prefixes(conn) {
+        if let Some(rest) = reference.strip_prefix(&format!("{prefix}/")) {
+            for f in ref_forms(rest) {
+                if !forms.contains(&f) {
+                    forms.push(f);
+                }
+            }
+        }
+    }
+    forms
+}
+
+/// Resolve an entity reference to a document id, tolerating collection-prefixed
+/// paths (`map/people/x.md` == `people/x.md`). For hot traversal paths use
+/// [`resolve_ref_to_doc`] instead (it skips the collection lookup).
+pub fn resolve_entity_ref(conn: &Connection, reference: &str) -> Result<Option<i64>> {
+    for form in resolvable_forms(conn, reference) {
         let id: Option<i64> = conn
             .query_row(
                 "SELECT id FROM documents WHERE relative_path = ?1 LIMIT 1",
@@ -228,30 +342,37 @@ fn canonical_key(conn: &Connection, reference: &str) -> Result<String> {
     Ok(reference.to_string())
 }
 
-/// Undirected adjacency of a node (outgoing targets ∪ incoming sources), as
-/// canonical node keys. A dangling node (not a document) has no adjacency.
-fn adjacent_keys(conn: &Connection, node_key: &str, relation: Option<&str>) -> Result<Vec<String>> {
+/// Undirected adjacency of a node (outgoing targets ∪ incoming sources) as
+/// `(canonical key, relation)` pairs. Carrying the relation lets traversal report
+/// *why* nodes connect without a second query. A dangling node has no adjacency.
+fn adjacent_pairs(
+    conn: &Connection,
+    node_key: &str,
+    relation: Option<&str>,
+) -> Result<Vec<(String, String)>> {
     let Some(doc_id) = resolve_ref_to_doc(conn, node_key)? else {
         return Ok(Vec::new());
     };
 
-    let mut keys = Vec::new();
+    let mut pairs = Vec::new();
     for edge in get_outgoing(conn, doc_id, relation)? {
-        keys.push(canonical_key(conn, &edge.target_ref)?);
+        pairs.push((canonical_key(conn, &edge.target_ref)?, edge.relation));
     }
     for edge in get_incoming(conn, node_key, relation)? {
         if let Some(path) = doc_relative_path(conn, edge.source_doc_id)? {
-            keys.push(path);
+            pairs.push((path, edge.relation));
         }
     }
-    Ok(keys)
+    Ok(pairs)
 }
 
-/// A neighbor node reached during traversal, with its distance from the start.
+/// A neighbor node reached during traversal, with its distance from the start and
+/// the relation label(s) it was reached through (`via`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Neighbor {
     pub entity: String,
     pub depth: u32,
+    pub via: Vec<String>,
 }
 
 /// Breadth-first neighbors of `start_doc_id` up to `depth` hops (undirected).
@@ -274,20 +395,38 @@ pub fn neighbors(
     let mut out = Vec::new();
 
     for hop in 1..=depth {
-        let mut next = Vec::new();
+        // Discover this hop's new keys, accumulating every relation that reaches
+        // each one (a key may be linked through several relations at the same hop).
+        let mut order: Vec<String> = Vec::new();
+        let mut via: HashMap<String, Vec<String>> = HashMap::new();
         for node in &frontier {
-            for key in adjacent_keys(conn, node, relation)? {
-                if visited.insert(key.clone()) {
-                    out.push(Neighbor {
-                        entity: key.clone(),
-                        depth: hop,
-                    });
-                    next.push(key);
+            for (key, rel) in adjacent_pairs(conn, node, relation)? {
+                if visited.contains(&key) {
+                    continue;
+                }
+                let rels = via.entry(key.clone()).or_insert_with(|| {
+                    order.push(key.clone());
+                    Vec::new()
+                });
+                if !rels.contains(&rel) {
+                    rels.push(rel);
                 }
             }
         }
-        if next.is_empty() {
+        if order.is_empty() {
             break;
+        }
+        let mut next = Vec::new();
+        for key in order {
+            visited.insert(key.clone());
+            let mut rels = via.remove(&key).unwrap_or_default();
+            rels.sort();
+            out.push(Neighbor {
+                entity: key.clone(),
+                depth: hop,
+                via: rels,
+            });
+            next.push(key);
         }
         frontier = next;
     }
@@ -323,7 +462,7 @@ pub fn shortest_path(
         if hops >= max_hops {
             continue;
         }
-        for key in adjacent_keys(conn, &node, None)? {
+        for (key, _rel) in adjacent_pairs(conn, &node, None)? {
             if !visited.insert(key.clone()) {
                 continue;
             }
@@ -351,6 +490,118 @@ fn reconstruct_path(prev: &HashMap<String, String>, start: &str, end: &str) -> V
     }
     path.reverse();
     path
+}
+
+/// An edge whose `target_ref` resolves to no indexed document.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct DanglingRef {
+    pub target_ref: String,
+    pub relation: String,
+    pub source: String,
+}
+
+/// Edges pointing at a reference that resolves to no indexed document.
+///
+/// Full-table scan — an explicit gardening command only, never run inside
+/// hooks/recall. Resolution per distinct `target_ref` is cached so duplicated
+/// targets are resolved once.
+pub fn dangling(conn: &Connection) -> Result<Vec<DanglingRef>> {
+    let sql =
+        format!("SELECT {EDGE_COLUMNS} FROM edges ORDER BY target_ref, relation, source_doc_id");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], map_edge)?;
+
+    let mut resolves: HashMap<String, bool> = HashMap::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let e = row?;
+        let ok = match resolves.get(&e.target_ref) {
+            Some(v) => *v,
+            None => {
+                let ok = resolve_ref_to_doc(conn, &e.target_ref)?.is_some();
+                resolves.insert(e.target_ref.clone(), ok);
+                ok
+            }
+        };
+        if !ok {
+            let source = doc_relative_path(conn, e.source_doc_id)?
+                .unwrap_or_else(|| format!("#{}", e.source_doc_id));
+            out.push(DanglingRef {
+                target_ref: e.target_ref,
+                relation: e.relation,
+                source,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// A graph node ranked by degree centrality, with a per-relation breakdown of the
+/// edges incident to it (as source or target).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct Hub {
+    pub entity: String,
+    pub in_degree: usize,
+    pub out_degree: usize,
+    pub by_relation: Vec<(String, usize)>,
+}
+
+#[derive(Default)]
+struct HubAcc {
+    in_degree: usize,
+    out_degree: usize,
+    by_relation: BTreeMap<String, usize>,
+}
+
+/// Top-`limit` entities by total degree (in + out), each with a per-relation
+/// breakdown. `relation` restricts the scan to a single relation type; `limit`
+/// of 0 returns all. Ties break on entity key for determinism.
+///
+/// Full-table scan — an explicit command only, never run inside hooks/recall.
+pub fn hubs(conn: &Connection, relation: Option<&str>, limit: usize) -> Result<Vec<Hub>> {
+    let sql = format!("SELECT {EDGE_COLUMNS} FROM edges");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], map_edge)?;
+
+    let mut acc: HashMap<String, HubAcc> = HashMap::new();
+    for row in rows {
+        let e = row?;
+        if let Some(rel) = relation {
+            if e.relation != rel {
+                continue;
+            }
+        }
+        let source = doc_relative_path(conn, e.source_doc_id)?
+            .unwrap_or_else(|| format!("#{}", e.source_doc_id));
+        let target = canonical_key(conn, &e.target_ref)?;
+
+        let s = acc.entry(source).or_default();
+        s.out_degree += 1;
+        *s.by_relation.entry(e.relation.clone()).or_default() += 1;
+
+        let t = acc.entry(target).or_default();
+        t.in_degree += 1;
+        *t.by_relation.entry(e.relation.clone()).or_default() += 1;
+    }
+
+    let mut hubs: Vec<Hub> = acc
+        .into_iter()
+        .map(|(entity, a)| Hub {
+            entity,
+            in_degree: a.in_degree,
+            out_degree: a.out_degree,
+            by_relation: a.by_relation.into_iter().collect(),
+        })
+        .collect();
+    hubs.sort_by(|x, y| {
+        (y.in_degree + y.out_degree)
+            .cmp(&(x.in_degree + x.out_degree))
+            .then_with(|| x.entity.cmp(&y.entity))
+    });
+    if limit > 0 {
+        hubs.truncate(limit);
+    }
+    Ok(hubs)
 }
 
 #[cfg(test)]
@@ -548,5 +799,106 @@ mod tests {
 
         // c is 2 hops away; a max of 1 hop must not find it.
         assert!(shortest_path(&conn, a, "c", 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_edge_views_resolve_source_path_never_numeric() {
+        let conn = setup_db();
+        let doc = insert_doc(&conn, "people/stefano.md");
+        add_edge(&conn, doc, "repos/mdkb", "works_on", KIND_FRONTMATTER, None).unwrap();
+
+        let edges = get_outgoing(&conn, doc, None).unwrap();
+        let views = edge_views(&conn, &edges).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].source, "people/stefano.md");
+        assert_eq!(views[0].target_ref, "repos/mdkb");
+        assert_eq!(views[0].relation, "works_on");
+    }
+
+    #[test]
+    fn test_neighbors_carry_via_relations() {
+        let conn = setup_db();
+        let a = insert_doc(&conn, "a.md");
+        let _b = insert_doc(&conn, "b.md");
+        let _c = insert_doc(&conn, "c.md");
+        add_edge(&conn, a, "b", "owner", KIND_FRONTMATTER, None).unwrap();
+        add_edge(&conn, _b, "c", "themes", KIND_FRONTMATTER, None).unwrap();
+
+        let nbrs = neighbors(&conn, a, None, 2).unwrap();
+        assert!(!nbrs.is_empty());
+        for n in &nbrs {
+            assert!(
+                !n.via.is_empty(),
+                "every neighbor must carry the relation it was reached through: {n:?}"
+            );
+        }
+        let b = nbrs.iter().find(|n| n.entity == "b.md").unwrap();
+        assert_eq!(b.via, vec!["owner".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_entity_ref_accepts_collection_prefix() {
+        let conn = setup_db();
+        // collection 'docs' lives at './map' — a reference may be written map/people/x.md.
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('mapcoll', './map', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let doc = insert_doc(&conn, "people/x.md");
+
+        assert_eq!(
+            resolve_entity_ref(&conn, "map/people/x.md").unwrap(),
+            Some(doc),
+            "collection-prefixed path must resolve like the bare path"
+        );
+        assert_eq!(resolve_entity_ref(&conn, "people/x").unwrap(), Some(doc));
+
+        let forms = resolvable_forms(&conn, "map/people/x.md");
+        assert!(
+            forms.iter().any(|f| f == "people/x.md"),
+            "tried forms must include the stripped form: {forms:?}"
+        );
+    }
+
+    #[test]
+    fn test_dangling_lists_unresolved_targets() {
+        let conn = setup_db();
+        let project = insert_doc(&conn, "projects/x.md");
+        let target = insert_doc(&conn, "people/alice.md");
+        add_edge(&conn, project, "people/alice", "owner", KIND_FRONTMATTER, None).unwrap();
+        add_edge(&conn, project, "teams/wiz", "related", KIND_FRONTMATTER, None).unwrap();
+        let _ = target;
+
+        let dangling = dangling(&conn).unwrap();
+        assert_eq!(dangling.len(), 1, "only teams/wiz is unresolved");
+        assert_eq!(dangling[0].target_ref, "teams/wiz");
+        assert_eq!(dangling[0].relation, "related");
+        assert_eq!(dangling[0].source, "projects/x.md");
+    }
+
+    #[test]
+    fn test_hubs_rank_by_degree_with_relation_breakdown() {
+        let conn = setup_db();
+        let a = insert_doc(&conn, "a.md");
+        let b = insert_doc(&conn, "b.md");
+        let hub = insert_doc(&conn, "hub.md");
+        // Everyone points at hub → hub has the highest in-degree.
+        add_edge(&conn, a, "hub", "owner", KIND_FRONTMATTER, None).unwrap();
+        add_edge(&conn, b, "hub", "owner", KIND_FRONTMATTER, None).unwrap();
+        add_edge(&conn, hub, "a", "related", KIND_FRONTMATTER, None).unwrap();
+
+        let ranked = hubs(&conn, None, 10).unwrap();
+        assert_eq!(ranked[0].entity, "hub.md", "hub ranks first by total degree");
+        assert_eq!(ranked[0].in_degree, 2);
+        assert_eq!(ranked[0].out_degree, 1);
+        assert!(ranked[0].by_relation.iter().any(|(r, _)| r == "owner"));
+
+        // Relation filter narrows the scan.
+        let owners = hubs(&conn, Some("owner"), 10).unwrap();
+        let hub_row = owners.iter().find(|h| h.entity == "hub.md").unwrap();
+        assert_eq!(hub_row.in_degree, 2);
+        assert_eq!(hub_row.out_degree, 0, "hub's out-edge is 'related', filtered out");
     }
 }

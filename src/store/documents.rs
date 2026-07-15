@@ -351,6 +351,16 @@ pub fn list_documents(conn: &Connection, collection: &str) -> Result<Vec<Documen
     Ok(documents)
 }
 
+/// Count all indexed documents across every collection.
+///
+/// Used to tell whether a post-quarantine rebuild has already repopulated the
+/// (wiped) `documents` table, so the quarantine banner isn't stuck telling the
+/// operator to do work the daemon already did automatically.
+pub fn count_documents(conn: &Connection) -> Result<i64> {
+    conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+        .map_err(Into::into)
+}
+
 /// Get multiple documents by their IDs in a single query (fixes N+1 query pattern).
 pub fn get_documents_batch(conn: &Connection, ids: &[i64]) -> Result<Vec<Document>> {
     if ids.is_empty() {

@@ -604,9 +604,17 @@ fn smoke_graph() {
     run(&["update"], &repo.root);
 
     // links: by path, text and json.
-    assert_ok(
-        &run(&["graph", "links", "project.md"], &repo.root),
-        "graph links",
+    let links = run(&["graph", "links", "project.md"], &repo.root);
+    assert_ok(&links, "graph links");
+    // Human-readable endpoints: the source shows its path, never a numeric id.
+    let links_out = stdout(&links);
+    assert!(
+        links_out.contains("project.md --"),
+        "edge source must be the doc path, got: {links_out}"
+    );
+    assert!(
+        !links_out.contains("[1]") && !links_out.contains("[2]"),
+        "edge output must not leak numeric doc ids, got: {links_out}"
     );
     let out = run(
         &["--format", "json", "graph", "links", "project.md"],
@@ -631,13 +639,16 @@ fn smoke_graph() {
         "graph backlinks --relation",
     );
 
-    // neighbors: text and json, with depth.
-    assert_ok(
-        &run(
-            &["graph", "neighbors", "project.md", "--depth", "2"],
-            &repo.root,
-        ),
-        "graph neighbors",
+    // neighbors: text and json, with depth. Output must carry the relation (via).
+    let nbrs = run(
+        &["graph", "neighbors", "project.md", "--depth", "2"],
+        &repo.root,
+    );
+    assert_ok(&nbrs, "graph neighbors");
+    assert!(
+        stdout(&nbrs).contains("via"),
+        "neighbors must report the connecting relation, got: {}",
+        stdout(&nbrs)
     );
     let out = run(
         &["--format", "json", "graph", "neighbors", "project.md"],
@@ -698,6 +709,90 @@ fn smoke_graph() {
         stdout(&by_slug).contains("->"),
         "expected project -> alice via bare slugs, got: {}",
         stdout(&by_slug)
+    );
+}
+
+#[test]
+fn smoke_graph_dangling_and_hubs() {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.root.join("docs/project.md"),
+        "---\nowner: alice\nrelated:\n  - teams/wiz\n---\nbody\n",
+    )
+    .unwrap();
+    run(&["update"], &repo.root);
+
+    // dangling: teams/wiz and alice resolve to no document → both reported.
+    let dangling = run(&["graph", "dangling"], &repo.root);
+    assert_ok(&dangling, "graph dangling");
+    assert!(
+        stdout(&dangling).contains("teams/wiz"),
+        "dangling must list the unresolved ref, got: {}",
+        stdout(&dangling)
+    );
+    // json shape stable.
+    let dj = run(&["--format", "json", "graph", "dangling"], &repo.root);
+    assert_ok(&dj, "graph dangling json");
+    serde_json::from_str::<serde_json::Value>(stdout(&dj).trim()).expect("dangling json valid");
+
+    // hubs: project.md is the source of the edges → appears with out-degree.
+    let hubs = run(&["graph", "hubs", "--limit", "5"], &repo.root);
+    assert_ok(&hubs, "graph hubs");
+    assert!(
+        stdout(&hubs).contains("project.md"),
+        "hubs must rank the linking doc, got: {}",
+        stdout(&hubs)
+    );
+    let hj = run(&["--format", "json", "graph", "hubs"], &repo.root);
+    assert_ok(&hj, "graph hubs json");
+    serde_json::from_str::<serde_json::Value>(stdout(&hj).trim()).expect("hubs json valid");
+}
+
+#[test]
+fn smoke_collection_list() {
+    let repo = Repo::new();
+    run(&["update"], &repo.root);
+
+    let out = run(&["collection", "list"], &repo.root);
+    assert_ok(&out, "collection list");
+    assert!(
+        stdout(&out).contains("docs"),
+        "collection list must show the docs collection, got: {}",
+        stdout(&out)
+    );
+
+    let json = run(&["--format", "json", "collection", "list"], &repo.root);
+    assert_ok(&json, "collection list json");
+    let v: serde_json::Value =
+        serde_json::from_str(stdout(&json).trim()).expect("collection list json valid");
+    assert!(v.is_array(), "collection list json is an array");
+}
+
+#[test]
+fn smoke_graph_collection_prefixed_ref() {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.root.join("docs/project.md"),
+        "---\nowner: alice\n---\nbody\n",
+    )
+    .unwrap();
+    run(&["update"], &repo.root);
+
+    // The docs collection lives at ./docs — a collection-prefixed reference
+    // (docs/project.md) must resolve like the bare path (project.md).
+    let prefixed = run(&["graph", "links", "docs/project.md"], &repo.root);
+    assert_ok(&prefixed, "graph links with collection-prefixed ref");
+
+    // A truly unresolvable ref lists the accepted forms it tried.
+    let missing = run(&["graph", "links", "nope/missing.md"], &repo.root);
+    assert!(
+        !missing.status.success(),
+        "unresolvable ref must fail nonzero"
+    );
+    let err = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        err.contains("tried:"),
+        "NotFound must enumerate tried forms, got: {err}"
     );
 }
 

@@ -1,5 +1,47 @@
 # Changelog
 
+## 3.7.3 (2026-07-11)
+
+Graph navigation & DX (stories 075–082) plus a P1 autoheal data-safety fix (083).
+
+### Fixed
+
+- **Autoheal no longer silently loses memory.** `memory_entries`/`memory_edges`
+  live only in `index.sqlite`; on quarantine they are now salvaged into the fresh
+  database via `ATTACH ... immutable=1` (a table that cannot be read logs the row
+  count lost). The event is surfaced loudly and never silently: an enriched stderr
+  warning at heal time, a persistent banner in `mdkb stats` while a `*.corrupt-*`
+  file remains, and a SessionStart warmup line (even when the rebuilt store is
+  empty). Post-heal now triggers a full docs + sessions + code rebuild, not just
+  code. `search`/`get` on an empty store append an actionable "run `mdkb update`"
+  hint so a blank result no longer reads as "nothing matched".
+- **Graph output no longer leaks numeric doc ids.** `links`/`backlinks` render the
+  source document's path (`people/x --owner--> repos/mdkb`) across CLI
+  (text/json/csv/markdown) and MCP, resolved in one batched query.
+- **`mdkb update` reports honest doc counts.** Output leads with
+  `Docs: N indexed (X new, Y changed, Z removed)` so an unchanged re-run reads as
+  `N indexed`, not the misleading code-index `Files discovered: 0`.
+
+### Added
+
+- **`neighbors` carries relation labels.** Each neighbor is annotated with the
+  `via` relation(s) it was reached through — you see WHY nodes connect, not just
+  THAT they do. No extra queries (labels come from the adjacency rows).
+- **Collection-prefixed graph refs.** `graph links map/people/x.md` resolves like
+  `people/x`; an unresolved ref enumerates the forms it tried.
+- **`mdkb collection list`** — name, path, pattern, and document count per
+  collection (`--format json` stable).
+- **`mdkb graph dangling`** — references that resolve to no indexed document
+  (with source doc + relation). Full-table scan, explicit command only.
+- **`mdkb graph hubs [--relation R] [--limit N]`** — entities ranked by degree
+  centrality with a per-relation breakdown. Full-table scan, explicit command only.
+
+### Changed
+
+- **Recall expansion caps are configurable.** `[graph] expand_seeds`,
+  `expand_neighbors`, and `doc_neighbor_cap` move from hardcoded constants into
+  `GraphConfig`, with defaults (2/3/3) that keep existing behavior byte-identical.
+
 ## 3.7.2 (2026-07-07)
 
 ### Fixed

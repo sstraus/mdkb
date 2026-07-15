@@ -1392,7 +1392,14 @@ pub async fn run_file_watcher_inner(
                     }
                 }
                 path = recv_injected!() => {
-                    if let Some(p) = path { code_batch.push(p); }
+                    if let Some(p) = path {
+                        // Directory = post-heal full-rebuild signal; file = code reindex.
+                        if p.is_dir() {
+                            full_rebuild_from_heal(&ctx, &code_index, &root).await;
+                        } else {
+                            code_batch.push(p);
+                        }
+                    }
                 }
             }
         } else {
@@ -1419,7 +1426,15 @@ pub async fn run_file_watcher_inner(
                     }
                 }
                 path = recv_injected!() => {
-                    if let Some(p) = path { code_batch.push(p); }
+                    if let Some(p) = path {
+                        // A directory is the post-heal full-rebuild signal (the repo
+                        // root); a file is a targeted code reindex.
+                        if p.is_dir() {
+                            full_rebuild_from_heal(&ctx, &code_index, &root).await;
+                        } else {
+                            code_batch.push(p);
+                        }
+                    }
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(batch_idle_ms)) => {
                     if watcher.take_missed_events() {
@@ -1489,6 +1504,42 @@ async fn full_code_rescan(code_index: &Arc<Mutex<Option<IndexFacade>>>, root: &P
         }
         crate::llm::release_cached_service();
         CODE_REINDEX_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Full rebuild after an autoheal quarantine rebuilt an empty index.
+///
+/// The injected signal is the repo root (a directory), distinct from the file
+/// paths post_tool_use injects. A quarantine wipes documents AND sessions from
+/// the index (they live only there), so both must be re-derived from source —
+/// not just code. Best-effort; every phase logs and continues on failure.
+async fn full_rebuild_from_heal(
+    ctx: &Arc<Mutex<Option<Context>>>,
+    code_index: &Arc<Mutex<Option<IndexFacade>>>,
+    root: &Path,
+) {
+    tracing::warn!("post-heal: rebuilding docs + sessions + code from source");
+    let mut needs_docs = true;
+    flush_doc_update(ctx, root, &mut needs_docs).await;
+    full_code_rescan(code_index, root).await;
+
+    match crate::daemon::config::home_dir() {
+        Err(e) => tracing::warn!("post-heal session reindex skipped: {e}"),
+        Ok(home) => {
+            let sessions_base = home.join(".claude/projects");
+            let project_root = root.to_string_lossy().to_string();
+            let ctx = Arc::clone(ctx);
+            let indexed = tokio::task::spawn_blocking(move || {
+                let mut guard = ctx.blocking_lock();
+                guard
+                    .as_mut()
+                    .map(|c| handle_session_index(c, &sessions_base, &project_root))
+            })
+            .await;
+            if let Ok(Some(Err(e))) = indexed {
+                tracing::warn!("post-heal session reindex failed: {e}");
+            }
+        }
     }
 }
 

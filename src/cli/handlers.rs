@@ -125,22 +125,20 @@ impl Context {
         // Initialize sqlite-vec extension before opening connection
         vectors::init_sqlite_vec();
 
+        // Opening is not read-only: every process runs migrations and creates
+        // FTS/vector virtual tables if needed. Keep one project-wide lock from
+        // the integrity probe through schema initialization and salvage; two
+        // concurrent virtual-table constructors can otherwise fail with
+        // `SQLITE_SCHEMA: vtable constructor failed`.
+        let _open_guard =
+            crate::store::mutation_lock::acquire(&db_path, "open-schema")?;
+
         // Autoheal: quarantine a structurally-corrupt index before we build on
         // it, so the `Connection::open` below lands on a clean file. Throttled,
         // so this is cheap on the hot open path.
-        let rebuilt_from_corruption = match crate::store::heal::ensure_sound(&db_path)? {
-            crate::store::heal::Heal::Sound => false,
-            crate::store::heal::Heal::Quarantined { corrupt_path } => {
-                tracing::warn!(
-                    corrupt = %corrupt_path.display(),
-                    "index.sqlite was structurally corrupt; quarantined it and rebuilding an empty index — content will re-index from source"
-                );
-                eprintln!(
-                    "mdkb: index.sqlite was corrupt — quarantined to {} and rebuilt empty; run `mdkb update` to re-index",
-                    corrupt_path.display()
-                );
-                true
-            }
+        let quarantined = match crate::store::heal::ensure_sound_locked(&db_path)? {
+            crate::store::heal::Heal::Sound => None,
+            crate::store::heal::Heal::Quarantined { corrupt_path } => Some(corrupt_path),
         };
 
         let conn = Connection::open(&db_path)?;
@@ -155,6 +153,29 @@ impl Context {
         // and query_events work on every transport, including the daemon-less
         // in-process CLI hook path (previously only the MCP server created them).
         crate::store::stats::init_stats_schema(&conn)?;
+
+        // memory_entries/memory_edges live ONLY in this DB — salvage them out of
+        // the quarantined file into the fresh schema before it takes over, and
+        // record the loss so it surfaces loudly (stderr now, stats/warmup later).
+        let rebuilt_from_corruption = if let Some(corrupt_path) = quarantined {
+            let salvage = crate::store::heal::salvage_memory(&conn, &corrupt_path);
+            crate::store::heal::write_report(&corrupt_path, salvage);
+            tracing::warn!(
+                corrupt = %corrupt_path.display(),
+                salvaged_entries = salvage.entries,
+                salvaged_edges = salvage.edges,
+                "index.sqlite was structurally corrupt; quarantined and rebuilt empty — docs/code re-index from source"
+            );
+            eprintln!(
+                "mdkb: index.sqlite was CORRUPT — quarantined to {}; salvaged {} memory entries + {} edges; run `mdkb update` to re-index docs",
+                corrupt_path.display(),
+                salvage.entries,
+                salvage.edges
+            );
+            true
+        } else {
+            false
+        };
 
         Ok(Self {
             conn,
@@ -329,9 +350,29 @@ pub fn handle_collection_remove(ctx: &Context, name: &str) -> Result<bool> {
     collections::remove_collection(&ctx.conn, name)
 }
 
+/// A collection with its indexed-document count, for `collection list`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CollectionInfo {
+    pub name: String,
+    pub path: String,
+    pub pattern: String,
+    pub doc_count: i64,
+}
+
 /// Handle `mdkb collection list` command.
-pub fn handle_collection_list(ctx: &Context) -> Result<Vec<Collection>> {
-    collections::list_collections(&ctx.conn)
+pub fn handle_collection_list(ctx: &Context) -> Result<Vec<CollectionInfo>> {
+    let colls = collections::list_collections(&ctx.conn)?;
+    let mut out = Vec::with_capacity(colls.len());
+    for c in colls {
+        let doc_count = collections::get_collection_document_count(&ctx.conn, &c.name)?;
+        out.push(CollectionInfo {
+            name: c.name,
+            path: c.path,
+            pattern: c.pattern,
+            doc_count,
+        });
+    }
+    Ok(out)
 }
 
 /// Handle `mdkb collection rename` command.
@@ -719,6 +760,8 @@ pub fn handle_update_force(
     force: bool,
 ) -> Result<UpdateResult> {
     let root = root.as_ref();
+    let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, "update")?;
+    crate::store::heal::invalidate_marker(&ctx.db_path);
 
     // Remove vestigial artifacts / warn on dead config before indexing.
     housekeeping(root);
@@ -776,6 +819,8 @@ pub fn handle_update_force(
             Err(e) => tracing::warn!("auto-embed on update failed: {e}"),
         }
     }
+
+    crate::store::heal::verify_and_mark(&ctx.conn, &ctx.db_path)?;
 
     Ok(result)
 }
@@ -1091,6 +1136,9 @@ pub fn handle_update_files_force(
         return Ok(result);
     }
 
+    let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, "update-files")?;
+    crate::store::heal::invalidate_marker(&ctx.db_path);
+
     let canonical_root = root
         .canonicalize()
         .map_err(|e| Error::other(format!("Failed to canonicalize root: {}", e)))?;
@@ -1146,6 +1194,7 @@ pub fn handle_update_files_force(
             &mut result,
         )
     })?;
+    crate::store::heal::verify_and_mark(&ctx.conn, &ctx.db_path)?;
     Ok(result)
 }
 
@@ -1835,6 +1884,37 @@ pub fn handle_memory_search(ctx: &Context, query: &str, limit: usize) -> Result<
 /// Handle `mdkb memory warmup` command.
 pub fn handle_memory_warmup(ctx: &Context, limit: usize) -> Result<Vec<String>> {
     memory::get_warmup_index(&ctx.conn, limit)
+}
+
+/// Handle `mdkb eval recall` — seed a fixture DB and score recall@k / MRR.
+pub fn handle_eval_recall(
+    fixture: Option<&std::path::Path>,
+    k: usize,
+) -> Result<crate::eval::recall::RecallReport> {
+    let fx = match fixture {
+        Some(p) => crate::eval::fixture::Fixture::load(p)?,
+        None => crate::eval::fixture::Fixture::bundled()?,
+    };
+    let conn = fx.seed_db()?;
+    crate::eval::recall::run_recall(&conn, &fx.recall_cases(), k)
+}
+
+/// Handle `mdkb eval judge` — seed a fixture DB and score answer support.
+pub fn handle_eval_judge(
+    fixture: Option<&std::path::Path>,
+    k: usize,
+) -> Result<crate::eval::judge::JudgeReport> {
+    let fx = match fixture {
+        Some(p) => crate::eval::fixture::Fixture::load(p)?,
+        None => crate::eval::fixture::Fixture::bundled()?,
+    };
+    let conn = fx.seed_db()?;
+    crate::eval::judge::run_judge(
+        &conn,
+        &fx.judge_cases(),
+        k,
+        &crate::eval::judge::SubstringJudge,
+    )
 }
 
 /// Handle `mdkb memory rm` command.
@@ -2748,11 +2828,13 @@ fn resolve_graph_entity(ctx: &Context, entity: &str) -> Result<i64> {
     if let Ok(id) = resolve_document_id(ctx, entity) {
         return Ok(id);
     }
-    if let Some(id) = crate::store::graph::resolve_ref_to_doc(&ctx.conn, entity)? {
+    // Tolerate collection-prefixed paths (`map/people/x.md` == `people/x.md`).
+    if let Some(id) = crate::store::graph::resolve_entity_ref(&ctx.conn, entity)? {
         return Ok(id);
     }
+    let tried = crate::store::graph::resolvable_forms(&ctx.conn, entity).join(", ");
     Err(Error::from(ErrorKind::DocumentNotFound {
-        id: entity.to_string(),
+        id: format!("{entity} (tried: {tried})"),
     }))
 }
 
@@ -2954,22 +3036,26 @@ pub fn handle_superseded_by(ctx: &Context, path_or_id: &str) -> Result<Vec<Evolu
 // ==================== Knowledge-Graph Handlers ====================
 
 /// Outgoing edges from an entity (the entity must be an indexed document).
+/// Edge sources are resolved to `relative_path` so output never leaks numeric ids.
 pub fn handle_graph_links(
     ctx: &Context,
     entity: &str,
     relation: Option<&str>,
-) -> Result<Vec<crate::store::graph::Edge>> {
+) -> Result<Vec<crate::store::graph::EdgeView>> {
     let doc_id = resolve_graph_entity(ctx, entity)?;
-    crate::store::graph::get_outgoing(&ctx.conn, doc_id, relation)
+    let edges = crate::store::graph::get_outgoing(&ctx.conn, doc_id, relation)?;
+    crate::store::graph::edge_views(&ctx.conn, &edges)
 }
 
 /// Incoming edges to an entity. Accepts a dangling slug — no document required.
+/// Edge sources are resolved to `relative_path` so output never leaks numeric ids.
 pub fn handle_graph_backlinks(
     ctx: &Context,
     entity: &str,
     relation: Option<&str>,
-) -> Result<Vec<crate::store::graph::Edge>> {
-    crate::store::graph::get_incoming(&ctx.conn, entity, relation)
+) -> Result<Vec<crate::store::graph::EdgeView>> {
+    let edges = crate::store::graph::get_incoming(&ctx.conn, entity, relation)?;
+    crate::store::graph::edge_views(&ctx.conn, &edges)
 }
 
 /// Adjacent entities up to `depth` hops (undirected); start must be a document.
@@ -3006,6 +3092,20 @@ fn resolve_target_key(ctx: &Context, b: &str) -> Result<String> {
         }
     }
     Ok(b.to_string())
+}
+
+/// References that resolve to no indexed document (full-table scan).
+pub fn handle_graph_dangling(ctx: &Context) -> Result<Vec<crate::store::graph::DanglingRef>> {
+    crate::store::graph::dangling(&ctx.conn)
+}
+
+/// Entities ranked by degree centrality (full-table scan).
+pub fn handle_graph_hubs(
+    ctx: &Context,
+    relation: Option<&str>,
+    limit: usize,
+) -> Result<Vec<crate::store::graph::Hub>> {
+    crate::store::graph::hubs(&ctx.conn, relation, limit)
 }
 
 // ==================== Metrics Handlers ====================
@@ -3635,6 +3735,34 @@ mod tests {
                 .unwrap()
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn test_update_docs_indexed_counts_docs_on_doc_only_store() {
+        // Regression for the "Files discovered: 0" lie: on a doc-only store the
+        // update summary must report the real doc total, not the code delta.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).unwrap();
+        let ctx = Context::open(temp.path()).unwrap();
+        std::fs::create_dir_all(temp.path().join("docs")).unwrap();
+        handle_collection_add(&ctx, "docs", "./docs", "**/*.md").unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(temp.path().join("docs").join(name), "# t\nbody\n").unwrap();
+        }
+
+        let r1 = handle_update(&ctx, temp.path()).unwrap();
+        assert_eq!(r1.added, 3);
+        assert_eq!(r1.docs_indexed(), 3, "first run: 3 new docs indexed");
+
+        // Re-run with no changes: delta is 0/0 but the honest total stays 3.
+        let r2 = handle_update(&ctx, temp.path()).unwrap();
+        assert_eq!(r2.added, 0);
+        assert_eq!(r2.unchanged, 3);
+        assert_eq!(
+            r2.docs_indexed(),
+            3,
+            "unchanged re-run still reports 3 docs indexed, not 0"
         );
     }
 

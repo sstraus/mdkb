@@ -244,6 +244,18 @@ pub struct GraphConfig {
 
     /// Extract body wikilinks (`[[target]]`) as soft edges.
     pub include_wikilinks: bool,
+
+    /// Recall expansion: number of top recall seeds whose memory-graph neighbors
+    /// are surfaced during UserPromptSubmit injection.
+    pub expand_seeds: usize,
+
+    /// Recall expansion: maximum total memory-graph neighbors surfaced across all
+    /// seeds (hard cap on the recall hot path).
+    pub expand_neighbors: usize,
+
+    /// Doc-graph expansion: max frontmatter-neighbor lines surfaced when a prompt
+    /// names a document (the expansion is always 1-hop; this caps the count).
+    pub doc_neighbor_cap: usize,
 }
 
 /// MCP server settings.
@@ -577,6 +589,9 @@ impl Default for GraphConfig {
                 .map(|s| s.to_string())
                 .collect(),
             include_wikilinks: true,
+            expand_seeds: 2,
+            expand_neighbors: 3,
+            doc_neighbor_cap: 3,
         }
     }
 }
