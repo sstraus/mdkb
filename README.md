@@ -348,6 +348,40 @@ mdkb memory import .mdkb/memory/entries --skip-duplicates
 mdkb memory import entries.json --dry-run --skip-duplicates
 ```
 
+#### Team sync (git)
+
+`.mdkb/` is gitignored — `index.sqlite` is the binary source of truth and
+isn't meant to be committed. To share memory with teammates, export to a
+**tracked** directory outside `.mdkb/` and import after pulling:
+
+```bash
+# Export to a git-tracked folder (not .mdkb/memory/, which stays gitignored)
+mdkb memory export --dir memory/entries --overwrite
+git add memory/entries/ && git commit -m "chore(memory): sync team knowledge"
+
+# Teammate, after pulling:
+mdkb memory import memory/entries --skip-duplicates
+```
+
+Automate both ends with git hooks so nobody has to remember the manual steps:
+
+```bash
+# .git/hooks/pre-commit — keep memory/entries/ current before every commit
+#!/bin/sh
+mdkb memory export --dir memory/entries --overwrite
+git add memory/entries/
+
+# .git/hooks/post-merge and post-checkout — pick up teammates' entries after a pull
+#!/bin/sh
+mdkb memory import memory/entries --skip-duplicates
+```
+
+Only `entries/*.md` is meant for version control. `index.json` and `archive/`
+under `.mdkb/memory/` are regenerable caches — never commit those. Derived
+counters (`access_count`, `last_accessed`, `confirmations`) reset to zero on
+import; they track local usage, not authored knowledge, so they don't need
+to round-trip.
+
 ### Stats
 
 `mdkb stats` is the unified diagnostic dashboard introduced in 2.0.0 (replaces the former `mdkb status` — not aliased, it was removed).
@@ -430,12 +464,14 @@ All data stays local in `.mdkb/`:
 ├── config.toml
 ├── index.sqlite      # FTS5 + document metadata
 ├── code.sqlite       # Source code symbols + call graph
-└── memory/           # Memory entries (markdown files)
+└── memory/           # Memory entries (markdown mirror + index.json cache)
 ```
 
 The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded on first use and cached locally.
 
-Add `.mdkb/` to `.gitignore` — it can be regenerated with `mdkb update && mdkb embed`.
+Add `.mdkb/` to `.gitignore` — it can be regenerated with `mdkb update && mdkb embed`. To
+share memory entries with a team via git, export to a tracked folder outside `.mdkb/`
+instead — see [Team sync (git)](#team-sync-git).
 
 ## License
 
