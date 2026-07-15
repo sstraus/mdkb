@@ -239,7 +239,10 @@ fn prune_skips_delete_when_content_missing_under_export() {
     let summary = handle_prune_sessions(&env.ctx, now + 3600, Some(&export_dir)).expect("prune");
 
     assert_eq!(summary.exported, 0, "no body available to export");
-    assert_eq!(summary.pruned, 0, "must not delete without a successful export");
+    assert_eq!(
+        summary.pruned, 0,
+        "must not delete without a successful export"
+    );
     let beta = env
         .ctx
         .conn
@@ -249,7 +252,10 @@ fn prune_skips_delete_when_content_missing_under_export() {
             |r| r.get::<_, i64>(0),
         )
         .unwrap();
-    assert_eq!(beta, 1, "beta transcript preserved — not deleted without export");
+    assert_eq!(
+        beta, 1,
+        "beta transcript preserved — not deleted without export"
+    );
 }
 
 #[test]

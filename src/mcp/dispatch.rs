@@ -554,8 +554,7 @@ fn resolve_source_file(
             if metadata.len() > MAX_SOURCE_FILE_BYTES {
                 return Err(mcp_error(SOURCE_FILE_ERROR));
             }
-            let text =
-                std::fs::read_to_string(&abs).map_err(|_| mcp_error(SOURCE_FILE_ERROR))?;
+            let text = std::fs::read_to_string(&abs).map_err(|_| mcp_error(SOURCE_FILE_ERROR))?;
             Ok((text, Some(abs.to_string_lossy().to_string())))
         }
         None if content.is_empty() => {
@@ -1884,9 +1883,7 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
             })
             .await;
             match indexed {
-                Ok(Some(Ok(sr)))
-                    if sr.added > 0 || sr.updated > 0 || sr.sessions_archived > 0 =>
-                {
+                Ok(Some(Ok(sr))) if sr.added > 0 || sr.updated > 0 || sr.sessions_archived > 0 => {
                     format!(
                         "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}\nArchived: {}",
                         sr.added, sr.updated, sr.unchanged, sr.sessions_archived
@@ -2059,13 +2056,15 @@ pub async fn graph_impl(handle: &RepoHandle, params: &GraphParams) -> Result<Str
             let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
             let edges = graph::get_outgoing(&ctx.conn, doc.id, relation)
                 .map_err(|e| mcp_error(e.to_string()))?;
-            let views = graph::edge_views(&ctx.conn, &edges).map_err(|e| mcp_error(e.to_string()))?;
+            let views =
+                graph::edge_views(&ctx.conn, &edges).map_err(|e| mcp_error(e.to_string()))?;
             format_graph_edges(entity, "links", &views)
         }
         "backlinks" => {
             let edges = graph::get_incoming(&ctx.conn, entity, relation)
                 .map_err(|e| mcp_error(e.to_string()))?;
-            let views = graph::edge_views(&ctx.conn, &edges).map_err(|e| mcp_error(e.to_string()))?;
+            let views =
+                graph::edge_views(&ctx.conn, &edges).map_err(|e| mcp_error(e.to_string()))?;
             format_graph_edges(entity, "backlinks", &views)
         }
         "neighbors" => {

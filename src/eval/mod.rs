@@ -11,7 +11,7 @@ pub mod recall;
 
 #[cfg(test)]
 pub(crate) mod testkit {
-    use crate::store::memory::{add_entry, EntryStatus, EntryType, MemoryEntry, SourceType};
+    use crate::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
     use crate::store::schema::init_schema;
     use chrono::Utc;
     use rusqlite::Connection;

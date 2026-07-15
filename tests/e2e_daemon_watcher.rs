@@ -249,7 +249,7 @@ async fn late_ctx_still_reindexes_injected_file() {
             true,
             vec![],
             true,
-            50,  // debounce_ms — fast for test
+            50, // debounce_ms — fast for test
             200,
             None,
             Some(rx),

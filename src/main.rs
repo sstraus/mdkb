@@ -18,20 +18,19 @@ use mdkb::cli::CodeCommand;
 use mdkb::cli::daemon as daemon_cli;
 use mdkb::cli::handlers::{
     Context, EmbedResult, EvolutionHistoryEntry, handle_collection_add, handle_collection_list,
-    handle_collection_remove,
-    handle_collection_rename, handle_current, handle_embed, handle_eval_judge,
-    handle_eval_recall, handle_evolve_corrects,
-    handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
+    handle_collection_remove, handle_collection_rename, handle_current, handle_embed,
+    handle_eval_judge, handle_eval_recall, handle_evolve_corrects, handle_evolve_extends,
+    handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
     handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
-    handle_graph_dangling, handle_graph_hubs,
-    handle_graph_links, handle_graph_neighbors, handle_graph_path, handle_history,
-    handle_hybrid_search, handle_init, handle_memory_add, handle_memory_confirm,
-    handle_memory_export, handle_memory_import, handle_memory_import_dir, handle_memory_link,
-    handle_memory_list, handle_memory_prune, handle_memory_rm, handle_memory_search,
-    handle_memory_show, handle_memory_warmup, handle_metrics_export, handle_metrics_latency,
-    handle_metrics_show, handle_mget, handle_prune_sessions, handle_session_index,
-    handle_superseded_by, handle_update_files_force, handle_update_force, parse_retention_secs,
+    handle_graph_dangling, handle_graph_hubs, handle_graph_links, handle_graph_neighbors,
+    handle_graph_path, handle_history, handle_hybrid_search, handle_init, handle_memory_add,
+    handle_memory_confirm, handle_memory_export, handle_memory_import, handle_memory_import_dir,
+    handle_memory_link, handle_memory_list, handle_memory_prune, handle_memory_rm,
+    handle_memory_search, handle_memory_show, handle_memory_warmup, handle_metrics_export,
+    handle_metrics_latency, handle_metrics_show, handle_mget, handle_prune_sessions,
+    handle_session_index, handle_superseded_by, handle_update_files_force, handle_update_force,
+    parse_retention_secs,
 };
 #[cfg(unix)]
 use mdkb::cli::hook_client;
@@ -39,10 +38,9 @@ use mdkb::cli::hook_logic;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
     Cli, CollectionCommand, Command, DaemonCommand, EvalCommand, EvolveCommand, ExperimentCommand,
-    GraphCommand,
-    HookCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, RemoveHooksCommand,
-    RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand, SetupMcpCommand,
-    SetupRemoveCommand,
+    GraphCommand, HookCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat,
+    RemoveHooksCommand, RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand,
+    SetupMcpCommand, SetupRemoveCommand,
 };
 use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
@@ -1907,7 +1905,12 @@ fn format_graph_neighbors(neighbors: &[mdkb::store::graph::Neighbor], format: Ou
                 println!("No neighbors found.");
             } else {
                 for n in neighbors {
-                    println!("  {} (depth {}, via {})", n.entity, n.depth, n.via.join(", "));
+                    println!(
+                        "  {} (depth {}, via {})",
+                        n.entity,
+                        n.depth,
+                        n.via.join(", ")
+                    );
                 }
             }
         }
@@ -1926,7 +1929,10 @@ fn format_graph_path(path: &Option<Vec<String>>, format: OutputFormat) {
     }
 }
 
-fn format_collection_list(collections: &[mdkb::cli::handlers::CollectionInfo], format: OutputFormat) {
+fn format_collection_list(
+    collections: &[mdkb::cli::handlers::CollectionInfo],
+    format: OutputFormat,
+) {
     match format {
         OutputFormat::Json => {
             println!("{}", serde_json::to_string_pretty(collections).unwrap());
@@ -1944,7 +1950,10 @@ fn format_collection_list(collections: &[mdkb::cli::handlers::CollectionInfo], f
                 println!("| Name | Path | Pattern | Docs |");
                 println!("|------|------|---------|------|");
                 for c in collections {
-                    println!("| {} | {} | {} | {} |", c.name, c.path, c.pattern, c.doc_count);
+                    println!(
+                        "| {} | {} | {} | {} |",
+                        c.name, c.path, c.pattern, c.doc_count
+                    );
                 }
             }
         }
@@ -1990,7 +1999,10 @@ fn format_graph_dangling(dangling: &[mdkb::store::graph::DanglingRef], format: O
                 println!("No dangling references.");
             } else {
                 for d in dangling {
-                    println!("  {} --{}--> {} (unresolved)", d.source, d.relation, d.target_ref);
+                    println!(
+                        "  {} --{}--> {} (unresolved)",
+                        d.source, d.relation, d.target_ref
+                    );
                 }
             }
         }
@@ -2970,7 +2982,9 @@ mod tests {
     #[test]
     fn server_subcommands_use_multi_thread_runtime() {
         assert!(is_server_invocation(args(&["serve"])));
-        assert!(is_server_invocation(args(&["serve", "--http", "--token", "x"])));
+        assert!(is_server_invocation(args(&[
+            "serve", "--http", "--token", "x"
+        ])));
         assert!(is_server_invocation(args(&["mcp"])));
         assert!(is_server_invocation(args(&["serve", "--daemon"])));
     }

@@ -61,7 +61,6 @@ pub struct TelemetryConfig {
     pub query_events: bool,
 }
 
-
 /// Indexing settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

@@ -867,8 +867,24 @@ mod tests {
         let conn = setup_db();
         let project = insert_doc(&conn, "projects/x.md");
         let target = insert_doc(&conn, "people/alice.md");
-        add_edge(&conn, project, "people/alice", "owner", KIND_FRONTMATTER, None).unwrap();
-        add_edge(&conn, project, "teams/wiz", "related", KIND_FRONTMATTER, None).unwrap();
+        add_edge(
+            &conn,
+            project,
+            "people/alice",
+            "owner",
+            KIND_FRONTMATTER,
+            None,
+        )
+        .unwrap();
+        add_edge(
+            &conn,
+            project,
+            "teams/wiz",
+            "related",
+            KIND_FRONTMATTER,
+            None,
+        )
+        .unwrap();
         let _ = target;
 
         let dangling = dangling(&conn).unwrap();
@@ -890,7 +906,10 @@ mod tests {
         add_edge(&conn, hub, "a", "related", KIND_FRONTMATTER, None).unwrap();
 
         let ranked = hubs(&conn, None, 10).unwrap();
-        assert_eq!(ranked[0].entity, "hub.md", "hub ranks first by total degree");
+        assert_eq!(
+            ranked[0].entity, "hub.md",
+            "hub ranks first by total degree"
+        );
         assert_eq!(ranked[0].in_degree, 2);
         assert_eq!(ranked[0].out_degree, 1);
         assert!(ranked[0].by_relation.iter().any(|(r, _)| r == "owner"));
@@ -899,6 +918,9 @@ mod tests {
         let owners = hubs(&conn, Some("owner"), 10).unwrap();
         let hub_row = owners.iter().find(|h| h.entity == "hub.md").unwrap();
         assert_eq!(hub_row.in_degree, 2);
-        assert_eq!(hub_row.out_degree, 0, "hub's out-edge is 'related', filtered out");
+        assert_eq!(
+            hub_row.out_degree, 0,
+            "hub's out-edge is 'related', filtered out"
+        );
     }
 }

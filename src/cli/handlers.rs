@@ -130,8 +130,7 @@ impl Context {
         // the integrity probe through schema initialization and salvage; two
         // concurrent virtual-table constructors can otherwise fail with
         // `SQLITE_SCHEMA: vtable constructor failed`.
-        let _open_guard =
-            crate::store::mutation_lock::acquire(&db_path, "open-schema")?;
+        let _open_guard = crate::store::mutation_lock::acquire(&db_path, "open-schema")?;
 
         // Autoheal: quarantine a structurally-corrupt index before we build on
         // it, so the `Connection::open` below lands on a clean file. Throttled,

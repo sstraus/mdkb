@@ -350,8 +350,7 @@ pub fn stale_dependency_ids(
                 OR COALESCE(t.corrections, 0) > t.confirmations)"
     );
 
-    let params: Vec<&dyn rusqlite::ToSql> =
-        ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params.as_slice(), |r| r.get::<_, String>(0))?;
     let mut stale = std::collections::HashSet::new();
@@ -721,10 +720,38 @@ mod tests {
         )
         .unwrap();
 
-        add_edge(&conn, "stale_a", "sup_base", TargetKind::Memory, MemoryRelation::DerivedFrom).unwrap();
-        add_edge(&conn, "stale_b", "refuted_base", TargetKind::Memory, MemoryRelation::Supports).unwrap();
-        add_edge(&conn, "healthy", "live_base", TargetKind::Memory, MemoryRelation::DerivedFrom).unwrap();
-        add_edge(&conn, "weak", "sup_base", TargetKind::Memory, MemoryRelation::RelatesTo).unwrap();
+        add_edge(
+            &conn,
+            "stale_a",
+            "sup_base",
+            TargetKind::Memory,
+            MemoryRelation::DerivedFrom,
+        )
+        .unwrap();
+        add_edge(
+            &conn,
+            "stale_b",
+            "refuted_base",
+            TargetKind::Memory,
+            MemoryRelation::Supports,
+        )
+        .unwrap();
+        add_edge(
+            &conn,
+            "healthy",
+            "live_base",
+            TargetKind::Memory,
+            MemoryRelation::DerivedFrom,
+        )
+        .unwrap();
+        add_edge(
+            &conn,
+            "weak",
+            "sup_base",
+            TargetKind::Memory,
+            MemoryRelation::RelatesTo,
+        )
+        .unwrap();
 
         let ids = ["stale_a", "stale_b", "healthy", "weak", "no_edges"];
         let batched = stale_dependency_ids(&conn, &ids).unwrap();
@@ -739,7 +766,11 @@ mod tests {
         }
         let mut got: Vec<&str> = batched.iter().map(|s| s.as_str()).collect();
         got.sort_unstable();
-        assert_eq!(got, vec!["stale_a", "stale_b"], "only truly-stale ids flagged");
+        assert_eq!(
+            got,
+            vec!["stale_a", "stale_b"],
+            "only truly-stale ids flagged"
+        );
     }
 
     #[test]

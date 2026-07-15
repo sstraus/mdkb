@@ -5,9 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use mdkb::cli::handlers::{
-    Context, handle_collection_add, handle_init, handle_update_force,
-};
+use mdkb::cli::handlers::{Context, handle_collection_add, handle_init, handle_update_force};
 use tempfile::TempDir;
 
 /// Writer A holds the write lock for ~300ms; writer B (a second connection to

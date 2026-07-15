@@ -1598,7 +1598,10 @@ mod tests {
             })
         })
         .unwrap();
-        assert_eq!(embedded, 2, "poison row skipped, rows 1 and 3 still embedded");
+        assert_eq!(
+            embedded, 2,
+            "poison row skipped, rows 1 and 3 still embedded"
+        );
 
         // A cold model stops the whole batch (leaving the remainder for next pass).
         let embedded = drive_backfill(rows, |rowid, _, _| {
@@ -1609,7 +1612,10 @@ mod tests {
             })
         })
         .unwrap();
-        assert_eq!(embedded, 1, "cold model stops after row 1, nothing forced through");
+        assert_eq!(
+            embedded, 1,
+            "cold model stops after row 1, nothing forced through"
+        );
     }
 
     #[test]
@@ -4052,6 +4058,9 @@ mod tests {
         // Every tag is noise → no tag segment, and no trailing space. Slug id
         // (not "topic-…") keeps the [type] label.
         let e = warmup_line_entry("deploy-notes", EntryType::Topic, &["topic", "session-abc"]);
-        assert_eq!(format_warmup_line(&e), "[topic] deploy-notes: A concise title");
+        assert_eq!(
+            format_warmup_line(&e),
+            "[topic] deploy-notes: A concise title"
+        );
     }
 }

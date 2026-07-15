@@ -206,7 +206,9 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
 /// trusted single-repo in-process path.
 fn in_process_config(root: &Path) -> Result<DaemonConfig> {
     let mut config = DaemonConfig::load_or_default(&DaemonConfig::config_path())?;
-    config.whitelist_dirs.push(root.to_string_lossy().to_string());
+    config
+        .whitelist_dirs
+        .push(root.to_string_lossy().to_string());
     Ok(config)
 }
 

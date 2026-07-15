@@ -1212,7 +1212,10 @@ pub fn world() {
             .store_load_filtered(|id| id == bbb_id);
         assert_eq!(bbb_after.len(), 1, "bbb embedding must still be present");
         assert!(
-            bbb_after[0].1.iter().all(|&v| (v - 0.5).abs() < f32::EPSILON),
+            bbb_after[0]
+                .1
+                .iter()
+                .all(|&v| (v - 0.5).abs() < f32::EPSILON),
             "bbb's sentinel embedding must be preserved — a 1-file change must not \
              re-embed unchanged symbols"
         );

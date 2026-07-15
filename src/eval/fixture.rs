@@ -11,7 +11,7 @@ use std::path::Path;
 
 use super::judge::JudgeCase;
 use super::recall::EvalCase;
-use crate::store::memory::{add_entry, EntryStatus, EntryType, MemoryEntry, SourceType};
+use crate::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
 
 /// The synthetic corpus shipped in the binary, used when no `--fixture` is given.
 const DEFAULT_FIXTURE: &str = include_str!("../../assets/eval/memory-recall.json");

@@ -64,7 +64,11 @@ fn update_prunes_docs_inside_nested_store() {
     // owns its docs — prune the subtree. A bare `.mdkb` dir is not enough.
     std::fs::create_dir_all(env.root.join("child/.mdkb")).unwrap();
     std::fs::write(env.root.join("child/.mdkb/index.sqlite"), b"").unwrap();
-    std::fs::write(env.root.join("child/nested.md"), "# Nested\n\nSub-repo doc.").unwrap();
+    std::fs::write(
+        env.root.join("child/nested.md"),
+        "# Nested\n\nSub-repo doc.",
+    )
+    .unwrap();
 
     handle_collection_add(&env.ctx, "docs", ".", "**/*.md").expect("add collection");
     handle_update(&env.ctx, &env.root).expect("update");

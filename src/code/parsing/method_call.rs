@@ -101,5 +101,4 @@ mod tests {
         let call = MethodCall::new("foo", "bar", test_range()).with_receiver("self");
         assert!(call.is_self_call());
     }
-
 }

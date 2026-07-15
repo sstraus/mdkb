@@ -118,7 +118,10 @@ mod tests {
     fn substring_judge_matches_case_insensitively() {
         let j = SubstringJudge;
         let ctx = vec!["OAuth2 PKCE flow\nauthorization CODE exchange".to_string()];
-        assert_eq!(j.judge("q", &ctx, "code exchange").unwrap(), Verdict::Correct);
+        assert_eq!(
+            j.judge("q", &ctx, "code exchange").unwrap(),
+            Verdict::Correct
+        );
         assert_eq!(
             j.judge("q", &ctx, "quantum entanglement").unwrap(),
             Verdict::Incorrect

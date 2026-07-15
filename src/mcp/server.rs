@@ -1932,7 +1932,10 @@ mod tests {
         // slicing would panic here. Prefix pads past the 60-byte truncation
         // threshold so truncation actually engages on the multi-byte tail.
         let sig = format!("fn f(x: {}) -> ()", "パラメータ".repeat(8));
-        assert!(!sig.is_char_boundary(57), "test setup: byte 57 must split a char");
+        assert!(
+            !sig.is_char_boundary(57),
+            "test setup: byte 57 must split a char"
+        );
 
         let sym = Symbol::new(
             SymbolId::new(1).unwrap(),

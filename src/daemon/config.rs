@@ -152,7 +152,10 @@ impl DaemonConfig {
                 }
             }
         } else {
-            self.whitelist_dirs.iter().map(|d| expand_tilde(d)).collect()
+            self.whitelist_dirs
+                .iter()
+                .map(|d| expand_tilde(d))
+                .collect()
         };
 
         let canonical = match path.canonicalize() {

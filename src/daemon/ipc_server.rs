@@ -538,9 +538,15 @@ mod tests {
         // serve() must return (drain completes well within the grace period) and
         // unlink the sockets.
         let result = tokio::time::timeout(std::time::Duration::from_secs(3), serve_handle).await;
-        assert!(result.is_ok(), "serve() did not return after shutdown drain");
+        assert!(
+            result.is_ok(),
+            "serve() did not return after shutdown drain"
+        );
         result.unwrap().unwrap().unwrap();
-        assert!(!hook_path.exists(), "hook socket should be unlinked after drain");
+        assert!(
+            !hook_path.exists(),
+            "hook socket should be unlinked after drain"
+        );
     }
 
     #[tokio::test]

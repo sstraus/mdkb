@@ -524,7 +524,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let corrupt = dir.path().join("index.sqlite.corrupt-1700000000");
         std::fs::write(&corrupt, b"corrupt bytes").unwrap();
-        write_report(&corrupt, Salvage { entries: 5, edges: 2 });
+        write_report(
+            &corrupt,
+            Salvage {
+                entries: 5,
+                edges: 2,
+            },
+        );
 
         let reports = quarantine_reports(dir.path());
         assert_eq!(reports.len(), 1, "one outstanding quarantine");

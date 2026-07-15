@@ -58,7 +58,11 @@ fn render_quarantine(
             r.corrupt_file, date, r.memory_entries_salvaged, r.memory_edges_salvaged, r.corrupt_file
         ));
     }
-    out.push_str(&frame("⚠ INDEX QUARANTINED (was corrupt)", body.trim_end(), WIDTH));
+    out.push_str(&frame(
+        "⚠ INDEX QUARANTINED (was corrupt)",
+        body.trim_end(),
+        WIDTH,
+    ));
 }
 
 fn render_header(out: &mut String, h: &HeaderInfo) {
@@ -425,7 +429,10 @@ mod tests {
         // is already repopulated (auto-rebuild already ran) — the banner must
         // not tell the operator to redo it.
         let out = render(&report, false);
-        assert!(out.contains("QUARANTINED"), "quarantine banner present: {out}");
+        assert!(
+            out.contains("QUARANTINED"),
+            "quarantine banner present: {out}"
+        );
         assert!(out.contains("673"), "salvaged entry count surfaced");
         assert!(
             out.contains("already re-indexed"),
