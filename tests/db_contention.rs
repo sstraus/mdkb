@@ -6,6 +6,8 @@
 use std::time::{Duration, Instant};
 
 use mdkb::cli::handlers::{Context, handle_collection_add, handle_init, handle_update_force};
+use mdkb::store::vectors;
+use rusqlite::params;
 use tempfile::TempDir;
 
 /// Writer A holds the write lock for ~300ms; writer B (a second connection to
@@ -84,6 +86,18 @@ fn concurrent_context_opens_do_not_race_virtual_table_setup() {
     }
 }
 
+/// SQLite 3.51.3 fixes the WAL-reset corruption race that affects concurrent
+/// writers/checkpointers in every release from 3.7.0 through 3.51.2.
+#[test]
+fn bundled_sqlite_contains_wal_reset_corruption_fix() {
+    const SQLITE_3_51_3: i32 = 3_051_003;
+    assert!(
+        rusqlite::version_number() >= SQLITE_3_51_3,
+        "bundled SQLite {} is vulnerable to the WAL-reset corruption race",
+        rusqlite::version()
+    );
+}
+
 /// Two independent mdkb processes can discover the same changed files at the
 /// same time (for example the daemon watcher and a manual `mdkb update`). The
 /// project mutation lock must serialize the complete logical updates, not just
@@ -136,4 +150,69 @@ fn concurrent_full_updates_leave_one_sound_index() {
         )
         .unwrap();
     assert_eq!(docs, 40, "both updates converge on one complete index");
+}
+
+/// Exercise the write pattern used by memory indexing: an ordinary table with
+/// FTS triggers plus a sqlite-vec virtual table, from several independent
+/// connections. This combination is the only native virtual-table write path
+/// shared by the repositories where recurring corruption was observed.
+#[test]
+fn concurrent_memory_and_vector_writes_leave_one_sound_index() {
+    const WORKERS: usize = 4;
+    const WRITES_PER_WORKER: usize = 100;
+
+    let tmp = TempDir::new().expect("tempdir");
+    handle_init(tmp.path()).expect("init mdkb");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+    let mut workers = Vec::new();
+    for worker_id in 0..WORKERS {
+        let root = tmp.path().to_path_buf();
+        let barrier = barrier.clone();
+        workers.push(std::thread::spawn(move || {
+            let ctx = Context::open(root).expect("open worker context");
+            barrier.wait();
+            let embedding = vec![worker_id as f32; vectors::EMBEDDING_DIM];
+
+            for n in 0..WRITES_PER_WORKER {
+                let id = format!("stress-{worker_id}-{n}");
+                ctx.conn
+                    .execute(
+                        "INSERT INTO memory_entries
+                         (id, title, content, entry_type, tags, status, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 'topic', '[]', 'active', ?4, ?4)",
+                        params![id, format!("Title {n}"), format!("Body {n}"), n as i64],
+                    )
+                    .expect("insert memory entry");
+                let rowid = ctx.conn.last_insert_rowid();
+                vectors::store_memory_embedding(&ctx.conn, rowid, &embedding, "stress")
+                    .expect("store memory embedding");
+
+                if n % 3 == 0 {
+                    ctx.conn
+                        .execute(
+                            "UPDATE memory_entries SET content = content || ' updated' WHERE rowid = ?1",
+                            [rowid],
+                        )
+                        .expect("update FTS-backed memory entry");
+                }
+                if n % 5 == 0 {
+                    ctx.conn
+                        .execute("DELETE FROM memory_entries WHERE rowid = ?1", [rowid])
+                        .expect("delete memory entry and vector through triggers");
+                }
+            }
+        }));
+    }
+
+    for worker in workers {
+        worker.join().expect("worker thread");
+    }
+
+    let final_ctx = Context::open(tmp.path()).expect("reopen final index");
+    let check: String = final_ctx
+        .conn
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .expect("quick_check");
+    assert_eq!(check, "ok");
 }

@@ -1,5 +1,16 @@
 # Changelog
 
+## 3.7.4 (2026-07-21)
+
+### Fixed
+
+- **Recurring SQLite corruption under concurrent daemon/CLI writes.** Upgrade
+  bundled SQLite from 3.46.0 to 3.51.3, which contains the upstream fix for the
+  WAL-reset corruption race affecting concurrent writers and checkpointers.
+- **Codex `PreToolUse` context injection no longer fails validation.** Context-only
+  hook responses now omit `permissionDecision`; Codex reserves `"allow"` for
+  responses that also rewrite the tool call through `updatedInput`.
+
 ## 3.7.3 (2026-07-11)
 
 Graph navigation & DX (stories 075–082) plus a P1 autoheal data-safety fix (083).

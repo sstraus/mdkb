@@ -162,11 +162,14 @@ Output (definition search, symbol indexed — the "act" case):
 {
   "hookSpecificOutput": {
     "hookEventName": "PreToolUse",
-    "permissionDecision": "allow",
     "additionalContext": "mdkb code index — `handle_auth` defined at:\n- src/auth.rs:42 (Function)\nRead the definition directly instead of grepping.\n"
   }
 }
 ```
+
+Context-only responses deliberately omit `permissionDecision`. Codex accepts
+`"allow"` only when the hook also supplies `updatedInput` to rewrite the tool
+call; including it here makes the hook fail validation.
 
 The code-index lookup only fires for definition-classified searches and is
 skipped entirely when `.mdkb/code.sqlite` is absent, so non-symbol searches

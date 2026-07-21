@@ -556,7 +556,6 @@ mod tests {
         let envelope = json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
                 "additionalContext": "Use mdkb search instead",
             }
         });

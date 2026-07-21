@@ -88,13 +88,20 @@ fn additional_context(stdout: &str) -> Option<String> {
         .map(String::from)
 }
 
-fn permission_decision(stdout: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
-    parsed
+fn assert_context_only_response(stdout: &str) {
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|_| panic!("expected JSON, got: {stdout}"));
+    let hook_output = parsed
         .get("hookSpecificOutput")
-        .and_then(|h| h.get("permissionDecision"))
-        .and_then(|v| v.as_str())
-        .map(String::from)
+        .unwrap_or_else(|| panic!("expected hookSpecificOutput, got: {stdout}"));
+    assert!(
+        hook_output.get("permissionDecision").is_none(),
+        "context-only responses must omit permissionDecision, got: {stdout}"
+    );
+    assert!(
+        hook_output.get("updatedInput").is_none(),
+        "context-only responses must not rewrite tool input, got: {stdout}"
+    );
 }
 
 #[test]
@@ -121,12 +128,7 @@ fn pre_tool_use_injects_code_index_hits_for_indexed_symbol() {
         !ctx.contains("search --scope symbols"),
         "must NOT fall back to the suggestion when a hit exists, got: {ctx}"
     );
-    // The hook must allow the tool call through, not just attach context.
-    assert_eq!(
-        permission_decision(&stdout).as_deref(),
-        Some("allow"),
-        "act path must carry permissionDecision=allow, got: {stdout}"
-    );
+    assert_context_only_response(&stdout);
 }
 
 #[test]
@@ -176,6 +178,7 @@ fn pre_tool_use_injects_code_index_hits_via_bash_grep() {
         ctx.contains("src/lib.rs:2"),
         "Bash definition search must inject file:line too, got: {ctx}"
     );
+    assert_context_only_response(&stdout);
 }
 
 #[test]
@@ -192,6 +195,7 @@ fn pre_tool_use_falls_back_to_suggestion_for_unknown_symbol() {
         ctx.contains("search --scope symbols") && ctx.contains("no_such_symbol_here"),
         "unknown symbol must fall back to the suggestion string, got: {ctx}"
     );
+    assert_context_only_response(&stdout);
 }
 
 #[test]

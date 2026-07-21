@@ -1,6 +1,6 @@
 [package]
 name = "mdkb"
-version = "3.7.3"
+version = "3.7.4"
 edition = "2024"
 description = "Persistent memory, hybrid search, and code intelligence for Claude Code and Codex — with CLI, lifecycle hooks, and MCP"
 license = "MIT"
@@ -18,7 +18,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive", "env"] }
 
 # Storage
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 sqlite-vec = "0.1"
 zerocopy = { version = "0.7", features = ["derive"] }
 

@@ -3481,7 +3481,6 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
         Some(text) => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
-                "permissionDecision": "allow",
                 "additionalContext": text,
             }
         }),
