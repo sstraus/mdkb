@@ -167,7 +167,7 @@ pub fn extract_evolution_refs(frontmatter: Option<&Value>, field: &str) -> Vec<E
 
     match value {
         // Array of objects or strings
-        Value::Array(arr) => arr.iter().filter_map(|v| parse_evolution_ref(v)).collect(),
+        Value::Array(arr) => arr.iter().filter_map(parse_evolution_ref).collect(),
         // Single object
         Value::Object(_) => parse_evolution_ref(value).into_iter().collect(),
         // Single string path

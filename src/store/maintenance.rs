@@ -17,7 +17,7 @@ use crate::error::Result;
 /// Returns true when `interval` is positive and `call_count` is a non-zero
 /// multiple of `interval`. `interval = 0` disables runtime optimize entirely.
 pub fn should_optimize(call_count: u64, interval: u64) -> bool {
-    interval > 0 && call_count > 0 && call_count % interval == 0
+    interval > 0 && call_count > 0 && call_count.is_multiple_of(interval)
 }
 
 /// Run `PRAGMA optimize` — non-locking, safe on the hot path.

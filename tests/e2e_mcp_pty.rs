@@ -13,8 +13,11 @@
 //! exercise the actual wire protocol as Claude Code would use it.
 
 mod common;
+#[path = "common/fixture.rs"]
+mod fixture;
 
 use common::McpTestHarness;
+use fixture::McpFixtureSupport;
 use serde_json::json;
 
 // =============================================================================
@@ -48,7 +51,10 @@ fn test_mcp_tools_list() {
     let mut harness = McpTestHarness::new();
     harness.initialize();
 
-    let tools = harness.list_tools();
+    let tools = harness.send_request("tools/list", json!({}))["result"]["tools"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
 
     // Expected tools based on server implementation (7 tools)
     let expected_tools = vec![

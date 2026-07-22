@@ -197,10 +197,8 @@ pub fn parse_episode(jsonl: &str) -> Episode {
                         }
                     }
                 }
-                Block::Text { text } if record.record_type == "user" => {
-                    if !text.trim().is_empty() {
-                        user_messages.push(text);
-                    }
+                Block::Text { text } if record.record_type == "user" && !text.trim().is_empty() => {
+                    user_messages.push(text);
                 }
                 _ => {}
             }

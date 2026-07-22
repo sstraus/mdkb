@@ -969,14 +969,16 @@ fn update_collection(
         let existing_doc = existing_by_path.remove(&relative);
 
         index_single_file(
-            ctx,
-            &collection.name,
-            &path,
-            relative,
-            existing_doc.as_ref(),
-            &path.display().to_string(),
-            &config.graph,
-            force,
+            SingleFileInput {
+                ctx,
+                collection_name: &collection.name,
+                abs_path: &path,
+                relative,
+                existing_doc: existing_doc.as_ref(),
+                display_name: &path.display().to_string(),
+                graph_cfg: &config.graph,
+                force,
+            },
             result,
         );
     }
@@ -1004,17 +1006,28 @@ fn update_collection(
 ///
 /// `existing_doc` is the previously indexed version (if any). Pass `None` for new files.
 /// All errors are soft — pushed to `result.errors` and the caller continues.
-fn index_single_file(
-    ctx: &Context,
-    collection_name: &str,
-    abs_path: &Path,
+struct SingleFileInput<'a> {
+    ctx: &'a Context,
+    collection_name: &'a str,
+    abs_path: &'a Path,
     relative: String,
-    existing_doc: Option<&Document>,
-    display_name: &str,
-    graph_cfg: &crate::config::GraphConfig,
+    existing_doc: Option<&'a Document>,
+    display_name: &'a str,
+    graph_cfg: &'a crate::config::GraphConfig,
     force: bool,
-    result: &mut UpdateResult,
-) {
+}
+
+fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateResult) {
+    let SingleFileInput {
+        ctx,
+        collection_name,
+        abs_path,
+        relative,
+        existing_doc,
+        display_name,
+        graph_cfg,
+        force,
+    } = input;
     // Read file metadata for mtime
     let metadata = match std::fs::metadata(abs_path) {
         Ok(m) => m,
@@ -1252,23 +1265,24 @@ fn index_specified_files(
             }
         });
 
-        let (collection, relative) = match matched {
-            Some(m) => m,
-            None => continue, // file not in any collection — skip
+        let Some((collection, relative)) = matched else {
+            continue;
         };
 
         // Look up existing document for mtime comparison
         let existing_doc = documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
 
         index_single_file(
-            ctx,
-            &collection.name,
-            &canonical_file,
-            relative,
-            existing_doc.as_ref(),
-            file_arg,
-            graph_cfg,
-            force,
+            SingleFileInput {
+                ctx,
+                collection_name: &collection.name,
+                abs_path: &canonical_file,
+                relative,
+                existing_doc: existing_doc.as_ref(),
+                display_name: file_arg,
+                graph_cfg,
+                force,
+            },
             result,
         );
     }
@@ -2261,19 +2275,16 @@ pub fn handle_memory_import(
         }
 
         // Check for duplicates
-        match memory::get_entry_without_tracking(&ctx.conn, &raw.id)? {
-            Some(_) => {
-                if skip_duplicates {
-                    result.skipped += 1;
-                    continue;
-                }
-                result.errors.push(format!(
-                    "{}: already exists (use --skip-duplicates to ignore)",
-                    raw.id
-                ));
+        if memory::get_entry_without_tracking(&ctx.conn, &raw.id)?.is_some() {
+            if skip_duplicates {
+                result.skipped += 1;
                 continue;
             }
-            None => {}
+            result.errors.push(format!(
+                "{}: already exists (use --skip-duplicates to ignore)",
+                raw.id
+            ));
+            continue;
         }
 
         if dry_run {
@@ -2378,8 +2389,6 @@ pub fn find_related_entries(
     tag_filter: Option<&str>,
     min_entries: usize,
 ) -> Result<Vec<CondenseGroup>> {
-    use std::collections::HashMap;
-
     // Get all active entries
     let entries = memory::list_entries(&ctx.conn, 1000, Some(memory::EntryStatus::Active))?;
 
@@ -2403,7 +2412,7 @@ pub fn find_related_entries(
 
     // Sort tags by entry count (descending)
     let mut sorted_tags: Vec<_> = tag_index.iter().collect();
-    sorted_tags.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+    sorted_tags.sort_by_key(|entry| std::cmp::Reverse(entry.1.len()));
 
     for (tag, tag_entries) in sorted_tags {
         // Skip if not enough entries
@@ -2415,7 +2424,7 @@ pub fn find_related_entries(
         let available: Vec<_> = tag_entries
             .iter()
             .filter(|e| !processed_ids.contains(&e.id))
-            .cloned()
+            .copied()
             .collect();
 
         if available.len() < min_entries {
@@ -3166,7 +3175,7 @@ mod tests {
 
         match handle_get(&ctx, "guide.md", None).expect("path-like doc resolves") {
             GetResult::Document(doc, _) => assert!(doc.relative_path.ends_with("guide.md")),
-            other => panic!("expected a document, got {other:?}"),
+            GetResult::Memory(entry) => panic!("expected a document, got {entry:?}"),
         }
 
         assert!(
@@ -3180,7 +3189,9 @@ mod tests {
         .unwrap();
         match handle_get(&ctx, "slug1", None).expect("memory slug resolves") {
             GetResult::Memory(e) => assert_eq!(e.id, "slug1"),
-            other => panic!("expected a memory entry, got {other:?}"),
+            GetResult::Document(document, content) => {
+                panic!("expected a memory entry, got {document:?} with {content:?}")
+            }
         }
     }
 
@@ -4940,7 +4951,7 @@ mod tests {
         std::fs::write(&file, make_session_jsonl("grow", 14)).unwrap();
         // Force mtime forward so the OLD mtime-dedup would reprocess EVERY chunk;
         // content-hash dedup must still skip the identical earlier chunk(s).
-        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        let bumped = std::time::SystemTime::now() + std::time::Duration::from_mins(2);
         std::fs::File::options()
             .write(true)
             .open(&file)
@@ -4985,7 +4996,7 @@ mod tests {
 
         // Append 2 turns; force mtime forward (worst case for the old dedup).
         std::fs::write(&file, make_session_jsonl("big", 52)).unwrap();
-        let bumped = std::time::SystemTime::now() + std::time::Duration::from_secs(120);
+        let bumped = std::time::SystemTime::now() + std::time::Duration::from_mins(2);
         std::fs::File::options()
             .write(true)
             .open(&file)
@@ -5282,7 +5293,7 @@ pub fn handle_experiment_create(
     }
 
     // Validate min_samples
-    if min_samples < 1 || min_samples > 10_000 {
+    if !(1..=10_000).contains(&min_samples) {
         return Err(Error::from(ErrorKind::Config(
             "min_samples must be between 1 and 10,000".to_string(),
         )));
@@ -5448,7 +5459,7 @@ pub fn handle_journal_import_all(
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
     {
         let path = entry.path();
         let path_str = path.to_string_lossy().to_string();
@@ -5494,12 +5505,9 @@ pub fn handle_session_index(
 ) -> Result<UpdateResult> {
     use crate::domain::sessions::{SessionParseConfig, find_session_dir, parse_session_file};
 
-    let session_dir = match find_session_dir(sessions_path, project_root) {
-        Some(dir) => dir,
-        None => {
-            tracing::debug!("No session directory found for {}", project_root);
-            return Ok(UpdateResult::default());
-        }
+    let Some(session_dir) = find_session_dir(sessions_path, project_root) else {
+        tracing::debug!("No session directory found for {}", project_root);
+        return Ok(UpdateResult::default());
     };
 
     // Ensure claude_sessions collection exists

@@ -72,7 +72,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore] // requires ONNX model download
+    #[ignore = "requires ONNX model download"]
     fn test_cached_service_returns_same_arc() {
         reset_cached_service();
         let a = get_cached_service().unwrap();

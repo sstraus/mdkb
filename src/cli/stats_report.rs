@@ -593,7 +593,7 @@ fn collect_hook_event_stats(mdkb_dir: &Path, since_ts: i64) -> Vec<HookEventStat
         })
         .collect();
 
-    stats.sort_by(|a, b| b.invocations.cmp(&a.invocations));
+    stats.sort_by_key(|stat| std::cmp::Reverse(stat.invocations));
     stats
 }
 

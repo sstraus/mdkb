@@ -593,7 +593,7 @@ mod tests {
         const TASKS: usize = 20;
 
         let tmps: Vec<TempDir> = (0..TASKS).map(|_| TempDir::new().unwrap()).collect();
-        let roots: Vec<PathBuf> = tmps.iter().map(|t| make_repo(t)).collect();
+        let roots: Vec<PathBuf> = tmps.iter().map(make_repo).collect();
 
         let config = DaemonConfig {
             max_active_repos: MAX,
@@ -625,7 +625,7 @@ mod tests {
 
     /// Serializes every test that reads `WATCHER_SPAWN_COUNT` — it's a
     /// process-global counter and parallel tests would race on deltas.
-    static WATCHER_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static WATCHER_COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     /// Story 017-91cb: both halves of the contract.
     ///
@@ -640,9 +640,7 @@ mod tests {
         use crate::mcp::server::{McpServer, WATCHER_SPAWN_COUNT};
         use std::sync::atomic::Ordering;
 
-        let _guard = WATCHER_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = WATCHER_COUNTER_LOCK.lock().await;
 
         // --- Half 1: standalone must not spawn a watcher. ---
         let tmp_standalone = TempDir::new().unwrap();
@@ -683,9 +681,7 @@ mod tests {
         use crate::mcp::server::WATCHER_SPAWN_COUNT;
         use std::sync::atomic::Ordering;
 
-        let _guard = WATCHER_COUNTER_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _guard = WATCHER_COUNTER_LOCK.lock().await;
 
         let tmp1 = TempDir::new().unwrap();
         let tmp2 = TempDir::new().unwrap();

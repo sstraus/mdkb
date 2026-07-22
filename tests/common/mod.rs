@@ -2,7 +2,6 @@
 //!
 //! Spawns a real `mdkb serve` process and communicates via JSON-RPC over stdin/stdout.
 
-use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -63,35 +62,6 @@ impl McpTestHarness {
         }
     }
 
-    /// Create a file in the test environment.
-    pub fn create_file(&self, relative_path: &str, content: &str) {
-        let full_path = self.root.join(relative_path);
-        if let Some(parent) = full_path.parent() {
-            fs::create_dir_all(parent).expect("Failed to create parent dirs");
-        }
-        fs::write(&full_path, content).expect("Failed to write file");
-    }
-
-    /// Add a collection using the CLI.
-    pub fn add_collection(&self, name: &str, path: &str, pattern: &str) {
-        let status = Command::new(env!("CARGO_BIN_EXE_mdkb"))
-            .args(["collection", "add", name, path, "--pattern", pattern])
-            .current_dir(&self.root)
-            .status()
-            .expect("Failed to run mdkb collection add");
-        assert!(status.success(), "mdkb collection add failed");
-    }
-
-    /// Update/reindex using the CLI.
-    pub fn update_index(&self) {
-        let status = Command::new(env!("CARGO_BIN_EXE_mdkb"))
-            .arg("update")
-            .current_dir(&self.root)
-            .status()
-            .expect("Failed to run mdkb update");
-        assert!(status.success(), "mdkb update failed");
-    }
-
     /// Send a JSON-RPC request and return the response.
     pub fn send_request(&mut self, method: &str, params: Value) -> Value {
         let id = self.next_id;
@@ -116,9 +86,11 @@ impl McpTestHarness {
                 Ok(0) => panic!("Server closed stdout unexpectedly"),
                 Ok(_) => break,
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if start.elapsed() > Duration::from_secs(10) {
-                        panic!("Timeout waiting for response to {}", method);
-                    }
+                    assert!(
+                        start.elapsed() <= Duration::from_secs(10),
+                        "Timeout waiting for response to {}",
+                        method
+                    );
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) => panic!("Read error: {}", e),
@@ -165,22 +137,15 @@ impl McpTestHarness {
             if status.get("error").is_none() {
                 break;
             }
-            if start.elapsed() > Duration::from_secs(10) {
-                panic!("Server did not become ready within 10s");
-            }
+            assert!(
+                start.elapsed() <= Duration::from_secs(10),
+                "Server for {} did not become ready within 10s",
+                self.root.display()
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
 
         response
-    }
-
-    /// List available tools.
-    pub fn list_tools(&mut self) -> Vec<Value> {
-        let response = self.send_request("tools/list", json!({}));
-        response["result"]["tools"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
     }
 
     /// Call an MCP tool and return the result.

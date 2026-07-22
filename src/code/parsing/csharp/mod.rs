@@ -42,11 +42,9 @@ impl CSharpParser {
         kind: SymbolKind,
         file_id: FileId,
         range: Range,
-        signature: Option<String>,
-        doc_comment: Option<String>,
-        module_path: &str,
-        visibility: Visibility,
+        tail: (Option<String>, Option<String>, &str, Visibility),
     ) -> Symbol {
+        let (signature, doc_comment, module_path, visibility) = tail;
         let mut sym = Symbol::new(id, name, kind, file_id, range);
         sym.visibility = visibility;
         sym.scope_context = Some(self.context.current_scope_context());
@@ -69,9 +67,8 @@ impl CSharpParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut symbols = Vec::new();
         self.extract_symbols_from_node(
@@ -80,8 +77,7 @@ impl CSharpParser {
             file_id,
             counter,
             &mut symbols,
-            "",
-            0,
+            ("", 0),
         );
         symbols
     }
@@ -93,9 +89,9 @@ impl CSharpParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if !check_recursion_depth(depth, node) {
             return;
         }
@@ -115,10 +111,7 @@ impl CSharpParser {
                         SymbolKind::Class,
                         file_id,
                         node_range(node),
-                        Some(format!("class {n}")),
-                        doc,
-                        module_path,
-                        vis,
+                        (Some(format!("class {n}")), doc, module_path, vis),
                     );
                     symbols.push(symbol);
                 }
@@ -135,8 +128,7 @@ impl CSharpParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -159,10 +151,7 @@ impl CSharpParser {
                         SymbolKind::Interface,
                         file_id,
                         node_range(node),
-                        Some(format!("interface {n}")),
-                        doc,
-                        module_path,
-                        vis,
+                        (Some(format!("interface {n}")), doc, module_path, vis),
                     );
                     symbols.push(symbol);
                 }
@@ -179,8 +168,7 @@ impl CSharpParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -200,10 +188,7 @@ impl CSharpParser {
                         SymbolKind::Struct,
                         file_id,
                         node_range(node),
-                        Some(format!("struct {name}")),
-                        doc,
-                        module_path,
-                        vis,
+                        (Some(format!("struct {name}")), doc, module_path, vis),
                     );
                     symbols.push(symbol);
                 }
@@ -216,8 +201,7 @@ impl CSharpParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
                 self.context.exit_scope();
@@ -234,10 +218,7 @@ impl CSharpParser {
                         SymbolKind::Enum,
                         file_id,
                         node_range(node),
-                        Some(format!("enum {name}")),
-                        doc,
-                        module_path,
-                        vis,
+                        (Some(format!("enum {name}")), doc, module_path, vis),
                     );
                     symbols.push(symbol);
                 }
@@ -262,8 +243,7 @@ impl CSharpParser {
                             file_id,
                             counter,
                             symbols,
-                            &new_path,
-                            depth + 1,
+                            (&new_path, depth + 1),
                         );
                     }
                 } else {
@@ -275,8 +255,7 @@ impl CSharpParser {
                             file_id,
                             counter,
                             symbols,
-                            &new_path,
-                            depth + 1,
+                            (&new_path, depth + 1),
                         );
                     }
                 }
@@ -310,10 +289,12 @@ impl CSharpParser {
                         SymbolKind::Method,
                         file_id,
                         node_range(node),
-                        Some(format!("{return_type} {name}{params}")),
-                        doc,
-                        module_path,
-                        vis,
+                        (
+                            Some(format!("{return_type} {name}{params}")),
+                            doc,
+                            module_path,
+                            vis,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -340,10 +321,7 @@ impl CSharpParser {
                         SymbolKind::Method,
                         file_id,
                         node_range(node),
-                        Some(format!("{name}{params}")),
-                        None,
-                        module_path,
-                        vis,
+                        (Some(format!("{name}{params}")), None, module_path, vis),
                     );
                     symbols.push(symbol);
                 }
@@ -371,10 +349,7 @@ impl CSharpParser {
                         SymbolKind::Field,
                         file_id,
                         node_range(node),
-                        Some(format!("{type_str} {name}")),
-                        None,
-                        module_path,
-                        vis,
+                        (Some(format!("{type_str} {name}")), None, module_path, vis),
                     );
                     symbols.push(symbol);
                 }
@@ -392,8 +367,7 @@ impl CSharpParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -436,10 +410,7 @@ impl CSharpParser {
                                 kind,
                                 file_id,
                                 node_range(node),
-                                None,
-                                None,
-                                module_path,
-                                vis,
+                                (None, None, module_path, vis),
                             );
                             symbols.push(symbol);
                         }
@@ -450,9 +421,8 @@ impl CSharpParser {
     }
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut imports = Vec::new();
         for child in tree.root_node().children(&mut tree.root_node().walk()) {
@@ -477,17 +447,15 @@ impl CSharpParser {
     }
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     fn find_calls_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -515,12 +483,11 @@ impl CSharpParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
     fn find_implementations_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -546,7 +513,7 @@ impl CSharpParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, depth + 1, results);
+            Self::find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 }
@@ -621,12 +588,11 @@ impl LanguageParser for CSharpParser {
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
+        Self::find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 

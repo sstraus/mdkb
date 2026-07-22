@@ -94,28 +94,25 @@ pub fn get_outgoing(
     relation: Option<&str>,
 ) -> Result<Vec<Edge>> {
     let mut edges = Vec::new();
-    match relation {
-        Some(rel) => {
-            let sql = format!(
-                "SELECT {EDGE_COLUMNS} FROM edges
-                 WHERE source_doc_id = ?1 AND relation = ?2 ORDER BY created_at DESC, id DESC"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![source_doc_id, rel], map_edge)?;
-            for row in rows {
-                edges.push(row?);
-            }
+    if let Some(rel) = relation {
+        let sql = format!(
+            "SELECT {EDGE_COLUMNS} FROM edges
+             WHERE source_doc_id = ?1 AND relation = ?2 ORDER BY created_at DESC, id DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![source_doc_id, rel], map_edge)?;
+        for row in rows {
+            edges.push(row?);
         }
-        None => {
-            let sql = format!(
-                "SELECT {EDGE_COLUMNS} FROM edges
-                 WHERE source_doc_id = ?1 ORDER BY created_at DESC, id DESC"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![source_doc_id], map_edge)?;
-            for row in rows {
-                edges.push(row?);
-            }
+    } else {
+        let sql = format!(
+            "SELECT {EDGE_COLUMNS} FROM edges
+             WHERE source_doc_id = ?1 ORDER BY created_at DESC, id DESC"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params![source_doc_id], map_edge)?;
+        for row in rows {
+            edges.push(row?);
         }
     }
     Ok(edges)
@@ -307,15 +304,13 @@ pub fn resolve_entity_ref(conn: &Connection, reference: &str) -> Result<Option<i
     Ok(None)
 }
 
-fn doc_relative_path(conn: &Connection, doc_id: i64) -> Result<Option<String>> {
-    let path: Option<String> = conn
-        .query_row(
-            "SELECT relative_path FROM documents WHERE id = ?1",
-            params![doc_id],
-            |row| row.get(0),
-        )
-        .ok();
-    Ok(path)
+fn doc_relative_path(conn: &Connection, doc_id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT relative_path FROM documents WHERE id = ?1",
+        params![doc_id],
+        |row| row.get(0),
+    )
+    .ok()
 }
 
 /// Resolve `reference` to the canonical `relative_path` of an indexed document,
@@ -325,7 +320,7 @@ fn doc_relative_path(conn: &Connection, doc_id: i64) -> Result<Option<String>> {
 /// [`resolve_ref_to_doc`] with [`canonical_key`] (which would resolve twice).
 pub fn resolve_to_path(conn: &Connection, reference: &str) -> Result<Option<String>> {
     match resolve_ref_to_doc(conn, reference)? {
-        Some(doc_id) => doc_relative_path(conn, doc_id),
+        Some(doc_id) => Ok(doc_relative_path(conn, doc_id)),
         None => Ok(None),
     }
 }
@@ -335,7 +330,7 @@ pub fn resolve_to_path(conn: &Connection, reference: &str) -> Result<Option<Stri
 /// treat `[[projects/x]]` and `projects/x.md` as the same node.
 fn canonical_key(conn: &Connection, reference: &str) -> Result<String> {
     if let Some(doc_id) = resolve_ref_to_doc(conn, reference)? {
-        if let Some(path) = doc_relative_path(conn, doc_id)? {
+        if let Some(path) = doc_relative_path(conn, doc_id) {
             return Ok(path);
         }
     }
@@ -359,7 +354,7 @@ fn adjacent_pairs(
         pairs.push((canonical_key(conn, &edge.target_ref)?, edge.relation));
     }
     for edge in get_incoming(conn, node_key, relation)? {
-        if let Some(path) = doc_relative_path(conn, edge.source_doc_id)? {
+        if let Some(path) = doc_relative_path(conn, edge.source_doc_id) {
             pairs.push((path, edge.relation));
         }
     }
@@ -385,7 +380,7 @@ pub fn neighbors(
     relation: Option<&str>,
     depth: u32,
 ) -> Result<Vec<Neighbor>> {
-    let Some(start_key) = doc_relative_path(conn, start_doc_id)? else {
+    let Some(start_key) = doc_relative_path(conn, start_doc_id) else {
         return Ok(Vec::new());
     };
 
@@ -443,7 +438,7 @@ pub fn shortest_path(
     target: &str,
     max_hops: u32,
 ) -> Result<Option<Vec<String>>> {
-    let Some(start_key) = doc_relative_path(conn, start_doc_id)? else {
+    let Some(start_key) = doc_relative_path(conn, start_doc_id) else {
         return Ok(None);
     };
     let target_key = canonical_key(conn, target)?;
@@ -515,16 +510,15 @@ pub fn dangling(conn: &Connection) -> Result<Vec<DanglingRef>> {
     let mut out = Vec::new();
     for row in rows {
         let e = row?;
-        let ok = match resolves.get(&e.target_ref) {
-            Some(v) => *v,
-            None => {
-                let ok = resolve_ref_to_doc(conn, &e.target_ref)?.is_some();
-                resolves.insert(e.target_ref.clone(), ok);
-                ok
-            }
+        let ok = if let Some(v) = resolves.get(&e.target_ref) {
+            *v
+        } else {
+            let ok = resolve_ref_to_doc(conn, &e.target_ref)?.is_some();
+            resolves.insert(e.target_ref.clone(), ok);
+            ok
         };
         if !ok {
-            let source = doc_relative_path(conn, e.source_doc_id)?
+            let source = doc_relative_path(conn, e.source_doc_id)
                 .unwrap_or_else(|| format!("#{}", e.source_doc_id));
             out.push(DanglingRef {
                 target_ref: e.target_ref,
@@ -571,7 +565,7 @@ pub fn hubs(conn: &Connection, relation: Option<&str>, limit: usize) -> Result<V
                 continue;
             }
         }
-        let source = doc_relative_path(conn, e.source_doc_id)?
+        let source = doc_relative_path(conn, e.source_doc_id)
             .unwrap_or_else(|| format!("#{}", e.source_doc_id));
         let target = canonical_key(conn, &e.target_ref)?;
 

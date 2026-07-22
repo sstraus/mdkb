@@ -42,11 +42,9 @@ impl GdscriptParser {
         kind: SymbolKind,
         file_id: FileId,
         range: Range,
-        signature: Option<String>,
-        doc_comment: Option<String>,
-        module_path: &str,
-        visibility: Visibility,
+        tail: (Option<String>, Option<String>, &str, Visibility),
     ) -> Symbol {
+        let (signature, doc_comment, module_path, visibility) = tail;
         let mut sym = Symbol::new(id, name, kind, file_id, range);
         sym.visibility = visibility;
         sym.scope_context = Some(self.context.current_scope_context());
@@ -69,9 +67,8 @@ impl GdscriptParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
 
         // Extract class_name if present
@@ -86,8 +83,7 @@ impl GdscriptParser {
             file_id,
             counter,
             &mut symbols,
-            module_path,
-            0,
+            (module_path, 0),
         );
         symbols
     }
@@ -99,9 +95,9 @@ impl GdscriptParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if !check_recursion_depth(depth, node) {
             return;
         }
@@ -120,10 +116,12 @@ impl GdscriptParser {
                         SymbolKind::Class,
                         file_id,
                         node_range(node),
-                        Some(format!("class {n}")),
-                        doc,
-                        module_path,
-                        Visibility::Public,
+                        (
+                            Some(format!("class {n}")),
+                            doc,
+                            module_path,
+                            Visibility::Public,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -140,8 +138,7 @@ impl GdscriptParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -183,10 +180,12 @@ impl GdscriptParser {
                         kind,
                         file_id,
                         node_range(node),
-                        Some(format!("func {name}{params}")),
-                        doc,
-                        module_path,
-                        visibility,
+                        (
+                            Some(format!("func {name}{params}")),
+                            doc,
+                            module_path,
+                            visibility,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -214,10 +213,12 @@ impl GdscriptParser {
                             kind,
                             file_id,
                             node_range(node),
-                            Some(code[node.byte_range()].trim().to_string()),
-                            None,
-                            module_path,
-                            visibility,
+                            (
+                                Some(code[node.byte_range()].trim().to_string()),
+                                None,
+                                module_path,
+                                visibility,
+                            ),
                         );
                         symbols.push(symbol);
                         break;
@@ -234,10 +235,12 @@ impl GdscriptParser {
                         SymbolKind::Enum,
                         file_id,
                         node_range(node),
-                        Some(format!("enum {name}")),
-                        None,
-                        module_path,
-                        Visibility::Public,
+                        (
+                            Some(format!("enum {name}")),
+                            None,
+                            module_path,
+                            Visibility::Public,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -250,13 +253,16 @@ impl GdscriptParser {
                         let symbol = self.create_symbol(
                             counter.next_id(),
                             name.to_string(),
-                            SymbolKind::Variable, // signals as variables
+                            SymbolKind::Variable,
+                            // signals as variables
                             file_id,
                             node_range(node),
-                            Some(format!("signal {name}")),
-                            None,
-                            module_path,
-                            Visibility::Public,
+                            (
+                                Some(format!("signal {name}")),
+                                None,
+                                module_path,
+                                Visibility::Public,
+                            ),
                         );
                         symbols.push(symbol);
                         break;
@@ -272,8 +278,7 @@ impl GdscriptParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -281,17 +286,15 @@ impl GdscriptParser {
     }
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     fn find_calls_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -319,7 +322,7 @@ impl GdscriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 }

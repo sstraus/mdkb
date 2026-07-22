@@ -747,8 +747,10 @@ fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyho
             &rel.to_name,
             &rel.kind.to_string(),
             real_file_id,
-            to_range.map(|r| r.start_line),
-            to_range.map(|r| r.start_column),
+            (
+                to_range.map(|r| r.start_line),
+                to_range.map(|r| r.start_column),
+            ),
         )?;
         stats.relationships_collected += 1;
     }

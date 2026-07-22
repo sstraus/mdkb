@@ -82,8 +82,7 @@ impl Language {
             "node" | "nodejs" | "bun" | "deno" => Some(Self::JavaScript),
             "ts-node" | "tsx" => Some(Self::TypeScript),
             "python" | "python3" | "python2" => Some(Self::Python),
-            "ruby" => None, // not supported yet
-            "bash" | "sh" | "zsh" | "fish" => None,
+            // not supported yet
             _ => None,
         }
     }

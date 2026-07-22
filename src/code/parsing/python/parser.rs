@@ -45,11 +45,9 @@ impl PythonParser {
         kind: SymbolKind,
         file_id: FileId,
         range: Range,
-        signature: Option<String>,
-        doc_comment: Option<String>,
-        module_path: &str,
-        visibility: Visibility,
+        tail: (Option<String>, Option<String>, &str, Visibility),
     ) -> Symbol {
+        let (signature, doc_comment, module_path, visibility) = tail;
         let mut sym = Symbol::new(id, name, kind, file_id, range);
         sym.visibility = visibility;
         sym.scope_context = Some(self.context.current_scope_context());
@@ -74,9 +72,8 @@ impl PythonParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut symbols = Vec::new();
         self.extract_symbols_from_node(
@@ -85,8 +82,7 @@ impl PythonParser {
             file_id,
             counter,
             &mut symbols,
-            "",
-            0,
+            ("", 0),
         );
         symbols
     }
@@ -98,9 +94,9 @@ impl PythonParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if !check_recursion_depth(depth, node) {
             return;
         }
@@ -130,8 +126,7 @@ impl PythonParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
 
@@ -162,8 +157,7 @@ impl PythonParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
 
@@ -181,8 +175,7 @@ impl PythonParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -199,20 +192,6 @@ impl PythonParser {
                 }
             }
 
-            "decorated_definition" => {
-                for child in node.children(&mut node.walk()) {
-                    self.extract_symbols_from_node(
-                        child,
-                        code,
-                        file_id,
-                        counter,
-                        symbols,
-                        module_path,
-                        depth + 1,
-                    );
-                }
-            }
-
             _ => {
                 for child in node.children(&mut node.walk()) {
                     self.extract_symbols_from_node(
@@ -221,8 +200,7 @@ impl PythonParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -272,10 +250,7 @@ impl PythonParser {
             kind,
             file_id,
             node_range(node),
-            Some(signature),
-            docstring,
-            module_path,
-            visibility,
+            (Some(signature), docstring, module_path, visibility),
         ))
     }
 
@@ -300,10 +275,7 @@ impl PythonParser {
             SymbolKind::Class,
             file_id,
             node_range(node),
-            Some(signature),
-            docstring,
-            module_path,
-            visibility,
+            (Some(signature), docstring, module_path, visibility),
         ))
     }
 
@@ -338,10 +310,7 @@ impl PythonParser {
             kind,
             file_id,
             node_range(node),
-            Some(signature),
-            None,
-            module_path,
-            visibility,
+            (Some(signature), None, module_path, visibility),
         );
         symbols.push(symbol);
     }
@@ -372,27 +341,22 @@ impl PythonParser {
             SymbolKind::TypeAlias,
             file_id,
             node_range(node),
-            Some(signature),
-            None,
-            module_path,
-            visibility,
+            (Some(signature), None, module_path, visibility),
         ))
     }
 
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut imports = Vec::new();
-        self.find_imports_in_node(tree.root_node(), code, file_id, &mut imports, 0);
+        Self::find_imports_in_node(tree.root_node(), code, file_id, &mut imports, 0);
         imports
     }
 
     fn find_imports_in_node(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -405,21 +369,20 @@ impl PythonParser {
 
         match node.kind() {
             "import_statement" => {
-                self.process_import_statement(node, code, file_id, imports);
+                Self::process_import_statement(node, code, file_id, imports);
             }
             "import_from_statement" => {
-                self.process_from_import(node, code, file_id, imports);
+                Self::process_from_import(node, code, file_id, imports);
             }
             _ => {
                 for child in node.children(&mut node.walk()) {
-                    self.find_imports_in_node(child, code, file_id, imports, depth + 1);
+                    Self::find_imports_in_node(child, code, file_id, imports, depth + 1);
                 }
             }
         }
     }
 
     fn process_import_statement(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -457,13 +420,7 @@ impl PythonParser {
         }
     }
 
-    fn process_from_import(
-        &self,
-        node: Node,
-        code: &str,
-        file_id: FileId,
-        imports: &mut Vec<Import>,
-    ) {
+    fn process_from_import(node: Node, code: &str, file_id: FileId, imports: &mut Vec<Import>) {
         // Extract the module path
         let module_path = extract_from_module_path(node, code);
 
@@ -535,7 +492,6 @@ impl PythonParser {
     // ── Calls ───────────────────────────────────────────────────────────
 
     fn find_calls_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -565,24 +521,22 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     // ── Method calls ────────────────────────────────────────────────────
 
     fn find_method_calls_in_node(
-        &self,
         node: &Node,
         code: &str,
         current_fn: Option<&str>,
@@ -628,24 +582,22 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
     fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     // ── Implementations (inheritance) ───────────────────────────────────
 
     fn find_implementations_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -665,14 +617,13 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, depth + 1, results);
+            Self::find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 
     // ── Method defines ──────────────────────────────────────────────────
 
     fn find_defines_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -714,14 +665,13 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_defines_in_node(&child, code, depth + 1, defines);
+            Self::find_defines_in_node(&child, code, depth + 1, defines);
         }
     }
 
     // ── Variable types ──────────────────────────────────────────────────
 
     fn find_variable_types_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -744,7 +694,7 @@ impl PythonParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_variable_types_in_node(&child, code, depth + 1, types);
+            Self::find_variable_types_in_node(&child, code, depth + 1, types);
         }
     }
 }
@@ -895,8 +845,7 @@ fn has_wildcard_import(node: Node) -> bool {
 /// Extract function name or attribute path for call targets.
 fn extract_call_target<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
-        "identifier" => Some(&code[node.byte_range()]),
-        "attribute" => Some(&code[node.byte_range()]),
+        "identifier" | "attribute" => Some(&code[node.byte_range()]),
         _ => None,
     }
 }
@@ -921,11 +870,7 @@ fn extract_base_class_names<'a>(
 ) {
     for child in superclasses.children(&mut superclasses.walk()) {
         match child.kind() {
-            "identifier" => {
-                let base = &code[child.byte_range()];
-                results.push((class_name, base, node_range(child)));
-            }
-            "attribute" => {
+            "identifier" | "attribute" => {
                 let base = &code[child.byte_range()];
                 results.push((class_name, base, node_range(child)));
             }
@@ -965,12 +910,11 @@ impl LanguageParser for PythonParser {
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
+        Self::find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 
@@ -979,12 +923,11 @@ impl LanguageParser for PythonParser {
     }
 
     fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut defines = Vec::new();
-        self.find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
+        Self::find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
         defines
     }
 
@@ -993,12 +936,11 @@ impl LanguageParser for PythonParser {
     }
 
     fn find_variable_types<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut types = Vec::new();
-        self.find_variable_types_in_node(&tree.root_node(), code, 0, &mut types);
+        Self::find_variable_types_in_node(&tree.root_node(), code, 0, &mut types);
         types
     }
 }
@@ -1221,7 +1163,7 @@ class Calculator:
 
         let tree = parser.parser.parse_cached(code).unwrap();
         let mut defines = Vec::new();
-        parser.find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
+        PythonParser::find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
 
         assert!(
             defines

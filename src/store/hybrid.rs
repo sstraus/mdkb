@@ -70,7 +70,7 @@ pub fn lost_in_middle_reorder<T>(items: &mut Vec<T>) {
         return;
     }
 
-    let original: Vec<T> = items.drain(..).collect();
+    let original: Vec<T> = std::mem::take(items);
     let mut front = Vec::new();
     let mut back = Vec::new();
 

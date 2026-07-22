@@ -25,7 +25,7 @@ impl RepairReport {
             + self.orphaned_relationships_file
             + self.orphaned_relationships_symbol
             + self.duplicate_rel_path_files
-            + if self.fts_rebuilt { 1 } else { 0 }
+            + usize::from(self.fts_rebuilt)
     }
 
     pub fn print_if_needed(&self) {

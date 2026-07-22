@@ -26,7 +26,7 @@ use rusqlite::{Connection, params};
 use crate::error::Result;
 
 /// Re-run the integrity probe at most once per this interval per database.
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+pub const CHECK_INTERVAL: Duration = Duration::from_hours(6);
 
 /// Outcome of [`ensure_sound`].
 #[derive(Debug, PartialEq, Eq)]
@@ -114,15 +114,37 @@ pub fn quarantine(db_path: &Path) -> Result<PathBuf> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let corrupt_path = with_suffix(db_path, &format!(".corrupt-{ts}"));
+    let corrupt_path = available_quarantine_path(db_path, ts);
     std::fs::rename(db_path, &corrupt_path)?;
+    let mut moved_sidecars = Vec::new();
     for ext in ["-wal", "-shm"] {
         let side = with_suffix(db_path, ext);
         if side.exists() {
-            let _ = std::fs::rename(&side, with_suffix(&corrupt_path, ext));
+            let target = with_suffix(&corrupt_path, ext);
+            if let Err(error) = std::fs::rename(&side, &target) {
+                // A fresh database must never open beside an orphaned WAL from the corrupt
+                // generation. Restore every completed rename before returning the failure.
+                for (moved, original) in moved_sidecars.into_iter().rev() {
+                    let _ = std::fs::rename(moved, original);
+                }
+                let _ = std::fs::rename(&corrupt_path, db_path);
+                return Err(error.into());
+            }
+            moved_sidecars.push((target, side));
         }
     }
     Ok(corrupt_path)
+}
+
+fn available_quarantine_path(db_path: &Path, timestamp: u64) -> PathBuf {
+    let base_suffix = format!(".corrupt-{timestamp}");
+    let mut candidate = with_suffix(db_path, &base_suffix);
+    let mut collision = 0_u32;
+    while candidate.exists() {
+        collision += 1;
+        candidate = with_suffix(db_path, &format!("{base_suffix}-{collision}"));
+    }
+    candidate
 }
 
 /// Count of memory rows recovered from a quarantined database.
@@ -207,7 +229,8 @@ fn report_path(corrupt_path: &Path) -> PathBuf {
 /// Parse the trailing `.corrupt-<unix_secs>` suffix into its timestamp.
 fn quarantine_ts(name: &str) -> Option<i64> {
     name.rsplit_once(".corrupt-")
-        .and_then(|(_, ts)| ts.parse::<i64>().ok())
+        .and_then(|(_, suffix)| suffix.split('-').next())
+        .and_then(|ts| ts.parse::<i64>().ok())
 }
 
 /// Write the quarantine report sidecar. Best-effort — a failed write only costs
@@ -397,6 +420,23 @@ mod tests {
             "shm quarantined alongside db"
         );
         assert!(!with_suffix(&db, "-wal").exists(), "original wal removed");
+    }
+
+    #[test]
+    fn quarantine_path_never_overwrites_an_existing_forensic_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let first = with_suffix(&db, ".corrupt-123");
+        let second = with_suffix(&db, ".corrupt-123-1");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+
+        let candidate = available_quarantine_path(&db, 123);
+
+        assert_eq!(candidate, with_suffix(&db, ".corrupt-123-2"));
+        assert_eq!(std::fs::read(&first).unwrap(), b"first");
+        assert_eq!(std::fs::read(&second).unwrap(), b"second");
+        assert_eq!(quarantine_ts("index.sqlite.corrupt-123-2"), Some(123));
     }
 
     #[test]

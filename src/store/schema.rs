@@ -2004,12 +2004,11 @@ mod tests {
             let mut stmt = conn
                 .prepare("SELECT id FROM memory_entries ORDER BY id")
                 .unwrap();
-            let ids = stmt
-                .query_map([], |row| row.get::<_, String>(0))
+
+            stmt.query_map([], |row| row.get::<_, String>(0))
                 .unwrap()
                 .map(|r| r.unwrap())
-                .collect();
-            ids
+                .collect()
         };
 
         assert_eq!(

@@ -43,9 +43,8 @@ impl GoParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut symbols = Vec::new();
         let module_path = "";
@@ -55,8 +54,7 @@ impl GoParser {
             file_id,
             counter,
             &mut symbols,
-            module_path,
-            0,
+            (module_path, 0),
         );
         symbols
     }
@@ -68,9 +66,9 @@ impl GoParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if !check_recursion_depth(depth, node) {
             return;
         }
@@ -104,8 +102,7 @@ impl GoParser {
                                 file_id,
                                 counter,
                                 symbols,
-                                module_path,
-                                depth + 1,
+                                (module_path, depth + 1),
                             );
                         }
                     }
@@ -153,8 +150,7 @@ impl GoParser {
                                 file_id,
                                 counter,
                                 symbols,
-                                module_path,
-                                depth + 1,
+                                (module_path, depth + 1),
                             );
                         }
                     }
@@ -186,8 +182,7 @@ impl GoParser {
                                 file_id,
                                 counter,
                                 symbols,
-                                module_path,
-                                depth,
+                                (module_path, depth),
                             );
                         }
                     }
@@ -200,8 +195,7 @@ impl GoParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -218,8 +212,7 @@ impl GoParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
                 self.context.exit_scope();
@@ -252,8 +245,7 @@ impl GoParser {
                     file_id,
                     counter,
                     symbols,
-                    module_path,
-                    depth + 1,
+                    (module_path, depth + 1),
                 );
             }
         }
@@ -268,11 +260,9 @@ impl GoParser {
         kind: SymbolKind,
         file_id: FileId,
         range: Range,
-        signature: Option<String>,
-        doc_comment: Option<String>,
-        module_path: &str,
-        visibility: Visibility,
+        tail: (Option<String>, Option<String>, &str, Visibility),
     ) -> Symbol {
+        let (signature, doc_comment, module_path, visibility) = tail;
         let mut sym = Symbol::new(id, name, kind, file_id, range);
         sym.visibility = visibility;
         sym.scope_context = Some(self.context.current_scope_context());
@@ -301,8 +291,8 @@ impl GoParser {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
 
-        let signature = self.extract_signature(node, code);
-        let doc_comment = self.extract_doc_comment_impl(&node, code);
+        let signature = Self::extract_signature(node, code);
+        let doc_comment = Self::extract_doc_comment_impl(&node, code);
         let visibility = determine_go_visibility(name);
 
         Some(self.create_symbol(
@@ -311,10 +301,7 @@ impl GoParser {
             SymbolKind::Function,
             file_id,
             node_range(node),
-            Some(signature),
-            doc_comment,
-            module_path,
-            visibility,
+            (Some(signature), doc_comment, module_path, visibility),
         ))
     }
 
@@ -329,8 +316,8 @@ impl GoParser {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
 
-        let signature = self.extract_method_signature(node, code);
-        let doc_comment = self.extract_doc_comment_impl(&node, code);
+        let signature = Self::extract_method_signature(node, code);
+        let doc_comment = Self::extract_doc_comment_impl(&node, code);
         let visibility = determine_go_visibility(name);
 
         Some(self.create_symbol(
@@ -339,10 +326,7 @@ impl GoParser {
             SymbolKind::Method,
             file_id,
             node_range(node),
-            Some(signature),
-            doc_comment,
-            module_path,
-            visibility,
+            (Some(signature), doc_comment, module_path, visibility),
         ))
     }
 
@@ -373,20 +357,18 @@ impl GoParser {
         symbols: &mut Vec<Symbol>,
         module_path: &str,
     ) {
-        let name_node = match node.child_by_field_name("name") {
-            Some(n) => n,
-            None => return,
+        let Some(name_node) = node.child_by_field_name("name") else {
+            return;
         };
         let name = &code[name_node.byte_range()];
-        let type_node = match node.child_by_field_name("type") {
-            Some(n) => n,
-            None => return,
+        let Some(type_node) = node.child_by_field_name("type") else {
+            return;
         };
 
         match type_node.kind() {
             "struct_type" => {
-                let signature = self.extract_struct_signature(node, code);
-                let doc_comment = self.extract_doc_comment_impl(&node, code);
+                let signature = Self::extract_struct_signature(node, code);
+                let doc_comment = Self::extract_doc_comment_impl(&node, code);
                 let visibility = determine_go_visibility(name);
 
                 let symbol = self.create_symbol(
@@ -395,10 +377,7 @@ impl GoParser {
                     SymbolKind::Struct,
                     file_id,
                     node_range(node),
-                    Some(signature),
-                    doc_comment,
-                    module_path,
-                    visibility,
+                    (Some(signature), doc_comment, module_path, visibility),
                 );
                 symbols.push(symbol);
 
@@ -408,13 +387,12 @@ impl GoParser {
                     file_id,
                     counter,
                     symbols,
-                    module_path,
-                    name,
+                    (module_path, name),
                 );
             }
             "interface_type" => {
-                let signature = self.extract_interface_signature(node, code);
-                let doc_comment = self.extract_doc_comment_impl(&node, code);
+                let signature = Self::extract_interface_signature(node, code);
+                let doc_comment = Self::extract_doc_comment_impl(&node, code);
                 let visibility = determine_go_visibility(name);
 
                 let symbol = self.create_symbol(
@@ -423,10 +401,7 @@ impl GoParser {
                     SymbolKind::Interface,
                     file_id,
                     node_range(node),
-                    Some(signature),
-                    doc_comment,
-                    module_path,
-                    visibility,
+                    (Some(signature), doc_comment, module_path, visibility),
                 );
                 symbols.push(symbol);
 
@@ -436,14 +411,13 @@ impl GoParser {
                     file_id,
                     counter,
                     symbols,
-                    module_path,
-                    name,
+                    (module_path, name),
                 );
             }
             _ => {
                 // Type alias
                 let signature = code[node.byte_range()].to_string();
-                let doc_comment = self.extract_doc_comment_impl(&node, code);
+                let doc_comment = Self::extract_doc_comment_impl(&node, code);
                 let visibility = determine_go_visibility(name);
 
                 let symbol = self.create_symbol(
@@ -452,10 +426,7 @@ impl GoParser {
                     SymbolKind::TypeAlias,
                     file_id,
                     node_range(node),
-                    Some(signature),
-                    doc_comment,
-                    module_path,
-                    visibility,
+                    (Some(signature), doc_comment, module_path, visibility),
                 );
                 symbols.push(symbol);
             }
@@ -471,9 +442,9 @@ impl GoParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        struct_name: &str,
+        tail: (&str, &str),
     ) {
+        let (module_path, struct_name) = tail;
         for child in struct_node.children(&mut struct_node.walk()) {
             if child.kind() == "field_declaration_list" {
                 for field_child in child.children(&mut child.walk()) {
@@ -484,8 +455,7 @@ impl GoParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            struct_name,
+                            (module_path, struct_name),
                         );
                     }
                 }
@@ -500,9 +470,9 @@ impl GoParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        struct_name: &str,
+        tail: (&str, &str),
     ) {
+        let (module_path, struct_name) = tail;
         let mut field_names = Vec::new();
         let mut field_type = None;
 
@@ -533,10 +503,7 @@ impl GoParser {
                 SymbolKind::Field,
                 file_id,
                 node_range(field_node),
-                Some(signature),
-                None,
-                module_path,
-                visibility,
+                (Some(signature), None, module_path, visibility),
             );
             symbols.push(symbol);
         }
@@ -551,9 +518,9 @@ impl GoParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        interface_name: &str,
+        tail: (&str, &str),
     ) {
+        let (module_path, interface_name) = tail;
         for child in interface_node.children(&mut interface_node.walk()) {
             if child.kind() == "method_elem" {
                 self.process_interface_method(
@@ -562,8 +529,7 @@ impl GoParser {
                     file_id,
                     counter,
                     symbols,
-                    module_path,
-                    interface_name,
+                    (module_path, interface_name),
                 );
             }
         }
@@ -576,9 +542,9 @@ impl GoParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        interface_name: &str,
+        tail: (&str, &str),
     ) {
+        let (module_path, interface_name) = tail;
         let method_name = method_node
             .children(&mut method_node.walk())
             .find(|n| n.kind() == "field_identifier")
@@ -595,10 +561,7 @@ impl GoParser {
                 SymbolKind::Method,
                 file_id,
                 node_range(method_node),
-                Some(signature),
-                None,
-                module_path,
-                visibility,
+                (Some(signature), None, module_path, visibility),
             );
             symbols.push(symbol);
         }
@@ -660,10 +623,7 @@ impl GoParser {
                 SymbolKind::Variable,
                 file_id,
                 node_range(node),
-                Some(signature),
-                None,
-                module_path,
-                visibility,
+                (Some(signature), None, module_path, visibility),
             );
             symbols.push(symbol);
         }
@@ -723,10 +683,7 @@ impl GoParser {
                 SymbolKind::Constant,
                 file_id,
                 node_range(node),
-                Some(signature),
-                None,
-                module_path,
-                visibility,
+                (Some(signature), None, module_path, visibility),
             );
             symbols.push(symbol);
         }
@@ -769,10 +726,7 @@ impl GoParser {
                 SymbolKind::Variable,
                 file_id,
                 node_range(node),
-                Some(signature),
-                None,
-                module_path,
-                visibility,
+                (Some(signature), None, module_path, visibility),
             );
 
             symbol.scope_context = Some(ScopeContext::Local {
@@ -826,10 +780,7 @@ impl GoParser {
                         SymbolKind::Parameter,
                         file_id,
                         node_range(child),
-                        Some(signature),
-                        None,
-                        module_path,
-                        visibility,
+                        (Some(signature), None, module_path, visibility),
                     );
                     symbol.scope_context = Some(ScopeContext::Parameter);
                     symbols.push(symbol);
@@ -878,10 +829,7 @@ impl GoParser {
                         SymbolKind::Parameter,
                         file_id,
                         node_range(child),
-                        Some(signature),
-                        None,
-                        module_path,
-                        visibility,
+                        (Some(signature), None, module_path, visibility),
                     );
                     symbol.scope_context = Some(ScopeContext::Parameter);
                     symbols.push(symbol);
@@ -897,9 +845,9 @@ impl GoParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         let mut range_vars = Vec::new();
 
         for child in range_node.children(&mut range_node.walk()) {
@@ -921,8 +869,7 @@ impl GoParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -942,10 +889,7 @@ impl GoParser {
                 SymbolKind::Variable,
                 file_id,
                 node_range(range_node),
-                Some(signature),
-                None,
-                module_path,
-                visibility,
+                (Some(signature), None, module_path, visibility),
             );
 
             symbol.scope_context = Some(ScopeContext::Local {
@@ -960,7 +904,7 @@ impl GoParser {
 
     // ── Signatures ──────────────────────────────────────────────────────
 
-    fn extract_signature(&self, node: Node, code: &str) -> String {
+    fn extract_signature(node: Node, code: &str) -> String {
         let start = node.start_byte();
         let end = node
             .child_by_field_name("body")
@@ -968,7 +912,7 @@ impl GoParser {
         code[start..end].trim().to_string()
     }
 
-    fn extract_method_signature(&self, node: Node, code: &str) -> String {
+    fn extract_method_signature(node: Node, code: &str) -> String {
         let start = node.start_byte();
         let end = node
             .child_by_field_name("body")
@@ -976,7 +920,7 @@ impl GoParser {
         code[start..end].trim().to_string()
     }
 
-    fn extract_struct_signature(&self, node: Node, code: &str) -> String {
+    fn extract_struct_signature(node: Node, code: &str) -> String {
         let start = node.start_byte();
         let mut end = node.end_byte();
 
@@ -992,7 +936,7 @@ impl GoParser {
         code[start..end].trim().to_string()
     }
 
-    fn extract_interface_signature(&self, node: Node, code: &str) -> String {
+    fn extract_interface_signature(node: Node, code: &str) -> String {
         let start = node.start_byte();
         let mut end = node.end_byte();
 
@@ -1011,7 +955,7 @@ impl GoParser {
 
     // ── Doc comments ────────────────────────────────────────────────────
 
-    fn extract_doc_comment_impl(&self, node: &Node, code: &str) -> Option<String> {
+    fn extract_doc_comment_impl(node: &Node, code: &str) -> Option<String> {
         // For type_spec nodes, check the parent type_declaration for comments
         let search_node = if node.kind() == "type_spec" {
             node.parent()?
@@ -1057,17 +1001,15 @@ impl GoParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut imports = Vec::new();
-        self.extract_imports_from_node(tree.root_node(), code, file_id, &mut imports, 0);
+        Self::extract_imports_from_node(tree.root_node(), code, file_id, &mut imports, 0);
         imports
     }
 
     fn extract_imports_from_node(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -1078,16 +1020,15 @@ impl GoParser {
             return;
         }
         if node.kind() == "import_declaration" {
-            self.process_import_declaration(node, code, file_id, imports);
+            Self::process_import_declaration(node, code, file_id, imports);
         } else {
             for child in node.children(&mut node.walk()) {
-                self.extract_imports_from_node(child, code, file_id, imports, depth + 1);
+                Self::extract_imports_from_node(child, code, file_id, imports, depth + 1);
             }
         }
     }
 
     fn process_import_declaration(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -1096,12 +1037,12 @@ impl GoParser {
         for child in node.children(&mut node.walk()) {
             match child.kind() {
                 "import_spec" => {
-                    self.process_import_spec(child, code, file_id, imports);
+                    Self::process_import_spec(child, code, file_id, imports);
                 }
                 "import_spec_list" => {
                     for spec_child in child.children(&mut child.walk()) {
                         if spec_child.kind() == "import_spec" {
-                            self.process_import_spec(spec_child, code, file_id, imports);
+                            Self::process_import_spec(spec_child, code, file_id, imports);
                         }
                     }
                 }
@@ -1110,13 +1051,7 @@ impl GoParser {
         }
     }
 
-    fn process_import_spec(
-        &self,
-        node: Node,
-        code: &str,
-        file_id: FileId,
-        imports: &mut Vec<Import>,
-    ) {
+    fn process_import_spec(node: Node, code: &str, file_id: FileId, imports: &mut Vec<Import>) {
         let mut import_path = None;
         let mut import_alias = None;
         let mut is_dot_import = false;
@@ -1163,7 +1098,6 @@ impl GoParser {
 
     #[allow(clippy::only_used_in_recursion)]
     fn extract_calls_recursive<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         current_function: Option<&'a str>,
@@ -1197,17 +1131,16 @@ impl GoParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_calls_recursive(&child, code, function_context, calls, depth + 1);
+            Self::extract_calls_recursive(&child, code, function_context, calls, depth + 1);
         }
     }
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.extract_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
+        Self::extract_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
         calls
     }
 
@@ -1215,7 +1148,6 @@ impl GoParser {
 
     #[allow(clippy::only_used_in_recursion)]
     fn extract_method_calls_recursive(
-        &self,
         node: &Node,
         code: &str,
         current_function: Option<&str>,
@@ -1258,17 +1190,16 @@ impl GoParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_method_calls_recursive(&child, code, function_context, calls, depth + 1);
+            Self::extract_method_calls_recursive(&child, code, function_context, calls, depth + 1);
         }
     }
 
     fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.extract_method_calls_recursive(
+        Self::extract_method_calls_recursive(
             &tree.root_node(),
             code,
             Some("<module>"),
@@ -1282,7 +1213,6 @@ impl GoParser {
 
     #[allow(clippy::only_used_in_recursion)]
     fn extract_type_uses_recursive<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         uses: &mut Vec<(&'a str, &'a str, Range)>,
@@ -1299,10 +1229,10 @@ impl GoParser {
                     .unwrap_or("anonymous");
 
                 if let Some(params) = node.child_by_field_name("parameters") {
-                    self.extract_go_parameter_types(params, code, context_name, uses);
+                    Self::extract_go_parameter_types(params, code, context_name, uses);
                 }
                 if let Some(result) = node.child_by_field_name("result") {
-                    self.extract_go_type_reference(&result, code, context_name, uses);
+                    Self::extract_go_type_reference(&result, code, context_name, uses);
                 }
             }
 
@@ -1311,7 +1241,7 @@ impl GoParser {
                     if child.kind() == "field_declaration_list" {
                         for field_child in child.children(&mut child.walk()) {
                             if field_child.kind() == "field_declaration" {
-                                self.extract_go_field_types(&field_child, code, "struct", uses);
+                                Self::extract_go_field_types(&field_child, code, "struct", uses);
                             }
                         }
                     }
@@ -1326,7 +1256,7 @@ impl GoParser {
                     let var_name = &code[identifier.byte_range()];
                     for child in node.children(&mut node.walk()) {
                         if is_go_type_kind(child.kind()) {
-                            self.extract_go_type_reference(&child, code, var_name, uses);
+                            Self::extract_go_type_reference(&child, code, var_name, uses);
                         }
                     }
                 }
@@ -1339,7 +1269,7 @@ impl GoParser {
                         if child.kind() == "type_arguments" {
                             for type_arg in child.children(&mut child.walk()) {
                                 if is_go_type_kind(type_arg.kind()) {
-                                    self.extract_go_type_reference(
+                                    Self::extract_go_type_reference(
                                         &type_arg, code, func_name, uses,
                                     );
                                 }
@@ -1353,12 +1283,11 @@ impl GoParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_type_uses_recursive(&child, code, uses, depth + 1);
+            Self::extract_type_uses_recursive(&child, code, uses, depth + 1);
         }
     }
 
     fn extract_go_parameter_types<'a>(
-        &self,
         params_node: Node,
         code: &'a str,
         context_name: &'a str,
@@ -1368,7 +1297,7 @@ impl GoParser {
             if param.kind() == "parameter_declaration" {
                 for child in param.children(&mut param.walk()) {
                     if is_go_type_kind(child.kind()) {
-                        self.extract_go_type_reference(&child, code, context_name, uses);
+                        Self::extract_go_type_reference(&child, code, context_name, uses);
                     }
                 }
             }
@@ -1376,7 +1305,6 @@ impl GoParser {
     }
 
     fn extract_go_field_types<'a>(
-        &self,
         field_node: &Node,
         code: &'a str,
         context_name: &'a str,
@@ -1384,13 +1312,12 @@ impl GoParser {
     ) {
         for child in field_node.children(&mut field_node.walk()) {
             if is_go_type_kind(child.kind()) {
-                self.extract_go_type_reference(&child, code, context_name, uses);
+                Self::extract_go_type_reference(&child, code, context_name, uses);
             }
         }
     }
 
     fn extract_go_type_reference<'a>(
-        &self,
         type_node: &Node,
         code: &'a str,
         context_name: &'a str,
@@ -1402,12 +1329,11 @@ impl GoParser {
     }
 
     fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut uses = Vec::new();
-        self.extract_type_uses_recursive(&tree.root_node(), code, &mut uses, 0);
+        Self::extract_type_uses_recursive(&tree.root_node(), code, &mut uses, 0);
         uses
     }
 
@@ -1415,7 +1341,6 @@ impl GoParser {
 
     #[allow(clippy::only_used_in_recursion)]
     fn extract_method_defines_recursive<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         defines: &mut Vec<(&'a str, &'a str, Range)>,
@@ -1457,17 +1382,16 @@ impl GoParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_method_defines_recursive(&child, code, defines, depth + 1);
+            Self::extract_method_defines_recursive(&child, code, defines, depth + 1);
         }
     }
 
     fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut defines = Vec::new();
-        self.extract_method_defines_recursive(&tree.root_node(), code, &mut defines, 0);
+        Self::extract_method_defines_recursive(&tree.root_node(), code, &mut defines, 0);
         defines
     }
 }
@@ -1567,7 +1491,7 @@ impl LanguageParser for GoParser {
     }
 
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String> {
-        self.extract_doc_comment_impl(node, code)
+        Self::extract_doc_comment_impl(node, code)
     }
 
     fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {

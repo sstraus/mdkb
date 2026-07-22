@@ -275,9 +275,9 @@ impl CodeDb {
         to_name: &str,
         kind: &str,
         file_id: i64,
-        to_line: Option<u32>,
-        to_col: Option<u16>,
+        to_position: (Option<u32>, Option<u16>),
     ) -> rusqlite::Result<i64> {
+        let (to_line, to_col) = to_position;
         self.conn.execute(
             "INSERT INTO code_relationships \
              (from_symbol_id, from_name, to_name, kind, file_id, to_line, to_col) \
@@ -330,7 +330,7 @@ impl CodeDb {
     /// Find all symbols with an exact name match.
     pub fn find_symbols_by_name(&self, name: &str) -> rusqlite::Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare_cached(SYMBOL_SELECT_BY_NAME)?;
-        let rows = stmt.query_map([name], |row| row_to_symbol(row))?;
+        let rows = stmt.query_map([name], row_to_symbol)?;
         rows.collect()
     }
 
@@ -348,7 +348,7 @@ impl CodeDb {
             let mut stmt = self.conn.prepare_cached(&format!(
                 "{SYMBOL_COLUMNS} FROM code_symbols WHERE name LIKE ?1 ESCAPE '\\' LIMIT ?2"
             ))?;
-            let rows = stmt.query_map(params![pattern, limit as i64], |row| row_to_symbol(row))?;
+            let rows = stmt.query_map(params![pattern, limit as i64], row_to_symbol)?;
             return rows.collect();
         }
 
@@ -356,7 +356,7 @@ impl CodeDb {
         let escaped = query.replace('"', "\"\"");
         let fts_query = format!("\"{escaped}\"");
         let mut stmt = self.conn.prepare_cached(SYMBOL_SELECT_FTS)?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], |row| row_to_symbol(row))?;
+        let rows = stmt.query_map(params![fts_query, limit as i64], row_to_symbol)?;
         rows.collect()
     }
 
@@ -374,7 +374,7 @@ impl CodeDb {
         let mut stmt = self.conn.prepare_cached(&format!(
             "{SYMBOL_COLUMNS} FROM code_symbols WHERE file_path LIKE ?1 ESCAPE '\\' ORDER BY file_path, line_start LIMIT ?2"
         ))?;
-        let rows = stmt.query_map(params![pattern, limit as i64], |row| row_to_symbol(row))?;
+        let rows = stmt.query_map(params![pattern, limit as i64], row_to_symbol)?;
         rows.collect()
     }
 
@@ -383,7 +383,7 @@ impl CodeDb {
         let mut stmt = self.conn.prepare_cached(&format!(
             "{SYMBOL_COLUMNS} FROM code_symbols WHERE file_path = ?1 ORDER BY line_start, col_start"
         ))?;
-        let rows = stmt.query_map(params![rel_path], |row| row_to_symbol(row))?;
+        let rows = stmt.query_map(params![rel_path], row_to_symbol)?;
         rows.collect()
     }
 
@@ -400,7 +400,7 @@ impl CodeDb {
              ORDER BY (COALESCE(line_end, line_start) - line_start) ASC \
              LIMIT 1"
         ))?;
-        let mut rows = stmt.query_map(params![rel_path, line], |row| row_to_symbol(row))?;
+        let mut rows = stmt.query_map(params![rel_path, line], row_to_symbol)?;
         match rows.next() {
             Some(Ok(sym)) => Ok(Some(sym)),
             Some(Err(e)) => Err(e),
@@ -427,7 +427,7 @@ impl CodeDb {
         let mut stmt = self
             .conn
             .prepare(&format!("{SYMBOL_COLUMNS} FROM code_symbols"))?;
-        let rows = stmt.query_map([], |row| row_to_symbol(row))?;
+        let rows = stmt.query_map([], row_to_symbol)?;
         rows.collect()
     }
 
@@ -450,7 +450,7 @@ impl CodeDb {
                 .iter()
                 .map(|p| p as &dyn rusqlite::types::ToSql)
                 .collect();
-            let rows = stmt.query_map(sql_params.as_slice(), |row| row_to_symbol(row))?;
+            let rows = stmt.query_map(sql_params.as_slice(), row_to_symbol)?;
             for row in rows {
                 result.push(row?);
             }
@@ -500,7 +500,7 @@ impl CodeDb {
                  JOIN code_symbols s ON s.name = r.to_name \
                  WHERE r.from_symbol_id = ?1 AND r.kind = 'Calls'"
         ))?;
-        let rows = stmt.query_map([symbol_id], |row| row_to_symbol(row))?;
+        let rows = stmt.query_map([symbol_id], row_to_symbol)?;
         rows.collect()
     }
 
@@ -512,7 +512,7 @@ impl CodeDb {
                  JOIN code_symbols s ON s.id = r.from_symbol_id \
                  WHERE r.to_name = ?1 AND r.kind = 'Calls'"
         ))?;
-        let rows = stmt.query_map([symbol_name], |row| row_to_symbol(row))?;
+        let rows = stmt.query_map([symbol_name], row_to_symbol)?;
         rows.collect()
     }
 
@@ -537,7 +537,7 @@ impl CodeDb {
                  FROM impact i \
                  JOIN code_symbols s ON s.id = i.sym_id"
         ))?;
-        let rows = stmt.query_map(params![symbol_name, max_depth], |row| row_to_symbol(row))?;
+        let rows = stmt.query_map(params![symbol_name, max_depth], row_to_symbol)?;
         rows.collect()
     }
 
@@ -1001,8 +1001,7 @@ mod tests {
                 "callee",
                 "Calls",
                 file_id,
-                Some(5),
-                Some(10),
+                (Some(5), Some(10)),
             )
             .unwrap();
         assert!(rel_id > 0);
@@ -1229,8 +1228,7 @@ mod tests {
             "callee_a",
             "Calls",
             file_id,
-            None,
-            None,
+            (None, None),
         )
         .unwrap();
         db.insert_relationship(
@@ -1239,8 +1237,7 @@ mod tests {
             "callee_b",
             "Calls",
             file_id,
-            None,
-            None,
+            (None, None),
         )
         .unwrap();
 
@@ -1272,8 +1269,7 @@ mod tests {
             "callee",
             "Calls",
             file_id,
-            None,
-            None,
+            (None, None),
         )
         .unwrap();
 
@@ -1306,9 +1302,9 @@ mod tests {
             )
             .unwrap();
 
-        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, None, None)
+        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, (None, None))
             .unwrap();
-        db.insert_relationship(Some(c_id), "c", "b", "Calls", file_id, None, None)
+        db.insert_relationship(Some(c_id), "c", "b", "Calls", file_id, (None, None))
             .unwrap();
 
         // Impact of "a" with depth 0: just "b" (direct caller)
@@ -1332,7 +1328,7 @@ mod tests {
             "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
         )
         .unwrap();
-        db.insert_relationship(None, "a", "b", "Calls", file_id, None, None)
+        db.insert_relationship(None, "a", "b", "Calls", file_id, (None, None))
             .unwrap();
 
         db.clear().unwrap();
@@ -1351,7 +1347,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        db.insert_relationship(Some(sym_id), "fn1", "fn2", "Calls", file_id, None, None)
+        db.insert_relationship(Some(sym_id), "fn1", "fn2", "Calls", file_id, (None, None))
             .unwrap();
 
         assert_eq!(db.symbol_count().unwrap(), 1);
@@ -1378,7 +1374,7 @@ mod tests {
         .unwrap();
         assert_eq!(db.symbol_count().unwrap(), 1);
 
-        db.insert_relationship(None, "a", "b", "Calls", file_id, None, None)
+        db.insert_relationship(None, "a", "b", "Calls", file_id, (None, None))
             .unwrap();
         assert_eq!(db.relationship_count().unwrap(), 1);
     }
@@ -1630,9 +1626,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        db.insert_relationship(Some(a_id), "a", "b", "Calls", file_id, None, None)
+        db.insert_relationship(Some(a_id), "a", "b", "Calls", file_id, (None, None))
             .unwrap();
-        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, None, None)
+        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, (None, None))
             .unwrap();
 
         // UNION in the CTE deduplicates, so this should terminate
@@ -1693,7 +1689,7 @@ mod tests {
         let mut rel_paths: Vec<String> = Vec::new();
         for i in 0..1001_u32 {
             let rel = format!("file_{i}.rs");
-            db.insert_file(&rel, &rel, "hash", Some("Rust"), None, Some(i as i64))
+            db.insert_file(&rel, &rel, "hash", Some("Rust"), None, Some(i64::from(i)))
                 .unwrap();
             rel_paths.push(rel);
         }

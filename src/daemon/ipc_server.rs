@@ -266,9 +266,8 @@ async fn hook_accept_loop(
             () = shutdown.cancelled() => return,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _addr)) => {
-                    let permit = match Arc::clone(&semaphore).acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => return, // semaphore closed — shutting down
+                    let Ok(permit) = Arc::clone(&semaphore).acquire_owned().await else {
+                        return; // semaphore closed — shutting down
                     };
                     let registry = Arc::clone(&registry);
                     let dctx = Arc::clone(&dctx);
@@ -357,9 +356,8 @@ async fn dispatch_hook_message(
         return rpc_error(id, -32600, "missing 'method'");
     }
 
-    let root = match params.get("root").and_then(Value::as_str) {
-        Some(r) => r,
-        None => return rpc_error(id, -32602, "missing 'params.root' (absolute repo path)"),
+    let Some(root) = params.get("root").and_then(Value::as_str) else {
+        return rpc_error(id, -32602, "missing 'params.root' (absolute repo path)");
     };
 
     let handle = match registry.get_or_open(Path::new(root)) {

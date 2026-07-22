@@ -215,7 +215,7 @@ mod tests {
     fn test_count_tokens_simple() {
         // "hello world" is typically 2 tokens
         let count = count_tokens("hello world");
-        assert!(count >= 1 && count <= 4);
+        assert!((1..=4).contains(&count));
     }
 
     #[test]

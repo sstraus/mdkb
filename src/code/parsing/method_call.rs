@@ -31,16 +31,19 @@ impl MethodCall {
         }
     }
 
+    #[must_use]
     pub fn with_receiver(mut self, receiver: &str) -> Self {
         self.receiver = Some(receiver.to_string());
         self
     }
 
+    #[must_use]
     pub fn static_method(mut self) -> Self {
         self.is_static = true;
         self
     }
 
+    #[must_use]
     pub fn with_caller_range(mut self, range: Range) -> Self {
         self.caller_range = Some(range);
         self

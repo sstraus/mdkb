@@ -198,11 +198,11 @@ fn test_semantic_similarity() {
 fn test_handle_embed_generates_embeddings() {
     let (temp, ctx) = setup_test_env();
 
-    // Generate embeddings for all documents
+    // Auto-embedding during update already populated all document vectors.
     let result = handle_embed(&ctx, None).expect("embed failed");
 
-    assert_eq!(result.generated, 3, "should generate embeddings for 3 docs");
-    assert_eq!(result.skipped, 0, "no docs should be skipped on first run");
+    assert_eq!(result.generated, 0, "all document vectors already exist");
+    assert_eq!(result.skipped, 3, "all three documents should be skipped");
     assert!(result.errors.is_empty(), "should have no errors");
 
     // Running again should skip all

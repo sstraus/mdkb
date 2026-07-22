@@ -57,11 +57,9 @@ impl TypeScriptParser {
         kind: SymbolKind,
         file_id: FileId,
         range: Range,
-        signature: Option<String>,
-        doc_comment: Option<String>,
-        module_path: &str,
-        visibility: Visibility,
+        tail: (Option<String>, Option<String>, &str, Visibility),
     ) -> Symbol {
+        let (signature, doc_comment, module_path, visibility) = tail;
         let mut sym = Symbol::new(id, name, kind, file_id, range);
         sym.visibility = visibility;
         sym.scope_context = Some(self.context.current_scope_context());
@@ -89,9 +87,8 @@ impl TypeScriptParser {
         self.default_exported.clear();
         self.named_exported.clear();
 
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
 
         let mut symbols = Vec::new();
@@ -101,8 +98,7 @@ impl TypeScriptParser {
             file_id,
             counter,
             &mut symbols,
-            "",
-            0,
+            ("", 0),
         );
 
         // Post-process: mark default/named exported symbols as Public
@@ -124,9 +120,9 @@ impl TypeScriptParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if !check_recursion_depth(depth, node) {
             return;
         }
@@ -156,8 +152,7 @@ impl TypeScriptParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
 
@@ -186,8 +181,7 @@ impl TypeScriptParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
 
                     self.context.exit_scope();
@@ -225,8 +219,7 @@ impl TypeScriptParser {
                     file_id,
                     counter,
                     symbols,
-                    module_path,
-                    depth + 1,
+                    (module_path, depth + 1),
                 );
             }
 
@@ -269,8 +262,7 @@ impl TypeScriptParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -284,8 +276,7 @@ impl TypeScriptParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -304,7 +295,7 @@ impl TypeScriptParser {
     ) -> Option<Symbol> {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
-        let signature = self.extract_signature(node, code);
+        let signature = Self::extract_signature(node, code);
         let doc_comment = extract_jsdoc(&node, code);
         let visibility = determine_ts_visibility(node, code);
 
@@ -314,10 +305,7 @@ impl TypeScriptParser {
             SymbolKind::Function,
             file_id,
             node_range(node),
-            Some(signature),
-            doc_comment,
-            module_path,
-            visibility,
+            (Some(signature), doc_comment, module_path, visibility),
         ))
     }
 
@@ -334,7 +322,7 @@ impl TypeScriptParser {
             .find(|n| n.kind() == "type_identifier")
             .map(|n| &code[n.byte_range()])?;
 
-        let signature = self.extract_class_signature(node, code);
+        let signature = Self::extract_class_signature(node, code);
         let doc_comment = extract_jsdoc(&node, code);
         let visibility = determine_ts_visibility(node, code);
 
@@ -344,10 +332,7 @@ impl TypeScriptParser {
             SymbolKind::Class,
             file_id,
             node_range(node),
-            Some(signature),
-            doc_comment,
-            module_path,
-            visibility,
+            (Some(signature), doc_comment, module_path, visibility),
         ))
     }
 
@@ -358,9 +343,9 @@ impl TypeScriptParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if let Some(body) = class_node.child_by_field_name("body") {
             for child in body.children(&mut body.walk()) {
                 match child.kind() {
@@ -387,8 +372,7 @@ impl TypeScriptParser {
                                 file_id,
                                 counter,
                                 symbols,
-                                module_path,
-                                depth + 1,
+                                (module_path, depth + 1),
                             );
 
                             self.context.exit_scope();
@@ -418,7 +402,7 @@ impl TypeScriptParser {
     ) -> Option<Symbol> {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
-        let signature = self.extract_interface_signature(node, code);
+        let signature = Self::extract_interface_signature(node, code);
         let doc_comment = extract_jsdoc(&node, code);
         let visibility = determine_ts_visibility(node, code);
 
@@ -428,10 +412,7 @@ impl TypeScriptParser {
             SymbolKind::Interface,
             file_id,
             node_range(node),
-            Some(signature),
-            doc_comment,
-            module_path,
-            visibility,
+            (Some(signature), doc_comment, module_path, visibility),
         ))
     }
 
@@ -455,10 +436,7 @@ impl TypeScriptParser {
             SymbolKind::TypeAlias,
             file_id,
             node_range(node),
-            Some(signature),
-            doc_comment,
-            module_path,
-            visibility,
+            (Some(signature), doc_comment, module_path, visibility),
         ))
     }
 
@@ -482,10 +460,7 @@ impl TypeScriptParser {
             SymbolKind::Enum,
             file_id,
             node_range(node),
-            Some(signature),
-            doc_comment,
-            module_path,
-            visibility,
+            (Some(signature), doc_comment, module_path, visibility),
         ))
     }
 
@@ -499,7 +474,7 @@ impl TypeScriptParser {
     ) -> Option<Symbol> {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
-        let signature = self.extract_signature(node, code);
+        let signature = Self::extract_signature(node, code);
         let doc_comment = extract_jsdoc(&node, code);
         let visibility = determine_member_visibility(node, code);
 
@@ -509,10 +484,7 @@ impl TypeScriptParser {
             SymbolKind::Method,
             file_id,
             node_range(node),
-            Some(signature),
-            doc_comment,
-            module_path,
-            visibility,
+            (Some(signature), doc_comment, module_path, visibility),
         ))
     }
 
@@ -535,10 +507,7 @@ impl TypeScriptParser {
             SymbolKind::Field,
             file_id,
             node_range(node),
-            None,
-            doc_comment,
-            module_path,
-            visibility,
+            (None, doc_comment, module_path, visibility),
         ))
     }
 
@@ -549,9 +518,9 @@ impl TypeScriptParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         for child in node.children(&mut node.walk()) {
             if child.kind() != "variable_declarator" {
                 continue;
@@ -583,10 +552,7 @@ impl TypeScriptParser {
                 kind,
                 file_id,
                 node_range(child),
-                None,
-                doc_comment,
-                module_path,
-                visibility,
+                (None, doc_comment, module_path, visibility),
             );
 
             // Arrow functions are never hoisted
@@ -624,8 +590,7 @@ impl TypeScriptParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
 
                         self.context.exit_scope();
@@ -639,7 +604,7 @@ impl TypeScriptParser {
 
     // ── Signatures ──────────────────────────────────────────────────────
 
-    fn extract_signature(&self, node: Node, code: &str) -> String {
+    fn extract_signature(node: Node, code: &str) -> String {
         let start = node.start_byte();
         let end = node
             .child_by_field_name("body")
@@ -647,7 +612,7 @@ impl TypeScriptParser {
         code[start..end].trim().to_string()
     }
 
-    fn extract_class_signature(&self, node: Node, code: &str) -> String {
+    fn extract_class_signature(node: Node, code: &str) -> String {
         let start = node.start_byte();
         let end = node
             .child_by_field_name("body")
@@ -655,7 +620,7 @@ impl TypeScriptParser {
         code[start..end].trim().to_string()
     }
 
-    fn extract_interface_signature(&self, node: Node, code: &str) -> String {
+    fn extract_interface_signature(node: Node, code: &str) -> String {
         let start = node.start_byte();
         let end = node
             .child_by_field_name("body")
@@ -666,35 +631,33 @@ impl TypeScriptParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut imports = Vec::new();
-        self.collect_imports(tree.root_node(), code, file_id, &mut imports);
+        Self::collect_imports(tree.root_node(), code, file_id, &mut imports);
         imports
     }
 
-    fn collect_imports(&self, node: Node, code: &str, file_id: FileId, imports: &mut Vec<Import>) {
+    fn collect_imports(node: Node, code: &str, file_id: FileId, imports: &mut Vec<Import>) {
         match node.kind() {
             "import_statement" => {
-                self.process_import_statement(node, code, file_id, imports);
+                Self::process_import_statement(node, code, file_id, imports);
             }
             "export_statement" => {
                 if node.child_by_field_name("source").is_some() {
-                    self.process_export_reexport(node, code, file_id, imports);
+                    Self::process_export_reexport(node, code, file_id, imports);
                 }
             }
             _ => {
                 for child in node.children(&mut node.walk()) {
-                    self.collect_imports(child, code, file_id, imports);
+                    Self::collect_imports(child, code, file_id, imports);
                 }
             }
         }
     }
 
     fn process_import_statement(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -708,9 +671,8 @@ impl TypeScriptParser {
             }
         }
 
-        let source_node = match node.child_by_field_name("source") {
-            Some(n) => n,
-            None => return,
+        let Some(source_node) = node.child_by_field_name("source") else {
+            return;
         };
         let source_path = code[source_node.byte_range()]
             .trim_matches(|c| c == '"' || c == '\'' || c == '`')
@@ -801,16 +763,9 @@ impl TypeScriptParser {
         }
     }
 
-    fn process_export_reexport(
-        &self,
-        node: Node,
-        code: &str,
-        file_id: FileId,
-        imports: &mut Vec<Import>,
-    ) {
-        let source_node = match node.child_by_field_name("source") {
-            Some(n) => n,
-            None => return,
+    fn process_export_reexport(node: Node, code: &str, file_id: FileId, imports: &mut Vec<Import>) {
+        let Some(source_node) = node.child_by_field_name("source") else {
+            return;
         };
         let source_path = code[source_node.byte_range()]
             .trim_matches(|c| c == '"' || c == '\'' || c == '`')
@@ -833,7 +788,6 @@ impl TypeScriptParser {
 
     #[allow(clippy::only_used_in_recursion)]
     fn extract_calls_recursive<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -873,17 +827,16 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_calls_recursive(&child, code, fn_ctx, calls, depth + 1);
+            Self::extract_calls_recursive(&child, code, fn_ctx, calls, depth + 1);
         }
     }
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.extract_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
+        Self::extract_calls_recursive(&tree.root_node(), code, Some("<module>"), &mut calls, 0);
         calls
     }
 
@@ -891,7 +844,6 @@ impl TypeScriptParser {
 
     #[allow(clippy::only_used_in_recursion)]
     fn extract_method_calls_recursive(
-        &self,
         node: &Node,
         code: &str,
         current_fn: Option<&str>,
@@ -938,17 +890,16 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_method_calls_recursive(&child, code, fn_ctx, calls, depth + 1);
+            Self::extract_method_calls_recursive(&child, code, fn_ctx, calls, depth + 1);
         }
     }
 
     fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.extract_method_calls_recursive(
+        Self::extract_method_calls_recursive(
             &tree.root_node(),
             code,
             Some("<module>"),
@@ -961,7 +912,6 @@ impl TypeScriptParser {
     // ── Implementations / extends ───────────────────────────────────────
 
     fn find_implementations_in_node<'a>(
-        &self,
         node: Node,
         code: &'a str,
         depth: usize,
@@ -981,24 +931,22 @@ impl TypeScriptParser {
                 if let Some(class_name) = class_name {
                     for child in node.children(&mut node.walk()) {
                         if child.kind() == "class_heritage" {
-                            self.process_heritage(child, code, class_name, results, extends_only);
+                            Self::process_heritage(child, code, class_name, results, extends_only);
                         }
                     }
                 }
             }
-            "interface_declaration" => {
-                if extends_only {
-                    if let Some(name_node) = node.child_by_field_name("name") {
-                        let iface_name = &code[name_node.byte_range()];
-                        for child in node.children(&mut node.walk()) {
-                            if child.kind() == "extends_type_clause" {
-                                if let Some(type_node) = child.child_by_field_name("type") {
-                                    if let Some(base) = extract_ts_type_name(type_node, code) {
-                                        results.push((iface_name, base, node_range(type_node)));
-                                    }
-                                } else {
-                                    self.process_extends_clause(child, code, iface_name, results);
+            "interface_declaration" if extends_only => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let iface_name = &code[name_node.byte_range()];
+                    for child in node.children(&mut node.walk()) {
+                        if child.kind() == "extends_type_clause" {
+                            if let Some(type_node) = child.child_by_field_name("type") {
+                                if let Some(base) = extract_ts_type_name(type_node, code) {
+                                    results.push((iface_name, base, node_range(type_node)));
                                 }
+                            } else {
+                                Self::process_extends_clause(child, code, iface_name, results);
                             }
                         }
                     }
@@ -1008,12 +956,11 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(child, code, depth + 1, results, extends_only);
+            Self::find_implementations_in_node(child, code, depth + 1, results, extends_only);
         }
     }
 
     fn process_heritage<'a>(
-        &self,
         heritage_node: Node,
         code: &'a str,
         class_name: &'a str,
@@ -1058,7 +1005,6 @@ impl TypeScriptParser {
     }
 
     fn process_extends_clause<'a>(
-        &self,
         node: Node,
         code: &'a str,
         iface_name: &'a str,
@@ -1077,7 +1023,6 @@ impl TypeScriptParser {
 
     #[allow(clippy::only_used_in_recursion)]
     fn extract_type_uses_recursive<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         uses: &mut Vec<(&'a str, &'a str, Range)>,
@@ -1094,7 +1039,7 @@ impl TypeScriptParser {
                     .unwrap_or("anonymous");
 
                 if let Some(params) = node.child_by_field_name("parameters") {
-                    self.extract_param_types(params, code, ctx, uses);
+                    Self::extract_param_types(params, code, ctx, uses);
                 }
                 if let Some(ret) = node.child_by_field_name("return_type") {
                     extract_ts_type_from_annotation(&ret, code, ctx, uses);
@@ -1124,12 +1069,11 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_type_uses_recursive(&child, code, uses, depth + 1);
+            Self::extract_type_uses_recursive(&child, code, uses, depth + 1);
         }
     }
 
     fn extract_param_types<'a>(
-        &self,
         params_node: Node,
         code: &'a str,
         ctx: &'a str,
@@ -1148,12 +1092,11 @@ impl TypeScriptParser {
     }
 
     fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut uses = Vec::new();
-        self.extract_type_uses_recursive(&tree.root_node(), code, &mut uses, 0);
+        Self::extract_type_uses_recursive(&tree.root_node(), code, &mut uses, 0);
         uses
     }
 
@@ -1161,7 +1104,6 @@ impl TypeScriptParser {
 
     #[allow(clippy::only_used_in_recursion)]
     fn extract_method_defines_recursive<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         defines: &mut Vec<(&'a str, &'a str, Range)>,
@@ -1211,17 +1153,16 @@ impl TypeScriptParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.extract_method_defines_recursive(&child, code, defines, depth + 1);
+            Self::extract_method_defines_recursive(&child, code, defines, depth + 1);
         }
     }
 
     fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut defines = Vec::new();
-        self.extract_method_defines_recursive(&tree.root_node(), code, &mut defines, 0);
+        Self::extract_method_defines_recursive(&tree.root_node(), code, &mut defines, 0);
         defines
     }
 }
@@ -1287,8 +1228,7 @@ fn extract_jsdoc(node: &Node, code: &str) -> Option<String> {
 
 fn extract_ts_function_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
-        "identifier" => Some(&code[node.byte_range()]),
-        "member_expression" => Some(&code[node.byte_range()]),
+        "identifier" | "member_expression" => Some(&code[node.byte_range()]),
         _ => None,
     }
 }
@@ -1373,22 +1313,20 @@ impl LanguageParser for TypeScriptParser {
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(tree.root_node(), code, 0, &mut results, false);
+        Self::find_implementations_in_node(tree.root_node(), code, 0, &mut results, false);
         results
     }
 
     fn find_extends<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(tree.root_node(), code, 0, &mut results, true);
+        Self::find_implementations_in_node(tree.root_node(), code, 0, &mut results, true);
         results
     }
 

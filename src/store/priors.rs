@@ -651,7 +651,7 @@ pub fn trigger_matches(kind: &str, matcher_json: &str, ctx: &TriggerContext) -> 
             false
         }
         ("prompt", TriggerContext::Prompt { text }) => {
-            let needle = if !pattern.is_empty() { pattern } else { when };
+            let needle = if pattern.is_empty() { when } else { pattern };
             if needle.is_empty() {
                 return false;
             }

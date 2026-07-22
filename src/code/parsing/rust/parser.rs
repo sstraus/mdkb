@@ -49,17 +49,15 @@ impl RustParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut imports = Vec::new();
-        self.extract_imports_from_node(tree.root_node(), code, file_id, 0, &mut imports);
+        Self::extract_imports_from_node(tree.root_node(), code, file_id, 0, &mut imports);
         imports
     }
 
     fn extract_imports_from_node(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -71,17 +69,16 @@ impl RustParser {
         }
         if node.kind() == "use_declaration" {
             if let Some(arg_node) = node.child_by_field_name("argument") {
-                self.extract_import_from_node(arg_node, code, file_id, imports);
+                Self::extract_import_from_node(arg_node, code, file_id, imports);
             }
         } else {
             for child in node.children(&mut node.walk()) {
-                self.extract_imports_from_node(child, code, file_id, depth + 1, imports);
+                Self::extract_imports_from_node(child, code, file_id, depth + 1, imports);
             }
         }
     }
 
     fn extract_import_from_node(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -135,13 +132,13 @@ impl RustParser {
 
                 for child in node.children(&mut node.walk()) {
                     if child.kind() != "," && child.kind() != "{" && child.kind() != "}" {
-                        self.extract_import_list_item(child, code, file_id, &prefix, imports);
+                        Self::extract_import_list_item(child, code, file_id, &prefix, imports);
                     }
                 }
             }
             "scoped_use_list" => {
                 if let Some(list_node) = node.child_by_field_name("list") {
-                    self.extract_import_from_node(list_node, code, file_id, imports);
+                    Self::extract_import_from_node(list_node, code, file_id, imports);
                 }
             }
             _ => {}
@@ -149,7 +146,6 @@ impl RustParser {
     }
 
     fn extract_import_list_item(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -204,9 +200,8 @@ impl RustParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut symbols = Vec::new();
         self.extract_symbols(tree.root_node(), code, file_id, &mut symbols, counter, 0);
@@ -256,7 +251,7 @@ impl RustParser {
                     if let Some(mut sym) =
                         self.create_symbol(counter, node, name_node, kind, file_id, code)
                     {
-                        sym = sym.with_signature(self.extract_signature(node, code));
+                        sym = sym.with_signature(Self::extract_signature(node, code));
                         symbols.push(sym);
                     }
                 }
@@ -293,7 +288,7 @@ impl RustParser {
                         file_id,
                         code,
                     ) {
-                        sym = sym.with_signature(self.extract_struct_signature(node, code));
+                        sym = sym.with_signature(Self::extract_struct_signature(node, code));
                         symbols.push(sym);
                     }
                 }
@@ -343,7 +338,7 @@ impl RustParser {
                         file_id,
                         code,
                     ) {
-                        sym = sym.with_signature(self.extract_enum_signature(node, code));
+                        sym = sym.with_signature(Self::extract_enum_signature(node, code));
                         symbols.push(sym);
                     }
                 }
@@ -377,7 +372,7 @@ impl RustParser {
                         file_id,
                         code,
                     ) {
-                        sym = sym.with_signature(self.extract_type_alias_signature(node, code));
+                        sym = sym.with_signature(Self::extract_type_alias_signature(node, code));
                         symbols.push(sym);
                     }
                 }
@@ -392,7 +387,7 @@ impl RustParser {
                         file_id,
                         code,
                     ) {
-                        sym = sym.with_signature(self.extract_const_signature(node, code));
+                        sym = sym.with_signature(Self::extract_const_signature(node, code));
                         symbols.push(sym);
                     }
                 }
@@ -407,7 +402,7 @@ impl RustParser {
                         file_id,
                         code,
                     ) {
-                        sym = sym.with_signature(self.extract_trait_signature(node, code));
+                        sym = sym.with_signature(Self::extract_trait_signature(node, code));
                         symbols.push(sym);
                     }
 
@@ -426,7 +421,8 @@ impl RustParser {
                                         file_id,
                                         code,
                                     ) {
-                                        ms = ms.with_signature(self.extract_signature(child, code));
+                                        ms =
+                                            ms.with_signature(Self::extract_signature(child, code));
                                         symbols.push(ms);
                                     }
                                 }
@@ -440,7 +436,7 @@ impl RustParser {
             "impl_item" => {
                 let impl_type = node
                     .child_by_field_name("type")
-                    .and_then(|t| self.extract_type_name(t, code));
+                    .and_then(|t| Self::extract_type_name(t, code));
 
                 self.context.enter_scope(ScopeType::Class);
                 let saved_fn = self.context.current_function().map(|s| s.to_string());
@@ -521,7 +517,7 @@ impl RustParser {
         );
 
         let doc_node = name_node.parent()?;
-        let doc_comment = self.extract_doc_comments_outer(&doc_node, code);
+        let doc_comment = Self::extract_doc_comments_outer(&doc_node, code);
 
         let mut symbol = Symbol::new(id, name, kind, file_id, range);
         symbol.scope_context = Some(self.context.current_scope_context());
@@ -545,7 +541,7 @@ impl RustParser {
 
     // ── Signatures ──────────────────────────────────────────────────────
 
-    fn extract_signature(&self, node: Node, code: &str) -> String {
+    fn extract_signature(node: Node, code: &str) -> String {
         let start = node.start_byte();
         let end = node
             .child_by_field_name("body")
@@ -553,40 +549,40 @@ impl RustParser {
         code[start..end].trim().to_string()
     }
 
-    fn extract_struct_signature(&self, node: Node, code: &str) -> String {
-        self.extract_signature(node, code)
+    fn extract_struct_signature(node: Node, code: &str) -> String {
+        Self::extract_signature(node, code)
     }
 
-    fn extract_trait_signature(&self, node: Node, code: &str) -> String {
-        self.extract_signature(node, code)
+    fn extract_trait_signature(node: Node, code: &str) -> String {
+        Self::extract_signature(node, code)
     }
 
-    fn extract_enum_signature(&self, node: Node, code: &str) -> String {
-        self.extract_signature(node, code)
+    fn extract_enum_signature(node: Node, code: &str) -> String {
+        Self::extract_signature(node, code)
     }
 
-    fn extract_type_alias_signature(&self, node: Node, code: &str) -> String {
+    fn extract_type_alias_signature(node: Node, code: &str) -> String {
         code[node.byte_range()].trim().to_string()
     }
 
-    fn extract_const_signature(&self, node: Node, code: &str) -> String {
+    fn extract_const_signature(node: Node, code: &str) -> String {
         code[node.byte_range()].trim().to_string()
     }
 
     // ── Type name extraction ────────────────────────────────────────────
 
     #[allow(clippy::only_used_in_recursion)]
-    fn extract_type_name<'a>(&self, node: Node, code: &'a str) -> Option<&'a str> {
+    fn extract_type_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
         match node.kind() {
             "type_identifier" | "primitive_type" | "scoped_type_identifier" => {
                 Some(&code[node.byte_range()])
             }
             "generic_type" => node
                 .child_by_field_name("type")
-                .and_then(|t| self.extract_type_name(t, code)),
+                .and_then(|t| Self::extract_type_name(t, code)),
             _ => {
                 for child in node.children(&mut node.walk()) {
-                    if let Some(name) = self.extract_type_name(child, code) {
+                    if let Some(name) = Self::extract_type_name(child, code) {
                         return Some(name);
                     }
                 }
@@ -597,7 +593,7 @@ impl RustParser {
 
     /// Full type name including generic parameters (owned).
     #[allow(clippy::only_used_in_recursion)]
-    fn extract_full_type_name(&self, node: Node, code: &str) -> String {
+    fn extract_full_type_name(node: Node, code: &str) -> String {
         match node.kind() {
             "type_identifier" | "primitive_type" | "scoped_type_identifier" => {
                 code[node.byte_range()].to_string()
@@ -605,7 +601,7 @@ impl RustParser {
             "generic_type" => {
                 let mut result = String::new();
                 if let Some(t) = node.child_by_field_name("type") {
-                    result.push_str(&self.extract_full_type_name(t, code));
+                    result.push_str(&Self::extract_full_type_name(t, code));
                 }
                 if let Some(args) = node.child_by_field_name("type_arguments") {
                     result.push('<');
@@ -615,7 +611,7 @@ impl RustParser {
                             if !first {
                                 result.push_str(", ");
                             }
-                            result.push_str(&self.extract_full_type_name(child, code));
+                            result.push_str(&Self::extract_full_type_name(child, code));
                             first = false;
                         }
                     }
@@ -629,7 +625,7 @@ impl RustParser {
                     r.push_str("mut ");
                 }
                 if let Some(t) = node.child_by_field_name("type") {
-                    r.push_str(&self.extract_full_type_name(t, code));
+                    r.push_str(&Self::extract_full_type_name(t, code));
                 }
                 r
             }
@@ -639,7 +635,7 @@ impl RustParser {
 
     // ── Doc comments ────────────────────────────────────────────────────
 
-    fn classify_doc_comment(&self, text: &str) -> DocCommentType {
+    fn classify_doc_comment(text: &str) -> DocCommentType {
         if text.starts_with("///") && !text.starts_with("////") {
             DocCommentType::OuterLine
         } else if text.starts_with("//!") {
@@ -653,21 +649,21 @@ impl RustParser {
         }
     }
 
-    fn is_outer_doc(&self, text: &str) -> bool {
+    fn is_outer_doc(text: &str) -> bool {
         matches!(
-            self.classify_doc_comment(text),
+            Self::classify_doc_comment(text),
             DocCommentType::OuterLine | DocCommentType::OuterBlock
         )
     }
 
-    fn is_inner_doc(&self, text: &str) -> bool {
+    fn is_inner_doc(text: &str) -> bool {
         matches!(
-            self.classify_doc_comment(text),
+            Self::classify_doc_comment(text),
             DocCommentType::InnerLine | DocCommentType::InnerBlock
         )
     }
 
-    fn extract_doc_comments_outer(&self, node: &Node, code: &str) -> Option<String> {
+    fn extract_doc_comments_outer(node: &Node, code: &str) -> Option<String> {
         let mut doc_lines = Vec::new();
         let mut current = node.prev_sibling();
 
@@ -675,8 +671,8 @@ impl RustParser {
             match sibling.kind() {
                 "line_comment" | "block_comment" => {
                     if let Ok(text) = sibling.utf8_text(code.as_bytes()) {
-                        if self.is_outer_doc(text) {
-                            let content = match self.classify_doc_comment(text) {
+                        if Self::is_outer_doc(text) {
+                            let content = match Self::classify_doc_comment(text) {
                                 DocCommentType::OuterLine => {
                                     text.trim_start_matches("///").trim().to_string()
                                 }
@@ -706,9 +702,9 @@ impl RustParser {
         }
     }
 
-    fn extract_inner_doc_comments(&self, node: &Node, code: &str) -> Option<String> {
+    fn extract_inner_doc_comments(node: &Node, code: &str) -> Option<String> {
         let mut parts = Vec::new();
-        self.collect_inner_docs(node, code, 0, &mut parts);
+        Self::collect_inner_docs(node, code, 0, &mut parts);
         if parts.is_empty() {
             None
         } else {
@@ -716,20 +712,14 @@ impl RustParser {
         }
     }
 
-    fn collect_inner_docs<'a>(
-        &self,
-        node: &Node,
-        code: &'a str,
-        depth: usize,
-        parts: &mut Vec<&'a str>,
-    ) {
+    fn collect_inner_docs<'a>(node: &Node, code: &'a str, depth: usize, parts: &mut Vec<&'a str>) {
         if !check_recursion_depth(depth, *node) {
             return;
         }
         for child in node.children(&mut node.walk()) {
             if matches!(child.kind(), "line_comment" | "block_comment") {
                 if let Ok(text) = child.utf8_text(code.as_bytes()) {
-                    if self.is_inner_doc(text) {
+                    if Self::is_inner_doc(text) {
                         if text.starts_with("//!") {
                             let content = text.trim_start_matches("//!").trim();
                             if !content.is_empty() {
@@ -747,7 +737,7 @@ impl RustParser {
                     }
                 }
             } else {
-                self.collect_inner_docs(&child, code, depth + 1, parts);
+                Self::collect_inner_docs(&child, code, depth + 1, parts);
             }
         }
     }
@@ -757,17 +747,15 @@ impl RustParser {
     // ── Calls ───────────────────────────────────────────────────────────
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(t) => t,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(tree.root_node(), code, None, 0, &mut calls);
+        Self::find_calls_in_node(tree.root_node(), code, None, 0, &mut calls);
         calls
     }
 
     fn find_calls_in_node<'a>(
-        &self,
         node: Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -790,11 +778,10 @@ impl RustParser {
         if node.kind() == "call_expression" {
             if let Some(fn_node) = node.child_by_field_name("function") {
                 let target = match fn_node.kind() {
-                    "identifier" => Some(&code[fn_node.byte_range()]),
                     "field_expression" => fn_node
                         .child_by_field_name("field")
                         .map(|f| &code[f.byte_range()]),
-                    "scoped_identifier" => Some(&code[fn_node.byte_range()]),
+                    "identifier" | "scoped_identifier" => Some(&code[fn_node.byte_range()]),
                     _ => None,
                 };
 
@@ -805,24 +792,22 @@ impl RustParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(child, code, current_fn, depth + 1, calls);
+            Self::find_calls_in_node(child, code, current_fn, depth + 1, calls);
         }
     }
 
     // ── Method calls (structured) ───────────────────────────────────────
 
     fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(t) => t,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_method_calls_in_node(tree.root_node(), code, None, 0, &mut calls);
+        Self::find_method_calls_in_node(tree.root_node(), code, None, 0, &mut calls);
         calls
     }
 
     fn find_method_calls_in_node<'a>(
-        &self,
         node: Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -881,24 +866,22 @@ impl RustParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_method_calls_in_node(child, code, current_fn, depth + 1, calls);
+            Self::find_method_calls_in_node(child, code, current_fn, depth + 1, calls);
         }
     }
 
     // ── Implementations ─────────────────────────────────────────────────
 
     fn find_implementations_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(t) => t,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut impls = Vec::new();
-        self.find_implementations_in_node(tree.root_node(), code, 0, &mut impls);
+        Self::find_implementations_in_node(tree.root_node(), code, 0, &mut impls);
         impls
     }
 
     fn find_implementations_in_node<'a>(
-        &self,
         node: Node,
         code: &'a str,
         depth: usize,
@@ -911,8 +894,8 @@ impl RustParser {
             if let Some(trait_node) = node.child_by_field_name("trait") {
                 if let Some(type_node) = node.child_by_field_name("type") {
                     if let (Some(trait_name), Some(type_name)) = (
-                        self.extract_type_name(trait_node, code),
-                        self.extract_type_name(type_node, code),
+                        Self::extract_type_name(trait_node, code),
+                        Self::extract_type_name(type_node, code),
                     ) {
                         let range = Range::new(
                             node.start_position().row as u32,
@@ -926,24 +909,22 @@ impl RustParser {
             }
         }
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(child, code, depth + 1, impls);
+            Self::find_implementations_in_node(child, code, depth + 1, impls);
         }
     }
 
     // ── Type uses ───────────────────────────────────────────────────────
 
     fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(t) => t,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut uses = Vec::new();
-        self.find_uses_in_node(tree.root_node(), code, 0, &mut uses);
+        Self::find_uses_in_node(tree.root_node(), code, 0, &mut uses);
         uses
     }
 
     fn find_uses_in_node<'a>(
-        &self,
         node: Node,
         code: &'a str,
         depth: usize,
@@ -960,7 +941,8 @@ impl RustParser {
                         for child in body.children(&mut body.walk()) {
                             if child.kind() == "field_declaration" {
                                 if let Some(type_node) = child.child_by_field_name("type") {
-                                    if let Some(type_name) = self.extract_type_name(type_node, code)
+                                    if let Some(type_name) =
+                                        Self::extract_type_name(type_node, code)
                                     {
                                         let range = Range::new(
                                             type_node.start_position().row as u32,
@@ -983,7 +965,8 @@ impl RustParser {
                         for param in params.children(&mut params.walk()) {
                             if param.kind() == "parameter" {
                                 if let Some(type_node) = param.child_by_field_name("type") {
-                                    if let Some(type_name) = self.extract_type_name(type_node, code)
+                                    if let Some(type_name) =
+                                        Self::extract_type_name(type_node, code)
                                     {
                                         let range = Range::new(
                                             type_node.start_position().row as u32,
@@ -998,7 +981,7 @@ impl RustParser {
                         }
                     }
                     if let Some(ret) = node.child_by_field_name("return_type") {
-                        if let Some(type_name) = self.extract_type_name(ret, code) {
+                        if let Some(type_name) = Self::extract_type_name(ret, code) {
                             let range = Range::new(
                                 ret.start_position().row as u32,
                                 ret.start_position().column as u16,
@@ -1013,24 +996,22 @@ impl RustParser {
             _ => {}
         }
         for child in node.children(&mut node.walk()) {
-            self.find_uses_in_node(child, code, depth + 1, uses);
+            Self::find_uses_in_node(child, code, depth + 1, uses);
         }
     }
 
     // ── Defines ─────────────────────────────────────────────────────────
 
     fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(t) => t,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut defines = Vec::new();
-        self.find_defines_in_node(tree.root_node(), code, 0, &mut defines);
+        Self::find_defines_in_node(tree.root_node(), code, 0, &mut defines);
         defines
     }
 
     fn find_defines_in_node<'a>(
-        &self,
         node: Node,
         code: &'a str,
         depth: usize,
@@ -1064,7 +1045,7 @@ impl RustParser {
             }
             "impl_item" => {
                 if let Some(type_node) = node.child_by_field_name("type") {
-                    if let Some(type_name) = self.extract_type_name(type_node, code) {
+                    if let Some(type_name) = Self::extract_type_name(type_node, code) {
                         if let Some(body) = node.child_by_field_name("body") {
                             for child in body.children(&mut body.walk()) {
                                 if child.kind() == "function_item" {
@@ -1086,24 +1067,22 @@ impl RustParser {
             _ => {}
         }
         for child in node.children(&mut node.walk()) {
-            self.find_defines_in_node(child, code, depth + 1, defines);
+            Self::find_defines_in_node(child, code, depth + 1, defines);
         }
     }
 
     // ── Variable types ──────────────────────────────────────────────────
 
     fn find_variable_types_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(t) => t,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut bindings = Vec::new();
-        self.find_variable_types_in_node(tree.root_node(), code, 0, &mut bindings);
+        Self::find_variable_types_in_node(tree.root_node(), code, 0, &mut bindings);
         bindings
     }
 
     fn find_variable_types_in_node<'a>(
-        &self,
         node: Node,
         code: &'a str,
         depth: usize,
@@ -1117,7 +1096,7 @@ impl RustParser {
                 if pat.kind() == "identifier" {
                     let var_name = &code[pat.byte_range()];
                     if let Some(val) = node.child_by_field_name("value") {
-                        if let Some(type_name) = self.extract_value_type(val, code) {
+                        if let Some(type_name) = Self::extract_value_type(val, code) {
                             let range = Range::new(
                                 node.start_position().row as u32,
                                 node.start_position().column as u16,
@@ -1131,15 +1110,15 @@ impl RustParser {
             }
         }
         for child in node.children(&mut node.walk()) {
-            self.find_variable_types_in_node(child, code, depth + 1, bindings);
+            Self::find_variable_types_in_node(child, code, depth + 1, bindings);
         }
     }
 
-    fn extract_value_type<'a>(&self, node: Node, code: &'a str) -> Option<&'a str> {
+    fn extract_value_type<'a>(node: Node, code: &'a str) -> Option<&'a str> {
         match node.kind() {
             "struct_expression" => node
                 .child_by_field_name("name")
-                .and_then(|n| self.extract_type_name(n, code)),
+                .and_then(|n| Self::extract_type_name(n, code)),
             "call_expression" => node
                 .child_by_field_name("function")
                 .filter(|f| f.kind() == "scoped_identifier")
@@ -1154,17 +1133,15 @@ impl RustParser {
     // ── Inherent methods ────────────────────────────────────────────────
 
     fn find_inherent_methods_impl(&mut self, code: &str) -> Vec<(String, String, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(t) => t,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut methods = Vec::new();
-        self.find_inherent_methods_in_node(tree.root_node(), code, 0, &mut methods);
+        Self::find_inherent_methods_in_node(tree.root_node(), code, 0, &mut methods);
         methods
     }
 
     fn find_inherent_methods_in_node(
-        &self,
         node: Node,
         code: &str,
         depth: usize,
@@ -1175,7 +1152,7 @@ impl RustParser {
         }
         if node.kind() == "impl_item" && node.child_by_field_name("trait").is_none() {
             if let Some(type_node) = node.child_by_field_name("type") {
-                let type_name = self.extract_full_type_name(type_node, code);
+                let type_name = Self::extract_full_type_name(type_node, code);
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
                         if child.kind() == "function_item" {
@@ -1198,7 +1175,7 @@ impl RustParser {
             }
         }
         for child in node.children(&mut node.walk()) {
-            self.find_inherent_methods_in_node(child, code, depth + 1, methods);
+            Self::find_inherent_methods_in_node(child, code, depth + 1, methods);
         }
     }
 }
@@ -1215,8 +1192,8 @@ impl LanguageParser for RustParser {
     }
 
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String> {
-        let outer = self.extract_doc_comments_outer(node, code);
-        let inner = self.extract_inner_doc_comments(node, code);
+        let outer = Self::extract_doc_comments_outer(node, code);
+        let inner = Self::extract_inner_doc_comments(node, code);
         match (outer, inner) {
             (Some(o), Some(i)) => Some(format!("{o}\n\n{i}")),
             (Some(o), None) => Some(o),

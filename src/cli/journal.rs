@@ -70,18 +70,16 @@ pub fn parse_journal(content: &str) -> ParsedJournal {
         }
 
         // Parse section headers (H2 or H3)
-        if line.starts_with("## ") || line.starts_with("### ") {
+        if let Some(header) = line
+            .strip_prefix("## ")
+            .or_else(|| line.strip_prefix("### "))
+        {
             // Save previous section
             if let Some(ref section) = current_section {
                 save_section(&mut journal, section, &current_content);
             }
 
             // Start new section
-            let header = if line.starts_with("## ") {
-                &line[3..]
-            } else {
-                &line[4..]
-            };
             current_section = Some(header.trim().to_string());
             current_content.clear();
             continue;
@@ -157,7 +155,7 @@ fn extract_bullet_points(content: &str) -> Vec<String> {
                 &trimmed[2..]
             } else {
                 // Numbered list: skip "N. "
-                trimmed.splitn(2, ". ").nth(1).unwrap_or(trimmed)
+                trimmed.split_once(". ").map(|x| x.1).unwrap_or(trimmed)
             };
             current_point = text.to_string();
         } else if !trimmed.is_empty() && !current_point.is_empty() {

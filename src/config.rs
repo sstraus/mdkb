@@ -956,7 +956,7 @@ mod tests {
         assert_eq!(cfg.warmup_token_budget, 300);
         assert_eq!(cfg.recall_limit, 5);
         // Confidence floor on by default so low-signal entries stay out of warmup.
-        assert_eq!(cfg.warmup_min_confidence, 0.25);
+        assert!((cfg.warmup_min_confidence - 0.25).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1300,9 +1300,9 @@ default_limit = 0
             parsed.code.indexing.batch_size,
             config.code.indexing.batch_size
         );
-        assert_eq!(
-            parsed.code.semantic_search.threshold,
-            config.code.semantic_search.threshold
+        assert!(
+            (parsed.code.semantic_search.threshold - config.code.semantic_search.threshold).abs()
+                < f64::EPSILON
         );
     }
 
@@ -1326,7 +1326,7 @@ threshold = 0.5
         assert_eq!(config.code.indexing.batch_size, 1000);
         assert_eq!(config.code.indexing.parallelism, 0);
         assert!(config.code.semantic_search.enabled);
-        assert_eq!(config.code.semantic_search.threshold, 0.5);
+        assert!((config.code.semantic_search.threshold - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]

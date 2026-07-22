@@ -22,7 +22,8 @@ pub struct CachingParser {
 impl std::fmt::Debug for CachingParser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CachingParser")
-            .field("cached_hash", &self.cached.as_ref().map(|(h, _)| h))
+            .field("parser", &"<configured>")
+            .field("cached", &self.cached.as_ref().map(|(hash, _)| hash))
             .finish()
     }
 }
@@ -67,10 +68,10 @@ impl CachingParser {
 
 /// FNV-1a hash for cache keying. Fast, no allocation, good distribution.
 fn fnv1a_hash(bytes: &[u8]) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &byte in bytes {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
 }

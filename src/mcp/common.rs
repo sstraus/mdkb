@@ -56,7 +56,7 @@ pub async fn auth_middleware(
 
     match auth_header {
         Some(auth) if auth.starts_with("Bearer ") => {
-            let provided = auth["Bearer ".len()..].as_bytes();
+            let provided = &auth.as_bytes()["Bearer ".len()..];
             let expected = expected_token.as_bytes();
             if provided.ct_eq(expected).into() {
                 next.run(request).await

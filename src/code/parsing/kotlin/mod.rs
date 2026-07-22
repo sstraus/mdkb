@@ -48,11 +48,9 @@ impl KotlinParser {
         kind: SymbolKind,
         file_id: FileId,
         range: Range,
-        signature: Option<String>,
-        doc_comment: Option<String>,
-        module_path: &str,
-        visibility: Visibility,
+        tail: (Option<String>, Option<String>, &str, Visibility),
     ) -> Symbol {
+        let (signature, doc_comment, module_path, visibility) = tail;
         let mut sym = Symbol::new(id, name, kind, file_id, range);
         sym.visibility = visibility;
         sym.scope_context = Some(self.context.current_scope_context());
@@ -77,9 +75,8 @@ impl KotlinParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
 
         let mut symbols = Vec::new();
@@ -92,8 +89,7 @@ impl KotlinParser {
             file_id,
             counter,
             &mut symbols,
-            module_path,
-            0,
+            (module_path, 0),
         );
         symbols
     }
@@ -105,9 +101,9 @@ impl KotlinParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if !check_recursion_depth(depth, node) {
             return;
         }
@@ -120,8 +116,7 @@ impl KotlinParser {
                     file_id,
                     counter,
                     symbols,
-                    module_path,
-                    depth,
+                    (module_path, depth),
                 );
             }
 
@@ -144,8 +139,7 @@ impl KotlinParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -164,8 +158,7 @@ impl KotlinParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -193,8 +186,7 @@ impl KotlinParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -204,11 +196,13 @@ impl KotlinParser {
             }
 
             "secondary_constructor" => {
-                if let Some(symbol) =
-                    self.process_secondary_constructor(node, code, file_id, counter, module_path)
-                {
-                    symbols.push(symbol);
-                }
+                symbols.push(self.process_secondary_constructor(
+                    node,
+                    code,
+                    file_id,
+                    counter,
+                    module_path,
+                ));
             }
 
             "property_declaration" => {
@@ -231,8 +225,7 @@ impl KotlinParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -248,9 +241,9 @@ impl KotlinParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         let class_name = find_type_identifier(node, code);
         let is_enum = child_has_kind(node, "enum");
         let is_interface = child_has_kind(node, "interface");
@@ -275,10 +268,7 @@ impl KotlinParser {
                 kind,
                 file_id,
                 node_range(node),
-                Some(signature),
-                doc,
-                module_path,
-                visibility,
+                (Some(signature), doc, module_path, visibility),
             ));
         }
 
@@ -322,10 +312,7 @@ impl KotlinParser {
                             SymbolKind::Constant,
                             file_id,
                             node_range(child),
-                            None,
-                            None,
-                            module_path,
-                            Visibility::Public,
+                            (None, None, module_path, Visibility::Public),
                         ));
                     }
                 } else {
@@ -335,8 +322,7 @@ impl KotlinParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -383,10 +369,7 @@ impl KotlinParser {
                         SymbolKind::Field,
                         file_id,
                         node_range(child),
-                        sig,
-                        None,
-                        module_path,
-                        visibility,
+                        (sig, None, module_path, visibility),
                     ));
                 }
             }
@@ -413,13 +396,15 @@ impl KotlinParser {
             SymbolKind::Class,
             file_id,
             node_range(node),
-            Some(format!(
-                "object {}",
-                find_type_identifier(node, code).unwrap_or_default()
-            )),
-            doc,
-            module_path,
-            visibility,
+            (
+                Some(format!(
+                    "object {}",
+                    find_type_identifier(node, code).unwrap_or_default()
+                )),
+                doc,
+                module_path,
+                visibility,
+            ),
         ))
     }
 
@@ -454,10 +439,7 @@ impl KotlinParser {
             kind,
             file_id,
             node_range(node),
-            Some(signature),
-            doc,
-            module_path,
-            visibility,
+            (Some(signature), doc, module_path, visibility),
         ))
     }
 
@@ -468,7 +450,7 @@ impl KotlinParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         module_path: &str,
-    ) -> Option<Symbol> {
+    ) -> Symbol {
         let visibility = determine_kotlin_visibility(node, code);
         let params = find_child_by_kind(node, "function_value_parameters")
             .map(|n| &code[n.byte_range()])
@@ -480,17 +462,19 @@ impl KotlinParser {
             "constructor".to_string()
         };
 
-        Some(self.create_symbol(
+        self.create_symbol(
             counter.next_id(),
             name.clone(),
             SymbolKind::Method,
             file_id,
             node_range(node),
-            Some(format!("constructor{params}")),
-            extract_kdoc(&node, code),
-            module_path,
-            visibility,
-        ))
+            (
+                Some(format!("constructor{params}")),
+                extract_kdoc(&node, code),
+                module_path,
+                visibility,
+            ),
+        )
     }
 
     fn process_property(
@@ -535,10 +519,7 @@ impl KotlinParser {
                 kind,
                 file_id,
                 node_range(node),
-                sig,
-                extract_kdoc(&node, code),
-                module_path,
-                visibility,
+                (sig, extract_kdoc(&node, code), module_path, visibility),
             ));
         }
     }
@@ -561,17 +542,19 @@ impl KotlinParser {
                 SymbolKind::TypeAlias,
                 file_id,
                 node_range(node),
-                Some(
-                    code[node.byte_range()]
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .to_string(),
+                (
+                    Some(
+                        code[node.byte_range()]
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string(),
+                    ),
+                    extract_kdoc(&node, code),
+                    module_path,
+                    visibility,
                 ),
-                extract_kdoc(&node, code),
-                module_path,
-                visibility,
             ),
         )
     }
@@ -579,17 +562,15 @@ impl KotlinParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut imports = Vec::new();
-        self.find_imports_in_node(tree.root_node(), code, file_id, 0, &mut imports);
+        Self::find_imports_in_node(tree.root_node(), code, file_id, 0, &mut imports);
         imports
     }
 
     fn find_imports_in_node(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -627,24 +608,22 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_imports_in_node(child, code, file_id, depth + 1, imports);
+            Self::find_imports_in_node(child, code, file_id, depth + 1, imports);
         }
     }
 
     // ── Calls ───────────────────────────────────────────────────────────
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     fn find_calls_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -679,24 +658,22 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
     // ── Method calls ────────────────────────────────────────────────────
 
     fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     fn find_method_calls_in_node(
-        &self,
         node: &Node,
         code: &str,
         current_fn: Option<&str>,
@@ -749,14 +726,13 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
     // ── Implementations (: interface) ───────────────────────────────────
 
     fn find_implementations_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -767,11 +743,7 @@ impl KotlinParser {
         }
 
         if node.kind() == "class_declaration" || node.kind() == "object_declaration" {
-            let name_opt = if node.kind() == "class_declaration" {
-                find_type_identifier_ref(*node, code)
-            } else {
-                find_type_identifier_ref(*node, code)
-            };
+            let name_opt = find_type_identifier_ref(*node, code);
 
             if let Some(class_name) = name_opt {
                 // delegation_specifier children contain supertypes
@@ -784,14 +756,13 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, depth + 1, results);
+            Self::find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 
     // ── Method defines ──────────────────────────────────────────────────
 
     fn find_defines_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -802,11 +773,7 @@ impl KotlinParser {
         }
 
         if node.kind() == "class_declaration" || node.kind() == "object_declaration" {
-            let type_name = if node.kind() == "class_declaration" {
-                find_type_identifier_ref(*node, code)
-            } else {
-                find_type_identifier_ref(*node, code)
-            };
+            let type_name = find_type_identifier_ref(*node, code);
 
             if let Some(type_name) = type_name {
                 let body = find_child_by_kind(*node, "class_body")
@@ -827,14 +794,13 @@ impl KotlinParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_defines_in_node(&child, code, depth + 1, defines);
+            Self::find_defines_in_node(&child, code, depth + 1, defines);
         }
     }
 
     // ── Type uses ───────────────────────────────────────────────────────
 
     fn find_uses_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -860,19 +826,18 @@ impl KotlinParser {
             if let Some(params) = find_child_by_kind(*node, "function_value_parameters") {
                 for param in params.children(&mut params.walk()) {
                     if param.kind() == "parameter" {
-                        self.extract_type_uses_from_param(param, code, ctx, uses);
+                        Self::extract_type_uses_from_param(param, code, ctx, uses);
                     }
                 }
             }
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_uses_in_node(&child, code, depth + 1, uses);
+            Self::find_uses_in_node(&child, code, depth + 1, uses);
         }
     }
 
     fn extract_type_uses_from_param<'a>(
-        &self,
         node: Node,
         code: &'a str,
         ctx: &'a str,
@@ -922,12 +887,8 @@ fn find_simple_identifier_ref<'a>(node: Node, code: &'a str) -> Option<&'a str> 
 
 /// Find the first child of a given kind.
 fn find_child_by_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
-    for child in node.children(&mut node.walk()) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-    }
-    None
+    node.children(&mut node.walk())
+        .find(|&child| child.kind() == kind)
 }
 
 /// Check if a node has a direct child token of the given kind (e.g., "val", "var").
@@ -973,7 +934,6 @@ fn determine_kotlin_visibility(node: Node, code: &str) -> Visibility {
                 if mod_child.kind() == "visibility_modifier" {
                     let text = &code[mod_child.byte_range()];
                     return match text {
-                        "public" => Visibility::Public,
                         "private" => Visibility::Private,
                         "protected" => Visibility::Module,
                         "internal" => Visibility::Crate,
@@ -1159,32 +1119,29 @@ impl LanguageParser for KotlinParser {
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
+        Self::find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 
     fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut uses = Vec::new();
-        self.find_uses_in_node(&tree.root_node(), code, 0, &mut uses);
+        Self::find_uses_in_node(&tree.root_node(), code, 0, &mut uses);
         uses
     }
 
     fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut defines = Vec::new();
-        self.find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
+        Self::find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
         defines
     }
 

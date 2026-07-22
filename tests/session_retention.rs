@@ -14,11 +14,11 @@ use tempfile::TempDir;
 /// A minimal 3-user-turn transcript (min_turns = 3) whose content is searchable.
 fn transcript(topic: &str) -> String {
     let ts = "2026-01-09T08:43:52.235Z";
+    let u1 = format!(
+        r#"{{"type":"user","message":{{"role":"user","content":"question about {topic} handling"}},"timestamp":"{ts}"}}"#
+    );
     format!(
         "{u1}\n{a1}\n{u2}\n{a2}\n{u3}\n",
-        u1 = format!(
-            r#"{{"type":"user","message":{{"role":"user","content":"question about {topic} handling"}},"timestamp":"{ts}"}}"#
-        ),
         a1 = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"an answer"}]},"timestamp":"2026-01-09T08:44:00.000Z"}"#,
         u2 = r#"{"type":"user","message":{"role":"user","content":"follow up two"},"timestamp":"2026-01-09T08:45:00.000Z"}"#,
         a2 = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"answer two"}]},"timestamp":"2026-01-09T08:46:00.000Z"}"#,

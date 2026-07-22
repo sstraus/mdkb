@@ -263,9 +263,9 @@ pub fn delete_document(conn: &Connection, id: i64) -> Result<bool> {
 /// explicit `--collection claude_sessions` query — mdkb is often the only
 /// remaining copy once Claude Code rotates the on-disk jsonl away, so this
 /// never deletes; hard removal is opt-in via `mdkb compact --prune-sessions`.
-pub fn archive_missing_sessions(
+pub fn archive_missing_sessions<S: std::hash::BuildHasher>(
     conn: &Connection,
-    present_paths: &std::collections::HashSet<String>,
+    present_paths: &std::collections::HashSet<String, S>,
 ) -> Result<usize> {
     let coll = crate::domain::COLLECTION_CLAUDE_SESSIONS;
     let mut stmt = conn.prepare(

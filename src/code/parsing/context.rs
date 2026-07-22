@@ -129,9 +129,7 @@ impl ParserContext {
                 ScopeType::Global => {
                     return ScopeContext::Global;
                 }
-                ScopeType::Module => {
-                    continue;
-                }
+                ScopeType::Module => {}
             }
         }
         ScopeContext::Module

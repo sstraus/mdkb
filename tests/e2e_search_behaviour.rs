@@ -17,8 +17,11 @@
 //! and test them here to measure impact before committing.
 
 mod common;
+#[path = "common/fixture.rs"]
+mod fixture;
 
 use common::McpTestHarness;
+use fixture::McpFixtureSupport;
 use serde_json::json;
 
 // =============================================================================

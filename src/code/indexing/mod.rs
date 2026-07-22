@@ -61,6 +61,7 @@ impl IndexFacade {
     }
 
     /// Override the default pipeline configuration.
+    #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
         self.config = config;
         self
@@ -930,7 +931,7 @@ pub fn world() {
         );
 
         // All values should be valid SHA-256 hex strings (64 chars)
-        for (_path, hash) in &hashes {
+        for hash in hashes.values() {
             assert_eq!(hash.len(), 64, "hash should be 64 hex chars");
             assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
         }
@@ -1166,7 +1167,7 @@ pub fn world() {
     }
 
     #[test]
-    #[ignore] // requires ONNX model download (see tests/e2e_llm.rs convention)
+    #[ignore = "requires ONNX model download (see tests/e2e_llm.rs convention)"]
     fn incremental_update_reembeds_only_changed_symbols() {
         // PERF-D3: an incremental update of one file must re-embed only that
         // file's symbols, reusing the stored vectors for everything else. We
@@ -1194,7 +1195,9 @@ pub fn world() {
             let mut all = semantic.store_load_filtered(|_| true);
             for (id, vec) in &mut all {
                 if *id == bbb_id {
-                    vec.iter_mut().for_each(|v| *v = 0.5); // sentinel
+                    for value in vec.iter_mut() {
+                        *value = 0.5;
+                    }
                 }
             }
             semantic

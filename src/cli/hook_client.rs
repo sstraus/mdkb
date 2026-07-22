@@ -137,13 +137,12 @@ pub async fn call_memory_confirm(id: String, outcome: String, root: Option<PathB
 /// The result is collapsed to the main worktree and canonicalized (the
 /// daemon whitelist compares canonical paths).
 fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {
-    let resolved = match explicit {
-        Some(path) => crate::git::resolve_main_worktree(&path),
-        None => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from);
-            crate::git::resolve_project_root(&cwd, hint.as_deref())
-        }
+    let resolved = if let Some(path) = explicit {
+        crate::git::resolve_main_worktree(&path)
+    } else {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from);
+        crate::git::resolve_project_root(&cwd, hint.as_deref())
     };
     resolved.canonicalize().unwrap_or(resolved)
 }

@@ -167,14 +167,13 @@ async fn connect(
     replay: Option<(&str, &str)>,
     event_tx: &mpsc::Sender<SocketEvent>,
 ) -> Result<DaemonConnection> {
-    let stream = match UnixStream::connect(socket_path).await {
-        Ok(stream) => stream,
-        Err(_) => {
-            ensure_daemon_running(socket_path).await?;
-            UnixStream::connect(socket_path)
-                .await
-                .map_err(|e| Error::other(format!("connect {}: {e}", socket_path.display())))?
-        }
+    let stream = if let Ok(stream) = UnixStream::connect(socket_path).await {
+        stream
+    } else {
+        ensure_daemon_running(socket_path).await?;
+        UnixStream::connect(socket_path)
+            .await
+            .map_err(|e| Error::other(format!("connect {}: {e}", socket_path.display())))?
     };
     let (read, mut writer) = stream.into_split();
     let mut read = BufReader::new(read);

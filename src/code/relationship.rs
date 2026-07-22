@@ -28,6 +28,7 @@ pub enum RelationKind {
 
 impl RelationKind {
     /// Get the inverse relationship kind.
+    #[must_use]
     pub fn inverse(self) -> Self {
         match self {
             Self::Calls => Self::CalledBy,

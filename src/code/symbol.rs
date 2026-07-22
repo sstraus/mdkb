@@ -80,31 +80,37 @@ impl Symbol {
         }
     }
 
+    #[must_use]
     pub fn with_file_path(mut self, file_path: impl Into<Box<str>>) -> Self {
         self.file_path = file_path.into();
         self
     }
 
+    #[must_use]
     pub fn with_signature(mut self, signature: impl Into<Box<str>>) -> Self {
         self.signature = Some(signature.into());
         self
     }
 
+    #[must_use]
     pub fn with_doc(mut self, doc: impl Into<Box<str>>) -> Self {
         self.doc_comment = Some(doc.into());
         self
     }
 
+    #[must_use]
     pub fn with_module_path(mut self, path: impl Into<Box<str>>) -> Self {
         self.module_path = Some(path.into());
         self
     }
 
+    #[must_use]
     pub fn with_visibility(mut self, visibility: Visibility) -> Self {
         self.visibility = visibility;
         self
     }
 
+    #[must_use]
     pub fn with_scope(mut self, scope: ScopeContext) -> Self {
         self.scope_context = Some(scope);
         self

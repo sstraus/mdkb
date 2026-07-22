@@ -44,11 +44,9 @@ impl PhpParser {
         kind: SymbolKind,
         file_id: FileId,
         range: Range,
-        signature: Option<String>,
-        doc_comment: Option<String>,
-        module_path: &str,
-        visibility: Visibility,
+        tail: (Option<String>, Option<String>, &str, Visibility),
     ) -> Symbol {
+        let (signature, doc_comment, module_path, visibility) = tail;
         let mut sym = Symbol::new(id, name, kind, file_id, range);
         sym.visibility = visibility;
         sym.scope_context = Some(self.context.current_scope_context());
@@ -71,9 +69,8 @@ impl PhpParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut symbols = Vec::new();
         let ns = extract_php_namespace(tree.root_node(), code);
@@ -85,8 +82,7 @@ impl PhpParser {
             file_id,
             counter,
             &mut symbols,
-            module_path,
-            0,
+            (module_path, 0),
         );
         symbols
     }
@@ -98,9 +94,9 @@ impl PhpParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if !check_recursion_depth(depth, node) {
             return;
         }
@@ -121,10 +117,12 @@ impl PhpParser {
                         SymbolKind::Function,
                         file_id,
                         node_range(node),
-                        Some(format!("function {name}{params}")),
-                        doc,
-                        module_path,
-                        Visibility::Public,
+                        (
+                            Some(format!("function {name}{params}")),
+                            doc,
+                            module_path,
+                            Visibility::Public,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -143,10 +141,12 @@ impl PhpParser {
                         SymbolKind::Class,
                         file_id,
                         node_range(node),
-                        Some(format!("class {n}")),
-                        doc,
-                        module_path,
-                        Visibility::Public,
+                        (
+                            Some(format!("class {n}")),
+                            doc,
+                            module_path,
+                            Visibility::Public,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -163,8 +163,7 @@ impl PhpParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -183,10 +182,12 @@ impl PhpParser {
                         SymbolKind::Interface,
                         file_id,
                         node_range(node),
-                        Some(format!("interface {name}")),
-                        doc,
-                        module_path,
-                        Visibility::Public,
+                        (
+                            Some(format!("interface {name}")),
+                            doc,
+                            module_path,
+                            Visibility::Public,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -200,8 +201,7 @@ impl PhpParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -218,10 +218,12 @@ impl PhpParser {
                         SymbolKind::Trait,
                         file_id,
                         node_range(node),
-                        Some(format!("trait {name}")),
-                        doc,
-                        module_path,
-                        Visibility::Public,
+                        (
+                            Some(format!("trait {name}")),
+                            doc,
+                            module_path,
+                            Visibility::Public,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -236,10 +238,12 @@ impl PhpParser {
                         SymbolKind::Enum,
                         file_id,
                         node_range(node),
-                        Some(format!("enum {name}")),
-                        None,
-                        module_path,
-                        Visibility::Public,
+                        (
+                            Some(format!("enum {name}")),
+                            None,
+                            module_path,
+                            Visibility::Public,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -261,11 +265,7 @@ impl PhpParser {
                         name.to_string()
                     };
 
-                    let kind = if name == "__construct" {
-                        SymbolKind::Method
-                    } else {
-                        SymbolKind::Method
-                    };
+                    let kind = SymbolKind::Method;
 
                     let symbol = self.create_symbol(
                         counter.next_id(),
@@ -273,10 +273,12 @@ impl PhpParser {
                         kind,
                         file_id,
                         node_range(node),
-                        Some(format!("function {name}{params}")),
-                        doc,
-                        module_path,
-                        vis,
+                        (
+                            Some(format!("function {name}{params}")),
+                            doc,
+                            module_path,
+                            vis,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -298,8 +300,7 @@ impl PhpParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -333,10 +334,7 @@ impl PhpParser {
                             SymbolKind::Field,
                             file_id,
                             node_range(node),
-                            None,
-                            None,
-                            module_path,
-                            vis,
+                            (None, None, module_path, vis),
                         );
                         symbols.push(symbol);
                     }
@@ -370,10 +368,7 @@ impl PhpParser {
                         SymbolKind::Constant,
                         file_id,
                         node_range(node),
-                        None,
-                        None,
-                        module_path,
-                        Visibility::Public,
+                        (None, None, module_path, Visibility::Public),
                     );
                     symbols.push(symbol);
                 }
@@ -382,17 +377,15 @@ impl PhpParser {
     }
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     fn find_calls_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -427,14 +420,13 @@ impl PhpParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut imports = Vec::new();
         for child in tree.root_node().children(&mut tree.root_node().walk()) {
@@ -474,7 +466,6 @@ fn extract_php_namespace(root: Node, code: &str) -> Option<String> {
 fn determine_php_visibility(node: Node, code: &str) -> Visibility {
     // Inspect modifier AST nodes, not substrings of the declaration text (BUG-C1).
     match find_modifier_keyword(node, code, &["public", "protected", "private"]) {
-        Some("public") => Visibility::Public,
         Some("protected") => Visibility::Module,
         Some("private") => Visibility::Private,
         _ => Visibility::Public, // PHP default is public

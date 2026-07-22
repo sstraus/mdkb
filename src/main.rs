@@ -504,15 +504,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
         Command::Stats { no_color } => {
             let ctx = Context::open(&cwd)?;
             let report = mdkb::cli::stats_report::collect_report(&ctx)?;
-            match cli.format {
-                mdkb::cli::OutputFormat::Json => {
-                    println!("{}", serde_json::to_string_pretty(&report)?);
-                }
-                _ => {
-                    use std::io::IsTerminal;
-                    let color = !no_color && std::io::stdout().is_terminal();
-                    print!("{}", mdkb::cli::stats_render_report::render(&report, color));
-                }
+            if let mdkb::cli::OutputFormat::Json = cli.format {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                use std::io::IsTerminal;
+                let color = !no_color && std::io::stdout().is_terminal();
+                print!("{}", mdkb::cli::stats_render_report::render(&report, color));
             }
         }
         Command::Compact {
@@ -871,7 +868,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 }
                 GraphCommand::Path { a, b, max_hops } => {
                     let path = handle_graph_path(&ctx, &a, &b, max_hops)?;
-                    format_graph_path(&path, cli.format);
+                    format_graph_path(path.as_deref(), cli.format);
                 }
                 GraphCommand::Dangling => {
                     let dangling = handle_graph_dangling(&ctx)?;
@@ -1920,10 +1917,10 @@ fn format_graph_neighbors(neighbors: &[mdkb::store::graph::Neighbor], format: Ou
     }
 }
 
-fn format_graph_path(path: &Option<Vec<String>>, format: OutputFormat) {
+fn format_graph_path(path: Option<&[String]>, format: OutputFormat) {
     match format {
         OutputFormat::Json => {
-            println!("{}", serde_json::to_string_pretty(path).unwrap());
+            println!("{}", serde_json::to_string_pretty(&path).unwrap());
         }
         _ => match path {
             Some(nodes) => println!("{}", nodes.join(" -> ")),

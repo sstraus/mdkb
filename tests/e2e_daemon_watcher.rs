@@ -117,11 +117,10 @@ async fn two_clients_single_reindex() {
         if current > doc_before {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "DOC_REINDEX_COUNT did not increment within 10s (before={doc_before}, now={current})"
-            );
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "DOC_REINDEX_COUNT did not increment within 10s (before={doc_before}, now={current})"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -196,11 +195,10 @@ async fn injected_path_triggers_code_reindex() {
         if current > code_before {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "CODE_REINDEX_COUNT did not increment within 5s (before={code_before}, now={current})"
-            );
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "CODE_REINDEX_COUNT did not increment within 5s (before={code_before}, now={current})"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
@@ -286,9 +284,10 @@ async fn late_ctx_still_reindexes_injected_file() {
         if indexed {
             break;
         }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("late-ctx injected path was never reindexed");
-        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "late-ctx injected path was never reindexed"
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

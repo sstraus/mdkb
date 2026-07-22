@@ -45,11 +45,9 @@ impl JavaParser {
         kind: SymbolKind,
         file_id: FileId,
         range: Range,
-        signature: Option<String>,
-        doc_comment: Option<String>,
-        module_path: &str,
-        visibility: Visibility,
+        tail: (Option<String>, Option<String>, &str, Visibility),
     ) -> Symbol {
+        let (signature, doc_comment, module_path, visibility) = tail;
         let mut sym = Symbol::new(id, name, kind, file_id, range);
         sym.visibility = visibility;
         sym.scope_context = Some(self.context.current_scope_context());
@@ -74,9 +72,8 @@ impl JavaParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
 
         let mut symbols = Vec::new();
@@ -89,8 +86,7 @@ impl JavaParser {
             file_id,
             counter,
             &mut symbols,
-            module_path,
-            0,
+            (module_path, 0),
         );
         symbols
     }
@@ -102,9 +98,9 @@ impl JavaParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if !check_recursion_depth(depth, node) {
             return;
         }
@@ -132,8 +128,7 @@ impl JavaParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -165,8 +160,7 @@ impl JavaParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -204,8 +198,7 @@ impl JavaParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -234,8 +227,7 @@ impl JavaParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -264,10 +256,7 @@ impl JavaParser {
             SymbolKind::Class,
             file_id,
             node_range(node),
-            Some(signature),
-            doc,
-            module_path,
-            visibility,
+            (Some(signature), doc, module_path, visibility),
         ))
     }
 
@@ -291,10 +280,7 @@ impl JavaParser {
             SymbolKind::Interface,
             file_id,
             node_range(node),
-            Some(signature),
-            doc,
-            module_path,
-            visibility,
+            (Some(signature), doc, module_path, visibility),
         ))
     }
 
@@ -317,10 +303,7 @@ impl JavaParser {
             SymbolKind::Enum,
             file_id,
             node_range(node),
-            Some(format!("enum {name}")),
-            doc,
-            module_path,
-            visibility,
+            (Some(format!("enum {name}")), doc, module_path, visibility),
         ))
     }
 
@@ -356,10 +339,7 @@ impl JavaParser {
             kind,
             file_id,
             node_range(node),
-            Some(signature),
-            doc,
-            module_path,
-            visibility,
+            (Some(signature), doc, module_path, visibility),
         ))
     }
 
@@ -393,10 +373,12 @@ impl JavaParser {
             SymbolKind::Method,
             file_id,
             node_range(node),
-            Some(format!("{name}{params}")),
-            doc,
-            module_path,
-            visibility,
+            (
+                Some(format!("{name}{params}")),
+                doc,
+                module_path,
+                visibility,
+            ),
         ))
     }
 
@@ -440,10 +422,12 @@ impl JavaParser {
                         kind,
                         file_id,
                         node_range(child),
-                        Some(format!("{type_str} {name}")),
-                        None,
-                        module_path,
-                        visibility,
+                        (
+                            Some(format!("{type_str} {name}")),
+                            None,
+                            module_path,
+                            visibility,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -454,17 +438,15 @@ impl JavaParser {
     // ── Imports ─────────────────────────────────────────────────────────
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut imports = Vec::new();
-        self.find_imports_in_node(tree.root_node(), code, file_id, 0, &mut imports);
+        Self::find_imports_in_node(tree.root_node(), code, file_id, 0, &mut imports);
         imports
     }
 
     fn find_imports_in_node(
-        &self,
         node: Node,
         code: &str,
         file_id: FileId,
@@ -498,24 +480,22 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_imports_in_node(child, code, file_id, depth + 1, imports);
+            Self::find_imports_in_node(child, code, file_id, depth + 1, imports);
         }
     }
 
     // ── Calls ───────────────────────────────────────────────────────────
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     fn find_calls_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -544,24 +524,22 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
     // ── Method calls ────────────────────────────────────────────────────
 
     fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     fn find_method_calls_in_node(
-        &self,
         node: &Node,
         code: &str,
         current_fn: Option<&str>,
@@ -603,14 +581,13 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
     // ── Implementations (extends/implements) ────────────────────────────
 
     fn find_implementations_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -659,14 +636,13 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, depth + 1, results);
+            Self::find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 
     // ── Method defines ──────────────────────────────────────────────────
 
     fn find_defines_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -680,11 +656,7 @@ impl JavaParser {
             "class_declaration" | "interface_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let type_name = &code[name_node.byte_range()];
-                    let body_field = if node.kind() == "class_declaration" {
-                        "body"
-                    } else {
-                        "body"
-                    };
+                    let body_field = "body";
 
                     if let Some(body) = node.child_by_field_name(body_field) {
                         for child in body.children(&mut body.walk()) {
@@ -705,14 +677,13 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_defines_in_node(&child, code, depth + 1, defines);
+            Self::find_defines_in_node(&child, code, depth + 1, defines);
         }
     }
 
     // ── Type uses ───────────────────────────────────────────────────────
 
     fn find_uses_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -754,7 +725,7 @@ impl JavaParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_uses_in_node(&child, code, depth + 1, uses);
+            Self::find_uses_in_node(&child, code, depth + 1, uses);
         }
     }
 }
@@ -907,32 +878,29 @@ impl LanguageParser for JavaParser {
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
+        Self::find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 
     fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut uses = Vec::new();
-        self.find_uses_in_node(&tree.root_node(), code, 0, &mut uses);
+        Self::find_uses_in_node(&tree.root_node(), code, 0, &mut uses);
         uses
     }
 
     fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut defines = Vec::new();
-        self.find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
+        Self::find_defines_in_node(&tree.root_node(), code, 0, &mut defines);
         defines
     }
 

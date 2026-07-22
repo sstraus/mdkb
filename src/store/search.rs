@@ -13,6 +13,7 @@ use std::collections::HashMap;
 /// - Hyphenated words like "anti-CSRF" being parsed as negation
 /// - ALL CAPS words being interpreted as operators or column names
 /// - Special characters in the query
+///
 /// Split a query into whitespace terms, each safely double-quoted for FTS5.
 fn quote_fts5_terms(query: &str) -> Vec<String> {
     query

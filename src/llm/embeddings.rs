@@ -166,7 +166,7 @@ mod tests {
 
     // Integration tests that require model download
     #[test]
-    #[ignore]
+    #[ignore = "requires ONNX model download"]
     fn test_embed_query_returns_correct_dimension() {
         let service = EmbeddingService::new().unwrap();
         let embedding = service.embed_query("test query").unwrap();
@@ -174,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires ONNX model download"]
     fn test_embed_documents_batch() {
         let service = EmbeddingService::new().unwrap();
         let texts = vec!["first document", "second document", "third document"];
@@ -186,7 +186,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires ONNX model download"]
     fn test_embed_documents_empty() {
         let service = EmbeddingService::new().unwrap();
         let embeddings = service.embed_documents(&[]).unwrap();
@@ -194,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires ONNX model download"]
     fn test_similar_texts_have_higher_similarity() {
         let service = EmbeddingService::new().unwrap();
         let cat = service.embed_query("cat").unwrap();

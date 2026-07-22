@@ -322,6 +322,9 @@ pub struct SemanticMatch {
 /// Batch size for embedding generation to avoid loading all symbols at once.
 const EMBED_BATCH_SIZE: usize = 5000;
 
+type SymbolEmbedding = (u32, Vec<f32>);
+type EmbeddingCache = Mutex<Option<Vec<SymbolEmbedding>>>;
+
 /// Orchestrates embedding generation and brute-force search over code symbols.
 ///
 /// Acquires the embedding service on-demand from the global cache. The global
@@ -330,7 +333,7 @@ const EMBED_BATCH_SIZE: usize = 5000;
 pub struct SemanticSearch {
     store: VectorStore,
     /// Cached embeddings loaded from disk. Invalidated on write.
-    cache: Mutex<Option<Vec<(u32, Vec<f32>)>>>,
+    cache: EmbeddingCache,
 }
 
 impl std::fmt::Debug for SemanticSearch {
@@ -360,7 +363,7 @@ impl SemanticSearch {
     }
 
     /// Get the embedding service, initializing it if needed.
-    fn service(&self) -> anyhow::Result<Arc<EmbeddingService>> {
+    fn service() -> anyhow::Result<Arc<EmbeddingService>> {
         crate::llm::get_cached_service()
             .map_err(|e| anyhow::anyhow!("Failed to get embedding service: {e}"))
     }
@@ -377,7 +380,7 @@ impl SemanticSearch {
             return self.store.clear();
         }
 
-        let service = self.service()?;
+        let service = Self::service()?;
         let mut all_entries: Vec<(u32, Vec<f32>)> = Vec::with_capacity(symbols.len());
 
         for chunk in symbols.chunks(EMBED_BATCH_SIZE) {
@@ -433,7 +436,7 @@ impl SemanticSearch {
         let mut all_entries: Vec<(u32, Vec<f32>)> = existing.to_vec();
 
         if !new_symbols.is_empty() {
-            let service = self.service()?;
+            let service = Self::service()?;
             for chunk in new_symbols.chunks(EMBED_BATCH_SIZE) {
                 let texts: Vec<&str> = chunk.iter().map(|(_, text)| text.as_str()).collect();
                 let embeddings = service
@@ -467,7 +470,7 @@ impl SemanticSearch {
         threshold: f32,
     ) -> anyhow::Result<Vec<SemanticMatch>> {
         // Embed the query
-        let service = self.service()?;
+        let service = Self::service()?;
         let query_embedding = service
             .embed_query(query)
             .map_err(|e| anyhow::anyhow!("Failed to embed query: {e}"))?;
@@ -981,7 +984,7 @@ mod tests {
     // --- Integration tests (require model download) ---
 
     #[test]
-    #[ignore]
+    #[ignore = "requires ONNX model download"]
     fn test_semantic_search_basic() {
         let dir = tempfile::tempdir().unwrap();
         let search = SemanticSearch::new(dir.path().join("vectors.bin")).unwrap();
@@ -1006,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "requires ONNX model download"]
     fn test_semantic_search_threshold() {
         let dir = tempfile::tempdir().unwrap();
         let search = SemanticSearch::new(dir.path().join("vectors.bin")).unwrap();

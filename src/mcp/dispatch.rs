@@ -53,7 +53,7 @@ const MAX_HOOK_PROMPT_FINGERPRINTS: usize = 32;
 /// explicitly reset on a same-session Stop/wrapup; one that ends abnormally
 /// (client crash, kill, no Stop hook) would otherwise leak forever. An hour is
 /// far longer than any real session's inter-hook gap.
-const HOOK_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+const HOOK_SESSION_TTL: std::time::Duration = std::time::Duration::from_hours(1);
 
 /// Hard cap on live sessions as a safety net against a burst of distinct keys
 /// within the TTL window. When exceeded, the least-recently-touched session is
@@ -595,24 +595,45 @@ async fn embed_query_off_lock(query: &str) -> Option<Vec<f32>> {
 /// `embedding` must be pre-computed by the async caller **before** the ctx
 /// lock is acquired so that CPU-bound ONNX inference never blocks the tokio
 /// executor while holding the Mutex guard.
-fn write_single_memory(
-    conn: &rusqlite::Connection,
-    id: &str,
-    title: &str,
-    content: &str,
-    entry_type_str: &str,
-    source_type_str: &str,
-    tags: &[String],
+struct WriteSingleMemory<'a> {
+    id: &'a str,
+    title: &'a str,
+    content: &'a str,
+    entry_type: &'a str,
+    source_type: &'a str,
+    tags: &'a [String],
     ttl: Option<u64>,
     due_in: Option<u64>,
     embedding: Option<Vec<f32>>,
-    source_path: Option<&str>,
-    relates: &[RelatesInput],
-    session: Option<&str>,
-    agent: Option<&str>,
-    on_conflict: Option<&str>,
+    source_path: Option<&'a str>,
+    relates: &'a [RelatesInput],
+    session: Option<&'a str>,
+    agent: Option<&'a str>,
+    on_conflict: Option<&'a str>,
     dry_run: bool,
+}
+
+fn write_single_memory(
+    conn: &rusqlite::Connection,
+    input: WriteSingleMemory<'_>,
 ) -> Result<String, McpError> {
+    let WriteSingleMemory {
+        id,
+        title,
+        content,
+        entry_type: entry_type_str,
+        source_type: source_type_str,
+        tags,
+        ttl,
+        due_in,
+        embedding,
+        source_path,
+        relates,
+        session,
+        agent,
+        on_conflict,
+        dry_run,
+    } = input;
     memory::validate_entry_input(id, title, tags, content).map_err(|e| mcp_error(e.to_string()))?;
 
     let existing = memory::get_entry_without_tracking(conn, id)
@@ -687,7 +708,8 @@ fn write_single_memory(
                                 contradicts_target = Some(dup.id);
                                 break;
                             }
-                            let similarity = 1.0 - (*distance as f64 * *distance as f64 / 2.0);
+                            let similarity =
+                                1.0 - (f64::from(*distance) * f64::from(*distance) / 2.0);
                             return Err(mcp_error(format!(
                                 "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
                                  Update that entry instead, or use a more distinct title/content.",
@@ -861,21 +883,23 @@ pub async fn memory_write_impl(
 
     write_single_memory(
         &ctx.conn,
-        &entry.id,
-        &entry.title,
-        &content,
-        &entry.entry_type,
-        &entry.source_type,
-        &entry.tags,
-        entry.ttl,
-        entry.due_in,
-        embedding,
-        source_path.as_deref(),
-        &entry.relates,
-        session,
-        entry.agent.as_deref(),
-        entry.on_conflict.as_deref(),
-        dry_run,
+        WriteSingleMemory {
+            id: &entry.id,
+            title: &entry.title,
+            content: &content,
+            entry_type: &entry.entry_type,
+            source_type: &entry.source_type,
+            tags: &entry.tags,
+            ttl: entry.ttl,
+            due_in: entry.due_in,
+            embedding,
+            source_path: source_path.as_deref(),
+            relates: &entry.relates,
+            session,
+            agent: entry.agent.as_deref(),
+            on_conflict: entry.on_conflict.as_deref(),
+            dry_run,
+        },
     )
 }
 
@@ -946,28 +970,28 @@ pub async fn memory_write_batch_impl(
         .ok_or_else(|| mcp_error("Database not initialized"))?;
 
     let mut results = Vec::with_capacity(entries.len());
-    for ((entry, (content, source_path)), embedding) in entries
-        .iter()
-        .zip(resolved.iter())
-        .zip(embeddings.into_iter())
+    for ((entry, (content, source_path)), embedding) in
+        entries.iter().zip(resolved.iter()).zip(embeddings)
     {
         let result = write_single_memory(
             &ctx.conn,
-            &entry.id,
-            &entry.title,
-            content,
-            &entry.entry_type,
-            &entry.source_type,
-            &entry.tags,
-            entry.ttl,
-            entry.due_in,
-            embedding,
-            source_path.as_deref(),
-            &entry.relates,
-            session,
-            entry.agent.as_deref(),
-            entry.on_conflict.as_deref(),
-            dry_run,
+            WriteSingleMemory {
+                id: &entry.id,
+                title: &entry.title,
+                content,
+                entry_type: &entry.entry_type,
+                source_type: &entry.source_type,
+                tags: &entry.tags,
+                ttl: entry.ttl,
+                due_in: entry.due_in,
+                embedding,
+                source_path: source_path.as_deref(),
+                relates: &entry.relates,
+                session,
+                agent: entry.agent.as_deref(),
+                on_conflict: entry.on_conflict.as_deref(),
+                dry_run,
+            },
         )?;
         results.push(result);
     }
@@ -1151,13 +1175,10 @@ pub async fn search_impl(
             append_empty_index_hint(&mut output, total, &ctx.conn);
             Ok((output, total))
         }
-        Some("code") | Some("symbols") => {
+        Some("code" | "symbols") => {
             let mut idx_guard = acquire_handle_code_index(handle).await?;
-            let facade = match idx_guard.as_mut() {
-                Some(f) => f,
-                None => {
-                    return Ok(("Code index is being rebuilt, retry shortly.".to_string(), 0));
-                }
+            let Some(facade) = idx_guard.as_mut() else {
+                return Ok(("Code index is being rebuilt, retry shortly.".to_string(), 0));
             };
 
             if scope == Some("code") {
@@ -1270,7 +1291,7 @@ pub async fn cross_repo_search_impl(
     let scope = params.scope.as_deref();
     let limit = params.limit.min(100);
 
-    if matches!(scope, Some("code") | Some("symbols")) {
+    if matches!(scope, Some("code" | "symbols")) {
         return Err(mcp_error(
             "Cross-repo search is not supported for code/symbols scope. Specify a root.",
         ));
@@ -1305,9 +1326,8 @@ pub async fn cross_repo_search_impl(
             };
 
             let ctx_guard = handle.ctx.lock().await;
-            let ctx = match ctx_guard.as_ref() {
-                Some(ctx) => ctx,
-                None => return Vec::new(),
+            let Some(ctx) = ctx_guard.as_ref() else {
+                return Vec::new();
             };
 
             let repo_tag = handle.root.display().to_string();
@@ -1361,7 +1381,7 @@ pub async fn cross_repo_search_impl(
                                     repo_root: Some(repo_tag),
                                 };
                                 if let Some(e) = entries.first() {
-                                    pseudo.path = e.id.clone();
+                                    pseudo.path.clone_from(&e.id);
                                     pseudo.title = Some(e.title.clone());
                                 }
                                 repo_results.push(pseudo);
@@ -1889,7 +1909,7 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
                         sr.added, sr.updated, sr.unchanged, sr.sessions_archived
                     )
                 }
-                Ok(Some(Ok(_))) | Ok(None) => String::new(),
+                Ok(Some(Ok(_)) | None) => String::new(),
                 Ok(Some(Err(e))) => {
                     tracing::warn!("Session indexing failed: {e}");
                     String::new()
@@ -1931,9 +1951,8 @@ pub async fn symbols_in_file_impl(
     params: &SymbolsInFileParams,
 ) -> Result<String, McpError> {
     let idx_guard = acquire_handle_code_index(handle).await?;
-    let facade = match idx_guard.as_ref() {
-        Some(f) => f,
-        None => return Err(mcp_error("code index not available — run `update` first")),
+    let Some(facade) = idx_guard.as_ref() else {
+        return Err(mcp_error("code index not available — run `update` first"));
     };
     let symbols = facade
         .db()
@@ -1949,9 +1968,8 @@ pub async fn code_find_impl(
     params: &CodeFindParams,
 ) -> Result<String, McpError> {
     let idx_guard = acquire_handle_code_index(handle).await?;
-    let facade = match idx_guard.as_ref() {
-        Some(f) => f,
-        None => return Err(mcp_error("code index not available — run `update` first")),
+    let Some(facade) = idx_guard.as_ref() else {
+        return Err(mcp_error("code index not available — run `update` first"));
     };
 
     let mut results = facade.find_symbols_by_name(&params.name);
@@ -1979,9 +1997,8 @@ pub async fn symbol_at_position_impl(
     params: &SymbolAtPositionParams,
 ) -> Result<String, McpError> {
     let idx_guard = acquire_handle_code_index(handle).await?;
-    let facade = match idx_guard.as_ref() {
-        Some(f) => f,
-        None => return Err(mcp_error("code index not available — run `update` first")),
+    let Some(facade) = idx_guard.as_ref() else {
+        return Err(mcp_error("code index not available — run `update` first"));
     };
     let symbol = facade
         .db()
@@ -2160,9 +2177,8 @@ pub async fn code_graph_impl(
     params: &CodeGraphParams,
 ) -> Result<String, McpError> {
     let idx_guard = acquire_handle_code_index(handle).await?;
-    let facade = match idx_guard.as_ref() {
-        Some(f) => f,
-        None => return Ok("Code index is being rebuilt, retry shortly.".to_string()),
+    let Some(facade) = idx_guard.as_ref() else {
+        return Ok("Code index is being rebuilt, retry shortly.".to_string());
     };
 
     let symbol = super::server::McpServer::resolve_symbol(facade, &params.name, params.symbol_id)?;
@@ -2274,19 +2290,19 @@ pub async fn usage_impl(
         Vec::new()
     };
 
-    let lifetime = if !params.session_only {
+    let lifetime = if params.session_only {
+        None
+    } else {
         Some(
             stats::get_aggregate_stats(&ctx.conn)
                 .map_err(|e| mcp_error(format!("Failed to read lifetime stats: {e}")))?,
         )
-    } else {
-        None
     };
-    let lifetime_tool_usage = if !params.session_only {
+    let lifetime_tool_usage = if params.session_only {
+        Vec::new()
+    } else {
         stats::get_aggregate_tool_usage(&ctx.conn)
             .map_err(|e| mcp_error(format!("Failed to read lifetime tool usage: {e}")))?
-    } else {
-        Vec::new()
     };
 
     let primary_tools = if params.session_only {
@@ -2439,12 +2455,12 @@ fn is_high_confidence_prior(entry: &crate::store::memory::MemoryEntry, now: i64)
 
 /// Rank merged warmup entries: drop sub-floor entries (when `min_confidence`
 /// > 0.0), order by `access_count DESC` with `confidence_at` as tie-breaker,
-/// reserve at most one slot for the single highest-confidence curated prior
-/// (confidence >= gate) so it can appear without crowding out hot entries, then
-/// truncate to `limit`.
-/// A handoff whose stripped body is shorter than this is treated as "empty" (an
-/// auto-handoff that captured no real state): its body is not injected as the
-/// session-start handoff block.
+/// > reserve at most one slot for the single highest-confidence curated prior
+/// > (confidence >= gate) so it can appear without crowding out hot entries, then
+/// > truncate to `limit`.
+/// > A handoff whose stripped body is shorter than this is treated as "empty" (an
+/// > auto-handoff that captured no real state): its body is not injected as the
+/// > session-start handoff block.
 const HANDOFF_MIN_BODY_CHARS: usize = 80;
 
 fn rank_warmup_entries(
@@ -2589,7 +2605,7 @@ fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
             }
             Ok(Err(e)) => tracing::error!("SessionStart code refresh failed: {e}"),
             Err(_) => {
-                tracing::error!("SessionStart code refresh panicked; restoring index handle")
+                tracing::error!("SessionStart code refresh panicked; restoring index handle");
             }
         }
 
@@ -3360,27 +3376,24 @@ fn tail_lines(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
+pub fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
     if !handle.config.hooks.post_tool_use_enabled {
         return json!({});
     }
-    let tool_name = match event.get("tool_name").and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => return json!({}),
+    let Some(tool_name) = event.get("tool_name").and_then(|v| v.as_str()) else {
+        return json!({});
     };
     if !REINDEX_TOOLS.contains(&tool_name) {
         return json!({});
     }
-    let raw_path = match event.get("tool_input").and_then(tool_input_path) {
-        Some(p) => p,
-        None => return json!({}),
+    let Some(raw_path) = event.get("tool_input").and_then(tool_input_path) else {
+        return json!({});
     };
-    let path = match canonicalize_under_cwd(&handle.root, &raw_path) {
-        Some(p) => std::path::PathBuf::from(p),
-        None => {
-            tracing::warn!("hook.post_tool_use: rejected path outside root: {raw_path}");
-            return json!({});
-        }
+    let path = if let Some(p) = canonicalize_under_cwd(&handle.root, &raw_path) {
+        std::path::PathBuf::from(p)
+    } else {
+        tracing::warn!("hook.post_tool_use: rejected path outside root: {raw_path}");
+        return json!({});
     };
     if let Err(e) = handle.reindex_tx.try_send(path) {
         // Bounded logging: warn once per failure episode, not on every edit (the
@@ -3410,13 +3423,11 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
     if !handle.config.hooks.pre_tool_use_enabled {
         return json!({});
     }
-    let tool_name = match event.get("tool_name").and_then(|v| v.as_str()) {
-        Some(t) => t,
-        None => return json!({}),
+    let Some(tool_name) = event.get("tool_name").and_then(|v| v.as_str()) else {
+        return json!({});
     };
-    let tool_input = match event.get("tool_input") {
-        Some(v) => v,
-        None => return json!({}),
+    let Some(tool_input) = event.get("tool_input") else {
+        return json!({});
     };
     let bin = std::env::current_exe()
         .ok()
@@ -3663,7 +3674,7 @@ pub async fn dispatch_call(
                 .unwrap_or(false);
             let entry: MemoryWriteBatchEntry = serde_json::from_value(params)
                 .map_err(|e| mcp_error(format!("memory_write: invalid params: {e}")))?;
-            let session = session_provenance(&dctx);
+            let session = session_provenance(dctx);
             let text = memory_write_impl(&handle, &entry, session.as_deref(), dry_run).await?;
             let tokens = count_tokens(&text);
             dctx.record_persistent_call(&handle, "memory_write", tokens, 1, false)
@@ -3681,7 +3692,7 @@ pub async fn dispatch_call(
                 .ok_or_else(|| mcp_error("memory_write_batch: missing 'entries'"))?;
             let entries: Vec<MemoryWriteBatchEntry> = serde_json::from_value(entries_value)
                 .map_err(|e| mcp_error(format!("memory_write_batch: invalid 'entries': {e}")))?;
-            let session = session_provenance(&dctx);
+            let session = session_provenance(dctx);
             let (text, count) =
                 memory_write_batch_impl(&handle, &entries, session.as_deref(), dry_run).await?;
             let tokens = count_tokens(&text);
@@ -3808,7 +3819,7 @@ pub async fn dispatch_call(
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || {
-                log_hook_event(root, "session_start", outcome, ms, budget)
+                log_hook_event(root, "session_start", outcome, ms, budget);
             });
             record_hook_call(&handle, tool_name).await;
             Ok(result)
@@ -3831,14 +3842,14 @@ pub async fn dispatch_call(
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || {
-                log_hook_event(root, "user_prompt_submit", outcome, ms, budget)
+                log_hook_event(root, "user_prompt_submit", outcome, ms, budget);
             });
             record_hook_call(&handle, tool_name).await;
             Ok(result)
         }
         "hook.post_tool_use" => {
             let t0 = std::time::Instant::now();
-            let result = hook_post_tool_use_impl(&handle, &params).await;
+            let result = hook_post_tool_use_impl(&handle, &params);
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) {
                 "skipped"
@@ -3848,7 +3859,7 @@ pub async fn dispatch_call(
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || {
-                log_hook_event(root, "post_tool_use", outcome, ms, budget)
+                log_hook_event(root, "post_tool_use", outcome, ms, budget);
             });
             record_hook_call(&handle, tool_name).await;
             Ok(json!({}))
@@ -3877,7 +3888,7 @@ pub async fn dispatch_call(
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || {
-                log_hook_event(root, "pre_tool_use", outcome, ms, budget)
+                log_hook_event(root, "pre_tool_use", outcome, ms, budget);
             });
             record_hook_call(&handle, tool_name).await;
             Ok(result)
@@ -3910,7 +3921,6 @@ pub async fn dispatch_call(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use std::sync::atomic::AtomicBool;
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
@@ -5676,21 +5686,23 @@ mod tests {
         // Original entry with a stored embedding.
         write_single_memory(
             conn,
-            "orig-dup",
-            "Orig",
-            "Auth notes",
-            "topic",
-            "user_statement",
-            &[],
-            None,
-            None,
-            Some(emb.clone()),
-            None,
-            &[],
-            None,
-            None,
-            None,
-            false,
+            WriteSingleMemory {
+                id: "orig-dup",
+                title: "Orig",
+                content: "Auth notes",
+                entry_type: "topic",
+                source_type: "user_statement",
+                tags: &[],
+                ttl: None,
+                due_in: None,
+                embedding: Some(emb.clone()),
+                source_path: None,
+                relates: &[],
+                session: None,
+                agent: None,
+                on_conflict: None,
+                dry_run: false,
+            },
         )
         .expect("orig write");
 
@@ -5698,21 +5710,23 @@ mod tests {
         // records a contradicts edge to the similar one, returning both ids.
         let out = write_single_memory(
             conn,
-            "new-dup",
-            "New",
-            "Auth notes v2",
-            "topic",
-            "user_statement",
-            &[],
-            None,
-            None,
-            Some(emb.clone()),
-            None,
-            &[],
-            None,
-            None,
-            Some("contradicts"),
-            false,
+            WriteSingleMemory {
+                id: "new-dup",
+                title: "New",
+                content: "Auth notes v2",
+                entry_type: "topic",
+                source_type: "user_statement",
+                tags: &[],
+                ttl: None,
+                due_in: None,
+                embedding: Some(emb.clone()),
+                source_path: None,
+                relates: &[],
+                session: None,
+                agent: None,
+                on_conflict: Some("contradicts"),
+                dry_run: false,
+            },
         )
         .expect("contradicts write");
         assert!(out.contains("new-dup"), "new id in output: {out}");
@@ -5726,21 +5740,23 @@ mod tests {
         // Default (on_conflict absent): a near-duplicate is rejected verbatim.
         let err = write_single_memory(
             conn,
-            "third-dup",
-            "Third",
-            "Auth notes v3",
-            "topic",
-            "user_statement",
-            &[],
-            None,
-            None,
-            Some(emb.clone()),
-            None,
-            &[],
-            None,
-            None,
-            None,
-            false,
+            WriteSingleMemory {
+                id: "third-dup",
+                title: "Third",
+                content: "Auth notes v3",
+                entry_type: "topic",
+                source_type: "user_statement",
+                tags: &[],
+                ttl: None,
+                due_in: None,
+                embedding: Some(emb.clone()),
+                source_path: None,
+                relates: &[],
+                session: None,
+                agent: None,
+                on_conflict: None,
+                dry_run: false,
+            },
         )
         .unwrap_err();
         assert!(
@@ -6163,7 +6179,7 @@ mod tests {
         let body = usage_impl(&handle, &params, 0).await.expect("usage impl");
         let parsed: Value = serde_json::from_str(&body).expect("json");
 
-        assert!(parsed.get("session").map_or(false, Value::is_null));
+        assert!(parsed.get("session").is_some_and(Value::is_null));
         assert_eq!(parsed["per_tool"].as_array().map(Vec::len), Some(0));
         assert_eq!(
             parsed["top_5_most_called"].as_array().map(Vec::len),
@@ -6843,7 +6859,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let event = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
-        let result = hook_post_tool_use_impl(&handle, &event).await;
+        let result = hook_post_tool_use_impl(&handle, &event);
         assert_eq!(result, json!({}));
     }
 
@@ -6859,7 +6875,7 @@ mod tests {
             "tool_name": "Write",
             "tool_input": {"file_path": file.to_str().unwrap()},
         });
-        let result = hook_post_tool_use_impl(&handle, &event).await;
+        let result = hook_post_tool_use_impl(&handle, &event);
         assert_eq!(
             result,
             json!({"queued": true}),
@@ -7022,7 +7038,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires ONNX model download (see tests/e2e_llm.rs convention)
+    #[ignore = "requires ONNX model download (see tests/e2e_llm.rs convention)"]
     async fn embeds_run_concurrently_off_the_runtime() {
         // PERF-A1 proof: embedding is on the blocking pool, not serialized by
         // the async runtime or a shared lock. N concurrent embeds must overlap,

@@ -183,7 +183,7 @@ impl MemoryEntry {
     /// Calculate confidence at a specific timestamp (for testing).
     pub fn confidence_at(&self, now: i64) -> f64 {
         // Belief: sigmoid over confirmations. 0 confirms = 0.5, 10 = 0.91, 50 = 0.98.
-        let belief = (1.0 + self.confirmations as f64) / (2.0 + self.confirmations as f64);
+        let belief = (1.0 + f64::from(self.confirmations)) / (2.0 + f64::from(self.confirmations));
 
         // Temporal decay: how fresh is the verification?
         let reference_time = self.last_confirmed_at.unwrap_or(self.created_at);
@@ -460,7 +460,7 @@ pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> 
         params![delta, now, new_status, id],
     )?;
 
-    let new_count = (entry.confirmations as i64 + delta as i64).max(0) as u32;
+    let new_count = (i64::from(entry.confirmations) + i64::from(delta)).max(0) as u32;
     if entry.status == EntryStatus::Archived && delta > 0 {
         Ok(format!("Confirmed and restored to active: {id}"))
     } else if delta >= 0 {
@@ -858,7 +858,7 @@ pub fn find_similar_entries(
             }
             if let Ok(Some(sim_entry)) = get_entry_by_rowid(conn, *sim_rowid) {
                 if sim_entry.id != exclude_id {
-                    let similarity = 1.0 - (*distance as f64 * *distance as f64 / 2.0);
+                    let similarity = 1.0 - (f64::from(*distance) * f64::from(*distance) / 2.0);
                     warnings.push_str(&format!(
                         "\nSimilar entry exists: {} (similarity: {:.2}). Consider updating it instead.",
                         sim_entry.id, similarity
@@ -1014,9 +1014,8 @@ pub fn search_entries_hybrid_fts(
     };
 
     // If no embedding provided, fall back to BM25-only
-    let query_embedding = match query_embedding {
-        Some(emb) => emb,
-        None => return Ok(bm25_fallback(bm25_results)),
+    let Some(query_embedding) = query_embedding else {
+        return Ok(bm25_fallback(bm25_results));
     };
 
     // Vector search
@@ -1030,8 +1029,7 @@ pub fn search_entries_hybrid_fts(
     // Build SearchResult wrappers for BM25 (RRF needs SearchResult with i64 id)
     let bm25_for_rrf: Vec<crate::domain::SearchResult> = bm25_results
         .iter()
-        .enumerate()
-        .map(|(_, (rowid, _))| crate::domain::SearchResult {
+        .map(|(rowid, _)| crate::domain::SearchResult {
             id: *rowid,
             collection: String::new(),
             path: String::new(),
@@ -1283,7 +1281,7 @@ fn drive_backfill(
     for (rowid, title, content) in rows {
         match embed(rowid, &title, &content)? {
             EmbedOutcome::Embedded => embedded += 1,
-            EmbedOutcome::RowFailed => continue, // skip poison row, keep going
+            EmbedOutcome::RowFailed => {} // skip poison row, keep going
             EmbedOutcome::ModelUnavailable => break, // model cold — retry next pass
         }
     }
@@ -1468,7 +1466,7 @@ pub fn count_active_entries(conn: &Connection) -> Result<usize> {
 /// Returns the list of pruned entry IDs.
 pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<String>> {
     let now = Utc::now().timestamp();
-    let cutoff = now - (days as i64 * 24 * 60 * 60);
+    let cutoff = now - (i64::from(days) * 24 * 60 * 60);
 
     conn.execute("SAVEPOINT prune_entries", [])?;
     let result = (|| -> Result<Vec<String>> {
@@ -1925,7 +1923,7 @@ mod tests {
                     &format!("rem-{i:02}"),
                     &format!("Due {i}"),
                     "body",
-                    Some(now - 1000 + i as i64),
+                    Some(now - 1000 + i64::from(i)),
                     now,
                 ),
             )
@@ -3006,7 +3004,7 @@ mod tests {
 
     #[test]
     fn test_validate_entry_too_many_tags() {
-        let tags: Vec<String> = (0..MAX_TAGS + 1).map(|i| format!("tag-{i}")).collect();
+        let tags: Vec<String> = (0..=MAX_TAGS).map(|i| format!("tag-{i}")).collect();
         let err = validate_entry_input("ok-id", "Title", &tags, "content").unwrap_err();
         assert!(err.to_string().contains("Too many tags"), "{err}");
     }
@@ -3985,9 +3983,9 @@ mod tests {
 
     #[test]
     fn test_access_recency_score_zero_when_never_accessed() {
-        assert_eq!(access_recency_score(0, None, 1_000, 2_592_000), 0.0);
-        assert_eq!(access_recency_score(5, None, 1_000, 2_592_000), 0.0);
-        assert_eq!(access_recency_score(0, Some(900), 1_000, 2_592_000), 0.0);
+        assert!(access_recency_score(0, None, 1_000, 2_592_000).abs() < f64::EPSILON);
+        assert!(access_recency_score(5, None, 1_000, 2_592_000).abs() < f64::EPSILON);
+        assert!(access_recency_score(0, Some(900), 1_000, 2_592_000).abs() < f64::EPSILON);
     }
 
     #[test]

@@ -489,7 +489,7 @@ pub struct QueryMetricsSummary {
 
 /// Get comprehensive query metrics for a period.
 pub fn get_query_metrics(conn: &Connection, days: u32) -> Result<QueryMetricsSummary> {
-    let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 24 * 60 * 60);
+    let cutoff = chrono::Utc::now().timestamp() - (i64::from(days) * 24 * 60 * 60);
 
     // Total queries
     let total_queries: i64 = conn.query_row(
@@ -603,7 +603,7 @@ fn get_percentile(conn: &Connection, cutoff: i64, percentile: u8) -> Result<i64>
         return Ok(0);
     }
 
-    let offset = (total as f64 * (percentile as f64 / 100.0)).floor() as i64;
+    let offset = (total as f64 * (f64::from(percentile) / 100.0)).floor() as i64;
 
     let result: i64 = conn.query_row(
         r#"
@@ -621,7 +621,7 @@ fn get_percentile(conn: &Connection, cutoff: i64, percentile: u8) -> Result<i64>
 
 /// Export query events for a period.
 pub fn export_query_events(conn: &Connection, days: u32) -> Result<Vec<QueryEvent>> {
-    let cutoff = chrono::Utc::now().timestamp() - (days as i64 * 24 * 60 * 60);
+    let cutoff = chrono::Utc::now().timestamp() - (i64::from(days) * 24 * 60 * 60);
 
     let mut stmt = conn.prepare(
         r#"
@@ -889,8 +889,8 @@ mod tests {
                 query_hash: hash_query(&format!("query {i}")),
                 query_text: format!("query {i}"),
                 search_type: "hybrid".to_string(),
-                result_count: i as i64,
-                latency_ms: 10 + i as i64 * 5,
+                result_count: i64::from(i),
+                latency_ms: 10 + i64::from(i) * 5,
                 top_score: Some(0.8),
                 session_id: None,
             };
@@ -903,7 +903,7 @@ mod tests {
                 query_text: format!("bm25 query {i}"),
                 search_type: "bm25".to_string(),
                 result_count: 1,
-                latency_ms: 5 + i as i64 * 2,
+                latency_ms: 5 + i64::from(i) * 2,
                 top_score: Some(0.9),
                 session_id: None,
             };
@@ -1240,19 +1240,16 @@ pub fn get_variant_stats(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     );
 
-    let (sample_count, avg_score, avg_latency, zero_results) = match result {
-        Ok(r) => r,
-        Err(_) => {
-            return Ok(VariantStats {
-                variant: variant.to_string(),
-                sample_count: 0,
-                avg_score: 0.0,
-                avg_latency_ms: 0.0,
-                p95_latency_ms: 0,
-                zero_result_rate: 0.0,
-                score_variance: 0.0,
-            });
-        }
+    let Ok((sample_count, avg_score, avg_latency, zero_results)) = result else {
+        return Ok(VariantStats {
+            variant: variant.to_string(),
+            sample_count: 0,
+            avg_score: 0.0,
+            avg_latency_ms: 0.0,
+            p95_latency_ms: 0,
+            zero_result_rate: 0.0,
+            score_variance: 0.0,
+        });
     };
 
     if sample_count == 0 {
@@ -1359,7 +1356,7 @@ pub fn calculate_significance(
     let p_value = 2.0 * (1.0 - normal_cdf(t_stat.abs()));
 
     // Effect size (Cohen's d)
-    let pooled_sd = ((var_a + var_b) / 2.0).sqrt();
+    let pooled_sd = f64::midpoint(var_a, var_b).sqrt();
     let effect_size = if pooled_sd > 0.0 {
         (stats_a.avg_score - stats_b.avg_score).abs() / pooled_sd
     } else {
@@ -1391,12 +1388,12 @@ pub fn calculate_significance(
 /// Approximate normal CDF for p-value calculation.
 fn normal_cdf(x: f64) -> f64 {
     // Using the approximation from Abramowitz and Stegun
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
+    let a1 = 0.254_829_592;
+    let a2 = -0.284_496_736;
+    let a3 = 1.421_413_741;
+    let a4 = -1.453_152_027;
+    let a5 = 1.061_405_429;
+    let p = 0.327_591_1;
 
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
     let x = x.abs() / std::f64::consts::SQRT_2;
@@ -1412,9 +1409,8 @@ pub fn get_experiment_status(
     conn: &Connection,
     name: &str,
 ) -> Result<Option<ExperimentStatusReport>> {
-    let experiment = match get_experiment(conn, name)? {
-        Some(e) => e,
-        None => return Ok(None),
+    let Some(experiment) = get_experiment(conn, name)? else {
+        return Ok(None);
     };
 
     let variant_a = get_variant_stats(conn, experiment.id, "A")?;
@@ -1463,12 +1459,11 @@ pub fn end_experiment(conn: &Connection, name: &str, winner: Option<&str>) -> Re
                 "Experiment '{}' is not running (may already be completed or cancelled)",
                 name
             )));
-        } else {
-            return Err(crate::Error::config(format!(
-                "Experiment '{}' not found",
-                name
-            )));
         }
+        return Err(crate::Error::config(format!(
+            "Experiment '{}' not found",
+            name
+        )));
     }
 
     Ok(())
@@ -1499,12 +1494,11 @@ pub fn cancel_experiment(conn: &Connection, name: &str) -> Result<()> {
                 "Experiment '{}' is not running (may already be completed or cancelled)",
                 name
             )));
-        } else {
-            return Err(crate::Error::config(format!(
-                "Experiment '{}' not found",
-                name
-            )));
         }
+        return Err(crate::Error::config(format!(
+            "Experiment '{}' not found",
+            name
+        )));
     }
 
     Ok(())
@@ -1579,7 +1573,7 @@ mod experiment_tests {
         let exp = get_experiment(&conn, "test-exp").unwrap().unwrap();
         assert_eq!(exp.name, "test-exp");
         assert_eq!(exp.status, ExperimentStatus::Running);
-        assert_eq!(exp.traffic_split, 0.5);
+        assert!((exp.traffic_split - 0.5).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1612,8 +1606,8 @@ mod experiment_tests {
                 experiment_id: exp_id,
                 variant: "A".to_string(),
                 query_hash: format!("hash-a-{i}"),
-                latency_ms: 10 + i as i64,
-                score: 0.7 + (i as f64 * 0.01),
+                latency_ms: 10 + i64::from(i),
+                score: 0.7 + (f64::from(i) * 0.01),
                 result_count: 5,
                 created_at: 0,
             };
@@ -1626,8 +1620,8 @@ mod experiment_tests {
                 experiment_id: exp_id,
                 variant: "B".to_string(),
                 query_hash: format!("hash-b-{i}"),
-                latency_ms: 15 + i as i64,
-                score: 0.8 + (i as f64 * 0.01),
+                latency_ms: 15 + i64::from(i),
+                score: 0.8 + (f64::from(i) * 0.01),
                 result_count: 6,
                 created_at: 0,
             };

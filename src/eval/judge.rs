@@ -41,6 +41,7 @@ pub trait Judge {
 /// Deterministic judge: `Correct` iff `expected` appears (case-insensitively)
 /// in any retrieved entry. No model, no network — this is the reproducible
 /// baseline judge and the one the tests exercise.
+#[derive(Debug)]
 pub struct SubstringJudge;
 
 impl Judge for SubstringJudge {
@@ -105,7 +106,7 @@ mod tests {
 
     #[test]
     fn judge_accuracy_is_fraction_correct() {
-        assert_eq!(judge_accuracy(&[]), 0.0);
+        assert!(judge_accuracy(&[]).abs() < f64::EPSILON);
         assert!((judge_accuracy(&[Verdict::Correct, Verdict::Incorrect]) - 0.5).abs() < 1e-9);
         assert!(
             (judge_accuracy(&[Verdict::Correct, Verdict::Correct, Verdict::Incorrect]) - 2.0 / 3.0)

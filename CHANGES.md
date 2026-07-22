@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.7.6 (2026-07-22)
+
+### Changed
+
+- **Rust lint and API hardening.** Apply project-wide Clippy cleanups across
+  parsers, storage, daemon, MCP, and tests, including explicit conversion,
+  result-use, async-lock, and floating-point assertion handling. No runtime
+  behavior changes are intended.
+
+### Fixed
+
+- **Quarantine artifacts are collision-safe and transactional.** Preserve every
+  forensic copy when multiple recoveries share a timestamp, move WAL/SHM
+  sidecars with the database, and roll back partial moves on filesystem errors.
+
 ## 3.7.5 (2026-07-22)
 
 ### Fixed

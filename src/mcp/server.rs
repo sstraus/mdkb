@@ -996,9 +996,9 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 let _doc_guard = super::dispatch::ActiveFlagGuard::from_armed(
                     startup_server.doc_reindex_active.clone(),
                 );
-                if let Some(mut ctx) = taken_ctx {
+                if let Some(ctx) = taken_ctx {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        match handle_update(&mut ctx, &startup_root) {
+                        match handle_update(&ctx, &startup_root) {
                             Ok(result) => {
                                 if result.added > 0 || result.updated > 0 || result.removed > 0 {
                                     tracing::info!(
@@ -1082,7 +1082,7 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                     }
                     Ok(Err(e)) => tracing::error!("Startup code reindex failed: {}", e),
                     Err(_) => {
-                        tracing::error!("Startup code reindex panicked; restoring index handle")
+                        tracing::error!("Startup code reindex panicked; restoring index handle");
                     }
                 }
 
@@ -1406,23 +1406,20 @@ pub async fn run_file_watcher_inner(
             // Pending batch — accumulate more events or flush after idle timeout.
             tokio::select! {
                 change = watcher.recv() => {
-                    match change {
-                        Some(change) => {
-                            tracing::debug!("File change detected: {:?}", change.path);
-                            let (is_code, is_doc) = classify_change(&change.path, &collection_paths, &code_excludes);
-                            if is_code { code_batch.push(change.path.clone()); }
-                            if is_doc { needs_doc_update = true; }
-                            if !is_code && !is_doc {
-                                tracing::debug!("Ignoring non-code, non-doc change: {:?}", change.path);
-                            }
+                    if let Some(change) = change {
+                        tracing::debug!("File change detected: {:?}", change.path);
+                        let (is_code, is_doc) = classify_change(&change.path, &collection_paths, &code_excludes);
+                        if is_code { code_batch.push(change.path.clone()); }
+                        if is_doc { needs_doc_update = true; }
+                        if !is_code && !is_doc {
+                            tracing::debug!("Ignoring non-code, non-doc change: {:?}", change.path);
                         }
-                        None => {
-                            tracing::error!(
-                                "Watcher: FSEvents stream closed; file-change watching stopped \
-                                 for this repo (restart the daemon to restore it)."
-                            );
-                            break;
-                        }
+                    } else {
+                        tracing::error!(
+                            "Watcher: FSEvents stream closed; file-change watching stopped \
+                             for this repo (restart the daemon to restore it)."
+                        );
+                        break;
                     }
                 }
                 path = recv_injected!() => {
@@ -1436,7 +1433,7 @@ pub async fn run_file_watcher_inner(
                         }
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(batch_idle_ms)) => {
+                () = tokio::time::sleep(std::time::Duration::from_millis(batch_idle_ms)) => {
                     if watcher.take_missed_events() {
                         // The watcher dropped events under backpressure; the batch
                         // is an incomplete view, so rescan everything instead.
@@ -1621,7 +1618,7 @@ When you see one:
 /// Add new variants here for A/B testing, then validate with `e2e_search_behaviour` tests.
 fn select_base_instructions() -> &'static str {
     static VARIANT: std::sync::OnceLock<&str> = std::sync::OnceLock::new();
-    *VARIANT.get_or_init(
+    VARIANT.get_or_init(
         || match std::env::var("MDKB_INSTRUCTIONS_VARIANT").as_deref() {
             Ok("default") | Err(_) => BASE_INSTRUCTIONS,
             Ok(variant) => {
@@ -2249,9 +2246,9 @@ mod tests {
             match result {
                 Ok(Ok(_)) => {} // Success
                 Ok(Err(e)) => panic!("Tool call {} failed with error: {:?}", i, e),
-                Err(_) => panic!(
-                    "Tool call {} timed out after {:?} - likely deadlock!",
-                    i, timeout_duration
+                Err(error) => panic!(
+                    "Tool call {} timed out after {:?} - likely deadlock: {error}",
+                    i, timeout_duration,
                 ),
             }
         }
@@ -2342,7 +2339,7 @@ mod tests {
         let timeout_duration = Duration::from_secs(5);
 
         // Call status tool multiple times to verify no deadlock
-        let tools_to_test = vec!["status", "status", "status"];
+        let tools_to_test = ["status", "status", "status"];
 
         for (i, tool_name) in tools_to_test.iter().enumerate() {
             let result = match *tool_name {
@@ -2356,9 +2353,12 @@ mod tests {
             };
 
             match result {
-                Ok(Ok(_)) => {} // Success
+                Ok(Ok(())) => {} // Success
                 Ok(Err(e)) => panic!("Tool {} ({}) failed: {:?}", tool_name, i, e),
-                Err(_) => panic!("Tool {} ({}) timed out - likely deadlock!", tool_name, i),
+                Err(error) => panic!(
+                    "Tool {} ({}) timed out - likely deadlock: {error}",
+                    tool_name, i
+                ),
             }
         }
     }
@@ -2426,7 +2426,7 @@ mod tests {
                 );
             }
             Ok(Err(e)) => panic!("memory_delete failed: {:?}", e),
-            Err(_) => panic!("memory_delete timed out - likely deadlock!"),
+            Err(error) => panic!("memory_delete timed out - likely deadlock: {error}"),
         }
 
         // Verify it's gone - get should return not found
@@ -3972,8 +3972,8 @@ if (require.main === module) {
         crate::store::collections::add_collection(&ctx.conn, &coll).unwrap();
         drop(ctx);
         {
-            let mut ctx = crate::cli::handlers::Context::open(&root).unwrap();
-            crate::cli::handlers::handle_update(&mut ctx, &root).unwrap();
+            let ctx = crate::cli::handlers::Context::open(&root).unwrap();
+            crate::cli::handlers::handle_update(&ctx, &root).unwrap();
         }
 
         // Standalone server — no registry, no root param
@@ -4037,8 +4037,8 @@ if (require.main === module) {
             };
             crate::store::collections::add_collection(&ctx.conn, &coll).unwrap();
             drop(ctx);
-            let mut ctx = crate::cli::handlers::Context::open(&root2).unwrap();
-            crate::cli::handlers::handle_update(&mut ctx, &root2).unwrap();
+            let ctx = crate::cli::handlers::Context::open(&root2).unwrap();
+            crate::cli::handlers::handle_update(&ctx, &root2).unwrap();
         }
 
         let config = global_test_config();

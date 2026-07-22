@@ -42,11 +42,9 @@ impl CppParser {
         kind: SymbolKind,
         file_id: FileId,
         range: Range,
-        signature: Option<String>,
-        doc_comment: Option<String>,
-        module_path: &str,
-        visibility: Visibility,
+        tail: (Option<String>, Option<String>, &str, Visibility),
     ) -> Symbol {
+        let (signature, doc_comment, module_path, visibility) = tail;
         let mut sym = Symbol::new(id, name, kind, file_id, range);
         sym.visibility = visibility;
         sym.scope_context = Some(self.context.current_scope_context());
@@ -69,9 +67,8 @@ impl CppParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut symbols = Vec::new();
         self.extract_symbols_from_node(
@@ -80,8 +77,7 @@ impl CppParser {
             file_id,
             counter,
             &mut symbols,
-            "",
-            0,
+            ("", 0),
         );
         symbols
     }
@@ -93,9 +89,9 @@ impl CppParser {
         file_id: FileId,
         counter: &mut SymbolCounter,
         symbols: &mut Vec<Symbol>,
-        module_path: &str,
-        depth: usize,
+        tail: (&str, usize),
     ) {
+        let (module_path, depth) = tail;
         if !check_recursion_depth(depth, node) {
             return;
         }
@@ -120,8 +116,7 @@ impl CppParser {
                                 file_id,
                                 counter,
                                 symbols,
-                                module_path,
-                                depth + 1,
+                                (module_path, depth + 1),
                             );
                         }
                     }
@@ -153,10 +148,12 @@ impl CppParser {
                         sym_kind,
                         file_id,
                         node_range(node),
-                        Some(format!("{kind_str} {n}")),
-                        doc,
-                        module_path,
-                        Visibility::Public,
+                        (
+                            Some(format!("{kind_str} {n}")),
+                            doc,
+                            module_path,
+                            Visibility::Public,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -173,8 +170,7 @@ impl CppParser {
                             file_id,
                             counter,
                             symbols,
-                            module_path,
-                            depth + 1,
+                            (module_path, depth + 1),
                         );
                     }
                 }
@@ -202,8 +198,7 @@ impl CppParser {
                             file_id,
                             counter,
                             symbols,
-                            &new_path,
-                            depth + 1,
+                            (&new_path, depth + 1),
                         );
                     }
                 }
@@ -220,10 +215,12 @@ impl CppParser {
                         SymbolKind::Enum,
                         file_id,
                         node_range(node),
-                        Some(format!("enum {name}")),
-                        doc,
-                        module_path,
-                        Visibility::Public,
+                        (
+                            Some(format!("enum {name}")),
+                            doc,
+                            module_path,
+                            Visibility::Public,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -256,8 +253,7 @@ impl CppParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -274,8 +270,7 @@ impl CppParser {
                         file_id,
                         counter,
                         symbols,
-                        module_path,
-                        depth + 1,
+                        (module_path, depth + 1),
                     );
                 }
             }
@@ -322,10 +317,7 @@ impl CppParser {
             kind,
             file_id,
             node_range(node),
-            Some(sig),
-            doc,
-            module_path,
-            Visibility::Public,
+            (Some(sig), doc, module_path, Visibility::Public),
         ))
     }
 
@@ -362,10 +354,7 @@ impl CppParser {
             SymbolKind::Method,
             file_id,
             node_range(node),
-            Some(sig),
-            doc,
-            module_path,
-            visibility,
+            (Some(sig), doc, module_path, visibility),
         ))
     }
 
@@ -393,15 +382,17 @@ impl CppParser {
                     SymbolKind::Field,
                     file_id,
                     node_range(node),
-                    Some(
-                        code[node.byte_range()]
-                            .trim_end_matches(';')
-                            .trim()
-                            .to_string(),
+                    (
+                        Some(
+                            code[node.byte_range()]
+                                .trim_end_matches(';')
+                                .trim()
+                                .to_string(),
+                        ),
+                        None,
+                        module_path,
+                        Visibility::Private,
                     ),
-                    None,
-                    module_path,
-                    Visibility::Private,
                 );
                 symbols.push(symbol);
             }
@@ -409,17 +400,15 @@ impl CppParser {
     }
 
     fn find_calls_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut calls = Vec::new();
-        self.find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
+        Self::find_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
     fn find_calls_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         current_fn: Option<&'a str>,
@@ -447,12 +436,11 @@ impl CppParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+            Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
     }
 
     fn find_implementations_in_node<'a>(
-        &self,
         node: &Node,
         code: &'a str,
         depth: usize,
@@ -482,14 +470,13 @@ impl CppParser {
         }
 
         for child in node.children(&mut node.walk()) {
-            self.find_implementations_in_node(&child, code, depth + 1, results);
+            Self::find_implementations_in_node(&child, code, depth + 1, results);
         }
     }
 
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut imports = Vec::new();
         for child in tree.root_node().children(&mut tree.root_node().walk()) {
@@ -497,8 +484,8 @@ impl CppParser {
                 if let Some(path_node) = child.child_by_field_name("path") {
                     let raw = &code[path_node.byte_range()];
                     let path = raw
-                        .trim_start_matches(|c| c == '"' || c == '<')
-                        .trim_end_matches(|c| c == '"' || c == '>')
+                        .trim_start_matches(['"', '<'])
+                        .trim_end_matches(['"', '>'])
                         .to_string();
                     imports.push(Import {
                         path,
@@ -518,7 +505,6 @@ impl CppParser {
 
 fn extract_cpp_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
-        "identifier" | "field_identifier" | "destructor_name" => Some(&code[node.byte_range()]),
         "qualified_identifier" => {
             // Return just the rightmost name for display
             node.child_by_field_name("name")
@@ -536,7 +522,9 @@ fn extract_cpp_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str>
         "template_function" => node
             .child_by_field_name("name")
             .and_then(|n| extract_cpp_declarator_name(n, code)),
-        "operator_name" => Some(&code[node.byte_range()]),
+        "identifier" | "field_identifier" | "destructor_name" | "operator_name" => {
+            Some(&code[node.byte_range()])
+        }
         _ => None,
     }
 }
@@ -601,12 +589,11 @@ impl LanguageParser for CppParser {
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let tree = match self.parser.parse_cached(code) {
-            Some(tree) => tree,
-            None => return Vec::new(),
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
         };
         let mut results = Vec::new();
-        self.find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
+        Self::find_implementations_in_node(&tree.root_node(), code, 0, &mut results);
         results
     }
 
