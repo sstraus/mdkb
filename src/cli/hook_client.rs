@@ -141,6 +141,33 @@ fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {
     resolved.canonicalize().unwrap_or(resolved)
 }
 
+/// Resolve the target repository for a lifecycle hook event.
+///
+/// Hook hosts provide the session working directory in `event.cwd`. Prefer it
+/// over the hook subprocess working directory: global hooks can be launched
+/// from a stale or unrelated cwd when several repositories are active in the
+/// same host process. An explicit root still has highest priority.
+pub fn resolve_hook_root(event: &Value, explicit: Option<PathBuf>) -> PathBuf {
+    if explicit.is_some() {
+        return resolve_root(explicit);
+    }
+
+    if let Some(cwd) = event
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|cwd| !cwd.is_empty())
+    {
+        let cwd = PathBuf::from(cwd);
+        if cwd.is_absolute() && cwd.is_dir() {
+            let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from);
+            let resolved = crate::git::resolve_project_root(&cwd, hint.as_deref());
+            return resolved.canonicalize().unwrap_or(resolved);
+        }
+    }
+
+    resolve_root(None)
+}
+
 fn hook_socket_path() -> PathBuf {
     // Hook socket always lives beside daemon.sock under ~/.mdkb — see
     // `daemon::ipc_server::serve(base_dir = lock.parent())` and
@@ -183,7 +210,7 @@ pub async fn call_hook_event(method: &str, event: Value, root: Option<PathBuf>) 
 /// Like `run` but routes through `emit_hook_response` (raw envelope → stdout)
 /// rather than `print_response` (text extraction). Uses per-event timeouts.
 async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<()> {
-    let root = resolve_root(root);
+    let root = resolve_hook_root(&params, root);
     params["root"] = json!(root.display().to_string());
 
     if std::env::var_os("MDKB_NO_DAEMON").is_some() {
@@ -469,6 +496,33 @@ mod tests {
         // path (canonicalize guarantees that for existing dirs).
         let got = resolve_root(None);
         assert!(got.is_absolute() || got.components().count() > 0);
+    }
+
+    #[test]
+    fn resolve_hook_root_prefers_event_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("event-repo");
+        std::fs::create_dir_all(repo.join(".mdkb")).unwrap();
+
+        let got = resolve_hook_root(&json!({"cwd": repo.to_string_lossy()}), None);
+
+        assert_eq!(got, repo.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn resolve_hook_root_explicit_beats_event_cwd() {
+        let tmp = TempDir::new().unwrap();
+        let explicit = tmp.path().join("explicit-repo");
+        let event_repo = tmp.path().join("event-repo");
+        std::fs::create_dir_all(&explicit).unwrap();
+        std::fs::create_dir_all(&event_repo).unwrap();
+
+        let got = resolve_hook_root(
+            &json!({"cwd": event_repo.to_string_lossy()}),
+            Some(explicit.clone()),
+        );
+
+        assert_eq!(got, explicit.canonicalize().unwrap());
     }
 
     #[tokio::test]

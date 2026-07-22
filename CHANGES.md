@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **Lifecycle hooks no longer leak context across repositories.** Prefer the
+  host-provided event working directory over the hook subprocess directory, so
+  a SessionStart in one repository cannot surface another repository's warmup
+  or quarantine banner.
+- **Corrupt code indexes recover automatically.** Validate `code.sqlite` before
+  opening it, retain malformed databases and WAL sidecars under
+  `.mdkb/quarantine/`, and rebuild the reproducible code index from source.
+
 ## 3.7.4 (2026-07-21)
 
 ### Fixed

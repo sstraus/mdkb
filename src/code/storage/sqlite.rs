@@ -6,9 +6,11 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
@@ -28,6 +30,7 @@ impl CodeDb {
     /// Create a new database at `path`. Fails if the file already exists.
     pub fn create(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let _guard = acquire_code_lock(&path, "code-create")?;
         if path.exists() {
             return Err(rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
@@ -50,6 +53,8 @@ impl CodeDb {
     /// Open an existing database at `path`.
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let _guard = acquire_code_lock(&path, "code-integrity-check")?;
+        quarantine_if_corrupt(&path)?;
         let conn = Connection::open(&path)?;
         schema::init_schema(&conn)?;
         Ok(Self { conn, path })
@@ -549,6 +554,97 @@ impl CodeDb {
     }
 }
 
+fn acquire_code_lock(
+    path: &Path,
+    operation: &str,
+) -> rusqlite::Result<crate::store::mutation_lock::MutationGuard> {
+    crate::store::mutation_lock::acquire(path, operation).map_err(|e| {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some(e.to_string()),
+        )
+    })
+}
+
+/// Move a structurally corrupt, rebuildable code index out of the active path.
+///
+/// Unlike `index.sqlite`, the code index contains no unique user data, so no
+/// salvage is needed. The original database and any WAL sidecars are retained
+/// under `.mdkb/quarantine/` for diagnosis; the caller then creates a fresh
+/// schema at the original path and the normal rescan repopulates it.
+fn quarantine_if_corrupt(path: &Path) -> rusqlite::Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let probe = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    probe.busy_timeout(std::time::Duration::from_secs(5))?;
+    let check = probe.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0));
+    let reason = match check {
+        Ok(result) if result == "ok" => return Ok(()),
+        Ok(result) => result,
+        Err(rusqlite::Error::SqliteFailure(err, message))
+            if matches!(
+                err.code,
+                ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase
+            ) =>
+        {
+            message.unwrap_or_else(|| err.to_string())
+        }
+        Err(e) => return Err(e),
+    };
+    drop(probe);
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let quarantine_dir = parent.join("quarantine");
+    fs::create_dir_all(&quarantine_dir).map_err(|e| io_as_sqlite("create quarantine", e))?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let file_name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("code.sqlite"));
+    let target_base = quarantine_dir.join(file_name);
+    let mut target = append_suffix(&target_base, &format!(".corrupt-{timestamp}"));
+    let mut collision = 0_u32;
+    while target.exists() {
+        collision += 1;
+        target = append_suffix(&target_base, &format!(".corrupt-{timestamp}-{collision}"));
+    }
+    fs::rename(path, &target).map_err(|e| io_as_sqlite("quarantine code database", e))?;
+
+    for suffix in ["-wal", "-shm"] {
+        let source = append_suffix(path, suffix);
+        if source.exists() {
+            let sidecar_target = append_suffix(&target, suffix);
+            fs::rename(&source, &sidecar_target)
+                .map_err(|e| io_as_sqlite("quarantine code database sidecar", e))?;
+        }
+    }
+
+    tracing::warn!(
+        database = %path.display(),
+        quarantined = %target.display(),
+        reason,
+        "code index was corrupt; quarantined for automatic rebuild"
+    );
+    Ok(())
+}
+
+fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn io_as_sqlite(operation: &str, error: std::io::Error) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+        Some(format!("{operation}: {error}")),
+    )
+}
+
 // --- SQL fragments ---
 
 /// Standard 14-column SELECT list for symbol queries (no table prefix).
@@ -718,6 +814,28 @@ mod tests {
         }
         let db = CodeDb::open_or_create(&path).unwrap();
         assert_eq!(db.file_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_open_quarantines_structurally_corrupt_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.sqlite");
+        {
+            let db = CodeDb::create(&path).unwrap();
+            db.insert_file("a.rs", "a.rs", "hash", Some("Rust"), None, None)
+                .unwrap();
+        }
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+
+        let db = CodeDb::open(&path).unwrap();
+
+        assert_eq!(db.file_count().unwrap(), 0);
+        let quarantined = std::fs::read_dir(dir.path().join("quarantine"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(quarantined.len(), 1);
+        assert!(quarantined[0].starts_with("code.sqlite.corrupt-"));
     }
 
     #[test]
