@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.7.5 (2026-07-22)
 
 ### Fixed
 
@@ -11,6 +11,13 @@
 - **Corrupt code indexes recover automatically.** Validate `code.sqlite` before
   opening it, retain malformed databases and WAL sidecars under
   `.mdkb/quarantine/`, and rebuild the reproducible code index from source.
+- **MCP stdio survives daemon restarts.** Keep the client transport open after
+  a daemon socket disconnect, fail only requests that were in flight, and
+  reconnect by replaying the initialization handshake before the next request.
+  The proxy no longer leaves detached stdin tasks and zombie processes behind.
+- **Hook memory writes accept documented comma-separated tags.** Normalize the
+  CLI string into the JSON array required by the daemon instead of returning an
+  `invalid type: string, expected a sequence` protocol error.
 
 ## 3.7.4 (2026-07-21)
 

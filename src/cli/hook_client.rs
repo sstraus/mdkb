@@ -99,12 +99,19 @@ pub async fn call_memory_write(
         "content": content,
     });
     if let Some(t) = tags {
-        params["tags"] = json!(t);
+        params["tags"] = json!(parse_comma_separated_tags(&t));
     }
     if let Some(t) = ttl {
         params["ttl"] = json!(t);
     }
     run("memory_write", params, root).await
+}
+
+fn parse_comma_separated_tags(tags: &str) -> Vec<&str> {
+    tags.split(',')
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .collect()
 }
 
 /// Send a `memory_confirm` call.
@@ -523,6 +530,14 @@ mod tests {
         );
 
         assert_eq!(got, explicit.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn memory_write_tags_are_sent_as_a_trimmed_sequence() {
+        assert_eq!(
+            parse_comma_separated_tags("mdkb, mcp, ,fixed"),
+            vec!["mdkb", "mcp", "fixed"]
+        );
     }
 
     #[tokio::test]
