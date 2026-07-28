@@ -1,5 +1,45 @@
 # Changelog
 
+## 3.7.8 (2026-07-28)
+
+### Fixed
+
+- **`mdkb stats` and `mdkb compact` no longer open `code.sqlite` without
+  announcing themselves.** 3.7.6 closed the corruption loop by making every
+  connection hold a shared `*.live.lock` so a quarantine can never rename the
+  database out from under an open handle — but three `code.sqlite` opens
+  bypassed it. Two of them write: `mdkb compact` runs `VACUUM`, and `mdkb
+  stats` runs `run_repairs`, which issues `DELETE`s. A quarantine concurrent
+  with either one recycled the path onto a fresh database, and SQLite derives
+  `-wal`/`-shm` from the path, so those frames landed in the replacement's
+  WAL — the same mechanism 3.7.6 set out to close. Both now take the live lock
+  before opening. The third site (the hook staleness probe) is read-only and
+  injects no frames, so it is left as is.
+
+- **The quarantine banner no longer truncates its own remediation.** Every
+  line of `⚠ INDEX QUARANTINED` exceeded the 72-column frame, so the only
+  actionable part — how to clear the warning — was ellipsized away, leaving a
+  healthy store nagging about a weeks-old file with no visible way out. The
+  banner now prints one field per line and states the cleanup command
+  (`rm .mdkb/*.corrupt-*`, matching the scan predicate, so it also clears a
+  quarantined `code.sqlite`) once per store instead of once per file.
+
+### Known issues
+
+- **`index.sqlite` corruption still reproduces under 3.7.7.** A repo whose
+  index passed `PRAGMA integrity_check` was found corrupt roughly an hour
+  later — `2nd reference to page` in `memory_entries` and `memory_fts_data`,
+  plus a freelist size mismatch and a malformed FTS5 inverted index. The
+  signature matches the doubly-referenced pages 3.7.6 set out to close, but
+  none of the three known mechanisms was in play: the live lock *was* held
+  (verified by probing the sidecar with a non-blocking exclusive `flock`), no
+  rename had occurred, `auto_vacuum` is `NONE`, no `mmap_size` is set anywhere,
+  and there is no `incremental_vacuum` caller. So a fourth mechanism is open
+  and the root cause is not identified. Recovery is safe where memory is
+  mirrored to `.mdkb/memory/entries` (a 1:1 markdown mirror of
+  `memory_entries`): stop the daemon, move the corrupt index aside, then
+  `mdkb memory import .mdkb/memory/entries && mdkb update`.
+
 ## 3.7.7 (2026-07-28)
 
 ### Added
