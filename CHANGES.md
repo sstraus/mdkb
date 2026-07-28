@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.7.7 (2026-07-28)
 
 ### Added
 
