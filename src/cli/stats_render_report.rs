@@ -48,19 +48,29 @@ fn render_quarantine(
     } else {
         "docs not yet re-indexed; run `mdkb update`".to_string()
     };
-    let mut body = String::new();
+    // One field per short line: `frame` silently ellipsizes anything wider than
+    // WIDTH - 2, and packing the filename, the salvage counts and the cleanup
+    // command onto two lines pushed the only actionable part off the edge.
+    let mut lines = Vec::new();
     for r in reports {
         let date = chrono::DateTime::from_timestamp(r.quarantined_at, 0)
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "unknown".to_string());
-        body.push_str(&format!(
-            "  {} ({}): salvaged {} memory entries, {} edges\n  {docs_status}; remove .mdkb/{} to clear\n",
-            r.corrupt_file, date, r.memory_entries_salvaged, r.memory_edges_salvaged, r.corrupt_file
+        lines.push(format!("  {} ({date})", r.corrupt_file));
+        lines.push(format!(
+            "    salvaged {} memory entries, {} edges",
+            r.memory_entries_salvaged, r.memory_edges_salvaged
         ));
     }
+    // Status and remediation are per-store, not per-file: emit them once.
+    lines.push(String::new());
+    lines.push(format!("  {docs_status}"));
+    // Mirrors the scan predicate in `store::heal::quarantine_reports` (any name
+    // containing `.corrupt-`), so it also clears quarantined `code.sqlite`.
+    lines.push("  clear with: rm .mdkb/*.corrupt-*".to_string());
     out.push_str(&frame(
         "⚠ INDEX QUARANTINED (was corrupt)",
-        body.trim_end(),
+        &lines.join("\n"),
         WIDTH,
     ));
 }
@@ -465,6 +475,103 @@ mod tests {
     fn render_omits_quarantine_when_healthy() {
         let out = render(&fixture_report(), false);
         assert!(!out.contains("QUARANTINED"), "no banner on a healthy store");
+    }
+
+    fn quarantine_fixture(ts: i64) -> crate::store::heal::QuarantineReport {
+        crate::store::heal::QuarantineReport {
+            corrupt_file: format!("index.sqlite.corrupt-{ts}"),
+            quarantined_at: ts,
+            memory_entries_salvaged: 673,
+            memory_edges_salvaged: 12,
+        }
+    }
+
+    /// The banner exists to tell the operator how to clear it. `frame`
+    /// ellipsizes overlong lines, so a too-wide layout silently eats the
+    /// `rm` command and the warning becomes unclearable — exactly the state
+    /// found in the wild (a healthy store nagging about a 3-week-old file).
+    #[test]
+    fn render_quarantine_keeps_cleanup_command_intact() {
+        let mut r = fixture_report();
+        r.quarantine = vec![quarantine_fixture(1_700_000_000)];
+        let out = render(&r, false);
+        assert!(
+            out.contains("clear with: rm .mdkb/*.corrupt-*"),
+            "remediation command truncated or missing: {out}"
+        );
+        assert!(
+            out.contains("index.sqlite.corrupt-1700000000 (2023-11-14)"),
+            "filename and date must survive in full: {out}"
+        );
+        assert!(
+            out.contains("salvaged 673 memory entries, 12 edges"),
+            "salvage counts must survive in full: {out}"
+        );
+    }
+
+    #[test]
+    fn render_quarantine_lines_fit_width() {
+        let mut r = fixture_report();
+        r.quarantine = vec![quarantine_fixture(1_700_000_000)];
+        let out = render(&r, false);
+        let banner: Vec<&str> = out.lines().take_while(|l| !l.contains("mdkb")).collect();
+        assert!(banner.len() > 3, "banner rendered: {out}");
+        for line in &banner {
+            assert!(
+                !line.contains('…'),
+                "quarantine line ellipsized: {line:?}\nfull: {out}"
+            );
+            let len = line.chars().count();
+            assert!(len <= WIDTH, "line too wide ({len} > {WIDTH}): {line:?}");
+        }
+    }
+
+    /// Several outstanding quarantines are common (corruption tends to recur).
+    /// Status and remediation are properties of the store, not of each file,
+    /// so they must not be repeated once per report.
+    #[test]
+    fn render_quarantine_lists_every_file_but_states_remedy_once() {
+        let mut r = fixture_report();
+        r.quarantine = vec![
+            quarantine_fixture(1_700_000_000),
+            quarantine_fixture(1_700_086_400),
+        ];
+        let out = render(&r, false);
+        assert!(out.contains("index.sqlite.corrupt-1700000000"));
+        assert!(out.contains("index.sqlite.corrupt-1700086400"));
+        assert_eq!(
+            out.matches("clear with:").count(),
+            1,
+            "remediation repeated per file: {out}"
+        );
+        assert_eq!(
+            out.matches("already re-indexed").count(),
+            1,
+            "docs status repeated per file: {out}"
+        );
+        for line in out.lines() {
+            let len = line.chars().count();
+            assert!(len <= WIDTH, "line too wide ({len} > {WIDTH}): {line:?}");
+        }
+    }
+
+    /// A pathological filename must still not break the frame: `frame` may
+    /// ellipsize it, but the box must stay square and nothing may panic.
+    #[test]
+    fn render_quarantine_survives_overlong_filename() {
+        let mut r = fixture_report();
+        r.quarantine = vec![crate::store::heal::QuarantineReport {
+            corrupt_file: format!("index.sqlite.corrupt-{}", "9".repeat(120)),
+            quarantined_at: 1_700_000_000,
+            memory_entries_salvaged: 0,
+            memory_edges_salvaged: 0,
+        }];
+        let out = render(&r, false);
+        assert!(out.contains("QUARANTINED"));
+        for line in out.lines() {
+            let len = line.chars().count();
+            assert!(len <= WIDTH, "line too wide ({len} > {WIDTH}): {line:?}");
+        }
     }
 
     #[test]
