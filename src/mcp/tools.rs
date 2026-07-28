@@ -56,7 +56,7 @@ pub struct GetParams {
     /// Document ID, path, or memory slug.
     pub id: String,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
+    /// Exact repository root path (daemon mode). Omit for default/standalone repo. "*" is supported only by search.
     #[serde(default)]
     pub root: Option<String>,
 

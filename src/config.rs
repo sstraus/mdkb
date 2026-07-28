@@ -512,6 +512,12 @@ pub struct HooksConfig {
     /// Maximum number of recall results injected on UserPromptSubmit.
     pub recall_limit: usize,
 
+    /// Maximum number of matching documents injected on UserPromptSubmit,
+    /// alongside the memory recall. Same hybrid engine as `mdkb search
+    /// --scope docs`, reusing the recall query and embedding. Set to 0 to
+    /// inject memory only.
+    pub recall_docs_limit: usize,
+
     /// Latency budget in milliseconds; hook truncates output if exceeded.
     pub latency_budget_ms: u64,
 
@@ -561,6 +567,7 @@ impl Default for HooksConfig {
             warmup_limit: 10,
             warmup_token_budget: 300,
             recall_limit: 5,
+            recall_docs_limit: 3,
             latency_budget_ms: 200,
             min_recall_score: 0.3,
             warmup_min_confidence: 0.25,
@@ -955,6 +962,8 @@ mod tests {
         assert_eq!(cfg.warmup_limit, 10);
         assert_eq!(cfg.warmup_token_budget, 300);
         assert_eq!(cfg.recall_limit, 5);
+        // Documents leg on by default; 0 would make recall memory-only.
+        assert_eq!(cfg.recall_docs_limit, 3);
         // Confidence floor on by default so low-signal entries stay out of warmup.
         assert!((cfg.warmup_min_confidence - 0.25).abs() < f64::EPSILON);
     }

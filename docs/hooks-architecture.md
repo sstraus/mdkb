@@ -112,8 +112,14 @@ of what memory entries exist — encouraging MCP tool use for deeper lookup.
 5. Build FTS query: tokenize prompt, strip stopwords (EN+IT), drop tokens < 3 chars,
    join with OR, quote each token
 6. Call `search_entries_fts(conn, query, recall_limit)` → BM25-ranked results
-7. Build markdown: `## mdkb: relevant context\n\n- [id] title — snippet (160 chars)\n...`
-8. If elapsed > `latency_budget_ms`, log to `hook-slow.jsonl`
+7. Call `hybrid_search_fts(ctx, query, embedding, recall_docs_limit)` → matching
+   documents, reusing the same OR query and the embedding already computed for
+   the memory leg (no second inference pass, no lock held across ONNX)
+8. Build markdown: `## mdkb: relevant context` (memory), then
+   `## mdkb: matching docs` (search hits), then `## mdkb: related docs`
+   (graph neighbors). A doc reachable both ways is emitted once, as a graph
+   neighbor — that block carries the relation label
+9. If elapsed > `latency_budget_ms`, log to `hook-slow.jsonl`
 
 **Stopword handling:** The filter includes both English and Italian
 stopwords (e.g. "il", "della", "perche"). Prompts consisting entirely of
@@ -177,6 +183,7 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `post_tool_use_enabled` | bool | `true` | Disable reindex-on-edit notifications |
 | `warmup_limit` | usize | `50` | Max entries in SessionStart warmup |
 | `recall_limit` | usize | `5` | Max FTS results in UserPromptSubmit |
+| `recall_docs_limit` | usize | `3` | Max matching documents in UserPromptSubmit; `0` = memory only |
 | `latency_budget_ms` | u64 | `200` | Overrun threshold; logs to `hook-slow.jsonl` |
 | `min_recall_score` | f64 | `0.3` | Declared but **not wired** into FTS filtering |
 

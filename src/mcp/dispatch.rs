@@ -2946,6 +2946,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     }
 
     let mut results = Vec::new();
+    let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
     if let Some(ref q) = fts_query {
         if ensure_handle_context(handle).await.is_err() {
             return json!({});
@@ -2987,6 +2988,34 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             };
             if let Err(e) = stats::record_query_event(conn, &ev) {
                 tracing::warn!("record_query_event failed: {e}");
+            }
+        }
+
+        // Documents leg — same hybrid engine as `search --scope docs`, reusing
+        // the OR-expanded recall query and the embedding already computed above
+        // (a second embed would double the per-turn CPU cost). No score floor:
+        // RRF normalization pins the top hit at 1.0, so a threshold would filter
+        // nothing — `recall_docs_limit` is the control (0 = memory only).
+        if let Some(ctx) = ctx_guard.as_ref() {
+            let docs_limit = cfg.recall_docs_limit;
+            if docs_limit > 0 {
+                match crate::cli::handlers::hybrid_search_fts(
+                    ctx,
+                    q,
+                    query_embedding.as_deref(),
+                    docs_limit,
+                    None,
+                    false,
+                ) {
+                    Ok(hits) => {
+                        doc_hits = hits
+                            .into_iter()
+                            .map(|hit| (hit.path, hit.title.filter(|t| !t.is_empty())))
+                            .collect();
+                    }
+                    // Degrade silently (hooks must not block) but stay observable.
+                    Err(e) => tracing::debug!("recall doc search failed: {e}"),
+                }
             }
         }
         drop(ctx_guard);
@@ -3031,7 +3060,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     // D — doc-graph neighbors: when the prompt names a document, surface its
     // 1-hop frontmatter neighbors. Independent of memory recall, deduped against
     // the (now finalized) memory ids about to be injected.
-    let mut related: Vec<String> = Vec::new();
+    let mut neighbors: Vec<(String, String)> = Vec::new();
     if !path_tokens.is_empty() {
         // The FTS leg already initialized the context if it ran; only ensure when
         // it didn't (path-only prompt) so we don't re-acquire on the hot path.
@@ -3041,7 +3070,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             if let Some(c) = ctx_guard.as_ref() {
                 let seen: std::collections::HashSet<String> =
                     results.iter().map(|e| e.id.clone()).collect();
-                related = doc_graph_neighbors(
+                neighbors = doc_graph_neighbors(
                     &c.conn,
                     &path_tokens,
                     &seen,
@@ -3049,18 +3078,37 @@ async fn hook_user_prompt_submit_impl_with_dedup(
                 );
             }
         }
-        if let Some((dctx, key)) = &dedup {
-            dctx.retain_new_hook_related_lines(key, &mut related);
-        }
+    }
+
+    // A doc reachable both ways is emitted once, as a graph neighbor: that block
+    // carries the relation label, which the search hit cannot reconstruct.
+    let neighbor_paths: std::collections::HashSet<&str> =
+        neighbors.iter().map(|(p, _)| p.as_str()).collect();
+    let mut doc_lines: Vec<String> = doc_hits
+        .iter()
+        .filter(|(path, _)| !neighbor_paths.contains(path.as_str()))
+        .map(|(path, title)| match title {
+            Some(t) => format!("- {path} — {t}"),
+            None => format!("- {path}"),
+        })
+        .collect();
+    let mut related: Vec<String> = neighbors
+        .iter()
+        .map(|(path, relation)| format!("- {path} ({relation})"))
+        .collect();
+    if let Some((dctx, key)) = &dedup {
+        dctx.retain_new_hook_related_lines(key, &mut doc_lines);
+        dctx.retain_new_hook_related_lines(key, &mut related);
     }
 
     // Trigger-matched behavioral priors whose prompt pattern fires here.
     let prior_block = prompt_prior_block(handle, prompt, dedup.as_ref()).await;
 
-    if results.is_empty() && related.is_empty() && prior_block.is_none() && !wants_cg {
+    let nothing_found = results.is_empty() && doc_lines.is_empty() && related.is_empty();
+    if nothing_found && prior_block.is_none() && !wants_cg {
         return json!({});
     }
-    if prompt_repeat && results.is_empty() && related.is_empty() && prior_block.is_none() {
+    if prompt_repeat && nothing_found && prior_block.is_none() {
         return json!({});
     }
 
@@ -3092,6 +3140,17 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             body.push('\n');
         }
         body.push_str("\nIf your work corroborates any entry above, run `mdkb memory confirm <id> --outcome confirmed` instead of writing a new one.\n");
+    }
+
+    if !doc_lines.is_empty() {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("## mdkb: matching docs\n\n");
+        for line in &doc_lines {
+            body.push_str(line);
+            body.push('\n');
+        }
     }
 
     if !related.is_empty() {
@@ -3189,9 +3248,9 @@ fn doc_graph_neighbors(
     tokens: &[String],
     seen: &std::collections::HashSet<String>,
     cap: usize,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     use crate::store::graph;
-    let mut out: Vec<String> = Vec::new();
+    let mut out: Vec<(String, String)> = Vec::new();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
     for tok in tokens {
         if out.len() >= cap {
@@ -3227,7 +3286,7 @@ fn doc_graph_neighbors(
             if seen.contains(&path) || !emitted.insert(path.clone()) {
                 continue;
             }
-            out.push(format!("- {} ({})", path, edge.relation));
+            out.push((path, edge.relation));
         }
     }
     out
@@ -4268,6 +4327,178 @@ mod tests {
             due_at: None,
         };
         crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed entry");
+    }
+
+    /// Seed an indexed document so the recall documents leg has something to
+    /// find. Content drives BM25 (the embedding service is absent under test,
+    /// so the hybrid search degrades to BM25-only — deterministic).
+    async fn seed_document(handle: &RepoHandle, path: &str, title: &str, content: &str) {
+        ensure_handle_context(handle).await.expect("init ctx");
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard.as_ref().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        // documents.collection is a FK — register it once, ignore re-adds.
+        let _ = crate::store::collections::add_collection(
+            &ctx.conn,
+            &crate::domain::Collection {
+                name: "default".to_string(),
+                path: "./docs".to_string(),
+                pattern: "**/*.md".to_string(),
+                source: "manual".to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+        );
+        let doc = crate::domain::Document {
+            id: 0,
+            collection: "default".to_string(),
+            relative_path: path.to_string(),
+            hash: crate::store::documents::compute_hash(content),
+            title: Some(title.to_string()),
+            metadata: None,
+            file_modified_at: now,
+            indexed_at: now,
+            status: Some("current".to_string()),
+        };
+        crate::store::documents::index_document(&ctx.conn, &doc, content).expect("seed doc");
+    }
+
+    #[tokio::test]
+    async fn recall_injects_matching_docs_alongside_memory() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "recall-mem").await;
+        seed_document(
+            &handle,
+            "docs/quarantine.md",
+            "Quarantine handling",
+            "The autoheal routine quarantines a corrupt index before rebuilding it.",
+        )
+        .await;
+
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(
+            body.contains("## mdkb: matching docs"),
+            "documents leg should emit its own block: {body}"
+        );
+        assert!(
+            body.contains("docs/quarantine.md"),
+            "matching doc path must be injected: {body}"
+        );
+        assert!(
+            body.contains("Quarantine handling"),
+            "doc title carries the signal that makes the path worth opening: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_docs_limit_zero_injects_memory_only() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let mut config = Config::default();
+        config.hooks.user_prompt_submit_require_sigil = false;
+        config.hooks.recall_docs_limit = 0;
+        let handle = Arc::new(RepoHandle::from_shared(
+            root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            config,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        seed_memory_entry(&handle, "topic-mem").await;
+        seed_document(
+            &handle,
+            "docs/topic.md",
+            "Topic doc",
+            "Some content about the topic.",
+        )
+        .await;
+
+        let out = hook_user_prompt_submit_impl(&handle, "what about the topic content").await;
+        let body = additional_context(&out);
+        assert!(
+            body.contains("topic-mem"),
+            "memory recall must still fire: {body}"
+        );
+        assert!(
+            !body.contains("docs/topic.md"),
+            "recall_docs_limit = 0 must suppress the documents leg: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_docs_limit_caps_injected_documents() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let mut config = Config::default();
+        config.hooks.user_prompt_submit_require_sigil = false;
+        config.hooks.recall_docs_limit = 2;
+        let handle = Arc::new(RepoHandle::from_shared(
+            root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            config,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        for i in 0..5 {
+            seed_document(
+                &handle,
+                &format!("docs/quarantine-{i}.md"),
+                &format!("Quarantine {i}"),
+                "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            )
+            .await;
+        }
+
+        let out = hook_user_prompt_submit_impl(&handle, "quarantine autoheal rebuilding").await;
+        let body = additional_context(&out);
+        let injected = body.matches("docs/quarantine-").count();
+        assert_eq!(
+            injected, 2,
+            "5 matching docs must be capped at recall_docs_limit = 2: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_docs_leg_is_gated_by_the_sigil() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+        let mut config = Config::default();
+        config.hooks.user_prompt_submit_require_sigil = true;
+        let handle = Arc::new(RepoHandle::from_shared(
+            root,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            config,
+            Vec::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        seed_document(
+            &handle,
+            "docs/quarantine.md",
+            "Quarantine handling",
+            "The autoheal routine quarantines a corrupt index before rebuilding it.",
+        )
+        .await;
+
+        // A doc-only match (no memory, no priors) must still respect the gate.
+        let plain = hook_user_prompt_submit_impl(&handle, "quarantine autoheal rebuilding").await;
+        assert_eq!(plain, json!({}), "sigil-less prompt must not inject docs");
+
+        let opted = hook_user_prompt_submit_impl(&handle, "* quarantine autoheal rebuilding").await;
+        assert!(
+            additional_context(&opted).contains("docs/quarantine.md"),
+            "sigil-prefixed prompt should surface matching docs: {opted}"
+        );
     }
 
     #[tokio::test]

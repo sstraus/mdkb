@@ -37,6 +37,16 @@ pub enum Heal {
     /// `corrupt_path` (and `-wal`/`-shm` siblings). The caller must open a fresh
     /// database at the original path and trigger a reindex.
     Quarantined { corrupt_path: PathBuf },
+    /// Database is structurally corrupt but another process holds a live
+    /// connection to it, so it was left in place.
+    ///
+    /// Renaming under an open connection recycles the path onto a second inode
+    /// while the survivor keeps deriving `-wal`/`-shm` from the same names — the
+    /// surviving connection can then land its frames in the *replacement*
+    /// database's WAL, which is how one quarantine seeds the next corruption.
+    /// The caller must surface this: every mdkb process (daemon included) has to
+    /// close before the next open can quarantine and rebuild.
+    CorruptInUse,
 }
 
 /// Append `suffix` to a path's file name (`index.sqlite` + `.corrupt-1` →
@@ -337,6 +347,12 @@ fn ensure_sound_at_locked(db_path: &Path, interval: Duration, now: SystemTime) -
         return Ok(Heal::Sound);
     }
 
+    // Only rename when nobody is holding the database open — see [`Heal::CorruptInUse`].
+    let Some(_live) = crate::store::mutation_lock::try_acquire_live_exclusive(db_path)? else {
+        let _ = std::fs::remove_file(&marker);
+        return Ok(Heal::CorruptInUse);
+    };
+
     let corrupt_path = quarantine(db_path)?;
     let _ = std::fs::remove_file(&marker);
     Ok(Heal::Quarantined { corrupt_path })
@@ -449,8 +465,51 @@ mod tests {
 
         match outcome {
             Heal::Quarantined { corrupt_path } => assert!(corrupt_path.exists()),
-            Heal::Sound => panic!("corrupt db must be quarantined"),
+            other => panic!("corrupt db must be quarantined, got {other:?}"),
         }
+        assert!(!db.exists(), "path is freed for a fresh database");
+    }
+
+    #[test]
+    fn corrupt_db_is_left_in_place_while_a_connection_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        std::fs::write(&db, b"not a sqlite database at all").unwrap();
+
+        // Somebody has the database open: renaming it now would recycle the path
+        // onto a second inode while that connection keeps deriving its
+        // `-wal`/`-shm` from the old name.
+        let _live = crate::store::mutation_lock::acquire_live_shared(&db).unwrap();
+
+        assert_eq!(
+            ensure_sound(&db).unwrap(),
+            Heal::CorruptInUse,
+            "a live connection must veto the quarantine"
+        );
+        assert!(
+            db.exists(),
+            "the corrupt file stays where the holder sees it"
+        );
+        assert!(
+            !marker_path(&db).exists(),
+            "no integrity marker, so the next open re-probes instead of trusting it"
+        );
+    }
+
+    #[test]
+    fn quarantine_resumes_once_the_last_connection_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        std::fs::write(&db, b"not a sqlite database at all").unwrap();
+
+        let live = crate::store::mutation_lock::acquire_live_shared(&db).unwrap();
+        assert_eq!(ensure_sound(&db).unwrap(), Heal::CorruptInUse);
+        drop(live);
+
+        assert!(
+            matches!(ensure_sound(&db).unwrap(), Heal::Quarantined { .. }),
+            "with no holder left the corrupt file is quarantined as before"
+        );
         assert!(!db.exists(), "path is freed for a fresh database");
     }
 

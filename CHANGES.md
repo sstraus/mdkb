@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **`*`-prefixed prompts now search documents, not just memory.** The
+  UserPromptSubmit recall gained a documents leg backed by the same hybrid
+  engine as `mdkb search --scope docs`, emitted as a `## mdkb: matching docs`
+  block. It reuses the recall query and the embedding already computed for the
+  memory leg, so the added cost is one BM25 pass plus one vector probe — no
+  second inference, and no lock held across it. Tune with
+  `[hooks] recall_docs_limit` (default `3`, `0` restores memory-only recall).
+  A document reachable both by search and by the frontmatter graph is emitted
+  once, under `## mdkb: related docs`, which carries the relation label.
+
+### Fixed
+
+- **A quarantine no longer seeds the next corruption.** Autoheal renamed
+  `index.sqlite` (and `code.sqlite`) plus their `-wal`/`-shm` sidecars while
+  other processes still had the database open — the daemon keeps per-repo
+  handles alive for days. SQLite ties a connection to the inode but derives
+  `-wal`/`-shm` from the *path*, so once the path was recycled onto a fresh
+  database a surviving connection could land its frames in the replacement's
+  WAL, which produces exactly the doubly-referenced pages seen after each
+  heal. Every connection now holds a shared `*.live.lock` for its lifetime and
+  quarantine only renames when it can take that lock exclusively; otherwise the
+  corrupt file is left in place and reported (`Heal::CorruptInUse`,
+  `Context::corrupt_in_use`) so the operator can close the daemon and let the
+  next open rebuild it. The lock is a separate sidecar from the mutation lock,
+  so a live connection never blocks an index-wide write.
+
 ## 3.7.6 (2026-07-22)
 
 ### Changed

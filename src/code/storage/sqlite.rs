@@ -24,6 +24,10 @@ use super::schema;
 pub struct CodeDb {
     conn: Connection,
     path: PathBuf,
+    /// Shared advisory lock announcing this connection so nobody quarantines
+    /// (renames) the database files underneath it. Never read — it only has to
+    /// live as long as the connection does.
+    _live_guard: Option<crate::store::mutation_lock::MutationGuard>,
 }
 
 impl CodeDb {
@@ -45,19 +49,31 @@ impl CodeDb {
                 )
             })?;
         }
+        let live_guard = acquire_live_code_lock(&path)?;
         let conn = Connection::open(&path)?;
         schema::init_schema(&conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            _live_guard: Some(live_guard),
+        })
     }
 
     /// Open an existing database at `path`.
     pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let _guard = acquire_code_lock(&path, "code-integrity-check")?;
+        // Probe before announcing this connection, so our own guard cannot veto
+        // the quarantine we are about to perform.
         quarantine_if_corrupt(&path)?;
+        let live_guard = acquire_live_code_lock(&path)?;
         let conn = Connection::open(&path)?;
         schema::init_schema(&conn)?;
-        Ok(Self { conn, path })
+        Ok(Self {
+            conn,
+            path,
+            _live_guard: Some(live_guard),
+        })
     }
 
     /// Open an existing database, or create one if none exists at `path`.
@@ -566,6 +582,19 @@ fn acquire_code_lock(
     })
 }
 
+/// Announce a live connection to the code index for as long as the returned
+/// guard lives, so [`quarantine_if_corrupt`] never renames the files under it.
+fn acquire_live_code_lock(
+    path: &Path,
+) -> rusqlite::Result<crate::store::mutation_lock::MutationGuard> {
+    crate::store::mutation_lock::acquire_live_shared(path).map_err(|e| {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some(e.to_string()),
+        )
+    })
+}
+
 /// Move a structurally corrupt, rebuildable code index out of the active path.
 ///
 /// Unlike `index.sqlite`, the code index contains no unique user data, so no
@@ -594,6 +623,25 @@ fn quarantine_if_corrupt(path: &Path) -> rusqlite::Result<()> {
         Err(e) => return Err(e),
     };
     drop(probe);
+
+    // Never rename under an open connection: the path would be recycled onto a
+    // second inode while the survivor keeps deriving `-wal`/`-shm` from the old
+    // name, so its frames can land in the replacement database. Leave the
+    // corrupt file for the next open that finds nobody attached.
+    let live = crate::store::mutation_lock::try_acquire_live_exclusive(path).map_err(|e| {
+        io_as_sqlite(
+            "probe live code-index connections",
+            std::io::Error::other(e),
+        )
+    })?;
+    if live.is_none() {
+        tracing::warn!(
+            database = %path.display(),
+            reason,
+            "code index is corrupt but held open by another process; left in place — restart the daemon to rebuild it"
+        );
+        return Ok(());
+    }
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let quarantine_dir = parent.join("quarantine");
@@ -785,6 +833,28 @@ mod tests {
         // Re-open
         let db = CodeDb::open(&path).unwrap();
         assert_eq!(db.path(), path);
+    }
+
+    #[test]
+    fn corrupt_code_db_is_left_in_place_while_a_connection_is_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.sqlite");
+        std::fs::write(&path, b"not a sqlite database at all").unwrap();
+        let quarantine_dir = dir.path().join("quarantine");
+
+        // A live holder: renaming now would recycle the path onto a second
+        // inode while that connection still derives `-wal`/`-shm` from it.
+        let live = crate::store::mutation_lock::acquire_live_shared(&path).unwrap();
+        quarantine_if_corrupt(&path).unwrap();
+        assert!(path.exists(), "corrupt file stays where the holder sees it");
+        assert!(
+            !quarantine_dir.exists(),
+            "nothing may be moved while a connection is open"
+        );
+
+        drop(live);
+        quarantine_if_corrupt(&path).unwrap();
+        assert!(!path.exists(), "with no holder left it is quarantined");
     }
 
     #[test]

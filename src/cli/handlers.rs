@@ -69,6 +69,15 @@ pub struct Context {
     /// quarantined it, and built this connection on a fresh empty database.
     /// The caller should trigger a reindex to repopulate it.
     pub rebuilt_from_corruption: bool,
+    /// True when the index is structurally corrupt but could not be quarantined
+    /// because another process holds it open. Nothing was renamed — repairing it
+    /// requires closing every mdkb process (the daemon included) so the next
+    /// open can quarantine and rebuild.
+    pub corrupt_in_use: bool,
+    /// Shared advisory lock announcing this connection for as long as the
+    /// context lives, so no other process renames the database files underneath
+    /// it. Never read — its whole job is to exist until drop.
+    _live_guard: Option<crate::store::mutation_lock::MutationGuard>,
 }
 
 impl std::fmt::Debug for Context {
@@ -135,10 +144,20 @@ impl Context {
         // Autoheal: quarantine a structurally-corrupt index before we build on
         // it, so the `Connection::open` below lands on a clean file. Throttled,
         // so this is cheap on the hot open path.
+        let mut corrupt_in_use = false;
         let quarantined = match crate::store::heal::ensure_sound_locked(&db_path)? {
             crate::store::heal::Heal::Sound => None,
             crate::store::heal::Heal::Quarantined { corrupt_path } => Some(corrupt_path),
+            crate::store::heal::Heal::CorruptInUse => {
+                corrupt_in_use = true;
+                None
+            }
         };
+
+        // Announce this connection before opening it, so any concurrent heal
+        // sees a live holder and leaves the files alone. Taken after the probe
+        // above so it never vetoes our own quarantine.
+        let live_guard = crate::store::mutation_lock::acquire_live_shared(&db_path)?;
 
         let conn = Connection::open(&db_path)?;
         Self::configure_connection(&conn)?;
@@ -176,11 +195,26 @@ impl Context {
             false
         };
 
+        if corrupt_in_use {
+            tracing::error!(
+                db = %db_path.display(),
+                "index.sqlite is structurally corrupt but held open by another process; \
+                 left in place — close every mdkb process (restart the daemon) so the next open can rebuild it"
+            );
+            eprintln!(
+                "mdkb: {} is CORRUPT and in use by another process — nothing was quarantined. \
+                 Stop the daemon and every mdkb session, then reopen to quarantine and rebuild.",
+                db_path.display()
+            );
+        }
+
         Ok(Self {
             conn,
             config_path,
             db_path,
             rebuilt_from_corruption,
+            corrupt_in_use,
+            _live_guard: Some(live_guard),
         })
     }
 
@@ -210,6 +244,7 @@ impl Context {
         vectors::init_sqlite_vec();
 
         // Create and initialize database
+        let live_guard = crate::store::mutation_lock::acquire_live_shared(&db_path)?;
         let conn = Connection::open(&db_path)?;
         Self::configure_connection(&conn)?;
         schema::init_schema(&conn)?;
@@ -220,6 +255,8 @@ impl Context {
             config_path,
             db_path,
             rebuilt_from_corruption: false,
+            corrupt_in_use: false,
+            _live_guard: Some(live_guard),
         })
     }
 
@@ -479,27 +516,54 @@ pub fn handle_hybrid_search(
     collection: Option<&str>,
     include_superseded: bool,
 ) -> Result<Vec<SearchResult>> {
+    let fts_query = search::escape_fts5_query(query_text);
+    // Falls back to BM25-only if the embedding service is unavailable.
+    let query_embedding =
+        match crate::llm::get_cached_service().and_then(|s| s.embed_query(query_text)) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::debug!("Hybrid search falling back to BM25-only: {e}");
+                None
+            }
+        };
+    hybrid_search_fts(
+        ctx,
+        &fts_query,
+        query_embedding.as_deref(),
+        limit,
+        collection,
+        include_superseded,
+    )
+}
+
+/// Hybrid doc search over a pre-built FTS5 expression and a pre-computed query
+/// embedding. Mirrors `memory::search_entries_hybrid_fts`: the caller owns both
+/// escaping (so a full-sentence prompt can be OR-expanded) and embedding (so
+/// inference never runs while a caller holds the context mutex).
+///
+/// `query_embedding: None` degrades to BM25-only.
+pub fn hybrid_search_fts(
+    ctx: &Context,
+    fts_query: &str,
+    query_embedding: Option<&[f32]>,
+    limit: usize,
+    collection: Option<&str>,
+    include_superseded: bool,
+) -> Result<Vec<SearchResult>> {
     // Get BM25 results
     let bm25_query = SearchQuery {
-        text: query_text.to_string(),
-        limit: limit * 2, // Get more for fusion
+        text: String::new(), // ignored: `fts_query` is already escaped
+        limit: limit * 2,    // Get more for fusion
         collection: collection.map(String::from),
         tags: vec![],
         include_superseded,
     };
-    let bm25_results = search::search(&ctx.conn, &bm25_query)?;
+    let bm25_results = search::search_fts(&ctx.conn, fts_query, &bm25_query)?;
 
-    // Vector search — falls back to BM25-only if embedding service is unavailable
-    let vector_results =
-        match crate::llm::get_cached_service().and_then(|s| s.embed_query(query_text)) {
-            Ok(query_embedding) => {
-                vectors::chunk_vector_search(&ctx.conn, &query_embedding, limit * 2)?
-            }
-            Err(e) => {
-                tracing::debug!("Hybrid search falling back to BM25-only: {e}");
-                Vec::new()
-            }
-        };
+    let vector_results = match query_embedding {
+        Some(embedding) => vectors::chunk_vector_search(&ctx.conn, embedding, limit * 2)?,
+        None => Vec::new(),
+    };
 
     // Fuse results using RRF
     let config = hybrid::HybridConfig::default();

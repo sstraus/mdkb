@@ -59,10 +59,20 @@ pub fn index_is_empty(conn: &Connection) -> bool {
 /// By default, only returns documents with status 'current' (or NULL for legacy docs).
 /// With `include_superseded`, returns all documents with status markers.
 pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult>> {
-    let mut search_results = Vec::new();
+    search_fts(conn, &escape_fts5_query(&query.text), query)
+}
 
-    // Escape the query for safe FTS5 usage
-    let fts_query = escape_fts5_query(&query.text);
+/// BM25 search variant accepting a pre-built FTS5 expression.
+///
+/// `query.text` is ignored — the caller owns escaping, so it can OR-expand a
+/// full-sentence prompt instead of taking FTS5's implicit AND. Every other
+/// field of `query` (collection, limit, include_superseded) still applies.
+pub fn search_fts(
+    conn: &Connection,
+    fts_query: &str,
+    query: &SearchQuery,
+) -> Result<Vec<SearchResult>> {
+    let mut search_results = Vec::new();
 
     // Build status filter clause
     let status_filter = if query.include_superseded {
@@ -128,9 +138,9 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<SearchResult
     };
 
     let rows = if let Some(coll) = collection_param {
-        stmt.query_map(params![&fts_query, coll, query.limit as i64], row_mapper)?
+        stmt.query_map(params![fts_query, coll, query.limit as i64], row_mapper)?
     } else {
-        stmt.query_map(params![&fts_query, query.limit as i64], row_mapper)?
+        stmt.query_map(params![fts_query, query.limit as i64], row_mapper)?
     };
 
     for result in rows {
@@ -334,6 +344,58 @@ mod tests {
         }
 
         conn
+    }
+
+    #[test]
+    fn search_fts_honours_a_prebuilt_or_expression() {
+        let conn = setup_db_with_docs();
+        // A full-sentence prompt: no single document contains every term, so
+        // the default implicit-AND escaping matches nothing. That is exactly
+        // why the hook recall path OR-expands before calling `search_fts`.
+        let prompt = "how do rust lifetimes compare to python";
+        let query = SearchQuery {
+            text: prompt.to_string(),
+            limit: 10,
+            collection: None,
+            tags: vec![],
+            include_superseded: false,
+        };
+
+        let and_results = search(&conn, &query).expect("AND search should succeed");
+        assert!(
+            and_results.is_empty(),
+            "implicit AND must not match a full sentence: {and_results:?}"
+        );
+
+        let or_results = search_fts(&conn, &escape_fts5_query_or(prompt), &query)
+            .expect("OR search should succeed");
+        let paths: Vec<&str> = or_results.iter().map(|r| r.path.as_str()).collect();
+        assert!(
+            paths.contains(&"rust-advanced.md"),
+            "OR expression should match on 'lifetimes': {paths:?}"
+        );
+        assert!(
+            paths.contains(&"python-intro.md"),
+            "OR expression should match on 'python': {paths:?}"
+        );
+    }
+
+    #[test]
+    fn search_fts_ignores_query_text_but_honours_other_fields() {
+        let conn = setup_db_with_docs();
+        // `text` is deliberately a term that matches nothing — `search_fts`
+        // must use the passed expression, and still apply `limit`.
+        let query = SearchQuery {
+            text: "zzzz-no-such-term".to_string(),
+            limit: 1,
+            collection: None,
+            tags: vec![],
+            include_superseded: false,
+        };
+
+        let results =
+            search_fts(&conn, &escape_fts5_query_or("rust python"), &query).expect("search");
+        assert_eq!(results.len(), 1, "limit must still apply: {results:?}");
     }
 
     // ==================== Search Tests ====================

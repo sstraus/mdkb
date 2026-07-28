@@ -211,6 +211,10 @@ post_tool_use_enabled = true
 # Max recall results injected on UserPromptSubmit.
 recall_limit = 5
 
+# Max matching documents injected alongside the memory recall, from
+# the same hybrid engine as `mdkb search --scope docs`. 0 = memory only.
+recall_docs_limit = 3
+
 # Latency budget in milliseconds. If a hook exceeds this,
 # the overrun is appended to .mdkb/hook-slow.jsonl and the
 # output may be truncated with a notice.
@@ -229,11 +233,12 @@ code_hits_in_pretooluse = true
 doc_graph_in_recall = true
 ```
 
-Defaults are safe for interactive use; tune `recall_limit` higher if
-you want more context, lower if the assistant is getting too much
-noise on every prompt. `code_hits_in_pretooluse` and
-`doc_graph_in_recall` independently kill the two graph/index injectors
-if you want the plain suggestion / memory-only behavior.
+Defaults are safe for interactive use; tune `recall_limit` and
+`recall_docs_limit` higher if you want more context, lower if the
+assistant is getting too much noise on every prompt.
+`code_hits_in_pretooluse` and `doc_graph_in_recall` independently kill
+the two graph/index injectors if you want the plain suggestion /
+memory-only behavior.
 
 ## Opt out
 

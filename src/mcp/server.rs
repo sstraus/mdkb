@@ -221,7 +221,7 @@ impl McpServer {
     /// - Global mode, `root` = None, 1 registered repo: auto-selects it.
     /// - Global mode, `root` = None, N > 1 repos: error listing available roots.
     /// - Global mode, `root` = Some(path): resolves from registry.
-    /// - `root` = "*": reserved for cross-repo search (not yet implemented).
+    /// - `root` = "*": rejected here; only `search` handles cross-repo fan-out.
     async fn resolve_handle(&self, root: Option<&str>) -> Result<Arc<RepoHandle>, McpError> {
         if let Some(registry) = &self.registry {
             // Global mode: resolve from registry
@@ -250,7 +250,7 @@ impl McpServer {
                 }
                 Some("*") => {
                     return Err(mcp_error(
-                        "Cross-repo search (root=\"*\") not yet implemented.",
+                        "root=\"*\" is supported only by search. Pass the exact repository root for get and other tools.",
                     ));
                 }
                 Some(path) => registry
@@ -591,7 +591,7 @@ impl McpServer {
     /// Retrieve a document by ID or path, with optional line range.
     /// Also accepts memory slugs, glob patterns, and comma-separated lists.
     #[tool(
-        description = "Retrieve a document by ID, path, or memory slug, with optional line range."
+        description = "Retrieve a document by ID, path, or memory slug, with optional line range. In multi-repo mode, pass the exact repository root; root=\"*\" is supported only by search."
     )]
     pub async fn get(
         &self,
@@ -1598,7 +1598,7 @@ mdkb is a **semantic** search engine (fuzzy, concept-based). It does NOT match l
 - `memory_confirm(id, outcome=\"confirmed\"|\"refuted\")` — adjust belief (+/-1, floor 0) instead of rewriting.
 - `memory_delete` — remove stale entries.
 
-`search` returns IDs → `get(id)` for full content. Multi-repo: pass `root` (`\"*\"` for cross-repo).
+`search` returns IDs → `get(id)` for full content. Use `root=\"*\"` only for cross-repo search. Then call `get` with the exact `repo` shown on the selected result; `get` does not accept `root=\"*\"`.
 
 ### Reminders
 
@@ -1776,14 +1776,36 @@ pub(super) fn format_search_results(results: &[SearchResult], limit: usize) -> S
     }
 
     // Hint: guide the model toward get() for retrieval
-    let ids: Vec<_> = ordered.iter().map(|r| r.id.to_string()).collect();
-    if ids.len() == 1 {
-        output.push_str(&format!("\nUse get(\"{}\") to read.", ids[0]));
+    let retrieval_ids: Vec<_> = ordered
+        .iter()
+        .map(|r| {
+            if r.collection == "memory" && !r.path.is_empty() {
+                r.path.clone()
+            } else {
+                r.id.to_string()
+            }
+        })
+        .collect();
+    let repo_roots: Vec<_> = ordered
+        .iter()
+        .filter_map(|r| r.repo_root.as_deref())
+        .collect();
+
+    if let Some(root) = repo_roots.first() {
+        let id = serde_json::to_string(&retrieval_ids[0]).expect("string serialization");
+        let root = serde_json::to_string(root).expect("string serialization");
+        output.push_str(&format!("\nUse get({id}, root={root}) to read one."));
+        if retrieval_ids.len() > 1 {
+            output.push_str(" For another result, pass its listed repo as root.");
+        }
+        output.push_str(" root=\"*\" is search-only.");
+    } else if retrieval_ids.len() == 1 {
+        output.push_str(&format!("\nUse get(\"{}\") to read.", retrieval_ids[0]));
     } else {
         output.push_str(&format!(
             "\nUse get(\"{}\") to read one, or get(\"{}\") for all.",
-            ids[0],
-            ids.join(",")
+            retrieval_ids[0],
+            retrieval_ids.join(",")
         ));
     }
 
@@ -2058,6 +2080,57 @@ mod tests {
         assert!(
             output.contains("get(\"10,20\")"),
             "Should hint batch get, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_format_cross_repo_results_get_hint_uses_exact_root() {
+        let results = vec![SearchResult {
+            id: 10,
+            collection: "docs".to_string(),
+            path: "auth.md".to_string(),
+            title: Some("Auth Guide".to_string()),
+            score: 0.85,
+            snippets: vec![],
+            status: None,
+            superseded_by: None,
+            repo_root: Some("/repos/example".to_string()),
+        }];
+
+        let output = format_search_results(&results, 10);
+        assert!(
+            output.contains("get(\"10\", root=\"/repos/example\")"),
+            "Should include the exact repo in the get hint, got: {output}"
+        );
+        assert!(
+            output.contains("root=\"*\" is search-only"),
+            "Should explain wildcard scope, got: {output}"
+        );
+    }
+
+    #[test]
+    fn test_format_cross_repo_memory_hint_uses_slug_and_exact_root() {
+        let results = vec![SearchResult {
+            id: 0,
+            collection: "memory".to_string(),
+            path: "parity-backlog-checkpoint-2026-07-23".to_string(),
+            title: Some("Parity backlog checkpoint".to_string()),
+            score: 1.0,
+            snippets: vec![],
+            status: None,
+            superseded_by: None,
+            repo_root: Some("/repos/example".to_string()),
+        }];
+
+        let output = format_search_results(&results, 10);
+        assert!(
+            output
+                .contains("get(\"parity-backlog-checkpoint-2026-07-23\", root=\"/repos/example\")"),
+            "Should use the memory slug and exact repo, got: {output}"
+        );
+        assert!(
+            !output.contains("get(\"0\""),
+            "Should not expose the synthetic aggregation ID, got: {output}"
         );
     }
 
@@ -3804,15 +3877,15 @@ if (require.main === module) {
     }
 
     #[tokio::test]
-    async fn test_resolve_handle_cross_repo_not_implemented() {
+    async fn test_resolve_handle_rejects_wildcard_outside_search() {
         let config = global_test_config();
         let registry = Arc::new(RepoRegistry::new(config));
         let server = McpServer::global(registry);
 
         let err = server.resolve_handle(Some("*")).await.unwrap_err();
         assert!(
-            format!("{:?}", err).contains("Cross-repo"),
-            "Should report cross-repo not implemented: {:?}",
+            format!("{:?}", err).contains("supported only by search"),
+            "Should explain that wildcard roots are search-only: {:?}",
             err
         );
     }
