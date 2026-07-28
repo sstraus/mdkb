@@ -24,21 +24,36 @@
   (`rm .mdkb/*.corrupt-*`, matching the scan predicate, so it also clears a
   quarantined `code.sqlite`) once per store instead of once per file.
 
+- **`Context::open` canonicalizes the store before deriving any lock.** Every
+  cross-process identity was built from the caller's spelling of the path as a
+  string: the `.mutation.lock` and `.live.lock` sidecars, and the `-wal`/`-shm`
+  files SQLite names itself. Two spellings of one store therefore yielded two
+  lock domains over a single inode — neither the open guard nor the live lock
+  excluded the other writer, which produces exactly the doubly-referenced pages
+  and freelist mismatch seen after each incident. On a case-insensitive volume
+  (the APFS default) `Gits` and `GITS` are such a pair, resolving to the same
+  file. Callers were expected to canonicalize and `main.rs` did, but with a
+  silent `unwrap_or` fallback to the raw spelling; the invariant now lives
+  where the locks are named, and a store whose path cannot be resolved is
+  refused instead of opened.
+
 ### Known issues
 
-- **`index.sqlite` corruption still reproduces under 3.7.7.** A repo whose
-  index passed `PRAGMA integrity_check` was found corrupt roughly an hour
-  later — `2nd reference to page` in `memory_entries` and `memory_fts_data`,
-  plus a freelist size mismatch and a malformed FTS5 inverted index. The
-  signature matches the doubly-referenced pages 3.7.6 set out to close, but
-  none of the three known mechanisms was in play: the live lock *was* held
-  (verified by probing the sidecar with a non-blocking exclusive `flock`), no
-  rename had occurred, `auto_vacuum` is `NONE`, no `mmap_size` is set anywhere,
-  and there is no `incremental_vacuum` caller. So a fourth mechanism is open
-  and the root cause is not identified. Recovery is safe where memory is
-  mirrored to `.mdkb/memory/entries` (a 1:1 markdown mirror of
-  `memory_entries`): stop the daemon, move the corrupt index aside, then
-  `mdkb memory import .mdkb/memory/entries && mdkb update`.
+- **One `index.sqlite` corruption remains unexplained.** A repo whose index
+  passed `PRAGMA integrity_check` was found corrupt roughly an hour later, with
+  the signature above. Three candidate mechanisms were ruled out by direct
+  measurement: the live lock *was* held (probed with a non-blocking exclusive
+  `flock` on the sidecar) and no rename had occurred; `auto_vacuum` reads
+  `NONE`; no `mmap_size` is set anywhere and there is no `incremental_vacuum`
+  caller. Path aliasing — closed above — was the fourth candidate and cannot be
+  confirmed as the cause of *that* incident either, since `Path::canonicalize`
+  does normalize case on APFS and the CLI already applied it. Distinguishing the
+  remaining possibilities needs write-level tracing while corruption happens,
+  which a post-mortem file cannot supply. Recovery, verified: memory is a 1:1
+  markdown mirror in `.mdkb/memory/entries`, so stop the daemon in a poll loop
+  until an exclusive `flock` on `index.sqlite.live.lock` succeeds, move the
+  corrupt file aside, then `mdkb memory import .mdkb/memory/entries && mdkb
+  update`.
 
 ## 3.7.7 (2026-07-28)
 
