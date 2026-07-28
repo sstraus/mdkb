@@ -121,15 +121,32 @@ impl Context {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let mdkb_dir = root.join(".mdkb");
-        let config_path = mdkb_dir.join("config.toml");
-        let db_path = mdkb_dir.join("index.sqlite");
 
         if !mdkb_dir.exists() {
             return Err(ErrorKind::DatabaseNotFound {
-                path: db_path.clone(),
+                path: mdkb_dir.join("index.sqlite"),
             }
             .into());
         }
+
+        // Every cross-process identity below is derived from `db_path` as a
+        // STRING: the `.mutation.lock` and `.live.lock` sidecars, and the
+        // `-wal`/`-shm` files SQLite itself names. Two spellings of one file
+        // therefore give two lock domains over a single inode — no shared WAL
+        // index, no mutual exclusion, and the doubly-referenced pages that
+        // follow. On a case-insensitive volume (APFS default) `Gits` and `GITS`
+        // are exactly such a pair. Canonicalizing here makes the identity a
+        // property of the store rather than of whatever spelling the caller
+        // happened to hold.
+        let mdkb_dir = mdkb_dir.canonicalize().map_err(|e| {
+            Error::other(format!(
+                "cannot canonicalize {}: {e} — refusing to open, because locks \
+                 keyed on a non-canonical path silently corrupt the index",
+                mdkb_dir.display()
+            ))
+        })?;
+        let config_path = mdkb_dir.join("config.toml");
+        let db_path = mdkb_dir.join("index.sqlite");
 
         // Initialize sqlite-vec extension before opening connection
         vectors::init_sqlite_vec();
@@ -3207,6 +3224,54 @@ mod tests {
 
     fn setup_temp_dir() -> TempDir {
         tempfile::tempdir().expect("failed to create temp dir")
+    }
+
+    /// `.mutation.lock`, `.live.lock` and SQLite's own `-wal`/`-shm` are all
+    /// named from `db_path` as a string. Two spellings of one store therefore
+    /// mean two lock domains over a single inode: neither the open guard nor
+    /// the live lock excludes the other writer, and the result is the
+    /// doubly-referenced pages and freelist mismatch we kept recovering from.
+    /// Opening through an alias must land on the identical path.
+    #[test]
+    fn open_canonicalizes_the_store_so_every_lock_shares_one_identity() {
+        let temp = setup_temp_dir();
+        let real = temp.path().join("real");
+        std::fs::create_dir_all(&real).expect("mkdir");
+        handle_init(&real).expect("init");
+
+        let direct = Context::open(&real).expect("open directly");
+
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink");
+        let aliased = Context::open(&alias).expect("open through the alias");
+
+        assert_eq!(
+            direct.db_path, aliased.db_path,
+            "aliased spelling opened a second lock domain over the same inode"
+        );
+        assert_eq!(
+            crate::store::mutation_lock::live_lock_path(&direct.db_path),
+            crate::store::mutation_lock::live_lock_path(&aliased.db_path),
+            "the live lock that guards against renames must be one file, not two"
+        );
+    }
+
+    /// A missing store must fail loudly rather than open something. The
+    /// canonicalization error branch itself is defensive only — the existence
+    /// check above it means a `.mdkb` that resolves cannot then fail to
+    /// canonicalize, so this covers the reachable half.
+    #[test]
+    fn open_refuses_a_store_that_is_not_there() {
+        let temp = setup_temp_dir();
+        let root = temp.path().join("gone");
+        std::fs::create_dir_all(root.join(".mdkb")).expect("mkdir");
+        std::fs::remove_dir(root.join(".mdkb")).expect("rmdir");
+        let err = Context::open(&root).expect_err("must not open");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("index.sqlite") || msg.contains("canonicalize"),
+            "error must name the store or the canonicalization failure: {msg}"
+        );
     }
 
     // ==================== Memory confirm ====================
