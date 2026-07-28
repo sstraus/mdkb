@@ -560,6 +560,11 @@ async fn run_cli(cli: Cli) -> Result<()> {
             // Vacuum code.sqlite if present
             let code_path = mdkb_dir.join("code.sqlite");
             if code_path.exists() {
+                // Announce the connection before opening it: a quarantine that
+                // renames the path mid-VACUUM recycles it onto a fresh database,
+                // and SQLite derives -wal/-shm from the path — so this
+                // connection's frames would land in the replacement's WAL.
+                let _live = mdkb::store::mutation_lock::acquire_live_shared(&code_path)?;
                 let conn = rusqlite::Connection::open(&code_path)?;
                 conn.execute_batch("VACUUM;")?;
                 let code_size = code_path.metadata().map(|m| m.len()).unwrap_or(0);

@@ -321,9 +321,19 @@ fn collect_code(mdkb_dir: &Path) -> CodeSummary {
         return empty_code_summary();
     }
 
+    // `run_repairs` DELETEs, so this connection must announce itself: a
+    // quarantine renaming the path under it recycles the path onto a fresh
+    // database and these frames would land in the replacement's WAL. The lock
+    // is shared, so this only ever waits for the brief exclusive window a
+    // quarantine holds while renaming; `ok()` covers the sidecar being
+    // unopenable, and then we skip the repairs — a pure reader injects no
+    // frames.
+    let live = crate::store::mutation_lock::acquire_live_shared(&code_path).ok();
     let conn = match rusqlite::Connection::open(&code_path) {
         Ok(c) => {
-            crate::code::storage::repair::run_repairs(&c);
+            if live.is_some() {
+                crate::code::storage::repair::run_repairs(&c);
+            }
             c
         }
         Err(_) => {
@@ -990,6 +1000,54 @@ mod tests {
             .unwrap();
         assert_eq!(post.invocations, 1);
         assert_eq!(post.fired, 1);
+    }
+
+    /// `collect_code` writes (`run_repairs` DELETEs), so it must hold the live
+    /// lock for the life of its connection. Renaming `code.sqlite` under an open
+    /// connection is what seeded the repeated corruptions: SQLite binds the
+    /// connection to the inode but derives `-wal`/`-shm` from the path, so a
+    /// survivor lands its frames in the replacement's WAL. Holding the lock
+    /// exclusively must therefore make `collect_code` wait.
+    #[test]
+    fn collect_code_waits_for_the_live_lock_before_opening() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("code.sqlite");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        crate::code::storage::schema::init_schema(&conn).unwrap();
+        drop(conn);
+
+        let blocker = crate::store::mutation_lock::try_acquire_live_exclusive(&db_path)
+            .unwrap()
+            .expect("nothing else holds the live lock yet");
+
+        let (tx, rx) = mpsc::channel();
+        let root = dir.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            let summary = collect_code(&root);
+            tx.send(summary).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "collect_code opened code.sqlite without announcing itself on the live lock"
+        );
+
+        drop(blocker);
+        let summary = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("collect_code must proceed once the live lock is free");
+        worker.join().unwrap();
+
+        assert_eq!(summary.files, 0, "empty index counted correctly");
+        assert!(
+            crate::store::mutation_lock::try_acquire_live_exclusive(&db_path)
+                .unwrap()
+                .is_some(),
+            "collect_code leaked its live guard — quarantine would be vetoed forever"
+        );
     }
 
     #[test]
