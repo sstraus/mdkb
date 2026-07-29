@@ -287,7 +287,17 @@ pub fn run_distiller_cli(
         .stderr(Stdio::null())
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes())?;
+        // A distiller that exits, or stops reading, before the whole prompt is
+        // written closes the pipe. EPIPE here means "did not want the input",
+        // not a failure: its stdout still decides the outcome, and whether our
+        // write lands before the child exits is a scheduling race. Propagating
+        // it made the result platform-dependent — the same non-zero-exit stub
+        // returned Ok on macOS and Err on Linux.
+        if let Err(e) = stdin.write_all(prompt.as_bytes()) {
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                return Err(e.into());
+            }
+        }
     }
     let output = child.wait_with_output()?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -475,6 +485,18 @@ mod tests {
         // it as NotJson. The hook proceeds — no crash, no block.
         let out = run_distiller_cli("sh", &["-c".into(), "exit 1".into()], "prompt")
             .expect("spawn of sh must succeed even though the script exits non-zero");
+        assert_eq!(parse_distilled(&out), Err(DistillReject::NotJson));
+    }
+
+    /// A distiller that exits without ever reading stdin closes the pipe under
+    /// us. With a prompt too large for the pipe buffer the EPIPE is not a race
+    /// but a certainty, so this pins the behaviour on every platform: the write
+    /// failure is swallowed and the (empty) stdout is what gets judged.
+    #[test]
+    fn run_distiller_cli_swallows_broken_pipe_on_a_prompt_that_is_never_read() {
+        let huge = "x".repeat(4 * 1024 * 1024);
+        let out = run_distiller_cli("sh", &["-c".into(), "exit 3".into()], &huge)
+            .expect("a distiller that never reads stdin is not an error");
         assert_eq!(parse_distilled(&out), Err(DistillReject::NotJson));
     }
 
