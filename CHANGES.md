@@ -1,5 +1,20 @@
 # Changelog
 
+## 3.7.9 (2026-07-29)
+
+### Fixed
+
+- **A distiller that never reads its prompt is no longer an error.**
+  `run_distiller_cli` propagated `EPIPE` from writing the prompt to the agent
+  CLI's stdin, so a distiller that exited before reading it failed the call.
+  Whether the write lands before the child exits is a scheduling race, which
+  made the outcome platform-dependent — the same non-zero-exit stub returned
+  `Ok` on macOS and `Err` on Linux, so 3.7.8's CI went red on a test that is
+  green locally. A closed pipe means the child did not want the input; its
+  stdout still decides the outcome, so `EPIPE` is swallowed while every other
+  write error still propagates. The regression test writes 4 MiB to a child
+  that never reads, making `EPIPE` a certainty rather than a coin flip.
+
 ## 3.7.8 (2026-07-28)
 
 ### Fixed
