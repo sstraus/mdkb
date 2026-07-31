@@ -62,6 +62,12 @@ impl Error {
     pub fn is_not_found(&self) -> bool {
         self.kind.is_not_found()
     }
+
+    /// Returns true if this error means the index file itself is broken.
+    #[must_use]
+    pub fn is_index_corrupt(&self) -> bool {
+        self.kind.is_index_corrupt()
+    }
 }
 
 impl fmt::Debug for Error {
@@ -104,6 +110,15 @@ pub enum ErrorKind {
 
     #[error("database not initialized at {path}")]
     DatabaseNotFound { path: PathBuf },
+
+    /// The index is structurally corrupt (`PRAGMA quick_check` failed).
+    ///
+    /// Distinct from a generic `Database` error because it demands a distinct
+    /// reaction: the holder must CLOSE the connection so autoheal can quarantine
+    /// the file. A process that keeps retrying instead writes into a malformed
+    /// database indefinitely — and every memory entry written meanwhile is lost.
+    #[error("index at {path} is structurally corrupt")]
+    IndexCorrupt { path: PathBuf },
 
     #[error("database migration failed: {0}")]
     Migration(String),
@@ -188,6 +203,24 @@ impl ErrorKind {
                 | Self::DocumentNotFound { .. }
                 | Self::PathNotFound { .. }
         )
+    }
+
+    /// Returns true if this error means the index file itself is broken.
+    ///
+    /// Covers both our own post-mutation probe ([`Self::IndexCorrupt`]) and the
+    /// SQLite codes that report a torn file mid-statement, so a caller that
+    /// reacts by closing the connection catches the damage whichever layer
+    /// notices it first.
+    #[must_use]
+    pub fn is_index_corrupt(&self) -> bool {
+        match self {
+            Self::IndexCorrupt { .. } => true,
+            Self::Database(rusqlite::Error::SqliteFailure(err, _)) => matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+            ),
+            _ => false,
+        }
     }
 }
 

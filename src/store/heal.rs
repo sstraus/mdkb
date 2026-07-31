@@ -107,10 +107,56 @@ pub fn is_structurally_sound(conn: &Connection) -> bool {
 pub fn verify_and_mark(conn: &Connection, db_path: &Path) -> Result<()> {
     if !is_structurally_sound(conn) {
         invalidate_marker(db_path);
-        return Err(crate::error::Error::other(format!(
-            "{} failed PRAGMA quick_check after mutation; close this process and reopen mdkb to quarantine and rebuild the index",
-            db_path.display()
-        )));
+        return Err(crate::error::ErrorKind::IndexCorrupt {
+            path: db_path.to_path_buf(),
+        }
+        .into());
+    }
+    touch_marker(&marker_path(db_path));
+    Ok(())
+}
+
+/// [`verify_and_mark`], skipped when the last probe is younger than
+/// [`CHECK_INTERVAL`].
+///
+/// For a database that can reach gigabytes (the code index), a full-file
+/// `quick_check` after every mutation would cost more than the mutation. The
+/// throttle bounds it to one scan per interval while still bounding how long
+/// corruption can go unnoticed — which matters because a long-lived connection
+/// serves reads from its page cache and writes into the WAL, so it can operate
+/// for days over a torn file without SQLite ever reporting it.
+pub fn verify_and_mark_throttled(db_path: &Path) -> Result<()> {
+    verify_and_mark_throttled_at(db_path, CHECK_INTERVAL, SystemTime::now())
+}
+
+/// [`verify_and_mark_throttled`] with an injectable interval and clock.
+pub fn verify_and_mark_throttled_at(
+    db_path: &Path,
+    interval: Duration,
+    now: SystemTime,
+) -> Result<()> {
+    if checked_recently(&marker_path(db_path), interval, now) {
+        return Ok(());
+    }
+    if !db_path.exists() {
+        return Ok(());
+    }
+
+    // Probe on a THROWAWAY connection, not the caller's. A long-lived
+    // connection answers `quick_check` out of its own page cache, so damage
+    // written to the file underneath it — the whole failure mode this guards —
+    // reads back as sound. A fresh connection sees the file (plus its WAL).
+    let sound = {
+        let probe = Connection::open(db_path)?;
+        is_structurally_sound(&probe)
+    };
+
+    if !sound {
+        invalidate_marker(db_path);
+        return Err(crate::error::ErrorKind::IndexCorrupt {
+            path: db_path.to_path_buf(),
+        }
+        .into());
     }
     touch_marker(&marker_path(db_path));
     Ok(())

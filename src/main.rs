@@ -2625,6 +2625,7 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
             let output = serde_json::json!({
                 "files_discovered": stats.files_discovered,
                 "files_indexed": stats.files_indexed,
+                "files_removed": stats.files_removed,
                 "symbols_indexed": stats.symbols_indexed,
                 "relationships_collected": stats.relationships_collected,
                 "parse_errors": stats.parse_errors,
@@ -2632,11 +2633,14 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
             println!("{}", serde_json::to_string_pretty(&output).unwrap());
         }
         OutputFormat::Csv => {
-            println!("files_discovered,files_indexed,symbols_indexed,relationships,parse_errors");
             println!(
-                "{},{},{},{},{}",
+                "files_discovered,files_indexed,files_removed,symbols_indexed,relationships,parse_errors"
+            );
+            println!(
+                "{},{},{},{},{},{}",
                 stats.files_discovered,
                 stats.files_indexed,
+                stats.files_removed,
                 stats.symbols_indexed,
                 stats.relationships_collected,
                 stats.parse_errors,
@@ -2645,6 +2649,11 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
         OutputFormat::Markdown | OutputFormat::Text => {
             println!("Files discovered: {}", stats.files_discovered);
             println!("Files indexed:    {}", stats.files_indexed);
+            // Deletions are the one number the file counts can't imply — stay
+            // quiet when nothing was dropped.
+            if stats.files_removed > 0 {
+                println!("Files removed:    {}", stats.files_removed);
+            }
             println!("Symbols indexed:  {}", stats.symbols_indexed);
             println!("Relationships:    {}", stats.relationships_collected);
             // Only surface parse failures when there are any — a clean run stays quiet.

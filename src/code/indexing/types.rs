@@ -124,6 +124,10 @@ impl Default for IndexBatch {
 pub struct IndexStats {
     pub files_discovered: u32,
     pub files_indexed: u32,
+    /// Files dropped from the index because they no longer exist on disk. Only a
+    /// caller that walked the whole tree can know this, so it is zero on the
+    /// explicit-path paths (`index_files`, `reindex_files`).
+    pub files_removed: u32,
     pub symbols_indexed: u32,
     pub relationships_collected: u32,
     /// Files the PARSE stage could not handle: unsupported/unknown language or a

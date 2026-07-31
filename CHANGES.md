@@ -1,5 +1,75 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`mdkb update` drops files deleted from disk.** The code index kept the
+  symbols and relationships of deleted files forever: `update` walks the tree
+  and hands the result to `reindex_files`, which computes deletions by testing
+  the paths it was given for existence — and a file removed from disk never
+  appears in a walk, so the deleted branch was unreachable on that path. Stale
+  symbols kept answering `search`, `callers` and `calls` until someone ran a
+  full `--force` reindex (agent2 was carrying four such files). `update` now
+  prunes every indexed path absent from its walk before diffing, and reports the
+  count as `Files removed`. The prune deliberately does NOT live in
+  `reindex_files` or `index_directory`: both are also called with a subset of
+  the tree (the watcher's changed paths, `mdkb code index <subdir>`), where
+  "indexed but not in this batch" is the normal case, not a deletion.
+
+- **A corrupt index is now released by the process that detects it, instead of
+  being retried forever.** `verify_and_mark` runs after every index-wide
+  mutation, but its failure was only logged. A one-shot CLI recovers anyway (it
+  reopens, and the open path quarantines), while the daemon does not: it holds
+  the `Context` — and with it the `.live.lock` that stops autoheal renaming the
+  file — for the life of the repo handle, so every reopen found the file *in
+  use* and declined to quarantine. The daemon was the holder blocking its own
+  heal. `~/.mdkb/logs/daemon.log` records the result: `failed PRAGMA quick_check
+  after mutation` 17153 times across four stores over 13 days (tuicommander from
+  07-11, itview from 07-17), each retry writing into a malformed database. That
+  is where tuicommander's 673 lost memory entries went — memory lives only in
+  this database, and by the time a daemon restart finally allowed the
+  quarantine, only what survived in the torn file could be salvaged.
+  `verify_and_mark` now returns a typed `ErrorKind::IndexCorrupt` (and
+  `Error::is_index_corrupt` also recognises SQLite's own `DatabaseCorrupt` /
+  `NotADatabase`), and the daemon's four mutation sites run through
+  `handlers::run_mutation`, which closes the context on that signal. The next
+  open then quarantines, salvages memory, and schedules the rebuild — machinery
+  that already existed and was simply unreachable while the handle stayed open.
+  `tests/e2e_corrupt_recovery.rs` reproduces both halves against a real torn
+  database: with the handle held nothing is ever quarantined, and with the
+  release the reopen heals and the memory entry survives.
+
+- **`code.sqlite` is probed after index-wide mutations too, on a throwaway
+  connection.** It was checked only at open, so a daemon that opens once and
+  runs for days could never notice damage — and the obvious fix, probing the
+  caller's own connection, does not work: `quick_check` goes through the pager,
+  so a long-lived connection answers out of its page cache and reports a file
+  torn underneath it as sound. (The reproduction test caught exactly that: with
+  the probe on the working connection the mutation reported success over a
+  deliberately corrupted database.) `IndexFacade::{update, index_directory,
+  reindex_files}` now call `heal::verify_and_mark_throttled`, which opens a fresh
+  connection and is bounded to one scan per `CHECK_INTERVAL` (6h) by the same
+  marker the open path uses — the watcher fires this constantly, and a code index
+  can reach gigabytes. The daemon's three code-index mutation sites run through
+  `indexing::run_code_mutation`, which closes the facade on corruption so the
+  next open quarantines and rebuilds from source.
+
+### Diagnosis notes
+
+- **No store has gone corrupt since 2026-07-18, and the original cause remains
+  unproven.** Onset dates from the daemon log are tuicommander 07-11, automa
+  07-16, itview 07-17, agent2 07-18 — all before the 3.7.6/3.7.7/3.7.8 lock work,
+  and agent2's four quarantines (07-22 → 07-28) are re-corruptions of a store
+  already stuck in the loop. Everything logged after 3.7.9 shipped (2026-07-29
+  07:43) is aftermath on already-corrupt stores, not a new onset: itview's
+  07-30 23:40 write is a failed write into a file corrupt since 07-17, not the
+  moment of damage. Post-mortem cannot go further — a quarantined file records
+  no writer identity — but the two releases above change what a recurrence looks
+  like: detection within one `CHECK_INTERVAL` instead of never, a quarantine
+  timestamp that dates the damage rather than the discovery, and no window in
+  which memory is written into a file that is already lost.
+
 ## 3.7.9 (2026-07-29)
 
 ### Fixed

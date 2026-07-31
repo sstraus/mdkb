@@ -89,6 +89,40 @@ impl std::fmt::Debug for Context {
     }
 }
 
+/// Run a mutation on a long-lived context slot, CLOSING it if the index turns
+/// out to be corrupt.
+///
+/// A one-shot CLI process heals on its next run because it reopens; a daemon
+/// does not — it holds the connection (and with it the live lock that stops
+/// autoheal renaming the file) for days. Without this, a corrupt index means
+/// every subsequent mutation fails the post-mutation probe, `Context::open`
+/// reports `CorruptInUse` because the daemon is the very holder blocking it,
+/// and the loop never ends: itview logged that failure every 30s for 13 days
+/// while every memory write in that window was lost.
+///
+/// Dropping the context releases the connection and the live lock, so the next
+/// `Context::open` quarantines the file, salvages memory out of it, and rebuilds.
+/// Returns `None` when the slot was already empty (nothing to run).
+pub fn run_mutation<T>(
+    slot: &mut Option<Context>,
+    what: &str,
+    f: impl FnOnce(&mut Context) -> Result<T>,
+) -> Option<Result<T>> {
+    let result = f(slot.as_mut()?);
+
+    if let Err(e) = &result {
+        if e.is_index_corrupt() {
+            tracing::error!(
+                operation = what,
+                error = %e,
+                "index is corrupt — closing this connection so the next open can quarantine, salvage memory and rebuild"
+            );
+            *slot = None;
+        }
+    }
+    Some(result)
+}
+
 impl Context {
     /// Apply the connection pragmas for the main index DB.
     ///
@@ -5940,6 +5974,7 @@ pub fn handle_code_index(
                 .map_err(|e| Error::other(format!("Indexing '{}' failed: {}", p, e)))?;
             total.files_discovered += stats.files_discovered;
             total.files_indexed += stats.files_indexed;
+            total.files_removed += stats.files_removed;
             total.symbols_indexed += stats.symbols_indexed;
             total.relationships_collected += stats.relationships_collected;
         }

@@ -1837,10 +1837,11 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
         let root = handle.root.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut ctx_guard = ctx.blocking_lock();
-            let ctx = ctx_guard
-                .as_mut()
-                .ok_or_else(|| "Database not initialized".to_string())?;
-            handle_update(ctx, &root).map_err(|e| format!("Document update failed: {e}"))
+            crate::cli::handlers::run_mutation(&mut ctx_guard, "document update", |ctx| {
+                handle_update(ctx, &root)
+            })
+            .ok_or_else(|| "Database not initialized".to_string())?
+            .map_err(|e| format!("Document update failed: {e}"))
         })
         .await
         .map_err(|e| mcp_error(format!("Document update task panicked: {e}")))?
@@ -1867,8 +1868,12 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
 
     let code_output = {
         let mut idx_guard = acquire_handle_code_index(handle).await?;
-        if let Some(facade) = idx_guard.as_mut() {
-            match facade.update(&handle.root) {
+        let outcome =
+            crate::code::indexing::run_code_mutation(&mut idx_guard, "code update", |facade| {
+                facade.update(&handle.root)
+            });
+        if let Some(result) = outcome {
+            match result {
                 Ok(stats) => format!(
                     "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
                     stats.files_indexed, stats.symbols_indexed, stats.relationships_collected
@@ -1897,9 +1902,9 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
             let ctx = Arc::clone(&handle.ctx);
             let indexed = tokio::task::spawn_blocking(move || {
                 let mut ctx_guard = ctx.blocking_lock();
-                ctx_guard
-                    .as_mut()
-                    .map(|ctx| handle_session_index(ctx, &sessions_base, &project_root))
+                crate::cli::handlers::run_mutation(&mut ctx_guard, "session index", |ctx| {
+                    handle_session_index(ctx, &sessions_base, &project_root)
+                })
             })
             .await;
             match indexed {

@@ -108,19 +108,18 @@ impl IndexFacade {
             let mut changed = Vec::new();
 
             for path in &discovered {
-                let rel_key = path
-                    .strip_prefix(root)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string();
                 let current_mtime = hasher::file_mtime(path).unwrap_or(0);
 
-                match indexed_mtimes.get(&rel_key) {
+                match indexed_mtimes.get(&rel_key(path, root)) {
                     Some(&old) if old == current_mtime => {} // unchanged
                     _ => changed.push(path.clone()),
                 }
             }
 
+            // No prune pass here: `mdkb code index <subdir>` calls this with a
+            // subdirectory as `root`, so "indexed but absent from the walk" also
+            // covers the rest of the project. Deletion detection lives in
+            // `update`, whose walk is always the whole tree.
             if changed.is_empty() {
                 self.db.mark_index_scan_completed()?;
                 return Ok(IndexStats {
@@ -148,7 +147,19 @@ impl IndexFacade {
         };
 
         self.db.mark_index_scan_completed()?;
+        self.verify_sound()?;
         Ok(stats)
+    }
+
+    /// Probe the index for structural damage, throttled to one scan per
+    /// [`crate::store::heal::CHECK_INTERVAL`].
+    ///
+    /// Without this nothing ever notices: this connection answers reads from its
+    /// page cache and appends writes to the WAL, so a torn main file can stay
+    /// invisible for as long as the process lives — and the daemon's process
+    /// lives for days.
+    fn verify_sound(&self) -> anyhow::Result<()> {
+        crate::store::heal::verify_and_mark_throttled(self.db.path()).map_err(anyhow::Error::from)
     }
 
     /// Incrementally refresh the whole index for `root`.
@@ -171,7 +182,14 @@ impl IndexFacade {
             &self.config.ignore_patterns,
             self.config.respect_gitignore,
         );
-        self.reindex_files(root, &all_files)
+        // `reindex_files` derives deletions from the paths it is handed, and a
+        // file removed from disk is absent from the walk — so only this caller,
+        // which knows `all_files` is the complete tree, can drop it.
+        let files_removed = self.prune_missing_files(root, &all_files)?;
+        let mut stats = self.reindex_files(root, &all_files)?;
+        stats.files_removed = files_removed;
+        self.verify_sound()?;
+        Ok(stats)
     }
 
     /// Re-index a directory (full reindex, discarding previous data).
@@ -214,16 +232,15 @@ impl IndexFacade {
     /// `file_path` is an absolute path; `root` is used to derive the relative
     /// path key stored in the database.
     pub fn delete_by_file(&mut self, file_path: &Path, root: &Path) -> anyhow::Result<()> {
-        let rel_path = file_path
-            .strip_prefix(root)
-            .unwrap_or(file_path)
-            .to_string_lossy()
-            .to_string();
+        self.delete_by_rel_path(&rel_key(file_path, root))
+    }
 
+    /// Delete an indexed file by the relative path key stored in the database.
+    fn delete_by_rel_path(&mut self, rel_path: &str) -> anyhow::Result<()> {
         // Collect symbol IDs before deleting (for embedding cleanup)
-        let symbol_ids = self.get_symbol_ids_for_path(&rel_path);
+        let symbol_ids = self.get_symbol_ids_for_path(rel_path);
 
-        self.db.delete_by_file(&rel_path)?;
+        self.db.delete_by_file(rel_path)?;
 
         // Only remove embeddings if semantic is already initialized;
         // avoid triggering lazy model load (~300-800 MB) for a delete operation.
@@ -253,6 +270,34 @@ impl IndexFacade {
         }
     }
 
+    /// Drop every indexed file that is absent from a COMPLETE walk of `root`.
+    ///
+    /// Returns the number of files removed. Deletion detection cannot live in
+    /// [`Self::reindex_files`]: that function inspects only the paths it is
+    /// given, and a file deleted from disk never appears in a filesystem walk,
+    /// so its symbols and relationships survived every incremental update and
+    /// kept answering searches until a full reindex. Only a caller holding the
+    /// whole walk can tell "deleted" from "not in this batch", so `walk` must be
+    /// the full discovery result — passing a subset deletes the rest of the index.
+    fn prune_missing_files(&mut self, root: &Path, walk: &[PathBuf]) -> anyhow::Result<u32> {
+        let present: HashSet<String> = walk.iter().map(|p| rel_key(p, root)).collect();
+        let stale: Vec<String> = self
+            .db
+            .get_file_hashes()?
+            .into_keys()
+            .filter(|indexed| !present.contains(indexed))
+            .collect();
+
+        for rel_path in &stale {
+            self.delete_by_rel_path(rel_path)?;
+        }
+
+        if !stale.is_empty() {
+            tracing::info!("Pruned {} file(s) deleted from disk", stale.len());
+        }
+        Ok(stale.len() as u32)
+    }
+
     /// Incrementally reindex only changed files.
     ///
     /// Compares content hashes of the given paths against what's already indexed.
@@ -265,11 +310,7 @@ impl IndexFacade {
         let mut deleted: Vec<PathBuf> = Vec::new();
 
         for path in paths {
-            let rel_key = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
+            let rel_key = rel_key(path, root);
 
             if !path.exists() {
                 // File deleted from disk
@@ -332,6 +373,9 @@ impl IndexFacade {
         // count (`paths`, the full walk `update()` passed in) so "discovered"
         // means the same thing regardless of how much of the repo changed.
         stats.files_discovered = paths.len() as u32;
+        // The watcher drives this path constantly; the probe's own throttle is
+        // what keeps that affordable.
+        self.verify_sound()?;
         Ok(stats)
     }
 
@@ -630,6 +674,72 @@ impl IndexFacade {
             );
         }
     }
+}
+
+/// The database key for an indexed file: its path relative to the index root.
+///
+/// A path outside `root` keeps its full spelling, matching how the COLLECT
+/// stage registers files — the lookup key must be built the same way everywhere
+/// or a file is silently seen as new (and, in a prune pass, as deleted).
+fn rel_key(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string()
+}
+
+/// Run a code-index mutation on a long-lived facade slot, CLOSING it if the
+/// database turns out to be corrupt.
+///
+/// The mirror of `handlers::run_mutation` for `code.sqlite`, and it exists for
+/// the same reason: [`CodeDb::open`] quarantines a corrupt file, but only ever
+/// at open, and it declines while any connection is live — so a daemon that
+/// keeps its facade forever keeps its own corruption forever.
+///
+/// The signal is different, though, and deliberately so: the index database can
+/// be gigabytes, so probing it after every watcher-driven reindex would cost a
+/// full-file scan each time. There is no primary data here (every symbol
+/// re-derives from source), so this reacts to SQLite reporting a torn file
+/// during the mutation instead of hunting for damage that may never be read.
+pub fn run_code_mutation<T>(
+    slot: &mut Option<IndexFacade>,
+    what: &str,
+    f: impl FnOnce(&mut IndexFacade) -> anyhow::Result<T>,
+) -> Option<anyhow::Result<T>> {
+    let result = f(slot.as_mut()?);
+
+    if let Err(e) = &result {
+        if is_corruption(e) {
+            tracing::error!(
+                operation = what,
+                error = %e,
+                "code index is corrupt — closing this connection so the next open can quarantine and rebuild it"
+            );
+            *slot = None;
+        }
+    }
+    Some(result)
+}
+
+/// True when an error from the code-index pipeline means the database file
+/// itself is torn, rather than the operation being wrong.
+///
+/// The pipeline erases types into `anyhow`, so the chain is searched for either
+/// SQLite's own corruption codes or an mdkb error that already classified it.
+fn is_corruption(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        if let Some(e) = cause.downcast_ref::<crate::error::Error>() {
+            return e.is_index_corrupt();
+        }
+        matches!(
+            cause.downcast_ref::<rusqlite::Error>(),
+            Some(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+                )
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,6 +1273,78 @@ pub fn world() {
         );
         assert!(facade.get_symbol_by_name("aaa").is_some());
         assert!(facade.get_symbol_by_name("bbb").is_none());
+        assert!(facade.get_symbol_by_name("ccc").is_some());
+    }
+
+    #[test]
+    fn update_drops_files_deleted_from_disk() {
+        // A file removed from disk is absent from the walk, so the changed/deleted
+        // diff over the walk can never see it: without an explicit prune its
+        // symbols answered searches forever (only a full reindex cleared them).
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        assert_eq!(facade.file_count(), 2);
+
+        fs::remove_file(src_dir.path().join("a.rs")).unwrap();
+
+        let stats = facade.update(src_dir.path()).unwrap();
+        assert_eq!(stats.files_removed, 1, "the deleted file must be reported");
+        assert_eq!(stats.files_indexed, 0, "a pure deletion re-parses nothing");
+        assert!(
+            facade.get_symbol_by_name("aaa").is_none(),
+            "symbols of a deleted file must not survive the update"
+        );
+        assert!(facade.get_symbol_by_name("bbb").is_some());
+        assert_eq!(facade.file_count(), 1);
+    }
+
+    #[test]
+    fn update_after_deletion_reports_nothing_removed_on_the_next_run() {
+        // The prune must be idempotent: a second update finds nothing stale, so
+        // a steady-state run stays quiet instead of re-reporting the deletion.
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        fs::remove_file(src_dir.path().join("a.rs")).unwrap();
+        facade.update(src_dir.path()).unwrap();
+
+        let stats = facade.update(src_dir.path()).unwrap();
+        assert_eq!(stats.files_removed, 0);
+        assert_eq!(facade.file_count(), 1);
+    }
+
+    #[test]
+    fn reindex_files_with_a_subset_prunes_nothing() {
+        // `reindex_files` is also driven by the watcher with a handful of changed
+        // paths. Deletion detection must stay out of it: pruning "indexed but not
+        // in this batch" there would drop the whole rest of the index.
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src_dir.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        fs::write(src_dir.path().join("b.rs"), "pub fn ccc() {}").unwrap();
+        let stats = facade
+            .reindex_files(src_dir.path(), &[src_dir.path().join("b.rs")])
+            .unwrap();
+
+        assert_eq!(stats.files_removed, 0);
+        assert!(
+            facade.get_symbol_by_name("aaa").is_some(),
+            "a file outside the batch must not be treated as deleted"
+        );
         assert!(facade.get_symbol_by_name("ccc").is_some());
     }
 

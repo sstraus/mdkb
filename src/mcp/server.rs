@@ -1466,8 +1466,12 @@ async fn flush_code_batch(
     }
     let paths = std::mem::take(batch);
     let mut idx_guard = code_index.lock().await;
-    if let Some(facade) = idx_guard.as_mut() {
-        match facade.reindex_files(root, &paths) {
+    let outcome =
+        crate::code::indexing::run_code_mutation(&mut idx_guard, "code reindex", |facade| {
+            facade.reindex_files(root, &paths)
+        });
+    if let Some(result) = outcome {
+        match result {
             Ok(stats) => {
                 if stats.symbols_indexed > 0 || stats.files_indexed > 0 {
                     tracing::info!(
@@ -1490,8 +1494,13 @@ async fn flush_code_batch(
 /// paths are unknown, so `update` re-checks everything.
 async fn full_code_rescan(code_index: &Arc<Mutex<Option<IndexFacade>>>, root: &Path) {
     let mut idx_guard = code_index.lock().await;
-    if let Some(facade) = idx_guard.as_mut() {
-        match facade.update(root) {
+    let outcome = crate::code::indexing::run_code_mutation(
+        &mut idx_guard,
+        "watcher recovery rescan",
+        |facade| facade.update(root),
+    );
+    if let Some(result) = outcome {
+        match result {
             Ok(stats) => tracing::info!(
                 "Watcher recovery rescan: {} files, {} symbols",
                 stats.files_indexed,
@@ -1528,9 +1537,9 @@ async fn full_rebuild_from_heal(
             let ctx = Arc::clone(ctx);
             let indexed = tokio::task::spawn_blocking(move || {
                 let mut guard = ctx.blocking_lock();
-                guard
-                    .as_mut()
-                    .map(|c| handle_session_index(c, &sessions_base, &project_root))
+                crate::cli::handlers::run_mutation(&mut guard, "post-heal session index", |c| {
+                    handle_session_index(c, &sessions_base, &project_root)
+                })
             })
             .await;
             if let Ok(Some(Err(e))) = indexed {
@@ -1554,7 +1563,9 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
     let root = root.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
         let mut guard = ctx.blocking_lock();
-        guard.as_mut().map(|ctx_ref| handle_update(ctx_ref, &root))
+        crate::cli::handlers::run_mutation(&mut guard, "doc reindex", |ctx_ref| {
+            handle_update(ctx_ref, &root)
+        })
     })
     .await;
     match outcome {
