@@ -5953,8 +5953,13 @@ pub fn handle_code_index(
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 
     let result = if paths.is_empty() {
+        // Whole-tree refresh: `update` (not `index_directory`) because only a
+        // caller that walked everything may prune files deleted from disk, and
+        // this is that caller. The per-path branch below is NOT — it indexes one
+        // subdirectory at a time, where "indexed but absent" is the rest of the
+        // project, not a deletion.
         facade
-            .index_directory(root)
+            .update(root)
             .map_err(|e| Error::other(format!("Indexing failed: {}", e)))
     } else {
         let root_canonical = root

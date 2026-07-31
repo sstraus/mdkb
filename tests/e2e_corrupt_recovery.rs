@@ -343,3 +343,29 @@ fn a_corrupt_code_index_is_released_and_rebuilt_instead_of_retried() {
         "the rebuilt index must repopulate from source"
     );
 }
+
+/// `mdkb update` reaches the code index through `handle_code_index(root, &[])`,
+/// not through the facade directly — so the prune has to be live on that path or
+/// the CLI keeps answering with symbols of deleted files (agent2 carried four).
+#[test]
+fn the_cli_whole_tree_refresh_prunes_files_deleted_from_disk() {
+    let (_dir, root) = seed_code_repo();
+
+    let first = mdkb::cli::handlers::handle_code_index(&root, &[]).expect("initial index");
+    assert!(first.symbols_indexed > 0, "seed produced no symbols");
+
+    std::fs::remove_file(root.join("src/m0.rs")).expect("delete a source file");
+
+    let after = mdkb::cli::handlers::handle_code_index(&root, &[]).expect("refresh");
+    assert_eq!(
+        after.files_removed, 1,
+        "the CLI refresh must drop the deleted file and say so"
+    );
+
+    let db = mdkb::code::indexing::IndexFacade::open_or_create(root.join(".mdkb/code.sqlite"))
+        .expect("open index");
+    assert!(
+        db.find_symbols_by_file("m0.rs", 10).is_empty(),
+        "symbols of a deleted file must not survive the refresh"
+    );
+}
