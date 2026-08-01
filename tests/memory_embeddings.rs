@@ -452,7 +452,7 @@ async fn session_start_hook_clears_pending_embeddings_end_to_end() {
 
     // Fire the real session-start hook. The drain is detached; the single-flight
     // guard is our completion signal (it resets when the drain task finishes).
-    let _ = mdkb::mcp::dispatch::hook_session_start_impl(&handle).await;
+    let _ = mdkb::mcp::dispatch::hook_session_start_impl(&handle, None).await;
     for _ in 0..200 {
         if !handle.backfill_in_flight.load(Ordering::Acquire) {
             break;

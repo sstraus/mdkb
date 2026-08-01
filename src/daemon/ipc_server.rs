@@ -613,6 +613,44 @@ mod tests {
         assert!(text.contains("## Index Status"), "text: {text}");
     }
 
+    /// The hook wire carries the host's raw event, so `params.cwd` rides along
+    /// beside the resolved `params.root`. A session-start event carrying a cwd
+    /// must route exactly like one without it: the cwd only narrows scope
+    /// downstream, it can never make the hook fail.
+    #[tokio::test]
+    async fn session_start_routes_with_and_without_session_cwd() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".mdkb")).unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let project = root.join("lattice");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let registry = make_registry();
+        let dctx = make_dctx();
+
+        let without = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"hook.session_start","params":{{"root":"{}"}}}}"#,
+            root.display()
+        );
+        let with = format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"hook.session_start","params":{{"root":"{}","cwd":"{}"}}}}"#,
+            root.display(),
+            project.display()
+        );
+
+        let a: Value =
+            serde_json::from_str(&dispatch_hook_message(without.as_bytes(), &registry, &dctx).await)
+                .unwrap();
+        let b: Value =
+            serde_json::from_str(&dispatch_hook_message(with.as_bytes(), &registry, &dctx).await)
+                .unwrap();
+
+        assert!(a.get("error").is_none(), "no-cwd resp: {a}");
+        assert!(b.get("error").is_none(), "cwd resp: {b}");
+        // Empty store → both warm up to the same (empty) result.
+        assert_eq!(a["result"], b["result"]);
+    }
+
     /// Behavior-equivalence: same tool call via `dispatch_call` (the McpServer
     /// path now also funnels through this) and via the hook JSON-RPC path
     /// returns equal `text` bodies. McpServer's tool methods are thin

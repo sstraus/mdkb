@@ -127,6 +127,32 @@ fn hook_session_key(handle: &RepoHandle, params: &Value) -> String {
     format!("{}|repo", handle.root.display())
 }
 
+/// The session's real working directory, as reported by the hook host, trusted
+/// only when it sits inside the store.
+///
+/// `params.root` has already been collapsed to the store anchor by
+/// `resolve_hook_root`, so it says nothing about WHICH project a session is in
+/// when one store anchors many sibling projects. `params.cwd` is the raw host
+/// event field that does — but it is client-supplied over the hook socket, so
+/// it is accepted only when absolute and, after canonicalization, under `root`.
+/// Anything else (missing, relative, unreadable, escaping via `..`, or another
+/// repo entirely) yields `None`, which every caller must read as "unscoped" and
+/// handle exactly as before this existed.
+fn hook_session_cwd(params: &Value, root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let cwd = std::path::PathBuf::from(
+        params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())?,
+    );
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let cwd = cwd.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    cwd.starts_with(&root).then_some(cwd)
+}
+
 fn prompt_fingerprint(prompt: &str) -> String {
     prompt
         .split(|c: char| !c.is_alphanumeric())
@@ -2448,6 +2474,45 @@ fn log_hook_event(
     }
 }
 
+/// The project a session is working in, as a token the warmup selectors match
+/// against entry tags. `None` = unscoped, and every caller must then behave
+/// exactly as it did before scoping existed.
+///
+/// One `.mdkb` store routinely anchors a whole family of sibling projects, so
+/// the store root cannot identify the project — but the first path segment
+/// below it can. That segment is only trusted when a collection of that name is
+/// registered: collections are created one per subproject, which makes them the
+/// store's own statement of "these folders are projects" and keeps a stray
+/// `scratch/` or `tmp/` from inventing a scope nobody tagged entries with.
+///
+/// Deliberately NOT derived from `source_path`: it is populated on a small
+/// minority of entries and points at the writing tool's directory, not at the
+/// project. Tags are populated and do discriminate — see [`entry_in_scope`].
+///
+/// The returned token is lowercased so tag matching has a single form.
+fn project_scope_token(
+    root: &std::path::Path,
+    cwd: Option<&std::path::Path>,
+    collection_names: &[String],
+) -> Option<String> {
+    let relative = cwd?.strip_prefix(root).ok()?;
+    let segment = match relative.components().next()? {
+        std::path::Component::Normal(s) => s.to_str()?,
+        _ => return None,
+    };
+    collection_names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(segment))
+        .then(|| segment.to_lowercase())
+}
+
+/// True when `entry` belongs to the project named by `token` (lowercased by
+/// [`project_scope_token`]). An entry with no matching tag is out of scope, not
+/// unwanted: cross-cutting knowledge is demoted in ranking, never filtered.
+fn entry_in_scope(entry: &crate::store::memory::MemoryEntry, token: &str) -> bool {
+    entry.tags.iter().any(|tag| tag.to_lowercase() == token)
+}
+
 /// Minimum confidence for a prior to be treated as "curated" — the threshold
 /// the recall gate and the warmup reserved-prior slot both key off.
 const PRIOR_CONFIDENCE_GATE: f64 = 0.7;
@@ -2473,6 +2538,7 @@ fn rank_warmup_entries(
     limit: usize,
     min_confidence: f64,
     now: i64,
+    scope: Option<&str>,
 ) -> Vec<crate::store::memory::MemoryEntry> {
     // Handoffs never appear here: the newest one is injected in full as a body
     // block by hook_session_start_impl, and the caller strips all handoffs before
@@ -2482,13 +2548,23 @@ fn rank_warmup_entries(
         entries.retain(|e| e.confidence_at(now) >= min_confidence);
     }
 
-    // Primary sort: access_count DESC, confidence_at as tie-breaker.
+    // Project affinity is a BIAS, never a filter: an out-of-scope entry is
+    // demoted below every in-scope one but still emitted while budget remains,
+    // so cross-cutting knowledge (tagged for no project at all) keeps reaching
+    // every session. With no scope every entry scores 0 and the comparator
+    // collapses to the pre-scoping one: access_count DESC, confidence tie-break.
+    let affinity = |e: &crate::store::memory::MemoryEntry| {
+        u8::from(scope.is_some_and(|token| entry_in_scope(e, token)))
+    };
     entries.sort_by(|a, b| {
-        b.access_count.cmp(&a.access_count).then_with(|| {
-            b.confidence_at(now)
-                .partial_cmp(&a.confidence_at(now))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
+        affinity(b)
+            .cmp(&affinity(a))
+            .then_with(|| b.access_count.cmp(&a.access_count))
+            .then_with(|| {
+                b.confidence_at(now)
+                    .partial_cmp(&a.confidence_at(now))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
     });
 
     if entries.len() <= limit {
@@ -2631,14 +2707,21 @@ fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
 /// The body is `None` when there is no handoff, or the newest one is effectively
 /// empty (an auto-handoff whose stripped body is shorter than
 /// [`HANDOFF_MIN_BODY_CHARS`]).
+///
+/// With a `scope` token the candidate set narrows to handoffs tagged for that
+/// project, and an empty candidate set injects NOTHING: a handoff is verbatim
+/// session state, so another project's is actively misleading — worse than
+/// starting with no anchor at all. Unscoped, the rule is unchanged: newest wins.
 fn take_newest_handoff_body(
     entries: Vec<crate::store::memory::MemoryEntry>,
+    scope: Option<&str>,
 ) -> (Option<String>, Vec<crate::store::memory::MemoryEntry>) {
     use crate::store::memory::{EntryType, strip_frontmatter};
     let newest_idx = entries
         .iter()
         .enumerate()
         .filter(|(_, e)| e.entry_type == EntryType::Handoff)
+        .filter(|(_, e)| scope.is_none_or(|token| entry_in_scope(e, token)))
         .max_by_key(|(_, e)| e.updated_at)
         .map(|(i, _)| i);
     let mut body = None;
@@ -2711,7 +2794,14 @@ fn format_quarantine_banner(mdkb_dir: &std::path::Path, doc_count: i64) -> Optio
     Some(out)
 }
 
-pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
+/// `session_cwd` is the validated session working directory (see
+/// [`hook_session_cwd`]) — the only signal that says which project inside a
+/// multi-project store this session belongs to. `None` means unscoped: every
+/// selection below then behaves exactly as it did before scoping existed.
+pub async fn hook_session_start_impl(
+    handle: &Arc<RepoHandle>,
+    session_cwd: Option<&std::path::Path>,
+) -> Value {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
         return json!({});
@@ -2733,7 +2823,16 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
         }
     };
     let doc_count = crate::store::documents::count_documents(conn).unwrap_or(0);
+    // Which of the store's projects this session is in. Read here, under the
+    // lock we already hold, so scoping costs one extra query on the hook path.
+    let collection_names: Vec<String> = collections::list_collections(conn)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
     drop(ctx_guard);
+
+    let scope = project_scope_token(&handle.root, session_cwd, &collection_names);
 
     // Data-loss banner: surface any outstanding autoheal quarantine loudly,
     // computed before the empty-warmup early return so a freshly-rebuilt (empty)
@@ -2743,12 +2842,21 @@ pub async fn hook_session_start_impl(handle: &Arc<RepoHandle>) -> Value {
     // mdkb owns handoff injection: pull the newest handoff's full body out for a
     // dedicated block and drop ALL handoffs from the ranked compact list — a
     // 50-char truncated handoff title-line is useless for context restoration.
-    let (handoff_body, entries) = take_newest_handoff_body(entries);
+    // Scoped, the newest handoff FOR THIS PROJECT is the anchor; with none, no
+    // handoff block at all rather than another project's session state.
+    let (handoff_body, entries) = take_newest_handoff_body(entries, scope.as_deref());
 
-    // Global rank: confidence floor (off at 0.0), access_count DESC primary with
-    // confidence tie-break, one reserved slot for the top curated prior.
+    // Rank: confidence floor (off at 0.0), project affinity first when a scope
+    // resolved, then access_count DESC with confidence tie-break, one reserved
+    // slot for the top curated prior.
     let now = chrono::Utc::now().timestamp();
-    let ranked = rank_warmup_entries(entries, limit, cfg.warmup_min_confidence, now);
+    let ranked = rank_warmup_entries(
+        entries,
+        limit,
+        cfg.warmup_min_confidence,
+        now,
+        scope.as_deref(),
+    );
 
     // Due reminders lead (preserved verbatim); ranked entries follow.
     let mut lines = due_lines;
@@ -3873,7 +3981,8 @@ pub async fn dispatch_call(
             let key = hook_session_key(&handle, &params);
             dctx.reset_hook_session(&key);
             let t0 = std::time::Instant::now();
-            let result = hook_session_start_impl(&handle).await;
+            let session_cwd = hook_session_cwd(&params, &handle.root);
+            let result = hook_session_start_impl(&handle, session_cwd.as_deref()).await;
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) {
                 "skipped"
@@ -4006,6 +4115,162 @@ mod tests {
         assert_eq!(fit_warmup_lines(&lines, t0), vec![lines[0].clone()]);
     }
 
+    // ── Session cwd: the only signal of WHICH project a session is in ────────
+
+    #[test]
+    fn hook_session_cwd_accepts_a_directory_under_the_store_root() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let project = root.join("lattice");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let params = json!({"cwd": project.display().to_string()});
+        assert_eq!(hook_session_cwd(&params, &root), Some(project));
+    }
+
+    #[test]
+    fn hook_session_cwd_accepts_the_store_root_itself() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        let params = json!({"cwd": root.display().to_string()});
+        assert_eq!(hook_session_cwd(&params, &root), Some(root));
+    }
+
+    #[test]
+    fn hook_session_cwd_rejects_a_path_outside_the_store_root() {
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        // Client-supplied: a cwd pointing anywhere else must not be trusted.
+        let params = json!({"cwd": other.path().display().to_string()});
+        assert_eq!(hook_session_cwd(&params, &root), None);
+    }
+
+    #[test]
+    fn hook_session_cwd_rejects_relative_and_missing_values() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        assert_eq!(hook_session_cwd(&json!({"cwd": "lattice"}), &root), None);
+        assert_eq!(hook_session_cwd(&json!({"cwd": ""}), &root), None);
+        assert_eq!(hook_session_cwd(&json!({"cwd": 7}), &root), None);
+        // No cwd at all — an older hook client — degrades to unscoped.
+        assert_eq!(hook_session_cwd(&json!({}), &root), None);
+    }
+
+    #[test]
+    fn hook_session_cwd_rejects_a_traversal_that_escapes_the_root() {
+        let tmp = TempDir::new().unwrap();
+        let other = TempDir::new().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+
+        let escape = format!("{}/../{}", root.display(), {
+            let o = other.path().canonicalize().unwrap();
+            o.file_name().unwrap().to_string_lossy().to_string()
+        });
+        // Both TempDirs live in the same parent, so `root/../<other>` resolves
+        // outside the store: canonicalization must catch it, not the raw prefix.
+        assert_eq!(hook_session_cwd(&json!({"cwd": escape}), &root), None);
+    }
+
+    // ── Project scope token: which of a store's many projects is in play ─────
+
+    /// Registered collection names, as `project_scope_token` receives them.
+    fn collections(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn scope_token_resolves_the_segment_below_root_when_a_collection_matches() {
+        let root = std::path::Path::new("/store");
+        let known = collections(&["lattice", "riscosity"]);
+
+        // Directly below the root, and arbitrarily deep inside it: both resolve
+        // to the project segment, never to a deeper directory name.
+        assert_eq!(
+            project_scope_token(root, Some(std::path::Path::new("/store/lattice")), &known),
+            Some("lattice".to_string())
+        );
+        assert_eq!(
+            project_scope_token(
+                root,
+                Some(std::path::Path::new("/store/lattice/src/otr")),
+                &known
+            ),
+            Some("lattice".to_string())
+        );
+    }
+
+    #[test]
+    fn scope_token_matches_a_collection_name_case_insensitively() {
+        let root = std::path::Path::new("/store");
+        let known = collections(&["Lattice"]);
+
+        // The token is normalized to lowercase so tag matching has one form.
+        assert_eq!(
+            project_scope_token(root, Some(std::path::Path::new("/store/LATTICE")), &known),
+            Some("lattice".to_string())
+        );
+    }
+
+    #[test]
+    fn scope_token_is_none_when_there_is_no_project_to_scope_to() {
+        let root = std::path::Path::new("/store");
+        let known = collections(&["lattice"]);
+
+        // At the store root there is no segment below it — the session is
+        // working on the store itself, so warmup stays global.
+        assert_eq!(
+            project_scope_token(root, Some(std::path::Path::new("/store")), &known),
+            None
+        );
+        // A folder with no registered collection is not a project.
+        assert_eq!(
+            project_scope_token(root, Some(std::path::Path::new("/store/scratch")), &known),
+            None
+        );
+        // Outside the root entirely (defence in depth — the caller already
+        // validated this) and no cwd at all: both unscoped.
+        assert_eq!(
+            project_scope_token(root, Some(std::path::Path::new("/elsewhere/lattice")), &known),
+            None
+        );
+        assert_eq!(project_scope_token(root, None, &known), None);
+        // No collections registered at all: nothing can match.
+        assert_eq!(
+            project_scope_token(root, Some(std::path::Path::new("/store/lattice")), &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn scope_token_tags_decide_in_scope_case_insensitively() {
+        use crate::store::memory::{EntryType, SourceType};
+        let now = 1_000_000_000;
+        let mut entry = warmup_entry(
+            "e1",
+            EntryType::Topic,
+            "body",
+            SourceType::UserStatement,
+            1,
+            0,
+            now,
+        );
+
+        entry.tags = vec!["Lattice".to_string(), "otr".to_string()];
+        assert!(entry_in_scope(&entry, "lattice"));
+        assert!(!entry_in_scope(&entry, "riscosity"));
+
+        // Cross-cutting entries carry no project tag: out of scope, never dropped.
+        entry.tags = vec!["writing-style".to_string()];
+        assert!(!entry_in_scope(&entry, "lattice"));
+
+        entry.tags = vec![];
+        assert!(!entry_in_scope(&entry, "lattice"));
+    }
+
     fn write_quarantine_report(dir: &std::path::Path) {
         let corrupt = dir.join("index.sqlite.corrupt-1700000000");
         std::fs::write(&corrupt, b"corrupt").unwrap();
@@ -4133,7 +4398,7 @@ mod tests {
                 now,
             ),
         ];
-        let (body, rest) = take_newest_handoff_body(entries);
+        let (body, rest) = take_newest_handoff_body(entries, None);
         let body = body.expect("newest handoff body extracted");
         assert!(
             body.starts_with("full newest handoff body"),
@@ -4145,6 +4410,85 @@ mod tests {
             ids,
             vec!["topic"],
             "every handoff dropped, non-handoff retained: {ids:?}"
+        );
+    }
+
+    /// Build a handoff entry tagged for a project, `age_days` old.
+    fn scoped_handoff(
+        id: &str,
+        project: &str,
+        age_days: i64,
+        now: i64,
+    ) -> crate::store::memory::MemoryEntry {
+        use crate::store::memory::{EntryType, SourceType};
+        let body = format!(
+            "---\ns: {id}\n---\n{}",
+            format!("handoff body for {project} ").repeat(5)
+        );
+        let mut e = warmup_entry(
+            id,
+            EntryType::Handoff,
+            &body,
+            SourceType::UserStatement,
+            5,
+            age_days,
+            now,
+        );
+        e.tags = vec!["handoff".to_string(), project.to_string()];
+        e
+    }
+
+    #[test]
+    fn take_newest_handoff_body_prefers_the_newest_handoff_inside_the_scope() {
+        let now = 1_000_000_000;
+        // The globally newest handoff belongs to another project: injecting it
+        // would hand this session someone else's session state verbatim.
+        let entries = vec![
+            scoped_handoff("h-lattice-old", "lattice", 5, now),
+            scoped_handoff("h-lattice", "lattice", 3, now),
+            scoped_handoff("h-riscosity", "riscosity", 1, now),
+        ];
+
+        let (body, rest) = take_newest_handoff_body(entries, Some("lattice"));
+        let body = body.expect("in-scope handoff body extracted");
+        assert!(
+            body.starts_with("handoff body for lattice"),
+            "newest IN-SCOPE handoff wins over the newest overall: {body}"
+        );
+        assert!(
+            rest.is_empty(),
+            "story 073's contract holds: every handoff still leaves the compact list"
+        );
+    }
+
+    #[test]
+    fn take_newest_handoff_body_injects_nothing_when_no_handoff_is_in_scope() {
+        let now = 1_000_000_000;
+        let entries = vec![
+            scoped_handoff("h-riscosity", "riscosity", 1, now),
+            scoped_handoff("h-evoke", "evoke", 2, now),
+        ];
+
+        // A foreign handoff is worse than none: the session gets no body block.
+        let (body, rest) = take_newest_handoff_body(entries, Some("lattice"));
+        assert!(body.is_none(), "no in-scope handoff means no injection");
+        assert!(rest.is_empty(), "handoffs still dropped from the list");
+    }
+
+    #[test]
+    fn take_newest_handoff_body_unscoped_still_takes_the_newest_overall() {
+        let now = 1_000_000_000;
+        let entries = vec![
+            scoped_handoff("h-lattice", "lattice", 3, now),
+            scoped_handoff("h-riscosity", "riscosity", 1, now),
+        ];
+
+        // No scope resolved (cwd at the store root, or absent) → unchanged.
+        let (body, _) = take_newest_handoff_body(entries, None);
+        let body = body.expect("newest handoff body extracted");
+        assert!(
+            body.starts_with("handoff body for riscosity"),
+            "unscoped keeps the pre-scoping rule: newest overall wins: {body}"
         );
     }
 
@@ -4172,7 +4516,7 @@ mod tests {
                 now,
             ),
         ];
-        let (body, rest) = take_newest_handoff_body(entries);
+        let (body, rest) = take_newest_handoff_body(entries, None);
         assert!(body.is_none(), "no handoff means no body block");
         assert_eq!(rest.len(), 2, "non-handoff entries untouched");
     }
@@ -4202,7 +4546,7 @@ mod tests {
                 now,
             ),
         ];
-        let (body, rest) = take_newest_handoff_body(entries);
+        let (body, rest) = take_newest_handoff_body(entries, None);
         assert!(body.is_none(), "empty handoff body is not injected");
         let ids: Vec<&str> = rest.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(
@@ -4238,13 +4582,130 @@ mod tests {
                 now,
             ),
         ];
-        let ranked = rank_warmup_entries(entries, 10, 0.25, now);
+        let ranked = rank_warmup_entries(entries, 10, 0.25, now, None);
         let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
         assert!(ids.contains(&"fresh"));
         assert!(
             !ids.contains(&"stale"),
             "low-confidence entry excluded: {ids:?}"
         );
+    }
+
+    /// Build a warmup entry tagged for `project` (empty = cross-cutting).
+    fn tagged_entry(
+        id: &str,
+        project: &str,
+        access_count: u64,
+        now: i64,
+    ) -> crate::store::memory::MemoryEntry {
+        use crate::store::memory::{EntryType, SourceType};
+        let mut e = warmup_entry(
+            id,
+            EntryType::Topic,
+            "content",
+            SourceType::UserStatement,
+            access_count,
+            0,
+            now,
+        );
+        e.tags = if project.is_empty() {
+            vec![]
+        } else {
+            vec![project.to_string()]
+        };
+        e
+    }
+
+    #[test]
+    fn rank_warmup_promotes_in_scope_entries_over_hotter_out_of_scope_ones() {
+        let now = 1_000_000_000;
+        let entries = vec![
+            tagged_entry("riscosity-hot", "riscosity", 99, now),
+            tagged_entry("lattice-cold", "lattice", 1, now),
+        ];
+
+        let ranked = rank_warmup_entries(entries, 10, 0.0, now, Some("lattice"));
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["lattice-cold", "riscosity-hot"],
+            "the project in play outranks the globally hottest entry: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn rank_warmup_keeps_out_of_scope_entries_so_cross_cutting_knowledge_survives() {
+        let now = 1_000_000_000;
+        let entries = vec![
+            tagged_entry("riscosity-hot", "riscosity", 99, now),
+            // No project tag: browser rules, writing style — must reach every project.
+            tagged_entry("cross-cutting", "", 50, now),
+            tagged_entry("lattice-cold", "lattice", 1, now),
+        ];
+
+        let ranked = rank_warmup_entries(entries, 10, 0.0, now, Some("lattice"));
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["lattice-cold", "riscosity-hot", "cross-cutting"],
+            "scoping is a bias, not a filter — everything is still emitted: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn rank_warmup_reserved_prior_slot_survives_scoping() {
+        use crate::store::memory::{EntryType, SourceType};
+        let now = 1_000_000_000;
+        let mut entries: Vec<_> = (0..4)
+            .map(|i| tagged_entry(&format!("lattice-{i}"), "lattice", 100 - i as u64, now))
+            .collect();
+        // A curated prior nobody has read yet: it must still claim the last slot.
+        let mut prior = warmup_entry(
+            "curated-prior",
+            EntryType::Prior,
+            "content",
+            SourceType::UserStatement,
+            0,
+            0,
+            now,
+        );
+        prior.confirmations = 10;
+        prior.tags = vec!["riscosity".to_string()];
+        entries.push(prior);
+
+        let ranked = rank_warmup_entries(entries, 3, 0.0, now, Some("lattice"));
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(
+            ids.last(),
+            Some(&"curated-prior"),
+            "the reserved curated-prior slot is untouched by scoping: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn rank_warmup_unscoped_ordering_is_the_pre_scoping_ordering() {
+        let now = 1_000_000_000;
+        let build = || {
+            vec![
+                tagged_entry("riscosity-hot", "riscosity", 99, now),
+                tagged_entry("cross-cutting", "", 50, now),
+                tagged_entry("lattice-cold", "lattice", 1, now),
+            ]
+        };
+
+        let ranked = rank_warmup_entries(build(), 10, 0.0, now, None);
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["riscosity-hot", "cross-cutting", "lattice-cold"],
+            "with no scope the sort key stays access_count DESC: {ids:?}"
+        );
+
+        // A scope token nothing is tagged with must not perturb that order either.
+        let ranked = rank_warmup_entries(build(), 10, 0.0, now, Some("evoke"));
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["riscosity-hot", "cross-cutting", "lattice-cold"]);
     }
 
     fn make_dctx() -> DispatchContext {
@@ -4638,7 +5099,7 @@ mod tests {
         ));
         seed_memory_entry(&primary, "child-mem").await;
 
-        let out = hook_session_start_impl(&primary).await;
+        let out = hook_session_start_impl(&primary, None).await;
         let body = out
             .pointer("/hookSpecificOutput/additionalContext")
             .and_then(Value::as_str)
@@ -5072,7 +5533,7 @@ mod tests {
             .unwrap();
         }
 
-        let out = hook_session_start_impl(&handle).await;
+        let out = hook_session_start_impl(&handle, None).await;
         let body = out
             .pointer("/hookSpecificOutput/additionalContext")
             .and_then(Value::as_str)
@@ -5127,7 +5588,7 @@ mod tests {
         }
         seed_topic_with_content(&handle, "topic-x", "Deployment checklist", 50).await;
 
-        let out = hook_session_start_impl(&handle).await;
+        let out = hook_session_start_impl(&handle, None).await;
         let body = out
             .pointer("/hookSpecificOutput/additionalContext")
             .and_then(Value::as_str)
@@ -5151,6 +5612,182 @@ mod tests {
         assert!(
             body.contains("topic-x"),
             "non-handoff entry still listed: {body}"
+        );
+    }
+
+    /// Seed a handoff tagged for `project`, `age_days` old, into the store.
+    async fn seed_project_handoff(handle: &RepoHandle, project: &str, age_days: i64) {
+        ensure_handle_context(handle).await.expect("init ctx");
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let ts = chrono::Utc::now().timestamp() - age_days * 86_400;
+        let entry = crate::store::memory::MemoryEntry {
+            id: format!("handoff-{project}"),
+            title: format!("Session handoff for {project}"),
+            content: format!(
+                "---\nsession: {project}\n---\n# Session Handoff\n\n{}",
+                format!("Pending work on the {project} project. ").repeat(3)
+            ),
+            entry_type: crate::store::memory::EntryType::Handoff,
+            tags: vec!["handoff".to_string(), project.to_string()],
+            status: crate::store::memory::EntryStatus::Active,
+            created_at: ts,
+            updated_at: ts,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: Some(ts),
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: crate::store::memory::SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        crate::store::memory::add_entry(conn, &entry).expect("seed handoff");
+    }
+
+    /// Register `name` as a collection — the store's own statement that this
+    /// subfolder is a project, which is what `project_scope_token` keys off.
+    async fn register_collection(handle: &RepoHandle, name: &str) {
+        ensure_handle_context(handle).await.expect("init ctx");
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let now = chrono::Utc::now().timestamp();
+        collections::add_collection(
+            conn,
+            &crate::domain::Collection {
+                name: name.to_string(),
+                path: name.to_string(),
+                pattern: "**/*.md".to_string(),
+                source: "manual".to_string(),
+                created_at: now,
+                updated_at: now,
+            },
+        )
+        .expect("register collection");
+    }
+
+    /// One store, many projects: a session inside `lattice/` must be anchored by
+    /// lattice's handoff, never by the globally newest one from another project.
+    #[tokio::test]
+    async fn warmup_injects_the_in_scope_handoff_not_another_projects() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        register_collection(&handle, "lattice").await;
+        register_collection(&handle, "riscosity").await;
+        seed_project_handoff(&handle, "lattice", 3).await;
+        seed_project_handoff(&handle, "riscosity", 1).await; // newest overall
+
+        let cwd = handle.root.join("lattice");
+        let out = hook_session_start_impl(&handle, Some(&cwd)).await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        assert!(
+            body.contains("Pending work on the lattice project"),
+            "in-scope handoff injected: {body}"
+        );
+        assert!(
+            !body.contains("Pending work on the riscosity project"),
+            "another project's handoff must never be injected: {body}"
+        );
+    }
+
+    /// A project with no handoff of its own gets NO handoff block: a foreign
+    /// handoff is worse than none.
+    #[tokio::test]
+    async fn warmup_injects_no_handoff_when_the_project_has_none() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        register_collection(&handle, "lattice").await;
+        register_collection(&handle, "riscosity").await;
+        seed_project_handoff(&handle, "riscosity", 1).await;
+        seed_topic_with_content(&handle, "topic-x", "Deployment checklist", 50).await;
+
+        let cwd = handle.root.join("lattice");
+        let out = hook_session_start_impl(&handle, Some(&cwd)).await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        assert!(
+            !body.contains("## Last session handoff"),
+            "no in-scope handoff → no handoff block: {body}"
+        );
+        assert!(
+            !body.contains("Pending work on the riscosity project"),
+            "the out-of-scope handoff body must not leak: {body}"
+        );
+        assert!(
+            body.contains("topic-x"),
+            "the rest of warmup is unaffected: {body}"
+        );
+    }
+
+    /// End-to-end proof that the resolved scope reaches the ranker: a session in
+    /// `lattice/` sees its own entry first, and still sees the hotter foreign one.
+    #[tokio::test]
+    async fn warmup_lists_the_in_scope_entry_first_without_dropping_the_rest() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        register_collection(&handle, "lattice").await;
+        seed_topic_with_content(&handle, "riscosity-hot", "Proxy retry budget", 99).await;
+        seed_topic_with_content(&handle, "lattice-cold", "OTR reformat rules", 1).await;
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            conn.execute(
+                r#"UPDATE memory_entries SET tags='["lattice"]' WHERE id='lattice-cold'"#,
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                r#"UPDATE memory_entries SET tags='["riscosity"]' WHERE id='riscosity-hot'"#,
+                [],
+            )
+            .unwrap();
+        }
+
+        let cwd = handle.root.join("lattice");
+        let out = hook_session_start_impl(&handle, Some(&cwd)).await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        let in_scope = body.find("lattice-cold").expect("in-scope entry listed");
+        let out_of_scope = body
+            .find("riscosity-hot")
+            .expect("out-of-scope entry still listed — bias, not filter");
+        assert!(
+            in_scope < out_of_scope,
+            "in-scope entry ranks above the hotter foreign one: {body}"
+        );
+    }
+
+    /// An unregistered subfolder is not a project: warmup stays global, so the
+    /// newest handoff overall is still the anchor (pre-scoping behaviour).
+    #[tokio::test]
+    async fn warmup_falls_back_to_the_newest_handoff_when_cwd_is_not_a_project() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        register_collection(&handle, "lattice").await;
+        seed_project_handoff(&handle, "lattice", 3).await;
+        seed_project_handoff(&handle, "riscosity", 1).await;
+
+        let cwd = handle.root.join("scratch");
+        let out = hook_session_start_impl(&handle, Some(&cwd)).await;
+        let body = out
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+
+        assert!(
+            body.contains("Pending work on the riscosity project"),
+            "unscoped → newest handoff overall: {body}"
         );
     }
 
@@ -5272,7 +5909,7 @@ mod tests {
             seed_topic_with_content(&primary, &format!("hot-{i}"), "hot entry content", 100).await;
         }
 
-        let out = hook_session_start_impl(&primary).await;
+        let out = hook_session_start_impl(&primary, None).await;
         let body = out
             .pointer("/hookSpecificOutput/additionalContext")
             .and_then(Value::as_str)
@@ -6577,7 +7214,7 @@ mod tests {
     async fn hook_session_start_silent_on_empty_index() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
-        let result = hook_session_start_impl(&handle).await;
+        let result = hook_session_start_impl(&handle, None).await;
         // Empty index → no warmup lines → silent ({})
         assert_eq!(result, json!({}), "must be silent when index is empty");
     }
@@ -6602,7 +7239,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let result = hook_session_start_impl(&handle).await;
+        let result = hook_session_start_impl(&handle, None).await;
         let body = result
             .pointer("/hookSpecificOutput/additionalContext")
             .and_then(Value::as_str)
@@ -6649,7 +7286,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ));
-        let result = hook_session_start_impl(&handle).await;
+        let result = hook_session_start_impl(&handle, None).await;
         assert_eq!(result, json!({}));
     }
 
@@ -6886,7 +7523,7 @@ mod tests {
         let handle = make_handle(&tmp);
         assert!(!handle.backfill_in_flight.load(Ordering::Acquire));
 
-        let _ = hook_session_start_impl(&handle).await;
+        let _ = hook_session_start_impl(&handle, None).await;
 
         // The spawn is the last statement before the return (no trailing await),
         // so the guard is still held when control returns here.
@@ -6912,7 +7549,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ));
-        let _ = hook_session_start_impl(&handle).await;
+        let _ = hook_session_start_impl(&handle, None).await;
         assert!(
             !handle.backfill_in_flight.load(Ordering::Acquire),
             "a disabled session_start must not trigger a backfill"
