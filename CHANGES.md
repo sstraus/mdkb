@@ -1,8 +1,46 @@
 # Changelog
 
-## Unreleased
+## 3.7.10 (2026-08-02)
+
+### Changed
+
+- **Session-start warmup is scoped to the project the session works in.** One
+  `.mdkb` store routinely anchors a family of sibling projects, and warmup was
+  project-blind: `get_warmup_entries` ranked purely by access count, and
+  `take_newest_handoff_body` picked the newest handoff in the whole store —
+  whose full body is injected verbatim and exempt from the token budget. A
+  session was warmed with unrelated projects' entries and handed another
+  project's session state as its anchor. The missing signal was the session
+  cwd, which already rides the hook wire and was simply never consumed:
+  `hook_session_cwd` accepts `params.cwd` only when absolute and, canonicalized,
+  under the store root (it is client-supplied, so it is validated rather than
+  trusted), and `project_scope_token` takes the first path segment below the
+  root only when a collection of that name is registered — collections are
+  created one per subproject, so they are the store's own statement of what a
+  project is. The handoff selector now takes the newest handoff *in scope* and
+  injects nothing when there is none, because another project's session state is
+  worse than no anchor. Scope affinity is a leading term in the existing ranking
+  comparator, constant 0 when unscoped, so it is a bias and not a filter:
+  out-of-scope entries still reach every project while budget remains, and there
+  is no second code path to drift.
 
 ### Fixed
+
+- **Index recovery is serialized across processes, and a corrupt in-use index no
+  longer hands back a usable connection.** `Context::open` treated
+  `Heal::CorruptInUse` as a warning and continued, so a read command became
+  another holder of a database already known to be corrupt — `open` initializes
+  schemas and ordinary reads update access statistics, so it both wrote into the
+  malformed generation and extended the live-lock veto that blocks recovery. It
+  now returns the typed `ErrorKind::IndexCorruptInUse`, which
+  `is_index_corrupt` recognises alongside `IndexCorrupt`, so the daemon's
+  close-on-corruption path catches it too. Two adjacent holes are closed with
+  it: `Context::init` canonicalizes the store directory and takes the mutation
+  lock before creating config and virtual tables, so the several hook/MCP
+  processes that can enter auto-init at once no longer race; and `Store::open`
+  — public, and used as a low-level disk-backed opener — takes the same shared
+  live lock as `Context`, so it can no longer keep an invisible connection alive
+  while autoheal renames and recreates the database underneath it.
 
 - **`mdkb update` drops files deleted from disk.** The code index kept the
   symbols and relationships of deleted files forever: `update` walks the tree
