@@ -158,7 +158,7 @@ fn a_mutation_on_a_corrupt_index_reports_it_as_corruption() {
 }
 
 #[test]
-fn a_held_corrupt_index_cannot_be_quarantined_the_production_loop() {
+fn a_read_open_refuses_to_join_a_known_corrupt_generation() {
     // The condition that made the incident last 13 days: while the connection
     // stays open, autoheal refuses to rename (CorruptInUse) — so a daemon that
     // keeps its handle can never recover, no matter how often it retries.
@@ -172,31 +172,39 @@ fn a_held_corrupt_index_cannot_be_quarantined_the_production_loop() {
     // so the reopen below really does probe rather than trust the throttle.
     let _ = mutate(&mut slot, &repo.root);
 
-    // Reopening while the file is held recovers nothing: either the open itself
-    // trips over the torn pages, or it comes back flagged `corrupt_in_use`.
-    // Either way the file is NOT quarantined, so the next mutation finds the
-    // same corrupt index — the loop the daemon ran 17153 times.
-    match Context::open(&repo.root) {
-        Ok(reopened) => {
-            assert!(
-                reopened.corrupt_in_use,
-                "a successful reopen of a corrupt held index must flag corrupt_in_use"
-            );
-            assert!(
-                !reopened.rebuilt_from_corruption,
-                "nothing may be quarantined while another handle is live"
-            );
-        }
-        Err(e) => assert!(
-            e.is_index_corrupt(),
-            "the only acceptable failure here is the corruption itself, got: {e}"
-        ),
-    }
+    // A read command still goes through `Context::open`, which initializes
+    // schemas and whose searches update access counters. It must fail before
+    // opening a second connection: joining the malformed generation would both
+    // write to it and extend the live-lock veto indefinitely.
+    let err = Context::open(&repo.root)
+        .expect_err("a known-corrupt generation must never be opened for reads");
+    assert!(err.is_index_corrupt(), "corruption must stay typed: {err}");
+    assert!(
+        err.to_string().contains("still in use"),
+        "the error must explain why recovery was deferred: {err}"
+    );
     assert!(
         repo.quarantine_files().is_empty(),
         "no quarantine file may appear while the index is held open"
     );
     drop(held);
+}
+
+#[test]
+fn a_failed_read_open_does_not_become_a_new_recovery_blocker() {
+    let repo = Repo::seed();
+    let last_holder = Context::open(&repo.root).expect("open last holder");
+    let mut slot = Some(Context::open(&repo.root).expect("open detecting holder"));
+    repo.corrupt();
+    let _ = mutate(&mut slot, &repo.root);
+    assert!(slot.is_none(), "the detecting holder must close");
+
+    Context::open(&repo.root).expect_err("the read open must be rejected");
+    drop(last_holder);
+
+    let healed = Context::open(&repo.root)
+        .expect("the rejected read must not block heal after the final holder closes");
+    assert!(healed.rebuilt_from_corruption);
 }
 
 #[test]
@@ -227,7 +235,6 @@ fn releasing_the_handle_lets_the_next_open_quarantine_salvage_and_rebuild() {
         healed.rebuilt_from_corruption,
         "the release must let the next open quarantine and rebuild"
     );
-    assert!(!healed.corrupt_in_use, "nothing should still hold the file");
     assert_eq!(
         repo.quarantine_files()
             .iter()

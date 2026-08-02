@@ -25,6 +25,9 @@ use crate::error::Result;
 /// Main storage handle for mdkb database operations.
 pub struct Store {
     conn: rusqlite::Connection,
+    // Keep this after `conn`: Rust drops fields in declaration order, so the
+    // SQLite handle closes before its live-lock announcement disappears.
+    _live_guard: Option<mutation_lock::MutationGuard>,
 }
 
 impl std::fmt::Debug for Store {
@@ -49,10 +52,19 @@ impl Store {
     /// Returns an error if the database file can't be created or opened,
     /// or if SQLite initialization fails.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
         // Ensure sqlite-vec is registered before opening any connection
         vectors::init_sqlite_vec();
+        // `Store` is public and used as a low-level disk-backed opener. It must
+        // participate in the same recovery protocol as `Context`; otherwise a
+        // caller can keep an invisible connection alive while autoheal renames
+        // and recreates the database at this path.
+        let live_guard = mutation_lock::acquire_live_shared(path)?;
         let conn = rusqlite::Connection::open(path)?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            _live_guard: Some(live_guard),
+        };
         store.setup_pragmas()?;
         Ok(store)
     }
@@ -62,7 +74,10 @@ impl Store {
         // Ensure sqlite-vec is registered before opening any connection
         vectors::init_sqlite_vec();
         let conn = rusqlite::Connection::open_in_memory()?;
-        let store = Self { conn };
+        let store = Self {
+            conn,
+            _live_guard: None,
+        };
         store.setup_pragmas()?;
         Ok(store)
     }
@@ -110,5 +125,27 @@ mod tests {
             .query_row("SELECT 1", [], |row| row.get(0))
             .unwrap();
         assert_eq!(result, 1);
+    }
+
+    #[test]
+    fn disk_store_vetoes_recovery_rename_for_its_lifetime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+
+        let store = Store::open(&db).unwrap();
+        assert!(
+            mutation_lock::try_acquire_live_exclusive(&db)
+                .unwrap()
+                .is_none(),
+            "a disk-backed Store must be visible to corruption recovery"
+        );
+
+        drop(store);
+        assert!(
+            mutation_lock::try_acquire_live_exclusive(&db)
+                .unwrap()
+                .is_some(),
+            "dropping Store must release its live guard"
+        );
     }
 }

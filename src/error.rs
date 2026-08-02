@@ -120,6 +120,14 @@ pub enum ErrorKind {
     #[error("index at {path} is structurally corrupt")]
     IndexCorrupt { path: PathBuf },
 
+    /// The index is corrupt, but another process still has that generation
+    /// open, so replacing it would let the stale connection write into the
+    /// replacement database's WAL.
+    #[error(
+        "index at {path} is structurally corrupt and still in use; close every mdkb process and retry"
+    )]
+    IndexCorruptInUse { path: PathBuf },
+
     #[error("database migration failed: {0}")]
     Migration(String),
 
@@ -207,14 +215,13 @@ impl ErrorKind {
 
     /// Returns true if this error means the index file itself is broken.
     ///
-    /// Covers both our own post-mutation probe ([`Self::IndexCorrupt`]) and the
-    /// SQLite codes that report a torn file mid-statement, so a caller that
-    /// reacts by closing the connection catches the damage whichever layer
-    /// notices it first.
+    /// Covers both of our corruption outcomes and the SQLite codes that report
+    /// a torn file mid-statement, so a caller that reacts by closing the
+    /// connection catches the damage whichever layer notices it first.
     #[must_use]
     pub fn is_index_corrupt(&self) -> bool {
         match self {
-            Self::IndexCorrupt { .. } => true,
+            Self::IndexCorrupt { .. } | Self::IndexCorruptInUse { .. } => true,
             Self::Database(rusqlite::Error::SqliteFailure(err, _)) => matches!(
                 err.code,
                 rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
@@ -281,6 +288,15 @@ mod tests {
             name: "docs".to_string(),
         });
         assert_eq!(err.to_string(), "collection not found: docs");
+    }
+
+    #[test]
+    fn corrupt_in_use_is_typed_as_index_corruption() {
+        let err = Error::from(ErrorKind::IndexCorruptInUse {
+            path: PathBuf::from("index.sqlite"),
+        });
+        assert!(err.is_index_corrupt());
+        assert!(err.to_string().contains("still in use"));
     }
 
     #[test]

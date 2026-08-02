@@ -69,10 +69,12 @@ pub struct Context {
     /// quarantined it, and built this connection on a fresh empty database.
     /// The caller should trigger a reindex to repopulate it.
     pub rebuilt_from_corruption: bool,
-    /// True when the index is structurally corrupt but could not be quarantined
-    /// because another process holds it open. Nothing was renamed — repairing it
-    /// requires closing every mdkb process (the daemon included) so the next
-    /// open can quarantine and rebuild.
+    /// Always false for a successfully opened context.
+    ///
+    /// A corrupt in-use generation is now returned as
+    /// [`ErrorKind::IndexCorruptInUse`] instead of exposing a connection to the
+    /// malformed database. Retained so existing callers can inspect `Context`
+    /// without an unrelated API break.
     pub corrupt_in_use: bool,
     /// Shared advisory lock announcing this connection for as long as the
     /// context lives, so no other process renames the database files underneath
@@ -195,13 +197,19 @@ impl Context {
         // Autoheal: quarantine a structurally-corrupt index before we build on
         // it, so the `Connection::open` below lands on a clean file. Throttled,
         // so this is cheap on the hot open path.
-        let mut corrupt_in_use = false;
         let quarantined = match crate::store::heal::ensure_sound_locked(&db_path)? {
             crate::store::heal::Heal::Sound => None,
             crate::store::heal::Heal::Quarantined { corrupt_path } => Some(corrupt_path),
             crate::store::heal::Heal::CorruptInUse => {
-                corrupt_in_use = true;
-                None
+                // Do not turn a read command into another holder of a database
+                // already known to be corrupt. `Context::open` initializes
+                // schemas and ordinary reads update access statistics, so
+                // continuing here both writes into the malformed generation
+                // and extends the live-lock veto that prevents recovery.
+                return Err(ErrorKind::IndexCorruptInUse {
+                    path: db_path.clone(),
+                }
+                .into());
             }
         };
 
@@ -246,25 +254,12 @@ impl Context {
             false
         };
 
-        if corrupt_in_use {
-            tracing::error!(
-                db = %db_path.display(),
-                "index.sqlite is structurally corrupt but held open by another process; \
-                 left in place — close every mdkb process (restart the daemon) so the next open can rebuild it"
-            );
-            eprintln!(
-                "mdkb: {} is CORRUPT and in use by another process — nothing was quarantined. \
-                 Stop the daemon and every mdkb session, then reopen to quarantine and rebuild.",
-                db_path.display()
-            );
-        }
-
         Ok(Self {
             conn,
             config_path,
             db_path,
             rebuilt_from_corruption,
-            corrupt_in_use,
+            corrupt_in_use: false,
             _live_guard: Some(live_guard),
         })
     }
@@ -273,13 +268,24 @@ impl Context {
     pub fn init(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let mdkb_dir = root.join(".mdkb");
-        let config_path = mdkb_dir.join("config.toml");
-        let db_path = mdkb_dir.join("index.sqlite");
 
         // Create directory if needed
         if !mdkb_dir.exists() {
             std::fs::create_dir_all(&mdkb_dir)?;
         }
+
+        // Auto-init can be entered concurrently by several hook/MCP processes.
+        // Derive every sidecar from the canonical store identity and serialize
+        // config + virtual-table creation exactly like `open` does.
+        let mdkb_dir = mdkb_dir.canonicalize().map_err(|e| {
+            Error::other(format!(
+                "cannot canonicalize {} during initialization: {e}",
+                mdkb_dir.display()
+            ))
+        })?;
+        let config_path = mdkb_dir.join("config.toml");
+        let db_path = mdkb_dir.join("index.sqlite");
+        let _init_guard = crate::store::mutation_lock::acquire(&db_path, "init-schema")?;
 
         // Create memory directories
         let memory_dir = mdkb_dir.join("memory");

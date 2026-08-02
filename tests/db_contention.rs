@@ -10,6 +10,35 @@ use mdkb::store::vectors;
 use rusqlite::params;
 use tempfile::TempDir;
 
+/// Auto-init creates FTS/sqlite-vec virtual tables just like `Context::open`.
+/// It must join the project mutation domain rather than racing another hook
+/// that is opening, healing, or initializing the same store.
+#[test]
+fn context_init_waits_for_the_project_mutation_lock() {
+    let tmp = TempDir::new().expect("tempdir");
+    let mdkb_dir = tmp.path().join(".mdkb");
+    std::fs::create_dir_all(&mdkb_dir).expect("create .mdkb");
+    let db = mdkb_dir.join("index.sqlite");
+    let blocker =
+        mdkb::store::mutation_lock::acquire(&db, "test-blocker").expect("take mutation lock");
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let root = tmp.path().to_path_buf();
+    let worker = std::thread::spawn(move || {
+        tx.send(Context::init(root)).expect("send init result");
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "Context::init must wait rather than construct schemas outside the mutation lock"
+    );
+    drop(blocker);
+    rx.recv_timeout(Duration::from_secs(5))
+        .expect("init result after lock release")
+        .expect("init succeeds");
+    worker.join().expect("init worker");
+}
+
 /// Writer A holds the write lock for ~300ms; writer B (a second connection to
 /// the same file, opened via the production `Context::open` path) must wait for
 /// the lock rather than erroring immediately. Without `busy_timeout` B returns
