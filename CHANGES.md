@@ -1,5 +1,26 @@
 # Changelog
 
+## 3.7.11 (2026-08-03)
+
+### Fixed
+
+- **Daemon-backed memory mutations now participate in index recovery.** MCP
+  memory write, batch, delete, and confirm operations previously wrote directly
+  through the long-lived repository context. They neither held the
+  cross-process mutation lock nor invalidated and rechecked the integrity
+  marker, so a corrupt connection could retain its live lock and block the
+  quarantine intended to repair it. These operations are now serialized,
+  verified through a fresh SQLite connection, and release the repository
+  context immediately on corruption so the next call can quarantine, salvage,
+  and rebuild. Salvage also reports rows skipped by `INSERT OR IGNORE` instead
+  of presenting its inserted-row count as complete recovery.
+
+- **The daemon ping identifies the running mdkb version.** Integrators can now
+  detect a detached daemon left behind by a binary upgrade instead of silently
+  sending work to an older process. The local-release script terminates every
+  matching MCP proxy and detached daemon before starting the rebuilt daemon,
+  rather than relying on one PID-file owner to represent all stale runtimes.
+
 ## 3.7.10 (2026-08-02)
 
 ### Changed
