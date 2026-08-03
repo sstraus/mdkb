@@ -347,7 +347,10 @@ async fn dispatch_hook_message(
         return json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": {"pong": true}
+            "result": {
+                "pong": true,
+                "version": env!("CARGO_PKG_VERSION")
+            }
         })
         .to_string();
     }
@@ -553,6 +556,7 @@ mod tests {
         let resp = dispatch_hook_message(body, &make_registry(), &make_dctx()).await;
         assert!(resp.contains("\"id\":7"));
         assert!(resp.contains("pong"));
+        assert!(resp.contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[tokio::test]
@@ -638,9 +642,10 @@ mod tests {
             project.display()
         );
 
-        let a: Value =
-            serde_json::from_str(&dispatch_hook_message(without.as_bytes(), &registry, &dctx).await)
-                .unwrap();
+        let a: Value = serde_json::from_str(
+            &dispatch_hook_message(without.as_bytes(), &registry, &dctx).await,
+        )
+        .unwrap();
         let b: Value =
             serde_json::from_str(&dispatch_hook_message(with.as_bytes(), &registry, &dctx).await)
                 .unwrap();

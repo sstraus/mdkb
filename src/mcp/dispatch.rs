@@ -334,6 +334,48 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
     Ok(())
 }
 
+/// Run one daemon-backed memory mutation under the cross-process mutation lock,
+/// verify the resulting database through a fresh connection, and release the
+/// long-lived context immediately if the index is corrupt.
+///
+/// Memory tools used to write directly through `RepoHandle::ctx`. That bypassed
+/// both the project lock and [`crate::cli::handlers::run_mutation`], so a daemon
+/// could retain the live lock after detecting corruption and block its own
+/// quarantine indefinitely. The fresh-connection probe is intentional: the
+/// working connection's pager can report a file torn underneath it as healthy.
+fn run_handle_memory_mutation<T>(
+    slot: &mut Option<Context>,
+    what: &str,
+    f: impl FnOnce(&Context) -> Result<T, McpError>,
+) -> Result<T, McpError> {
+    let (result, verification) = {
+        let ctx = slot
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, what)
+            .map_err(|e| mcp_error(format!("Failed to acquire mutation lock: {e}")))?;
+
+        crate::store::heal::invalidate_marker(&ctx.db_path);
+        let result = f(ctx);
+        let verification = crate::store::heal::verify_and_mark_throttled(&ctx.db_path);
+        (result, verification)
+    };
+
+    if let Err(error) = verification {
+        tracing::error!(
+            operation = what,
+            error = %error,
+            "index is corrupt after memory mutation — closing this connection so the next open can quarantine, salvage memory and rebuild"
+        );
+        *slot = None;
+        return Err(mcp_error(format!(
+            "Index is corrupt after {what}; the connection was closed for automatic recovery: {error}"
+        )));
+    }
+
+    result
+}
+
 /// Drain pending memory embeddings in the background. Single-flight per handle
 /// (a second call while one is in flight is a no-op), gated on a cheap `COUNT(*)`,
 /// with ONNX inference pushed off the async runtime via `spawn_blocking`.
@@ -494,12 +536,11 @@ pub async fn memory_delete_impl(
     memory::validate_entry_id(id).map_err(|e| mcp_error(e.to_string()))?;
     ensure_handle_context(handle).await?;
 
-    let ctx_guard = handle.ctx.lock().await;
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| mcp_error("Database not initialized"))?;
-
     if dry_run {
+        let ctx_guard = handle.ctx.lock().await;
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
         let exists = memory::get_entry_without_tracking(&ctx.conn, id)
             .map_err(|e| mcp_error(format!("Failed to check existing entry: {e}")))?
             .is_some();
@@ -510,8 +551,11 @@ pub async fn memory_delete_impl(
         });
     }
 
-    let deleted = memory::delete_entry(&ctx.conn, id)
-        .map_err(|e| mcp_error(format!("Failed to delete memory entry: {e}")))?;
+    let mut ctx_guard = handle.ctx.lock().await;
+    let deleted = run_handle_memory_mutation(&mut ctx_guard, "memory delete", |ctx| {
+        memory::delete_entry(&ctx.conn, id)
+            .map_err(|e| mcp_error(format!("Failed to delete memory entry: {e}")))
+    })?;
 
     Ok(if deleted {
         format!("Deleted memory entry '{id}'.")
@@ -531,13 +575,11 @@ pub async fn memory_confirm_impl(
 
     ensure_handle_context(handle).await?;
 
-    let ctx_guard = handle.ctx.lock().await;
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-    memory::confirm_entry(&ctx.conn, id, delta)
-        .map_err(|e| mcp_error(format!("Failed to confirm memory entry: {e}")))
+    let mut ctx_guard = handle.ctx.lock().await;
+    run_handle_memory_mutation(&mut ctx_guard, "memory confirm", |ctx| {
+        memory::confirm_entry(&ctx.conn, id, delta)
+            .map_err(|e| mcp_error(format!("Failed to confirm memory entry: {e}")))
+    })
 }
 
 /// Generic error returned for any `source_file` rejection (missing,
@@ -902,31 +944,35 @@ pub async fn memory_write_impl(
         .unwrap_or(None)
     };
 
-    let ctx_guard = handle.ctx.lock().await;
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| mcp_error("Database not initialized"))?;
+    let input = WriteSingleMemory {
+        id: &entry.id,
+        title: &entry.title,
+        content: &content,
+        entry_type: &entry.entry_type,
+        source_type: &entry.source_type,
+        tags: &entry.tags,
+        ttl: entry.ttl,
+        due_in: entry.due_in,
+        embedding,
+        source_path: source_path.as_deref(),
+        relates: &entry.relates,
+        session,
+        agent: entry.agent.as_deref(),
+        on_conflict: entry.on_conflict.as_deref(),
+        dry_run,
+    };
 
-    write_single_memory(
-        &ctx.conn,
-        WriteSingleMemory {
-            id: &entry.id,
-            title: &entry.title,
-            content: &content,
-            entry_type: &entry.entry_type,
-            source_type: &entry.source_type,
-            tags: &entry.tags,
-            ttl: entry.ttl,
-            due_in: entry.due_in,
-            embedding,
-            source_path: source_path.as_deref(),
-            relates: &entry.relates,
-            session,
-            agent: entry.agent.as_deref(),
-            on_conflict: entry.on_conflict.as_deref(),
-            dry_run,
-        },
-    )
+    let mut ctx_guard = handle.ctx.lock().await;
+    if dry_run {
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        write_single_memory(&ctx.conn, input)
+    } else {
+        run_handle_memory_mutation(&mut ctx_guard, "memory write", |ctx| {
+            write_single_memory(&ctx.conn, input)
+        })
+    }
 }
 
 /// `memory_write_batch` — create or update up to 20 entries in one call.
@@ -990,40 +1036,47 @@ pub async fn memory_write_batch_impl(
         .unwrap_or_else(|_| vec![None; entries.len()])
     };
 
-    let ctx_guard = handle.ctx.lock().await;
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| mcp_error("Database not initialized"))?;
+    let run = |ctx: &Context| {
+        let mut results = Vec::with_capacity(entries.len());
+        for ((entry, (content, source_path)), embedding) in
+            entries.iter().zip(resolved.iter()).zip(embeddings)
+        {
+            let result = write_single_memory(
+                &ctx.conn,
+                WriteSingleMemory {
+                    id: &entry.id,
+                    title: &entry.title,
+                    content,
+                    entry_type: &entry.entry_type,
+                    source_type: &entry.source_type,
+                    tags: &entry.tags,
+                    ttl: entry.ttl,
+                    due_in: entry.due_in,
+                    embedding,
+                    source_path: source_path.as_deref(),
+                    relates: &entry.relates,
+                    session,
+                    agent: entry.agent.as_deref(),
+                    on_conflict: entry.on_conflict.as_deref(),
+                    dry_run,
+                },
+            )?;
+            results.push(result);
+        }
 
-    let mut results = Vec::with_capacity(entries.len());
-    for ((entry, (content, source_path)), embedding) in
-        entries.iter().zip(resolved.iter()).zip(embeddings)
-    {
-        let result = write_single_memory(
-            &ctx.conn,
-            WriteSingleMemory {
-                id: &entry.id,
-                title: &entry.title,
-                content,
-                entry_type: &entry.entry_type,
-                source_type: &entry.source_type,
-                tags: &entry.tags,
-                ttl: entry.ttl,
-                due_in: entry.due_in,
-                embedding,
-                source_path: source_path.as_deref(),
-                relates: &entry.relates,
-                session,
-                agent: entry.agent.as_deref(),
-                on_conflict: entry.on_conflict.as_deref(),
-                dry_run,
-            },
-        )?;
-        results.push(result);
+        let count = results.len();
+        Ok((results.join("\n"), count))
+    };
+
+    let mut ctx_guard = handle.ctx.lock().await;
+    if dry_run {
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        run(ctx)
+    } else {
+        run_handle_memory_mutation(&mut ctx_guard, "memory write batch", run)
     }
-
-    let count = results.len();
-    Ok((results.join("\n"), count))
 }
 
 /// `memory_list` — list active memory entries sorted by `sort` ("recent" |
@@ -4234,7 +4287,11 @@ mod tests {
         // Outside the root entirely (defence in depth — the caller already
         // validated this) and no cwd at all: both unscoped.
         assert_eq!(
-            project_scope_token(root, Some(std::path::Path::new("/elsewhere/lattice")), &known),
+            project_scope_token(
+                root,
+                Some(std::path::Path::new("/elsewhere/lattice")),
+                &known
+            ),
             None
         );
         assert_eq!(project_scope_token(root, None, &known), None);
@@ -4329,6 +4386,50 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
         ))
+    }
+
+    #[tokio::test]
+    async fn memory_mutation_releases_corrupt_context_for_next_open() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle)
+            .await
+            .expect("initialize context");
+
+        let error = {
+            let mut slot = handle.ctx.lock().await;
+            run_handle_memory_mutation(&mut slot, "corruption regression test", |ctx| {
+                ctx.conn
+                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .expect("checkpoint before truncation");
+                let len = std::fs::metadata(&ctx.db_path).unwrap().len();
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&ctx.db_path)
+                    .unwrap();
+                file.set_len(len / 2).unwrap();
+                Ok(())
+            })
+            .expect_err("fresh-connection verification must detect the torn file")
+        };
+
+        assert!(error.message.contains("connection was closed"), "{error:?}");
+        assert!(
+            handle.ctx.lock().await.is_none(),
+            "corruption must release the connection and live lock"
+        );
+
+        ensure_handle_context(&handle)
+            .await
+            .expect("next open quarantines and rebuilds");
+        assert!(handle.ctx.lock().await.is_some());
+        assert!(
+            std::fs::read_dir(tmp.path().join(".mdkb"))
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-")),
+            "the released generation must be quarantined on the next open"
+        );
     }
 
     /// Build a warmup candidate entry with controllable type/content/age.

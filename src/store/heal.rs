@@ -252,7 +252,15 @@ fn salvage_table(fresh: &Connection, table: &str) -> usize {
         &format!("INSERT OR IGNORE INTO main.{table} SELECT * FROM corrupt.{table}"),
         [],
     ) {
-        Ok(n) => n,
+        Ok(inserted) => {
+            if inserted < present {
+                let not_recovered = present - inserted;
+                tracing::error!(
+                    "memory salvage: {not_recovered} of {present} rows in {table} were NOT recovered (INSERT OR IGNORE skipped them)"
+                );
+            }
+            inserted
+        }
         Err(e) => {
             tracing::error!(
                 "memory salvage: {present} rows in {table} could NOT be recovered ({e}) — they are LOST"
