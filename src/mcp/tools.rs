@@ -142,14 +142,16 @@ fn default_target_kind() -> String {
 /// A typed relation to attach to a memory entry at write time.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct RelatesInput {
-    /// Relation: supports, contradicts, supersedes, derived_from, or relates_to.
+    /// Relation type.
+    #[schemars(with = "crate::store::memory_graph::MemoryRelation")]
     pub relation: String,
 
     /// Target: a memory entry slug, or a document relative path when target_kind is "doc".
     pub target: String,
 
-    /// Target kind: "memory" (default) or "doc".
+    /// Target kind (default "memory").
     #[serde(default = "default_target_kind")]
+    #[schemars(with = "crate::store::memory_graph::TargetKind")]
     pub target_kind: String,
 }
 
@@ -605,5 +607,53 @@ mod tests {
         let params: CodeGraphParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.root.as_deref(), Some("/project"));
         assert!(params.symbol_id.is_none());
+    }
+
+    /// Resolve a property subschema of `RelatesInput`, following a `$ref` into
+    /// the root `$defs` when schemars factors the enum out.
+    fn relates_property_schema(property: &str) -> serde_json::Value {
+        let root = serde_json::to_value(schemars::schema_for!(MemoryWriteParams)).unwrap();
+        let defs = root.get("$defs").expect("schema has $defs");
+        let sub = defs["RelatesInput"]["properties"][property].clone();
+        match sub.get("$ref").and_then(|r| r.as_str()) {
+            Some(r) => {
+                let name = r.rsplit('/').next().expect("ref has a name");
+                defs[name].clone()
+            }
+            None => sub,
+        }
+    }
+
+    fn enum_values(schema: &serde_json::Value) -> Vec<String> {
+        schema["enum"]
+            .as_array()
+            .expect("subschema declares enum")
+            .iter()
+            .map(|v| v.as_str().expect("enum value is a string").to_string())
+            .collect()
+    }
+
+    /// The wire type is `String`, so nothing but the schema stops a client from
+    /// inventing a relation (agents have guessed "implements"). Assert the closed
+    /// set reaches the JSON Schema, straight from the domain enum.
+    #[test]
+    fn test_relates_relation_schema_advertises_closed_set() {
+        let expected: Vec<String> = crate::store::memory_graph::MemoryRelation::ALL
+            .iter()
+            .map(|r| r.as_str().to_string())
+            .collect();
+        assert_eq!(
+            enum_values(&relates_property_schema("relation")),
+            expected,
+            "relation must advertise exactly MemoryRelation::ALL"
+        );
+    }
+
+    #[test]
+    fn test_relates_target_kind_schema_advertises_closed_set() {
+        assert_eq!(
+            enum_values(&relates_property_schema("target_kind")),
+            vec!["memory".to_string(), "doc".to_string()],
+        );
     }
 }

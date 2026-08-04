@@ -18,7 +18,11 @@ use crate::store::graph::ref_forms;
 use crate::store::memory::{self, MemoryEntry};
 
 /// A typed relation from one memory entry to another entity.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `JsonSchema` is derived so the MCP tool schema advertises the closed set
+/// verbatim — clients see the valid values instead of guessing at a free string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, schemars::JsonSchema)]
+#[schemars(rename_all = "snake_case")]
 pub enum MemoryRelation {
     Supports,
     Contradicts,
@@ -77,7 +81,8 @@ impl std::str::FromStr for MemoryRelation {
 }
 
 /// What kind of entity a `target_ref` points at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, schemars::JsonSchema)]
+#[schemars(rename_all = "snake_case")]
 pub enum TargetKind {
     Memory,
     Doc,
