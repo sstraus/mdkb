@@ -1,6 +1,16 @@
 # Changelog
 
-## 3.7.11 (2026-08-03)
+## 3.7.12 (2026-08-04)
+
+### Fixed
+
+- **The `memory_write` tool schema now advertises the valid relation values.**
+  `relates[].relation` and `relates[].target_kind` were plain strings in the
+  JSON Schema, with the accepted values mentioned only in prose, so MCP clients
+  guessed relations outside the closed set and had the whole write rejected at
+  runtime. Both fields now emit a JSON Schema `enum` generated from the domain
+  enums themselves, so the advertised vocabulary cannot drift from the one the
+  server enforces. Server-side validation and its error message are unchanged.
 
 ### Fixed
 
