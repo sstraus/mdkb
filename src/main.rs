@@ -146,6 +146,25 @@ async fn run_cli(cli: Cli) -> Result<()> {
     };
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
+    // The daemon is the sole writer. A mutation the daemon already exposes an
+    // RPC for is sent over the hook socket instead of opening a second
+    // write-capable connection to a file the daemon is already writing — the
+    // same client pattern `mdkb hook` uses (story 018-56b2).
+    //
+    // `MDKB_NO_DAEMON=1` is the single escape hatch, checked inside
+    // `should_route`. An unreachable daemon falls back to running in-process
+    // rather than failing: a routing layer that turns a daemon outage into a
+    // broken CLI is worse than no routing (the lesson from 021-0636).
+    #[cfg(unix)]
+    if mdkb::core::routing::should_route(&cli.command)
+        && let Some((method, params)) = mdkb::core::routing::daemon_method(&cli.command)
+        && mdkb::cli::hook_client::call_store_mutation(method, params, &cwd)
+            .await
+            .is_ok()
+    {
+        return Ok(());
+    }
+
     match cli.command {
         Command::Init => {
             tracing::info!("Initializing mdkb...");

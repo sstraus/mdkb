@@ -418,6 +418,7 @@ pub mod indexing;
 pub mod memory;
 pub mod memory_sync;
 pub mod ops;
+pub mod routing;
 pub mod search;
 pub mod sessions;
 pub mod surface;
