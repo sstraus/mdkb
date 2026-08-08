@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Added
+
+- **Projection drift is reported by the standing health check, not only by the
+  run that caused it.** On one store, 387 entry files drifted away from the
+  database — 265 of them carrying unique decision/problem knowledge — and were
+  found by accident months later, because the only place the number ever
+  appeared was the output of an `mdkb update` nobody re-read. `mdkb stats` now
+  reports two counts, each shown only when non-zero so the line is never
+  wallpaper: entry files reconciliation refuses to absorb (merge markers, bad
+  frontmatter, id/filename mismatch, failed validation — these are inert and do
+  not self-heal), and non-archived entries with no file on disk. Session start
+  carries a cheaper version: one `read_dir` and one `COUNT(*)`, no file
+  contents read, because that is a hook path against a corpus of thousands. It
+  is a smoke signal by design and points at `mdkb stats` for the breakdown.
+  A bulk import — more than ten files with no database row — announces itself
+  but is **not** capped: the largest import there is, a fresh clone of the whole
+  corpus, is the reason the projection is tracked at all, and blocking it would
+  put a flag on the one command a new checkout must run unattended. Archiving
+  keeps its cap, because archiving is destructive and importing is additive.
+
 ### Fixed
 
 - **Enum-valued CLI flags now publish their accepted values.** `--entry-type`,

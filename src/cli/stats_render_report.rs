@@ -150,6 +150,30 @@ fn render_memory(out: &mut String, m: &MemorySummary) {
             if m.pending_embeddings == 1 { "" } else { "s" }
         ));
     }
+    // Projection drift, shown only when non-zero: a permanently-displayed "0
+    // orphans" trains the eye to skip the line, and the whole point is that it
+    // gets noticed the one time it isn't zero. The remedy is named because
+    // neither number is self-explanatory.
+    if m.files_unreadable > 0 {
+        lines.push(format!(
+            "  ⚠ {} entry file{} UNREADABLE — never imported, never searched; \
+             fix the frontmatter or merge markers and run: mdkb memory sync",
+            m.files_unreadable,
+            if m.files_unreadable == 1 { "" } else { "s" }
+        ));
+    }
+    if m.entries_unprojected > 0 {
+        lines.push(format!(
+            "  ⚠ {} entr{} with no file — DB-only, not shared or backed up; \
+             run: mdkb memory sync",
+            m.entries_unprojected,
+            if m.entries_unprojected == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        ));
+    }
 
     out.push_str(&frame("Memory", &lines.join("\n"), WIDTH));
 }
@@ -355,6 +379,8 @@ mod tests {
                 reminders_due: 1,
                 reminders_upcoming_7d: 2,
                 pending_embeddings: 0,
+                files_unreadable: 0,
+                entries_unprojected: 0,
             },
             code: CodeSummary {
                 files: 12,

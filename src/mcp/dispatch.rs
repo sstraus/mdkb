@@ -2848,6 +2848,31 @@ fn format_quarantine_banner(mdkb_dir: &std::path::Path, doc_count: i64) -> Optio
     Some(out)
 }
 
+/// A one-line warning when the entry projection and the database disagree on
+/// how many entries exist.
+///
+/// Story 015-2dc2: 387 files drifted from the database for weeks, 265 of them
+/// carrying unique knowledge, and were found by accident. The only place the
+/// number had ever appeared was the output of an `mdkb update` nobody re-read.
+/// Session start is where an agent actually looks.
+///
+/// Deliberately a smoke signal, not a diagnosis: it counts, it does not parse.
+/// Classifying each file (unreadable vs importable vs orphaned) means reading
+/// all of them, which belongs in `mdkb stats` — a command someone chose to run
+/// — not on a hook that fires every session against thousands of files. Equal
+/// counts can still hide offsetting drift, which is exactly why this points at
+/// the command that checks properly instead of claiming the store is healthy.
+fn format_projection_drift_banner(ctx: &crate::core::Context) -> Option<String> {
+    let (files, rows) = crate::cli::handlers::projection_file_and_row_counts(ctx).ok()?;
+    if files == rows {
+        return None;
+    }
+    Some(format!(
+        "⚠️ mdkb memory projection out of sync: {files} entry file(s) on disk vs {rows} \
+         active database row(s). Run `mdkb stats` for the breakdown, then `mdkb memory sync`.\n"
+    ))
+}
+
 /// `session_cwd` is the validated session working directory (see
 /// [`hook_session_cwd`]) — the only signal that says which project inside a
 /// multi-project store this session belongs to. `None` means unscoped: every
@@ -2884,6 +2909,9 @@ pub async fn hook_session_start_impl(
         .into_iter()
         .map(|c| c.name)
         .collect();
+    // Computed under the lock we already hold, so the check costs one readdir
+    // and one COUNT on a path that is already open.
+    let drift_banner = ctx_guard.as_ref().and_then(format_projection_drift_banner);
     drop(ctx_guard);
 
     let scope = project_scope_token(&handle.root, session_cwd, &collection_names);
@@ -2942,7 +2970,11 @@ pub async fn hook_session_start_impl(
     // Single-flight + best-effort; the ctx lock is already released.
     spawn_embedding_backfill(Arc::clone(handle));
 
-    if lines.is_empty() && handoff_body.is_none() && quarantine_banner.is_none() {
+    if lines.is_empty()
+        && handoff_body.is_none()
+        && quarantine_banner.is_none()
+        && drift_banner.is_none()
+    {
         return json!({});
     }
 
@@ -2955,6 +2987,10 @@ pub async fn hook_session_start_impl(
     // anchor — exempt from the compact-list token budget.
     let mut body = String::new();
     if let Some(banner) = &quarantine_banner {
+        body.push_str(banner);
+        body.push('\n');
+    }
+    if let Some(banner) = &drift_banner {
         body.push_str(banner);
         body.push('\n');
     }

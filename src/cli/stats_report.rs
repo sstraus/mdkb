@@ -76,6 +76,13 @@ pub struct MemorySummary {
     /// Entries missing a stored embedding (hybrid search degrades to BM25 for
     /// these). Cleared by `mdkb update`'s backfill.
     pub pending_embeddings: usize,
+    /// Entry files reconciliation refuses to absorb (merge markers, bad
+    /// frontmatter, id/filename mismatch, failed validation). Inert: never
+    /// imported, never searched, and they do not self-heal.
+    pub files_unreadable: usize,
+    /// Non-archived entries with no file on disk — present only in a database
+    /// that is deliberately untracked.
+    pub entries_unprojected: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -293,12 +300,19 @@ fn collect_memory(ctx: &Context) -> Result<MemorySummary> {
 
     let pending_embeddings = memory::count_pending_embeddings(&ctx.conn).unwrap_or(0);
 
+    // Drift is read-only here on purpose: `stats` reports, `update` repairs.
+    // A failure to measure must not fail the whole report — a store too broken
+    // to walk its own projection still needs its other numbers.
+    let drift = crate::cli::handlers::projection_drift(ctx).unwrap_or_default();
+
     Ok(MemorySummary {
         active_count,
         counts_by_type,
         reminders_due: reminders_due as usize,
         reminders_upcoming_7d: reminders_upcoming_7d as usize,
         pending_embeddings,
+        files_unreadable: drift.files_unreadable,
+        entries_unprojected: drift.entries_unprojected,
     })
 }
 
@@ -921,6 +935,8 @@ mod tests {
                 reminders_due: 0,
                 reminders_upcoming_7d: 0,
                 pending_embeddings: 0,
+                files_unreadable: 0,
+                entries_unprojected: 0,
             },
             code: empty_code_summary(),
             sessions: SessionsSummary {

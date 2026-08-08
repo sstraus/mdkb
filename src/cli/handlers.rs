@@ -1470,10 +1470,101 @@ pub struct MemorySyncSummary {
     /// merge markers, unparseable frontmatter, or an `id` disagreeing with the
     /// filename. Never imported, never used to overwrite the DB.
     pub quarantined: usize,
+    /// Set to the count when this pass imported more than
+    /// [`MEMORY_SYNC_BULK_ARCHIVE_CAP`] files at once. Not a veto — see the
+    /// reasoning at the check itself — but never silent either.
+    pub bulk_import_reported: Option<usize>,
     /// Set when a `.gitignore` above the store excludes `.mdkb/` wholesale,
     /// which makes `.mdkb/.gitignore` inert — git never descends into an
     /// excluded directory, so the entry projection cannot be tracked.
     pub gitignore_shadowed: Option<String>,
+}
+
+/// Standing disagreement between the entry projection and the database.
+///
+/// Reported by `mdkb stats` and at session start, NOT only by the run that
+/// caused it: 387 orphan files accumulated on a real store because the only
+/// place the number ever appeared was the output of an `mdkb update` nobody
+/// re-read. A count that lives in a health check is the difference between
+/// finding this in a day and finding it by accident months later.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct ProjectionDrift {
+    /// Files in `entries/` that reconciliation refuses to absorb — unresolved
+    /// merge markers, unparseable frontmatter, an `id` disagreeing with the
+    /// filename, or content failing entry validation. These are inert: never
+    /// imported, never searched, and they do not self-heal.
+    pub files_unreadable: usize,
+    /// Non-archived entries with no file on disk. They exist only in a database
+    /// that is deliberately untracked and unbacked-up.
+    pub entries_unprojected: usize,
+}
+
+/// The cheap drift check: how many `.md` files sit in `entries/`, and how many
+/// non-archived entries the database holds.
+///
+/// One `read_dir` and one `COUNT(*)`, with no file contents read and nothing
+/// parsed, because this runs on the session-start hook path — [`projection_drift`]
+/// opens and parses every file, which is fine for a command someone typed and
+/// far too much for a hook that fires on every session against a corpus of
+/// thousands.
+///
+/// Equal counts do not prove the two sides agree (a file could be unreadable
+/// while an unrelated entry is unprojected, netting to zero), so this is a
+/// *smoke* signal: it points at `mdkb stats`, which does the real classification.
+pub fn projection_file_and_row_counts(ctx: &Context) -> Result<(usize, usize)> {
+    let entries_dir = ctx.memory_dir().join("entries");
+    let files = std::fs::read_dir(&entries_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
+                .count()
+        })
+        .unwrap_or(0);
+    let rows: i64 = ctx.conn.query_row(
+        "SELECT COUNT(*) FROM memory_entries WHERE status != 'archived'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok((files, rows as usize))
+}
+
+/// Measure projection drift without changing anything.
+///
+/// Shares [`read_entries_dir`] with the reconciliation pass, so "unreadable"
+/// means exactly what reconciliation means by it — a second implementation
+/// would drift from the first and report a number nobody could act on.
+pub fn projection_drift(ctx: &Context) -> Result<ProjectionDrift> {
+    let entries_dir = ctx.memory_dir().join("entries");
+    let mut files_unreadable = 0;
+    let mut on_disk = read_entries_dir(&entries_dir, &mut files_unreadable);
+
+    let mut entries_unprojected = 0;
+    for row in memory::list_projection_state(&ctx.conn)? {
+        if on_disk.remove(&row.entry.id).is_none() && row.entry.status != EntryStatus::Archived {
+            entries_unprojected += 1;
+        }
+    }
+
+    // Whatever is left parses but has no row. It is about to be imported, so it
+    // is not drift — unless it would fail validation, in which case it is inert
+    // for the same reason as the rest.
+    for disk in on_disk.values() {
+        if memory::validate_entry_input(
+            &disk.file.meta.id,
+            &disk.file.meta.title,
+            &disk.file.meta.tags,
+            &disk.file.content,
+        )
+        .is_err()
+        {
+            files_unreadable += 1;
+        }
+    }
+
+    Ok(ProjectionDrift {
+        files_unreadable,
+        entries_unprojected,
+    })
 }
 
 /// Detect a `.gitignore` above the store that excludes `.mdkb/` wholesale.
@@ -1762,6 +1853,28 @@ pub fn sync_memory_files(ctx: &Context) -> Result<MemorySyncSummary> {
         summary.archive_skipped = suspect.len();
     } else {
         to_archive.extend(suspect);
+    }
+
+    // A bulk import is NOT capped. Archiving is destructive and reversible only
+    // by hand, so its cap buys time; importing is additive, and the largest
+    // import there is — a fresh clone of the whole corpus — is the primary
+    // reason the projection is tracked at all. Blocking it would need a flag on
+    // the one command a new checkout must run unattended.
+    //
+    // What 015-2dc2 actually cost was silence: 387 files drifted for weeks
+    // because nothing said so. So the size is announced, and the import runs.
+    let incoming = actions
+        .iter()
+        .filter(|a| matches!(a, SyncAction::Import(_)))
+        .count();
+    if incoming > MEMORY_SYNC_BULK_ARCHIVE_CAP {
+        summary.bulk_import_reported = Some(incoming);
+        tracing::warn!(
+            "memory sync: importing {incoming} entry files with no database row (> cap {}). \
+             Expected on a fresh checkout; unexpected on a store that was already in sync, \
+             where it means the database lost rows the projection still has.",
+            MEMORY_SYNC_BULK_ARCHIVE_CAP,
+        );
     }
 
     for action in actions {
