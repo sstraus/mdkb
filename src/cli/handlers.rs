@@ -1623,7 +1623,7 @@ enum SyncAction {
 ///
 /// Deletions git can *prove* were intentional bypass the cap — see
 /// [`committed_deletions`].
-const MEMORY_SYNC_BULK_ARCHIVE_CAP: usize = 10;
+pub const MEMORY_SYNC_BULK_ARCHIVE_CAP: usize = 10;
 
 /// Reconcile the markdown projection with the DB, in both directions.
 ///
