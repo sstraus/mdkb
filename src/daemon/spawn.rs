@@ -30,6 +30,19 @@ pub async fn ensure_daemon_running(socket_path: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // `MDKB_NO_SPAWN=1` forbids forking a daemon: report unreachable at once
+    // instead of paying the full backoff waiting for one that will never come.
+    // For a sandbox or CI runner that must not leave a background process
+    // behind, and for exercising the caller's no-daemon path deterministically.
+    // Distinct from `MDKB_NO_DAEMON`, which bypasses the daemon entirely and
+    // runs in-process.
+    if std::env::var_os("MDKB_NO_SPAWN").is_some() {
+        return Err(Error::other(format!(
+            "no daemon at {} and MDKB_NO_SPAWN is set",
+            socket_path.display()
+        )));
+    }
+
     spawn_daemon_detached()?;
 
     for &delay in BACKOFF_MS {

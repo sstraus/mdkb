@@ -261,13 +261,15 @@ fn codex_generated_command_has_daemon_then_fallback_guard() {
             cmd.contains(&format!("hook {cli_event}")),
             "{event_name}: primary invocation missing: {cmd}"
         );
+        // See setup_hooks_test.rs: the shell fallback was unreachable by
+        // construction and is now in-process (story 021-0636).
         assert!(
-            cmd.contains("MDKB_NO_DAEMON=1"),
-            "{event_name}: MDKB_NO_DAEMON=1 fallback missing: {cmd}"
+            !cmd.contains("MDKB_NO_DAEMON=1"),
+            "{event_name}: the unreachable shell fallback must not be generated: {cmd}"
         );
         assert!(
-            cmd.contains("if !") && cmd.contains("; fi"),
-            "{event_name}: fallback must be wrapped in `if ! …; then …; fi`: {cmd}"
+            !cmd.contains("if !"),
+            "{event_name}: no conditional retry belongs in the wiring: {cmd}"
         );
 
         let actual_matcher = managed[0].get("matcher").and_then(|v| v.as_str());

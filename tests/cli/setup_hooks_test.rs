@@ -431,13 +431,19 @@ fn generated_command_has_daemon_then_fallback_guard() {
             cmd.contains(&expected_primary),
             "{event_name}: primary invocation missing: {cmd}"
         );
+        // The shell fallback is gone on purpose (story 021-0636). It could never
+        // fire: `run_hook` returns Ok(()) on every failure because the host hook
+        // must exit 0, so the `if !` branch was unreachable and the settings
+        // file advertised a rail that did not exist. The real fallback now runs
+        // in-process — see tests/hook_daemon_fallback.rs — so the wiring must
+        // describe what actually happens.
         assert!(
-            cmd.contains("MDKB_NO_DAEMON=1"),
-            "{event_name}: MDKB_NO_DAEMON=1 fallback missing: {cmd}"
+            !cmd.contains("MDKB_NO_DAEMON=1"),
+            "{event_name}: the unreachable shell fallback must not be generated: {cmd}"
         );
         assert!(
-            cmd.contains("if !") && cmd.contains("; fi"),
-            "{event_name}: fallback must be wrapped in `if ! …; then …; fi`: {cmd}"
+            !cmd.contains("if !"),
+            "{event_name}: no conditional retry belongs in the wiring: {cmd}"
         );
 
         let actual_matcher = managed[0].get("matcher").and_then(|v| v.as_str());

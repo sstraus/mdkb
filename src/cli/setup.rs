@@ -319,17 +319,23 @@ fn shell_quote(s: &str) -> String {
 ///
 /// When `daemon_required` is true, the fallback is omitted — the hook
 /// runs daemon-only and silently returns `{}` if the daemon is down.
-pub fn hook_command_line(binary_path: &str, cli_event: &str, daemon_required: bool) -> String {
-    let bin = shell_quote(binary_path);
-    if daemon_required {
-        format!("{bin} hook {event}", bin = bin, event = cli_event)
-    } else {
-        format!(
-            "if ! {bin} hook {event}; then MDKB_NO_DAEMON=1 {bin} hook {event}; fi",
-            bin = bin,
-            event = cli_event,
-        )
-    }
+pub fn hook_command_line(binary_path: &str, cli_event: &str, _daemon_required: bool) -> String {
+    // One command, no shell conditional. The old wiring was
+    // `if ! mdkb hook <event>; then MDKB_NO_DAEMON=1 mdkb hook <event>; fi`,
+    // which could never fire: `run_hook` returns `Ok(())` on every failure
+    // because the host hook must exit 0, so the `if !` branch was unreachable
+    // and the settings file advertised a rail that did not exist (021-0636).
+    //
+    // The fallback now lives inside the process — `run_hook` runs the event
+    // in-process when the daemon cannot answer — so the wiring describes what
+    // actually happens. `daemon_required` no longer changes the command line;
+    // it is retained in the signature because callers pass it through from
+    // config, and removing it would be an unrelated API break.
+    format!(
+        "{bin} hook {event}",
+        bin = shell_quote(binary_path),
+        event = cli_event
+    )
 }
 
 /// Resolve the Claude Code settings path for the given scope.

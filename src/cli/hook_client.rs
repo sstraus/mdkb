@@ -226,10 +226,30 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
     let socket_path = hook_socket_path();
     let timeout = hook_timeout(method);
     match call_daemon_with_timeout(&socket_path, method, &params, timeout).await {
-        Ok(response) => emit_hook_response(&response),
-        Err(e) => eprintln!("mdkb hook {method}: {e}"),
+        Ok(response) => {
+            emit_hook_response(&response);
+            Ok(())
+        }
+        // The daemon could not answer. Do the work here instead of returning
+        // silence.
+        //
+        // The generated wiring used to be
+        // `if ! mdkb hook <event>; then MDKB_NO_DAEMON=1 mdkb hook <event>; fi`,
+        // which can never fire: this function returns `Ok(())` on every failure
+        // by contract, because the host hook must exit 0. So the branch was
+        // unreachable and a dead daemon meant hooks silently did nothing, while
+        // the settings file advertised a rail that did not exist (021-0636).
+        //
+        // Falling back in-process rather than fixing the exit code keeps that
+        // contract intact — the host still never sees a non-zero exit for an
+        // ordinary hook failure — and is strictly better than the shell retry
+        // would have been: no second process launch, and no way for the two
+        // invocations to disagree about which repo they are in.
+        Err(e) => {
+            tracing::warn!("hook {method}: daemon unavailable ({e}); running in-process");
+            run_hook_in_process(method, params, &root).await
+        }
     }
-    Ok(())
 }
 
 /// Daemon config for the in-process (`MDKB_NO_DAEMON`) fallback. The `root` here
