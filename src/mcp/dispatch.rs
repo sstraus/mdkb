@@ -2766,34 +2766,53 @@ fn schedule_code_index_refresh(handle: &RepoHandle) -> bool {
 /// project, and an empty candidate set injects NOTHING: a handoff is verbatim
 /// session state, so another project's is actively misleading — worse than
 /// starting with no anchor at all. Unscoped, the rule is unchanged: newest wins.
-fn take_newest_handoff_body(
+/// Extract `anchor`'s body and drop EVERY handoff from the compact list.
+///
+/// The anchor is passed in rather than chosen here, because it is now selected
+/// by its own query (`memory::newest_handoff_for_scope`) instead of from the
+/// `access_count`-ranked pool — a handoff's access_count is 0 or 1 by
+/// construction, so it could never win that race (story 009-686d).
+///
+/// Handoffs are dropped from the list whether or not one was chosen: a 50-char
+/// truncated handoff title-line is useless for context restoration and would
+/// only crowd out an entry that is not.
+fn strip_handoffs(
     entries: Vec<crate::store::memory::MemoryEntry>,
-    scope: Option<&str>,
+    anchor: Option<&crate::store::memory::MemoryEntry>,
 ) -> (Option<String>, Vec<crate::store::memory::MemoryEntry>) {
     use crate::store::memory::{EntryType, strip_frontmatter};
-    let newest_idx = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, e)| e.entry_type == EntryType::Handoff)
-        .filter(|(_, e)| scope.is_none_or(|token| entry_in_scope(e, token)))
-        .max_by_key(|(_, e)| e.updated_at)
-        .map(|(i, _)| i);
-    let mut body = None;
-    let mut rest = Vec::with_capacity(entries.len());
-    for (i, e) in entries.into_iter().enumerate() {
-        if e.entry_type == EntryType::Handoff {
-            if Some(i) == newest_idx {
-                let stripped = strip_frontmatter(&e.content).trim().to_string();
-                if stripped.chars().count() >= HANDOFF_MIN_BODY_CHARS {
-                    body = Some(stripped);
-                }
-            }
-            // every handoff is dropped from the compact list
-        } else {
-            rest.push(e);
-        }
-    }
+    let body = anchor.and_then(|e| {
+        let stripped = strip_frontmatter(&e.content).trim().to_string();
+        (stripped.chars().count() >= HANDOFF_MIN_BODY_CHARS).then_some(stripped)
+    });
+    let rest = entries
+        .into_iter()
+        .filter(|e| e.entry_type != EntryType::Handoff)
+        .collect();
     (body, rest)
+}
+
+/// Test seam for the stripping stage, so the handoff-injection scenarios can be
+/// asserted against the same function production calls.
+#[doc(hidden)]
+pub fn strip_handoffs_for_test(
+    entries: Vec<crate::store::memory::MemoryEntry>,
+    anchor: Option<&crate::store::memory::MemoryEntry>,
+) -> (Option<String>, Vec<crate::store::memory::MemoryEntry>) {
+    strip_handoffs(entries, anchor)
+}
+
+/// Test seam for the ranking stage, so a test can assert that widening the
+/// candidate pool does not widen the emitted list.
+#[doc(hidden)]
+pub fn rank_warmup_entries_for_test(
+    entries: Vec<crate::store::memory::MemoryEntry>,
+    limit: usize,
+    min_confidence: f64,
+    now: i64,
+    scope: Option<&str>,
+) -> Vec<crate::store::memory::MemoryEntry> {
+    rank_warmup_entries(entries, limit, min_confidence, now, scope)
 }
 
 /// Select warmup lines that fit within `budget` tokens (real tiktoken count,
@@ -2926,7 +2945,19 @@ pub async fn hook_session_start_impl(
     // 50-char truncated handoff title-line is useless for context restoration.
     // Scoped, the newest handoff FOR THIS PROJECT is the anchor; with none, no
     // handoff block at all rather than another project's session state.
-    let (handoff_body, entries) = take_newest_handoff_body(entries, scope.as_deref());
+    // The anchor comes from its own query, not from the access_count-ranked pool
+    // above: a handoff is written once and read once, so its access_count is 0
+    // or 1 and it structurally loses that ordering to every warm topic. Selecting
+    // it here is what stops a scoped session from correctly refusing a foreign
+    // handoff and then silently getting none (story 009-686d).
+    let anchor = {
+        let ctx_guard = handle.ctx.lock().await;
+        ctx_guard.as_ref().and_then(|c| {
+            crate::store::memory::newest_handoff_for_scope(&c.conn, scope.as_deref())
+                .unwrap_or(None)
+        })
+    };
+    let (handoff_body, entries) = strip_handoffs(entries, anchor.as_ref());
 
     // Rank: confidence floor (off at 0.0), project affinity first when a scope
     // resolved, then access_count DESC with confidence tie-break, one reserved
@@ -4500,199 +4531,6 @@ mod tests {
             expires_at: None,
             due_at: None,
         }
-    }
-
-    #[test]
-    fn take_newest_handoff_body_extracts_newest_and_drops_all_handoffs() {
-        use crate::store::memory::{EntryType, SourceType};
-        let now = 1_000_000_000;
-        let newest_body = format!("---\ns: 3\n---\n{}", "full newest handoff body ".repeat(5));
-        let older_body = format!("---\ns: 2\n---\n{}", "older handoff body ".repeat(5));
-        let entries = vec![
-            warmup_entry(
-                "h-old",
-                EntryType::Handoff,
-                &older_body,
-                SourceType::UserStatement,
-                5,
-                3,
-                now,
-            ),
-            warmup_entry(
-                "h-new",
-                EntryType::Handoff,
-                &newest_body,
-                SourceType::UserStatement,
-                5,
-                1,
-                now,
-            ),
-            warmup_entry(
-                "topic",
-                EntryType::Topic,
-                "real content",
-                SourceType::UserStatement,
-                5,
-                0,
-                now,
-            ),
-        ];
-        let (body, rest) = take_newest_handoff_body(entries, None);
-        let body = body.expect("newest handoff body extracted");
-        assert!(
-            body.starts_with("full newest handoff body"),
-            "frontmatter stripped and newest chosen: {body}"
-        );
-        assert!(!body.contains("---"), "frontmatter removed: {body}");
-        let ids: Vec<&str> = rest.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["topic"],
-            "every handoff dropped, non-handoff retained: {ids:?}"
-        );
-    }
-
-    /// Build a handoff entry tagged for a project, `age_days` old.
-    fn scoped_handoff(
-        id: &str,
-        project: &str,
-        age_days: i64,
-        now: i64,
-    ) -> crate::store::memory::MemoryEntry {
-        use crate::store::memory::{EntryType, SourceType};
-        let body = format!(
-            "---\ns: {id}\n---\n{}",
-            format!("handoff body for {project} ").repeat(5)
-        );
-        let mut e = warmup_entry(
-            id,
-            EntryType::Handoff,
-            &body,
-            SourceType::UserStatement,
-            5,
-            age_days,
-            now,
-        );
-        e.tags = vec!["handoff".to_string(), project.to_string()];
-        e
-    }
-
-    #[test]
-    fn take_newest_handoff_body_prefers_the_newest_handoff_inside_the_scope() {
-        let now = 1_000_000_000;
-        // The globally newest handoff belongs to another project: injecting it
-        // would hand this session someone else's session state verbatim.
-        let entries = vec![
-            scoped_handoff("h-lattice-old", "lattice", 5, now),
-            scoped_handoff("h-lattice", "lattice", 3, now),
-            scoped_handoff("h-riscosity", "riscosity", 1, now),
-        ];
-
-        let (body, rest) = take_newest_handoff_body(entries, Some("lattice"));
-        let body = body.expect("in-scope handoff body extracted");
-        assert!(
-            body.starts_with("handoff body for lattice"),
-            "newest IN-SCOPE handoff wins over the newest overall: {body}"
-        );
-        assert!(
-            rest.is_empty(),
-            "story 073's contract holds: every handoff still leaves the compact list"
-        );
-    }
-
-    #[test]
-    fn take_newest_handoff_body_injects_nothing_when_no_handoff_is_in_scope() {
-        let now = 1_000_000_000;
-        let entries = vec![
-            scoped_handoff("h-riscosity", "riscosity", 1, now),
-            scoped_handoff("h-evoke", "evoke", 2, now),
-        ];
-
-        // A foreign handoff is worse than none: the session gets no body block.
-        let (body, rest) = take_newest_handoff_body(entries, Some("lattice"));
-        assert!(body.is_none(), "no in-scope handoff means no injection");
-        assert!(rest.is_empty(), "handoffs still dropped from the list");
-    }
-
-    #[test]
-    fn take_newest_handoff_body_unscoped_still_takes_the_newest_overall() {
-        let now = 1_000_000_000;
-        let entries = vec![
-            scoped_handoff("h-lattice", "lattice", 3, now),
-            scoped_handoff("h-riscosity", "riscosity", 1, now),
-        ];
-
-        // No scope resolved (cwd at the store root, or absent) → unchanged.
-        let (body, _) = take_newest_handoff_body(entries, None);
-        let body = body.expect("newest handoff body extracted");
-        assert!(
-            body.starts_with("handoff body for riscosity"),
-            "unscoped keeps the pre-scoping rule: newest overall wins: {body}"
-        );
-    }
-
-    #[test]
-    fn take_newest_handoff_body_none_when_no_handoff() {
-        use crate::store::memory::{EntryType, SourceType};
-        let now = 1_000_000_000;
-        let entries = vec![
-            warmup_entry(
-                "topic",
-                EntryType::Topic,
-                "content",
-                SourceType::UserStatement,
-                5,
-                0,
-                now,
-            ),
-            warmup_entry(
-                "prob",
-                EntryType::Problem,
-                "content",
-                SourceType::UserStatement,
-                5,
-                0,
-                now,
-            ),
-        ];
-        let (body, rest) = take_newest_handoff_body(entries, None);
-        assert!(body.is_none(), "no handoff means no body block");
-        assert_eq!(rest.len(), 2, "non-handoff entries untouched");
-    }
-
-    #[test]
-    fn take_newest_handoff_body_skips_empty_body_but_still_drops_handoff() {
-        use crate::store::memory::{EntryType, SourceType};
-        let now = 1_000_000_000;
-        // An auto-handoff whose body is only frontmatter (< HANDOFF_MIN_BODY_CHARS).
-        let entries = vec![
-            warmup_entry(
-                "h-empty",
-                EntryType::Handoff,
-                "---\ns: 1\n---\n",
-                SourceType::UserStatement,
-                5,
-                1,
-                now,
-            ),
-            warmup_entry(
-                "topic",
-                EntryType::Topic,
-                "real content",
-                SourceType::UserStatement,
-                5,
-                0,
-                now,
-            ),
-        ];
-        let (body, rest) = take_newest_handoff_body(entries, None);
-        assert!(body.is_none(), "empty handoff body is not injected");
-        let ids: Vec<&str> = rest.iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["topic"],
-            "handoff still dropped from the compact list: {ids:?}"
-        );
     }
 
     #[test]

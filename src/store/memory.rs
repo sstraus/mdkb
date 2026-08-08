@@ -1545,12 +1545,77 @@ fn due_reminder_lines(conn: &Connection, now: i64) -> Result<Vec<String>> {
 ///
 /// The hook layer ranks and truncates these; `get_warmup_index` formats the
 /// non-prior subset into the legacy string contract.
+/// How many candidates to fetch per emitted line.
+///
+/// The pool is an INPUT to ranking, not an output. Fetching exactly
+/// `warmup_limit` rows meant project-affinity ranking could only reorder the
+/// globally hottest N: foreign entries were demoted, but no cold in-scope entry
+/// could ever be promoted in to replace them, so the list got shorter rather
+/// than better. A wider pool gives affinity something to promote.
+pub const WARMUP_POOL_FACTOR: usize = 10;
+
+/// Ceiling on the candidate pool regardless of `warmup_limit`.
+///
+/// This runs on the session-start hook path, so the pool has to stay bounded by
+/// something other than the store's size. At 500 rows the cost is a bounded
+/// index range scan plus 500 row decodes — tens of milliseconds against entries
+/// of a few hundred bytes — while the *emitted* list is still capped by
+/// `warmup_limit` and the token budget, so nothing downstream grows.
+pub const WARMUP_POOL_HARD_CAP: usize = 500;
+
+/// The newest handoff for `scope`, selected on its own terms.
+///
+/// Deliberately NOT taken from the `access_count`-ranked warmup pool. A handoff
+/// is written once at the end of a session and read once at the start of the
+/// next, so its `access_count` is 0 or 1 by construction — it is structurally
+/// guaranteed to lose an `ORDER BY access_count DESC` race against every warm
+/// topic in the store. The one entry session restoration most needs is the one
+/// that ranking is least able to see, which is how a session could correctly
+/// refuse a foreign handoff and then silently get none when a legitimate one
+/// existed (story 009-686d).
+///
+/// `scope` is a project tag. `None` means unscoped: the newest handoff overall,
+/// which is the pre-scoping behaviour. Tag matching is done in Rust rather than
+/// SQL because tags are stored as a JSON array and a `LIKE` over that text would
+/// match substrings of neighbouring tags.
+pub fn newest_handoff_for_scope(
+    conn: &Connection,
+    scope: Option<&str>,
+) -> Result<Option<MemoryEntry>> {
+    let now = Utc::now().timestamp();
+    let mut stmt = conn.prepare(
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
+         FROM memory_entries
+         WHERE status = 'active'
+           AND entry_type = 'handoff'
+           AND (expires_at IS NULL OR expires_at > ?1)
+         ORDER BY updated_at DESC",
+    )?;
+    let rows = stmt.query_map(params![now], row_to_entry)?;
+    for row in rows {
+        let entry = row?;
+        let matches = match scope {
+            None => true,
+            Some(token) => entry.tags.iter().any(|t| t.to_lowercase() == token),
+        };
+        if matches {
+            return Ok(Some(entry));
+        }
+    }
+    Ok(None)
+}
+
 pub fn get_warmup_entries(
     conn: &Connection,
     limit: usize,
 ) -> Result<(Vec<String>, Vec<MemoryEntry>)> {
     let now = Utc::now().timestamp();
     let due_lines = due_reminder_lines(conn, now)?;
+
+    // Fetch a POOL, not the final list. See `WARMUP_POOL_FACTOR`.
+    let pool = limit
+        .saturating_mul(WARMUP_POOL_FACTOR)
+        .min(WARMUP_POOL_HARD_CAP);
 
     let mut stmt = conn.prepare(
         "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
@@ -1563,7 +1628,7 @@ pub fn get_warmup_entries(
     )?;
 
     let entries: Vec<MemoryEntry> = stmt
-        .query_map(params![limit as i64, now], row_to_entry)?
+        .query_map(params![pool as i64, now], row_to_entry)?
         .filter_map(|r| match r {
             Ok(v) => Some(v),
             Err(e) => {
