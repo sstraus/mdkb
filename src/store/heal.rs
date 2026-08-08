@@ -203,15 +203,50 @@ fn available_quarantine_path(db_path: &Path, timestamp: u64) -> PathBuf {
     candidate
 }
 
-/// Count of memory rows recovered from a quarantined database.
+/// Count of rows recovered from a quarantined database.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Salvage {
     pub entries: usize,
     pub edges: usize,
+    /// Collection registrations recovered. Reported separately because their
+    /// loss has a different symptom from memory loss: not "an entry is missing"
+    /// but "every later `mdkb update` silently indexes the wrong thing".
+    pub collections: usize,
+    /// Memory revisions recovered — edit history, and since schema v19 the
+    /// losing side of every file/DB conflict.
+    pub revisions: usize,
+    /// Mined behavioural priors (candidates + clusters) recovered.
+    pub priors: usize,
 }
 
-/// Copy `memory_entries` and `memory_edges` out of a quarantined database into
-/// the fresh one via `ATTACH ... immutable=1`.
+/// Tables that a quarantine must carry into the fresh database, in the order
+/// they are copied.
+///
+/// The rule is whether the rows can be re-derived from files still on disk.
+/// `documents`, `content` and `edges` can: `mdkb update` rebuilds them from the
+/// markdown, so dropping them costs a reindex. These cannot. `collections`
+/// records the *decision* that a directory is a collection, which exists nowhere
+/// else — story 012-19e7 is what its loss looks like from outside: a store went
+/// from 2046 indexed documents to 3, `mdkb update` printed success and exited 0,
+/// and the cause was blamed on an unrelated config edit for weeks.
+///
+/// Order matters: `memory_revisions` has a foreign key onto `memory_entries`, so
+/// the parent is copied first and `INSERT OR IGNORE` drops any child whose
+/// parent was in the torn pages.
+///
+/// `evolution` is deliberately absent — its foreign keys point at `documents`,
+/// which the rebuild wipes, so every row would be rejected. Recovering it would
+/// have to happen after a reindex, against document ids that are re-assigned.
+const SALVAGED_TABLES: [&str; 5] = [
+    "memory_entries",
+    "memory_edges",
+    "memory_revisions",
+    "collections",
+    "prior_clusters",
+];
+
+/// Copy the non-derivable tables out of a quarantined database into the fresh
+/// one via `ATTACH ... immutable=1`.
 ///
 /// `immutable=1` tells SQLite the file will not change, so it skips locking and
 /// hot-journal rollback — the only safe way to read a possibly-corrupt file. The
@@ -222,17 +257,37 @@ pub fn salvage_memory(fresh: &Connection, corrupt_path: &Path) -> Salvage {
     let uri = format!("file:{}?immutable=1", corrupt_path.to_string_lossy());
     if let Err(e) = fresh.execute("ATTACH DATABASE ?1 AS corrupt", params![uri]) {
         tracing::error!(
-            "memory salvage: cannot attach quarantined {} ({e}) — memory entries may be lost",
+            "salvage: cannot attach quarantined {} ({e}) — memory entries and collection \
+             registrations may be lost",
             corrupt_path.display()
         );
         return Salvage::default();
     }
-    let entries = salvage_table(fresh, "memory_entries");
-    let edges = salvage_table(fresh, "memory_edges");
-    if let Err(e) = fresh.execute("DETACH DATABASE corrupt", []) {
-        tracing::warn!("memory salvage: detach failed: {e}");
+    let mut salvage = Salvage::default();
+    for table in SALVAGED_TABLES {
+        let rows = salvage_table(fresh, table);
+        match table {
+            "memory_entries" => salvage.entries = rows,
+            "memory_edges" => salvage.edges = rows,
+            "memory_revisions" => salvage.revisions = rows,
+            "collections" => salvage.collections = rows,
+            _ => salvage.priors += rows,
+        }
     }
-    Salvage { entries, edges }
+    // Candidates reference a cluster, so clusters go first; counted together
+    // because the pair is one feature to the operator.
+    salvage.priors += salvage_table(fresh, "prior_candidates");
+    if let Err(e) = fresh.execute("DETACH DATABASE corrupt", []) {
+        tracing::warn!("salvage: detach failed: {e}");
+    }
+    if salvage.collections > 0 {
+        tracing::warn!(
+            collections = salvage.collections,
+            "salvaged collection registrations from the quarantined index — run `mdkb update` \
+             to re-index their documents"
+        );
+    }
+    salvage
 }
 
 /// Copy one whole table from the attached `corrupt` db into `main`, returning the
@@ -871,6 +926,7 @@ mod tests {
             Salvage {
                 entries: 5,
                 edges: 2,
+                ..Default::default()
             },
         );
 

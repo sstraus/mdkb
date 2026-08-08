@@ -4373,6 +4373,7 @@ mod tests {
             crate::store::heal::Salvage {
                 entries: 673,
                 edges: 12,
+                ..Default::default()
             },
         );
     }
