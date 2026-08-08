@@ -183,6 +183,29 @@ pub struct UpdateResult {
     #[serde(default)]
     pub memory_files_projected: usize,
 
+    /// Memory entries inserted from a markdown file with no DB row — a
+    /// colleague's entry arriving in a checkout.
+    #[serde(default)]
+    pub memory_files_imported: usize,
+
+    /// Memory entries updated from their markdown file (file → DB).
+    #[serde(default)]
+    pub memory_files_adopted: usize,
+
+    /// Entries where file and DB had both changed; the newer `updated_at` won
+    /// and the loser was preserved in `memory_revisions`.
+    #[serde(default)]
+    pub memory_sync_conflicts: usize,
+
+    /// Archived entries restored to active because their file reappeared.
+    #[serde(default)]
+    pub memory_entries_revived: usize,
+
+    /// Markdown files skipped as unsafe to read (unresolved merge markers,
+    /// unparseable frontmatter, id disagreeing with the filename).
+    #[serde(default)]
+    pub memory_files_quarantined: usize,
+
     /// Memory entries archived because their projected file was deleted.
     #[serde(default)]
     pub memory_entries_archived: usize,
@@ -191,6 +214,11 @@ pub struct UpdateResult {
     /// once (suspected bulk loss, not deliberate deletion).
     #[serde(default)]
     pub memory_entries_archive_skipped: usize,
+
+    /// Set when a `.gitignore` above the store excludes `.mdkb/` wholesale,
+    /// making `.mdkb/.gitignore` inert and the entry projection untrackable.
+    #[serde(default)]
+    pub memory_gitignore_shadowed: Option<String>,
 
     /// Errors encountered during indexing.
     pub errors: Vec<String>,

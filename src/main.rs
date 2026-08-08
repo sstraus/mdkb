@@ -754,6 +754,15 @@ async fn run_cli(cli: Cli) -> Result<()> {
                         eprintln!("Error: {err}");
                     }
                 }
+                MemoryCommand::Sync => {
+                    let s = mdkb::cli::handlers::sync_memory_files(&ctx)?;
+                    println!(
+                        "Projected: {}  Imported: {}  Adopted: {}  Conflicts: {}  \
+                         Revived: {}  Archived: {}",
+                        s.projected, s.imported, s.adopted, s.conflicts, s.revived, s.archived
+                    );
+                    print_memory_sync_warnings(&s);
+                }
                 MemoryCommand::Import {
                     path,
                     dry_run,
@@ -1407,10 +1416,46 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
                     result.doc_embeddings_generated
                 );
             }
+            if result.memory_files_imported > 0 {
+                println!(
+                    "Memory entries imported from files: {}",
+                    result.memory_files_imported
+                );
+            }
+            if result.memory_files_adopted > 0 {
+                println!(
+                    "Memory entries updated from files: {}",
+                    result.memory_files_adopted
+                );
+            }
+            if result.memory_entries_revived > 0 {
+                println!(
+                    "Memory entries revived (file returned): {}",
+                    result.memory_entries_revived
+                );
+            }
             if result.memory_entries_archived > 0 {
                 println!(
                     "Memory entries archived (file deleted): {}",
                     result.memory_entries_archived
+                );
+            }
+            // Conflicts and quarantines demand a human decision; a colleague
+            // whose edit lost must be able to find it, so name the command that
+            // retrieves the preserved version rather than only counting.
+            if result.memory_sync_conflicts > 0 {
+                println!(
+                    "⚠ Memory conflicts resolved by newest edit: {} — the superseded \
+                     versions are kept; inspect with `mdkb memory history <id>`.",
+                    result.memory_sync_conflicts
+                );
+            }
+            if result.memory_files_quarantined > 0 {
+                println!(
+                    "⚠ Memory files SKIPPED as unreadable: {} (unresolved merge markers, \
+                     bad frontmatter, or id/filename mismatch) — see the warning log, \
+                     fix them and re-run.",
+                    result.memory_files_quarantined
                 );
             }
             if result.memory_entries_archive_skipped > 0 {
@@ -1420,6 +1465,9 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
                      .mdkb/memory/entries/ and re-run `mdkb update`.",
                     result.memory_entries_archive_skipped
                 );
+            }
+            if let Some(warning) = &result.memory_gitignore_shadowed {
+                println!("⚠ {warning}");
             }
             if !result.errors.is_empty() {
                 println!("Errors:    {}", result.errors.len());
@@ -1653,6 +1701,36 @@ fn format_warmup_index(index: &[String], format: OutputFormat) {
                 println!("- {line}");
             }
         }
+    }
+}
+
+/// Surface the two sync outcomes a human has to act on: a resolved conflict
+/// (someone's edit lost and needs retrieving) and an ignore rule that silently
+/// makes the whole projection untrackable.
+fn print_memory_sync_warnings(s: &mdkb::cli::handlers::MemorySyncSummary) {
+    if s.conflicts > 0 {
+        println!(
+            "⚠ {} conflict(s) resolved by newest edit — the superseded versions are \
+             kept; inspect with `mdkb memory history <id>`.",
+            s.conflicts
+        );
+    }
+    if s.quarantined > 0 {
+        println!(
+            "⚠ {} file(s) skipped as unreadable (unresolved merge markers, bad \
+             frontmatter, or id/filename mismatch) — see the warning log.",
+            s.quarantined
+        );
+    }
+    if s.archive_skipped > 0 {
+        println!(
+            "⚠ Archival SKIPPED — {} projected files missing at once (suspected bulk \
+             loss). Restore .mdkb/memory/entries/ and re-run.",
+            s.archive_skipped
+        );
+    }
+    if let Some(warning) = &s.gitignore_shadowed {
+        println!("⚠ {warning}");
     }
 }
 

@@ -743,6 +743,12 @@ pub enum MemoryCommand {
         dry_run: bool,
     },
 
+    /// Reconcile memory entries with their git-tracked markdown files
+    ///
+    /// Runs automatically as part of `mdkb update`; use this to pick up a
+    /// `git pull` without reindexing documents.
+    Sync,
+
     /// Import memory entries from a JSON file or markdown folder
     Import {
         /// Path to JSON file or markdown directory

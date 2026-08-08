@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 18;
+pub const SCHEMA_VERSION: i32 = 19;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     due_at INTEGER,                            -- Unix timestamp; surfaces reminders at/after this time
     created_session TEXT,                      -- session id that authored this entry (provenance)
     created_agent TEXT,                        -- agent/tool that authored this entry (provenance)
-    projected_at INTEGER                       -- when the markdown projection was last written; NULL = never
+    projected_at INTEGER,                      -- when the markdown projection was last written; NULL = never
+    projected_hash TEXT                        -- SHA-256 of the bytes last projected; NULL = predates the column
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
@@ -641,6 +642,29 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
             END;
             "#,
         )?;
+    }
+
+    // Migration from v18 to v19: `memory_entries.projected_hash` records the
+    // SHA-256 of the exact bytes last written to the entry's markdown file, so
+    // reconciliation can tell "the file changed" from "the file was rewritten by
+    // a checkout". mtime cannot answer that — git stamps every file it writes
+    // during a checkout/merge with the checkout time, so after any `git pull`
+    // every pulled file, changed or not, looks newer than `projected_at`.
+    // NULL = the projection predates this column (re-project once, §migration).
+    if from_version < 19 {
+        let has_hash: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'projected_hash'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_hash {
+            conn.execute(
+                "ALTER TABLE memory_entries ADD COLUMN projected_hash TEXT",
+                [],
+            )?;
+        }
     }
 
     // Update schema version

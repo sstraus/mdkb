@@ -463,6 +463,14 @@ fn smoke_memory_lifecycle() {
     let out = run(&["memory", "export", "--dry-run"], &repo.root);
     assert_ok(&out, "memory export --dry-run");
 
+    let out = run(&["memory", "sync"], &repo.root);
+    assert_ok(&out, "memory sync");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Conflicts:"),
+        "memory sync must report its outcome: {stdout}"
+    );
+
     let out = run(&["memory", "rm", "smoke-test-entry"], &repo.root);
     assert_ok(&out, "memory rm");
 }

@@ -107,6 +107,18 @@ impl MemoryFile {
 
 /// Serialize a [`MemoryEntry`] to a markdown file with YAML frontmatter.
 ///
+/// **Durable fields only.** The file is git-tracked and shared between clones, so
+/// it carries what two machines should agree on — authorship and classification —
+/// and nothing that is a function of *this* machine's usage. `access_count` and
+/// `last_accessed` in particular are bumped by every single `get_entry`
+/// (`memory::get_entry`), so projecting them would produce a one-line diff per
+/// lookup and a merge conflict per pull: the directory would be unmergeable by
+/// construction. `confirmations`/`last_confirmed_at` are counters git cannot sum,
+/// where last-writer-wins silently discards a clone's observations.
+///
+/// Those fields stay in `memory_entries` and are still *parsed* (see
+/// [`MemoryFileMeta`]) so hand-authored and pre-v19 files keep loading.
+///
 /// Output layout:
 /// ```text
 /// ---
@@ -117,6 +129,7 @@ impl MemoryFile {
 /// status: …
 /// tags: [a, b]
 /// created_at: 1700000000
+/// updated_at: 1700000100
 /// …
 /// ---
 ///
@@ -133,10 +146,6 @@ pub fn to_markdown(entry: &MemoryEntry) -> String {
     write_string_array(&mut out, "tags", &entry.tags);
     write_i64(&mut out, "created_at", entry.created_at);
     write_i64(&mut out, "updated_at", entry.updated_at);
-    write_u64(&mut out, "access_count", entry.access_count);
-    write_opt_i64(&mut out, "last_accessed", entry.last_accessed);
-    write_u64(&mut out, "confirmations", u64::from(entry.confirmations));
-    write_opt_i64(&mut out, "last_confirmed_at", entry.last_confirmed_at);
     write_opt_scalar(&mut out, "source_path", entry.source_path.as_deref());
     write_opt_scalar(&mut out, "superseded_by", entry.superseded_by.as_deref());
     write_opt_i64(&mut out, "expires_at", entry.expires_at);
@@ -190,13 +199,6 @@ fn write_opt_scalar(out: &mut String, key: &str, value: Option<&str>) {
 }
 
 fn write_i64(out: &mut String, key: &str, value: i64) {
-    out.push_str(key);
-    out.push_str(": ");
-    out.push_str(&value.to_string());
-    out.push('\n');
-}
-
-fn write_u64(out: &mut String, key: &str, value: u64) {
     out.push_str(key);
     out.push_str(": ");
     out.push_str(&value.to_string());
@@ -334,12 +336,47 @@ mod tests {
         assert_eq!(back.updated_at, entry.updated_at);
         assert_eq!(back.source_type, entry.source_type);
         assert_eq!(back.source_path, entry.source_path);
-        assert_eq!(back.access_count, entry.access_count);
-        assert_eq!(back.last_accessed, entry.last_accessed);
-        assert_eq!(back.confirmations, entry.confirmations);
-        assert_eq!(back.last_confirmed_at, entry.last_confirmed_at);
         assert_eq!(back.expires_at, entry.expires_at);
         assert_eq!(back.due_at, entry.due_at);
+    }
+
+    /// The file is git-tracked and shared; per-machine counters must not reach
+    /// it. `access_count`/`last_accessed` move on every read, so projecting them
+    /// would diff the directory on every lookup.
+    #[test]
+    fn local_telemetry_is_never_serialized() {
+        let entry = sample_entry(); // access_count 3, confirmations 1, both timestamps set
+        let text = to_markdown(&entry);
+        for key in [
+            "access_count",
+            "last_accessed",
+            "confirmations",
+            "last_confirmed_at",
+        ] {
+            assert!(
+                !text.contains(key),
+                "`{key}` must not appear in the projection:\n{text}"
+            );
+        }
+        // Dropped from the projection, not from the entry.
+        assert_eq!(entry.access_count, 3);
+        assert_eq!(entry.confirmations, 1);
+    }
+
+    /// Parsing keeps accepting the fields serialization no longer writes:
+    /// pre-v19 projected files and `memory export` output still load.
+    #[test]
+    fn legacy_telemetry_frontmatter_still_parses() {
+        let legacy = "---\nid: abc\ntitle: Legacy\nentry_type: topic\n\
+                      access_count: 12\nlast_accessed: 1700000200\n\
+                      confirmations: 4\nlast_confirmed_at: 1700000150\n---\n\nBody.\n";
+        let parsed = from_markdown(legacy).expect("parse");
+        assert_eq!(parsed.meta.access_count, Some(12));
+        assert_eq!(parsed.meta.confirmations, Some(4));
+        // …and an import still resets them, because the DB owns counter truth.
+        let fresh = parsed.into_fresh_entry();
+        assert_eq!(fresh.access_count, 0);
+        assert_eq!(fresh.confirmations, 0);
     }
 
     #[test]

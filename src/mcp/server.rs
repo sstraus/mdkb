@@ -1168,15 +1168,34 @@ fn build_code_excludes(root: &Path, patterns: &[String]) -> globset::GlobSet {
     })
 }
 
+/// Which sinks a changed path belongs to. A path can belong to several.
+#[derive(Debug, Clone, Copy, Default)]
+struct ChangeRoutes {
+    code: bool,
+    doc: bool,
+    /// The git-tracked memory entry projection, `.mdkb/memory/entries/*.md`.
+    memory: bool,
+}
+
+impl ChangeRoutes {
+    fn any(self) -> bool {
+        self.code || self.doc || self.memory
+    }
+}
+
 fn classify_change(
     path: &Path,
     collection_paths: &[PathBuf],
     code_excludes: &globset::GlobSet,
-) -> (bool, bool) {
+    memory_entries_dir: &Path,
+) -> ChangeRoutes {
     use crate::code::parsing::language::Language;
-    let is_code = Language::from_path(path).is_some() && !code_excludes.is_match(path);
-    let is_doc = collection_paths.iter().any(|cp| path.starts_with(cp));
-    (is_code, is_doc)
+    ChangeRoutes {
+        code: Language::from_path(path).is_some() && !code_excludes.is_match(path),
+        doc: collection_paths.iter().any(|cp| path.starts_with(cp)),
+        memory: path.starts_with(memory_entries_dir)
+            && path.extension().and_then(|e| e.to_str()) == Some("md"),
+    }
 }
 
 /// How long the watcher waits for context initialization before giving up.
@@ -1279,13 +1298,20 @@ pub async fn run_file_watcher_inner(
     // Build exclude matcher for code changes (node_modules, dist, target, etc.)
     let code_excludes = build_code_excludes(&root, &code_ignore_patterns);
 
-    // Watch root recursively (covers both code and collections inside root)
-    if code_enabled {
-        if let Err(e) = watcher.watch(&root.to_path_buf()) {
-            tracing::warn!("Failed to watch root: {}", e);
-        } else {
-            tracing::info!("Watching root for changes");
-        }
+    // The memory projection this watcher reconciles, `.mdkb/memory/entries/`.
+    let memory_entries_dir = root.join(".mdkb/memory/entries");
+
+    // Watch root recursively — it covers code, collections inside root, AND the
+    // memory entry projection. This registration must NOT be gated on any one
+    // sink: it used to sit behind `if code_enabled`, so turning code indexing off
+    // left the daemon watching nothing at all while every log line still said it
+    // was running. Whether a given change is acted on is a per-sink routing
+    // decision, which is where `code_enabled` belongs (see `classify_change` and
+    // the flush calls below).
+    if let Err(e) = watcher.watch(&root.to_path_buf()) {
+        tracing::warn!("Failed to watch root: {}", e);
+    } else {
+        tracing::info!("Watching root for changes");
     }
 
     // Only watch collection paths that are OUTSIDE the root (rare edge case)
@@ -1359,6 +1385,7 @@ pub async fn run_file_watcher_inner(
     // Two event sources: FSEvents watcher and injected paths from post-tool-use IPC.
     let mut code_batch: Vec<PathBuf> = Vec::new();
     let mut needs_doc_update = false;
+    let mut needs_memory_sync = false;
 
     loop {
         // Helper: receive from the optional injected-path channel, or block forever if absent.
@@ -1373,7 +1400,7 @@ pub async fn run_file_watcher_inner(
             };
         }
 
-        if code_batch.is_empty() && !needs_doc_update {
+        if code_batch.is_empty() && !needs_doc_update && !needs_memory_sync {
             // No pending work — block until next event from either source.
             tokio::select! {
                 change = watcher.recv() => {
@@ -1385,11 +1412,12 @@ pub async fn run_file_watcher_inner(
                         break;
                     };
                     tracing::debug!("File change detected: {:?}", change.path);
-                    let (is_code, is_doc) = classify_change(&change.path, &collection_paths, &code_excludes);
-                    if is_code { code_batch.push(change.path.clone()); }
-                    if is_doc { needs_doc_update = true; }
-                    if !is_code && !is_doc {
-                        tracing::debug!("Ignoring non-code, non-doc change: {:?}", change.path);
+                    let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
+                    if routes.code { code_batch.push(change.path.clone()); }
+                    if routes.doc { needs_doc_update = true; }
+                    if routes.memory { needs_memory_sync = true; }
+                    if !routes.any() {
+                        tracing::debug!("Ignoring unrouted change: {:?}", change.path);
                     }
                 }
                 path = recv_injected!() => {
@@ -1409,11 +1437,12 @@ pub async fn run_file_watcher_inner(
                 change = watcher.recv() => {
                     if let Some(change) = change {
                         tracing::debug!("File change detected: {:?}", change.path);
-                        let (is_code, is_doc) = classify_change(&change.path, &collection_paths, &code_excludes);
-                        if is_code { code_batch.push(change.path.clone()); }
-                        if is_doc { needs_doc_update = true; }
-                        if !is_code && !is_doc {
-                            tracing::debug!("Ignoring non-code, non-doc change: {:?}", change.path);
+                        let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
+                        if routes.code { code_batch.push(change.path.clone()); }
+                        if routes.doc { needs_doc_update = true; }
+                        if routes.memory { needs_memory_sync = true; }
+                        if !routes.any() {
+                            tracing::debug!("Ignoring unrouted change: {:?}", change.path);
                         }
                     } else {
                         tracing::error!(
@@ -1444,10 +1473,16 @@ pub async fn run_file_watcher_inner(
                         code_batch.clear();
                         full_code_rescan(&code_index, &root).await;
                         needs_doc_update = true;
+                        needs_memory_sync = true;
                     } else {
                         flush_code_batch(&code_index, &root, &mut code_batch).await;
                     }
-                    flush_doc_update(&ctx, &root, &mut needs_doc_update).await;
+                    // Order matters: `handle_update` already runs the memory
+                    // reconciliation, so a pending doc update subsumes a pending
+                    // memory sync. Flushing docs first lets the memory flush see
+                    // the flag cleared and skip a redundant second pass.
+                    flush_doc_update(&ctx, &root, &mut needs_doc_update, &mut needs_memory_sync).await;
+                    flush_memory_sync(&ctx, &mut needs_memory_sync).await;
                 }
             }
         }
@@ -1526,8 +1561,13 @@ async fn full_rebuild_from_heal(
     root: &Path,
 ) {
     tracing::warn!("post-heal: rebuilding docs + sessions + code from source");
+    // A quarantine rebuilds `memory_entries` empty, so the projection on disk is
+    // the only surviving copy — the doc update's reconciliation pass is what
+    // re-imports it. Both flags are set for that reason.
     let mut needs_docs = true;
-    flush_doc_update(ctx, root, &mut needs_docs).await;
+    let mut needs_memory = true;
+    flush_doc_update(ctx, root, &mut needs_docs, &mut needs_memory).await;
+    flush_memory_sync(ctx, &mut needs_memory).await;
     full_code_rescan(code_index, root).await;
 
     match crate::daemon::config::home_dir() {
@@ -1550,12 +1590,85 @@ async fn full_rebuild_from_heal(
     }
 }
 
+/// Reconcile the memory entry projection after a change under
+/// `.mdkb/memory/entries/` — typically a `git pull` landing a colleague's entry,
+/// or a hand edit.
+///
+/// The watcher delivers per-file events, but the bulk-loss circuit breaker and
+/// the git intentional/suspect discriminator are **set-level** decisions: they
+/// need to see every vanished file at once to tell a committed bulk deletion
+/// from a broken checkout. So an event is only ever a *trigger* — the debounced
+/// flush runs the same whole-directory pass as `mdkb update`, and the changed
+/// path is deliberately not passed in. A per-file archive decision would make
+/// twelve deletions twelve independent choices, each below the cap, and the
+/// breaker would never fire.
+///
+/// Reconciliation writes into the directory it watches, which re-triggers this
+/// flush once. That pass finds every recorded hash already matching, writes
+/// nothing, and the loop closes.
+async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, needs_sync: &mut bool) {
+    if !*needs_sync {
+        return;
+    }
+    *needs_sync = false;
+    // Synchronous SQLite + filesystem work, like `handle_update`: run it on a
+    // blocking thread so it never stalls a tokio worker (PERF-1).
+    let ctx = Arc::clone(ctx);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let mut guard = ctx.blocking_lock();
+        crate::core::run_mutation(&mut guard, "memory sync", |ctx_ref| {
+            crate::cli::handlers::sync_memory_files(ctx_ref)
+        })
+    })
+    .await;
+    match outcome {
+        Ok(Some(Ok(s))) => {
+            if s.imported > 0 || s.adopted > 0 || s.conflicts > 0 || s.revived > 0 {
+                tracing::info!(
+                    "Memory reconciled: {} imported, {} adopted, {} conflicts, {} revived",
+                    s.imported,
+                    s.adopted,
+                    s.conflicts,
+                    s.revived
+                );
+            }
+            if s.conflicts > 0 {
+                tracing::warn!(
+                    "Memory sync resolved {} conflict(s) by newest edit; the superseded \
+                     versions are kept — inspect with `mdkb memory history <id>`.",
+                    s.conflicts
+                );
+            }
+            if s.quarantined > 0 {
+                tracing::warn!(
+                    "Memory sync skipped {} unreadable file(s) (merge markers, bad \
+                     frontmatter, or id/filename mismatch).",
+                    s.quarantined
+                );
+            }
+        }
+        Ok(Some(Err(e))) => tracing::error!("Memory sync failed: {}", e),
+        Ok(None) => {} // ctx not initialized — nothing to do
+        Err(e) => tracing::error!("Memory sync task panicked: {}", e),
+    }
+}
+
 /// Flush pending document update.
-async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_update: &mut bool) {
+///
+/// Clears `needs_memory_sync` too: `handle_update` runs the memory
+/// reconciliation itself, so letting it stand would cost a redundant second
+/// whole-directory pass on every doc change.
+async fn flush_doc_update(
+    ctx: &Arc<Mutex<Option<Context>>>,
+    root: &Path,
+    needs_update: &mut bool,
+    needs_memory_sync: &mut bool,
+) {
     if !*needs_update {
         return;
     }
     *needs_update = false;
+    *needs_memory_sync = false;
     // `handle_update` is fully synchronous (SQLite writes, filesystem walks, and —
     // via auto-embed/memory-backfill — ONNX inference). Run it on a blocking thread
     // and take the lock there (`blocking_lock`), so it never blocks the tokio worker
@@ -3550,15 +3663,60 @@ if (require.main === module) {
         }
     }
 
+    /// `(code, doc)` for the pre-existing routing tests, which predate the
+    /// memory route and assert nothing about it. The memory directory is set to
+    /// a path none of them touch.
+    fn code_doc(path: &Path, collections: &[PathBuf], excludes: &globset::GlobSet) -> (bool, bool) {
+        let r = classify_change(
+            path,
+            collections,
+            excludes,
+            Path::new("/project/.mdkb/memory/entries"),
+        );
+        (r.code, r.doc)
+    }
+
+    #[test]
+    fn memory_entry_files_route_to_reconciliation() {
+        let entries = Path::new("/project/.mdkb/memory/entries");
+        let collections: Vec<PathBuf> = vec![];
+        let excludes = build_code_excludes(Path::new("/project"), &[]);
+
+        let r = classify_change(
+            &entries.join("auth-oauth2.md"),
+            &collections,
+            &excludes,
+            entries,
+        );
+        assert!(
+            r.memory,
+            "a projected entry file must trigger reconciliation"
+        );
+        assert!(!r.code && !r.doc, "and nothing else");
+
+        // The store is full of churn that must NOT trigger a pass: the sqlite
+        // index and its WAL are rewritten constantly, and index.json is
+        // regenerated by reconciliation itself — routing it would be a loop.
+        for noisy in [
+            Path::new("/project/.mdkb/index.sqlite-wal"),
+            Path::new("/project/.mdkb/memory/index.json"),
+            Path::new("/project/.mdkb/memory/archive/old.md"),
+        ] {
+            let r = classify_change(noisy, &collections, &excludes, entries);
+            assert!(
+                !r.memory,
+                "{} must not trigger reconciliation",
+                noisy.display()
+            );
+        }
+    }
+
     #[test]
     fn test_classify_change_rs_outside_collection() {
         let path = Path::new("/project/src/main.rs");
         let collections = vec![PathBuf::from("/project/docs")];
         let excludes = build_code_excludes(Path::new("/project"), &[]);
-        assert_eq!(
-            classify_change(path, &collections, &excludes),
-            (true, false)
-        );
+        assert_eq!(code_doc(path, &collections, &excludes), (true, false));
     }
 
     #[test]
@@ -3566,10 +3724,7 @@ if (require.main === module) {
         let path = Path::new("/project/docs/readme.md");
         let collections = vec![PathBuf::from("/project/docs")];
         let excludes = build_code_excludes(Path::new("/project"), &[]);
-        assert_eq!(
-            classify_change(path, &collections, &excludes),
-            (false, true)
-        );
+        assert_eq!(code_doc(path, &collections, &excludes), (false, true));
     }
 
     #[test]
@@ -3577,7 +3732,7 @@ if (require.main === module) {
         let path = Path::new("/project/docs/example.rs");
         let collections = vec![PathBuf::from("/project/docs")];
         let excludes = build_code_excludes(Path::new("/project"), &[]);
-        assert_eq!(classify_change(path, &collections, &excludes), (true, true));
+        assert_eq!(code_doc(path, &collections, &excludes), (true, true));
     }
 
     #[test]
@@ -3585,10 +3740,7 @@ if (require.main === module) {
         let path = Path::new("/project/data.json");
         let collections = vec![PathBuf::from("/project/docs")];
         let excludes = build_code_excludes(Path::new("/project"), &[]);
-        assert_eq!(
-            classify_change(path, &collections, &excludes),
-            (false, false)
-        );
+        assert_eq!(code_doc(path, &collections, &excludes), (false, false));
     }
 
     #[test]
@@ -3600,17 +3752,11 @@ if (require.main === module) {
 
         // .js in node_modules should NOT be classified as code
         let path = Path::new("/project/node_modules/lodash/index.js");
-        assert_eq!(
-            classify_change(path, &collections, &excludes),
-            (false, false)
-        );
+        assert_eq!(code_doc(path, &collections, &excludes), (false, false));
 
         // .js outside node_modules should still be code
         let path = Path::new("/project/src/app.js");
-        assert_eq!(
-            classify_change(path, &collections, &excludes),
-            (true, false)
-        );
+        assert_eq!(code_doc(path, &collections, &excludes), (true, false));
     }
 
     #[test]
@@ -3625,7 +3771,7 @@ if (require.main === module) {
         let excludes = build_code_excludes(root, &patterns);
 
         assert_eq!(
-            classify_change(
+            code_doc(
                 Path::new("/project/node_modules/x/a.js"),
                 &collections,
                 &excludes
@@ -3633,7 +3779,7 @@ if (require.main === module) {
             (false, false)
         );
         assert_eq!(
-            classify_change(
+            code_doc(
                 Path::new("/project/dist/bundle.js"),
                 &collections,
                 &excludes
@@ -3641,7 +3787,7 @@ if (require.main === module) {
             (false, false)
         );
         assert_eq!(
-            classify_change(
+            code_doc(
                 Path::new("/project/target/debug/build.rs"),
                 &collections,
                 &excludes
@@ -3649,7 +3795,7 @@ if (require.main === module) {
             (false, false)
         );
         assert_eq!(
-            classify_change(Path::new("/project/src/main.rs"), &collections, &excludes),
+            code_doc(Path::new("/project/src/main.rs"), &collections, &excludes),
             (true, false)
         );
     }
@@ -3945,7 +4091,7 @@ if (require.main === module) {
 
         // Add a collection and document to each repo
         {
-            let ctx1 = crate::cli::handlers::Context::open(&root1).unwrap();
+            let ctx1 = crate::core::Context::open(&root1).unwrap();
             let docs_dir1 = root1.join("docs");
             std::fs::create_dir_all(&docs_dir1).unwrap();
             std::fs::write(
@@ -3966,7 +4112,7 @@ if (require.main === module) {
             crate::cli::handlers::handle_update(&ctx1, &root1).unwrap();
         }
         {
-            let ctx2 = crate::cli::handlers::Context::open(&root2).unwrap();
+            let ctx2 = crate::core::Context::open(&root2).unwrap();
             let docs_dir2 = root2.join("docs");
             std::fs::create_dir_all(&docs_dir2).unwrap();
             std::fs::write(
@@ -4037,7 +4183,7 @@ if (require.main === module) {
         crate::cli::handlers::handle_init(&root).unwrap();
 
         // Add a doc
-        let ctx = crate::cli::handlers::Context::open(&root).unwrap();
+        let ctx = crate::core::Context::open(&root).unwrap();
         let docs_dir = root.join("docs");
         std::fs::create_dir_all(&docs_dir).unwrap();
         std::fs::write(
@@ -4057,7 +4203,7 @@ if (require.main === module) {
         crate::store::collections::add_collection(&ctx.conn, &coll).unwrap();
         drop(ctx);
         {
-            let ctx = crate::cli::handlers::Context::open(&root).unwrap();
+            let ctx = crate::core::Context::open(&root).unwrap();
             crate::cli::handlers::handle_update(&ctx, &root).unwrap();
         }
 
@@ -4107,7 +4253,7 @@ if (require.main === module) {
 
         // Add doc only to repo2
         {
-            let ctx = crate::cli::handlers::Context::open(&root2).unwrap();
+            let ctx = crate::core::Context::open(&root2).unwrap();
             let docs_dir = root2.join("docs");
             std::fs::create_dir_all(&docs_dir).unwrap();
             std::fs::write(docs_dir.join("unique.md"), "# Unique\n\nOnly in repo2").unwrap();
@@ -4122,7 +4268,7 @@ if (require.main === module) {
             };
             crate::store::collections::add_collection(&ctx.conn, &coll).unwrap();
             drop(ctx);
-            let ctx = crate::cli::handlers::Context::open(&root2).unwrap();
+            let ctx = crate::core::Context::open(&root2).unwrap();
             crate::cli::handlers::handle_update(&ctx, &root2).unwrap();
         }
 

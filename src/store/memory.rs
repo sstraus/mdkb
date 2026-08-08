@@ -534,10 +534,14 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
     }
 }
 
-/// Update an existing memory entry.
-pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
+/// Update an existing memory entry, stamping `updated_at` explicitly.
+///
+/// File→DB reconciliation needs this: an entry authored on another machine
+/// carries the timestamp of *its* edit, and that timestamp is what the conflict
+/// rule compares on. Overwriting it with local wall-clock would make every
+/// imported entry win the next conflict simply for having been imported.
+pub fn update_entry_at(conn: &Connection, entry: &MemoryEntry, updated_at: i64) -> Result<()> {
     let tags_json = serde_json::to_string(&entry.tags)?;
-    let now = Utc::now().timestamp();
 
     conn.execute(
         "UPDATE memory_entries
@@ -549,7 +553,7 @@ pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
             entry.entry_type.to_string(),
             tags_json,
             entry.status.to_string(),
-            now,
+            updated_at,
             entry.superseded_by,
             entry.expires_at,
             entry.due_at,
@@ -559,6 +563,11 @@ pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// Update an existing memory entry, stamped now.
+pub fn update_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
+    update_entry_at(conn, entry, Utc::now().timestamp())
 }
 
 /// Maximum number of revisions to keep per memory entry.
@@ -614,7 +623,45 @@ pub fn save_revision(
         params![memory_id, diff, now],
     )?;
 
-    // Prune oldest revisions beyond MAX_REVISIONS
+    prune_revisions(conn, memory_id)?;
+
+    Ok(())
+}
+
+/// Preserve the version that lost a file/DB conflict, verbatim.
+///
+/// Deliberately not routed through [`save_revision`], for two reasons that both
+/// end in silent data loss: that function stores nothing at all unless
+/// `source_type` is `UserStatement`/`OfficialDocs` (so an `auto_extracted`
+/// loser would simply vanish), and it stores a *content* diff, which records
+/// nothing about a title, tag or type that only the losing side changed. The
+/// loser is therefore kept as its full markdown, self-describing and complete.
+///
+/// Shares the `memory_revisions` table and its `MAX_REVISIONS` pruning: three
+/// prior losers is more history than a merge would have left behind anyway.
+pub fn save_conflict_snapshot(
+    conn: &Connection,
+    memory_id: &str,
+    losing_markdown: &str,
+    lost_to: &str,
+) -> Result<()> {
+    let now = Utc::now().timestamp();
+    let stamp = chrono::DateTime::from_timestamp(now, 0)
+        .map(|d| d.to_rfc3339())
+        .unwrap_or_else(|| now.to_string());
+    let body =
+        format!("# conflict {stamp} — this version lost to the {lost_to}\n{losing_markdown}");
+
+    conn.execute(
+        "INSERT INTO memory_revisions (memory_id, diff, created_at) VALUES (?1, ?2, ?3)",
+        params![memory_id, body, now],
+    )?;
+    prune_revisions(conn, memory_id)?;
+    Ok(())
+}
+
+/// Keep at most [`MAX_REVISIONS`] per entry, dropping the oldest.
+fn prune_revisions(conn: &Connection, memory_id: &str) -> Result<()> {
     conn.execute(
         "DELETE FROM memory_revisions WHERE id IN (
             SELECT id FROM memory_revisions
@@ -624,7 +671,6 @@ pub fn save_revision(
         )",
         params![memory_id, MAX_REVISIONS as i64],
     )?;
-
     Ok(())
 }
 
@@ -1196,39 +1242,84 @@ fn embed_entry_by_rowid(
     Ok(EmbedOutcome::Embedded)
 }
 
-/// `(id, projected_at)` for every active entry — the input to file-projection
-/// sync. `projected_at IS NULL` means the entry has never had a markdown file
-/// written (a DB-only entry to backfill); a set value means the projection
-/// exists (so a now-missing file is a deliberate deletion to archive).
-pub fn list_active_projection_state(conn: &Connection) -> Result<Vec<(String, Option<i64>)>> {
+/// One entry plus the state of its markdown projection.
+///
+/// `projected_at IS NULL` means the entry has never had a file written (a
+/// DB-only entry to backfill, never an archival candidate); `projected_hash IS
+/// NULL` with a file present means the projection predates schema v19 and its
+/// bytes are unknown.
+#[derive(Debug, Clone)]
+pub struct ProjectionRow {
+    pub entry: MemoryEntry,
+    pub projected_at: Option<i64>,
+    pub projected_hash: Option<String>,
+}
+
+/// Projection state for every entry, whatever its status.
+///
+/// The full entry is loaded, not just its metadata, because "did the DB side
+/// change?" is answered by re-rendering the entry and comparing to
+/// `projected_hash` — the same content comparison used on the file side.
+/// Timestamps cannot answer it: an edit landing in the same second as the
+/// projection is invisible to `updated_at > projected_at`, and an entry adopted
+/// from another machine carries a timestamp older than the projection that
+/// wrote it. The clock decides only who *wins* a conflict, never whether one
+/// happened.
+///
+/// Archived rows are included on purpose: a file that reappears (a branch switch
+/// back, a restore) must revive its entry rather than be re-imported as a
+/// duplicate or sit on disk shadowing a dead row.
+///
+/// Reads here must not be tracked — reconciliation is not a use of the memory.
+pub fn list_projection_state(conn: &Connection) -> Result<Vec<ProjectionRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, projected_at FROM memory_entries WHERE status = 'active' ORDER BY id",
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at, projected_at, projected_hash
+         FROM memory_entries ORDER BY id",
     )?;
     let rows = stmt
         .query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?))
+            Ok(ProjectionRow {
+                entry: row_to_entry(r)?,
+                projected_at: r.get(17)?,
+                projected_hash: r.get(18)?,
+            })
         })?
         .collect::<std::result::Result<_, _>>()?;
     Ok(rows)
 }
 
-/// Record that an entry's markdown projection was written at `ts`.
-pub fn set_projected_at(conn: &Connection, id: &str, ts: i64) -> Result<()> {
+/// Record that an entry's markdown projection was written at `ts` with content
+/// hashing to `hash`. Both move together — a timestamp without the bytes it
+/// describes cannot answer "did the file change since?".
+pub fn set_projection(conn: &Connection, id: &str, ts: i64, hash: &str) -> Result<()> {
     conn.execute(
-        "UPDATE memory_entries SET projected_at = ?1 WHERE id = ?2",
-        params![ts, id],
+        "UPDATE memory_entries SET projected_at = ?1, projected_hash = ?2 WHERE id = ?3",
+        params![ts, hash, id],
     )?;
     Ok(())
 }
 
-/// Set an entry's lifecycle status (e.g. archive it).
-pub fn set_status(conn: &Connection, id: &str, status: EntryStatus) -> Result<()> {
-    let now = Utc::now().timestamp();
+/// Set an entry's lifecycle status, stamping `updated_at` explicitly.
+///
+/// Archiving is a durable decision and takes `now`; reviving an entry whose file
+/// came back is not a content change and passes the entry's existing timestamp,
+/// so the returning file does not immediately look stale against the DB.
+pub fn set_status_at(
+    conn: &Connection,
+    id: &str,
+    status: EntryStatus,
+    updated_at: i64,
+) -> Result<()> {
     conn.execute(
         "UPDATE memory_entries SET status = ?1, updated_at = ?2 WHERE id = ?3",
-        params![status.to_string(), now, id],
+        params![status.to_string(), updated_at, id],
     )?;
     Ok(())
+}
+
+/// Set an entry's lifecycle status (e.g. archive it), stamped now.
+pub fn set_status(conn: &Connection, id: &str, status: EntryStatus) -> Result<()> {
+    set_status_at(conn, id, status, Utc::now().timestamp())
 }
 
 /// Count entries missing a stored embedding (pending backfill). Surfaced in
