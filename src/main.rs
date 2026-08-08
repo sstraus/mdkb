@@ -264,7 +264,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
         }
         Command::Get { id, lines } => {
             use mdkb::cli::handlers::GetResult;
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_read_only(&cwd)?;
 
             // Detect glob pattern (contains * or ?)
             if id.contains('*') || id.contains('?') {
@@ -313,7 +313,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             pattern,
             collection,
         } => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_read_only(&cwd)?;
             let results = handle_mget(&ctx, &pattern, collection.as_deref())?;
             format_mget_results(&results, cli.format);
         }
@@ -860,12 +860,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Command::History { path } => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_read_only(&cwd)?;
             let history = handle_history(&ctx, &path)?;
             format_evolution_history(&history, cli.format);
         }
         Command::Current { path } => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_read_only(&cwd)?;
             if let Some(doc) = handle_current(&ctx, &path)? {
                 format_current_document(&doc, cli.format);
             } else {
@@ -873,12 +873,12 @@ async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Command::SupersededBy { path } => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_read_only(&cwd)?;
             let evolutions = handle_superseded_by(&ctx, &path)?;
             format_superseded_by(&evolutions, cli.format);
         }
         Command::Graph(cmd) => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_read_only(&cwd)?;
             match cmd {
                 GraphCommand::Links { entity, relation } => {
                     let edges = handle_graph_links(&ctx, &entity, relation.as_deref())?;

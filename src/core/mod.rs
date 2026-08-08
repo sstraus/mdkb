@@ -230,6 +230,83 @@ impl Context {
         })
     }
 
+    /// Open the store for READING ONLY: no migration, no schema init, no locks.
+    ///
+    /// [`Context::open`] is itself a write. It runs migrations, creates the FTS
+    /// and vector virtual tables and initializes the stats schema — on every
+    /// open, including the ones that only want to answer `mdkb search`. So every
+    /// one-shot read was another writer process against the file the long-lived
+    /// daemon is also writing, which is one of the two surviving hypotheses for
+    /// the recurring corruption (story 018-56b2).
+    ///
+    /// Three deliberate differences from `open`:
+    ///
+    /// * `SQLITE_OPEN_READ_ONLY` — the guarantee is the database's, not a
+    ///   promise from code that might forget it;
+    /// * `query_only` and no `journal_mode` pragma, so the open cannot create a
+    ///   `-wal`/`-shm` pair on a store that had none. Creating those files is a
+    ///   write, and "a read that writes two files" is the bug, not a detail;
+    /// * a schema version MISMATCH IN EITHER DIRECTION is an error naming both
+    ///   versions and the remedy. Migrating here would make this path a writer
+    ///   again — the very thing it exists to remove — so it refuses and says
+    ///   which command will do it.
+    ///
+    /// No autoheal probe and no live lock either: quarantining is a write, and a
+    /// reader has no business renaming files underneath the daemon.
+    pub fn open_read_only(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        let mdkb_dir = root.join(".mdkb");
+        if !mdkb_dir.exists() {
+            return Err(ErrorKind::DatabaseNotFound {
+                path: mdkb_dir.join("index.sqlite"),
+            }
+            .into());
+        }
+        let mdkb_dir = mdkb_dir.canonicalize().map_err(|e| {
+            Error::other(format!("cannot canonicalize {}: {e}", mdkb_dir.display()))
+        })?;
+        let config_path = mdkb_dir.join("config.toml");
+        let db_path = mdkb_dir.join("index.sqlite");
+
+        // sqlite-vec must still be registered: a read-only connection can query
+        // the vector tables, it just cannot create them.
+        vectors::init_sqlite_vec();
+
+        let conn = Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000; PRAGMA query_only = ON;")?;
+
+        let found: i32 = conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .map_err(|e| {
+                Error::other(format!(
+                    "cannot read the schema version of {}: {e}",
+                    db_path.display()
+                ))
+            })?;
+        if found != schema::SCHEMA_VERSION {
+            return Err(Error::other(format!(
+                "store schema is v{found}, this mdkb binary expects v{}. A read-only \
+                 command will not migrate — that would make every read a writer. Run \
+                 `mdkb update` (or any write command) with a matching binary to migrate.",
+                schema::SCHEMA_VERSION
+            )));
+        }
+
+        Ok(Self {
+            conn,
+            config_path,
+            db_path,
+            rebuilt_from_corruption: false,
+            corrupt_in_use: false,
+            _live_guard: None,
+        })
+    }
+
     /// Initialize a new mdkb directory.
     pub fn init(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
