@@ -1,6 +1,6 @@
 //! Database schema management and migrations.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use rusqlite::Connection;
 
 /// Current schema version.
@@ -379,6 +379,24 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         Some(v) if v < SCHEMA_VERSION => {
             // Run migrations
             migrate_schema(conn, v)?;
+        }
+        // A store written by a NEWER binary. Refusing is the whole point: there
+        // is nothing to migrate forward, so the old code would simply carry on
+        // reading and writing tables whose shape it does not know — and
+        // `SCHEMA_SQL` above has already re-run, leaving anything the newer
+        // version redefined as whichever definition this binary carries.
+        //
+        // In practice this is a long-lived daemon meeting a store that a
+        // freshly-built CLI migrated underneath it. Version skew is a second
+        // writer with a different mental model of the schema, and the damage is
+        // silent. Naming both versions is what makes it diagnosable.
+        Some(v) if v > SCHEMA_VERSION => {
+            return Err(Error::other(format!(
+                "store schema is v{v}, but this mdkb binary understands v{SCHEMA_VERSION}. \
+                 Refusing to open: a newer store served by an older binary corrupts it \
+                 silently. Upgrade mdkb, and restart any running daemon (`mdkb daemon \
+                 restart`) so it is not left on the old build."
+            )));
         }
         _ => {
             // Up to date

@@ -3018,9 +3018,46 @@ async fn run_daemon() -> Result<()> {
         ipc_server::serve(&ipc_base, ipc_shutdown, ipc_registry, ipc_dctx).await
     });
 
-    // Wait for SIGINT or SIGTERM, whichever arrives first.
-    wait_for_shutdown_signal().await?;
-    tracing::info!("mdkb daemon received shutdown signal");
+    // Retire when the executable this process was launched from is replaced.
+    //
+    // The daemon outlives its own binary: measured on one machine, a daemon up
+    // for two days while `target/release/mdkb` was rebuilt underneath it, with
+    // two schema versions landing in between. Every one-shot CLI call then ran
+    // newer code against the same store. Standing down is enough — the next call
+    // spawns a daemon from the new binary — and it must be a graceful shutdown,
+    // not an exit, so in-flight connections drain and the singleton lock is
+    // released for the successor.
+    let exe_watch = mdkb::daemon::ExeIdentity::of_current();
+    let exe_shutdown = shutdown.clone();
+    if let Some(launched_as) = exe_watch {
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(std::time::Duration::from_secs(30));
+            ticks.tick().await; // fires immediately; skip it
+            loop {
+                ticks.tick().await;
+                if launched_as.changed() {
+                    tracing::warn!(
+                        exe = %launched_as.path().display(),
+                        "the executable this daemon was launched from has been replaced — \
+                         standing down so the next call spawns a matching build"
+                    );
+                    exe_shutdown.cancel();
+                    return;
+                }
+            }
+        });
+    }
+
+    // Wait for SIGINT or SIGTERM, or for the self-retirement above.
+    tokio::select! {
+        r = wait_for_shutdown_signal() => {
+            r?;
+            tracing::info!("mdkb daemon received shutdown signal");
+        }
+        () = shutdown.cancelled() => {
+            tracing::info!("mdkb daemon retiring: its executable changed on disk");
+        }
+    }
 
     shutdown.cancel();
     match ipc_task.await {
