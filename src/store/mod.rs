@@ -7,6 +7,7 @@ pub mod evolution;
 pub mod graph;
 pub mod heal;
 pub mod hybrid;
+pub mod identity;
 pub mod maintenance;
 pub mod memory;
 pub mod memory_file;
