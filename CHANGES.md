@@ -2,8 +2,62 @@
 
 ## Unreleased
 
+### Added
+
+- **`mdkb memory import <file>.md` restores a single entry, timeline intact.**
+  `mdkb memory add` stamps `created_at`/`updated_at` with now() and has no flag
+  to preserve them, so restoring a corpus of entry files flattened months of
+  history into one day and destroyed recency ranking. The only alternative was a
+  raw `sqlite3 INSERT` against `index.sqlite` — which skips the connection
+  pragmas the store depends on (`busy_timeout`, WAL, `synchronous = NORMAL`) and
+  the `.mutation.lock` protocol. Doing exactly that against a live store
+  corrupted `memory_fts_data` (`Rowid out of order`, `2nd reference to page
+  12862`). The restore runs on the ordinary `Context` connection, so the
+  pragmas, the lock and the FTS/embedding triggers all apply. A directory or a
+  `.json` file keeps the existing bulk semantics. An existing id is an explicit
+  conflict, never a silent overwrite; a frontmatter id disagreeing with the
+  filename is refused with both spellings named. Restore preserves the file's
+  counters, where a git sync deliberately resets them — the same file means
+  different things depending on whose history it records.
+
 ### Fixed
 
+- **The daemon hook fallback was decorative and is now real.** The generated
+  wiring was `if ! mdkb hook <event>; then MDKB_NO_DAEMON=1 mdkb hook <event>;
+  fi`, live in both global settings files. It could never fire: the hook client
+  returns success on every failure by contract, because the host hook must exit
+  0, so the `if !` branch was unreachable and a dead daemon meant hooks silently
+  did nothing while the settings file advertised a rail that did not exist. The
+  fallback now runs **in-process** when the daemon cannot answer, and the shell
+  conditional is gone from the generated wiring, so the settings file describes
+  what actually happens. The exit-0 contract is unchanged. New `MDKB_NO_SPAWN=1`
+  reports the daemon unreachable immediately instead of waiting out the spawn
+  backoff — for sandboxes and CI runners that must not leave a background
+  process behind. Distinct from `MDKB_NO_DAEMON`, which bypasses the daemon
+  entirely.
+- **A binary refuses to open a store newer than it understands, and a daemon
+  retires when its executable is replaced.** Measured on one machine: a daemon up
+  for two days while `target/release/mdkb` was rebuilt underneath it, with two
+  schema versions landing in between — so one-shot CLI writers and the daemon
+  were different builds writing one file. Opening a store recorded newer than the
+  running binary used to fall through and carry on: no migration runs, but the
+  binary then reads and writes tables whose shape it does not know, and
+  `SCHEMA_SQL` has already re-run by that point, leaving anything the newer
+  version redefined as whichever definition the older binary carries. Both
+  versions are now named in the refusal. Separately, the daemon polls the
+  executable it was launched from and stands down gracefully when it changes, so
+  the next call spawns a matching build.
+- **The v11 → v12 prior purge no longer leaves its markdown behind (schema
+  v20).** The migration deletes legacy behavioural priors and the delete cascades
+  through triggers, but nothing touched `.mdkb/memory/entries/<id>.md` — 113
+  files on one store, all with `status: active` frontmatter and no row. Since
+  bidirectional sync that is not litter but a correctness bug: a file with no row
+  is imported, so the purge would undo itself on the next `mdkb update`. Disposal
+  is now one shared rule (`mdkb memory rm` already had it; the migration did not,
+  and that duplication *was* the bug). Two halves, because they reach different
+  stores: the v12 purge disposes at source, and a new v20 sweep archives every
+  orphaned legacy prior projection — the heal for files already on disk. Files
+  are archived, never deleted.
 - **A quarantine no longer wipes collection registrations — this was the cause
   of the "collection vanished" reports.** Autoheal rebuilds a corrupt index empty
   and salvaged `memory_entries` and `memory_edges` out of the old file, and
