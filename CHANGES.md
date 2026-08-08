@@ -4,6 +4,44 @@
 
 ### Added
 
+- **A read-only store path, so a read stops being a write.** Opening the store
+  ran migrations, created the FTS and vector virtual tables and initialized the
+  stats schema — on *every* open, including the ones that only wanted to answer a
+  query. Every one-shot CLI read was therefore another writer process against the
+  file the long-lived daemon is also writing. `mdkb get`, `mget`, `graph`,
+  `history`, `current` and `superseded-by` now open with `SQLITE_OPEN_READ_ONLY`
+  and skip initialization entirely: they cannot even create a `-wal`/`-shm` pair
+  on a store that had none, because creating those files is itself a write. A
+  schema mismatch in either direction is an error naming both versions and the
+  remedy, rather than a migration — migrating on a read would put the writer
+  straight back. `mdkb stats` and `mdkb metrics` deliberately keep a write
+  connection: they record telemetry, so they are writers by design until that
+  telemetry routes through the daemon.
+- **`mdkb surface` maps each MCP tool to its CLI equivalent.** The two surfaces
+  expose overlapping capability under different names — the MCP tool is
+  `memory_write`, the command is `mdkb memory add`, and `mdkb memory-write` does
+  not exist at all — and nothing said so. The inventory is checked rather than
+  trusted: the tool names come from the MCP server's own generated router and the
+  command paths from clap's own parser, so a tool added on one side and forgotten
+  on the other fails the test suite, and a tool with no CLI equivalent must carry
+  a reason. The map also ships in the MCP server instructions, so an agent
+  holding a tool name can find the command without leaving MCP.
+
+### Changed
+
+- **The shared application layer moved out of `cli::handlers` into `core`.** The
+  MCP layer and the daemon reached into the command-line adapter for the work
+  they do, which made the CLI the de-facto core of the program and inverted the
+  dependency direction of every layer above it. `cli::handlers` is now 57 lines
+  of re-exports; the logic lives in `core::indexing`, `core::memory`,
+  `core::memory_sync`, `core::search`, `core::sessions`, `core::graph`,
+  `core::code` and `core::ops`, each with a header stating why it cannot live
+  behind a command-line entry point. A test fails if anything under `src/mcp` or
+  `src/daemon` names `cli::handlers` again. No behaviour changed.
+
+
+### Added
+
 - **`mdkb memory import <file>.md` restores a single entry, timeline intact.**
   `mdkb memory add` stamps `created_at`/`updated_at` with now() and has no flag
   to preserve them, so restoring a corpus of entry files flattened months of
