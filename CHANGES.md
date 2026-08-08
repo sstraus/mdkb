@@ -1,5 +1,111 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **Reading a memory entry no longer rewrites the full-text index (schema v18).**
+  `get_entry` bumps `access_count` and `last_accessed` on every read, and the
+  `memory_au` trigger was an unscoped `AFTER UPDATE` — so each read deleted and
+  reinserted the entry's FTS5 segments, making *reads* the store's single
+  heaviest writer against the blob-heavy `memory_fts_data` shadow table, one of
+  the three tables recurring field corruption keeps damaging. The trigger is now
+  scoped to the columns the index actually stores (`id`, `title`, `content`,
+  `tags`). **This changes behaviour on every existing store**: the v17 → v18
+  migration drops and recreates `memory_au` in place. No reindex is needed and
+  no index content changes — only the write amplification disappears.
+- **Quarantine reports now record the damage, not just the loss.** Every previous
+  post-mortem stalled at "the index is malformed" with no record of *how*. A
+  `.report.json` sidecar now also carries the `PRAGMA quick_check` rows, the
+  tables owning the damaged b-trees (resolved through `sqlite_master.rootpage`),
+  the database and WAL sizes at quarantine time, and the pid and version of the
+  process that *detected* the corruption — which is explicitly not a claim about
+  what caused it. All of it is read through `immutable=1`, best-effort: a file
+  too damaged to answer a question contributes nothing rather than failing the
+  quarantine. Nothing is collected on a healthy store.
+- **A store is refused under a second spelling of its own path.** Every
+  cross-process guarantee is keyed on the database path as a *string* — the
+  `.mutation.lock` and `.live.lock` sidecars, and the `-wal`/`-shm` files SQLite
+  derives itself — so two spellings that reach one inode give two lock domains
+  and two WAL indexes over a single database: writers that cannot see each other,
+  allocating the same pages twice, which is the `2nd reference to page N` damage
+  seen in the field. `Context::open` already canonicalized, ruling out case
+  folding on APFS, symlinks and `..`; it cannot rule out aliases canonicalization
+  does not resolve, such as macOS firmlinks. The first process to open a store now
+  records the spelling it used, and a later process arriving with a different
+  spelling for the same inode is refused with both paths named. A store that was
+  moved or copied is adopted, not refused.
+
+### Added
+
+- **Memory entries are git-tracked markdown, reconciled in both directions
+  (schema v19 `projected_hash`).** `.mdkb/` was excluded from git wholesale, so a
+  project's memory died with the machine: it could not be shared, reviewed, or
+  restored. The markdown projection existed but ran one way — the sync loop
+  iterated DB rows, so a file arriving from `git pull` was structurally invisible
+  and an edited file was ignored outright.
+  - **`mdkb init` writes `.mdkb/.gitignore`**, an allow-list (`*` then
+    re-includes) rather than an enumeration, so a sidecar added later cannot leak
+    into git. Only `.gitignore` and `memory/entries/*.md` are tracked; the sqlite
+    indexes and their `-wal`/`-shm`/lock/integrity sidecars, `vectors.bin`, hook
+    telemetry, backups, quarantined corrupt databases, the regenerated warm-up
+    index and the per-machine archive stay out.
+  - **Frontmatter is split into durable and local.** The file carries `id`,
+    `title`, `entry_type`, `source_type`, `status`, `tags`, `created_at`,
+    `updated_at`, `source_path`, `superseded_by`, `expires_at`, `due_at`.
+    `access_count`, `last_accessed`, `confirmations` and `last_confirmed_at` stay
+    in the DB: they move on every read, so projecting them meant a diff per
+    lookup and a merge conflict per pull. Consequence worth knowing —
+    **confidence is now per-clone**, since all of its inputs are local.
+  - **File → DB reconciliation.** A file with no DB row is imported; a file whose
+    bytes changed updates its entry. Change detection compares content hashes on
+    both sides, never mtime: git stamps every file it writes during a checkout
+    with the checkout time, so mtime would report the whole directory as
+    hand-edited after any pull.
+  - **Conflict rule.** When both sides moved, the newer `updated_at` wins (ties to
+    the file, which just arrived from a merge) and the loser is preserved as a
+    full markdown snapshot in `memory_revisions` — deliberately not through
+    `save_revision`, which stores nothing at all for `auto_extracted` entries and
+    records only a content diff, losing a title or tag change entirely.
+  - **The bulk-loss circuit breaker now asks git.** A colleague's committed
+    deletion of twenty entries and a broken checkout are identical on the
+    filesystem. A deletion recorded in reachable history is intent and archives
+    however large; a file HEAD still lists, or one history never saw deleted,
+    keeps the cap of 10. Outside a git repo the behaviour is unchanged. A file
+    that reappears revives its archived entry.
+  - **Unsafe files are never absorbed.** Unresolved merge markers, unparseable
+    frontmatter, or an `id` disagreeing with the filename leave the entry
+    untouched and are reported, not guessed at.
+  - **`mdkb memory sync`** runs the reconciliation without reindexing documents;
+    `mdkb update` still runs it and now reports imports, adoptions, conflicts,
+    revivals and quarantines.
+  - **The daemon watcher reconciles automatically.** A change under
+    `.mdkb/memory/entries/` is a third watcher route, so a `git pull` is picked up
+    without anyone remembering to run `mdkb update`. The watcher event is only a
+    *trigger*: the debounced flush re-reads the whole directory, because the
+    bulk-loss breaker and the git deletion discriminator are set-level decisions
+    that twelve per-file events would defeat. Reconciliation writing into the
+    directory it watches costs exactly one extra no-op pass, since the recorded
+    hashes then already match.
+
+### Fixed
+
+- **The daemon watched nothing when code indexing was disabled.**
+  `watcher.watch(&root)` is the only call that registers the repo root and it sat
+  behind `if code_enabled`, so with `[code] enabled = false` no code, no
+  documents — and none of the new memory routing — were ever seen, while every
+  log line still reported a running watcher. Registering the root is what makes
+  routing possible and no longer depends on any single sink; whether a change is
+  acted on remains a per-sink decision.
+  - **A parent `.gitignore` excluding `.mdkb/` is detected and reported.** Git
+    never descends into an excluded directory, so such a rule makes
+    `.mdkb/.gitignore` inert silently. mdkb names the offending rule and the fix;
+    it never rewrites a `.gitignore` it does not own.
+  - **Migration.** Existing projections have telemetry frontmatter and no recorded
+    hash. The first run re-projects them once — a single mechanical commit
+    stripping the local fields — and explicitly does not read the unknown bytes as
+    a conflict. Nothing is lost: those values live in `memory_entries`.
+
 ## 3.7.12 (2026-08-04)
 
 ### Fixed
