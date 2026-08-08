@@ -161,6 +161,50 @@ fn smoke_update_force() {
     assert_ok(&out, "update --force");
 }
 
+/// One run of `update`, one machine-readable document.
+///
+/// `update` has three phases and each used to render itself, so `--format json`
+/// emitted a JSON object, the literal line `Code index:`, another JSON object
+/// and then an English sentence about sessions. A human reads that fine; the
+/// parser the caller asked for by typing `--format json` cannot read it at all.
+/// The fixture seeds both a markdown doc and a source file precisely so more
+/// than one phase reports and the concatenation would reappear.
+#[test]
+fn smoke_update_machine_formats_emit_a_single_document() {
+    let repo = Repo::new();
+
+    let out = run(&["--format", "json", "update"], &repo.root);
+    assert_ok(&out, "update --format json");
+    let json = stdout(&out);
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap_or_else(|e| {
+        panic!("`update --format json` must be one JSON document ({e}):\n{json}")
+    });
+    assert!(
+        parsed.get("docs").is_some(),
+        "the document phase must be reported:\n{json}"
+    );
+    assert!(
+        parsed.get("code").is_some(),
+        "the fixture has a source file, so the code phase must be reported \
+         inside the same document:\n{json}"
+    );
+
+    let out = run(&["--format", "csv", "update", "--force"], &repo.root);
+    assert_ok(&out, "update --format csv");
+    let csv = stdout(&out);
+    let rows: Vec<&str> = csv.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "csv must be one header and one row, not a table per phase:\n{csv}"
+    );
+    assert_eq!(
+        rows[0].matches(',').count(),
+        rows[1].matches(',').count(),
+        "the row must have as many fields as the header:\n{csv}"
+    );
+}
+
 #[test]
 fn smoke_embed() {
     let repo = Repo::new();

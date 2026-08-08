@@ -4,6 +4,27 @@
 
 ### Fixed
 
+- **Every CLI store mutation now executes in the daemon.** A single internal
+  typed `cli.mutate` protocol covers the complete mutating command surface and
+  returns structured results for CLI-side formatting. `init` remains the local
+  bootstrap operation; `MDKB_NO_DAEMON=1` remains the explicit direct-write
+  escape hatch. The old partial `routing_gap()` and its misleading proof were
+  removed.
+
+- **Commands classified as reads are now actually read-only.** Search, stats,
+  collection and memory reads, metrics, experiment inspection, and code-index
+  queries no longer initialize schemas, update access telemetry, run repairs,
+  create a missing index, or open SQLite read-write. Regression coverage checks
+  that neither `index.sqlite` nor `code.sqlite` gains WAL/SHM sidecars. Direct
+  CLI reads therefore no longer increment memory `access_count` or
+  `last_accessed`; those per-clone signals now move only on daemon-owned paths.
+
+- **The repository's own memory projection is no longer shadowed by its root
+  `.gitignore`.** `.mdkb/memory/entries/*.md` can now be committed as designed,
+  while databases, locks, WAL files, caches, and archives remain ignored. The
+  README now documents the bidirectional `memory sync` workflow introduced by
+  schema v19 instead of the superseded external export directory.
+
 - **A routed mutation no longer becomes the second writer it was meant to
   remove.** The routing gave the daemon 30 seconds and then ran the mutation
   in-process regardless — so a `mdkb update` the daemon was still working on had

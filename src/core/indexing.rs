@@ -209,8 +209,8 @@ fn housekeeping(root: &Path) {
     if let Ok(raw) = std::fs::read_to_string(&config_path) {
         let dead = crate::config::detect_dead_model_keys(&raw);
         if !dead.is_empty() {
-            eprintln!(
-                "warning: [models] {} ignored: the embedder is fixed (all-MiniLM-L6-v2)",
+            tracing::warn!(
+                "[models] {} ignored: the embedder is fixed (all-MiniLM-L6-v2)",
                 dead.join(", ")
             );
         }

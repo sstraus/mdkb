@@ -8,6 +8,18 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 
+fn open_code_read_only(root: &Path) -> Result<crate::code::indexing::IndexFacade> {
+    let index_path = root.join(".mdkb/code.sqlite");
+    if !index_path.exists() {
+        return Err(Error::other(format!(
+            "Code index not found at {}; run `mdkb code index` first",
+            index_path.display()
+        )));
+    }
+    crate::code::indexing::IndexFacade::open_read_only(&index_path)
+        .map_err(|e| Error::other(format!("Failed to open code index read-only: {e}")))
+}
+
 /// Handle `mdkb code init` - initialize code index directory (idempotent).
 pub fn handle_code_init(root: &Path) -> Result<()> {
     let index_path = root.join(".mdkb/code.sqlite");
@@ -90,33 +102,42 @@ pub fn handle_code_reindex(
     let mut facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
         .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
 
+    let result = reindex_paths(&mut facade, root, paths);
+    crate::llm::release_cached_service();
+    result.map_err(|e| Error::other(e.to_string()))
+}
+
+/// Reindex through an already-open facade owned by the daemon.
+pub fn reindex_paths(
+    facade: &mut crate::code::indexing::IndexFacade,
+    root: &Path,
+    paths: &[String],
+) -> anyhow::Result<crate::code::indexing::types::IndexStats> {
     let target = if paths.is_empty() {
         root.to_path_buf()
     } else {
         let root_canonical = root
             .canonicalize()
-            .map_err(|e| Error::other(format!("Cannot resolve root: {e}")))?;
+            .map_err(|e| anyhow::anyhow!("Cannot resolve root: {e}"))?;
         // Validate all paths, use first (reindex clears DB so multiple passes don't combine)
         for p in paths {
             let candidate = root.join(p);
             let canonical = candidate
                 .canonicalize()
-                .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", p)))?;
+                .map_err(|e| anyhow::anyhow!("Cannot resolve path '{p}': {e}"))?;
             if !canonical.starts_with(&root_canonical) {
-                return Err(Error::other(format!("Path '{}' escapes project root", p)));
+                anyhow::bail!("Path '{p}' escapes project root");
             }
         }
         // Use first path as reindex target (reindex is a full rebuild)
         root.join(&paths[0])
             .canonicalize()
-            .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", paths[0])))?
+            .map_err(|e| anyhow::anyhow!("Cannot resolve path '{}': {e}", paths[0]))?
     };
 
-    let result = facade
+    facade
         .reindex(&target)
-        .map_err(|e| Error::other(format!("Reindexing failed: {}", e)));
-    crate::llm::release_cached_service();
-    result
+        .map_err(|e| anyhow::anyhow!("Reindexing failed: {e}"))
 }
 /// Handle `mdkb code search` - fuzzy symbol search.
 pub fn handle_code_search(
@@ -125,9 +146,7 @@ pub fn handle_code_search(
     limit: usize,
     kind_filter: Option<&str>,
 ) -> Result<Vec<crate::code::symbol::Symbol>> {
-    let index_path = root.join(".mdkb/code.sqlite");
-    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
-        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+    let facade = open_code_read_only(root)?;
 
     let mut results = facade.search_symbols(query, limit * 2);
 
@@ -148,9 +167,7 @@ pub fn handle_code_find(
     kind_filter: Option<&str>,
     file_filter: Option<&str>,
 ) -> Result<Vec<crate::code::symbol::Symbol>> {
-    let index_path = root.join(".mdkb/code.sqlite");
-    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
-        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+    let facade = open_code_read_only(root)?;
 
     let mut results = facade.find_symbols_by_name(name);
 
@@ -175,9 +192,7 @@ pub fn handle_code_calls(
     crate::code::symbol::Symbol,
     Vec<crate::code::symbol::Symbol>,
 )> {
-    let index_path = root.join(".mdkb/code.sqlite");
-    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
-        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+    let facade = open_code_read_only(root)?;
 
     let symbol = facade
         .get_symbol_by_name(name)
@@ -194,9 +209,7 @@ pub fn handle_code_callers(
     crate::code::symbol::Symbol,
     Vec<crate::code::symbol::Symbol>,
 )> {
-    let index_path = root.join(".mdkb/code.sqlite");
-    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
-        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+    let facade = open_code_read_only(root)?;
 
     let symbol = facade
         .get_symbol_by_name(name)
@@ -214,9 +227,7 @@ pub fn handle_code_impact(
     crate::code::symbol::Symbol,
     Vec<crate::code::symbol::Symbol>,
 )> {
-    let index_path = root.join(".mdkb/code.sqlite");
-    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
-        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+    let facade = open_code_read_only(root)?;
 
     let symbol = facade
         .get_symbol_by_name(name)
@@ -232,9 +243,7 @@ pub fn handle_code_impact(
 }
 /// Handle `mdkb code info` - show index statistics.
 pub fn handle_code_info(root: &Path) -> Result<CodeInfoResult> {
-    let index_path = root.join(".mdkb/code.sqlite");
-    let facade = crate::code::indexing::IndexFacade::open_or_create(&index_path)
-        .map_err(|e| Error::other(format!("Failed to open code index: {}", e)))?;
+    let facade = open_code_read_only(root)?;
 
     Ok(CodeInfoResult {
         symbols: facade.symbol_count(),

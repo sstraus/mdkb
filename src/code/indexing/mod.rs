@@ -60,6 +60,19 @@ impl IndexFacade {
         })
     }
 
+    /// Open an existing index with a SQLite-enforced read-only connection.
+    ///
+    /// Unlike [`Self::open_or_create`], this never initializes, repairs,
+    /// quarantines, migrates, or creates the database.
+    pub fn open_read_only(db_path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let db = CodeDb::open_read_only(db_path)?;
+        Ok(Self {
+            db,
+            config: PipelineConfig::default(),
+            semantic: OnceLock::new(),
+        })
+    }
+
     /// Override the default pipeline configuration.
     #[must_use]
     pub fn with_config(mut self, config: PipelineConfig) -> Self {
@@ -795,6 +808,14 @@ mod tests {
             facade.semantic.get().is_none(),
             "semantic OnceLock should be uninitialized on open_or_create"
         );
+    }
+
+    #[test]
+    fn test_facade_read_only_requires_an_existing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.sqlite");
+        assert!(IndexFacade::open_read_only(&path).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

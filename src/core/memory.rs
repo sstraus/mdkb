@@ -138,7 +138,7 @@ pub fn handle_memory_add(
 }
 /// Handle `mdkb memory show` command.
 pub fn handle_memory_show(ctx: &Context, id: &str) -> Result<Option<MemoryEntry>> {
-    memory::get_entry(&ctx.conn, id)
+    memory::get_entry_without_tracking(&ctx.conn, id)
 }
 /// Handle `mdkb memory confirm <id> --outcome confirmed|refuted`.
 ///
@@ -191,7 +191,6 @@ pub fn handle_memory_link(
         memory::set_provenance(&ctx.conn, id, None, Some(agent))?;
     }
 
-    println!("Linked {id} --{relation}--> {target}");
     Ok(())
 }
 /// Handle `mdkb memory list` command.
@@ -749,7 +748,7 @@ pub fn handle_memory_condense(
     Ok(result)
 }
 /// Outcome of a `mdkb memory confirm` command.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ConfirmResult {
     pub id: String,
     pub outcome: String,
@@ -765,7 +764,7 @@ pub struct ExportResult {
     pub errors: Vec<String>,
 }
 /// Result of a memory import operation.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ImportResult {
     pub imported: usize,
     pub skipped: usize,
@@ -819,7 +818,7 @@ fn default_import_entry_type() -> String {
 }
 /// Result of a condense operation.
 #[cfg(feature = "llm")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CondenseResult {
     /// Groups of related entries found.
     pub groups: Vec<CondenseGroup>,
@@ -830,7 +829,7 @@ pub struct CondenseResult {
 }
 /// A group of related entries that can be condensed.
 #[cfg(feature = "llm")]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CondenseGroup {
     /// IDs of entries in this group.
     pub entry_ids: Vec<String>,

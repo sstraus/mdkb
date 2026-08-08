@@ -19,8 +19,8 @@ use super::schema;
 
 /// SQLite-backed code intelligence index.
 ///
-/// Wraps a `rusqlite::Connection` with the code index schema initialized.
-/// Create with [`CodeDb::create`] or open an existing one with [`CodeDb::open`].
+/// Write-capable constructors initialize the schema; [`CodeDb::open_read_only`]
+/// trusts the existing schema and performs no mutation or repair.
 pub struct CodeDb {
     conn: Connection,
     path: PathBuf,
@@ -73,6 +73,25 @@ impl CodeDb {
             conn,
             path,
             _live_guard: Some(live_guard),
+        })
+    }
+
+    /// Open an existing code index for queries only.
+    ///
+    /// This deliberately skips the mutation/live locks, integrity quarantine,
+    /// schema initialization, migrations, and repairs performed by [`Self::open`].
+    /// `SQLITE_OPEN_READ_ONLY` is the enforcement boundary: a query path cannot
+    /// accidentally become a second writer if code inside it changes later.
+    /// SQLite also refuses a missing path under these flags, so a read never
+    /// creates an empty index and hides the fact that indexing has not run.
+    pub fn open_read_only(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let conn = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self {
+            conn,
+            path,
+            _live_guard: None,
         })
     }
 
@@ -833,6 +852,50 @@ mod tests {
         // Re-open
         let db = CodeDb::open(&path).unwrap();
         assert_eq!(db.path(), path);
+    }
+
+    #[test]
+    fn read_only_open_cannot_write_or_create_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.sqlite");
+        CodeDb::create(&path).unwrap();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
+        }
+        let wal = append_suffix(&path, "-wal");
+        let shm = append_suffix(&path, "-shm");
+        assert!(!wal.exists() && !shm.exists());
+
+        let db = CodeDb::open_read_only(&path).unwrap();
+        assert!(db.conn().execute("DELETE FROM code_files", []).is_err());
+        drop(db);
+        assert!(!wal.exists() && !shm.exists());
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_a_missing_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.sqlite");
+        assert!(CodeDb::open_read_only(&path).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn read_only_open_does_not_quarantine_or_repair_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("code.sqlite");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+
+        let db = CodeDb::open_read_only(&path).unwrap();
+        assert!(db.file_count().is_err());
+        drop(db);
+
+        assert!(path.exists(), "a reader must not move the active database");
+        assert!(
+            !dir.path().join("quarantine").exists(),
+            "a reader must not create quarantine state"
+        );
     }
 
     #[test]

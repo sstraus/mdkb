@@ -6,9 +6,12 @@ stories/
 # mdkb:index
 plans/
 patches/
-.mdkb/
+.mdkb/*
+!.mdkb/.gitignore
+!.mdkb/memory/
 .mcp.json
 .fastembed_cache/
 # mdkb:index
 reviews/
 history/
+.wiz/

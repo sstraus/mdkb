@@ -33,7 +33,6 @@ fn parse(args: &[&str]) -> Command {
 #[test]
 fn mutating_commands_are_classified_as_mutations() {
     let mutating: &[&[&str]] = &[
-        &["init"],
         &["update"],
         &["embed"],
         &["memory", "add", "x", "--title", "T", "--content", "C"],
@@ -49,6 +48,21 @@ fn mutating_commands_are_classified_as_mutations() {
         &["evolve", "supersedes", "a", "b"],
         &["compact"],
         &["code", "index"],
+        &["code", "init"],
+        &[
+            "experiment",
+            "create",
+            "x",
+            "--config-a",
+            "{}",
+            "--config-b",
+            "{}",
+        ],
+        &["experiment", "end", "x"],
+        &["experiment", "cancel", "x"],
+        &["journal", "import", "journal.md"],
+        &["journal", "import-all"],
+        &["session", "index"],
     ];
     for args in mutating {
         assert_eq!(
@@ -74,6 +88,7 @@ fn read_commands_are_not_classified_as_mutations() {
         &["code", "find", "sym"],
         &["surface"],
         &["cheatsheet"],
+        &["init"],
     ];
     for args in reads {
         assert_ne!(
@@ -181,10 +196,7 @@ fn a_mutation_falls_back_in_process_when_the_daemon_is_unreachable() {
     );
     drop(ctx);
 
-    // `memory add` is still in the routing gap, so the run above proves the
-    // command works without a daemon but never touches the fallback. `memory rm`
-    // does resolve to an RPC, so it is the one that has to come back Unstarted
-    // and finish the job in-process.
+    // A second routed mutation must take the same admission-refusal fallback.
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
         .args(["memory", "rm", "fallback"])
         .current_dir(&root)
@@ -205,6 +217,74 @@ fn a_mutation_falls_back_in_process_when_the_daemon_is_unreachable() {
             .is_none(),
         "the fallback reported success without performing the delete"
     );
+}
+
+/// A successfully routed mutation must not open the main store in the CLI
+/// process. A fake daemon returns the typed success without touching SQLite;
+/// any WAL/SHM sidecar therefore proves the CLI opened its own writer.
+#[test]
+fn a_routed_mutation_creates_no_local_sqlite_sidecars() {
+    use std::io::{Read, Write};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonicalize");
+    mdkb::cli::handlers::handle_init(&root).expect("init");
+    let db = root.join(".mdkb/index.sqlite");
+    assert!(!std::path::PathBuf::from(format!("{}-wal", db.display())).exists());
+    assert!(!std::path::PathBuf::from(format!("{}-shm", db.display())).exists());
+
+    let home = tempfile::tempdir().expect("home");
+    let daemon_home = home.path().join(".mdkb");
+    std::fs::create_dir_all(&daemon_home).expect("daemon home");
+    let listener = std::os::unix::net::UnixListener::bind(daemon_home.join("daemon-hook.sock"))
+        .expect("bind fake daemon socket");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut header = [0_u8; 4];
+            if stream.read_exact(&mut header).is_err() {
+                continue;
+            }
+            let mut body = vec![0_u8; u32::from_le_bytes(header) as usize];
+            if stream.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": { "result": "memory_added" }
+            });
+            let bytes = serde_json::to_vec(&response).unwrap();
+            stream
+                .write_all(&(bytes.len() as u32).to_le_bytes())
+                .unwrap();
+            stream.write_all(&bytes).unwrap();
+        }
+    });
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
+        .args([
+            "memory",
+            "add",
+            "remote",
+            "--title",
+            "Remote",
+            "--content",
+            "daemon-owned",
+        ])
+        .current_dir(&root)
+        .env("HOME", home.path())
+        .env("MDKB_NO_SPAWN", "1")
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!std::path::PathBuf::from(format!("{}-wal", db.display())).exists());
+    assert!(!std::path::PathBuf::from(format!("{}-shm", db.display())).exists());
 }
 
 /// A daemon that took the request but never answered must NOT be second-guessed.
@@ -300,22 +380,31 @@ fn a_mutation_is_not_retried_after_the_daemon_took_the_request() {
 /// The routing is wired, not merely classified.
 ///
 /// A classifier nothing calls is worse than none — it reads as a property the
-/// program has. This asserts the commands the daemon already exposes an RPC for
-/// actually resolve to one.
+/// program has. This asserts mutations actually resolve to the single typed
+/// internal request while reads do not.
 #[test]
-fn routed_mutations_resolve_to_a_daemon_rpc() {
-    use mdkb::core::routing::daemon_method;
+fn routed_mutations_resolve_to_the_typed_daemon_request() {
+    use mdkb::core::cli_mutation::CliMutation;
+    use mdkb::core::routing::mutation_request;
 
-    let (method, params) =
-        daemon_method(&parse(&["memory", "rm", "gone"])).expect("memory rm must route");
-    assert_eq!(method, "memory_delete");
-    assert_eq!(params["id"], "gone");
+    let cwd = std::env::current_dir().unwrap();
+    let mut command = parse(&["memory", "rm", "gone"]);
+    assert!(
+        matches!(mutation_request(&mut command, &cwd, &cwd).unwrap(), Some(CliMutation::MemoryRemove { id }) if id == "gone")
+    );
 
-    let (method, _) = daemon_method(&parse(&["update"])).expect("update must route");
-    assert_eq!(method, "update");
+    let mut command = parse(&["update"]);
+    assert!(matches!(
+        mutation_request(&mut command, &cwd, &cwd).unwrap(),
+        Some(CliMutation::Update { .. })
+    ));
 
-    // A read never resolves to a mutation RPC.
-    assert!(daemon_method(&parse(&["search", "q"])).is_none());
+    let mut command = parse(&["search", "q"]);
+    assert!(
+        mutation_request(&mut command, &cwd, &cwd)
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Routing must carry the command's arguments, not just its name.
@@ -327,47 +416,69 @@ fn routed_mutations_resolve_to_a_daemon_rpc() {
 /// tells on every invocation.
 #[test]
 fn routed_mutations_carry_their_arguments() {
-    use mdkb::core::routing::daemon_method;
-
-    let (_, params) = daemon_method(&parse(&["update", "--force"])).expect("update must route");
-    assert_eq!(
-        params["force"], true,
-        "--force must reach the daemon or it is silently ignored"
-    );
-
-    let (_, params) = daemon_method(&parse(&["update", "--files", "docs/a.md", "docs/b.md"]))
-        .expect("targeted update must route");
-    assert_eq!(
-        params["files"],
-        serde_json::json!(["docs/a.md", "docs/b.md"]),
-        "the file list must reach the daemon or a targeted update reindexes everything"
-    );
-    assert_eq!(params["force"], false);
-
-    // No arguments means no scoping — the whole tree, mtime-gated.
-    let (_, params) = daemon_method(&parse(&["update"])).expect("update must route");
-    assert_eq!(params["files"], serde_json::json!([]));
-    assert_eq!(params["force"], false);
+    use mdkb::core::cli_mutation::CliMutation;
+    let cwd = std::env::current_dir().unwrap();
+    let mut command = parse(&["update", "--force", "--files", "docs/a.md", "docs/b.md"]);
+    let request = mdkb::core::routing::mutation_request(&mut command, &cwd, &cwd)
+        .unwrap()
+        .unwrap();
+    match request {
+        CliMutation::Update { request } => {
+            assert!(request.force, "--force must reach the daemon");
+            assert_eq!(request.files, ["docs/a.md", "docs/b.md"]);
+        }
+        other => panic!("wrong request: {other:?}"),
+    }
 }
 
-/// The shortfall is enumerable rather than implied.
-///
-/// The daemon does not yet expose an RPC for every mutation, and a story
-/// claiming "the daemon is the sole writer" while half the commands still open
-/// their own connection is worse than one that says which half — the first reads
-/// as done and stops anyone looking.
 #[test]
-fn the_unrouted_mutations_are_named() {
-    let gap = mdkb::core::routing::routing_gap();
-    assert!(
-        !gap.is_empty(),
-        "if the gap is finally empty, delete routing_gap() and this test rather \
-         than leaving an assertion that can no longer fail"
-    );
-    for entry in &gap {
+fn every_classified_mutation_has_a_typed_request() {
+    let commands: &[&[&str]] = &[
+        &["update"],
+        &["embed"],
+        &["compact"],
+        &["collection", "add", "n", "p"],
+        &["collection", "remove", "n"],
+        &["collection", "rename", "a", "b"],
+        &["memory", "add", "x", "--title", "T", "--content", "C"],
+        &["memory", "confirm", "x", "--outcome", "confirmed"],
+        &["memory", "link", "x", "supports", "y"],
+        &["memory", "rm", "x"],
+        &["memory", "sync"],
+        &["memory", "import", "f.json"],
+        &["memory", "prune"],
+        &["evolve", "supersedes", "a", "b"],
+        &["evolve", "updates", "a", "b"],
+        &["evolve", "corrects", "a", "b"],
+        &["evolve", "retracts", "a", "b"],
+        &["evolve", "extends", "a", "b"],
+        &[
+            "experiment",
+            "create",
+            "x",
+            "--config-a",
+            "{}",
+            "--config-b",
+            "{}",
+        ],
+        &["experiment", "end", "x"],
+        &["experiment", "cancel", "x"],
+        &["journal", "import", "j.md"],
+        &["journal", "import-all"],
+        &["code", "init"],
+        &["code", "index"],
+        &["session", "index"],
+    ];
+    let cwd = std::env::current_dir().unwrap();
+    for args in commands {
+        let mut command = parse(args);
+        assert_eq!(routing_for(&command), Routing::Mutation);
         assert!(
-            !entry.is_empty(),
-            "every gap entry must name the commands it covers"
+            mdkb::core::routing::mutation_request(&mut command, &cwd, &cwd)
+                .unwrap()
+                .is_some(),
+            "missing request for mdkb {}",
+            args.join(" ")
         );
     }
 }

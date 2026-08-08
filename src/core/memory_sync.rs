@@ -77,7 +77,7 @@ pub(crate) fn project_entry(ctx: &Context, entry: &MemoryEntry, now: i64) -> Res
 }
 
 /// Outcome of [`sync_memory_files`].
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MemorySyncSummary {
     /// Entries written DB → file (backfilled, or re-projected after a DB edit).
     pub projected: usize,

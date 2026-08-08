@@ -335,30 +335,11 @@ fn collect_code(mdkb_dir: &Path) -> CodeSummary {
         return empty_code_summary();
     }
 
-    // `run_repairs` DELETEs, so this connection must announce itself: a
-    // quarantine renaming the path under it recycles the path onto a fresh
-    // database and these frames would land in the replacement's WAL. The lock
-    // is shared, so this only ever waits for the brief exclusive window a
-    // quarantine holds while renaming; `ok()` covers the sidecar being
-    // unopenable, and then we skip the repairs — a pure reader injects no
-    // frames.
-    let live = crate::store::mutation_lock::acquire_live_shared(&code_path).ok();
-    let conn = match rusqlite::Connection::open(&code_path) {
-        Ok(c) => {
-            if live.is_some() {
-                crate::code::storage::repair::run_repairs(&c);
-            }
-            c
-        }
-        Err(_) => {
-            match rusqlite::Connection::open_with_flags(
-                &code_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            ) {
-                Ok(c) => c,
-                Err(_) => return empty_code_summary(),
-            }
-        }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &code_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return empty_code_summary();
     };
 
     let files = scalar_count(&conn, "SELECT COUNT(*) FROM code_files");
@@ -472,7 +453,6 @@ where
 }
 
 fn collect_sessions(ctx: &Context) -> Result<SessionsSummary> {
-    stats::init_stats_schema(&ctx.conn)?;
     let agg = stats::get_aggregate_stats(&ctx.conn)?;
     let tool_rows: Vec<ToolRow> = stats::get_aggregate_tool_usage(&ctx.conn)?
         .into_iter()
@@ -1018,14 +998,13 @@ mod tests {
         assert_eq!(post.fired, 1);
     }
 
-    /// `collect_code` writes (`run_repairs` DELETEs), so it must hold the live
-    /// lock for the life of its connection. Renaming `code.sqlite` under an open
-    /// connection is what seeded the repeated corruptions: SQLite binds the
-    /// connection to the inode but derives `-wal`/`-shm` from the path, so a
-    /// survivor lands its frames in the replacement's WAL. Holding the lock
-    /// exclusively must therefore make `collect_code` wait.
+    /// Stats is a best-effort read. It must never join the live-lock protocol:
+    /// that protocol protects mutation and recovery, while waiting here would
+    /// turn an informational command into a blocker behind quarantine. A plain
+    /// read-only SQLite snapshot may succeed while the exclusive advisory lock
+    /// is held; if SQLite itself cannot provide one, an empty summary is safe.
     #[test]
-    fn collect_code_waits_for_the_live_lock_before_opening() {
+    fn collect_code_does_not_wait_on_live_lock_or_mutate_the_index() {
         use std::sync::mpsc;
         use std::time::Duration;
 
@@ -1033,11 +1012,31 @@ mod tests {
         let db_path = dir.path().join("code.sqlite");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
         crate::code::storage::schema::init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO code_files (path, rel_path, hash, language, indexed_at)
+             VALUES ('/repo/src/lib.rs', 'src/lib.rs', 'hash', 'rust', 1)",
+            [],
+        )
+        .unwrap();
+        // `init_schema` deliberately enables WAL for writers. Collapse that
+        // fixture state before testing the reader, so any sidecar observed
+        // afterwards can only have been created by `collect_code`.
+        conn.pragma_update(None, "journal_mode", "DELETE").unwrap();
         drop(conn);
+
+        let before_db = std::fs::read(&db_path).unwrap();
+        let wal_path = db_path.with_extension("sqlite-wal");
+        let shm_path = db_path.with_extension("sqlite-shm");
+        let mutation_path = crate::store::mutation_lock::lock_path(&db_path);
+        assert!(!wal_path.exists() && !shm_path.exists() && !mutation_path.exists());
 
         let blocker = crate::store::mutation_lock::try_acquire_live_exclusive(&db_path)
             .unwrap()
             .expect("nothing else holds the live lock yet");
+        let before_entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
 
         let (tx, rx) = mpsc::channel();
         let root = dir.path().to_path_buf();
@@ -1046,23 +1045,26 @@ mod tests {
             tx.send(summary).unwrap();
         });
 
-        assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "collect_code opened code.sqlite without announcing itself on the live lock"
-        );
-
+        let summary = rx.recv_timeout(Duration::from_secs(2));
         drop(blocker);
-        let summary = rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("collect_code must proceed once the live lock is free");
         worker.join().unwrap();
+        let summary =
+            summary.expect("collect_code must return while the exclusive live lock is still held");
 
-        assert_eq!(summary.files, 0, "empty index counted correctly");
-        assert!(
-            crate::store::mutation_lock::try_acquire_live_exclusive(&db_path)
-                .unwrap()
-                .is_some(),
-            "collect_code leaked its live guard — quarantine would be vetoed forever"
+        assert_eq!(summary.files, 1, "read-only snapshot remains available");
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            before_db,
+            "collect_code must not repair or otherwise modify code.sqlite"
+        );
+        assert!(!wal_path.exists() && !shm_path.exists() && !mutation_path.exists());
+        let after_entries = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            after_entries, before_entries,
+            "collect_code created a sidecar"
         );
     }
 

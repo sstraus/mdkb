@@ -682,7 +682,7 @@ pub enum MemoryCommand {
     },
 
     /// Record a confirmation signal against an entry (raises/lowers confidence).
-    /// Runs in-process — no daemon required.
+    /// Routed through the daemon like every other store mutation.
     Confirm {
         /// Entry ID (slug)
         id: String,

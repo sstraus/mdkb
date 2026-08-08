@@ -7,6 +7,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
+fn is_missing_table(error: &rusqlite::Error, table: &str) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message == &format!("no such table: {table}")
+    )
+}
+
 /// Initialize the statistics schema.
 pub fn init_stats_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -311,9 +319,19 @@ pub fn get_aggregate_stats(conn: &Connection) -> Result<AggregateStats> {
                 },
             })
         },
-    )?;
+    );
 
-    Ok(result)
+    match result {
+        Ok(stats) => Ok(stats),
+        Err(error) if is_missing_table(&error, "sessions") => Ok(AggregateStats {
+            total_sessions: 0,
+            total_calls: 0,
+            total_tokens: 0,
+            total_truncations: 0,
+            avg_tokens_per_call: 0.0,
+        }),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Get recent sessions with their stats.
@@ -346,7 +364,7 @@ pub fn get_recent_sessions(conn: &Connection, limit: usize) -> Result<Vec<Sessio
 
 /// Get aggregate tool usage across all sessions.
 pub fn get_aggregate_tool_usage(conn: &Connection) -> Result<Vec<ToolUsageRecord>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = match conn.prepare(
         r#"
         SELECT
             tool_name,
@@ -357,7 +375,11 @@ pub fn get_aggregate_tool_usage(conn: &Connection) -> Result<Vec<ToolUsageRecord
         GROUP BY tool_name
         ORDER BY calls DESC
         "#,
-    )?;
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) if is_missing_table(&error, "tool_usage") => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let results = stmt
         .query_map([], |row| {
@@ -443,7 +465,7 @@ pub struct QueryLatencyStats {
 
 /// Get query latency statistics by search type.
 pub fn get_query_latency_stats(conn: &Connection) -> Result<Vec<QueryLatencyStats>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = match conn.prepare(
         r#"
         SELECT
             search_type,
@@ -455,7 +477,11 @@ pub fn get_query_latency_stats(conn: &Connection) -> Result<Vec<QueryLatencyStat
         GROUP BY search_type
         ORDER BY count DESC
         "#,
-    )?;
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) if is_missing_table(&error, "query_events") => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let results = stmt
         .query_map([], |row| {
@@ -492,11 +518,16 @@ pub fn get_query_metrics(conn: &Connection, days: u32) -> Result<QueryMetricsSum
     let cutoff = chrono::Utc::now().timestamp() - (i64::from(days) * 24 * 60 * 60);
 
     // Total queries
-    let total_queries: i64 = conn.query_row(
+    let total_queries = conn.query_row(
         "SELECT COUNT(*) FROM query_events WHERE created_at >= ?1",
         params![cutoff],
         |row| row.get(0),
-    )?;
+    );
+    let total_queries: i64 = match total_queries {
+        Ok(total) => total,
+        Err(error) if is_missing_table(&error, "query_events") => 0,
+        Err(error) => return Err(error.into()),
+    };
 
     if total_queries == 0 {
         return Ok(QueryMetricsSummary {
@@ -623,14 +654,18 @@ fn get_percentile(conn: &Connection, cutoff: i64, percentile: u8) -> Result<i64>
 pub fn export_query_events(conn: &Connection, days: u32) -> Result<Vec<QueryEvent>> {
     let cutoff = chrono::Utc::now().timestamp() - (i64::from(days) * 24 * 60 * 60);
 
-    let mut stmt = conn.prepare(
+    let mut stmt = match conn.prepare(
         r#"
         SELECT query_hash, query_text, search_type, result_count, latency_ms, top_score, session_id
         FROM query_events
         WHERE created_at >= ?1
         ORDER BY created_at DESC
         "#,
-    )?;
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) if is_missing_table(&error, "query_events") => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let results = stmt
         .query_map(params![cutoff], |row| {
@@ -923,6 +958,24 @@ mod tests {
         let bm25 = stats.iter().find(|s| s.search_type == "bm25").unwrap();
         assert_eq!(bm25.count, 3);
     }
+
+    #[test]
+    fn optional_table_compatibility_does_not_hide_invalid_schemas() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (unexpected INTEGER);
+             CREATE TABLE tool_usage (unexpected INTEGER);
+             CREATE TABLE query_events (created_at INTEGER);
+             INSERT INTO query_events (created_at) VALUES (0);",
+        )
+        .unwrap();
+
+        assert!(get_aggregate_stats(&conn).is_err());
+        assert!(get_aggregate_tool_usage(&conn).is_err());
+        assert!(get_query_latency_stats(&conn).is_err());
+        assert!(get_query_metrics(&conn, u32::MAX).is_err());
+        assert!(export_query_events(&conn, u32::MAX).is_err());
+    }
 }
 
 // ==================== A/B Experiments ====================
@@ -1015,11 +1068,8 @@ pub fn init_experiments_schema(conn: &Connection) -> Result<()> {
         )
         .ok();
 
-    if current_version == Some(EXPERIMENTS_SCHEMA_VERSION) {
-        return Ok(()); // Already at current version
-    }
-
-    // Create or migrate schema
+    // Ensure every table exists even when an older initializer recorded the
+    // current optional-schema version before completing all DDL.
     conn.execute_batch(
         r#"
         -- A/B Experiments
@@ -1056,12 +1106,13 @@ pub fn init_experiments_schema(conn: &Connection) -> Result<()> {
         "#,
     )?;
 
-    // Record schema version
-    let now = chrono::Utc::now().timestamp();
-    conn.execute(
-        "INSERT INTO experiments_schema_version (version, migrated_at) VALUES (?1, ?2)",
-        params![EXPERIMENTS_SCHEMA_VERSION, now],
-    )?;
+    if current_version != Some(EXPERIMENTS_SCHEMA_VERSION) {
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO experiments_schema_version (version, migrated_at) VALUES (?1, ?2)",
+            params![EXPERIMENTS_SCHEMA_VERSION, now],
+        )?;
+    }
 
     Ok(())
 }
@@ -1091,13 +1142,17 @@ pub fn create_experiment(
 
 /// Get an experiment by name.
 pub fn get_experiment(conn: &Connection, name: &str) -> Result<Option<Experiment>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = match conn.prepare(
         r#"
         SELECT id, name, description, config_a, config_b, traffic_split, status, min_sample_size, created_at, ended_at, winner
         FROM experiments
         WHERE name = ?1
         "#,
-    )?;
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) if is_missing_table(&error, "experiments") => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
 
     let result = stmt.query_row(params![name], |row| {
         let status_str: String = row.get(6)?;
@@ -1130,14 +1185,18 @@ pub fn get_experiment(conn: &Connection, name: &str) -> Result<Option<Experiment
 
 /// Get all active (running) experiments.
 pub fn get_active_experiments(conn: &Connection) -> Result<Vec<Experiment>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = match conn.prepare(
         r#"
         SELECT id, name, description, config_a, config_b, traffic_split, status, min_sample_size, created_at, ended_at, winner
         FROM experiments
         WHERE status = 'running'
         ORDER BY created_at DESC
         "#,
-    )?;
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) if is_missing_table(&error, "experiments") => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let results = stmt
         .query_map([], |row| {
@@ -1232,7 +1291,7 @@ pub fn get_variant_stats(
             COUNT(*) as sample_count,
             COALESCE(AVG(score), 0.0) as avg_score,
             COALESCE(AVG(latency_ms), 0.0) as avg_latency,
-            SUM(CASE WHEN result_count = 0 THEN 1 ELSE 0 END) as zero_results
+            COALESCE(SUM(CASE WHEN result_count = 0 THEN 1 ELSE 0 END), 0) as zero_results
         FROM experiment_results
         WHERE experiment_id = ?1 AND variant = ?2
         "#,
@@ -1240,16 +1299,20 @@ pub fn get_variant_stats(
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
     );
 
-    let Ok((sample_count, avg_score, avg_latency, zero_results)) = result else {
-        return Ok(VariantStats {
-            variant: variant.to_string(),
-            sample_count: 0,
-            avg_score: 0.0,
-            avg_latency_ms: 0.0,
-            p95_latency_ms: 0,
-            zero_result_rate: 0.0,
-            score_variance: 0.0,
-        });
+    let (sample_count, avg_score, avg_latency, zero_results) = match result {
+        Ok(stats) => stats,
+        Err(error) if is_missing_table(&error, "experiment_results") => {
+            return Ok(VariantStats {
+                variant: variant.to_string(),
+                sample_count: 0,
+                avg_score: 0.0,
+                avg_latency_ms: 0.0,
+                p95_latency_ms: 0,
+                zero_result_rate: 0.0,
+                score_variance: 0.0,
+            });
+        }
+        Err(error) => return Err(error.into()),
     };
 
     if sample_count == 0 {
@@ -1268,31 +1331,27 @@ pub fn get_variant_stats(
 
     // P95 latency (requires sorted access)
     let p95_idx = ((sample_count as f64 * 0.95).ceil() as i64).max(1) - 1;
-    let p95_latency: i64 = conn
-        .query_row(
-            r#"
+    let p95_latency: i64 = conn.query_row(
+        r#"
         SELECT latency_ms FROM experiment_results
         WHERE experiment_id = ?1 AND variant = ?2
         ORDER BY latency_ms
         LIMIT 1 OFFSET ?3
         "#,
-            params![experiment_id, variant, p95_idx],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
+        params![experiment_id, variant, p95_idx],
+        |row| row.get(0),
+    )?;
 
     // Score variance for significance testing
-    let score_variance: f64 = conn
-        .query_row(
-            r#"
+    let score_variance: f64 = conn.query_row(
+        r#"
         SELECT COALESCE(AVG((score - ?1) * (score - ?1)), 0.0)
         FROM experiment_results
         WHERE experiment_id = ?2 AND variant = ?3
         "#,
-            params![avg_score, experiment_id, variant],
-            |row| row.get::<_, f64>(0),
-        )
-        .unwrap_or(0.0);
+        params![avg_score, experiment_id, variant],
+        |row| row.get::<_, f64>(0),
+    )?;
 
     Ok(VariantStats {
         variant: variant.to_string(),
@@ -1506,13 +1565,17 @@ pub fn cancel_experiment(conn: &Connection, name: &str) -> Result<()> {
 
 /// List all experiments.
 pub fn list_experiments(conn: &Connection) -> Result<Vec<Experiment>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = match conn.prepare(
         r#"
         SELECT id, name, description, config_a, config_b, traffic_split, status, min_sample_size, created_at, ended_at, winner
         FROM experiments
         ORDER BY created_at DESC
         "#,
-    )?;
+    ) {
+        Ok(stmt) => stmt,
+        Err(error) if is_missing_table(&error, "experiments") => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
 
     let results = stmt
         .query_map([], |row| {
@@ -1723,5 +1786,37 @@ mod experiment_tests {
         assert!(status.has_min_samples);
         assert_eq!(status.variant_a.sample_count, 6);
         assert_eq!(status.variant_b.sample_count, 6);
+    }
+
+    #[test]
+    fn test_experiment_status_with_no_variant_results() {
+        let conn = setup_experiment_db();
+        create_experiment(&conn, "empty-exp", None, "{}", "{}", 0.5, 5).unwrap();
+
+        let status = get_experiment_status(&conn, "empty-exp")
+            .unwrap()
+            .expect("experiment exists");
+
+        assert_eq!(status.variant_a.sample_count, 0);
+        assert!(status.variant_a.zero_result_rate.abs() < f64::EPSILON);
+        assert_eq!(status.variant_b.sample_count, 0);
+        assert!(status.variant_b.zero_result_rate.abs() < f64::EPSILON);
+        assert!(!status.has_min_samples);
+        assert!(status.significance.is_none());
+    }
+
+    #[test]
+    fn optional_experiment_compatibility_does_not_hide_invalid_schemas() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE experiments (name TEXT);
+             CREATE TABLE experiment_results (experiment_id INTEGER, variant TEXT);",
+        )
+        .unwrap();
+
+        assert!(get_experiment(&conn, "missing").is_err());
+        assert!(get_active_experiments(&conn).is_err());
+        assert!(list_experiments(&conn).is_err());
+        assert!(get_variant_stats(&conn, 1, "A").is_err());
     }
 }

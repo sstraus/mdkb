@@ -196,6 +196,7 @@ impl Context {
         // and query_events work on every transport, including the daemon-less
         // in-process CLI hook path (previously only the MCP server created them).
         crate::store::stats::init_stats_schema(&conn)?;
+        crate::store::stats::init_experiments_schema(&conn)?;
 
         // memory_entries/memory_edges live ONLY in this DB — salvage them out of
         // the quarantined file into the fresh schema before it takes over, and
@@ -352,6 +353,8 @@ impl Context {
         Self::configure_connection(&conn)?;
         schema::init_schema(&conn)?;
         vectors::init_vector_schema(&conn)?;
+        crate::store::stats::init_stats_schema(&conn)?;
+        crate::store::stats::init_experiments_schema(&conn)?;
 
         Ok(Self {
             conn,
@@ -412,6 +415,7 @@ pub(crate) fn ensure_store_gitignore(memory_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+pub mod cli_mutation;
 pub mod code;
 pub mod graph;
 pub mod indexing;

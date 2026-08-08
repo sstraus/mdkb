@@ -350,30 +350,31 @@ mdkb memory import entries.json --dry-run --skip-duplicates
 
 #### Team sync (git)
 
-`.mdkb/` is gitignored — `index.sqlite` is the binary source of truth and
-isn't meant to be committed. To share memory with teammates, export to a
-**tracked** directory outside `.mdkb/` and import after pulling:
+`mdkb init` keeps the SQLite indexes and machine-local state ignored while
+allowing `.mdkb/memory/entries/*.md` into Git. Memory writes update that durable
+projection, and `mdkb memory sync` reconciles changes arriving from a pull:
 
 ```bash
-# Export to a git-tracked folder (not .mdkb/memory/, which stays gitignored)
-mdkb memory export --dir memory/entries --overwrite
-git add memory/entries/ && git commit -m "chore(memory): sync team knowledge"
+# Reconcile and commit the tracked projection
+mdkb memory sync
+git add .mdkb/.gitignore .mdkb/memory/entries/
+git commit -m "chore(memory): sync team knowledge"
 
 # Teammate, after pulling:
-mdkb memory import memory/entries --skip-duplicates
+mdkb memory sync
 ```
 
 Automate both ends with git hooks so nobody has to remember the manual steps:
 
 ```bash
-# .git/hooks/pre-commit — keep memory/entries/ current before every commit
+# .git/hooks/pre-commit — reconcile before every commit
 #!/bin/sh
-mdkb memory export --dir memory/entries --overwrite
-git add memory/entries/
+mdkb memory sync
+git add .mdkb/memory/entries/
 
 # .git/hooks/post-merge and post-checkout — pick up teammates' entries after a pull
 #!/bin/sh
-mdkb memory import memory/entries --skip-duplicates
+mdkb memory sync
 ```
 
 Only `entries/*.md` is meant for version control. `index.json` and `archive/`
@@ -469,9 +470,10 @@ All data stays local in `.mdkb/`:
 
 The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded on first use and cached locally.
 
-Add `.mdkb/` to `.gitignore` — it can be regenerated with `mdkb update && mdkb embed`. To
-share memory entries with a team via git, export to a tracked folder outside `.mdkb/`
-instead — see [Team sync (git)](#team-sync-git).
+Keep `.mdkb/*` ignored at the repository root, then re-include
+`.mdkb/.gitignore` and `.mdkb/memory/`. The generated store-level ignore file
+allows only `memory/entries/*.md` to be tracked; indexes and machine-local state
+remain ignored. See [Team sync (git)](#team-sync-git).
 
 ## License
 

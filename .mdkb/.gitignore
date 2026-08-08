@@ -1,0 +1,9 @@
+# Managed by `mdkb init`. Everything in the store is derived, per-machine or
+# merge-hostile; only the durable memory entry projection is tracked.
+*
+!.gitignore
+!memory/
+memory/*
+!memory/entries/
+memory/entries/*
+!memory/entries/*.md

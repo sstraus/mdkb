@@ -377,6 +377,16 @@ async fn dispatch_hook_message(
         return rpc_error(id, -32602, "missing 'params.root' (absolute repo path)");
     };
 
+    // A malformed typed mutation is an admission refusal: no handler has run,
+    // so the CLI may safely use its documented in-process fallback. Validate
+    // before acquiring a repo handle and before entering dispatch_call.
+    if method == "cli.mutate"
+        && let Err(error) =
+            serde_json::from_value::<crate::core::cli_mutation::CliMutation>(params.clone())
+    {
+        return rpc_error(id, -32602, &format!("cli.mutate: invalid params: {error}"));
+    }
+
     let handle = match registry.get_or_open(Path::new(root)) {
         Ok(h) => h,
         Err(e) => return rpc_error(id, -32602, &format!("repo registry: {e}")),
@@ -605,6 +615,19 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","id":1}"#;
         let resp = dispatch_hook_message(body, &make_registry(), &make_dctx()).await;
         assert!(resp.contains("-32600"), "resp: {resp}");
+    }
+
+    #[tokio::test]
+    async fn malformed_cli_mutation_is_refused_before_dispatch() {
+        let root = std::env::temp_dir();
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"cli.mutate","params":{{"root":"{}","command":"not_real"}}}}"#,
+            root.display()
+        );
+        let response = dispatch_hook_message(body.as_bytes(), &make_registry(), &make_dctx()).await;
+        let envelope: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(envelope["error"]["code"], -32602);
+        assert_ne!(envelope["error"]["code"], DISPATCHED_ERROR_CODE);
     }
 
     /// Refusals raised before dispatch must never wear [`DISPATCHED_ERROR_CODE`].

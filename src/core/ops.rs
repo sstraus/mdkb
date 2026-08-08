@@ -289,17 +289,14 @@ pub struct EvolutionHistoryEntry {
 }
 /// Handle `mdkb metrics show` command.
 pub fn handle_metrics_show(ctx: &Context, period: u32) -> Result<stats::QueryMetricsSummary> {
-    stats::init_stats_schema(&ctx.conn)?;
     stats::get_query_metrics(&ctx.conn, period)
 }
 /// Handle `mdkb metrics latency` command.
 pub fn handle_metrics_latency(ctx: &Context) -> Result<Vec<stats::QueryLatencyStats>> {
-    stats::init_stats_schema(&ctx.conn)?;
     stats::get_query_latency_stats(&ctx.conn)
 }
 /// Handle `mdkb metrics export` command.
 pub fn handle_metrics_export(ctx: &Context, period: u32) -> Result<Vec<stats::QueryEvent>> {
-    stats::init_stats_schema(&ctx.conn)?;
     stats::export_query_events(&ctx.conn, period)
 }
 /// Handle `mdkb experiment create`.
@@ -386,7 +383,6 @@ pub fn handle_experiment_status(
     ctx: &Context,
     name: &str,
 ) -> Result<Option<stats::ExperimentStatusReport>> {
-    stats::init_experiments_schema(&ctx.conn)?;
     stats::get_experiment_status(&ctx.conn, name)
 }
 /// Handle `mdkb experiment end`.
@@ -429,8 +425,6 @@ pub fn handle_experiment_cancel(ctx: &Context, name: &str) -> Result<()> {
 }
 /// Handle `mdkb experiment list`.
 pub fn handle_experiment_list(ctx: &Context, running_only: bool) -> Result<Vec<stats::Experiment>> {
-    stats::init_experiments_schema(&ctx.conn)?;
-
     if running_only {
         stats::get_active_experiments(&ctx.conn)
     } else {
@@ -449,6 +443,17 @@ pub fn handle_journal_import(
     path: &Path,
     dry_run: bool,
 ) -> Result<JournalImportResult> {
+    handle_journal_import_from(ctx, path, path, dry_run)
+}
+
+/// Import a journal read from `path` while preserving the caller-visible path
+/// in entry provenance and structured output.
+pub fn handle_journal_import_from(
+    ctx: &Context,
+    path: &Path,
+    source_path: &Path,
+    dry_run: bool,
+) -> Result<JournalImportResult> {
     // Read journal file
     let content = std::fs::read_to_string(path).map_err(|e| Error::from(ErrorKind::IoError(e)))?;
 
@@ -456,13 +461,13 @@ pub fn handle_journal_import(
     let parsed = journal::parse_journal(&content);
 
     // Generate base ID from filename
-    let base_id = journal::path_to_base_id(path);
+    let base_id = journal::path_to_base_id(source_path);
 
     // Convert to memory entries
-    let entries = journal::journal_to_memory_entries(&parsed, path, &base_id);
+    let entries = journal::journal_to_memory_entries(&parsed, source_path, &base_id);
 
     let mut result = JournalImportResult {
-        source_path: path.to_string_lossy().to_string(),
+        source_path: source_path.to_string_lossy().to_string(),
         ..Default::default()
     };
 
@@ -499,6 +504,17 @@ pub fn handle_journal_import_all(
     dry_run: bool,
     skip_existing: bool,
 ) -> Result<Vec<JournalImportResult>> {
+    handle_journal_import_all_from(ctx, dir, dir, dry_run, skip_existing)
+}
+
+/// Import a directory while retaining the path spelling supplied by the CLI.
+pub fn handle_journal_import_all_from(
+    ctx: &Context,
+    dir: &Path,
+    source_dir: &Path,
+    dry_run: bool,
+    skip_existing: bool,
+) -> Result<Vec<JournalImportResult>> {
     let mut results = Vec::new();
 
     // Get list of already imported source paths if skip_existing
@@ -520,7 +536,11 @@ pub fn handle_journal_import_all(
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
     {
         let path = entry.path();
-        let path_str = path.to_string_lossy().to_string();
+        let source_path = path
+            .strip_prefix(dir)
+            .map(|relative| source_dir.join(relative))
+            .unwrap_or_else(|_| path.to_path_buf());
+        let path_str = source_path.to_string_lossy().to_string();
 
         // Skip if already imported
         if skip_existing && existing_sources.contains(&path_str) {
@@ -532,7 +552,7 @@ pub fn handle_journal_import_all(
             continue;
         }
 
-        match handle_journal_import(ctx, path, dry_run) {
+        match handle_journal_import_from(ctx, path, &source_path, dry_run) {
             Ok(result) => results.push(result),
             Err(e) => {
                 results.push(JournalImportResult {
@@ -626,7 +646,7 @@ pub fn handle_prune_sessions(
     Ok(summary)
 }
 /// Outcome of a `mdkb compact --prune-sessions` run.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PruneSessionsSummary {
     pub pruned: usize,
     pub exported: usize,
@@ -784,7 +804,7 @@ pub fn handle_get(ctx: &Context, id_or_path: &str, lines: Option<&str>) -> Resul
     }
 
     // Try memory slug
-    if let Some(entry) = crate::store::memory::get_entry(&ctx.conn, id_or_path)? {
+    if let Some(entry) = crate::store::memory::get_entry_without_tracking(&ctx.conn, id_or_path)? {
         return Ok(GetResult::Memory(entry));
     }
 

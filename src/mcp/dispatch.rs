@@ -25,6 +25,7 @@ use crate::cli::hook_logic::{
 };
 use crate::code::indexing::IndexFacade;
 use crate::core::Context;
+use crate::core::cli_mutation::{CliMutation, CliMutationResult};
 use crate::core::indexing::{UpdateOutcome, UpdateRequest, update_documents};
 use crate::core::search::{handle_hybrid_search, handle_mget};
 use crate::daemon::registry::RepoHandle;
@@ -3962,6 +3963,105 @@ async fn record_hook_call(handle: &RepoHandle, method: &str) {
     }
 }
 
+/// Execute the internal CLI mutation protocol against daemon-owned resources.
+async fn cli_mutate_impl(
+    handle: &RepoHandle,
+    mutation: CliMutation,
+) -> Result<CliMutationResult, McpError> {
+    use CliMutation::{CodeIndex, CodeInit, Compact, Update};
+
+    match mutation {
+        Update { request } => Ok(CliMutationResult::Update {
+            outcome: update_impl(handle, &request).await?,
+        }),
+        CodeInit => {
+            let index = acquire_handle_code_index(handle).await?;
+            if index.is_none() {
+                return Err(mcp_error(
+                    "Code index is currently rebuilding; retry shortly",
+                ));
+            }
+            Ok(CliMutationResult::CodeInitialized)
+        }
+        CodeIndex { paths, force } => {
+            let mut index = acquire_handle_code_index(handle).await?;
+            let stats =
+                crate::code::indexing::run_code_mutation(&mut index, "CLI code index", |facade| {
+                    if force {
+                        crate::core::code::reindex_paths(facade, &handle.root, &paths)
+                    } else if paths.is_empty() {
+                        facade.update(&handle.root)
+                    } else {
+                        crate::core::code::index_paths(facade, &handle.root, &paths)
+                    }
+                })
+                .ok_or_else(|| mcp_error("Code index not initialized"))?
+                .map_err(|e| mcp_error(format!("Code indexing failed: {e}")))?;
+            crate::llm::release_cached_service();
+            Ok(CliMutationResult::CodeIndexed { stats })
+        }
+        Compact {
+            prune_sessions,
+            older_than,
+            export,
+        } => {
+            ensure_handle_context(handle).await?;
+            let (prune, index_bytes) = {
+                let mut slot = handle.ctx.lock().await;
+                run_handle_memory_mutation(&mut slot, "compact", |ctx| {
+                    let prune = if prune_sessions {
+                        let raw = older_than.as_deref().ok_or_else(|| mcp_error(
+                            "--prune-sessions requires --older-than <e.g. 90d> to avoid deleting recent archives",
+                        ))?;
+                        let secs = crate::core::ops::parse_retention_secs(raw)
+                            .map_err(|e| mcp_error(e.to_string()))?;
+                        let cutoff = chrono::Utc::now().timestamp().checked_sub(secs).ok_or_else(|| {
+                            mcp_error(format!("--older-than '{raw}' is too large to compute a cutoff"))
+                        })?;
+                        Some(crate::core::ops::handle_prune_sessions(ctx, cutoff, export.as_deref())
+                            .map_err(|e| mcp_error(e.to_string()))?)
+                    } else {
+                        None
+                    };
+                    ctx.conn.execute_batch("VACUUM;")
+                        .map_err(|e| mcp_error(format!("vacuum index.sqlite: {e}")))?;
+                    Ok((prune, ctx.db_path.metadata().map(|m| m.len()).unwrap_or(0)))
+                })
+                .map_err(|e| mcp_error(format!("compact failed: {e}")))?
+            };
+
+            let code_path = handle.root.join(".mdkb/code.sqlite");
+            let code_bytes = if code_path.exists() {
+                let mut index = handle.code_index.lock().await;
+                *index = None;
+                let _live = crate::store::mutation_lock::acquire_live_shared(&code_path)
+                    .map_err(|e| mcp_error(format!("compact code lock: {e}")))?;
+                let conn = rusqlite::Connection::open(&code_path)
+                    .map_err(|e| mcp_error(format!("compact code open: {e}")))?;
+                conn.execute_batch("VACUUM;")
+                    .map_err(|e| mcp_error(format!("compact code vacuum: {e}")))?;
+                Some(code_path.metadata().map(|m| m.len()).unwrap_or(0))
+            } else {
+                None
+            };
+            Ok(CliMutationResult::Compact {
+                prune,
+                index_bytes,
+                code_bytes,
+            })
+        }
+        mutation => {
+            ensure_handle_context(handle).await?;
+            let mut slot = handle.ctx.lock().await;
+            run_handle_memory_mutation(&mut slot, "cli mutation", |ctx| {
+                crate::core::cli_mutation::execute_context_mutation(ctx, mutation)
+                    .map_err(|e| mcp_error(e.to_string()))
+            })
+            .map_err(|e| mcp_error(format!("cli mutation failed: {e}")))
+        }
+    }
+}
+
 /// Dispatch a tool call by method name. Returns a JSON value — callers are
 /// responsible for the transport envelope.
 ///
@@ -3974,6 +4074,13 @@ pub async fn dispatch_call(
     dctx: &DispatchContext,
 ) -> Result<Value, McpError> {
     match tool_name {
+        "cli.mutate" => {
+            let mutation: CliMutation = serde_json::from_value(params)
+                .map_err(|e| mcp_error(format!("cli.mutate: invalid params: {e}")))?;
+            let result = cli_mutate_impl(&handle, mutation).await?;
+            serde_json::to_value(result)
+                .map_err(|e| mcp_error(format!("cli.mutate: encode result: {e}")))
+        }
         "status" => {
             let text = status_impl(&handle).await?;
             let tokens = count_tokens(&text);
@@ -4757,6 +4864,40 @@ mod tests {
             optimize_interval_calls: 200,
             hook_dedup: Arc::new(StdMutex::new(Default::default())),
         }
+    }
+
+    #[tokio::test]
+    async fn cli_mutate_dispatch_returns_the_typed_result() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let result = dispatch_call(
+            "cli.mutate",
+            json!({
+                "command": "memory_add",
+                "id": "typed-route",
+                "title": "Typed route",
+                "entry_type": "topic",
+                "tags": null,
+                "content": "written by daemon dispatch",
+                "source_path": null,
+                "ttl": null,
+                "due_in": null,
+                "source_type": null
+            }),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await
+        .expect("cli mutation dispatch");
+        assert_eq!(result["result"], "memory_added");
+
+        let context = handle.ctx.lock().await;
+        let entry = crate::store::memory::get_entry_without_tracking(
+            &context.as_ref().unwrap().conn,
+            "typed-route",
+        )
+        .unwrap();
+        assert!(entry.is_some());
     }
 
     fn additional_context(result: &Value) -> &str {

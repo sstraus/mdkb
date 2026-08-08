@@ -19,8 +19,11 @@
 
 use crate::cli::{
     CodeCommand, CollectionCommand, Command, EvolveCommand, ExperimentCommand, JournalCommand,
-    MemoryCommand, MetricsCommand,
+    MemoryCommand, SessionCommand,
 };
+use crate::core::cli_mutation::CliMutation;
+use crate::core::indexing::UpdateRequest;
+use crate::error::{Error, Result};
 
 /// Where a command must run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,10 +50,9 @@ pub enum Routing {
 pub fn routing_for(command: &Command) -> Routing {
     match command {
         // ── writes ──────────────────────────────────────────────────────────
-        Command::Init
-        | Command::Update { .. }
-        | Command::Embed { .. }
-        | Command::Compact { .. } => Routing::Mutation,
+        Command::Update { .. } | Command::Embed { .. } | Command::Compact { .. } => {
+            Routing::Mutation
+        }
         Command::Collection(c) => match c {
             CollectionCommand::List => Routing::Read,
             CollectionCommand::Add { .. }
@@ -98,17 +100,11 @@ pub fn routing_for(command: &Command) -> Routing {
         | Command::Current { .. }
         | Command::SupersededBy { .. }
         | Command::Eval(_) => Routing::Read,
-        // `metrics show` reads, but recording usage is a write on this schema —
-        // see the note in core::mod on why stats/metrics keep a write
-        // connection. Classified as a mutation so it routes rather than opening
-        // its own writer.
-        Command::Metrics(c) => match c {
-            MetricsCommand::Show { .. } => Routing::Mutation,
-            _ => Routing::Read,
-        },
+        Command::Metrics(_) => Routing::Read,
 
         // ── no store ────────────────────────────────────────────────────────
-        Command::Serve { .. }
+        Command::Init
+        | Command::Serve { .. }
         | Command::Daemon(_)
         | Command::Mcp { .. }
         | Command::Hook(_)
@@ -139,53 +135,283 @@ pub fn should_route(command: &Command) -> bool {
     routing_for(command) == Routing::Mutation && std::env::var_os("MDKB_NO_DAEMON").is_none()
 }
 
-/// The daemon RPC that performs this command, when one exists.
+/// Convert a parsed mutating command into the complete internal wire request.
 ///
-/// Returns the JSON-RPC method name and its params, ready for the hook socket —
-/// the same client pattern `mdkb hook` uses, which is what the story asks for.
-///
-/// Deliberately partial, and the gap is the point. The daemon exposes RPCs for
-/// the memory write path and for `update`, which is exactly where the recurring
-/// corruption is confined (`memory_entries`, `memory_fts_data`,
-/// `memory_embeddings`). Those route today. Every other mutation is still
-/// classified as [`Routing::Mutation`] and still runs in-process, so the
-/// remaining gap is visible in the type rather than hidden — `routing_gap()`
-/// names them, and a test asserts the list only ever shrinks.
-pub fn daemon_method(command: &Command) -> Option<(&'static str, serde_json::Value)> {
-    use serde_json::json;
-    match command {
-        Command::Memory(MemoryCommand::Rm { id }) => {
-            Some(("memory_delete", json!({ "id": id, "dry_run": false })))
+/// The match has no wildcard for mutating subcommands. Adding one therefore
+/// requires an explicit protocol decision. `memory add` materializes stdin in
+/// the caller before delivery so an admission refusal can still fall back
+/// without trying to read an already-consumed stream.
+pub fn mutation_request(
+    command: &mut Command,
+    invocation_dir: &std::path::Path,
+    store_root: &std::path::Path,
+) -> Result<Option<CliMutation>> {
+    use CliMutation as M;
+    let absolute = |path: &std::path::Path| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            invocation_dir.join(path)
         }
-        // Both arguments travel. A routed command that keeps its name and drops
-        // its arguments is worse than one that does not route: `--force` was
-        // accepted and ignored, and a targeted update quietly reindexed the
-        // whole tree — each reporting success.
-        Command::Update { files, force } => {
-            Some(("update", json!({ "files": files, "force": *force })))
-        }
-        _ => None,
-    }
-}
+    };
 
-/// Mutating commands that do NOT yet route, so the shortfall is enumerable
-/// rather than implicit.
-///
-/// A story that claims "the daemon is the sole writer" while half the commands
-/// still open their own connection is worse than one that says which half: the
-/// first reads as done and stops anyone looking.
-pub fn routing_gap() -> Vec<&'static str> {
-    vec![
-        "init",
-        "embed",
-        "compact",
-        "collection add/remove/rename",
-        "memory add/link/confirm/sync/prune/import/condense",
-        "evolve *",
-        "experiment create/end/cancel",
-        "journal import/import-all",
-        "code init/index",
-        "session *",
-        "metrics show",
-    ]
+    Ok(Some(match command {
+        Command::Update { files, force } => M::Update {
+            request: UpdateRequest {
+                files: files.clone(),
+                force: *force,
+            },
+        },
+        Command::Embed { collection } => M::Embed {
+            collection: collection.clone(),
+        },
+        Command::Compact {
+            prune_sessions,
+            older_than,
+            export,
+        } => M::Compact {
+            prune_sessions: *prune_sessions,
+            older_than: older_than.clone(),
+            export: export.as_deref().map(absolute),
+        },
+        Command::Collection(c) => match c {
+            CollectionCommand::Add {
+                name,
+                path,
+                pattern,
+            } => M::CollectionAdd {
+                name: name.clone(),
+                path: path.clone(),
+                pattern: pattern.clone(),
+            },
+            CollectionCommand::Remove { name } => M::CollectionRemove { name: name.clone() },
+            CollectionCommand::Rename { old_name, new_name } => M::CollectionRename {
+                old_name: old_name.clone(),
+                new_name: new_name.clone(),
+            },
+            CollectionCommand::List => return Ok(None),
+        },
+        Command::Memory(c) => match c {
+            MemoryCommand::Add {
+                id,
+                title,
+                entry_type,
+                tags,
+                content,
+                file,
+                ttl,
+                due_in,
+                source_type,
+            } => {
+                let (body, source_path) = if let Some(path) = file.as_ref() {
+                    let abs = absolute(path);
+                    let body = std::fs::read_to_string(&abs).map_err(|e| {
+                        Error::other(format!("Failed to read file {}: {e}", path.display()))
+                    })?;
+                    (
+                        body,
+                        Some(
+                            abs.canonicalize()
+                                .unwrap_or(abs)
+                                .to_string_lossy()
+                                .to_string(),
+                        ),
+                    )
+                } else if let Some(body) = content.clone() {
+                    (body, None)
+                } else {
+                    use std::io::Read;
+                    let mut body = String::new();
+                    std::io::stdin()
+                        .take(100_000)
+                        .read_to_string(&mut body)
+                        .map_err(Error::from)?;
+                    *content = Some(body.clone());
+                    (body, None)
+                };
+                M::MemoryAdd {
+                    id: id.clone(),
+                    title: title.clone(),
+                    entry_type: entry_type.clone(),
+                    tags: tags.clone(),
+                    content: body,
+                    source_path,
+                    ttl: *ttl,
+                    due_in: *due_in,
+                    source_type: source_type.clone(),
+                }
+            }
+            MemoryCommand::Confirm { id, outcome } => M::MemoryConfirm {
+                id: id.clone(),
+                outcome: outcome.clone(),
+            },
+            MemoryCommand::Link {
+                id,
+                relation,
+                target,
+                doc,
+                agent,
+            } => M::MemoryLink {
+                id: id.clone(),
+                relation: relation.clone(),
+                target: target.clone(),
+                doc: *doc,
+                agent: agent.clone(),
+            },
+            MemoryCommand::Rm { id } => M::MemoryRemove { id: id.clone() },
+            MemoryCommand::Sync => M::MemorySync,
+            MemoryCommand::Import {
+                path,
+                dry_run,
+                skip_duplicates,
+            } => M::MemoryImport {
+                path: absolute(std::path::Path::new(path)),
+                dry_run: *dry_run,
+                skip_duplicates: *skip_duplicates,
+            },
+            MemoryCommand::Prune { days, dry_run } => M::MemoryPrune {
+                days: *days,
+                dry_run: *dry_run,
+            },
+            #[cfg(feature = "llm")]
+            MemoryCommand::Condense {
+                tag,
+                dry_run,
+                interactive: _,
+                min_entries,
+            } => M::MemoryCondense {
+                tag: tag.clone(),
+                dry_run: *dry_run,
+                min_entries: *min_entries,
+            },
+            MemoryCommand::Show { .. }
+            | MemoryCommand::List { .. }
+            | MemoryCommand::Search { .. }
+            | MemoryCommand::Warmup { .. }
+            | MemoryCommand::History { .. }
+            | MemoryCommand::Export { .. } => return Ok(None),
+        },
+        Command::Evolve(c) => match c {
+            EvolveCommand::Supersedes { new, old, reason } => M::EvolveSupersedes {
+                new: new.clone(),
+                old: old.clone(),
+                reason: reason.clone(),
+            },
+            EvolveCommand::Updates {
+                new,
+                old,
+                scope,
+                reason,
+            } => M::EvolveUpdates {
+                new: new.clone(),
+                old: old.clone(),
+                scope: scope.clone(),
+                reason: reason.clone(),
+            },
+            EvolveCommand::Corrects { new, old, reason } => M::EvolveCorrects {
+                new: new.clone(),
+                old: old.clone(),
+                reason: reason.clone(),
+            },
+            EvolveCommand::Retracts { new, old, reason } => M::EvolveRetracts {
+                new: new.clone(),
+                old: old.clone(),
+                reason: reason.clone(),
+            },
+            EvolveCommand::Extends { new, old, reason } => M::EvolveExtends {
+                new: new.clone(),
+                old: old.clone(),
+                reason: reason.clone(),
+            },
+        },
+        Command::Experiment(c) => match c {
+            ExperimentCommand::Create {
+                name,
+                config_a,
+                config_b,
+                description,
+                split,
+                min_samples,
+            } => M::ExperimentCreate {
+                name: name.clone(),
+                config_a: config_a.clone(),
+                config_b: config_b.clone(),
+                description: description.clone(),
+                split: *split,
+                min_samples: *min_samples,
+            },
+            ExperimentCommand::End { name, winner } => M::ExperimentEnd {
+                name: name.clone(),
+                winner: winner.clone(),
+            },
+            ExperimentCommand::Cancel { name } => M::ExperimentCancel { name: name.clone() },
+            ExperimentCommand::Status { .. } | ExperimentCommand::List { .. } => return Ok(None),
+        },
+        Command::Journal(c) => match c {
+            JournalCommand::Import { path, dry_run } => M::JournalImport {
+                path: absolute(std::path::Path::new(path)),
+                source_path: std::path::PathBuf::from(path.as_str()),
+                dry_run: *dry_run,
+            },
+            JournalCommand::ImportAll {
+                dir,
+                dry_run,
+                skip_existing,
+            } => {
+                let source_dir =
+                    std::path::PathBuf::from(dir.as_deref().unwrap_or(".claude/journal"));
+                M::JournalImportAll {
+                    dir: absolute(&source_dir),
+                    source_dir,
+                    dry_run: *dry_run,
+                    skip_existing: *skip_existing,
+                }
+            }
+        },
+        Command::Code(c) => match c {
+            CodeCommand::Init => M::CodeInit,
+            CodeCommand::Index { paths, force } => M::CodeIndex {
+                paths: paths.clone(),
+                force: *force,
+            },
+            CodeCommand::Search { .. }
+            | CodeCommand::Find { .. }
+            | CodeCommand::Calls { .. }
+            | CodeCommand::Callers { .. }
+            | CodeCommand::Impact { .. }
+            | CodeCommand::Info
+            | CodeCommand::Parse { .. } => return Ok(None),
+        },
+        Command::Session(SessionCommand::Index {
+            sessions_path,
+            project_root,
+        }) => M::SessionIndex {
+            sessions_path: match sessions_path {
+                Some(path) => absolute(std::path::Path::new(path)),
+                None => crate::daemon::config::home_dir()?.join(".claude/projects"),
+            },
+            project_root: project_root
+                .clone()
+                .unwrap_or_else(|| store_root.to_string_lossy().to_string()),
+        },
+        Command::Init
+        | Command::Search { .. }
+        | Command::Get { .. }
+        | Command::Mget { .. }
+        | Command::Serve { .. }
+        | Command::Daemon(_)
+        | Command::Mcp { .. }
+        | Command::Stats { .. }
+        | Command::Metrics(_)
+        | Command::Eval(_)
+        | Command::History { .. }
+        | Command::Current { .. }
+        | Command::SupersededBy { .. }
+        | Command::Graph(_)
+        | Command::Setup(_)
+        | Command::Cheatsheet
+        | Command::Surface
+        | Command::Schema { .. }
+        | Command::Hook(_) => return Ok(None),
+    }))
 }

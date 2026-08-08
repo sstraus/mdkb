@@ -177,7 +177,7 @@ fn extract_bullet_points(content: &str) -> Vec<String> {
 }
 
 /// Result of a journal import operation.
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct JournalImportResult {
     /// IDs of created memory entries
     pub created: Vec<String>,

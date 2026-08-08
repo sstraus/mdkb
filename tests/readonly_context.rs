@@ -27,6 +27,112 @@ fn set_schema_version(root: &std::path::Path, v: i32) {
         .expect("set version");
 }
 
+const OPTIONAL_TABLES: &[&str] = &[
+    "sessions",
+    "tool_usage",
+    "call_log",
+    "query_events",
+    "experiments_schema_version",
+    "experiments",
+    "experiment_results",
+];
+
+fn drop_optional_tables(root: &std::path::Path) {
+    let conn = rusqlite::Connection::open(root.join(".mdkb/index.sqlite")).expect("open");
+    conn.execute_batch(
+        "DROP TABLE experiment_results;
+         DROP TABLE experiments;
+         DROP TABLE experiments_schema_version;
+         DROP TABLE query_events;
+         DROP TABLE call_log;
+         DROP TABLE tool_usage;
+         DROP TABLE sessions;",
+    )
+    .expect("remove optional tables from legacy fixture");
+}
+
+fn assert_optional_tables_exist(conn: &rusqlite::Connection) {
+    for table in OPTIONAL_TABLES {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1)",
+                [*table],
+                |row| row.get(0),
+            )
+            .expect("inspect schema");
+        assert!(exists, "optional table {table} was not initialized");
+    }
+}
+
+#[test]
+fn fresh_init_bootstraps_optional_read_schemas() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ctx = Context::init(dir.path()).expect("init");
+
+    assert_optional_tables_exist(&ctx.conn);
+}
+
+#[test]
+fn write_capable_open_backfills_optional_read_schemas() {
+    let (_dir, root) = store();
+    let conn = rusqlite::Connection::open(root.join(".mdkb/index.sqlite")).expect("open");
+    conn.execute_batch(
+        "DROP TABLE experiment_results;
+         DROP TABLE experiments;
+         DROP TABLE query_events;
+         DROP TABLE call_log;
+         DROP TABLE tool_usage;
+         DROP TABLE sessions;",
+    )
+    .expect("remove optional tables but retain experiment schema version");
+    drop(conn);
+
+    let ctx = Context::open(&root).expect("write-capable open");
+
+    assert_optional_tables_exist(&ctx.conn);
+}
+
+#[test]
+fn legacy_store_without_optional_tables_reads_as_empty() {
+    let (_dir, root) = store();
+    drop_optional_tables(&root);
+    let ctx = Context::open_read_only(&root).expect("read legacy store");
+
+    let report = mdkb::cli::stats_report::collect_report(&ctx).expect("stats report");
+    assert_eq!(report.sessions.total_sessions, 0);
+    assert_eq!(report.sessions.total_calls, 0);
+    assert!(report.sessions.top_tools.is_empty());
+
+    let metrics = mdkb::core::ops::handle_metrics_show(&ctx, 30).expect("metrics");
+    assert_eq!(metrics.total_queries, 0);
+    assert!(
+        mdkb::core::ops::handle_metrics_latency(&ctx)
+            .expect("latency")
+            .is_empty()
+    );
+    assert!(
+        mdkb::core::ops::handle_metrics_export(&ctx, 30)
+            .expect("export")
+            .is_empty()
+    );
+
+    assert!(
+        mdkb::core::ops::handle_experiment_status(&ctx, "missing")
+            .expect("experiment status")
+            .is_none()
+    );
+    assert!(
+        mdkb::core::ops::handle_experiment_list(&ctx, false)
+            .expect("experiment list")
+            .is_empty()
+    );
+    assert!(
+        mdkb::core::ops::handle_experiment_list(&ctx, true)
+            .expect("active experiment list")
+            .is_empty()
+    );
+}
+
 /// The connection must refuse writes at the SQLite level, not by convention.
 ///
 /// A promise not to write is worth nothing against a code path that forgets;
@@ -222,16 +328,35 @@ fn read_commands_leave_no_write_trace_on_the_store() {
         conn.pragma_update(None, "journal_mode", "DELETE")
             .expect("checkpoint");
     }
+    let code_db = root.join(".mdkb/code.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&code_db).expect("open code index");
+        conn.pragma_update(None, "journal_mode", "DELETE")
+            .expect("checkpoint code index");
+    }
     let wal = root.join(".mdkb/index.sqlite-wal");
     let shm = root.join(".mdkb/index.sqlite-shm");
+    let code_wal = root.join(".mdkb/code.sqlite-wal");
+    let code_shm = root.join(".mdkb/code.sqlite-shm");
     let home = tempfile::tempdir().expect("home");
 
-    // `stats` and `metrics` are deliberately NOT in this list. They record
-    // telemetry — session rows, call counts — so they are writers by design, and
-    // pretending otherwise would mean either dropping the telemetry or letting a
-    // "read" fail on a read-only connection. Routing their writes through the
-    // daemon is the remaining half of this story, not something to fake here.
-    for args in [vec!["graph", "hubs"], vec!["graph", "dangling"]] {
+    for args in [
+        vec!["collection", "list"],
+        vec!["search", "seeded", "--scope", "memory"],
+        vec!["get", "seeded"],
+        vec!["stats"],
+        vec!["metrics", "show"],
+        vec!["metrics", "latency"],
+        vec!["memory", "show", "seeded"],
+        vec!["memory", "list"],
+        vec!["memory", "search", "seeded"],
+        vec!["memory", "warmup"],
+        vec!["memory", "history", "seeded"],
+        vec!["experiment", "status", "missing"],
+        vec!["experiment", "list"],
+        vec!["graph", "hubs"],
+        vec!["graph", "dangling"],
+    ] {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
             .args(&args)
             .current_dir(&root)
@@ -246,10 +371,71 @@ fn read_commands_leave_no_write_trace_on_the_store() {
             String::from_utf8_lossy(&out.stderr)
         );
         assert!(
-            !wal.exists() && !shm.exists(),
+            !wal.exists() && !shm.exists() && !code_wal.exists() && !code_shm.exists(),
             "`mdkb {}` created WAL sidecars, so it held a write-capable \
-             connection to a store the daemon may also be writing",
-            args.join(" ")
+             connection to a store the daemon may also be writing: \
+             index={} code={}",
+            args.join(" "),
+            wal.exists() || shm.exists(),
+            code_wal.exists() || code_shm.exists(),
         );
     }
+
+    for (args, succeeds) in [
+        (vec!["search", "missing", "--scope", "code"], true),
+        (vec!["search", "missing", "--scope", "symbols"], true),
+        (vec!["code", "search", "missing"], true),
+        (vec!["code", "find", "missing"], true),
+        (vec!["code", "info"], true),
+        (vec!["code", "calls", "missing"], false),
+        (vec!["code", "callers", "missing"], false),
+        (vec!["code", "impact", "missing"], false),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
+            .args(&args)
+            .current_dir(&root)
+            .env("HOME", home.path())
+            .env("MDKB_NO_SPAWN", "1")
+            .output()
+            .expect("run code read");
+        assert_eq!(
+            out.status.success(),
+            succeeds,
+            "unexpected status for `mdkb {}`: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !wal.exists() && !shm.exists() && !code_wal.exists() && !code_shm.exists(),
+            "`mdkb {}` created SQLite sidecars: index={} code={}",
+            args.join(" "),
+            wal.exists() || shm.exists(),
+            code_wal.exists() || code_shm.exists(),
+        );
+    }
+}
+
+#[test]
+fn a_code_read_does_not_create_a_missing_index() {
+    let (_dir, root) = store();
+    let code_db = root.join(".mdkb/code.sqlite");
+    std::fs::remove_file(&code_db).expect("remove fixture code index");
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
+        .args(["code", "info"])
+        .current_dir(&root)
+        .env("MDKB_NO_SPAWN", "1")
+        .output()
+        .expect("run code info");
+
+    assert!(!out.status.success(), "a missing index must be reported");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("Code index not found"),
+        "error must explain how to create the index: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !code_db.exists(),
+        "a read must not create an empty code index"
+    );
 }

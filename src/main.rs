@@ -118,7 +118,7 @@ async fn run() -> Result<()> {
     result
 }
 
-async fn run_cli(cli: Cli) -> Result<()> {
+async fn run_cli(mut cli: Cli) -> Result<()> {
     // Set up tracing based on verbosity
     let level = match cli.verbose {
         0 => Level::WARN,
@@ -147,8 +147,8 @@ async fn run_cli(cli: Cli) -> Result<()> {
     };
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
-    // The daemon is the sole writer. A mutation the daemon already exposes an
-    // RPC for is sent over the hook socket instead of opening a second
+    // The daemon is the sole writer. Every mutation is sent over one typed
+    // internal RPC instead of opening a second
     // write-capable connection to a file the daemon is already writing — the
     // same client pattern `mdkb hook` uses (story 018-56b2).
     //
@@ -157,13 +157,13 @@ async fn run_cli(cli: Cli) -> Result<()> {
     // rather than failing: a routing layer that turns a daemon outage into a
     // broken CLI is worse than no routing (the lesson from 021-0636).
     #[cfg(unix)]
-    if mdkb::core::routing::should_route(&cli.command)
-        && let Some((method, params)) = mdkb::core::routing::daemon_method(&cli.command)
-    {
+    if mdkb::core::routing::should_route(&cli.command) {
         use mdkb::cli::hook_client::MutationFailure;
-        match mdkb::cli::hook_client::call_store_mutation(method, params, &cwd).await {
+        let request = mdkb::core::routing::mutation_request(&mut cli.command, &raw_cwd, &cwd)?
+            .ok_or_else(|| mdkb::Error::other("mutating command has no cli.mutate mapping"))?;
+        match mdkb::cli::hook_client::call_cli_mutation(&request, &cwd).await {
             Ok(result) => {
-                print_routed_result(&cli.command, method, &result, cli.format);
+                print_routed_result(&cli.command, &result, cli.format)?;
                 return Ok(());
             }
             // The daemon may be writing right now. Running the same mutation
@@ -172,14 +172,14 @@ async fn run_cli(cli: Cli) -> Result<()> {
             // to outlast a client's patience.
             Err(MutationFailure::Undetermined(e)) => {
                 return Err(mdkb::error::Error::other(format!(
-                    "{method}: the daemon took this request and did not report back ({e}). \
+                    "cli.mutate: the daemon took this request and did not report back ({e}). \
                      Not running it here — the daemon may still be writing. Check \
                      `mdkb daemon status`; if no daemon is running, re-run with \
                      MDKB_NO_DAEMON=1."
                 )));
             }
             Err(MutationFailure::Unstarted(e)) => {
-                tracing::info!("{method}: daemon did not run this ({e}); writing in-process");
+                tracing::info!("cli.mutate: daemon did not run this ({e}); writing in-process");
             }
         }
     }
@@ -191,7 +191,11 @@ async fn run_cli(cli: Cli) -> Result<()> {
             println!("Initialized .mdkb/ in {}", cwd.display());
         }
         Command::Collection(cmd) => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = if matches!(&cmd, CollectionCommand::List) {
+                Context::open_read_only(&cwd)?
+            } else {
+                Context::open(&cwd)?
+            };
             match cmd {
                 CollectionCommand::Add {
                     name,
@@ -228,7 +232,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             file,
             entry_type,
         } => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_read_only(&cwd)?;
             match scope.as_deref() {
                 Some("docs") => {
                     let results = handle_hybrid_search(
@@ -487,7 +491,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Command::Stats { no_color } => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_read_only(&cwd)?;
             let report = mdkb::cli::stats_report::collect_report(&ctx)?;
             if let mdkb::cli::OutputFormat::Json = cli.format {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -557,7 +561,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Command::Metrics(cmd) => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_read_only(&cwd)?;
             match cmd {
                 MetricsCommand::Show { period } => {
                     let metrics = handle_metrics_show(&ctx, period)?;
@@ -603,7 +607,19 @@ async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Command::Memory(cmd) => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = if matches!(
+                &cmd,
+                MemoryCommand::Show { .. }
+                    | MemoryCommand::List { .. }
+                    | MemoryCommand::Search { .. }
+                    | MemoryCommand::Warmup { .. }
+                    | MemoryCommand::History { .. }
+                    | MemoryCommand::Export { .. }
+            ) {
+                Context::open_read_only(&cwd)?
+            } else {
+                Context::open(&cwd)?
+            };
             match cmd {
                 MemoryCommand::Add {
                     id,
@@ -676,6 +692,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     agent,
                 } => {
                     handle_memory_link(&ctx, &id, &relation, &target, doc, agent.as_deref())?;
+                    println!("Linked {id} --{relation}--> {target}");
                 }
                 MemoryCommand::List { limit, status } => {
                     let entries = handle_memory_list(&ctx, limit, status.as_deref())?;
@@ -894,7 +911,14 @@ async fn run_cli(cli: Cli) -> Result<()> {
             }
         }
         Command::Experiment(cmd) => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = if matches!(
+                &cmd,
+                ExperimentCommand::Status { .. } | ExperimentCommand::List { .. }
+            ) {
+                Context::open_read_only(&cwd)?
+            } else {
+                Context::open(&cwd)?
+            };
             match cmd {
                 ExperimentCommand::Create {
                     name,
@@ -994,7 +1018,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
 {0} memory add <id> --title T --content C --source-type official_docs  # provenance/trust
 {0} memory add <id> --title T --content C --entry-type prior --tags t1,t2
 {0} memory add <id> --title T --content C --entry-type reminder --due-in 3600
-{0} memory confirm <id> --outcome confirmed            # raise confidence (or refuted) — daemon-less
+{0} memory confirm <id> --outcome confirmed            # raise confidence (or refuted)
 {0} memory link <id> <relation> <target>              # typed edge (supports|contradicts|supersedes|derived_from|relates_to)
 {0} memory link <id> derived_from <path> --doc        # link to a document; --agent records provenance
 {0} memory rm <id>                                     # delete
@@ -1442,47 +1466,269 @@ fn index_sessions_in_process(ctx: &Context, root: &Path) -> Option<mdkb::domain:
 /// and never prose: text formatted inside the daemon is text `--format json`
 /// cannot undo, and a routed update that reads differently from a direct one is
 /// a routing layer the user can feel.
+///
+/// One run produces one document. The phases used to print themselves in
+/// sequence, so `--format json` emitted three separate objects with prose
+/// headers between them and `--format csv` two tables plus a sentence — output
+/// that reads fine to a human and cannot be parsed by anything else, which is
+/// the entire point of asking for those formats.
 fn format_update_outcome(outcome: &UpdateOutcome, format: OutputFormat) {
-    format_update_result(&outcome.docs, format);
-
-    if let Some(stats) = &outcome.code {
-        println!("\nCode index:");
-        format_code_index_stats(stats, format);
+    match format {
+        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(outcome).unwrap()),
+        OutputFormat::Csv => print_update_outcome_csv(outcome),
+        OutputFormat::Markdown | OutputFormat::Text => {
+            format_update_result(&outcome.docs, format);
+            if let Some(stats) = &outcome.code {
+                println!("\nCode index:");
+                format_code_index_stats(stats, format);
+            }
+            if let Some(sr) = &outcome.sessions {
+                println!(
+                    "\nSessions: {} added, {} updated, {} unchanged, {} archived",
+                    sr.added, sr.updated, sr.unchanged, sr.sessions_archived
+                );
+            }
+        }
     }
+    // On stderr in every format, so a machine-readable run on stdout stays
+    // machine-readable and a failed code phase is still impossible to miss.
     if let Some(e) = &outcome.code_error {
         eprintln!("Warning: code reindexing failed: {e}");
     }
-    if let Some(sr) = &outcome.sessions {
-        println!(
-            "\nSessions: {} added, {} updated, {} unchanged, {} archived",
-            sr.added, sr.updated, sr.unchanged, sr.sessions_archived
-        );
+}
+
+/// One header, one row, every phase — a phase that did not run leaves its cells
+/// empty rather than dropping columns, so a caller can diff two runs.
+fn print_update_outcome_csv(outcome: &UpdateOutcome) {
+    println!(
+        "docs_indexed,added,updated,removed,unchanged,errors,\
+         code_files_discovered,code_files_indexed,code_files_removed,code_symbols_indexed,\
+         code_relationships,code_parse_errors,\
+         sessions_added,sessions_updated,sessions_unchanged,sessions_archived"
+    );
+
+    let d = &outcome.docs;
+    print!(
+        "{},{},{},{},{},{}",
+        d.docs_indexed(),
+        d.added,
+        d.updated,
+        d.removed,
+        d.unchanged,
+        d.errors.len()
+    );
+    match &outcome.code {
+        Some(c) => print!(
+            ",{},{},{},{},{},{}",
+            c.files_discovered,
+            c.files_indexed,
+            c.files_removed,
+            c.symbols_indexed,
+            c.relationships_collected,
+            c.parse_errors
+        ),
+        None => print!(",,,,,,"),
+    }
+    match &outcome.sessions {
+        Some(s) => println!(
+            ",{},{},{},{}",
+            s.added, s.updated, s.unchanged, s.sessions_archived
+        ),
+        None => println!(",,,,"),
     }
 }
 
 /// Print what the daemon returned for a routed mutation.
 ///
-/// `update` carries structured numbers this process renders; the rest carry a
-/// summary the daemon already rendered, and printing that is all there is to do.
+/// Every result remains structured across the socket; this CLI process owns
+/// all user-facing stdout and stderr formatting.
 fn print_routed_result(
     command: &Command,
-    method: &str,
-    result: &serde_json::Value,
+    result: &mdkb::core::cli_mutation::CliMutationResult,
     format: OutputFormat,
-) {
-    if matches!(command, Command::Update { .. }) {
-        match serde_json::from_value::<UpdateOutcome>(result["outcome"].clone()) {
-            Ok(outcome) => {
-                format_update_outcome(&outcome, format);
-                return;
+) -> Result<()> {
+    use mdkb::core::cli_mutation::{CliMutationResult as R, MemoryImportOutcome};
+    match (command, result) {
+        (Command::Update { .. }, R::Update { outcome }) => format_update_outcome(outcome, format),
+        (
+            Command::Embed { .. },
+            R::Embed {
+                generated,
+                skipped,
+                errors,
+            },
+        ) => format_embed_result(
+            &EmbedResult {
+                generated: *generated,
+                skipped: *skipped,
+                errors: errors.clone(),
+            },
+            format,
+        ),
+        (
+            Command::Compact { export, .. },
+            R::Compact {
+                prune,
+                index_bytes,
+                code_bytes,
+            },
+        ) => {
+            if let Some(summary) = prune {
+                if let Some(dir) = export
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .or_else(|| summary.export_dir.clone())
+                {
+                    eprintln!(
+                        "Pruned {} archived session(s); exported {} to {}",
+                        summary.pruned, summary.exported, dir
+                    );
+                } else {
+                    eprintln!("Pruned {} archived session(s)", summary.pruned);
+                }
             }
-            // The write happened and only the report is unreadable, so say so
-            // and print the daemon's own summary rather than failing a mutation
-            // that succeeded.
-            Err(e) => tracing::warn!("update: cannot read the daemon's result ({e})"),
+            eprintln!("index.sqlite vacuumed ({} KB)", index_bytes / 1024);
+            if let Some(bytes) = code_bytes {
+                eprintln!("code.sqlite vacuumed ({} KB)", bytes / 1024);
+            }
+        }
+        (Command::Collection(CollectionCommand::Add { name, .. }), R::CollectionAdded) => {
+            println!("Added collection '{name}'");
+        }
+        (
+            Command::Collection(CollectionCommand::Remove { name }),
+            R::CollectionRemoved { removed },
+        ) => {
+            if *removed {
+                println!("Removed collection '{name}'");
+            } else {
+                println!("Collection '{name}' not found");
+            }
+        }
+        (
+            Command::Collection(CollectionCommand::Rename { old_name, new_name }),
+            R::CollectionRenamed,
+        ) => println!("Renamed collection '{old_name}' to '{new_name}'"),
+        (Command::Memory(MemoryCommand::Add { id, .. }), R::MemoryAdded) => {
+            println!("Added memory entry '{id}'");
+        }
+        (Command::Memory(MemoryCommand::Confirm { .. }), R::MemoryConfirmed { outcome }) => {
+            match format {
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(outcome)?),
+                _ => println!("{}", outcome.message),
+            }
+        }
+        (
+            Command::Memory(MemoryCommand::Link {
+                id,
+                relation,
+                target,
+                ..
+            }),
+            R::MemoryLinked,
+        ) => println!("Linked {id} --{relation}--> {target}"),
+        (Command::Memory(MemoryCommand::Rm { id }), R::MemoryRemoved { deleted }) => {
+            if *deleted {
+                println!("Deleted memory entry '{id}'");
+            } else {
+                println!("Memory entry '{id}' not found");
+            }
+        }
+        (Command::Memory(MemoryCommand::Sync), R::MemorySynced { summary }) => {
+            println!(
+                "Projected: {}  Imported: {}  Adopted: {}  Conflicts: {}  Revived: {}  Archived: {}",
+                summary.projected,
+                summary.imported,
+                summary.adopted,
+                summary.conflicts,
+                summary.revived,
+                summary.archived
+            );
+            print_memory_sync_warnings(summary);
+        }
+        (
+            Command::Memory(MemoryCommand::Import { path, dry_run, .. }),
+            R::MemoryImported { outcome },
+        ) => match outcome {
+            MemoryImportOutcome::RestoreDryRun => println!("Dry run: would restore {path}"),
+            MemoryImportOutcome::Restored => println!("Restored 1 entry from {path}"),
+            MemoryImportOutcome::Bulk { outcome } => {
+                if *dry_run {
+                    println!("Dry run: would import {} entries", outcome.imported);
+                } else {
+                    println!("Imported {} entries", outcome.imported);
+                }
+                if outcome.skipped > 0 {
+                    println!("Skipped {} duplicates", outcome.skipped);
+                }
+                for error in &outcome.errors {
+                    eprintln!("Error: {error}");
+                }
+            }
+        },
+        (Command::Memory(MemoryCommand::Prune { days, dry_run }), R::MemoryPruned { ids }) => {
+            format_prune_result(ids, *days, *dry_run, format);
+        }
+        #[cfg(feature = "llm")]
+        (
+            Command::Memory(MemoryCommand::Condense { dry_run, .. }),
+            R::MemoryCondensed { outcome },
+        ) => format_condense_result(outcome, *dry_run, format),
+        (Command::Evolve(cmd), R::EvolutionCreated { id }) => match cmd {
+            EvolveCommand::Supersedes { new, old, .. } => {
+                println!("Created evolution relationship #{id}: {new} supersedes {old}");
+            }
+            EvolveCommand::Updates { new, old, .. } => {
+                println!("Created evolution relationship #{id}: {new} updates {old}");
+            }
+            EvolveCommand::Corrects { new, old, .. } => {
+                println!("Created evolution relationship #{id}: {new} corrects {old}");
+            }
+            EvolveCommand::Retracts { new, old, .. } => {
+                println!("Created evolution relationship #{id}: {new} retracts {old}");
+            }
+            EvolveCommand::Extends { new, old, .. } => {
+                println!("Created evolution relationship #{id}: {new} extends {old}");
+            }
+        },
+        (
+            Command::Experiment(ExperimentCommand::Create { .. }),
+            R::ExperimentCreated { id, name },
+        ) => println!("Created experiment '{name}' (ID: {id})"),
+        (
+            Command::Experiment(ExperimentCommand::End { name, .. }),
+            R::ExperimentEnded { winner },
+        ) => match winner {
+            Some(winner) => println!("Experiment '{name}' ended with winner: {winner}"),
+            None => println!("Experiment '{name}' ended with no significant winner"),
+        },
+        (Command::Experiment(ExperimentCommand::Cancel { name }), R::ExperimentCancelled) => {
+            println!("Experiment '{name}' cancelled");
+        }
+        (
+            Command::Journal(JournalCommand::Import { dry_run, .. }),
+            R::JournalImported { outcome },
+        ) => format_journal_import_result(outcome, *dry_run, format),
+        (
+            Command::Journal(JournalCommand::ImportAll { dry_run, .. }),
+            R::JournalsImported { outcomes },
+        ) => format_journal_import_all_results(outcomes, *dry_run, format),
+        (Command::Code(CodeCommand::Init), R::CodeInitialized) => {
+            println!("Initialized code index at .mdkb/code.sqlite");
+        }
+        (Command::Code(CodeCommand::Index { .. }), R::CodeIndexed { stats }) => {
+            format_code_index_stats(stats, format);
+        }
+        (Command::Session(SessionCommand::Index { .. }), R::SessionIndexed { outcome }) => {
+            format_update_result(outcome, format);
+        }
+        _ => {
+            return Err(mdkb::Error::other(
+                "cli.mutate returned a result for a different command",
+            ));
         }
     }
-    hook_client::print_tool_text(method, result);
+    Ok(())
 }
 
 fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputFormat) {

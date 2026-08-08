@@ -581,6 +581,18 @@ pub async fn call_store_mutation(
     call_daemon_phased(&socket_path, method, &params, MUTATION_TIMEOUT).await
 }
 
+/// Send the one typed internal CLI mutation request and decode its typed result.
+pub async fn call_cli_mutation(
+    mutation: &crate::core::cli_mutation::CliMutation,
+    root: &Path,
+) -> std::result::Result<crate::core::cli_mutation::CliMutationResult, MutationFailure> {
+    let params = serde_json::to_value(mutation)
+        .map_err(|e| MutationFailure::Unstarted(format!("serialize cli mutation: {e}")))?;
+    let value = call_store_mutation("cli.mutate", params, root).await?;
+    serde_json::from_value(value)
+        .map_err(|e| MutationFailure::Undetermined(format!("decode cli mutation result: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

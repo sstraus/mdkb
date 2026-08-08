@@ -141,10 +141,8 @@ fn git_commit_all(dir: &Path, msg: &str) {
 
 // ------------------------------------------------- AC2 / AC3: read isolation
 
-/// AC2: local telemetry must never reach the file. `access_count` and
-/// `last_accessed` change on every single read (`get_entry` bumps them), so a
-/// projection that carries them produces a diff per lookup and a merge conflict
-/// per pull — the directory would be unmergeable by construction.
+/// AC2: local telemetry must never reach the file. Projecting machine-local
+/// counters would produce irrelevant diffs and merge conflicts.
 #[test]
 fn projected_file_carries_no_local_telemetry() {
     let env = Env::new();
@@ -178,11 +176,15 @@ fn projected_file_carries_no_local_telemetry() {
 /// reconciliation pass that follows it, which is where a telemetry-carrying
 /// projection would actually rewrite the bytes.
 #[test]
-fn reading_an_entry_leaves_its_file_byte_identical() {
+fn cli_reads_leave_database_telemetry_and_projection_unchanged() {
     let env = Env::new();
     env.add("read-me", "Read Me", "body text");
     sync_memory_files(&env.ctx).expect("initial sync");
-    let before = env.read_file("read-me");
+    let before = std::fs::read(env.file("read-me")).expect("read projection");
+    let telemetry_before = {
+        let entry = env.get("read-me");
+        (entry.access_count, entry.last_accessed)
+    };
 
     for _ in 0..3 {
         handle_memory_show(&env.ctx, "read-me")
@@ -191,19 +193,20 @@ fn reading_an_entry_leaves_its_file_byte_identical() {
     }
 
     assert_eq!(
-        env.read_file("read-me"),
+        std::fs::read(env.file("read-me")).expect("read projection after CLI reads"),
         before,
         "three reads must leave the entry file byte-identical"
     );
+    let after_reads = env.get("read-me");
     assert_eq!(
-        env.get("read-me").access_count,
-        3,
-        "the reads must still be counted in the DB — otherwise this test cannot fail"
+        (after_reads.access_count, after_reads.last_accessed),
+        telemetry_before,
+        "read-only CLI handlers must not update access telemetry"
     );
 
     let s = sync_memory_files(&env.ctx).expect("resync");
     assert_eq!(
-        env.read_file("read-me"),
+        std::fs::read(env.file("read-me")).expect("read projection after reconciliation"),
         before,
         "reconciliation after reads must not rewrite the file"
     );
@@ -217,15 +220,32 @@ fn reading_an_entry_leaves_its_file_byte_identical() {
 /// contain only durable lines. Reads that happened in between must not smuggle
 /// themselves into the commit.
 #[test]
-fn a_read_never_appears_in_the_projection_diff() {
+fn repeated_cli_reads_do_not_affect_a_later_durable_projection_diff() {
     let env = Env::new();
     env.add("diffed", "First Title", "body text");
     sync_memory_files(&env.ctx).expect("initial sync");
     let before = env.read_file("diffed");
+    let before_bytes = std::fs::read(env.file("diffed")).expect("read projection");
+    let telemetry_before = {
+        let entry = env.get("diffed");
+        (entry.access_count, entry.last_accessed)
+    };
 
     for _ in 0..5 {
         handle_memory_show(&env.ctx, "diffed").expect("show");
     }
+    assert_eq!(
+        std::fs::read(env.file("diffed")).expect("read projection after CLI reads"),
+        before_bytes,
+        "repeated reads must leave projection bytes unchanged"
+    );
+    let after_reads = env.get("diffed");
+    assert_eq!(
+        (after_reads.access_count, after_reads.last_accessed),
+        telemetry_before,
+        "repeated reads must leave access telemetry unchanged"
+    );
+
     env.add("diffed", "Second Title", "body text"); // durable edit
     sync_memory_files(&env.ctx).expect("resync");
 
@@ -241,7 +261,12 @@ fn a_read_never_appears_in_the_projection_diff() {
             "only durable fields may appear in the diff, found `{line}` (all changed: {changed:?})"
         );
     }
-    assert_eq!(env.get("diffed").access_count, 5, "reads were real");
+    let after_edit = env.get("diffed");
+    assert_eq!(
+        (after_edit.access_count, after_edit.last_accessed),
+        telemetry_before,
+        "the durable edit must not retroactively add read telemetry"
+    );
 }
 
 // ------------------------------------------------------- AC4: file → DB
