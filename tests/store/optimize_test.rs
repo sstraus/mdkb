@@ -5,7 +5,8 @@
 //! corrupted `index.sqlite` pointer-map pages, so a freshly-opened database must
 //! stay in the historical `auto_vacuum = NONE` (0) mode with no pointer-map pages.
 
-use mdkb::cli::handlers::{Context, handle_init};
+use mdkb::cli::handlers::handle_init;
+use mdkb::core::Context;
 use mdkb::store::maintenance::{run_optimize, should_optimize};
 
 #[test]

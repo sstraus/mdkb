@@ -1,6 +1,7 @@
 //! End-to-end smoke tests for the reminder feature.
 
-use mdkb::cli::handlers::{Context, handle_init};
+use mdkb::cli::handlers::handle_init;
+use mdkb::core::Context;
 use mdkb::store::memory::{
     EntryStatus, EntryType, MemoryEntry, SourceType, add_entry, delete_entry, get_warmup_index,
 };

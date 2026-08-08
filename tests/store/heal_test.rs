@@ -7,7 +7,8 @@
 
 use std::fs;
 
-use mdkb::cli::handlers::{Context, handle_init};
+use mdkb::cli::handlers::handle_init;
+use mdkb::core::Context;
 
 /// Truncate the index file to half its length: a valid header over a torn
 /// b-tree — the structural damage class ordinary reads miss but `quick_check`

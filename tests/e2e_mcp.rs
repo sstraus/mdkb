@@ -16,7 +16,8 @@ use std::path::PathBuf;
 
 use tempfile::TempDir;
 
-use mdkb::cli::handlers::{Context, handle_collection_add, handle_init, handle_update};
+use mdkb::cli::handlers::{handle_collection_add, handle_init, handle_update};
+use mdkb::core::Context;
 use mdkb::domain::{SearchQuery, SearchResult};
 use mdkb::store::{collections, documents, memory, search, stats};
 

@@ -13,9 +13,10 @@ use std::fs;
 use std::sync::Arc;
 
 use mdkb::cli::handlers::{
-    Context, handle_collection_add, handle_embed, handle_hybrid_search, handle_init, handle_update,
+    handle_collection_add, handle_embed, handle_hybrid_search, handle_init, handle_update,
     handle_vsearch,
 };
+use mdkb::core::Context;
 use tempfile::TempDir;
 
 /// Set up a test environment with indexed documents.

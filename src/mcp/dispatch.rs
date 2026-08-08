@@ -19,7 +19,7 @@ use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
 
 use crate::cli::handlers::{
-    Context, handle_hybrid_search, handle_mget, handle_session_index, handle_update,
+    handle_hybrid_search, handle_mget, handle_session_index, handle_update,
 };
 use crate::cli::hook_logic::{
     REINDEX_TOOLS, build_recall_query, canonicalize_under_cwd, classify_bash_search,
@@ -27,6 +27,7 @@ use crate::cli::hook_logic::{
     tool_input_path,
 };
 use crate::code::indexing::IndexFacade;
+use crate::core::Context;
 use crate::daemon::registry::RepoHandle;
 use crate::domain::SearchResult;
 use crate::metrics::{
@@ -339,7 +340,7 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
 /// long-lived context immediately if the index is corrupt.
 ///
 /// Memory tools used to write directly through `RepoHandle::ctx`. That bypassed
-/// both the project lock and [`crate::cli::handlers::run_mutation`], so a daemon
+/// both the project lock and [`crate::core::run_mutation`], so a daemon
 /// could retain the live lock after detecting corruption and block its own
 /// quarantine indefinitely. The fresh-connection probe is intentional: the
 /// working connection's pager can report a file torn underneath it as healthy.
@@ -1916,7 +1917,7 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
         let root = handle.root.clone();
         let result = tokio::task::spawn_blocking(move || {
             let mut ctx_guard = ctx.blocking_lock();
-            crate::cli::handlers::run_mutation(&mut ctx_guard, "document update", |ctx| {
+            crate::core::run_mutation(&mut ctx_guard, "document update", |ctx| {
                 handle_update(ctx, &root)
             })
             .ok_or_else(|| "Database not initialized".to_string())?
@@ -1981,7 +1982,7 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
             let ctx = Arc::clone(&handle.ctx);
             let indexed = tokio::task::spawn_blocking(move || {
                 let mut ctx_guard = ctx.blocking_lock();
-                crate::cli::handlers::run_mutation(&mut ctx_guard, "session index", |ctx| {
+                crate::core::run_mutation(&mut ctx_guard, "session index", |ctx| {
                     handle_session_index(ctx, &sessions_base, &project_root)
                 })
             })

@@ -19,10 +19,11 @@ use tokio::sync::Mutex;
 
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 
-use crate::cli::handlers::{Context, handle_session_index, handle_update};
+use crate::cli::handlers::{handle_session_index, handle_update};
 use crate::code::indexing::IndexFacade;
 use crate::code::types::SymbolId;
 use crate::config::McpConfig;
+use crate::core::Context;
 use crate::domain::SearchResult;
 use crate::metrics::{UsageMetrics, count_tokens};
 use crate::store::{collections, documents, memory, stats};
@@ -1537,7 +1538,7 @@ async fn full_rebuild_from_heal(
             let ctx = Arc::clone(ctx);
             let indexed = tokio::task::spawn_blocking(move || {
                 let mut guard = ctx.blocking_lock();
-                crate::cli::handlers::run_mutation(&mut guard, "post-heal session index", |c| {
+                crate::core::run_mutation(&mut guard, "post-heal session index", |c| {
                     handle_session_index(c, &sessions_base, &project_root)
                 })
             })
@@ -1563,7 +1564,7 @@ async fn flush_doc_update(ctx: &Arc<Mutex<Option<Context>>>, root: &Path, needs_
     let root = root.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
         let mut guard = ctx.blocking_lock();
-        crate::cli::handlers::run_mutation(&mut guard, "doc reindex", |ctx_ref| {
+        crate::core::run_mutation(&mut guard, "doc reindex", |ctx_ref| {
             handle_update(ctx_ref, &root)
         })
     })

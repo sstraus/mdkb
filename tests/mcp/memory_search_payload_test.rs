@@ -7,7 +7,8 @@
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, RawContent};
 
-use mdkb::cli::handlers::{Context, handle_init};
+use mdkb::cli::handlers::handle_init;
+use mdkb::core::Context;
 use mdkb::mcp::server::McpServer;
 use mdkb::mcp::tools::SearchParams;
 use mdkb::store::memory::{self, EntryStatus, EntryType, MemoryEntry, SourceType};

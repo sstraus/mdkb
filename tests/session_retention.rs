@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use mdkb::cli::handlers::{
-    Context, handle_init, handle_prune_sessions, handle_session_index, parse_retention_secs,
+    handle_init, handle_prune_sessions, handle_session_index, parse_retention_secs,
 };
+use mdkb::core::Context;
 use mdkb::domain::{COLLECTION_CLAUDE_SESSIONS, SearchQuery};
 use mdkb::store::{documents, search};
 use tempfile::TempDir;

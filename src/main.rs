@@ -17,7 +17,7 @@ use mdkb::Result;
 use mdkb::cli::CodeCommand;
 use mdkb::cli::daemon as daemon_cli;
 use mdkb::cli::handlers::{
-    Context, EmbedResult, EvolutionHistoryEntry, handle_collection_add, handle_collection_list,
+    EmbedResult, EvolutionHistoryEntry, handle_collection_add, handle_collection_list,
     handle_collection_remove, handle_collection_rename, handle_current, handle_embed,
     handle_eval_judge, handle_eval_recall, handle_evolve_corrects, handle_evolve_extends,
     handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
@@ -42,6 +42,7 @@ use mdkb::cli::{
     RemoveHooksCommand, RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand,
     SetupMcpCommand, SetupRemoveCommand,
 };
+use mdkb::core::Context;
 use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;

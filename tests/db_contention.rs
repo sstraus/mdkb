@@ -5,7 +5,8 @@
 
 use std::time::{Duration, Instant};
 
-use mdkb::cli::handlers::{Context, handle_collection_add, handle_init, handle_update_force};
+use mdkb::cli::handlers::{handle_collection_add, handle_init, handle_update_force};
+use mdkb::core::Context;
 use mdkb::store::vectors;
 use rusqlite::params;
 use tempfile::TempDir;

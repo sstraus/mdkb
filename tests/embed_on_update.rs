@@ -12,8 +12,9 @@
 use std::path::PathBuf;
 
 use mdkb::cli::handlers::{
-    Context, handle_collection_add, handle_embed, handle_init, handle_update, handle_update_force,
+    handle_collection_add, handle_embed, handle_init, handle_update, handle_update_force,
 };
+use mdkb::core::Context;
 use mdkb::store::{documents, vectors};
 use tempfile::TempDir;
 

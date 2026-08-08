@@ -14,7 +14,8 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use mdkb::cli::handlers::{Context, handle_init, handle_memory_add};
+use mdkb::cli::handlers::{handle_init, handle_memory_add};
+use mdkb::core::Context;
 use serde_json::Value;
 
 fn mdkb_bin() -> &'static str {

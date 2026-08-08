@@ -13,8 +13,8 @@ use std::time::Duration;
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
-use mdkb::cli::handlers::Context;
 use mdkb::code::indexing::IndexFacade;
+use mdkb::core::Context;
 use mdkb::domain::Collection;
 use mdkb::mcp::server::{
     CODE_REINDEX_COUNT, DOC_REINDEX_COUNT, WATCHER_SPAWN_COUNT, run_file_watcher_inner,

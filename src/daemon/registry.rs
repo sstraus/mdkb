@@ -8,9 +8,9 @@ use dashmap::DashMap;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::cli::handlers::Context;
 use crate::code::indexing::IndexFacade;
 use crate::config::Config;
+use crate::core::Context;
 use crate::error::{Error, Result};
 
 use super::config::DaemonConfig;

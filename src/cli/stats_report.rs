@@ -8,7 +8,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::cli::handlers::Context;
+use crate::core::Context;
 use crate::domain::IndexStatus;
 use crate::error::Result;
 use crate::store::{collections, memory, search, stats};

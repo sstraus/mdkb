@@ -3,8 +3,9 @@
 use std::path::PathBuf;
 
 use mdkb::cli::handlers::{
-    Context, handle_init, handle_memory_export, handle_memory_import, handle_memory_import_dir,
+    handle_init, handle_memory_export, handle_memory_import, handle_memory_import_dir,
 };
+use mdkb::core::Context;
 use mdkb::store::memory::{self, EntryStatus, EntryType, MemoryEntry, SourceType};
 use tempfile::TempDir;
 

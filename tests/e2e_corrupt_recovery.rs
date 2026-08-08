@@ -17,8 +17,9 @@ use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use mdkb::cli::handlers::{Context, handle_init, handle_update, run_mutation};
+use mdkb::cli::handlers::{handle_init, handle_update};
 use mdkb::code::indexing::{IndexFacade, run_code_mutation};
+use mdkb::core::{Context, run_mutation};
 use mdkb::store::memory::{self, EntryStatus, EntryType, MemoryEntry, SourceType};
 use tempfile::TempDir;
 

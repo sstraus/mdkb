@@ -11,10 +11,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use mdkb::cli::handlers::{
-    Context, handle_init, handle_memory_add, handle_memory_import, handle_memory_show,
-    handle_update,
+    handle_init, handle_memory_add, handle_memory_import, handle_memory_show, handle_update,
 };
 use mdkb::config::Config;
+use mdkb::core::Context;
 use mdkb::daemon::registry::RepoHandle;
 use mdkb::mcp::dispatch::spawn_embedding_backfill;
 use mdkb::store::memory::{self, EntryStatus, EntryType, MemoryEntry, SourceType};
