@@ -631,6 +631,12 @@ pub fn handle_update_force(
         }
     }
 
+    // Read the per-collection document counts BEFORE indexing, so a collection
+    // that has since been unregistered can still be named. `documents` keeps its
+    // rows when a registration disappears, which is the only trace left of a
+    // collection that autoheal (or anything else) dropped.
+    let before = documents_per_collection(&ctx.conn).unwrap_or_default();
+
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult::default();
 
@@ -679,9 +685,124 @@ pub fn handle_update_force(
         }
     }
 
+    report_collection_deltas(ctx, &before, &mut result);
+
     crate::store::heal::verify_and_mark(&ctx.conn, &ctx.db_path)?;
 
     Ok(result)
+}
+
+/// Sidecar listing the collections registered at the end of the last successful
+/// update, keyed to document counts.
+///
+/// It lives OUTSIDE `index.sqlite` on purpose, and that is the whole point.
+/// Neither surviving trace inside the database works:
+/// * `documents.collection` has `ON DELETE CASCADE` onto `collections(name)`,
+///   so unregistering a collection erases its documents in the same statement;
+/// * an autoheal quarantine rebuilds the file empty, so both tables are gone
+///   together.
+///
+/// A file the database cannot cascade over is therefore the only thing that can
+/// answer "was this collection here last time?". It is advisory: a missing or
+/// unreadable snapshot degrades to "no previous run known", never to an error.
+fn collections_snapshot_path(ctx: &Context) -> PathBuf {
+    ctx.db_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("collections.snapshot.json")
+}
+
+fn read_collections_snapshot(ctx: &Context) -> BTreeMap<String, usize> {
+    std::fs::read_to_string(collections_snapshot_path(ctx))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn write_collections_snapshot(ctx: &Context, counts: &BTreeMap<String, usize>) {
+    if let Ok(json) = serde_json::to_string_pretty(counts) {
+        let _ = std::fs::write(collections_snapshot_path(ctx), json);
+    }
+}
+
+/// Documents currently indexed, keyed by collection name.
+fn documents_per_collection(conn: &Connection) -> Result<BTreeMap<String, usize>> {
+    let mut stmt = conn.prepare(
+        "SELECT collection, COUNT(*) FROM documents WHERE status != 'archived' GROUP BY collection",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Fill in the per-collection counts and the two loss signals.
+///
+/// Story 011-9a41: a collection of 2307 documents disappeared and `mdkb update`
+/// printed "Docs: 3 indexed (3 new, 0 changed)" and exited 0 — output a healthy
+/// store produces too. Recovery was `mdkb collection add map map && mdkb update`,
+/// found by accident several runs later when a spot-check query failed.
+///
+/// A vanished collection is put in `errors` as well as its own field: a caller
+/// that only checks `errors` (every hook and the MCP layer) would otherwise keep
+/// treating the run as clean, which is the failure being fixed rather than a
+/// second copy of it.
+fn report_collection_deltas(
+    ctx: &Context,
+    before: &BTreeMap<String, usize>,
+    result: &mut UpdateResult,
+) {
+    let registered = collections::list_collections(&ctx.conn).unwrap_or_default();
+    let after = documents_per_collection(&ctx.conn).unwrap_or_default();
+
+    result.collections = registered
+        .iter()
+        .map(|c| crate::domain::CollectionDelta {
+            name: c.name.clone(),
+            documents: after.get(&c.name).copied().unwrap_or(0),
+            previous: before.get(&c.name).copied(),
+        })
+        .collect();
+
+    // Held documents at the end of some previous run and is not registered now.
+    // The in-DB counts from the start of THIS run are unioned with the sidecar
+    // because each covers what the other cannot: the sidecar survives a cascade
+    // and a quarantine, while the live counts cover a store whose snapshot was
+    // never written (an upgrade, a hand-deleted sidecar).
+    let mut previous = read_collections_snapshot(ctx);
+    for (name, count) in before {
+        let slot = previous.entry(name.clone()).or_insert(0);
+        *slot = (*slot).max(*count);
+    }
+
+    let names: std::collections::HashSet<&str> =
+        registered.iter().map(|c| c.name.as_str()).collect();
+    for (name, count) in &previous {
+        if *count > 0 && !names.contains(name.as_str()) {
+            result.collections_vanished.push(name.clone());
+            result.errors.push(format!(
+                "collection `{name}` held {count} document(s) before this run and is no longer \
+                 registered — nothing re-registers it; restore with `mdkb collection add {name} \
+                 <path> && mdkb update`, and check `mdkb stats` for a quarantine that wiped it"
+            ));
+        }
+    }
+
+    result.no_collections_registered = registered.is_empty();
+    if result.no_collections_registered {
+        result.errors.push(
+            "no document collection is registered — this run indexed nothing. Register one with \
+             `mdkb collection add <name> <path>`."
+                .to_string(),
+        );
+    }
+
+    // Record what this run ended with, for the next run to compare against.
+    // Vanished collections are deliberately NOT carried forward: once reported,
+    // a deliberate `mdkb collection remove` must stop warning, or the message
+    // becomes permanent and gets ignored — which is how the original loss went
+    // unnoticed in the first place.
+    write_collections_snapshot(ctx, &after);
 }
 
 /// Detect and register convention-based collections.

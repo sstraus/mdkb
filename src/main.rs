@@ -1404,6 +1404,37 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
             if result.removed > 0 {
                 println!("Removed: {}", result.removed);
             }
+            // Per-collection, because the total above cannot distinguish a
+            // healthy re-index from one collection dropping to zero while
+            // another grows. A collection going 2307 -> absent is what this
+            // line exists to make visible.
+            for c in &result.collections {
+                let delta = match c.previous {
+                    Some(p) if p != c.documents => {
+                        format!(
+                            " ({}{})",
+                            if c.documents > p { "+" } else { "" },
+                            c.documents as i64 - p as i64
+                        )
+                    }
+                    _ => String::new(),
+                };
+                println!("  {:<24} {:>6} docs{delta}", c.name, c.documents);
+            }
+            for name in &result.collections_vanished {
+                println!(
+                    "⚠ Collection `{name}` was registered on a previous run and is GONE — \
+                     its documents are not indexed. Restore with \
+                     `mdkb collection add {name} <path> && mdkb update`, and check \
+                     `mdkb stats` for a quarantine."
+                );
+            }
+            if result.no_collections_registered {
+                println!(
+                    "⚠ No document collection is registered — this run indexed nothing. \
+                     Add one with `mdkb collection add <name> <path>`."
+                );
+            }
             if result.memory_embeddings_backfilled > 0 {
                 println!(
                     "Memory embeddings backfilled: {}",

@@ -220,8 +220,39 @@ pub struct UpdateResult {
     #[serde(default)]
     pub memory_gitignore_shadowed: Option<String>,
 
+    /// Per-collection document counts after this run.
+    ///
+    /// A single total cannot distinguish "everything was re-indexed" from "one
+    /// collection went to zero while another grew" — which is exactly the
+    /// ambiguity that let 2307 documents vanish behind the word "indexed".
+    #[serde(default)]
+    pub collections: Vec<CollectionDelta>,
+
+    /// Collections that held documents at the start of this run and are no
+    /// longer registered. Named, never silently omitted.
+    #[serde(default)]
+    pub collections_vanished: Vec<String>,
+
+    /// True when the store has no document collection registered at all. A run
+    /// like that indexes nothing, and "Docs: 0 indexed" reads identically to a
+    /// healthy no-op.
+    #[serde(default)]
+    pub no_collections_registered: bool,
+
     /// Errors encountered during indexing.
     pub errors: Vec<String>,
+}
+
+/// One collection's document count after an update.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionDelta {
+    pub name: String,
+    /// Documents currently indexed under this collection.
+    pub documents: usize,
+    /// Documents it held before this run, when that is known. `None` means the
+    /// collection is new to this store.
+    #[serde(default)]
+    pub previous: Option<usize>,
 }
 
 impl UpdateResult {

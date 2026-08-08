@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A quarantine no longer wipes collection registrations — this was the cause
+  of the "collection vanished" reports.** Autoheal rebuilds a corrupt index empty
+  and salvaged `memory_entries` and `memory_edges` out of the old file, and
+  nothing else. `collections` went with it, so the next `mdkb update` found no
+  collection registered, indexed only the repo root, printed a success line and
+  exited 0. On one store that turned 2046 indexed documents into 3; it was blamed
+  on an unrelated `.mdkb/config.toml` edit and found by accident several runs
+  later, when a spot-check query failed. The rule now applied is whether a table
+  can be re-derived from files still on disk: `documents`, `content` and `edges`
+  can, so a reindex rebuilds them; `collections` records the *decision* that a
+  directory is a collection and exists nowhere else. Also salvaged:
+  `memory_revisions` (edit history, and since v19 the losing side of every
+  file/DB conflict) and the mined behavioural priors. `evolution` is deliberately
+  excluded — its foreign keys point at `documents`, which the rebuild wipes.
+- **`mdkb update` reports per-collection counts and names a collection that
+  disappeared.** The old single total could not distinguish a healthy re-index
+  from one collection dropping to zero while another grew. A collection that held
+  documents on a previous run and is no longer registered is now named in the
+  output *and* pushed into `errors`, so a caller that only checks `errors` — every
+  hook, and the MCP layer — stops treating the run as clean. A store with no
+  collection registered at all says so instead of printing "Docs: 0 indexed".
+  Detection uses a `.mdkb/collections.snapshot.json` sidecar, because neither
+  in-database trace works: `documents.collection` cascades on delete, so
+  unregistering erases the evidence in the same statement, and a quarantine wipes
+  both tables together.
+
 ### Added
 
 - **Projection drift is reported by the standing health check, not only by the
