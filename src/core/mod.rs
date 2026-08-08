@@ -335,9 +335,11 @@ pub(crate) fn ensure_store_gitignore(memory_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+pub mod code;
 pub mod graph;
 pub mod indexing;
 pub mod memory;
 pub mod memory_sync;
+pub mod ops;
 pub mod search;
 pub mod sessions;

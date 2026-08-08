@@ -16,19 +16,19 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::core::ops::handle_embed;
+
 use rusqlite::Connection;
 
-use crate::cli::handlers::{
-    DOC_WALKER_DEFAULT_EXCLUDES, SingleFileInput, compile_collection_matcher, handle_embed,
-    index_single_file, index_specified_files,
-};
 use crate::code::indexing::walker::{WalkOptions, walk_files};
 use crate::config::Config;
 use crate::core::Context;
 use crate::core::memory_sync::sync_memory_files;
+use crate::domain::frontmatter::{ParsedDocument, parse_frontmatter};
 use crate::domain::{Collection, Document, UpdateResult};
 use crate::error::{Error, Result};
-use crate::store::{collections, documents, memory};
+use crate::store::evolution::RelationshipType;
+use crate::store::{collections, documents, evolution, memory};
 use std::collections::{HashMap, HashSet};
 
 /// Run `body` inside a BEGIN IMMEDIATE / COMMIT transaction.
@@ -564,4 +564,396 @@ pub fn handle_update_files_force(
     })?;
     crate::store::heal::verify_and_mark(&ctx.conn, &ctx.db_path)?;
     Ok(result)
+}
+/// Build/dependency directories pruned by the document walker by default.
+/// Applied as glob excludes through the unified walker; callers can extend
+/// this via a `.mdkbignore` (when `respect_gitignore=false`) or `.gitignore`.
+pub(crate) const DOC_WALKER_DEFAULT_EXCLUDES: &[&str] = &[
+    "**/target/**",
+    "**/node_modules/**",
+    "**/.git/**",
+    "**/vendor/**",
+    "**/dist/**",
+    "**/build/**",
+    "**/__pycache__/**",
+    "**/.tox/**",
+    "**/.venv/**",
+];
+/// Compile a collection's glob pattern with POSIX-correct separator handling.
+///
+/// globset defaults to letting `*` cross `/`, so a non-recursive pattern like
+/// `*.md` (the `_root` convention) would recursively swallow the whole tree and
+/// duplicate every other collection's documents. `literal_separator(true)` stops
+/// `*`/`?` from crossing `/` while `**` stays recursive — so `docs/**/*.md` is
+/// unaffected and `*.md` matches only top-level files.
+pub(crate) fn compile_collection_matcher(
+    pattern: &str,
+) -> std::result::Result<globset::GlobMatcher, globset::Error> {
+    Ok(globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher())
+}
+/// Index a single file within a transaction. Shared by `update_collection` and
+/// `handle_update_files` to avoid duplicating the mtime/read/index/evolution pipeline.
+///
+/// `existing_doc` is the previously indexed version (if any). Pass `None` for new files.
+/// All errors are soft — pushed to `result.errors` and the caller continues.
+pub(crate) struct SingleFileInput<'a> {
+    pub(crate) ctx: &'a Context,
+    pub(crate) collection_name: &'a str,
+    pub(crate) abs_path: &'a Path,
+    pub(crate) relative: String,
+    pub(crate) existing_doc: Option<&'a Document>,
+    pub(crate) display_name: &'a str,
+    pub(crate) graph_cfg: &'a crate::config::GraphConfig,
+    pub(crate) force: bool,
+}
+pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateResult) {
+    let SingleFileInput {
+        ctx,
+        collection_name,
+        abs_path,
+        relative,
+        existing_doc,
+        display_name,
+        graph_cfg,
+        force,
+    } = input;
+    // Read file metadata for mtime
+    let metadata = match std::fs::metadata(abs_path) {
+        Ok(m) => m,
+        Err(e) => {
+            result.errors.push(format!(
+                "Failed to read metadata for {}: {}",
+                display_name, e
+            ));
+            return;
+        }
+    };
+
+    let file_mtime = match metadata.modified() {
+        Ok(t) => t
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+            .unwrap_or_else(|_| {
+                tracing::warn!(file = %display_name, "mtime before epoch; forcing reindex");
+                i64::MAX
+            }),
+        Err(e) => {
+            tracing::warn!(
+                file = %display_name,
+                error = %e,
+                "Cannot read mtime; forcing reindex"
+            );
+            i64::MAX
+        }
+    };
+
+    // Check if document needs reindexing based on mtime (--force reprocesses all,
+    // so config changes like graph relations reach already-indexed documents).
+    let needs_index = match existing_doc {
+        Some(_) if force => true,
+        Some(doc) => file_mtime > doc.indexed_at,
+        None => true,
+    };
+
+    if !needs_index {
+        result.unchanged += 1;
+        return;
+    }
+
+    // Read and index the file
+    let content = match std::fs::read_to_string(abs_path) {
+        Ok(c) => c,
+        Err(e) => {
+            result
+                .errors
+                .push(format!("Failed to read {}: {}", display_name, e));
+            return;
+        }
+    };
+
+    let parsed = parse_frontmatter(&content);
+    let now = chrono::Utc::now().timestamp();
+
+    let doc = Document {
+        id: existing_doc.map(|d| d.id).unwrap_or(0),
+        collection: collection_name.to_string(),
+        relative_path: relative,
+        hash: String::new(), // Will be computed by index_document
+        title: parsed.title.clone(),
+        metadata: parsed.frontmatter.clone(),
+        file_modified_at: file_mtime,
+        indexed_at: now,
+        status: None,
+    };
+
+    match documents::index_document_in_tx(&ctx.conn, &doc, &content) {
+        Ok(doc_id) => {
+            if existing_doc.is_some() {
+                result.updated += 1;
+            } else {
+                result.added += 1;
+            }
+
+            if has_evolution_refs(&parsed) {
+                process_frontmatter_evolution(&ctx.conn, doc_id, collection_name, &parsed);
+            }
+
+            if graph_cfg.enabled {
+                process_graph_edges(&ctx.conn, doc_id, &parsed, graph_cfg);
+            }
+        }
+        Err(e) => {
+            result
+                .errors
+                .push(format!("Failed to index {}: {}", display_name, e));
+        }
+    }
+}
+/// Process each user-supplied file path within a transaction.
+pub(crate) fn index_specified_files(
+    ctx: &Context,
+    canonical_root: &Path,
+    matchers: &[(&Collection, globset::GlobMatcher, PathBuf)],
+    files: &[String],
+    graph_cfg: &crate::config::GraphConfig,
+    force: bool,
+    result: &mut UpdateResult,
+) -> Result<()> {
+    for file_arg in files {
+        let file_path = PathBuf::from(file_arg);
+
+        // Resolve to absolute path
+        let abs_path = if file_path.is_absolute() {
+            file_path
+        } else {
+            canonical_root.join(&file_path)
+        };
+
+        // Canonicalize once per file for security check + collection matching
+        let canonical_file = match abs_path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                result
+                    .errors
+                    .push(format!("Cannot resolve '{}': {}", file_arg, e));
+                continue;
+            }
+        };
+
+        // Guard: file must resolve within root (path traversal protection, P2-SEC-001)
+        if !canonical_file.starts_with(canonical_root) {
+            result.errors.push(format!(
+                "File '{}' escapes root directory (path traversal blocked)",
+                file_arg
+            ));
+            continue;
+        }
+
+        // Find which collection this file belongs to
+        let matched = matchers.iter().find_map(|(coll, matcher, canonical_base)| {
+            let relative = canonical_file
+                .strip_prefix(canonical_base)
+                .ok()?
+                .to_string_lossy()
+                .to_string();
+
+            if matcher.is_match(&relative) {
+                Some((*coll, relative))
+            } else {
+                None
+            }
+        });
+
+        let Some((collection, relative)) = matched else {
+            continue;
+        };
+
+        // Look up existing document for mtime comparison
+        let existing_doc = documents::get_document_by_path(&ctx.conn, &collection.name, &relative)?;
+
+        index_single_file(
+            SingleFileInput {
+                ctx,
+                collection_name: &collection.name,
+                abs_path: &canonical_file,
+                relative,
+                existing_doc: existing_doc.as_ref(),
+                display_name: file_arg,
+                graph_cfg,
+                force,
+            },
+            result,
+        );
+    }
+    Ok(())
+}
+/// Process evolution references from frontmatter after document indexing.
+///
+/// This is called during the indexing phase to automatically create evolution
+/// relationships based on frontmatter fields like `supersedes`, `updates`, etc.
+/// Invalid references (pointing to non-existent documents) are logged as warnings
+/// but don't fail the indexing operation.
+fn process_frontmatter_evolution(
+    conn: &Connection,
+    source_doc_id: i64,
+    collection: &str,
+    parsed: &ParsedDocument,
+) {
+    // Helper to resolve path to doc ID
+    let resolve_path = |path: &str| -> Option<i64> {
+        // First try the path as-is in the same collection
+        if let Ok(Some(doc)) = documents::get_document_by_path(conn, collection, path) {
+            return Some(doc.id);
+        }
+        // Try without leading "./" or "/"
+        let clean_path = path.trim_start_matches("./").trim_start_matches('/');
+        if clean_path != path {
+            if let Ok(Some(doc)) = documents::get_document_by_path(conn, collection, clean_path) {
+                return Some(doc.id);
+            }
+        }
+        None
+    };
+
+    // Process supersedes
+    for evo_ref in &parsed.supersedes {
+        if let Some(target_id) = resolve_path(&evo_ref.path) {
+            if let Err(e) = evolution::add_evolution(
+                conn,
+                source_doc_id,
+                target_id,
+                RelationshipType::Supersedes,
+                None,
+                evo_ref.reason.as_deref(),
+            ) {
+                tracing::warn!("Failed to add supersedes evolution: {e}");
+            }
+        } else {
+            tracing::warn!(
+                "Evolution: supersedes reference '{}' not found, skipping",
+                evo_ref.path
+            );
+        }
+    }
+
+    // Process updates
+    for evo_ref in &parsed.updates {
+        if let Some(target_id) = resolve_path(&evo_ref.path) {
+            if let Err(e) = evolution::add_evolution(
+                conn,
+                source_doc_id,
+                target_id,
+                RelationshipType::Updates,
+                evo_ref.scope.as_deref(),
+                evo_ref.reason.as_deref(),
+            ) {
+                tracing::warn!("Failed to add updates evolution: {e}");
+            }
+        } else {
+            tracing::warn!(
+                "Evolution: updates reference '{}' not found, skipping",
+                evo_ref.path
+            );
+        }
+    }
+
+    // Process corrects
+    for evo_ref in &parsed.corrects {
+        if let Some(target_id) = resolve_path(&evo_ref.path) {
+            if let Err(e) = evolution::add_evolution(
+                conn,
+                source_doc_id,
+                target_id,
+                RelationshipType::Corrects,
+                None,
+                evo_ref.reason.as_deref(),
+            ) {
+                tracing::warn!("Failed to add corrects evolution: {e}");
+            }
+        } else {
+            tracing::warn!(
+                "Evolution: corrects reference '{}' not found, skipping",
+                evo_ref.path
+            );
+        }
+    }
+
+    // Process extends
+    for evo_ref in &parsed.extends {
+        if let Some(target_id) = resolve_path(&evo_ref.path) {
+            if let Err(e) = evolution::add_evolution(
+                conn,
+                source_doc_id,
+                target_id,
+                RelationshipType::Extends,
+                None,
+                evo_ref.reason.as_deref(),
+            ) {
+                tracing::warn!("Failed to add extends evolution: {e}");
+            }
+        } else {
+            tracing::warn!(
+                "Evolution: extends reference '{}' not found, skipping",
+                evo_ref.path
+            );
+        }
+    }
+}
+/// Check if a parsed document has any evolution references.
+fn has_evolution_refs(parsed: &ParsedDocument) -> bool {
+    !parsed.supersedes.is_empty()
+        || !parsed.updates.is_empty()
+        || !parsed.corrects.is_empty()
+        || !parsed.extends.is_empty()
+}
+/// Populate knowledge-graph edges for a freshly indexed document.
+///
+/// Replaces the document's outgoing edges (idempotent re-index): edges from
+/// allowlisted frontmatter keys (strong) and body wikilinks (soft). Target refs
+/// are stored verbatim — dangling targets survive and resolve on later indexing.
+pub(crate) fn process_graph_edges(
+    conn: &Connection,
+    doc_id: i64,
+    parsed: &ParsedDocument,
+    cfg: &crate::config::GraphConfig,
+) {
+    use crate::store::graph;
+
+    if let Err(e) = graph::delete_edges_for_source(conn, doc_id) {
+        tracing::warn!("Graph: failed to clear edges for doc {doc_id}: {e}");
+        return;
+    }
+
+    for key in &cfg.frontmatter_relations {
+        for target in
+            crate::domain::frontmatter::extract_relation_refs(parsed.frontmatter.as_ref(), key)
+        {
+            if let Err(e) =
+                graph::add_edge(conn, doc_id, &target, key, graph::KIND_FRONTMATTER, None)
+            {
+                tracing::warn!("Graph: failed to add frontmatter edge '{key}->{target}': {e}");
+            }
+        }
+    }
+
+    if cfg.include_wikilinks {
+        for link in crate::domain::links::extract_wiki_links(&parsed.body) {
+            if let Err(e) = graph::add_edge(
+                conn,
+                doc_id,
+                &link.target,
+                graph::RELATION_WIKILINK,
+                graph::KIND_WIKILINK,
+                None,
+            ) {
+                tracing::warn!(
+                    "Graph: failed to add wikilink edge -> '{}': {e}",
+                    link.target
+                );
+            }
+        }
+    }
 }
