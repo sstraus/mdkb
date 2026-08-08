@@ -436,6 +436,35 @@ async fn send_and_read(mut stream: UnixStream, body: &[u8]) -> std::io::Result<V
     Ok(buf)
 }
 
+/// Send a store mutation to the daemon over the hook socket.
+///
+/// The daemon is the sole writer (story 018-56b2): the plain CLI used to open
+/// its own write-capable connection for every `mdkb memory add`, racing the
+/// long-lived daemon on one file. This is the same client pattern `mdkb hook`
+/// uses, deliberately — one socket, one protocol, one thing to debug.
+///
+/// `Err` means the daemon could not do it, and the caller MUST fall back to
+/// running in-process. Returning an error rather than swallowing it is the
+/// difference from `run_hook`: a hook that silently does nothing is acceptable
+/// (the host must exit 0), a mutation that silently does nothing is data loss.
+pub async fn call_store_mutation(method: &str, params: Value, root: &Path) -> Result<()> {
+    let mut params = params;
+    params["root"] = json!(root.display().to_string());
+
+    let socket_path = hook_socket_path();
+    let timeout = hook_timeout(method);
+    match call_daemon_with_timeout(&socket_path, method, &params, timeout).await {
+        Ok(response) => {
+            emit_hook_response(&response);
+            Ok(())
+        }
+        Err(e) => {
+            tracing::info!("{method}: daemon unavailable ({e}); writing in-process");
+            Err(Error::other(e))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -664,34 +693,5 @@ mod tests {
             result.get("hookSpecificOutput").is_some(),
             "result: {result}"
         );
-    }
-}
-
-/// Send a store mutation to the daemon over the hook socket.
-///
-/// The daemon is the sole writer (story 018-56b2): the plain CLI used to open
-/// its own write-capable connection for every `mdkb memory add`, racing the
-/// long-lived daemon on one file. This is the same client pattern `mdkb hook`
-/// uses, deliberately — one socket, one protocol, one thing to debug.
-///
-/// `Err` means the daemon could not do it, and the caller MUST fall back to
-/// running in-process. Returning an error rather than swallowing it is the
-/// difference from `run_hook`: a hook that silently does nothing is acceptable
-/// (the host must exit 0), a mutation that silently does nothing is data loss.
-pub async fn call_store_mutation(method: &str, params: Value, root: &Path) -> Result<()> {
-    let mut params = params;
-    params["root"] = json!(root.display().to_string());
-
-    let socket_path = hook_socket_path();
-    let timeout = hook_timeout(method);
-    match call_daemon_with_timeout(&socket_path, method, &params, timeout).await {
-        Ok(response) => {
-            emit_hook_response(&response);
-            Ok(())
-        }
-        Err(e) => {
-            tracing::info!("{method}: daemon unavailable ({e}); writing in-process");
-            Err(Error::other(e))
-        }
     }
 }
