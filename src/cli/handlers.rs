@@ -2198,12 +2198,9 @@ fn committed_deletions(
 
 /// Move an entry to archive directory.
 fn archive_entry_on_disk(ctx: &Context, id: &str) -> Result<()> {
-    let entry_path = ctx.memory_dir().join("entries").join(format!("{}.md", id));
-    let archive_path = ctx.memory_dir().join("archive").join(format!("{}.md", id));
-
-    if entry_path.exists() {
-        std::fs::rename(entry_path, archive_path)?;
-    }
+    // One disposal rule, shared with the migration path — see
+    // `memory_file::archive_projection` for why a second copy was a bug.
+    crate::store::memory_file::archive_projection(&ctx.memory_dir(), id)?;
     Ok(())
 }
 

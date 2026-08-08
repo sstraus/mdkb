@@ -105,6 +105,47 @@ impl MemoryFile {
     }
 }
 
+/// Retire an entry's markdown projection: move `entries/<id>.md` to
+/// `archive/<id>.md`.
+///
+/// The single disposal rule. Every path that removes a row must go through it —
+/// `mdkb memory rm` did, and the v11 → v12 prior purge did not, which is how 113
+/// files ended up on disk with `status: active` frontmatter and no row behind
+/// them. Once bidirectional sync landed, those files stopped being litter and
+/// became a correctness bug: a file with no row is imported, so the purge would
+/// undo itself on the next update.
+///
+/// Archive rather than delete, deliberately. A retired entry is still the only
+/// copy of whatever it said, and a migration is the worst possible moment to
+/// make a deletion permanent. Missing file is success — disposal is idempotent
+/// by construction, so a re-run of any caller is safe.
+pub fn archive_projection(memory_dir: &std::path::Path, id: &str) -> std::io::Result<()> {
+    let from = memory_dir.join("entries").join(format!("{id}.md"));
+    if !from.exists() {
+        return Ok(());
+    }
+    let archive_dir = memory_dir.join("archive");
+    std::fs::create_dir_all(&archive_dir)?;
+    std::fs::rename(from, archive_dir.join(format!("{id}.md")))
+}
+
+/// The store's `memory/` directory, derived from an open connection.
+///
+/// Migrations run with nothing but a `Connection` — no `Context`, no config —
+/// yet a migration that deletes rows has to dispose of their files. SQLite knows
+/// where its own file is, and `memory/` sits beside it, so the path is
+/// recoverable without threading one through every migration signature.
+///
+/// `None` for an in-memory or unnamed database, where there is no projection to
+/// dispose of anyway.
+pub fn memory_dir_of(conn: &rusqlite::Connection) -> Option<std::path::PathBuf> {
+    let path = conn.path()?;
+    if path.is_empty() || path == ":memory:" {
+        return None;
+    }
+    Some(std::path::Path::new(path).parent()?.join("memory"))
+}
+
 /// Serialize a [`MemoryEntry`] to a markdown file with YAML frontmatter.
 ///
 /// **Durable fields only.** The file is git-tracked and shared between clones, so

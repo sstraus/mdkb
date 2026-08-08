@@ -4,7 +4,102 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 19;
+pub const SCHEMA_VERSION: i32 = 20;
+
+/// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
+/// One spelling, used by both the v12 purge and the v20 sweep that cleans up
+/// after it — two copies of this pattern is how the two halves drifted apart.
+const LEGACY_PRIOR_PREDICATE: &str = "entry_type = 'prior' AND id GLOB \
+     'prior-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]\
+[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'";
+
+/// Ids the v12 purge is responsible for, read before the rows go away.
+fn legacy_prior_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM memory_entries WHERE {LEGACY_PRIOR_PREDICATE}"
+    ))?;
+    let ids = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    Ok(ids)
+}
+
+/// Retire the markdown projection of rows a migration removed.
+///
+/// Best-effort: a schema migration must not fail because a file could not be
+/// renamed. A file left behind is reported by the drift count in `mdkb stats`
+/// and swept on a later run; a migration that aborts halfway leaves a store
+/// nobody can open.
+fn dispose_projections(conn: &Connection, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let Some(memory_dir) = crate::store::memory_file::memory_dir_of(conn) else {
+        return;
+    };
+    for id in ids {
+        if let Err(e) = crate::store::memory_file::archive_projection(&memory_dir, id) {
+            tracing::warn!("migration: could not archive projection for {id}: {e}");
+        }
+    }
+}
+
+/// Archive every `entries/prior-<16 hex>.md` that has no row behind it.
+///
+/// Best-effort like [`dispose_projections`], and for the same reason: a store
+/// that cannot be opened is worse than a file left on disk.
+fn sweep_orphaned_legacy_priors(conn: &Connection) {
+    let Some(memory_dir) = crate::store::memory_file::memory_dir_of(conn) else {
+        return;
+    };
+    let Ok(read_dir) = std::fs::read_dir(memory_dir.join("entries")) else {
+        return;
+    };
+    let mut swept = 0usize;
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("md") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if !is_legacy_prior_filename(stem) {
+            continue;
+        }
+        let has_row: bool = conn
+            .query_row("SELECT 1 FROM memory_entries WHERE id = ?1", [stem], |_| {
+                Ok(true)
+            })
+            .unwrap_or(false);
+        if has_row {
+            continue;
+        }
+        match crate::store::memory_file::archive_projection(&memory_dir, stem) {
+            Ok(()) => swept += 1,
+            Err(e) => tracing::warn!("migration: could not archive orphaned prior {stem}: {e}"),
+        }
+    }
+    if swept > 0 {
+        tracing::warn!(
+            "migration: archived {swept} orphaned legacy prior projection(s) left by the \
+             v11->v12 purge; they are in .mdkb/memory/archive/"
+        );
+    }
+}
+
+/// Does this filename look like a legacy System-B prior projection?
+///
+/// Matches the SQL predicate above in Rust, for the sweep — which works from
+/// filenames, since by definition the rows are already gone.
+fn is_legacy_prior_filename(stem: &str) -> bool {
+    stem.strip_prefix("prior-").is_some_and(|hex| {
+        hex.len() == 16
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    })
+}
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -514,12 +609,14 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // (e.g. `canvas-terminal-dont-reinvent-xterm`). Deletes cascade to FTS,
     // embeddings, and revisions via existing triggers/foreign keys.
     if from_version < 12 {
+        // Collect before deleting: after the DELETE there is nothing left to say
+        // which files the purge is responsible for.
+        let purged = legacy_prior_ids(conn)?;
         conn.execute(
-            "DELETE FROM memory_entries
-             WHERE entry_type = 'prior'
-             AND id GLOB 'prior-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'",
+            &format!("DELETE FROM memory_entries WHERE {LEGACY_PRIOR_PREDICATE}"),
             [],
         )?;
+        dispose_projections(conn, &purged);
     }
 
     // Migration from v12 to v13: behavioral-prior mining tables (prior_clusters,
@@ -665,6 +762,24 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 [],
             )?;
         }
+    }
+
+    // Migration from v19 to v20: sweep the projections the v12 prior purge left
+    // behind. A store that migrated before the purge learned to dispose of its
+    // files is already past v12, so replaying that migration will never reach
+    // it — the heal has to be its own one-time step, which is exactly what a
+    // migration is for. Measured on one store: 113 files, every one matching the
+    // purge pattern, all with `status: active` frontmatter and no row.
+    //
+    // Since bidirectional sync (v19) these are not litter but a live bug: a file
+    // with no row is imported, so the next `mdkb update` would resurrect the
+    // rows the purge deleted.
+    //
+    // Only files whose id has the legacy shape AND has no row are touched. A
+    // colleague's entry arriving in a checkout also has no row, and must still
+    // import.
+    if from_version < 20 {
+        sweep_orphaned_legacy_priors(conn);
     }
 
     // Update schema version
