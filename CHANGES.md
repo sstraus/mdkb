@@ -4,6 +4,23 @@
 
 ### Added
 
+- **Store mutations route through the daemon.** `mdkb mcp` and `mdkb hook`
+  already did; the plain CLI never adopted the pattern, so every `mdkb memory
+  add` was an independent writer process — its own connection, its own migration
+  run, its own virtual-table init — racing the long-lived daemon on one file.
+  Commands are now classified as mutation, read or local, with no wildcard: a new
+  command that nobody classified fails to *compile* rather than defaulting to a
+  direct write. Mutations the daemon exposes an RPC for go over the hook socket;
+  an unreachable daemon falls back to writing in-process, because a routing layer
+  that turns a daemon outage into a broken CLI is worse than no routing.
+  `MDKB_NO_DAEMON=1` remains the single escape hatch and the only way a CLI
+  process writes directly. **The coverage is partial and deliberately visible:**
+  the daemon exposes RPCs for the memory write path and `update` — where the
+  recurring corruption is confined — and `core::routing::routing_gap()`
+  enumerates the mutations that still run in-process. This narrows the corruption
+  search space; it does not prove the corruption fixed, since a cause inside the
+  in-process sqlite-vec extension would be unaffected by a single writer.
+
 - **A read-only store path, so a read stops being a write.** Opening the store
   ran migrations, created the FTS and vector virtual tables and initialized the
   stats schema — on *every* open, including the ones that only wanted to answer a
