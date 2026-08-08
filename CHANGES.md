@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A routed mutation no longer becomes the second writer it was meant to
+  remove.** The routing gave the daemon 30 seconds and then ran the mutation
+  in-process regardless — so a `mdkb update` the daemon was still working on had
+  the CLI open its own write connection alongside it, on the longest write in the
+  program. The client now classifies by *execution evidence*, not by symptom: the
+  only question is whether the daemon can have started writing. A request that
+  never arrived, one cut short mid-frame, or one the daemon refused before
+  dispatch (unknown method, missing `root`, a repo outside its whitelist) is
+  proof that nothing ran, and the CLI finishes the job itself. Anything after the
+  last request byte — silence, a dropped connection, a failure from inside a
+  dispatched method — leaves the outcome unknown, and the CLI fails loudly
+  naming the daemon rather than guessing (invariant I3). The boundary is a
+  contract, not an inference: `daemon::ipc_server::DISPATCHED_ERROR_CODE` is the
+  single code emitted post-dispatch, and a daemon-side test fails if any
+  admission refusal starts wearing it. Mutations also stopped borrowing the hook
+  deadline, which is sized so an editor keystroke never stalls; a write gets an
+  hour, because a full `update` walks the tree, embeds and reindexes the code
+  graph.
+
+- **Routed `update` kept its arguments.** Over the daemon, `--force` was dropped
+  and `--files` reindexed the whole tree: the RPC carried neither, so a targeted
+  update silently became a full one and a forced update silently became a no-op.
+  Both now travel with the request, and the daemon returns counts rather than
+  printed text, so `--format` is honoured on the routed path the same way it is
+  in-process. A targeted in-process update whose code phase fails now says so on
+  stderr instead of only tracing it.
+
 ### Added
 
 - **Store mutations route through the daemon.** `mdkb mcp` and `mdkb hook`

@@ -324,6 +324,20 @@ async fn handle_hook_conn(
     }
 }
 
+/// The only error code this server emits once a method has been dispatched.
+///
+/// Every other code is a refusal at admission — a parse failure, a missing
+/// `root`, an unknown method, a repo outside the whitelist — raised before
+/// `dispatch_call` is entered and therefore proof that nothing was executed.
+/// `cli::hook_client` keys on exactly that: a refusal lets the caller run the
+/// mutation itself, and this code does not, because a method that got as far as
+/// running may have written before it failed.
+///
+/// Pinned by `refusals_before_dispatch_never_use_the_dispatched_error_code`. Anything
+/// that widens this — a second post-dispatch code, or reusing this one for a
+/// pre-dispatch check — silently changes when the CLI is allowed to write.
+pub const DISPATCHED_ERROR_CODE: i32 = -32603;
+
 /// Parse a JSON-RPC request and route it through `dispatch_call`.
 ///
 /// `params.root` is the absolute path to the target repository — required for
@@ -591,6 +605,60 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","id":1}"#;
         let resp = dispatch_hook_message(body, &make_registry(), &make_dctx()).await;
         assert!(resp.contains("-32600"), "resp: {resp}");
+    }
+
+    /// Refusals raised before dispatch must never wear [`DISPATCHED_ERROR_CODE`].
+    ///
+    /// `cli::hook_client` reads that code as "the daemon ran something and it
+    /// may have written". Every rejection here happens before `dispatch_call`
+    /// is entered, so reusing the code for one of them would tell a routed CLI
+    /// its mutation might be in flight when the daemon never looked at it —
+    /// turning an unwhitelisted repo, a typo'd method or a malformed frame into
+    /// a command that cannot be run at all.
+    #[tokio::test]
+    async fn refusals_before_dispatch_never_use_the_dispatched_error_code() {
+        let outside = TempDir::new().unwrap();
+        let outside_root = outside.path().canonicalize().unwrap();
+        let refusals: Vec<(&str, String)> = vec![
+            ("malformed frame", "not json".to_string()),
+            ("no method", r#"{"jsonrpc":"2.0","id":1}"#.to_string()),
+            (
+                "unknown method",
+                r#"{"jsonrpc":"2.0","id":1,"method":"no_such","params":{"root":"/tmp"}}"#
+                    .to_string(),
+            ),
+            (
+                "no root",
+                r#"{"jsonrpc":"2.0","id":1,"method":"update","params":{}}"#.to_string(),
+            ),
+            (
+                "repo the daemon will not serve",
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"update","params":{{"root":"{}"}}}}"#,
+                    outside_root.display()
+                ),
+            ),
+        ];
+
+        // Nothing is whitelisted, so the last case is refused at admission —
+        // the configuration a routed CLI hits whenever it runs outside home.
+        let registry = Arc::new(RepoRegistry::new(DaemonConfig {
+            whitelist_dirs: vec!["/nonexistent/allowed".to_string()],
+            ..DaemonConfig::default()
+        }));
+
+        for (what, body) in refusals {
+            let resp = dispatch_hook_message(body.as_bytes(), &registry, &make_dctx()).await;
+            let envelope: Value = serde_json::from_str(&resp).unwrap();
+            let code = envelope["error"]["code"]
+                .as_i64()
+                .unwrap_or_else(|| panic!("{what} must be refused with an error envelope: {resp}"));
+            assert_ne!(
+                code,
+                i64::from(DISPATCHED_ERROR_CODE),
+                "{what} is refused before dispatch, so it must not claim the method ran: {resp}"
+            );
+        }
     }
 
     #[tokio::test]

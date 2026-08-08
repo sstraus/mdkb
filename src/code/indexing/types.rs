@@ -120,7 +120,11 @@ impl Default for IndexBatch {
 // ---------------------------------------------------------------------------
 
 /// Statistics from a pipeline run.
-#[derive(Debug, Default)]
+///
+/// Serializable because a routed `mdkb update` runs in the daemon and is
+/// reported by the CLI: the numbers have to cross a socket to reach the process
+/// that prints them.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexStats {
     pub files_discovered: u32,
     pub files_indexed: u32,

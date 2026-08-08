@@ -37,31 +37,49 @@ pub fn handle_code_index(
             .update(root)
             .map_err(|e| Error::other(format!("Indexing failed: {}", e)))
     } else {
-        let root_canonical = root
-            .canonicalize()
-            .map_err(|e| Error::other(format!("Cannot resolve root: {e}")))?;
-        let mut total = crate::code::indexing::types::IndexStats::default();
-        for p in paths {
-            let candidate = root.join(p);
-            let canonical = candidate
-                .canonicalize()
-                .map_err(|e| Error::other(format!("Cannot resolve path '{}': {e}", p)))?;
-            if !canonical.starts_with(&root_canonical) {
-                return Err(Error::other(format!("Path '{}' escapes project root", p)));
-            }
-            let stats = facade
-                .index_directory(&canonical)
-                .map_err(|e| Error::other(format!("Indexing '{}' failed: {}", p, e)))?;
-            total.files_discovered += stats.files_discovered;
-            total.files_indexed += stats.files_indexed;
-            total.files_removed += stats.files_removed;
-            total.symbols_indexed += stats.symbols_indexed;
-            total.relationships_collected += stats.relationships_collected;
-        }
-        Ok(total)
+        index_paths(&mut facade, root, paths).map_err(|e| Error::other(e.to_string()))
     };
     crate::llm::release_cached_service();
     result
+}
+
+/// Index the named paths into an already-open facade, accumulating their stats.
+///
+/// Separate from [`handle_code_index`] because the daemon holds its facade for
+/// the process lifetime and must not open a second one: `handle_code_index`
+/// opens its own, which is exactly the extra writer the routing exists to
+/// remove. Both call this so path validation and accumulation have one
+/// definition.
+///
+/// Each path is canonicalized and checked against the root, so a `../` in a
+/// user-supplied path cannot make the indexer walk outside the project.
+pub fn index_paths(
+    facade: &mut crate::code::indexing::IndexFacade,
+    root: &Path,
+    paths: &[String],
+) -> anyhow::Result<crate::code::indexing::types::IndexStats> {
+    let root_canonical = root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("Cannot resolve root: {e}"))?;
+    let mut total = crate::code::indexing::types::IndexStats::default();
+    for p in paths {
+        let canonical = root
+            .join(p)
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("Cannot resolve path '{p}': {e}"))?;
+        if !canonical.starts_with(&root_canonical) {
+            anyhow::bail!("Path '{p}' escapes project root");
+        }
+        let stats = facade
+            .index_directory(&canonical)
+            .map_err(|e| anyhow::anyhow!("Indexing '{p}' failed: {e}"))?;
+        total.files_discovered += stats.files_discovered;
+        total.files_indexed += stats.files_indexed;
+        total.files_removed += stats.files_removed;
+        total.symbols_indexed += stats.symbols_indexed;
+        total.relationships_collected += stats.relationships_collected;
+    }
+    Ok(total)
 }
 /// Handle `mdkb code index --force` - full reindex discarding existing data.
 pub fn handle_code_reindex(

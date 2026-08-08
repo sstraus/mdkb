@@ -638,7 +638,10 @@ impl McpServer {
         Parameters(_): Parameters<EmptyObject>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(None).await?;
-        let output = super::dispatch::update_impl(&handle).await?;
+        let outcome =
+            super::dispatch::update_impl(&handle, &crate::core::indexing::UpdateRequest::default())
+                .await?;
+        let output = super::dispatch::render_update_outcome(&outcome);
         let tokens = count_tokens(&output);
         self.metrics.record_update(tokens);
         self.record_persistent_call("update", tokens, 1, false)

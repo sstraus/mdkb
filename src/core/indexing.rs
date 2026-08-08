@@ -72,6 +72,95 @@ pub(crate) fn bootstrap_code_index(root: &Path) {
     }
     crate::llm::release_cached_service();
 }
+/// What one `mdkb update` was asked to do.
+///
+/// A routed update is parsed in one process and executed in another, so the
+/// arguments have to survive a socket. They did not: the daemon took the method
+/// name and dropped the params, so `--force` was accepted and ignored and
+/// `mdkb update one.md` reindexed the whole tree — both reporting success.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UpdateRequest {
+    /// Reindex only these paths, relative to the store root. Empty means the
+    /// whole tree, which is also the only run that indexes sessions — a
+    /// targeted update is about named files, and sessions have no path the
+    /// caller could have named.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Reindex documents whose mtime has not moved. Needed when what changed is
+    /// the configuration rather than the files.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// What one `mdkb update` did, phase by phase.
+///
+/// The daemon returns this rather than pre-rendered text so the CLI can honour
+/// `--format`: text formatted inside the daemon is text the caller cannot ask
+/// for as JSON.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct UpdateOutcome {
+    /// The document phase, which is the only one that must succeed.
+    pub docs: UpdateResult,
+    /// The code phase. `None` when the code index was unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<crate::code::indexing::types::IndexStats>,
+    /// Why the code phase failed, when it did.
+    ///
+    /// Carried rather than logged: the process that has to report it is not the
+    /// one that ran it, and a warning printed into the daemon's log is a
+    /// warning the user never sees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_error: Option<String>,
+    /// The session phase, when it ran and did something.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<UpdateResult>,
+}
+
+impl UpdateRequest {
+    /// Is this run scoped to named files?
+    ///
+    /// One question, one answer: the same predicate picks the document handler
+    /// and decides that sessions are skipped, and the CLI and the daemon both
+    /// ask it rather than each re-deriving "targeted" from `files`.
+    pub fn is_targeted(&self) -> bool {
+        !self.files.is_empty()
+    }
+}
+
+/// Should this code-index result be reported at all?
+///
+/// A whole-tree update always reports its numbers — "0 files indexed" is real
+/// information when you asked for everything. A targeted run that touched no
+/// source file has nothing to say, and an empty code block after
+/// `mdkb update notes.md` is noise. Shared so the routed and in-process runs
+/// cannot disagree about when the block appears.
+pub fn report_code_stats(
+    targeted: bool,
+    stats: crate::code::indexing::types::IndexStats,
+) -> Option<crate::code::indexing::types::IndexStats> {
+    if targeted && stats.files_indexed == 0 {
+        None
+    } else {
+        Some(stats)
+    }
+}
+
+/// The document phase of an update: the whole tree, or just the named files.
+///
+/// Both the in-process CLI and the daemon go through here, so a routed update
+/// and a direct one cannot disagree about what `--force` and a file list mean.
+pub fn update_documents(
+    ctx: &Context,
+    root: impl AsRef<Path>,
+    request: &UpdateRequest,
+) -> Result<UpdateResult> {
+    if request.is_targeted() {
+        handle_update_files_force(ctx, root, &request.files, request.force)
+    } else {
+        handle_update_force(ctx, root, request.force)
+    }
+}
+
 /// Handle `mdkb update` command - differential reindex.
 ///
 /// Wraps all collection updates in a single transaction to ensure atomicity.

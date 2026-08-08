@@ -157,7 +157,13 @@ pub fn daemon_method(command: &Command) -> Option<(&'static str, serde_json::Val
         Command::Memory(MemoryCommand::Rm { id }) => {
             Some(("memory_delete", json!({ "id": id, "dry_run": false })))
         }
-        Command::Update { force, .. } => Some(("update", json!({ "force": *force }))),
+        // Both arguments travel. A routed command that keeps its name and drops
+        // its arguments is worse than one that does not route: `--force` was
+        // accepted and ignored, and a targeted update quietly reindexed the
+        // whole tree — each reporting success.
+        Command::Update { files, force } => {
+            Some(("update", json!({ "files": files, "force": *force })))
+        }
         _ => None,
     }
 }

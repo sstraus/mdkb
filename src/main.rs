@@ -2,6 +2,7 @@
 
 use mimalloc::MiMalloc;
 use std::env;
+use std::path::Path;
 
 /// Use mimalloc as the global allocator for improved performance.
 /// Per Pragmatic Rust Guidelines (M-USE-ALLOCATOR-OPTIMIZED), mimalloc provides
@@ -42,7 +43,7 @@ use mdkb::cli::{
     SetupMcpCommand, SetupRemoveCommand,
 };
 use mdkb::core::Context;
-use mdkb::core::indexing::{handle_update_files_force, handle_update_force};
+use mdkb::core::indexing::{UpdateOutcome, UpdateRequest, report_code_stats, update_documents};
 use mdkb::core::search::{handle_hybrid_search, handle_mget};
 use mdkb::core::sessions::handle_session_index;
 use mdkb::mcp::server::run_server;
@@ -158,11 +159,29 @@ async fn run_cli(cli: Cli) -> Result<()> {
     #[cfg(unix)]
     if mdkb::core::routing::should_route(&cli.command)
         && let Some((method, params)) = mdkb::core::routing::daemon_method(&cli.command)
-        && mdkb::cli::hook_client::call_store_mutation(method, params, &cwd)
-            .await
-            .is_ok()
     {
-        return Ok(());
+        use mdkb::cli::hook_client::MutationFailure;
+        match mdkb::cli::hook_client::call_store_mutation(method, params, &cwd).await {
+            Ok(result) => {
+                print_routed_result(&cli.command, method, &result, cli.format);
+                return Ok(());
+            }
+            // The daemon may be writing right now. Running the same mutation
+            // here would be the second writer this routing exists to remove —
+            // on the longest write in the program, which is the one most likely
+            // to outlast a client's patience.
+            Err(MutationFailure::Undetermined(e)) => {
+                return Err(mdkb::error::Error::other(format!(
+                    "{method}: the daemon took this request and did not report back ({e}). \
+                     Not running it here — the daemon may still be writing. Check \
+                     `mdkb daemon status`; if no daemon is running, re-run with \
+                     MDKB_NO_DAEMON=1."
+                )));
+            }
+            Err(MutationFailure::Unstarted(e)) => {
+                tracing::info!("{method}: daemon did not run this ({e}); writing in-process");
+            }
+        }
     }
 
     match cli.command {
@@ -338,65 +357,9 @@ async fn run_cli(cli: Cli) -> Result<()> {
         }
         Command::Update { files, force } => {
             let ctx = Context::open(&cwd)?;
-
-            if files.is_empty() {
-                // Full reindex (--force ignores mtime so config changes reach all docs)
-                let result = handle_update_force(&ctx, &cwd, force)?;
-                format_update_result(&result, cli.format);
-
-                // Also reindex code (matching MCP update behavior)
-                match mdkb::cli::handlers::handle_code_index(&cwd, &[]) {
-                    Ok(stats) => {
-                        println!("\nCode index:");
-                        format_code_index_stats(&stats, cli.format);
-                    }
-                    Err(e) => {
-                        tracing::warn!("Code reindexing failed: {:?}", e);
-                        eprintln!("Warning: code reindexing failed: {}", e);
-                    }
-                }
-
-                // Also reindex Claude Code sessions
-                match mdkb::daemon::config::home_dir() {
-                    Ok(home) => {
-                        let sessions_base = home.join(".claude/projects");
-                        let project_root = cwd.to_string_lossy().to_string();
-                        match handle_session_index(&ctx, &sessions_base, &project_root) {
-                            Ok(sr)
-                                if sr.added > 0 || sr.updated > 0 || sr.sessions_archived > 0 =>
-                            {
-                                println!(
-                                    "\nSessions: {} added, {} updated, {} unchanged, {} archived",
-                                    sr.added, sr.updated, sr.unchanged, sr.sessions_archived
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::warn!("Session indexing failed: {:?}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Session indexing skipped: cannot resolve home dir: {e}");
-                    }
-                }
-            } else {
-                // Targeted file reindex (docs only — code index handles its own incremental)
-                let result = handle_update_files_force(&ctx, &cwd, &files, force)?;
-                format_update_result(&result, cli.format);
-
-                // Also reindex code for the specified files
-                match mdkb::cli::handlers::handle_code_index(&cwd, &files) {
-                    Ok(stats) if stats.files_indexed > 0 => {
-                        println!("\nCode index:");
-                        format_code_index_stats(&stats, cli.format);
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::warn!("Code reindexing failed: {:?}", e);
-                    }
-                }
-            }
+            let request = UpdateRequest { files, force };
+            let outcome = run_update_in_process(&ctx, &cwd, &request)?;
+            format_update_outcome(&outcome, cli.format);
         }
         Command::Embed { collection } => {
             let ctx = Context::open(&cwd)?;
@@ -1411,6 +1374,115 @@ fn format_document(doc: &mdkb::domain::Document, content: &str, format: OutputFo
             println!("{}", content);
         }
     }
+}
+
+/// Run all three phases of `update` in this process.
+///
+/// The in-process twin of `mcp::dispatch::update_impl`, which runs the same
+/// three phases against the daemon's long-lived handles. What must not diverge
+/// — which document handler runs, and whether sessions run at all — lives in
+/// `core::indexing` and is called by both; what differs here is only how the
+/// connections are acquired.
+fn run_update_in_process(
+    ctx: &Context,
+    root: &Path,
+    request: &UpdateRequest,
+) -> Result<UpdateOutcome> {
+    let docs = update_documents(ctx, root, request)?;
+
+    let (code, code_error) = match mdkb::cli::handlers::handle_code_index(root, &request.files) {
+        Ok(stats) => (report_code_stats(request.is_targeted(), stats), None),
+        Err(e) => {
+            tracing::warn!("Code reindexing failed: {e:?}");
+            (None, Some(e.to_string()))
+        }
+    };
+
+    let sessions = if request.is_targeted() {
+        None
+    } else {
+        index_sessions_in_process(ctx, root)
+    };
+
+    Ok(UpdateOutcome {
+        docs,
+        code,
+        code_error,
+        sessions,
+    })
+}
+
+/// The session leg of an update, or `None` when it did nothing worth reporting.
+///
+/// Every failure here is a warning, not an error: sessions index transcripts
+/// the user never asked mdkb to own, and losing them must not fail an update of
+/// the documents they did.
+fn index_sessions_in_process(ctx: &Context, root: &Path) -> Option<mdkb::domain::UpdateResult> {
+    let home = match mdkb::daemon::config::home_dir() {
+        Ok(home) => home,
+        Err(e) => {
+            tracing::warn!("Session indexing skipped: cannot resolve home dir: {e}");
+            return None;
+        }
+    };
+    let project_root = root.to_string_lossy().to_string();
+    match handle_session_index(ctx, &home.join(".claude/projects"), &project_root) {
+        Ok(sr) if sr.added > 0 || sr.updated > 0 || sr.sessions_archived > 0 => Some(sr),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!("Session indexing failed: {e:?}");
+            None
+        }
+    }
+}
+
+/// Print everything one `update` did, in the format the caller asked for.
+///
+/// The single renderer for both paths, which is why the daemon returns numbers
+/// and never prose: text formatted inside the daemon is text `--format json`
+/// cannot undo, and a routed update that reads differently from a direct one is
+/// a routing layer the user can feel.
+fn format_update_outcome(outcome: &UpdateOutcome, format: OutputFormat) {
+    format_update_result(&outcome.docs, format);
+
+    if let Some(stats) = &outcome.code {
+        println!("\nCode index:");
+        format_code_index_stats(stats, format);
+    }
+    if let Some(e) = &outcome.code_error {
+        eprintln!("Warning: code reindexing failed: {e}");
+    }
+    if let Some(sr) = &outcome.sessions {
+        println!(
+            "\nSessions: {} added, {} updated, {} unchanged, {} archived",
+            sr.added, sr.updated, sr.unchanged, sr.sessions_archived
+        );
+    }
+}
+
+/// Print what the daemon returned for a routed mutation.
+///
+/// `update` carries structured numbers this process renders; the rest carry a
+/// summary the daemon already rendered, and printing that is all there is to do.
+fn print_routed_result(
+    command: &Command,
+    method: &str,
+    result: &serde_json::Value,
+    format: OutputFormat,
+) {
+    if matches!(command, Command::Update { .. }) {
+        match serde_json::from_value::<UpdateOutcome>(result["outcome"].clone()) {
+            Ok(outcome) => {
+                format_update_outcome(&outcome, format);
+                return;
+            }
+            // The write happened and only the report is unreadable, so say so
+            // and print the daemon's own summary rather than failing a mutation
+            // that succeeded.
+            Err(e) => tracing::warn!("update: cannot read the daemon's result ({e})"),
+        }
+    }
+    hook_client::print_tool_text(method, result);
 }
 
 fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputFormat) {

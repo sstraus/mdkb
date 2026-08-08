@@ -179,6 +179,122 @@ fn a_mutation_falls_back_in_process_when_the_daemon_is_unreachable() {
             .is_some(),
         "the fallback must actually have performed the write"
     );
+    drop(ctx);
+
+    // `memory add` is still in the routing gap, so the run above proves the
+    // command works without a daemon but never touches the fallback. `memory rm`
+    // does resolve to an RPC, so it is the one that has to come back Unstarted
+    // and finish the job in-process.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
+        .args(["memory", "rm", "fallback"])
+        .current_dir(&root)
+        .env("HOME", home.path())
+        .env("MDKB_NO_SPAWN", "1")
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "a routed mutation must fall back rather than fail when no daemon exists: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let ctx = mdkb::core::Context::open_read_only(&root).expect("reopen read-only");
+    assert!(
+        mdkb::store::memory::get_entry_without_tracking(&ctx.conn, "fallback")
+            .unwrap()
+            .is_none(),
+        "the fallback reported success without performing the delete"
+    );
+}
+
+/// A daemon that took the request but never answered must NOT be second-guessed.
+///
+/// This is the other half of the fallback rule and the reason it needs one: once
+/// the request is across the socket, silence is not evidence that nothing
+/// happened. The daemon may be mid-write — `mdkb update` legitimately runs for
+/// minutes — so a client that retries in-process becomes the second writer the
+/// routing exists to remove, on the longest write in the program. Failing loudly
+/// is the only honest answer (invariant I3: no silent success).
+#[test]
+fn a_mutation_is_not_retried_after_the_daemon_took_the_request() {
+    use std::io::Read;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonicalize");
+    mdkb::cli::handlers::handle_init(&root).expect("init");
+
+    let home = tempfile::tempdir().expect("home");
+    let daemon_home = home.path().join(".mdkb");
+    std::fs::create_dir_all(&daemon_home).expect("daemon home");
+    let listener = std::os::unix::net::UnixListener::bind(daemon_home.join("daemon-hook.sock"))
+        .expect("bind fake daemon socket");
+
+    // A daemon that swallows whole frames and answers none of them. It has to
+    // keep accepting: `ensure_daemon_running` probes with its own connection
+    // first, and that probe would otherwise eat the only accept.
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut hdr = [0u8; 4];
+            if stream.read_exact(&mut hdr).is_err() {
+                continue; // the reachability probe, which sends nothing
+            }
+            let mut body = vec![0u8; u32::from_le_bytes(hdr) as usize];
+            let _ = stream.read_exact(&mut body);
+            // The request is ours now. Say nothing, and hang up.
+        }
+    });
+
+    // `memory rm` is one of the commands that actually resolves to an RPC, so
+    // it reaches the deaf daemon. Seed the entry it is asked to delete, using
+    // the escape hatch so the seeding write does not itself go over the socket.
+    let seed = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
+        .args([
+            "memory",
+            "add",
+            "doomed",
+            "--title",
+            "Doomed",
+            "--content",
+            "delete me",
+        ])
+        .current_dir(&root)
+        .env("HOME", home.path())
+        .env("MDKB_NO_SPAWN", "1")
+        .env("MDKB_NO_DAEMON", "1")
+        .output()
+        .expect("seed");
+    assert!(
+        seed.status.success(),
+        "seeding must succeed: {}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
+        .args(["memory", "rm", "doomed"])
+        .current_dir(&root)
+        .env("HOME", home.path())
+        .env("MDKB_NO_SPAWN", "1")
+        .output()
+        .expect("run");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a mutation whose outcome is unknown must not report success: {stderr}"
+    );
+    assert!(
+        stderr.contains("daemon"),
+        "the error must name the daemon as the possible writer: {stderr}"
+    );
+
+    let ctx = mdkb::core::Context::open_read_only(&root).expect("open read-only");
+    assert!(
+        mdkb::store::memory::get_entry_without_tracking(&ctx.conn, "doomed")
+            .unwrap()
+            .is_some(),
+        "the CLI performed the delete itself — that is the second writer"
+    );
 }
 
 /// The routing is wired, not merely classified.
@@ -200,6 +316,38 @@ fn routed_mutations_resolve_to_a_daemon_rpc() {
 
     // A read never resolves to a mutation RPC.
     assert!(daemon_method(&parse(&["search", "q"])).is_none());
+}
+
+/// Routing must carry the command's arguments, not just its name.
+///
+/// Dropping them is worse than not routing at all: `mdkb update --force` looked
+/// like it ran and silently skipped every unchanged file, and
+/// `mdkb update one.md` quietly reindexed the entire repository. Both reported
+/// success. A flag that is parsed, accepted and then discarded is a lie the CLI
+/// tells on every invocation.
+#[test]
+fn routed_mutations_carry_their_arguments() {
+    use mdkb::core::routing::daemon_method;
+
+    let (_, params) = daemon_method(&parse(&["update", "--force"])).expect("update must route");
+    assert_eq!(
+        params["force"], true,
+        "--force must reach the daemon or it is silently ignored"
+    );
+
+    let (_, params) = daemon_method(&parse(&["update", "--files", "docs/a.md", "docs/b.md"]))
+        .expect("targeted update must route");
+    assert_eq!(
+        params["files"],
+        serde_json::json!(["docs/a.md", "docs/b.md"]),
+        "the file list must reach the daemon or a targeted update reindexes everything"
+    );
+    assert_eq!(params["force"], false);
+
+    // No arguments means no scoping — the whole tree, mtime-gated.
+    let (_, params) = daemon_method(&parse(&["update"])).expect("update must route");
+    assert_eq!(params["files"], serde_json::json!([]));
+    assert_eq!(params["force"], false);
 }
 
 /// The shortfall is enumerable rather than implied.

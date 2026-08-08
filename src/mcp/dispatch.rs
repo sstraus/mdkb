@@ -25,10 +25,10 @@ use crate::cli::hook_logic::{
 };
 use crate::code::indexing::IndexFacade;
 use crate::core::Context;
-use crate::core::indexing::handle_update;
+use crate::core::indexing::{UpdateOutcome, UpdateRequest, update_documents};
 use crate::core::search::{handle_hybrid_search, handle_mget};
 use crate::daemon::registry::RepoHandle;
-use crate::domain::SearchResult;
+use crate::domain::{SearchResult, UpdateResult};
 use crate::metrics::{
     UsageMetrics, count_tokens, truncate_with_continuation, truncate_with_ellipsis,
 };
@@ -1905,108 +1905,161 @@ pub async fn get_impl(
 ///
 /// Each phase diffs against what is already indexed (documents by hash, code by
 /// content-hash via `IndexFacade::update`, sessions by hash) and only re-processes
-/// what changed. Returns the human-readable summary aggregated from each phase.
-pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
+/// what changed.
+///
+/// Returns the numbers, not a rendering of them: a routed `mdkb update` is
+/// executed here and printed by the CLI, which cannot honour `--format json` on
+/// prose. [`render_update_outcome`] does the rendering for the callers that want
+/// text.
+pub async fn update_impl(
+    handle: &RepoHandle,
+    request: &UpdateRequest,
+) -> Result<UpdateOutcome, McpError> {
     ensure_handle_context(handle).await?;
+
+    // A targeted run reindexes the named files only. Sessions are deliberately
+    // absent from it: they live outside the root and have no path the caller
+    // could have named, so including them would make "update this one file"
+    // walk every transcript on the machine.
+    let targeted = request.is_targeted();
 
     // Run the synchronous update (SQLite + filesystem + ONNX) on a blocking thread,
     // taking the lock there rather than holding an async guard across it (PERF-1).
-    let doc_output = {
+    let docs = {
         let ctx = Arc::clone(&handle.ctx);
         let root = handle.root.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let request = request.clone();
+        tokio::task::spawn_blocking(move || {
             let mut ctx_guard = ctx.blocking_lock();
             crate::core::run_mutation(&mut ctx_guard, "document update", |ctx| {
-                handle_update(ctx, &root)
+                update_documents(ctx, &root, &request)
             })
             .ok_or_else(|| "Database not initialized".to_string())?
             .map_err(|e| format!("Document update failed: {e}"))
         })
         .await
         .map_err(|e| mcp_error(format!("Document update task panicked: {e}")))?
-        .map_err(mcp_error)?;
-
-        let mut out = format!(
-            "## Documents\n\nAdded: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
-            result.added, result.updated, result.removed, result.unchanged
-        );
-        if result.memory_embeddings_backfilled > 0 {
-            out.push_str(&format!(
-                "\nMemory embeddings backfilled: {}",
-                result.memory_embeddings_backfilled
-            ));
-        }
-        if result.doc_embeddings_generated > 0 {
-            out.push_str(&format!(
-                "\nDoc embeddings generated: {}",
-                result.doc_embeddings_generated
-            ));
-        }
-        out
+        .map_err(mcp_error)?
     };
 
-    let code_output = {
+    let (code, code_error) = {
         let mut idx_guard = acquire_handle_code_index(handle).await?;
         let outcome =
             crate::code::indexing::run_code_mutation(&mut idx_guard, "code update", |facade| {
-                facade.update(&handle.root)
-            });
-        if let Some(result) = outcome {
-            match result {
-                Ok(stats) => format!(
-                    "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
-                    stats.files_indexed, stats.symbols_indexed, stats.relationships_collected
-                ),
-                Err(e) => {
-                    tracing::error!("Code reindex failed: {e}");
-                    format!("\n\n## Code\n\nReindex failed: {e}")
+                if targeted {
+                    crate::core::code::index_paths(facade, &handle.root, &request.files)
+                } else {
+                    facade.update(&handle.root)
                 }
+            });
+        match outcome {
+            Some(Ok(stats)) => (
+                crate::core::indexing::report_code_stats(targeted, stats),
+                None,
+            ),
+            Some(Err(e)) => {
+                tracing::error!("Code reindex failed: {e}");
+                (None, Some(e.to_string()))
             }
-        } else {
-            String::new()
+            None => (None, None),
         }
     };
 
-    let session_output = match crate::daemon::config::home_dir() {
+    let sessions = if targeted {
+        None
+    } else {
+        index_sessions(handle).await
+    };
+
+    Ok(UpdateOutcome {
+        docs,
+        code,
+        code_error,
+        sessions,
+    })
+}
+
+/// The session leg of `update`, or `None` when it did nothing worth reporting.
+///
+/// Every failure here is a warning, not an error: sessions are a convenience
+/// index over transcripts the user never asked mdkb to own, and losing them
+/// must not fail an update of the documents they asked it to index.
+async fn index_sessions(handle: &RepoHandle) -> Option<UpdateResult> {
+    let home = match crate::daemon::config::home_dir() {
+        Ok(home) => home,
         Err(e) => {
             tracing::warn!("Session indexing skipped: cannot resolve home dir: {e}");
-            String::new()
-        }
-        Ok(home) => {
-            let sessions_base = home.join(".claude/projects");
-            let project_root = handle.root.to_string_lossy().to_string();
-
-            // Session indexing is likewise synchronous — run it off the async
-            // worker with the lock taken on the blocking thread (PERF-1).
-            let ctx = Arc::clone(&handle.ctx);
-            let indexed = tokio::task::spawn_blocking(move || {
-                let mut ctx_guard = ctx.blocking_lock();
-                crate::core::run_mutation(&mut ctx_guard, "session index", |ctx| {
-                    crate::core::sessions::handle_session_index(ctx, &sessions_base, &project_root)
-                })
-            })
-            .await;
-            match indexed {
-                Ok(Some(Ok(sr))) if sr.added > 0 || sr.updated > 0 || sr.sessions_archived > 0 => {
-                    format!(
-                        "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}\nArchived: {}",
-                        sr.added, sr.updated, sr.unchanged, sr.sessions_archived
-                    )
-                }
-                Ok(Some(Ok(_)) | None) => String::new(),
-                Ok(Some(Err(e))) => {
-                    tracing::warn!("Session indexing failed: {e}");
-                    String::new()
-                }
-                Err(e) => {
-                    tracing::warn!("Session indexing task panicked: {e}");
-                    String::new()
-                }
-            }
+            return None;
         }
     };
+    let sessions_base = home.join(".claude/projects");
+    let project_root = handle.root.to_string_lossy().to_string();
 
-    Ok(format!("{doc_output}{code_output}{session_output}"))
+    // Session indexing is likewise synchronous — run it off the async worker
+    // with the lock taken on the blocking thread (PERF-1).
+    let ctx = Arc::clone(&handle.ctx);
+    let indexed = tokio::task::spawn_blocking(move || {
+        let mut ctx_guard = ctx.blocking_lock();
+        crate::core::run_mutation(&mut ctx_guard, "session index", |ctx| {
+            crate::core::sessions::handle_session_index(ctx, &sessions_base, &project_root)
+        })
+    })
+    .await;
+
+    match indexed {
+        Ok(Some(Ok(sr))) if sr.added > 0 || sr.updated > 0 || sr.sessions_archived > 0 => Some(sr),
+        Ok(Some(Ok(_)) | None) => None,
+        Ok(Some(Err(e))) => {
+            tracing::warn!("Session indexing failed: {e}");
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Session indexing task panicked: {e}");
+            None
+        }
+    }
+}
+
+/// Render an [`UpdateOutcome`] as the markdown summary the MCP `update` tool
+/// returns.
+///
+/// The CLI does not use this — it has `--format` and its own renderers. This is
+/// the shape Claude reads.
+pub fn render_update_outcome(outcome: &UpdateOutcome) -> String {
+    let d = &outcome.docs;
+    let mut out = format!(
+        "## Documents\n\nAdded: {}\nUpdated: {}\nRemoved: {}\nUnchanged: {}",
+        d.added, d.updated, d.removed, d.unchanged
+    );
+    if d.memory_embeddings_backfilled > 0 {
+        out.push_str(&format!(
+            "\nMemory embeddings backfilled: {}",
+            d.memory_embeddings_backfilled
+        ));
+    }
+    if d.doc_embeddings_generated > 0 {
+        out.push_str(&format!(
+            "\nDoc embeddings generated: {}",
+            d.doc_embeddings_generated
+        ));
+    }
+
+    if let Some(stats) = &outcome.code {
+        out.push_str(&format!(
+            "\n\n## Code\n\nFiles: {}\nSymbols: {}\nRelationships: {}",
+            stats.files_indexed, stats.symbols_indexed, stats.relationships_collected
+        ));
+    }
+    if let Some(e) = &outcome.code_error {
+        out.push_str(&format!("\n\n## Code\n\nReindex failed: {e}"));
+    }
+    if let Some(sr) = &outcome.sessions {
+        out.push_str(&format!(
+            "\n\n## Sessions\n\nAdded: {}\nUpdated: {}\nUnchanged: {}\nArchived: {}",
+            sr.added, sr.updated, sr.unchanged, sr.sessions_archived
+        ));
+    }
+    out
 }
 
 fn symbol_to_json(s: &crate::code::symbol::Symbol) -> serde_json::Value {
@@ -4035,12 +4088,24 @@ pub async fn dispatch_call(
             Ok(json!({ "text": text, "tokens": tokens, "count": count }))
         }
         "update" => {
-            let text = update_impl(&handle).await?;
+            // No params at all is the common case (`update` with no arguments),
+            // and `null` does not deserialize into a struct even when every
+            // field has a default.
+            let request: UpdateRequest = if params.is_null() {
+                UpdateRequest::default()
+            } else {
+                serde_json::from_value(params)
+                    .map_err(|e| mcp_error(format!("update: invalid params: {e}")))?
+            };
+            let outcome = update_impl(&handle, &request).await?;
+            let text = render_update_outcome(&outcome);
             let tokens = count_tokens(&text);
             dctx.metrics.record_update(tokens);
             dctx.record_persistent_call(&handle, "update", tokens, 1, false)
                 .await;
-            Ok(json!({ "text": text, "tokens": tokens }))
+            // `text` for the callers that print a summary, `outcome` for the
+            // routed CLI, which has `--format` and renders the numbers itself.
+            Ok(json!({ "text": text, "tokens": tokens, "outcome": outcome }))
         }
         "code_graph" => {
             let cp: CodeGraphParams = serde_json::from_value(params)
@@ -4728,6 +4793,114 @@ mod tests {
         assert!(
             result.get("tokens").and_then(Value::as_u64).unwrap_or(0) > 0,
             "tokens missing: {result}"
+        );
+    }
+
+    /// A routed `update` must do what it was asked, not merely what it was
+    /// named.
+    ///
+    /// The daemon used to take the method and discard the params: `--force` was
+    /// parsed, sent and dropped, so a config change never reached the
+    /// already-indexed documents, and `mdkb update --files one.md` reindexed
+    /// the entire tree. Both printed a success summary, which is why neither
+    /// was noticed.
+    #[tokio::test]
+    async fn update_honours_force_and_file_scoping() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.expect("init ctx");
+
+        let docs = tmp.path().join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("a.md"), "# A\n\nalpha\n").unwrap();
+        std::fs::write(docs.join("b.md"), "# B\n\nbeta\n").unwrap();
+        {
+            let ctx_guard = handle.ctx.lock().await;
+            let ctx = ctx_guard.as_ref().unwrap();
+            let now = chrono::Utc::now().timestamp();
+            crate::store::collections::add_collection(
+                &ctx.conn,
+                &crate::domain::Collection {
+                    name: "docs".to_string(),
+                    path: "./docs".to_string(),
+                    pattern: "**/*.md".to_string(),
+                    source: "manual".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .expect("register collection");
+        }
+
+        let first = update_impl(&handle, &UpdateRequest::default())
+            .await
+            .expect("initial update");
+        assert_eq!(first.docs.added, 2, "both files must index: {first:?}");
+
+        // Nothing changed on disk, so a plain re-run touches nothing...
+        let plain = update_impl(&handle, &UpdateRequest::default())
+            .await
+            .expect("plain update");
+        assert_eq!(plain.docs.updated, 0, "{plain:?}");
+        assert_eq!(plain.docs.unchanged, 2, "{plain:?}");
+
+        // ...but --force reindexes regardless of mtime, which is the whole
+        // point of the flag: the change is in the config, not the files.
+        let forced = update_impl(
+            &handle,
+            &UpdateRequest {
+                files: Vec::new(),
+                force: true,
+            },
+        )
+        .await
+        .expect("forced update");
+        assert_eq!(
+            forced.docs.updated, 2,
+            "--force must reach handle_update_force: {forced:?}"
+        );
+
+        // And naming one file must touch exactly that file.
+        let scoped = update_impl(
+            &handle,
+            &UpdateRequest {
+                files: vec!["docs/a.md".to_string()],
+                force: true,
+            },
+        )
+        .await
+        .expect("scoped update");
+        assert_eq!(
+            scoped.docs.updated, 1,
+            "a targeted update must not reindex the whole tree: {scoped:?}"
+        );
+        assert!(
+            scoped.sessions.is_none(),
+            "a targeted update names files, and no session has a name to give: {scoped:?}"
+        );
+    }
+
+    /// The routed CLI reads `outcome`; everything else reads `text`. Both must
+    /// be there, and the numbers must be the ones the phases produced.
+    #[tokio::test]
+    async fn dispatch_call_update_returns_numbers_and_text() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+
+        let result = dispatch_call("update", json!({ "force": true }), handle, &dctx)
+            .await
+            .expect("dispatch");
+
+        let outcome: UpdateOutcome =
+            serde_json::from_value(result["outcome"].clone()).expect("outcome must deserialize");
+        assert_eq!(outcome.docs.added, 0, "empty repo indexes nothing");
+        assert!(
+            result["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("## Documents"),
+            "the rendered summary must survive for the callers that print it: {result}"
         );
     }
 
