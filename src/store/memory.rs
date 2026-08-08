@@ -112,14 +112,41 @@ pub enum SourceType {
     Inference,
 }
 
+impl SourceType {
+    /// The closed set of source types, in declaration order.
+    ///
+    /// One source of truth: the CLI derives `[possible values: ...]` from this,
+    /// so a variant added here cannot be forgotten in a help string.
+    pub const ALL: [SourceType; 4] = [
+        Self::OfficialDocs,
+        Self::UserStatement,
+        Self::AutoExtracted,
+        Self::Inference,
+    ];
+
+    /// Wire/storage form of the source type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OfficialDocs => "official_docs",
+            Self::UserStatement => "user_statement",
+            Self::AutoExtracted => "auto_extracted",
+            Self::Inference => "inference",
+        }
+    }
+
+    /// The valid source types as a comma-separated list (for error messages).
+    pub fn valid_set() -> String {
+        Self::ALL
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 impl std::fmt::Display for SourceType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::OfficialDocs => write!(f, "official_docs"),
-            Self::UserStatement => write!(f, "user_statement"),
-            Self::AutoExtracted => write!(f, "auto_extracted"),
-            Self::Inference => write!(f, "inference"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -132,7 +159,8 @@ impl std::str::FromStr for SourceType {
             "auto_extracted" => Ok(Self::AutoExtracted),
             "inference" => Ok(Self::Inference),
             _ => Err(format!(
-                "Invalid source_type: {s}. Valid: official_docs, user_statement, auto_extracted, inference"
+                "Invalid source_type: {s}. Valid: {}",
+                Self::valid_set()
             )),
         }
     }
@@ -216,16 +244,47 @@ pub enum EntryType {
     Handoff,
 }
 
+impl EntryType {
+    /// The closed set of entry types, in declaration order.
+    ///
+    /// One source of truth: the CLI derives `[possible values: ...]` from this,
+    /// so a variant added here cannot be forgotten in a help string — and no
+    /// help string can claim one that does not exist (`pattern` was documented
+    /// for years and has never been a variant).
+    pub const ALL: [EntryType; 6] = [
+        Self::Topic,
+        Self::Problem,
+        Self::Decision,
+        Self::Reminder,
+        Self::Prior,
+        Self::Handoff,
+    ];
+
+    /// Wire/storage form of the entry type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Topic => "topic",
+            Self::Problem => "problem",
+            Self::Decision => "decision",
+            Self::Reminder => "reminder",
+            Self::Prior => "prior",
+            Self::Handoff => "handoff",
+        }
+    }
+
+    /// The valid entry types as a comma-separated list (for error messages).
+    pub fn valid_set() -> String {
+        Self::ALL
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
 impl std::fmt::Display for EntryType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Topic => write!(f, "topic"),
-            Self::Problem => write!(f, "problem"),
-            Self::Decision => write!(f, "decision"),
-            Self::Reminder => write!(f, "reminder"),
-            Self::Prior => write!(f, "prior"),
-            Self::Handoff => write!(f, "handoff"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -240,7 +299,10 @@ impl std::str::FromStr for EntryType {
             "reminder" => Ok(Self::Reminder),
             "prior" => Ok(Self::Prior),
             "handoff" => Ok(Self::Handoff),
-            _ => Err(format!("Invalid entry type: {s}")),
+            _ => Err(format!(
+                "Invalid entry type: {s}. Valid: {}",
+                Self::valid_set()
+            )),
         }
     }
 }

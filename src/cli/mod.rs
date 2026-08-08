@@ -15,7 +15,30 @@ pub mod stats_report;
 
 use std::path::PathBuf;
 
+use clap::builder::PossibleValuesParser;
 use clap::{Parser, Subcommand};
+
+use crate::store::memory::{EntryType, SourceType};
+use crate::store::memory_graph::MemoryRelation;
+
+/// Value parsers for the flags whose accepted values are a closed domain set.
+///
+/// Built from the enums rather than repeated in a help string, so `--help`
+/// prints `[possible values: ...]`, an unknown value fails as a clap *usage*
+/// error naming the set, and a variant added to the enum cannot be forgotten
+/// here. Each returns `String` because the handlers still parse the wire form
+/// themselves — the parser's job is the accepted set, not the conversion.
+fn entry_type_values() -> PossibleValuesParser {
+    PossibleValuesParser::new(EntryType::ALL.map(|t| t.as_str()))
+}
+
+fn source_type_values() -> PossibleValuesParser {
+    PossibleValuesParser::new(SourceType::ALL.map(|t| t.as_str()))
+}
+
+fn memory_relation_values() -> PossibleValuesParser {
+    PossibleValuesParser::new(MemoryRelation::ALL.map(|r| r.as_str()))
+}
 
 /// mdkb - Local markdown knowledge base with semantic search.
 #[derive(Parser, Debug)]
@@ -83,8 +106,8 @@ pub enum Command {
         #[arg(short, long)]
         file: Option<String>,
 
-        /// Filter by entry type (topic, problem, decision, reminder, prior) - used with memory scope
-        #[arg(long = "entry-type", alias = "type")]
+        /// Filter by entry type - used with memory scope
+        #[arg(long = "entry-type", alias = "type", value_parser = entry_type_values())]
         entry_type: Option<String>,
     },
 
@@ -362,8 +385,8 @@ pub enum HookCommand {
         #[arg(long)]
         title: String,
 
-        /// Entry type (topic, decision, problem, pattern, …).
-        #[arg(long = "entry-type", alias = "type", default_value = "topic")]
+        /// Entry type.
+        #[arg(long = "entry-type", alias = "type", default_value = "topic", value_parser = entry_type_values())]
         entry_type: String,
 
         /// Entry body (markdown).
@@ -614,7 +637,7 @@ pub enum MemoryCommand {
         title: String,
 
         /// Entry type
-        #[arg(short = 'T', long, alias = "type", default_value = "topic")]
+        #[arg(short = 'T', long, alias = "type", default_value = "topic", value_parser = entry_type_values())]
         entry_type: String,
 
         /// Tags (comma-separated)
@@ -639,9 +662,8 @@ pub enum MemoryCommand {
 
         /// Provenance/trust of this entry (default: user_statement on insert;
         /// preserved on re-write unless given). Drives the confidence authority
-        /// multiplier: official_docs (1.0) > user_statement (0.85) >
-        /// auto_extracted (0.70) > inference (0.65).
-        #[arg(long)]
+        /// multiplier, most to least authoritative: 1.0, 0.85, 0.70, 0.65.
+        #[arg(long, value_parser = source_type_values())]
         source_type: Option<String>,
     },
 
@@ -668,7 +690,8 @@ pub enum MemoryCommand {
         /// Source entry ID (slug)
         id: String,
 
-        /// Relation: supports, contradicts, supersedes, derived_from, relates_to
+        /// Typed relation from the source entry to the target
+        #[arg(value_parser = memory_relation_values())]
         relation: String,
 
         /// Target: a memory slug, or a doc relative path with --doc

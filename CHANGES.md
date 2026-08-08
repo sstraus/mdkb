@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Enum-valued CLI flags now publish their accepted values.** `--entry-type`,
+  `--source-type` and `mdkb memory link`'s `<RELATION>` named a closed set
+  without listing it, so the only way to learn the values was to read the source
+  — and a wrong guess failed at runtime with a Rust debug payload
+  (`Error { kind: InvalidQuery("Invalid entry type: pattern"), .. }`) that named
+  neither the flag nor the alternatives. They are now derived from `EntryType`,
+  `SourceType` and `MemoryRelation`, so `--help` prints
+  `[possible values: ...]` and a bad value fails as a clap usage error listing
+  the set. Two drifted help strings went with it: `mdkb hook memory-write`
+  advertised `pattern`, which has never been a variant, and `mdkb search
+  --entry-type` omitted `handoff`. A test asserts no help text hand-lists a
+  closed set, so the copy cannot drift from the enum again.
+
 ### Changed
 
 - **Reading a memory entry no longer rewrites the full-text index (schema v18).**
