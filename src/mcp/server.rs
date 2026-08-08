@@ -899,7 +899,14 @@ impl ServerHandler for McpServer {
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 ..Default::default()
             },
-            instructions: self.warmup_instructions.clone(),
+            // The surface map always ships; warmup content, when present,
+            // follows it. An agent holding an MCP tool name otherwise has no
+            // way to reach the CLI spelling of the same capability without
+            // leaving MCP (story 024-0c7e).
+            instructions: Some(match &self.warmup_instructions {
+                Some(warmup) => format!("{}\n{warmup}", surface_instructions()),
+                None => surface_instructions(),
+            }),
         }
     }
 
@@ -4496,4 +4503,39 @@ if (require.main === module) {
         // Future timestamps should still say "just now"
         assert_eq!(relative_time_ago(now + 1000), "just now");
     }
+}
+
+/// The tool names this server advertises to a client.
+///
+/// Read from the generated tool router rather than a list maintained by hand,
+/// so `tests/surface_parity.rs` compares the MCP surface against the CLI one
+/// using what the server actually publishes. A hand-written list would drift
+/// from the router and the parity check would then be asserting agreement
+/// between two pieces of prose (story 024-0c7e).
+pub fn advertised_tool_names() -> Vec<String> {
+    McpServer::tool_router()
+        .list_all()
+        .into_iter()
+        .map(|t| t.name.to_string())
+        .collect()
+}
+
+/// The MCP-tool-to-CLI-command map, rendered for the server instructions.
+///
+/// An agent holding an MCP tool name has no way to discover the CLI spelling
+/// without leaving MCP — `memory_write` and `mdkb memory add` are the same
+/// capability under two names, and nothing said so (story 024-0c7e). Included in
+/// the instructions because that is the one place an MCP client always reads.
+///
+/// Deliberately compact: only the pairs, and only the notes that state a real
+/// difference. Every token here is charged on every turn of every conversation,
+/// so a pair whose two names already imply each other earns none.
+pub fn surface_instructions() -> String {
+    let mut out = String::from("Equivalent CLI commands (same capability, different name):\n");
+    for e in crate::core::surface::SURFACE_MAP {
+        let Some(cli) = e.cli_command else { continue };
+        out.push_str(&format!("  {} = mdkb {}\n", e.mcp_tool, cli));
+    }
+    out.push_str("Full inventory with the differences that matter: `mdkb surface`.\n");
+    out
 }

@@ -289,6 +289,13 @@ pub enum Command {
     /// Compact command reference for AI consumption
     Cheatsheet,
 
+    /// Map each MCP tool to its CLI equivalent, and say where they differ
+    ///
+    /// The two surfaces expose overlapping capability under different names —
+    /// the MCP tool is `memory_write`, the command is `mdkb memory add` — so
+    /// this answers "what is the other name for this?" without reading source.
+    Surface,
+
     /// Emit machine-readable CLI schema as JSON (omit COMMAND for the full tree)
     Schema {
         /// Specific subcommand to describe (omit for the full schema)

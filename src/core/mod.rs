@@ -343,3 +343,4 @@ pub mod memory_sync;
 pub mod ops;
 pub mod search;
 pub mod sessions;
+pub mod surface;

@@ -985,6 +985,10 @@ async fn run_cli(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Surface => {
+            print!("{}", mdkb::core::surface::render());
+            return Ok(());
+        }
         Command::Cheatsheet => {
             let bin = std::env::current_exe()
                 .ok()
