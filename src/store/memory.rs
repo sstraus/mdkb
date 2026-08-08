@@ -1685,6 +1685,107 @@ mod tests {
         assert_eq!(retrieved.expires_at, None); // No TTL
     }
 
+    /// Byte-exact state of the FTS5 shadow table, so a rewrite is detectable
+    /// even when it produces segments of the same size.
+    fn fts_fingerprint(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT id, hex(block) FROM memory_fts_data ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| {
+            Ok(format!(
+                "{}:{}",
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1).unwrap_or_default()
+            ))
+        })
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    /// Reading an entry must not touch the full-text index.
+    ///
+    /// `get_entry` bumps `access_count`/`last_accessed` on every read. While the
+    /// FTS update trigger was unscoped, that bump deleted and reinserted the
+    /// entry's FTS5 segments — making every *read* the store's heaviest writer,
+    /// on `memory_fts_data`, one of the three tables that recurring field
+    /// corruption damages.
+    #[test]
+    fn reading_an_entry_does_not_rewrite_the_fts_index() {
+        let conn = setup_db();
+        let now = Utc::now().timestamp();
+        let mut entry = MemoryEntry {
+            id: "fts-churn".to_string(),
+            title: "Original title".to_string(),
+            content: "original body about pelicans".to_string(),
+            entry_type: EntryType::Topic,
+            tags: vec!["birds".to_string()],
+            status: EntryStatus::Active,
+            created_at: now,
+            updated_at: now,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            last_confirmed_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        add_entry(&conn, &entry).unwrap();
+
+        let indexed = fts_fingerprint(&conn);
+        assert!(!indexed.is_empty(), "the entry must be indexed on insert");
+
+        for _ in 0..10 {
+            get_entry(&conn, "fts-churn").unwrap().unwrap();
+        }
+
+        assert_eq!(
+            fts_fingerprint(&conn),
+            indexed,
+            "ten reads must leave the FTS index byte-identical"
+        );
+        assert_eq!(
+            get_entry_without_tracking(&conn, "fts-churn")
+                .unwrap()
+                .unwrap()
+                .access_count,
+            10,
+            "the reads must still be counted"
+        );
+
+        // A change to indexed content must still reindex.
+        entry.content = "rewritten body about cormorants".to_string();
+        update_entry(&conn, &entry).unwrap();
+        assert_ne!(
+            fts_fingerprint(&conn),
+            indexed,
+            "a content change must reindex the entry"
+        );
+
+        let hits: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'cormorants'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(hits, 1, "the new content must be searchable");
+        let stale: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM memory_fts WHERE memory_fts MATCH 'pelicans'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stale, 0,
+            "the replaced content must not linger in the index"
+        );
+    }
+
     #[test]
     fn test_entry_type_reminder_parsing() {
         assert_eq!(

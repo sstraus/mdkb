@@ -4,7 +4,7 @@ use crate::error::Result;
 use rusqlite::Connection;
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 17;
+pub const SCHEMA_VERSION: i32 = 18;
 
 /// SQL for creating the database schema.
 const SCHEMA_SQL: &str = r#"
@@ -136,7 +136,12 @@ CREATE TRIGGER IF NOT EXISTS memory_ad AFTER DELETE ON memory_entries BEGIN
             REPLACE(REPLACE(REPLACE(OLD.tags, '"', ''), '[', ''), ']', ''));
 END;
 
-CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory_entries BEGIN
+-- Scoped to the indexed columns on purpose. `get_entry` bumps `access_count`
+-- and `last_accessed` on every read, so an unscoped AFTER UPDATE made every
+-- memory *read* delete and reinsert the entry's FTS5 segments — churning the
+-- blob-heavy `memory_fts_data` shadow table for a counter the index never sees.
+CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE OF id, title, content, tags
+ON memory_entries BEGIN
     INSERT INTO memory_fts(memory_fts, rowid, id, title, content, tags)
     VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content,
             REPLACE(REPLACE(REPLACE(OLD.tags, '"', ''), '[', ''), ']', ''));
@@ -614,6 +619,28 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 [],
             )?;
         }
+    }
+
+    // Migration from v17 to v18: scope the memory FTS update trigger to the
+    // columns the index actually stores. Before this, `get_entry`'s
+    // access-count bump fired a full FTS5 delete+reinsert, so every memory read
+    // rewrote `memory_fts_data` segments — the single hottest writer in the
+    // store, on one of the three tables that field corruption keeps damaging.
+    if from_version < 18 {
+        conn.execute_batch(
+            r#"
+            DROP TRIGGER IF EXISTS memory_au;
+            CREATE TRIGGER memory_au AFTER UPDATE OF id, title, content, tags
+            ON memory_entries BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, id, title, content, tags)
+                VALUES('delete', OLD.rowid, OLD.id, OLD.title, OLD.content,
+                        REPLACE(REPLACE(REPLACE(OLD.tags, '"', ''), '[', ''), ']', ''));
+                INSERT INTO memory_fts(rowid, id, title, content, tags)
+                VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content,
+                        REPLACE(REPLACE(REPLACE(NEW.tags, '"', ''), '[', ''), ']', ''));
+            END;
+            "#,
+        )?;
     }
 
     // Update schema version
