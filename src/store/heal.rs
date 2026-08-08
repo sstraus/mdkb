@@ -273,6 +273,12 @@ fn salvage_table(fresh: &Connection, table: &str) -> usize {
 /// A record of one quarantine event, persisted as a sidecar next to the corrupt
 /// file so `mdkb stats` and SessionStart can surface the loss until the operator
 /// cleans up. Serialized to `<corrupt_file>.report.json`.
+///
+/// The forensic fields exist because a quarantined file on its own has never
+/// been enough to name a cause: every past post-mortem stalled at "the index is
+/// malformed" with no record of *how*. They are captured once, at quarantine
+/// time, on a file that is already known to be corrupt — so they cost nothing
+/// on any healthy path.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct QuarantineReport {
     /// File name (not full path) of the quarantined database.
@@ -283,6 +289,129 @@ pub struct QuarantineReport {
     pub memory_entries_salvaged: usize,
     /// Memory edges recovered into the fresh database.
     pub memory_edges_salvaged: usize,
+    /// `PRAGMA quick_check` rows: the damage as SQLite describes it.
+    #[serde(default)]
+    pub quick_check: Vec<String>,
+    /// Tables owning the b-trees `quick_check` named, resolved through
+    /// `sqlite_master.rootpage`. This is what distinguishes one recurrence from
+    /// another — field damage has so far always landed on the memory tables.
+    #[serde(default)]
+    pub damaged_tables: Vec<String>,
+    /// Size of the quarantined database and of its WAL, in bytes. A large WAL
+    /// means the damage was taken with un-checkpointed frames outstanding.
+    #[serde(default)]
+    pub db_bytes: u64,
+    #[serde(default)]
+    pub wal_bytes: u64,
+    /// Process that detected the corruption — NOT necessarily the one that
+    /// caused it, which is exactly why the distinction is spelled out here.
+    #[serde(default)]
+    pub detected_by_pid: u32,
+    #[serde(default)]
+    pub detected_by_version: String,
+}
+
+/// Forensics read off a quarantined file. Best-effort throughout: a file too
+/// damaged to answer a question contributes nothing rather than failing the
+/// quarantine.
+#[derive(Debug, Clone, Default)]
+struct Diagnosis {
+    quick_check: Vec<String>,
+    damaged_tables: Vec<String>,
+    db_bytes: u64,
+    wal_bytes: u64,
+}
+
+/// Rows `quick_check` reports name b-trees by root page (`Tree 23 page 23 cell
+/// 4: ...`). Extract those root pages so they can be resolved to table names.
+fn root_pages_in(rows: &[String]) -> Vec<i64> {
+    let mut pages = Vec::new();
+    for row in rows {
+        let Some(rest) = row.strip_prefix("Tree ") else {
+            continue;
+        };
+        let Some(page) = rest.split_whitespace().next() else {
+            continue;
+        };
+        if let Ok(page) = page.parse::<i64>()
+            && !pages.contains(&page)
+        {
+            pages.push(page);
+        }
+    }
+    pages
+}
+
+fn file_bytes(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Describe the damage in a quarantined database.
+///
+/// Read through `immutable=1`, the only safe way to open a file that may be
+/// torn: no locking, no hot-journal rollback, no writes.
+fn diagnose(corrupt_path: &Path) -> Diagnosis {
+    let mut diagnosis = Diagnosis {
+        db_bytes: file_bytes(corrupt_path),
+        wal_bytes: file_bytes(&with_suffix(corrupt_path, "-wal")),
+        ..Default::default()
+    };
+
+    let uri = format!("file:{}?immutable=1", corrupt_path.to_string_lossy());
+    let conn = match Connection::open(&uri) {
+        Ok(conn) => conn,
+        Err(e) => {
+            diagnosis.quick_check = vec![format!("cannot open quarantined file: {e}")];
+            return diagnosis;
+        }
+    };
+
+    // Bounded: enough rows to characterise the damage, not a full page walk of
+    // a file that can reach gigabytes.
+    //
+    // Stepped by hand rather than collected through an iterator because damage
+    // bad enough to abort the walk surfaces as an Err *after* zero or more
+    // rows, and that Err is itself the diagnosis — dropping it (as `flatten`
+    // would) is how a badly torn file ends up recorded as "no damage found".
+    diagnosis.quick_check = match conn.prepare("PRAGMA quick_check(20)") {
+        Ok(mut stmt) => match stmt.query([]) {
+            Ok(mut rows) => {
+                let mut out = Vec::new();
+                loop {
+                    match rows.next() {
+                        Ok(Some(row)) => match row.get::<_, String>(0) {
+                            Ok(text) if text != "ok" => out.push(text),
+                            Ok(_) => {}
+                            Err(e) => out.push(format!("unreadable quick_check row: {e}")),
+                        },
+                        Ok(None) => break,
+                        Err(e) => {
+                            out.push(format!("quick_check aborted: {e}"));
+                            break;
+                        }
+                    }
+                }
+                out
+            }
+            Err(e) => vec![format!("quick_check failed: {e}")],
+        },
+        Err(e) => vec![format!("quick_check unavailable: {e}")],
+    };
+
+    for page in root_pages_in(&diagnosis.quick_check) {
+        let name = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE rootpage = ?1",
+                params![page],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| format!("rootpage {page}"));
+        if !diagnosis.damaged_tables.contains(&name) {
+            diagnosis.damaged_tables.push(name);
+        }
+    }
+
+    diagnosis
 }
 
 /// `.report.json` sidecar path for a quarantined database file.
@@ -304,11 +433,24 @@ pub fn write_report(corrupt_path: &Path, salvage: Salvage) {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
+    let diagnosis = diagnose(corrupt_path);
+    if !diagnosis.damaged_tables.is_empty() {
+        tracing::error!(
+            tables = diagnosis.damaged_tables.join(", "),
+            "index corruption damaged these tables"
+        );
+    }
     let report = QuarantineReport {
         quarantined_at: quarantine_ts(&name).unwrap_or(0),
         corrupt_file: name,
         memory_entries_salvaged: salvage.entries,
         memory_edges_salvaged: salvage.edges,
+        quick_check: diagnosis.quick_check,
+        damaged_tables: diagnosis.damaged_tables,
+        db_bytes: diagnosis.db_bytes,
+        wal_bytes: diagnosis.wal_bytes,
+        detected_by_pid: std::process::id(),
+        detected_by_version: env!("CARGO_PKG_VERSION").to_string(),
     };
     match serde_json::to_string_pretty(&report) {
         Ok(json) => {
@@ -467,6 +609,53 @@ mod tests {
 
         let conn = Connection::open(&db).unwrap();
         assert!(!is_structurally_sound(&conn));
+    }
+
+    #[test]
+    fn root_pages_are_read_off_real_quick_check_rows() {
+        // Verbatim rows from quarantined field stores.
+        let rows = vec![
+            "*** in database main ***".to_string(),
+            "Tree 23 page 23 cell 35: 2nd reference to page 1820".to_string(),
+            "Tree 23 page 23 cell 34: 2nd reference to page 1819".to_string(),
+            "Tree 66 page 66 cell 0: 2nd reference to page 5191".to_string(),
+            "wrong # of entries in index idx_memory_access".to_string(),
+        ];
+        assert_eq!(
+            root_pages_in(&rows),
+            vec![23, 66],
+            "each damaged b-tree is named once, in report order"
+        );
+    }
+
+    #[test]
+    fn the_report_records_the_damage_not_just_the_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+
+        let len = std::fs::metadata(&db).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(&db).unwrap();
+        f.set_len(len / 2).unwrap();
+        drop(f);
+
+        let corrupt = quarantine(&db).unwrap();
+        write_report(&corrupt, Salvage::default());
+
+        let report: QuarantineReport =
+            serde_json::from_str(&std::fs::read_to_string(report_path(&corrupt)).unwrap()).unwrap();
+
+        assert!(
+            !report.quick_check.is_empty(),
+            "the quarantine must record how SQLite described the damage"
+        );
+        assert_eq!(
+            report.db_bytes,
+            len / 2,
+            "the size of the file that was set aside"
+        );
+        assert_eq!(report.detected_by_pid, std::process::id());
+        assert_eq!(report.detected_by_version, env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

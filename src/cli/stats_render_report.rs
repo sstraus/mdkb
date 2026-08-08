@@ -434,6 +434,7 @@ mod tests {
             quarantined_at: 1_700_000_000,
             memory_entries_salvaged: 673,
             memory_edges_salvaged: 12,
+            ..Default::default()
         }];
         // fixture_report()'s document_count (42) is > 0, meaning the docs table
         // is already repopulated (auto-rebuild already ran) — the banner must
@@ -463,6 +464,7 @@ mod tests {
             quarantined_at: 1_700_000_000,
             memory_entries_salvaged: 673,
             memory_edges_salvaged: 12,
+            ..Default::default()
         }];
         let out = render(&report, false);
         assert!(
@@ -483,6 +485,7 @@ mod tests {
             quarantined_at: ts,
             memory_entries_salvaged: 673,
             memory_edges_salvaged: 12,
+            ..Default::default()
         }
     }
 
@@ -565,6 +568,7 @@ mod tests {
             quarantined_at: 1_700_000_000,
             memory_entries_salvaged: 0,
             memory_edges_salvaged: 0,
+            ..Default::default()
         }];
         let out = render(&r, false);
         assert!(out.contains("QUARANTINED"));
