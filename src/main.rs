@@ -26,11 +26,11 @@ use mdkb::cli::handlers::{
     handle_graph_dangling, handle_graph_hubs, handle_graph_links, handle_graph_neighbors,
     handle_graph_path, handle_history, handle_hybrid_search, handle_init, handle_memory_add,
     handle_memory_confirm, handle_memory_export, handle_memory_import, handle_memory_import_dir,
-    handle_memory_link, handle_memory_list, handle_memory_prune, handle_memory_rm,
-    handle_memory_search, handle_memory_show, handle_memory_warmup, handle_metrics_export,
-    handle_metrics_latency, handle_metrics_show, handle_mget, handle_prune_sessions,
-    handle_session_index, handle_superseded_by, handle_update_files_force, handle_update_force,
-    parse_retention_secs,
+    handle_memory_import_file, handle_memory_link, handle_memory_list, handle_memory_prune,
+    handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
+    handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
+    handle_prune_sessions, handle_session_index, handle_superseded_by, handle_update_files_force,
+    handle_update_force, parse_retention_secs,
 };
 #[cfg(unix)]
 use mdkb::cli::hook_client;
@@ -769,8 +769,22 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     skip_duplicates,
                 } => {
                     let p = std::path::Path::new(&path);
+                    // A single .md file is a RESTORE, not a bulk import: it
+                    // preserves the timestamps and counters the file records,
+                    // because collapsing months of history into the moment of
+                    // the restore destroys recency ranking (story 017-a378).
+                    // A directory or a .json file keeps the bulk semantics,
+                    // where telemetry is DB-owned and starts fresh.
                     let result = if p.is_dir() {
                         handle_memory_import_dir(&ctx, p, dry_run, skip_duplicates)?
+                    } else if p.extension().and_then(|s| s.to_str()) == Some("md") {
+                        if dry_run {
+                            println!("Dry run: would restore {}", p.display());
+                            return Ok(());
+                        }
+                        handle_memory_import_file(&ctx, p)?;
+                        println!("Restored 1 entry from {}", p.display());
+                        return Ok(());
                     } else {
                         handle_memory_import(&ctx, &path, dry_run, skip_duplicates)?
                     };

@@ -103,6 +103,23 @@ impl MemoryFile {
             ..self.into_entry()
         }
     }
+
+    /// The entry with its telemetry taken from the file, for an explicit
+    /// restore.
+    ///
+    /// The opposite call from [`MemoryFile::into_fresh_entry`], and the
+    /// difference is whose history the file describes. In a git sync the file
+    /// came from another machine, so its counters are that machine's and this
+    /// one starts at zero. In a restore the file IS this machine's history —
+    /// resetting the counters would discard the very usage record the restore
+    /// exists to bring back.
+    ///
+    /// Only meaningful for files that still carry those fields: the projection
+    /// stopped writing them at schema v19, so this returns zeros for anything
+    /// written since. Parsing kept accepting them precisely for this case.
+    pub fn into_restored_entry(self) -> MemoryEntry {
+        self.into_entry()
+    }
 }
 
 /// Retire an entry's markdown projection: move `entries/<id>.md` to

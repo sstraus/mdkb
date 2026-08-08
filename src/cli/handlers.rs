@@ -2747,6 +2747,90 @@ pub fn handle_memory_import_dir(
     Ok(result)
 }
 
+/// Import ONE entry markdown file, preserving everything the file records.
+///
+/// The supported answer to "I have an entry file and need it back in the
+/// database". `mdkb memory add` cannot do it: it stamps `created_at` and
+/// `updated_at` with now(), so restoring a corpus flattens months of history
+/// into one day and destroys recency ranking. The only alternative was a raw
+/// `sqlite3 INSERT` against index.sqlite — which skips the connection pragmas
+/// this store depends on (`busy_timeout`, WAL, `synchronous = NORMAL`) and the
+/// `.mutation.lock` protocol. Doing exactly that against a live store corrupted
+/// `memory_fts_data` (`Rowid out of order`, `2nd reference to page 12862`), and
+/// recovery needed a pre-write file copy (story 017-a378).
+///
+/// So this runs on the caller's `Context` connection, which is the whole point:
+/// the pragmas, the lock, and the FTS/embedding triggers all apply.
+///
+/// Telemetry is preserved rather than reset — see
+/// [`MemoryFile::into_restored_entry`] for why a restore differs from a sync.
+/// An existing id is an explicit conflict, never a silent overwrite: a restore
+/// that clobbers a live entry is worse than one that refuses.
+pub fn handle_memory_import_file(ctx: &Context, path: &Path) -> Result<()> {
+    let text = std::fs::read_to_string(path).map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: path.to_path_buf(),
+            operation: format!("read: {e}"),
+        })
+    })?;
+    let file = crate::store::memory_file::from_markdown(&text)?;
+
+    // The filename and the frontmatter must agree. When they do not, either
+    // could be the intended id, and picking one silently writes the wrong row.
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
+    if file.meta.id != stem {
+        return Err(ErrorKind::InvalidQuery(format!(
+            "{}: frontmatter declares id `{}` but the filename says `{stem}` — refusing to \
+             guess which is authoritative. Rename the file to `{}.md`, or fix the frontmatter.",
+            path.display(),
+            file.meta.id,
+            file.meta.id
+        ))
+        .into());
+    }
+
+    memory::validate_entry_input(
+        &file.meta.id,
+        &file.meta.title,
+        &file.meta.tags,
+        &file.content,
+    )?;
+
+    let id = file.meta.id.clone();
+    if memory::get_entry_without_tracking(&ctx.conn, &id)?.is_some() {
+        return Err(ErrorKind::InvalidQuery(format!(
+            "memory entry `{id}` already exists — import refuses to overwrite. Remove it first \
+             (`mdkb memory rm {id}`) if the file is the version you want."
+        ))
+        .into());
+    }
+
+    let entry = file.into_restored_entry();
+    let now = chrono::Utc::now().timestamp();
+    memory::add_entry(&ctx.conn, &entry)?;
+    // Re-project so the recorded hash describes canonical bytes; otherwise the
+    // next reconciliation reads a pre-v19 file back as a local edit.
+    project_entry(ctx, &entry, now)?;
+
+    // Embed here when the model is warm; a cold model leaves the entry pending
+    // and `mdkb update`'s backfill picks it up with no manual step.
+    if crate::config::Config::load_or_default(&ctx.config_path)
+        .search
+        .auto_embed_memory
+        && let Err(e) = memory::embed_entry(&ctx.conn, &id, &entry.title, &entry.content)
+    {
+        tracing::warn!("imported entry {id}: embedding deferred to `mdkb update`: {e}");
+    }
+
+    if let Err(e) = generate_memory_index(ctx) {
+        tracing::warn!("Failed to regenerate memory index: {e}");
+    }
+    Ok(())
+}
+
 /// Handle `mdkb memory import` command.
 pub fn handle_memory_import(
     ctx: &Context,
