@@ -303,7 +303,7 @@ fn collect_memory(ctx: &Context) -> Result<MemorySummary> {
     // Drift is read-only here on purpose: `stats` reports, `update` repairs.
     // A failure to measure must not fail the whole report — a store too broken
     // to walk its own projection still needs its other numbers.
-    let drift = crate::cli::handlers::projection_drift(ctx).unwrap_or_default();
+    let drift = crate::core::memory_sync::projection_drift(ctx).unwrap_or_default();
 
     Ok(MemorySummary {
         active_count,

@@ -24,13 +24,12 @@ use mdkb::cli::handlers::{
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
     handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
     handle_graph_dangling, handle_graph_hubs, handle_graph_links, handle_graph_neighbors,
-    handle_graph_path, handle_history, handle_hybrid_search, handle_init, handle_memory_add,
-    handle_memory_confirm, handle_memory_export, handle_memory_import, handle_memory_import_dir,
+    handle_graph_path, handle_history, handle_init, handle_memory_add, handle_memory_confirm,
+    handle_memory_export, handle_memory_import, handle_memory_import_dir,
     handle_memory_import_file, handle_memory_link, handle_memory_list, handle_memory_prune,
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
-    handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_mget,
-    handle_prune_sessions, handle_session_index, handle_superseded_by, handle_update_files_force,
-    handle_update_force, parse_retention_secs,
+    handle_metrics_export, handle_metrics_latency, handle_metrics_show, handle_prune_sessions,
+    handle_superseded_by, parse_retention_secs,
 };
 #[cfg(unix)]
 use mdkb::cli::hook_client;
@@ -43,6 +42,9 @@ use mdkb::cli::{
     SetupMcpCommand, SetupRemoveCommand,
 };
 use mdkb::core::Context;
+use mdkb::core::indexing::{handle_update_files_force, handle_update_force};
+use mdkb::core::search::{handle_hybrid_search, handle_mget};
+use mdkb::core::sessions::handle_session_index;
 use mdkb::mcp::server::run_server;
 use mdkb::store::evolution::Evolution;
 use mdkb::store::memory::MemoryEntry;
@@ -755,7 +757,7 @@ async fn run_cli(cli: Cli) -> Result<()> {
                     }
                 }
                 MemoryCommand::Sync => {
-                    let s = mdkb::cli::handlers::sync_memory_files(&ctx)?;
+                    let s = mdkb::core::memory_sync::sync_memory_files(&ctx)?;
                     println!(
                         "Projected: {}  Imported: {}  Adopted: {}  Conflicts: {}  \
                          Revived: {}  Archived: {}",
@@ -1752,7 +1754,7 @@ fn format_warmup_index(index: &[String], format: OutputFormat) {
 /// Surface the two sync outcomes a human has to act on: a resolved conflict
 /// (someone's edit lost and needs retrieving) and an ignore rule that silently
 /// makes the whole projection untrackable.
-fn print_memory_sync_warnings(s: &mdkb::cli::handlers::MemorySyncSummary) {
+fn print_memory_sync_warnings(s: &mdkb::core::memory_sync::MemorySyncSummary) {
     if s.conflicts > 0 {
         println!(
             "⚠ {} conflict(s) resolved by newest edit — the superseded versions are \

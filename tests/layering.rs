@@ -57,7 +57,6 @@ fn production_source(path: &Path) -> String {
 /// story requires it be split by responsibility, not relocated wholesale. Remove
 /// the `#[ignore]` in the commit that empties the list.
 #[test]
-#[ignore = "story 019-3248: fails until the core extraction is finished"]
 fn no_adapter_reaches_into_the_cli_adapter() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();

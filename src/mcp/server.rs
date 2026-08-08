@@ -19,11 +19,11 @@ use tokio::sync::Mutex;
 
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 
-use crate::cli::handlers::{handle_session_index, handle_update};
 use crate::code::indexing::IndexFacade;
 use crate::code::types::SymbolId;
 use crate::config::McpConfig;
 use crate::core::Context;
+use crate::core::indexing::handle_update;
 use crate::domain::SearchResult;
 use crate::metrics::{UsageMetrics, count_tokens};
 use crate::store::{collections, documents, memory, stats};
@@ -1017,7 +1017,11 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                             std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
                                 .join(".claude/projects");
                         let project_root = startup_root.to_string_lossy().to_string();
-                        match handle_session_index(&ctx, &sessions_base, &project_root) {
+                        match crate::core::sessions::handle_session_index(
+                            &ctx,
+                            &sessions_base,
+                            &project_root,
+                        ) {
                             Ok(sr) if sr.added > 0 || sr.updated > 0 => {
                                 tracing::info!(
                                     "Startup session index: {} added, {} updated",
@@ -1579,7 +1583,7 @@ async fn full_rebuild_from_heal(
             let indexed = tokio::task::spawn_blocking(move || {
                 let mut guard = ctx.blocking_lock();
                 crate::core::run_mutation(&mut guard, "post-heal session index", |c| {
-                    handle_session_index(c, &sessions_base, &project_root)
+                    crate::core::sessions::handle_session_index(c, &sessions_base, &project_root)
                 })
             })
             .await;
@@ -1617,7 +1621,7 @@ async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, needs_sync: &mut b
     let outcome = tokio::task::spawn_blocking(move || {
         let mut guard = ctx.blocking_lock();
         crate::core::run_mutation(&mut guard, "memory sync", |ctx_ref| {
-            crate::cli::handlers::sync_memory_files(ctx_ref)
+            crate::core::memory_sync::sync_memory_files(ctx_ref)
         })
     })
     .await;
@@ -4109,7 +4113,7 @@ if (require.main === module) {
                 updated_at: now,
             };
             crate::store::collections::add_collection(&ctx1.conn, &coll1).unwrap();
-            crate::cli::handlers::handle_update(&ctx1, &root1).unwrap();
+            crate::core::indexing::handle_update(&ctx1, &root1).unwrap();
         }
         {
             let ctx2 = crate::core::Context::open(&root2).unwrap();
@@ -4130,7 +4134,7 @@ if (require.main === module) {
                 updated_at: now,
             };
             crate::store::collections::add_collection(&ctx2.conn, &coll2).unwrap();
-            crate::cli::handlers::handle_update(&ctx2, &root2).unwrap();
+            crate::core::indexing::handle_update(&ctx2, &root2).unwrap();
         }
 
         // Create global server with both repos
@@ -4204,7 +4208,7 @@ if (require.main === module) {
         drop(ctx);
         {
             let ctx = crate::core::Context::open(&root).unwrap();
-            crate::cli::handlers::handle_update(&ctx, &root).unwrap();
+            crate::core::indexing::handle_update(&ctx, &root).unwrap();
         }
 
         // Standalone server — no registry, no root param
@@ -4269,7 +4273,7 @@ if (require.main === module) {
             crate::store::collections::add_collection(&ctx.conn, &coll).unwrap();
             drop(ctx);
             let ctx = crate::core::Context::open(&root2).unwrap();
-            crate::cli::handlers::handle_update(&ctx, &root2).unwrap();
+            crate::core::indexing::handle_update(&ctx, &root2).unwrap();
         }
 
         let config = global_test_config();

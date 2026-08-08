@@ -18,9 +18,6 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
 
-use crate::cli::handlers::{
-    handle_hybrid_search, handle_mget, handle_session_index, handle_update,
-};
 use crate::cli::hook_logic::{
     REINDEX_TOOLS, build_recall_query, canonicalize_under_cwd, classify_bash_search,
     classify_definition_search, classify_grep_pattern, is_mdkb_invocation, prompt_is_wrapup,
@@ -28,6 +25,8 @@ use crate::cli::hook_logic::{
 };
 use crate::code::indexing::IndexFacade;
 use crate::core::Context;
+use crate::core::indexing::handle_update;
+use crate::core::search::{handle_hybrid_search, handle_mget};
 use crate::daemon::registry::RepoHandle;
 use crate::domain::SearchResult;
 use crate::metrics::{
@@ -1983,7 +1982,7 @@ pub async fn update_impl(handle: &RepoHandle) -> Result<String, McpError> {
             let indexed = tokio::task::spawn_blocking(move || {
                 let mut ctx_guard = ctx.blocking_lock();
                 crate::core::run_mutation(&mut ctx_guard, "session index", |ctx| {
-                    handle_session_index(ctx, &sessions_base, &project_root)
+                    crate::core::sessions::handle_session_index(ctx, &sessions_base, &project_root)
                 })
             })
             .await;
@@ -2882,7 +2881,7 @@ fn format_quarantine_banner(mdkb_dir: &std::path::Path, doc_count: i64) -> Optio
 /// counts can still hide offsetting drift, which is exactly why this points at
 /// the command that checks properly instead of claiming the store is healthy.
 fn format_projection_drift_banner(ctx: &crate::core::Context) -> Option<String> {
-    let (files, rows) = crate::cli::handlers::projection_file_and_row_counts(ctx).ok()?;
+    let (files, rows) = crate::core::memory_sync::projection_file_and_row_counts(ctx).ok()?;
     if files == rows {
         return None;
     }
@@ -3233,7 +3232,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         if let Some(ctx) = ctx_guard.as_ref() {
             let docs_limit = cfg.recall_docs_limit;
             if docs_limit > 0 {
-                match crate::cli::handlers::hybrid_search_fts(
+                match crate::core::search::hybrid_search_fts(
                     ctx,
                     q,
                     query_embedding.as_deref(),
