@@ -1,15 +1,34 @@
 # Changelog
 
-## Unreleased
+## 3.7.12 (2026-08-09)
 
 ### Fixed
 
-- **Every CLI store mutation now executes in the daemon.** A single internal
+- **On Unix, every CLI store mutation now executes in the daemon.** A single internal
   typed `cli.mutate` protocol covers the complete mutating command surface and
   returns structured results for CLI-side formatting. `init` remains the local
   bootstrap operation; `MDKB_NO_DAEMON=1` remains the explicit direct-write
   escape hatch. The old partial `routing_gap()` and its misleading proof were
-  removed.
+  removed. Windows, where the Unix-socket daemon is unavailable, keeps the
+  direct path; the same project writer-admission lock serializes it with MCP,
+  watcher, telemetry, and schema writers.
+
+- **Corruption detection now releases the daemon context and actually triggers
+  recovery.** Memory/document reads, hook telemetry, persistent call telemetry,
+  watcher mutations, and daemon mutations close their long-lived `Context` as
+  soon as SQLite reports corruption, allowing the next open to quarantine,
+  salvage, and rebuild. Successful markers are no longer trusted when the DB or
+  WAL is newer, and post-write checks use a fresh connection rather than the
+  daemon pager cache. Hook and MCP telemetry use the same universal writer lock
+  as direct CLI commands instead of remaining an uncoordinated hot writer.
+
+- **The `memory_write` tool schema now advertises the valid relation values.**
+  `relates[].relation` and `relates[].target_kind` were plain strings in the
+  JSON Schema, with the accepted values mentioned only in prose, so MCP clients
+  guessed relations outside the closed set and had the whole write rejected at
+  runtime. Both fields now emit a JSON Schema `enum` generated from the domain
+  enums themselves, so the advertised vocabulary cannot drift from the one the
+  server enforces. Server-side validation and its error message are unchanged.
 
 - **Commands classified as reads are now actually read-only.** Search, stats,
   collection and memory reads, metrics, experiment inspection, and code-index
@@ -54,22 +73,19 @@
 
 ### Added
 
-- **Store mutations route through the daemon.** `mdkb mcp` and `mdkb hook`
+- **Store mutations route through one typed daemon protocol on Unix.** `mdkb mcp` and `mdkb hook`
   already did; the plain CLI never adopted the pattern, so every `mdkb memory
   add` was an independent writer process — its own connection, its own migration
   run, its own virtual-table init — racing the long-lived daemon on one file.
   Commands are now classified as mutation, read or local, with no wildcard: a new
   command that nobody classified fails to *compile* rather than defaulting to a
-  direct write. Mutations the daemon exposes an RPC for go over the hook socket;
+  direct write. Every mutation is represented by the exhaustive `cli.mutate`
+  request and result enums and goes over the hook socket;
   an unreachable daemon falls back to writing in-process, because a routing layer
   that turns a daemon outage into a broken CLI is worse than no routing.
-  `MDKB_NO_DAEMON=1` remains the single escape hatch and the only way a CLI
-  process writes directly. **The coverage is partial and deliberately visible:**
-  the daemon exposes RPCs for the memory write path and `update` — where the
-  recurring corruption is confined — and `core::routing::routing_gap()`
-  enumerates the mutations that still run in-process. This narrows the corruption
-  search space; it does not prove the corruption fixed, since a cause inside the
-  in-process sqlite-vec extension would be unaffected by a single writer.
+  `MDKB_NO_DAEMON=1` remains the explicit Unix escape hatch. Windows continues
+  to use the direct path because the daemon transport is Unix-only, protected
+  by the same cross-surface writer-admission lock as MCP and watcher activity.
 
 - **A read-only store path, so a read stops being a write.** Opening the store
   ran migrations, created the FTS and vector virtual tables and initialized the
@@ -328,17 +344,7 @@
     stripping the local fields — and explicitly does not read the unknown bytes as
     a conflict. Nothing is lost: those values live in `memory_entries`.
 
-## 3.7.12 (2026-08-04)
-
-### Fixed
-
-- **The `memory_write` tool schema now advertises the valid relation values.**
-  `relates[].relation` and `relates[].target_kind` were plain strings in the
-  JSON Schema, with the accepted values mentioned only in prose, so MCP clients
-  guessed relations outside the closed set and had the whole write rejected at
-  runtime. Both fields now emit a JSON Schema `enum` generated from the domain
-  enums themselves, so the advertised vocabulary cannot drift from the one the
-  server enforces. Server-side validation and its error message are unchanged.
+## 3.7.11 (2026-08-03)
 
 ### Fixed
 

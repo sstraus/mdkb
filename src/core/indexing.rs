@@ -297,7 +297,7 @@ pub fn handle_update_force(
 
     report_collection_deltas(ctx, &before, &mut result);
 
-    crate::store::heal::verify_and_mark(&ctx.conn, &ctx.db_path)?;
+    crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
 
     Ok(result)
 }
@@ -651,7 +651,7 @@ pub fn handle_update_files_force(
             &mut result,
         )
     })?;
-    crate::store::heal::verify_and_mark(&ctx.conn, &ctx.db_path)?;
+    crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
     Ok(result)
 }
 /// Build/dependency directories pruned by the document walker by default.

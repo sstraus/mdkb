@@ -5,7 +5,8 @@
 //! backfills, and projection reconciliation. `compact` and corruption recovery
 //! also replace or rewrite the database file. A project-scoped advisory lock
 //! prevents those operations from overlapping across the daemon and one-shot
-//! CLI processes.
+//! CLI processes. A broader writer-admission lock also serializes smaller
+//! writes such as hook telemetry with those index-wide operations.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -44,6 +45,18 @@ pub fn lock_path(db_path: &Path) -> PathBuf {
 pub fn live_lock_path(db_path: &Path) -> PathBuf {
     let mut path = db_path.as_os_str().to_os_string();
     path.push(".live.lock");
+    PathBuf::from(path)
+}
+
+/// Sidecar shared by every process that can write the main project store.
+///
+/// This is deliberately broader than [`lock_path`]. The latter protects one
+/// index-wide operation; this lock admits exactly one write-capable adapter at
+/// a time, including daemon telemetry, watcher work, direct CLI execution and
+/// schema initialization.
+pub fn writer_lock_path(db_path: &Path) -> PathBuf {
+    let mut path = db_path.as_os_str().to_os_string();
+    path.push(".writer.lock");
     PathBuf::from(path)
 }
 
@@ -134,6 +147,45 @@ pub fn acquire(db_path: &Path, operation: &str) -> Result<MutationGuard> {
     Ok(MutationGuard { file })
 }
 
+/// Admit one writer for the complete project store.
+///
+/// Callers that also need [`acquire`] must always take this writer lock first.
+pub fn acquire_writer(db_path: &Path, operation: &str) -> Result<MutationGuard> {
+    let path = writer_lock_path(db_path);
+    let mut file = open_lock_file(&path)?;
+
+    file.lock_exclusive().map_err(|e| {
+        Error::from(ErrorKind::Io {
+            path: path.clone(),
+            operation: format!("acquire writer lock: {e}"),
+        })
+    })?;
+
+    let _ = file.set_len(0);
+    let _ = writeln!(file, "pid={} operation={operation}", std::process::id());
+    let _ = file.sync_data();
+
+    Ok(MutationGuard { file })
+}
+
+/// Admit a direct CLI writer using the same lock as daemon-owned writers.
+pub fn acquire_direct_cli(root: &Path) -> Result<MutationGuard> {
+    let mdkb_dir = root.join(".mdkb");
+    if !mdkb_dir.is_dir() {
+        return Err(ErrorKind::DatabaseNotFound {
+            path: mdkb_dir.join("index.sqlite"),
+        }
+        .into());
+    }
+    let mdkb_dir = mdkb_dir.canonicalize().map_err(|e| {
+        Error::other(format!(
+            "cannot canonicalize {} for writer admission: {e}",
+            mdkb_dir.display()
+        ))
+    })?;
+    acquire_writer(&mdkb_dir.join("index.sqlite"), "direct-cli-mutation")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -160,6 +212,29 @@ mod tests {
         drop(first);
         rx.recv_timeout(Duration::from_secs(2))
             .expect("second mutation should proceed after release");
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn direct_cli_and_daemon_writers_share_one_outer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".mdkb")).unwrap();
+        let first = acquire_direct_cli(dir.path()).unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let db = dir.path().join(".mdkb/index.sqlite");
+        let waiter = std::thread::spawn(move || {
+            let _second = acquire_writer(&db, "daemon telemetry").unwrap();
+            tx.send(()).unwrap();
+        });
+
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "a second direct CLI mutation must wait for the first"
+        );
+        drop(first);
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("direct CLI mutation should proceed after release");
         waiter.join().unwrap();
     }
 
@@ -207,6 +282,18 @@ mod tests {
         rx.recv_timeout(Duration::from_secs(2))
             .expect("an index-wide mutation must not wait on live connections");
         waiter.join().unwrap();
+    }
+
+    #[test]
+    fn writer_admission_is_outer_to_the_index_and_live_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        assert_ne!(writer_lock_path(&db), lock_path(&db));
+        assert_ne!(writer_lock_path(&db), live_lock_path(&db));
+
+        let _writer = acquire_writer(&db, "outer").unwrap();
+        let _index = acquire(&db, "inner").unwrap();
+        let _live = acquire_live_shared(&db).unwrap();
     }
 
     #[test]

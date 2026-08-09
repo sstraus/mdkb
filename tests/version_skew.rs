@@ -11,6 +11,8 @@
 //! *newer* than it understands must refuse. A daemon whose executable is
 //! replaced underneath it must retire, so the next call spawns a matching one.
 
+use std::io::{Seek, SeekFrom, Write};
+
 use mdkb::cli::handlers::handle_init;
 use mdkb::core::Context;
 use mdkb::store::schema::SCHEMA_VERSION;
@@ -48,6 +50,16 @@ fn a_store_newer_than_the_binary_is_refused() {
     let future = SCHEMA_VERSION + 3;
     set_schema_version(&root, future);
 
+    let db = root.join(".mdkb/index.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open for stable snapshot");
+        conn.pragma_update(None, "journal_mode", "DELETE")
+            .expect("disable WAL for byte comparison");
+        conn.execute_batch("VACUUM")
+            .expect("stabilize database bytes");
+    }
+    let before = std::fs::read(&db).expect("read database before refusal");
+
     let err = Context::open(&root).expect_err("a store from the future must not open");
     let msg = err.to_string();
     assert!(
@@ -61,6 +73,80 @@ fn a_store_newer_than_the_binary_is_refused() {
         future,
         "the refusal must leave the recorded version alone — writing it back down \
          is the exact silent downgrade this rule exists to prevent"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("read database after refusal"),
+        before,
+        "refusing a future schema must happen before SCHEMA_SQL or FTS ranking writes"
+    );
+}
+
+#[test]
+fn a_damaged_store_from_the_future_is_refused_before_autoheal() {
+    let (_dir, root) = store();
+    let future = SCHEMA_VERSION + 3;
+    let db = root.join(".mdkb/index.sqlite");
+    let (index_root, page_size) = {
+        let conn = rusqlite::Connection::open(&db).expect("open fixture");
+        conn.execute("UPDATE schema_version SET version = ?1", [future])
+            .expect("set future version");
+        conn.pragma_update(None, "journal_mode", "DELETE")
+            .expect("disable WAL");
+        conn.execute_batch("VACUUM").expect("stabilize fixture");
+        let index_root: u64 = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name = 'idx_memory_status'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read index rootpage");
+        let page_size: u64 = conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .expect("read page size");
+        (index_root, page_size)
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&db)
+        .expect("open index page for corruption");
+    file.seek(SeekFrom::Start((index_root - 1) * page_size))
+        .expect("seek to index rootpage");
+    file.write_all(&[0]).expect("invalidate b-tree page type");
+    file.sync_all().expect("persist fixture corruption");
+    drop(file);
+    {
+        let conn =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open damaged fixture read-only");
+        assert_eq!(
+            mdkb::store::schema::get_schema_version(&conn).expect("version remains readable"),
+            Some(future)
+        );
+        let quick_check = conn.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0));
+        assert!(
+            !matches!(quick_check, Ok(ref result) if result == "ok"),
+            "fixture must be structurally damaged"
+        );
+    }
+    let before = std::fs::read(&db).expect("read damaged future store");
+
+    let err = Context::open(&root).expect_err("damaged future store must still be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains(&future.to_string()) && message.contains(&SCHEMA_VERSION.to_string()),
+        "readable future version must win over autoheal; got: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&db).expect("read store after refusal"),
+        before,
+        "an older binary must not quarantine or rewrite a damaged future store"
+    );
+    assert!(
+        !std::fs::read_dir(root.join(".mdkb"))
+            .expect("read store directory")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt-")),
+        "future-version refusal must happen before quarantine"
     );
 }
 

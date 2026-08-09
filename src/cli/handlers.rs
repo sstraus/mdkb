@@ -21,7 +21,7 @@ pub use crate::core::indexing::{
     handle_update, handle_update_files, handle_update_files_force, handle_update_force,
 };
 #[cfg(feature = "llm")]
-pub use crate::core::memory::handle_memory_condense;
+pub use crate::core::memory::{CondenseResult, find_related_entries, handle_memory_condense};
 pub use crate::core::memory::{
     ConfirmResult, ExportResult, ImportResult, handle_memory_add, handle_memory_confirm,
     handle_memory_export, handle_memory_import, handle_memory_import_dir,

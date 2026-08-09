@@ -349,6 +349,9 @@ impl McpServer {
                 }
                 Err(e) => return Err(mcp_error(format!("Failed to open database: {}", e))),
             };
+            let _writer_guard =
+                crate::store::mutation_lock::acquire_writer(&ctx.db_path, "server context setup")
+                    .map_err(|e| mcp_error(format!("Failed to acquire writer lock: {e}")))?;
             stats::init_stats_schema(&ctx.conn)
                 .map_err(|e| mcp_error(format!("Failed to init stats schema: {}", e)))?;
             self.apply_conventions(&ctx)
@@ -385,6 +388,10 @@ impl McpServer {
                 }
                 Err(e) => return Err(mcp_error(format!("Failed to open database: {}", e))),
             };
+
+            let _writer_guard =
+                crate::store::mutation_lock::acquire_writer(&ctx.db_path, "server context setup")
+                    .map_err(|e| mcp_error(format!("Failed to acquire writer lock: {e}")))?;
 
             // Initialize stats schema
             stats::init_stats_schema(&ctx.conn)
@@ -547,21 +554,22 @@ impl McpServer {
             return; // No session yet
         }
 
-        let ctx_guard = self.ctx.lock().await;
-        if let Some(ctx) = ctx_guard.as_ref() {
-            if let Err(e) =
-                stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated)
-            {
-                tracing::warn!("Failed to record call stats: {}", e);
-            }
-
-            let call_count = self.persistent_call_count.fetch_add(1, Ordering::Relaxed) + 1;
-            let interval = self.full_config.db.optimize_interval_calls;
-            if crate::store::maintenance::should_optimize(call_count, interval) {
-                if let Err(e) = crate::store::maintenance::run_optimize(&ctx.conn) {
-                    tracing::warn!("PRAGMA optimize failed: {}", e);
+        let mut ctx_guard = self.ctx.lock().await;
+        if ctx_guard.is_none() {
+            return;
+        }
+        let call_count = self.persistent_call_count.fetch_add(1, Ordering::Relaxed) + 1;
+        let interval = self.full_config.db.optimize_interval_calls;
+        let outcome =
+            crate::core::run_guarded_write(&mut ctx_guard, "persistent call telemetry", |ctx| {
+                stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated)?;
+                if crate::store::maintenance::should_optimize(call_count, interval) {
+                    crate::store::maintenance::run_optimize(&ctx.conn)?;
                 }
-            }
+                Ok(())
+            });
+        if let Some(Err(error)) = outcome {
+            tracing::warn!("Failed to record call stats: {error}");
         }
     }
 
@@ -1009,6 +1017,18 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                 );
                 if let Some(ctx) = taken_ctx {
                     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _writer_guard = match crate::store::mutation_lock::acquire_writer(
+                            &ctx.db_path,
+                            "startup indexing",
+                        ) {
+                            Ok(guard) => guard,
+                            Err(error) => {
+                                tracing::error!("Startup writer admission failed: {error}");
+                                return false;
+                            }
+                        };
+                        crate::store::heal::invalidate_marker(&ctx.db_path);
+                        let mut corruption_observed = false;
                         match handle_update(&ctx, &startup_root) {
                             Ok(result) => {
                                 if result.added > 0 || result.updated > 0 || result.removed > 0 {
@@ -1020,7 +1040,10 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                                     );
                                 }
                             }
-                            Err(e) => tracing::error!("Startup doc reindex failed: {}", e),
+                            Err(e) => {
+                                corruption_observed |= e.is_index_corrupt();
+                                tracing::error!("Startup doc reindex failed: {}", e);
+                            }
                         }
 
                         let sessions_base =
@@ -1040,16 +1063,54 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                                 );
                             }
                             Ok(_) => {}
-                            Err(e) => tracing::warn!("Session indexing failed: {}", e),
+                            Err(e) => {
+                                corruption_observed |= e.is_index_corrupt();
+                                tracing::warn!("Session indexing failed: {}", e);
+                            }
                         }
+                        if let Err(error) =
+                            crate::store::heal::verify_and_mark_throttled(&ctx.db_path)
+                        {
+                            corruption_observed = true;
+                            tracing::error!(
+                                "Startup index verification failed; closing context for automatic recovery: {error}"
+                            );
+                        }
+                        corruption_observed
                     }));
-                    if outcome.is_err() {
-                        tracing::error!("Startup doc reindex panicked; restoring context");
-                    }
+                    let restore_context = match outcome {
+                        Ok(false) => true,
+                        Ok(true) => {
+                            tracing::error!(
+                                "Startup indexing observed corruption; leaving context closed for automatic recovery"
+                            );
+                            false
+                        }
+                        Err(_) => {
+                            tracing::error!("Startup doc reindex panicked; verifying context");
+                            let verification = crate::store::mutation_lock::acquire_writer(
+                                &ctx.db_path,
+                                "startup panic verification",
+                            )
+                            .and_then(|_guard| {
+                                crate::store::heal::verify_and_mark_throttled(&ctx.db_path)
+                            });
+                            match verification {
+                                Ok(()) => true,
+                                Err(error) => {
+                                    tracing::error!(
+                                        "Startup panic verification failed; leaving context closed for automatic recovery: {error}"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                    };
 
-                    // Put ctx back so tool calls can proceed (also on the panic path).
-                    let mut ctx_guard = startup_server.ctx.lock().await;
-                    *ctx_guard = Some(ctx);
+                    if restore_context {
+                        let mut ctx_guard = startup_server.ctx.lock().await;
+                        *ctx_guard = Some(ctx);
+                    }
                 }
                 // _doc_guard drops here → doc_reindex_active cleared.
             }
@@ -1286,9 +1347,18 @@ pub async fn run_file_watcher_inner(
             tokio::time::Instant::now() + std::time::Duration::from_secs(CTX_WAIT_SECS);
         let mut warned = false;
         loop {
-            let ctx_guard = ctx.lock().await;
-            if let Some(ctx_ref) = ctx_guard.as_ref() {
-                break collections::list_collections(&ctx_ref.conn)?;
+            let mut ctx_guard = ctx.lock().await;
+            if ctx_guard.is_some() {
+                let outcome = crate::core::run_guarded_read(
+                    &mut ctx_guard,
+                    "watcher collection discovery",
+                    |ctx_ref| collections::list_collections(&ctx_ref.conn),
+                );
+                match outcome {
+                    Some(Ok(collections)) => break collections,
+                    Some(Err(error)) => return Err(error),
+                    None => {}
+                }
             }
             drop(ctx_guard);
             if !warned && tokio::time::Instant::now() >= warn_after {
@@ -1798,10 +1868,7 @@ fn load_server_instructions(root: &std::path::Path, limit: usize) -> String {
     // Try to load memory entries from existing database
     let memory_index = Context::open(root)
         .ok()
-        .and_then(|ctx| {
-            crate::store::schema::init_schema(&ctx.conn).ok()?;
-            memory::get_warmup_index(&ctx.conn, limit).ok()
-        })
+        .and_then(|ctx| memory::get_warmup_index(&ctx.conn, limit).ok())
         .unwrap_or_default();
 
     if !memory_index.is_empty() {

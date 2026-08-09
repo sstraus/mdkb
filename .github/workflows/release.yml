@@ -9,8 +9,31 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    name: Verify release tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Match tag, package version, and main
+        shell: bash
+        run: |
+          manifest_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "${GITHUB_REF_NAME}" != "v${manifest_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${manifest_version}" >&2
+            exit 1
+          fi
+          git fetch origin main
+          if ! git merge-base --is-ancestor "${GITHUB_SHA}^{commit}" origin/main; then
+            echo "Release tag ${GITHUB_REF_NAME} is not on origin/main" >&2
+            exit 1
+          fi
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

@@ -219,6 +219,51 @@ fn a_mutation_falls_back_in_process_when_the_daemon_is_unreachable() {
     );
 }
 
+/// Direct CLI execution is the Windows path and the explicit Unix escape hatch.
+/// It must serialize the whole command, including handlers that do not take an
+/// index-wide lock themselves.
+#[test]
+fn direct_cli_mutations_wait_for_the_outer_lock() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonicalize");
+    mdkb::cli::handlers::handle_init(&root).expect("init");
+    let guard = mdkb::store::mutation_lock::acquire_writer(
+        &root.join(".mdkb/index.sqlite"),
+        "daemon writer",
+    )
+    .expect("hold daemon writer lock");
+
+    let home = tempfile::tempdir().expect("home");
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
+        .args([
+            "memory",
+            "add",
+            "serialized",
+            "--title",
+            "Serialized",
+            "--content",
+            "body",
+        ])
+        .current_dir(&root)
+        .env("HOME", home.path())
+        .env("MDKB_NO_DAEMON", "1")
+        .spawn()
+        .expect("spawn direct mutation");
+
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    assert!(
+        child.try_wait().expect("poll child").is_none(),
+        "the direct mutation bypassed the process-wide outer lock"
+    );
+
+    drop(guard);
+    let status = child.wait().expect("wait after releasing lock");
+    assert!(
+        status.success(),
+        "direct mutation failed after lock release"
+    );
+}
+
 /// A successfully routed mutation must not open the main store in the CLI
 /// process. A fake daemon returns the typed success without touching SQLite;
 /// any WAL/SHM sidecar therefore proves the CLI opened its own writer.

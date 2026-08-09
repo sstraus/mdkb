@@ -77,6 +77,7 @@ tempfile = "3"
 
 # Utilities
 sha2 = "0.10"
+same-file = "1"
 walkdir = "2"
 glob = "0.3"
 globset = "0.4"

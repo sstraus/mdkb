@@ -71,7 +71,23 @@ pub fn run_mutation<T>(
     what: &str,
     f: impl FnOnce(&mut Context) -> Result<T>,
 ) -> Option<Result<T>> {
-    let result = f(slot.as_mut()?);
+    let db_path = slot.as_ref()?.db_path.clone();
+    let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
+        Ok(guard) => guard,
+        Err(error) => return Some(Err(error)),
+    };
+
+    // A crash during the mutation must not leave a pre-write health marker
+    // capable of suppressing recovery on the next open.
+    crate::store::heal::invalidate_marker(&db_path);
+    let mut result = f(slot.as_mut().expect("slot was checked above"));
+
+    // Always verify through a fresh connection. Mutation implementations that
+    // already performed the same check have touched the marker after their last
+    // write, so this call is throttled to a cheap metadata check.
+    if let Err(error) = crate::store::heal::verify_and_mark_throttled(&db_path) {
+        result = Err(error);
+    }
 
     if let Err(e) = &result {
         if e.is_index_corrupt() {
@@ -82,6 +98,55 @@ pub fn run_mutation<T>(
             );
             *slot = None;
         }
+    }
+    Some(result)
+}
+
+/// Run a small write under universal writer admission and close a long-lived
+/// context immediately when SQLite reports structural corruption.
+///
+/// Telemetry uses this path: a full-file `quick_check` after every hook would be
+/// disproportionate, but silently swallowing `SQLITE_CORRUPT` keeps the live
+/// lock held forever and prevents autoheal.
+pub fn run_guarded_write<T>(
+    slot: &mut Option<Context>,
+    what: &str,
+    f: impl FnOnce(&Context) -> Result<T>,
+) -> Option<Result<T>> {
+    let db_path = slot.as_ref()?.db_path.clone();
+    let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
+        Ok(guard) => guard,
+        Err(error) => return Some(Err(error)),
+    };
+    // Even tiny writes change bytes certified by the marker. Remove it before
+    // the statement so coarse filesystem timestamp granularity cannot make a
+    // pre-write marker appear current on the next open.
+    crate::store::heal::invalidate_marker(&db_path);
+    let result = f(slot.as_ref().expect("slot was checked above"));
+    if result.as_ref().is_err_and(Error::is_index_corrupt) {
+        tracing::error!(
+            operation = what,
+            "index corruption observed during write — closing the context for automatic recovery"
+        );
+        *slot = None;
+    }
+    Some(result)
+}
+
+/// Run a read and release a corrupt long-lived context when SQLite reports the
+/// damaged file. The next `Context::open` can then quarantine and rebuild it.
+pub fn run_guarded_read<T>(
+    slot: &mut Option<Context>,
+    what: &str,
+    f: impl FnOnce(&Context) -> Result<T>,
+) -> Option<Result<T>> {
+    let result = f(slot.as_ref()?);
+    if result.as_ref().is_err_and(Error::is_index_corrupt) {
+        tracing::error!(
+            operation = what,
+            "index corruption observed during read — closing the context for automatic recovery"
+        );
+        *slot = None;
     }
     Some(result)
 }
@@ -116,7 +181,19 @@ impl Context {
 
     /// Open or create context at the given root.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        let root = root.as_ref();
+        Self::open_impl(root.as_ref(), false)
+    }
+
+    /// Open while the caller already holds the project writer-admission lock.
+    ///
+    /// The direct CLI admits the complete command before dispatch, so acquiring
+    /// the same non-reentrant file lock again here would deadlock. All other
+    /// callers must use [`Self::open`].
+    pub fn open_writer_admitted(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_impl(root.as_ref(), true)
+    }
+
+    fn open_impl(root: &Path, writer_admitted: bool) -> Result<Self> {
         let mdkb_dir = root.join(".mdkb");
 
         if !mdkb_dir.exists() {
@@ -127,8 +204,9 @@ impl Context {
         }
 
         // Every cross-process identity below is derived from `db_path` as a
-        // STRING: the `.mutation.lock` and `.live.lock` sidecars, and the
-        // `-wal`/`-shm` files SQLite itself names. Two spellings of one file
+        // STRING: the `.writer.lock`, `.mutation.lock` and `.live.lock`
+        // sidecars, and the `-wal`/`-shm` files SQLite itself names. Two
+        // spellings of one file
         // therefore give two lock domains over a single inode — no shared WAL
         // index, no mutual exclusion, and the doubly-referenced pages that
         // follow. On a case-insensitive volume (APFS default) `Gits` and `GITS`
@@ -145,6 +223,18 @@ impl Context {
         let config_path = mdkb_dir.join("config.toml");
         let db_path = mdkb_dir.join("index.sqlite");
 
+        // Schema initialization, integrity recovery and ordinary mutations are
+        // all writers. Admit them through the same cross-process lock. The
+        // direct CLI already holds it across complete command dispatch.
+        let _writer_guard = if writer_admitted {
+            None
+        } else {
+            Some(crate::store::mutation_lock::acquire_writer(
+                &db_path,
+                "open-schema",
+            )?)
+        };
+
         // Initialize sqlite-vec extension before opening connection
         vectors::init_sqlite_vec();
 
@@ -159,6 +249,31 @@ impl Context {
         // one: the locks taken above and the WAL files below are named from this
         // path, so two spellings are two lock domains over one database.
         crate::store::identity::claim(&db_path)?;
+
+        // Establish version compatibility before autoheal can quarantine or
+        // replace the file. If the version remains readable, an older binary
+        // must not mutate even a structurally damaged store from the future.
+        // A corruption error while inspecting the version falls through to the
+        // integrity recovery path because compatibility could not be established.
+        if db_path.exists() {
+            let version_check = (|| -> Result<()> {
+                let version_probe = Connection::open_with_flags(
+                    &db_path,
+                    rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                schema::refuse_future_schema(&version_probe)
+            })();
+            match version_check {
+                Ok(()) => {}
+                Err(error) if error.is_index_corrupt() => {
+                    tracing::warn!(
+                        "schema version could not be read from a corrupt index; continuing to autoheal: {error}"
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
 
         // Autoheal: quarantine a structurally-corrupt index before we build on
         // it, so the `Connection::open` below lands on a clean file. Throttled,
@@ -329,6 +444,7 @@ impl Context {
         })?;
         let config_path = mdkb_dir.join("config.toml");
         let db_path = mdkb_dir.join("index.sqlite");
+        let _writer_guard = crate::store::mutation_lock::acquire_writer(&db_path, "init-schema")?;
         let _init_guard = crate::store::mutation_lock::acquire(&db_path, "init-schema")?;
 
         // Create memory directories

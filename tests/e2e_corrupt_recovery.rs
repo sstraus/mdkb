@@ -19,7 +19,8 @@ use std::path::{Path, PathBuf};
 
 use mdkb::cli::handlers::{handle_init, handle_update};
 use mdkb::code::indexing::{IndexFacade, run_code_mutation};
-use mdkb::core::{Context, run_mutation};
+use mdkb::core::{Context, run_guarded_read, run_guarded_write, run_mutation};
+use mdkb::error::ErrorKind;
 use mdkb::store::memory::{self, EntryStatus, EntryType, MemoryEntry, SourceType};
 use tempfile::TempDir;
 
@@ -219,6 +220,50 @@ fn a_corrupt_index_is_released_by_the_mutation_that_detects_it() {
     assert!(
         slot.is_none(),
         "the holder must close a corrupt index instead of retrying against it"
+    );
+}
+
+#[test]
+fn a_telemetry_write_releases_the_context_when_sqlite_reports_corruption() {
+    let repo = Repo::seed();
+    let mut slot = Some(Context::open(&repo.root).expect("open"));
+    let db_path = repo.db_path();
+
+    let result: mdkb::error::Result<()> = run_guarded_write(&mut slot, "hook telemetry", |_| {
+        Err(ErrorKind::IndexCorrupt { path: db_path }.into())
+    })
+    .expect("slot was populated");
+
+    assert!(
+        result
+            .expect_err("fixture must report corruption")
+            .is_index_corrupt()
+    );
+    assert!(
+        slot.is_none(),
+        "best-effort telemetry must not retain the live lock after corruption"
+    );
+}
+
+#[test]
+fn a_failed_read_releases_the_context_for_the_next_open() {
+    let repo = Repo::seed();
+    let mut slot = Some(Context::open(&repo.root).expect("open"));
+    let db_path = repo.db_path();
+
+    let result: mdkb::error::Result<()> = run_guarded_read(&mut slot, "memory search", |_| {
+        Err(ErrorKind::IndexCorrupt { path: db_path }.into())
+    })
+    .expect("slot was populated");
+
+    assert!(
+        result
+            .expect_err("fixture must report corruption")
+            .is_index_corrupt()
+    );
+    assert!(
+        slot.is_none(),
+        "a read that observes corruption must release the live lock"
     );
 }
 

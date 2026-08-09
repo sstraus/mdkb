@@ -534,9 +534,8 @@ pub struct HooksConfig {
     /// recently get a larger boost. Set to 0 to disable re-ranking.
     pub recall_half_life_secs: i64,
 
-    /// When true, hooks require a running daemon and skip the in-process
-    /// fallback (MDKB_NO_DAEMON=1). The generated shell command will NOT
-    /// include the `if ! ...; then MDKB_NO_DAEMON=1 ...; fi` wrapper.
+    /// When true, hooks require a running daemon and skip every in-process
+    /// fallback, including an explicit `MDKB_NO_DAEMON=1` request.
     pub daemon_required: bool,
 
     /// On a definition Grep/Bash search (`fn X`, `struct X`, …), inject the real

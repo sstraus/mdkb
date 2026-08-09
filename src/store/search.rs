@@ -41,17 +41,13 @@ pub const INDEX_EMPTY_HINT: &str =
     "Index is empty (0 documents, 0 memory entries) — run `mdkb update` to populate it.";
 
 /// True when the index holds no documents and no memory entries.
-pub fn index_is_empty(conn: &Connection) -> bool {
-    let docs: i64 = conn
-        .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
-        .unwrap_or(0);
+pub fn index_is_empty(conn: &Connection) -> Result<bool> {
+    let docs: i64 = conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))?;
     if docs > 0 {
-        return false;
+        return Ok(false);
     }
-    let mem: i64 = conn
-        .query_row("SELECT COUNT(*) FROM memory_entries", [], |r| r.get(0))
-        .unwrap_or(0);
-    mem == 0
+    let mem: i64 = conn.query_row("SELECT COUNT(*) FROM memory_entries", [], |r| r.get(0))?;
+    Ok(mem == 0)
 }
 
 /// Perform BM25 full-text search with optional evolution filtering.
@@ -575,7 +571,10 @@ mod tests {
     #[test]
     fn test_index_is_empty_gates_on_docs_and_memory() {
         let conn = setup_db();
-        assert!(index_is_empty(&conn), "fresh store: no docs, no memory");
+        assert!(
+            index_is_empty(&conn).unwrap(),
+            "fresh store: no docs, no memory"
+        );
 
         conn.execute(
             "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
@@ -584,7 +583,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !index_is_empty(&conn),
+            !index_is_empty(&conn).unwrap(),
             "a single memory entry makes the store non-empty (hint must not fire)"
         );
     }
@@ -592,7 +591,7 @@ mod tests {
     #[test]
     fn test_index_not_empty_with_docs() {
         let conn = setup_db_with_docs();
-        assert!(!index_is_empty(&conn), "docs present → not empty");
+        assert!(!index_is_empty(&conn).unwrap(), "docs present → not empty");
     }
 
     // ==================== Evolution Filtering Tests ====================

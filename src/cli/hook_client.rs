@@ -15,9 +15,9 @@
 //! shell sees exit 0. The daemon signals whitelist rejection with a
 //! JSON-RPC `error` envelope (code `-32602`), which we log and swallow.
 //!
-//! `MDKB_NO_DAEMON=1` short-circuits to an in-process dispatch that opens
-//! an ephemeral `RepoRegistry` and calls `dispatch_call` directly. Same
-//! wire-level result, no daemon required — useful for scripts and tests.
+//! `MDKB_NO_DAEMON=1` requests an in-process dispatch that opens an ephemeral
+//! `RepoRegistry` and calls `dispatch_call` directly. Project policy still wins:
+//! `[hooks] daemon_required = true` refuses that fallback.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -227,38 +227,52 @@ pub async fn call_hook_event(method: &str, event: Value, root: Option<PathBuf>) 
 async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<()> {
     let root = resolve_hook_root(&params, root);
     params["root"] = json!(root.display().to_string());
+    let daemon_required = hook_requires_daemon(&root);
 
     if std::env::var_os("MDKB_NO_DAEMON").is_some() {
+        if daemon_required {
+            tracing::warn!(
+                "hook {method}: MDKB_NO_DAEMON ignored because hooks.daemon_required is true"
+            );
+            return Ok(());
+        }
         return run_hook_in_process(method, params, &root).await;
     }
 
     let socket_path = hook_socket_path();
     let timeout = hook_timeout(method);
-    match call_daemon_with_timeout(&socket_path, method, &params, timeout).await {
+    match call_daemon_phased(&socket_path, method, &params, timeout).await {
         Ok(response) => {
             emit_hook_response(&response);
             Ok(())
         }
-        // The daemon could not answer. Do the work here instead of returning
-        // silence.
-        //
-        // The generated wiring used to be
-        // `if ! mdkb hook <event>; then MDKB_NO_DAEMON=1 mdkb hook <event>; fi`,
-        // which can never fire: this function returns `Ok(())` on every failure
-        // by contract, because the host hook must exit 0. So the branch was
-        // unreachable and a dead daemon meant hooks silently did nothing, while
-        // the settings file advertised a rail that did not exist (021-0636).
-        //
-        // Falling back in-process rather than fixing the exit code keeps that
-        // contract intact — the host still never sees a non-zero exit for an
-        // ordinary hook failure — and is strictly better than the shell retry
-        // would have been: no second process launch, and no way for the two
-        // invocations to disagree about which repo they are in.
-        Err(e) => {
+        // The request provably never ran in the daemon. Falling back here keeps
+        // the host hook exit-zero contract without creating a second writer.
+        Err(MutationFailure::Unstarted(e)) if !daemon_required => {
             tracing::warn!("hook {method}: daemon unavailable ({e}); running in-process");
             run_hook_in_process(method, params, &root).await
         }
+        Err(MutationFailure::Unstarted(e)) => {
+            tracing::warn!("hook {method}: daemon required but unavailable ({e}); skipping");
+            Ok(())
+        }
+        // Once the complete frame crossed the socket, the daemon may already
+        // have written. Silence or a dropped response cannot license a second
+        // in-process dispatch.
+        Err(MutationFailure::Undetermined(e)) => {
+            tracing::warn!(
+                "hook {method}: daemon took the request but did not report back ({e}); skipping fallback"
+            );
+            Ok(())
+        }
     }
+}
+
+/// Whether project policy forbids an in-process hook fallback.
+fn hook_requires_daemon(root: &Path) -> bool {
+    crate::Config::load_or_default(root.join(".mdkb/config.toml"))
+        .hooks
+        .daemon_required
 }
 
 /// Daemon config for the in-process (`MDKB_NO_DAEMON`) fallback. The `root` here
@@ -378,11 +392,8 @@ async fn call_daemon(
     call_daemon_with_timeout(socket_path, method, params, CALL_TIMEOUT).await
 }
 
-/// [`call_daemon_phased`] flattened to one error string.
-///
-/// Hook events are advisory — a missed one costs a little context, never
-/// correctness — so their callers log and swallow every failure alike and have
-/// no use for the delivery phase. Mutations do; they call the phased form.
+/// [`call_daemon_phased`] flattened to one error string for non-hook RPC callers
+/// that do not perform an in-process fallback.
 async fn call_daemon_with_timeout(
     socket_path: &Path,
     method: &str,
@@ -555,7 +566,7 @@ async fn call_daemon_phased(
 
 /// Send a store mutation to the daemon over the hook socket.
 ///
-/// The daemon is the sole writer (story 018-56b2): the plain CLI used to open
+/// On Unix, the daemon is the sole writer (story 018-56b2): the plain CLI used to open
 /// its own write-capable connection for every `mdkb memory add`, racing the
 /// long-lived daemon on one file. This is the same client pattern `mdkb hook`
 /// uses, deliberately — one socket, one protocol, one thing to debug.
@@ -982,6 +993,21 @@ mod tests {
         );
         assert_eq!(hook_timeout("hook.pre_tool_use"), HOOK_TIMEOUT_PRE_TOOL_USE);
         assert_eq!(hook_timeout("status"), CALL_TIMEOUT);
+    }
+
+    #[test]
+    fn daemon_required_disables_hook_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let config_dir = tmp.path().join(".mdkb");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[hooks]\ndaemon_required = true\n",
+        )
+        .unwrap();
+
+        assert!(hook_requires_daemon(tmp.path()));
+        assert!(!hook_requires_daemon(&tmp.path().join("without-config")));
     }
 
     #[tokio::test]

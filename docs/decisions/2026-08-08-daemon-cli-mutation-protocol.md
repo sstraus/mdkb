@@ -2,7 +2,7 @@
 
 ## Problem
 
-The daemon is intended to be the only process that opens a store for writing,
+On Unix, the daemon is intended to be the only process that opens a store for writing,
 but the CLI currently routes only `update` and `memory rm`. Every other command
 classified as a mutation falls through to the in-process match and opens its own
 write-capable connection. Adding one unrelated JSON-RPC method per CLI spelling
@@ -17,7 +17,7 @@ the read side can still write.
 
 ## Decision
 
-The hook socket exposes one internal method, `cli.mutate`. Its request is a
+On Unix, the hook socket exposes one internal method, `cli.mutate`. Its request is a
 tagged, typed mutation enum and its response is a tagged, typed result enum. The
 enum is exhaustive over CLI mutations and is converted explicitly from the Clap
 command. The daemon executes each variant through the existing core operation;
@@ -74,8 +74,21 @@ also post-dispatch and therefore never licenses a retry.
 
 ## Ownership and Lifecycle
 
-The daemon owns all write-capable `Context` and code-index connections after a
-store exists. Core operations own behavior and return data. The CLI owns parsing
-and presentation. The hook socket owns framing and delivery evidence. Adding a
+On Unix, the daemon owns all write-capable `Context` and code-index connections
+after a store exists. Windows has no Unix-socket daemon transport and retains
+the direct path. Every write-capable adapter on every platform takes the same
+project writer-admission lock; index-wide work then takes the narrower database
+mutation lock in `writer -> index` order. This includes direct CLI commands,
+schema initialization, daemon mutations, watcher work, hook telemetry, and MCP
+call telemetry.
+
+A long-lived context that observes SQLite corruption is removed from its owner
+immediately, releasing the live lock. The next open can then quarantine, salvage,
+and rebuild. Integrity markers are valid only while newer than both the DB and
+its WAL, and post-write verification uses a fresh connection so the daemon page
+cache cannot certify bytes it did not reread.
+
+Core operations own behavior and return data. The CLI owns parsing and
+presentation. The hook socket owns framing and delivery evidence. Adding a
 mutation requires updating the typed conversion, daemon executor, result
 renderer, and exhaustiveness test in the same change.

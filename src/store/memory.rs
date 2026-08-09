@@ -957,25 +957,24 @@ pub fn find_similar_entries(
     embedding: &[f32],
     exclude_rowid: i64,
     exclude_id: &str,
-) -> String {
+) -> Result<String> {
     let mut warnings = String::new();
-    if let Ok(similar) = crate::store::vectors::memory_vector_search(conn, embedding, 5) {
-        for (sim_rowid, distance) in &similar {
-            if *sim_rowid == exclude_rowid || *distance > SIMILARITY_THRESHOLD {
-                continue;
-            }
-            if let Ok(Some(sim_entry)) = get_entry_by_rowid(conn, *sim_rowid) {
-                if sim_entry.id != exclude_id {
-                    let similarity = 1.0 - (f64::from(*distance) * f64::from(*distance) / 2.0);
-                    warnings.push_str(&format!(
-                        "\nSimilar entry exists: {} (similarity: {:.2}). Consider updating it instead.",
-                        sim_entry.id, similarity
-                    ));
-                }
+    let similar = crate::store::vectors::memory_vector_search(conn, embedding, 5)?;
+    for (sim_rowid, distance) in &similar {
+        if *sim_rowid == exclude_rowid || *distance > SIMILARITY_THRESHOLD {
+            continue;
+        }
+        if let Some(sim_entry) = get_entry_by_rowid(conn, *sim_rowid)? {
+            if sim_entry.id != exclude_id {
+                let similarity = 1.0 - (f64::from(*distance) * f64::from(*distance) / 2.0);
+                warnings.push_str(&format!(
+                    "\nSimilar entry exists: {} (similarity: {:.2}). Consider updating it instead.",
+                    sim_entry.id, similarity
+                ));
             }
         }
     }
-    warnings
+    Ok(warnings)
 }
 
 /// Get memory entry by rowid (internal, for hybrid search).

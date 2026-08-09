@@ -147,7 +147,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
     };
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
-    // The daemon is the sole writer. Every mutation is sent over one typed
+    // On Unix, the daemon is the sole writer. Every mutation is sent over one typed
     // internal RPC instead of opening a second
     // write-capable connection to a file the daemon is already writing — the
     // same client pattern `mdkb hook` uses (story 018-56b2).
@@ -184,6 +184,21 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
     }
 
+    // A successfully routed Unix mutation returned above. Anything mutating
+    // that reaches this point will execute directly: Windows has no Unix-socket
+    // daemon, MDKB_NO_DAEMON is an explicit override, or daemon admission
+    // proved the request never started. Serialize the complete command with the
+    // universal writer-admission lock shared by daemon telemetry, watcher work
+    // and schema initialization. Index-wide operations then take the narrower
+    // mutation lock in the fixed order writer -> index.
+    let _direct_mutation_guard = if mdkb::core::routing::routing_for(&cli.command)
+        == mdkb::core::routing::Routing::Mutation
+    {
+        Some(mdkb::store::mutation_lock::acquire_direct_cli(&cwd)?)
+    } else {
+        None
+    };
+
     match cli.command {
         Command::Init => {
             tracing::info!("Initializing mdkb...");
@@ -194,7 +209,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             let ctx = if matches!(&cmd, CollectionCommand::List) {
                 Context::open_read_only(&cwd)?
             } else {
-                Context::open(&cwd)?
+                Context::open_writer_admitted(&cwd)?
             };
             match cmd {
                 CollectionCommand::Add {
@@ -272,7 +287,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     }
                     if results.is_empty() && entries.is_empty() {
                         println!("No results found.");
-                        if mdkb::store::search::index_is_empty(&ctx.conn) {
+                        if mdkb::store::search::index_is_empty(&ctx.conn)? {
                             println!("{}", mdkb::store::search::INDEX_EMPTY_HINT);
                         }
                     }
@@ -360,13 +375,13 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             format_mget_results(&results, cli.format);
         }
         Command::Update { files, force } => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_writer_admitted(&cwd)?;
             let request = UpdateRequest { files, force };
             let outcome = run_update_in_process(&ctx, &cwd, &request)?;
             format_update_outcome(&outcome, cli.format);
         }
         Command::Embed { collection } => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_writer_admitted(&cwd)?;
             let result = handle_embed(&ctx, collection.as_deref())?;
             format_embed_result(&result, cli.format);
         }
@@ -506,7 +521,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             older_than,
             export,
         } => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_writer_admitted(&cwd)?;
             let mdkb_dir = ctx.db_path.parent().expect("db_path has parent");
             let _mutation_guard = mdkb::store::mutation_lock::acquire(&ctx.db_path, "compact")?;
             mdkb::store::heal::invalidate_marker(&ctx.db_path);
@@ -542,7 +557,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 
             // Vacuum index.sqlite
             ctx.conn.execute_batch("VACUUM;")?;
-            mdkb::store::heal::verify_and_mark(&ctx.conn, &ctx.db_path)?;
+            mdkb::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
             let idx_size = ctx.db_path.metadata().map(|m| m.len()).unwrap_or(0);
             eprintln!("index.sqlite vacuumed ({} KB)", idx_size / 1024);
 
@@ -618,7 +633,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             ) {
                 Context::open_read_only(&cwd)?
             } else {
-                Context::open(&cwd)?
+                Context::open_writer_admitted(&cwd)?
             };
             match cmd {
                 MemoryCommand::Add {
@@ -823,7 +838,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Evolve(cmd) => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_writer_admitted(&cwd)?;
             match cmd {
                 EvolveCommand::Supersedes { new, old, reason } => {
                     let id = handle_evolve_supersedes(&ctx, &new, &old, reason.as_deref())?;
@@ -917,7 +932,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             ) {
                 Context::open_read_only(&cwd)?
             } else {
-                Context::open(&cwd)?
+                Context::open_writer_admitted(&cwd)?
             };
             match cmd {
                 ExperimentCommand::Create {
@@ -965,7 +980,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Journal(cmd) => {
-            let ctx = Context::open(&cwd)?;
+            let ctx = Context::open_writer_admitted(&cwd)?;
             match cmd {
                 JournalCommand::Import { path, dry_run } => {
                     let result = mdkb::cli::handlers::handle_journal_import(
@@ -1232,7 +1247,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 sessions_path,
                 project_root,
             } => {
-                let ctx = Context::open(&cwd)?;
+                let ctx = Context::open_writer_admitted(&cwd)?;
                 let sessions_base = match sessions_path {
                     Some(p) => std::path::PathBuf::from(p),
                     None => mdkb::daemon::config::home_dir()?.join(".claude/projects"),

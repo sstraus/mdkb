@@ -4,6 +4,8 @@
 //! for. `mdkb memory add`, the MCP `memory_write` tool and the daemon hook path
 //! are three ways of invoking the same thing, so it belongs to none of them.
 
+#[cfg(feature = "llm")]
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::core::Context;

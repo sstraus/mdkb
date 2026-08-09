@@ -43,6 +43,41 @@ use super::server::{
     format_symbol, format_symbol_with_file_tokens, format_ttl_info, ood_hint, relative_time_ago,
     resolve_document, truncate_text,
 };
+
+fn mcp_store_error(context: &str, error: impl Into<crate::Error>) -> McpError {
+    let error = error.into();
+    McpError {
+        code: ErrorCode::INTERNAL_ERROR,
+        message: format!("{context}: {error}").into(),
+        data: error
+            .is_index_corrupt()
+            .then(|| json!({ "index_corrupt": true })),
+    }
+}
+
+fn mcp_error_reports_corruption(error: &McpError) -> bool {
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("index_corrupt"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn close_context_on_reported_corruption<T>(
+    slot: &mut Option<Context>,
+    operation: &str,
+    result: Result<T, McpError>,
+) -> Result<T, McpError> {
+    if result.as_ref().is_err_and(mcp_error_reports_corruption) {
+        tracing::error!(
+            operation,
+            "database statement reported index corruption — closing the connection for automatic recovery"
+        );
+        *slot = None;
+    }
+    result
+}
 use super::tools::{
     CodeFindParams, CodeGraphParams, GetParams, GraphParams, MemoryWriteBatchEntry, RelatesInput,
     SearchParams, SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
@@ -284,22 +319,25 @@ impl DispatchContext {
             return;
         }
 
-        let ctx_guard = handle.ctx.lock().await;
-        let Some(ctx) = ctx_guard.as_ref() else {
+        let mut ctx_guard = handle.ctx.lock().await;
+        if ctx_guard.is_none() {
             return;
-        };
-
-        if let Err(e) =
-            stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated)
-        {
-            tracing::warn!("Failed to record call stats: {e}");
         }
 
         let call_count = self.persistent_call_count.fetch_add(1, Ordering::Relaxed) + 1;
-        if crate::store::maintenance::should_optimize(call_count, self.optimize_interval_calls) {
-            if let Err(e) = crate::store::maintenance::run_optimize(&ctx.conn) {
-                tracing::warn!("PRAGMA optimize failed: {e}");
-            }
+        let outcome =
+            crate::core::run_guarded_write(&mut ctx_guard, "persistent call telemetry", |ctx| {
+                stats::record_call(&ctx.conn, session_id, tool_name, tokens, results, truncated)?;
+                if crate::store::maintenance::should_optimize(
+                    call_count,
+                    self.optimize_interval_calls,
+                ) {
+                    crate::store::maintenance::run_optimize(&ctx.conn)?;
+                }
+                Ok(())
+            });
+        if let Some(Err(error)) = outcome {
+            tracing::warn!("Failed to record call stats: {error}");
         }
     }
 }
@@ -353,6 +391,8 @@ fn run_handle_memory_mutation<T>(
         let ctx = slot
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
+        let _writer_guard = crate::store::mutation_lock::acquire_writer(&ctx.db_path, what)
+            .map_err(|e| mcp_error(format!("Failed to acquire writer lock: {e}")))?;
         let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, what)
             .map_err(|e| mcp_error(format!("Failed to acquire mutation lock: {e}")))?;
 
@@ -361,6 +401,8 @@ fn run_handle_memory_mutation<T>(
         let verification = crate::store::heal::verify_and_mark_throttled(&ctx.db_path);
         (result, verification)
     };
+
+    let result = close_context_on_reported_corruption(slot, what, result);
 
     if let Err(error) = verification {
         tracing::error!(
@@ -412,20 +454,26 @@ async fn run_embedding_backfill(handle: Arc<RepoHandle>) -> usize {
     }
     let ctx = Arc::clone(&handle.ctx);
     let drained = tokio::task::spawn_blocking(move || {
-        let guard = ctx.blocking_lock();
-        let ctx = guard.as_ref()?;
+        let mut guard = ctx.blocking_lock();
         // Cheap indexed COUNT(*): only a positive count is worth loading the model.
-        match crate::store::memory::count_pending_embeddings(&ctx.conn) {
-            Ok(0) => Some(0),
-            Ok(_) => match crate::store::memory::backfill_memory_embeddings(&ctx.conn) {
-                Ok(n) => Some(n),
-                Err(e) => {
-                    tracing::debug!("embedding backfill: backfill failed: {e}");
-                    Some(0)
+        match crate::core::run_guarded_read(&mut guard, "embedding backlog count", |ctx| {
+            crate::store::memory::count_pending_embeddings(&ctx.conn)
+        }) {
+            Some(Ok(0)) | None => Some(0),
+            Some(Ok(_)) => {
+                match crate::core::run_mutation(&mut guard, "memory embedding backfill", |ctx| {
+                    crate::store::memory::backfill_memory_embeddings(&ctx.conn)
+                }) {
+                    Some(Ok(n)) => Some(n),
+                    Some(Err(e)) => {
+                        tracing::debug!("embedding backfill: backfill failed: {e}");
+                        Some(0)
+                    }
+                    None => Some(0),
                 }
-            },
-            Err(e) => {
-                tracing::debug!("embedding backfill: pending count failed: {e}");
+            }
+            Some(Err(error)) => {
+                tracing::debug!("embedding backfill: pending count failed: {error}");
                 Some(0)
             }
         }
@@ -470,22 +518,16 @@ pub async fn acquire_handle_code_index(
 pub async fn status_impl(handle: &RepoHandle) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
-    let mut output = {
-        let ctx_guard = handle.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-        let index_status = search::get_status(&ctx.conn)
-            .map_err(|e| mcp_error(format!("Failed to get status: {e}")))?;
+    let mut ctx_guard = handle.ctx.lock().await;
+    let mut output = crate::core::run_guarded_read(&mut ctx_guard, "status", |ctx| {
+        let index_status = search::get_status(&ctx.conn)?;
 
         let mut output = format!(
             "## Index Status\n\nDocuments: {}\nStale: {}\nDB Size: {} bytes\n",
             index_status.documents, index_status.stale_documents, index_status.db_size_bytes
         );
 
-        let coll_list = collections::list_collections(&ctx.conn)
-            .map_err(|e| mcp_error(format!("Failed to list collections: {e}")))?;
+        let coll_list = collections::list_collections(&ctx.conn)?;
 
         output.push_str(&format!("\n## Collections ({})\n\n", coll_list.len()));
         if coll_list.is_empty() {
@@ -493,7 +535,7 @@ pub async fn status_impl(handle: &RepoHandle) -> Result<String, McpError> {
         } else {
             for coll in &coll_list {
                 let doc_count =
-                    collections::get_collection_document_count(&ctx.conn, &coll.name).unwrap_or(0);
+                    collections::get_collection_document_count(&ctx.conn, &coll.name)?;
                 let source_tag = if coll.source == "convention" {
                     "[convention]"
                 } else {
@@ -506,8 +548,11 @@ pub async fn status_impl(handle: &RepoHandle) -> Result<String, McpError> {
             }
         }
 
-        output
-    };
+        Ok(output)
+    })
+    .ok_or_else(|| mcp_error("Database not initialized"))?
+    .map_err(|e| mcp_error(format!("Failed to get status: {e}")))?;
+    drop(ctx_guard);
 
     if let Ok(idx_guard) = acquire_handle_code_index(handle).await {
         if let Some(facade) = idx_guard.as_ref() {
@@ -538,12 +583,13 @@ pub async fn memory_delete_impl(
     ensure_handle_context(handle).await?;
 
     if dry_run {
-        let ctx_guard = handle.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-        let exists = memory::get_entry_without_tracking(&ctx.conn, id)
-            .map_err(|e| mcp_error(format!("Failed to check existing entry: {e}")))?
+        let mut ctx_guard = handle.ctx.lock().await;
+        let exists =
+            crate::core::run_guarded_read(&mut ctx_guard, "memory delete dry run", |ctx| {
+                memory::get_entry_without_tracking(&ctx.conn, id)
+            })
+            .ok_or_else(|| mcp_error("Database not initialized"))?
+            .map_err(|e| mcp_store_error("Failed to check existing entry", e))?
             .is_some();
         return Ok(if exists {
             format!("dry-run: would delete memory entry '{id}'")
@@ -555,7 +601,7 @@ pub async fn memory_delete_impl(
     let mut ctx_guard = handle.ctx.lock().await;
     let deleted = run_handle_memory_mutation(&mut ctx_guard, "memory delete", |ctx| {
         memory::delete_entry(&ctx.conn, id)
-            .map_err(|e| mcp_error(format!("Failed to delete memory entry: {e}")))
+            .map_err(|e| mcp_store_error("Failed to delete memory entry", e))
     })?;
 
     Ok(if deleted {
@@ -579,7 +625,7 @@ pub async fn memory_confirm_impl(
     let mut ctx_guard = handle.ctx.lock().await;
     run_handle_memory_mutation(&mut ctx_guard, "memory confirm", |ctx| {
         memory::confirm_entry(&ctx.conn, id, delta)
-            .map_err(|e| mcp_error(format!("Failed to confirm memory entry: {e}")))
+            .map_err(|e| mcp_store_error("Failed to confirm memory entry", e))
     })
 }
 
@@ -706,7 +752,7 @@ fn write_single_memory(
     memory::validate_entry_input(id, title, tags, content).map_err(|e| mcp_error(e.to_string()))?;
 
     let existing = memory::get_entry_without_tracking(conn, id)
-        .map_err(|e| mcp_error(format!("Failed to check existing entry: {e}")))?;
+        .map_err(|e| mcp_store_error("Failed to check existing entry", e))?;
 
     let entry_type: memory::EntryType = entry_type_str.parse().map_err(|e: String| {
         mcp_error(format!(
@@ -769,24 +815,25 @@ fn write_single_memory(
     let mut contradicts_target: Option<String> = None;
     if is_new {
         if let Some(ref emb) = embedding {
-            if let Ok(similar) = crate::store::vectors::memory_vector_search(conn, emb, 3) {
-                for (rowid, distance) in &similar {
-                    if *distance < 0.32 {
-                        if let Ok(Some(dup)) = memory::get_entry_by_rowid(conn, *rowid) {
-                            if on_conflict == Some("contradicts") {
-                                contradicts_target = Some(dup.id);
-                                break;
-                            }
-                            let similarity =
-                                1.0 - (f64::from(*distance) * f64::from(*distance) / 2.0);
-                            return Err(mcp_error(format!(
-                                "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
-                                 Update that entry instead, or use a more distinct title/content.",
-                                dup.title,
-                                dup.id,
-                                similarity * 100.0
-                            )));
+            let similar = crate::store::vectors::memory_vector_search(conn, emb, 3)
+                .map_err(|e| mcp_store_error("Failed to search for duplicate entries", e))?;
+            for (rowid, distance) in &similar {
+                if *distance < 0.32 {
+                    if let Some(dup) = memory::get_entry_by_rowid(conn, *rowid)
+                        .map_err(|e| mcp_store_error("Failed to load duplicate entry", e))?
+                    {
+                        if on_conflict == Some("contradicts") {
+                            contradicts_target = Some(dup.id);
+                            break;
                         }
+                        let similarity = 1.0 - (f64::from(*distance) * f64::from(*distance) / 2.0);
+                        return Err(mcp_error(format!(
+                            "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). \
+                             Update that entry instead, or use a more distinct title/content.",
+                            dup.title,
+                            dup.id,
+                            similarity * 100.0
+                        )));
                     }
                 }
             }
@@ -797,17 +844,20 @@ fn write_single_memory(
     // edge or provenance write rolls back the entry too.
     let tx = conn
         .unchecked_transaction()
-        .map_err(|e| mcp_error(format!("Failed to begin transaction: {e}")))?;
+        .map_err(|e| mcp_store_error("Failed to begin transaction", e))?;
 
     let mut output = if let Some(mut existing_entry) = existing {
-        if let Err(e) = memory::save_revision(
+        if let Err(error) = memory::save_revision(
             &tx,
             id,
             &existing_entry.content,
             content,
             existing_entry.source_type,
         ) {
-            tracing::warn!("Failed to save revision for {id}: {e}");
+            if error.is_index_corrupt() {
+                return Err(mcp_store_error("Failed to save memory revision", error));
+            }
+            tracing::warn!("Failed to save revision for {id}: {error}");
         }
 
         existing_entry.title = title.to_string();
@@ -819,17 +869,15 @@ fn write_single_memory(
             existing_entry.due_at = due_at;
         }
         memory::update_entry(&tx, &existing_entry)
-            .map_err(|e| mcp_error(format!("Failed to update memory entry: {e}")))?;
+            .map_err(|e| mcp_store_error("Failed to update memory entry", e))?;
 
-        let rev_info = memory::get_revision_summary(&tx, id)
-            .map(|s| {
-                if s.count > 0 {
-                    format!(" ({} revisions)", s.count)
-                } else {
-                    String::new()
-                }
-            })
-            .unwrap_or_default();
+        let revision_summary = memory::get_revision_summary(&tx, id)
+            .map_err(|e| mcp_store_error("Failed to read memory revisions", e))?;
+        let rev_info = if revision_summary.count > 0 {
+            format!(" ({} revisions)", revision_summary.count)
+        } else {
+            String::new()
+        };
         format!("Updated memory entry: {id}{rev_info}")
     } else {
         let entry = memory::MemoryEntry {
@@ -852,13 +900,13 @@ fn write_single_memory(
             due_at,
         };
         memory::add_entry(&tx, &entry)
-            .map_err(|e| mcp_error(format!("Failed to create memory entry: {e}")))?;
+            .map_err(|e| mcp_store_error("Failed to create memory entry", e))?;
         format!("Created memory entry: {id}")
     };
 
     for (target, kind, rel) in &parsed_relates {
         memory_graph::add_edge_in(&tx, id, target, *kind, *rel)
-            .map_err(|e| mcp_error(format!("Failed to add relation: {e}")))?;
+            .map_err(|e| mcp_store_error("Failed to add relation", e))?;
     }
     if let Some(target) = &contradicts_target {
         memory_graph::add_edge_in(
@@ -868,33 +916,39 @@ fn write_single_memory(
             TargetKind::Memory,
             MemoryRelation::Contradicts,
         )
-        .map_err(|e| mcp_error(format!("Failed to record contradicts edge: {e}")))?;
+        .map_err(|e| mcp_store_error("Failed to record contradicts edge", e))?;
         output.push_str(&format!(
             " — conflict with '{target}' recorded as a contradicts edge (resolve via memory_confirm)"
         ));
     }
     memory::set_provenance(&tx, id, session, agent)
-        .map_err(|e| mcp_error(format!("Failed to record provenance: {e}")))?;
+        .map_err(|e| mcp_store_error("Failed to record provenance", e))?;
 
     tx.commit()
-        .map_err(|e| mcp_error(format!("Failed to commit memory write: {e}")))?;
+        .map_err(|e| mcp_store_error("Failed to commit memory write", e))?;
 
     // Store the pre-computed embedding and append similarity warnings.
     // The embedding was computed outside the lock by the async caller to avoid
     // blocking the tokio executor during CPU-bound ONNX inference.
     if let Some(ref emb) = embedding {
-        if let Some(rowid) = memory::get_rowid(conn, id).unwrap_or(None) {
+        if let Some(rowid) = memory::get_rowid(conn, id)
+            .map_err(|e| mcp_store_error("Failed to resolve memory row", e))?
+        {
             if let Err(e) = crate::store::vectors::store_memory_embedding(
                 conn,
                 rowid,
                 emb,
                 crate::llm::embeddings::MODEL_NAME,
             ) {
+                if e.is_index_corrupt() {
+                    return Err(mcp_store_error("Failed to store memory embedding", e));
+                }
                 tracing::warn!("Failed to store memory embedding for '{id}': {e}");
             }
 
             if is_new {
-                let warnings = memory::find_similar_entries(conn, emb, rowid, id);
+                let warnings = memory::find_similar_entries(conn, emb, rowid, id)
+                    .map_err(|e| mcp_store_error("Failed to find similar memory entries", e))?;
                 output.push_str(&warnings);
             }
         }
@@ -968,7 +1022,8 @@ pub async fn memory_write_impl(
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
-        write_single_memory(&ctx.conn, input)
+        let result = write_single_memory(&ctx.conn, input);
+        close_context_on_reported_corruption(&mut ctx_guard, "memory write dry run", result)
     } else {
         run_handle_memory_mutation(&mut ctx_guard, "memory write", |ctx| {
             write_single_memory(&ctx.conn, input)
@@ -1074,7 +1129,8 @@ pub async fn memory_write_batch_impl(
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
-        run(ctx)
+        let result = run(ctx);
+        close_context_on_reported_corruption(&mut ctx_guard, "memory write batch dry run", result)
     } else {
         run_handle_memory_mutation(&mut ctx_guard, "memory write batch", run)
     }
@@ -1092,17 +1148,16 @@ pub async fn memory_list_impl(
 
     ensure_handle_context(handle).await?;
 
-    let ctx_guard = handle.ctx.lock().await;
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-    let entries = memory::list_entries_sorted(
-        &ctx.conn,
-        limit,
-        sort_order,
-        Some(memory::EntryStatus::Active),
-    )
+    let mut ctx_guard = handle.ctx.lock().await;
+    let entries = crate::core::run_guarded_read(&mut ctx_guard, "memory list", |ctx| {
+        memory::list_entries_sorted(
+            &ctx.conn,
+            limit,
+            sort_order,
+            Some(memory::EntryStatus::Active),
+        )
+    })
+    .ok_or_else(|| mcp_error("Database not initialized"))?
     .map_err(|e| mcp_error(format!("Failed to list memory entries: {e}")))?;
 
     if entries.is_empty() {
@@ -1140,13 +1195,18 @@ pub async fn memory_list_impl(
 /// Append the index-empty hint when a search returned nothing AND the store
 /// really is empty (0 docs, 0 memory) — so an empty result after autoheal
 /// quarantine reads as "run `mdkb update`", not "nothing matched".
-fn append_empty_index_hint(output: &mut String, count: usize, conn: &rusqlite::Connection) {
-    if count == 0 && crate::store::search::index_is_empty(conn) {
+fn append_empty_index_hint(
+    output: &mut String,
+    count: usize,
+    conn: &rusqlite::Connection,
+) -> crate::Result<()> {
+    if count == 0 && crate::store::search::index_is_empty(conn)? {
         if !output.is_empty() {
             output.push('\n');
         }
         output.push_str(crate::store::search::INDEX_EMPTY_HINT);
     }
+    Ok(())
 }
 
 pub async fn search_impl(
@@ -1160,17 +1220,17 @@ pub async fn search_impl(
 
     match scope {
         Some("docs") => {
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-            let results = handle_hybrid_search(
-                ctx,
-                &params.query,
-                limit,
-                params.collection.as_deref(),
-                params.include_superseded,
-            )
+            let mut ctx_guard = handle.ctx.lock().await;
+            let results = crate::core::run_guarded_read(&mut ctx_guard, "document search", |ctx| {
+                handle_hybrid_search(
+                    ctx,
+                    &params.query,
+                    limit,
+                    params.collection.as_deref(),
+                    params.include_superseded,
+                )
+            })
+            .ok_or_else(|| mcp_error("Database not initialized"))?
             .map_err(|e| mcp_error(format!("Search failed: {e}")))?;
 
             let top_score = results.first().map(|r| r.score);
@@ -1178,23 +1238,27 @@ pub async fn search_impl(
             if let Some(hint) = ood_hint(results.len(), top_score) {
                 output.push_str(hint);
             }
-            append_empty_index_hint(&mut output, results.len(), &ctx.conn);
+            crate::core::run_guarded_read(&mut ctx_guard, "empty-index hint", |ctx| {
+                append_empty_index_hint(&mut output, results.len(), &ctx.conn)
+            })
+            .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?
+            .map_err(|e| mcp_store_error("Failed to inspect index state", e))?;
             Ok((output, results.len()))
         }
         Some("memory") => {
             let query_embedding = embed_query_off_lock(&params.query).await;
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-            let entries = memory::search_entries_hybrid(
-                &ctx.conn,
-                &params.query,
-                query_embedding.as_deref(),
-                limit,
-                handle.config.search.memory.access_recency_weight,
-                handle.config.search.memory.recency_half_life_secs,
-            )
+            let mut ctx_guard = handle.ctx.lock().await;
+            let entries = crate::core::run_guarded_read(&mut ctx_guard, "memory search", |ctx| {
+                memory::search_entries_hybrid(
+                    &ctx.conn,
+                    &params.query,
+                    query_embedding.as_deref(),
+                    limit,
+                    handle.config.search.memory.access_recency_weight,
+                    handle.config.search.memory.recency_half_life_secs,
+                )
+            })
+            .ok_or_else(|| mcp_error("Database not initialized"))?
             .map_err(|e| mcp_error(format!("Memory search failed: {e}")))?;
             let entries = apply_min_confidence(entries, params.min_confidence);
 
@@ -1202,33 +1266,37 @@ pub async fn search_impl(
             if let Some(hint) = ood_hint(entries.len(), None) {
                 output.push_str(hint);
             }
-            append_empty_index_hint(&mut output, entries.len(), &ctx.conn);
+            crate::core::run_guarded_read(&mut ctx_guard, "empty-index hint", |ctx| {
+                append_empty_index_hint(&mut output, entries.len(), &ctx.conn)
+            })
+            .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?
+            .map_err(|e| mcp_store_error("Failed to inspect index state", e))?;
             Ok((output, entries.len()))
         }
         None => {
             let query_embedding = embed_query_off_lock(&params.query).await;
-            let ctx_guard = handle.ctx.lock().await;
-            let ctx = ctx_guard
-                .as_ref()
-                .ok_or_else(|| mcp_error("Database not initialized"))?;
-            let doc_results = handle_hybrid_search(
-                ctx,
-                &params.query,
-                limit,
-                params.collection.as_deref(),
-                params.include_superseded,
-            )
-            .map_err(|e| mcp_error(format!("Search failed: {e}")))?;
-
-            let mem_entries = memory::search_entries_hybrid(
-                &ctx.conn,
-                &params.query,
-                query_embedding.as_deref(),
-                limit,
-                handle.config.search.memory.access_recency_weight,
-                handle.config.search.memory.recency_half_life_secs,
-            )
-            .map_err(|e| mcp_error(format!("Memory search failed: {e}")))?;
+            let mut ctx_guard = handle.ctx.lock().await;
+            let (doc_results, mem_entries) =
+                crate::core::run_guarded_read(&mut ctx_guard, "combined search", |ctx| {
+                    let docs = handle_hybrid_search(
+                        ctx,
+                        &params.query,
+                        limit,
+                        params.collection.as_deref(),
+                        params.include_superseded,
+                    )?;
+                    let memories = memory::search_entries_hybrid(
+                        &ctx.conn,
+                        &params.query,
+                        query_embedding.as_deref(),
+                        limit,
+                        handle.config.search.memory.access_recency_weight,
+                        handle.config.search.memory.recency_half_life_secs,
+                    )?;
+                    Ok((docs, memories))
+                })
+                .ok_or_else(|| mcp_error("Database not initialized"))?
+                .map_err(|e| mcp_error(format!("Search failed: {e}")))?;
             let mem_entries = apply_min_confidence(mem_entries, params.min_confidence);
 
             let total = doc_results.len() + mem_entries.len();
@@ -1252,7 +1320,11 @@ pub async fn search_impl(
             if let Some(hint) = ood_hint(total, top_score) {
                 output.push_str(hint);
             }
-            append_empty_index_hint(&mut output, total, &ctx.conn);
+            crate::core::run_guarded_read(&mut ctx_guard, "empty-index hint", |ctx| {
+                append_empty_index_hint(&mut output, total, &ctx.conn)
+            })
+            .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?
+            .map_err(|e| mcp_store_error("Failed to inspect index state", e))?;
             Ok((output, total))
         }
         Some("code" | "symbols") => {
@@ -1405,47 +1477,59 @@ pub async fn cross_repo_search_impl(
                 None
             };
 
-            let ctx_guard = handle.ctx.lock().await;
-            let Some(ctx) = ctx_guard.as_ref() else {
-                return Vec::new();
-            };
+            let mut ctx_guard = handle.ctx.lock().await;
 
             let repo_tag = handle.root.display().to_string();
             let mut repo_results: Vec<SearchResult> = Vec::new();
 
             match scope {
                 Some("docs") | None => {
-                    match handle_hybrid_search(
-                        ctx,
-                        &query,
-                        limit,
-                        collection.as_deref(),
-                        include_superseded,
-                    ) {
-                        Ok(mut results) => {
+                    let result = crate::core::run_guarded_read(
+                        &mut ctx_guard,
+                        "cross-repo document search",
+                        |ctx| {
+                            handle_hybrid_search(
+                                ctx,
+                                &query,
+                                limit,
+                                collection.as_deref(),
+                                include_superseded,
+                            )
+                        },
+                    );
+                    match result {
+                        Some(Ok(mut results)) => {
                             for r in &mut results {
                                 r.repo_root = Some(repo_tag.clone());
                             }
                             repo_results.extend(results);
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             tracing::warn!(
                                 "cross_repo_search: docs search failed on {}: {e}",
                                 repo_tag
                             );
                         }
+                        None => {}
                     }
                 }
                 Some("memory") => {
-                    match memory::search_entries_hybrid(
-                        &ctx.conn,
-                        &query,
-                        query_embedding.as_deref(),
-                        limit,
-                        recency_weight,
-                        recency_half_life,
-                    ) {
-                        Ok(entries) => {
+                    let result = crate::core::run_guarded_read(
+                        &mut ctx_guard,
+                        "cross-repo memory search",
+                        |ctx| {
+                            memory::search_entries_hybrid(
+                                &ctx.conn,
+                                &query,
+                                query_embedding.as_deref(),
+                                limit,
+                                recency_weight,
+                                recency_half_life,
+                            )
+                        },
+                    );
+                    match result {
+                        Some(Ok(entries)) => {
                             let entries = apply_min_confidence(entries, min_confidence);
                             if !entries.is_empty() {
                                 let text = format_memory_search_results(&entries);
@@ -1467,12 +1551,13 @@ pub async fn cross_repo_search_impl(
                                 repo_results.push(pseudo);
                             }
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             tracing::warn!(
                                 "cross_repo_search: memory search failed on {}: {e}",
                                 repo_tag
                             );
                         }
+                        None => {}
                     }
                 }
                 _ => {}
@@ -1515,7 +1600,7 @@ fn render_document_content(
     lines: Option<&str>,
 ) -> Result<String, McpError> {
     let content = documents::get_content(&ctx.conn, &doc.hash)
-        .map_err(|e| mcp_error(format!("Failed to get content: {e}")))?
+        .map_err(|e| mcp_store_error("Failed to get document content", e))?
         .ok_or_else(|| mcp_error("Content missing for document. Try `update` to reindex."))?;
 
     let mut output = if let Some(range) = lines {
@@ -1524,23 +1609,39 @@ fn render_document_content(
         content
     };
 
-    if let Ok(Some((status, reason))) = evolution::get_document_status(&ctx.conn, doc.id) {
+    let document_status = match evolution::get_document_status(&ctx.conn, doc.id) {
+        Ok(status) => status,
+        Err(error) if error.is_index_corrupt() => {
+            return Err(mcp_store_error("Failed to read document status", error));
+        }
+        Err(_) => None,
+    };
+    if let Some((status, reason)) = document_status {
         let status_str = format!("{status:?}");
         if status_str != "Current" {
             output.push_str(&format!("\n\n---\n**Status:** {status_str}"));
             if let Some(r) = reason {
                 output.push_str(&format!(" ({r})"));
             }
-            if let Ok(descendants) = evolution::get_superseded_by(&ctx.conn, doc.id) {
-                for evo in &descendants {
-                    if let Ok(Some(source)) = documents::get_document(&ctx.conn, evo.source_doc_id)
-                    {
-                        output.push_str(&format!(
-                            "\n**Superseded by:** {} ({})",
-                            source.relative_path, evo.relationship
-                        ));
+            match evolution::get_superseded_by(&ctx.conn, doc.id) {
+                Ok(descendants) => {
+                    for evo in &descendants {
+                        let source = documents::get_document(&ctx.conn, evo.source_doc_id)
+                            .map_err(|e| {
+                                mcp_store_error("Failed to read superseding document", e)
+                            })?;
+                        if let Some(source) = source {
+                            output.push_str(&format!(
+                                "\n**Superseded by:** {} ({})",
+                                source.relative_path, evo.relationship
+                            ));
+                        }
                     }
                 }
+                Err(error) if error.is_index_corrupt() => {
+                    return Err(mcp_store_error("Failed to read document evolution", error));
+                }
+                Err(_) => {}
             }
         }
     }
@@ -1570,10 +1671,7 @@ async fn get_batch_impl(
         )));
     }
 
-    let ctx_guard = handle.ctx.lock().await;
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| mcp_error("Database not initialized"))?;
+    let mut ctx_guard = handle.ctx.lock().await;
 
     let mut output = String::new();
     let mut found = 0usize;
@@ -1585,8 +1683,22 @@ async fn get_batch_impl(
         }
 
         if let Ok(numeric_id) = id.parse::<i64>() {
-            if let Ok(Some(doc)) = documents::get_document(&ctx.conn, numeric_id) {
-                match render_document_content(handle, ctx, &doc, lines) {
+            let doc = crate::core::run_guarded_read(&mut ctx_guard, "batch document get", |ctx| {
+                documents::get_document(&ctx.conn, numeric_id)
+            })
+            .ok_or_else(|| mcp_error("Database not initialized"))?
+            .map_err(|e| mcp_error(format!("Failed to get document: {e}")))?;
+            if let Some(doc) = doc {
+                let ctx = ctx_guard
+                    .as_ref()
+                    .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?;
+                let rendered = render_document_content(handle, ctx, &doc, lines);
+                let rendered = close_context_on_reported_corruption(
+                    &mut ctx_guard,
+                    "batch document render",
+                    rendered,
+                );
+                match rendered {
                     Ok(content) => {
                         let title = doc.title.as_deref().unwrap_or("(untitled)");
                         output.push_str(&format!(
@@ -1608,8 +1720,27 @@ async fn get_batch_impl(
             }
         }
 
-        if let Ok(doc) = resolve_document(&ctx.conn, id) {
-            match render_document_content(handle, ctx, &doc, lines) {
+        let resolved =
+            crate::core::run_guarded_read(&mut ctx_guard, "batch document resolve", |ctx| {
+                resolve_document(&ctx.conn, id)
+            })
+            .ok_or_else(|| mcp_error("Database not initialized"))?;
+        if let Err(error) = &resolved {
+            if error.is_index_corrupt() {
+                return Err(mcp_error(format!("Document resolution failed: {error}")));
+            }
+        }
+        if let Ok(doc) = resolved {
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?;
+            let rendered = render_document_content(handle, ctx, &doc, lines);
+            let rendered = close_context_on_reported_corruption(
+                &mut ctx_guard,
+                "batch document render",
+                rendered,
+            );
+            match rendered {
                 Ok(content) => {
                     let title = doc.title.as_deref().unwrap_or("(untitled)");
                     output.push_str(&format!(
@@ -1630,7 +1761,12 @@ async fn get_batch_impl(
             }
         }
 
-        if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+        let entry = crate::core::run_guarded_write(&mut ctx_guard, "batch memory get", |ctx| {
+            memory::get_entry(&ctx.conn, id)
+        })
+        .ok_or_else(|| mcp_error("Database not initialized"))?
+        .map_err(|e| mcp_store_error("Failed to get memory", e))?;
+        if let Some(entry) = entry {
             let ttl = format_ttl_info(entry.expires_at);
             output.push_str(&format!(
                 "=== [MEM] {} - {}{} ===\n{}\n\n",
@@ -1661,17 +1797,20 @@ async fn get_glob_impl(
     let max_response_tokens = handle.config.mcp.max_response_tokens;
 
     let (output, result_count) = {
-        let ctx_guard = handle.ctx.lock().await;
-        let ctx = ctx_guard
-            .as_ref()
-            .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-        let results = handle_mget(ctx, pattern, None)
-            .map_err(|e| mcp_error(format!("Glob retrieval failed: {e}")))?;
+        let mut ctx_guard = handle.ctx.lock().await;
+        let results = crate::core::run_guarded_read(&mut ctx_guard, "glob retrieval", |ctx| {
+            handle_mget(ctx, pattern, None)
+        })
+        .ok_or_else(|| mcp_error("Database not initialized"))?
+        .map_err(|e| mcp_error(format!("Glob retrieval failed: {e}")))?;
 
         if results.is_empty() {
             let mut msg = "No documents matched pattern.".to_string();
-            append_empty_index_hint(&mut msg, 0, &ctx.conn);
+            crate::core::run_guarded_read(&mut ctx_guard, "empty-index hint", |ctx| {
+                append_empty_index_hint(&mut msg, 0, &ctx.conn)
+            })
+            .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?
+            .map_err(|e| mcp_store_error("Failed to inspect index state", e))?;
             return Ok((msg, 0, false));
         }
 
@@ -1734,30 +1873,54 @@ pub async fn get_impl(
         return get_glob_impl(handle, id).await;
     }
 
-    let ctx_guard = handle.ctx.lock().await;
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| mcp_error("Database not initialized"))?;
+    let mut ctx_guard = handle.ctx.lock().await;
 
     if let Ok(numeric_id) = id.parse::<i64>() {
-        if let Some(doc) = documents::get_document(&ctx.conn, numeric_id)
-            .map_err(|e| mcp_error(format!("Failed to get document: {e}")))?
-        {
-            let output = render_document_content(handle, ctx, &doc, params.lines.as_deref())?;
+        let doc = crate::core::run_guarded_read(&mut ctx_guard, "document get", |ctx| {
+            documents::get_document(&ctx.conn, numeric_id)
+        })
+        .ok_or_else(|| mcp_error("Database not initialized"))?
+        .map_err(|e| mcp_error(format!("Failed to get document: {e}")))?;
+        if let Some(doc) = doc {
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?;
+            let rendered = render_document_content(handle, ctx, &doc, params.lines.as_deref());
+            let output =
+                close_context_on_reported_corruption(&mut ctx_guard, "document render", rendered)?;
             return Ok((output, 1, false));
         }
     }
 
     if id.contains('/') || id.contains('.') {
-        if let Ok(doc) = resolve_document(&ctx.conn, id) {
-            let output = render_document_content(handle, ctx, &doc, params.lines.as_deref())?;
+        let resolved = crate::core::run_guarded_read(&mut ctx_guard, "document resolve", |ctx| {
+            resolve_document(&ctx.conn, id)
+        })
+        .ok_or_else(|| mcp_error("Database not initialized"))?;
+        if let Ok(doc) = resolved {
+            let ctx = ctx_guard
+                .as_ref()
+                .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?;
+            let rendered = render_document_content(handle, ctx, &doc, params.lines.as_deref());
+            let output =
+                close_context_on_reported_corruption(&mut ctx_guard, "document render", rendered)?;
             return Ok((output, 1, false));
         }
     }
 
-    if let Ok(Some(entry)) = memory::get_entry(&ctx.conn, id) {
+    let memory_entry = crate::core::run_guarded_write(&mut ctx_guard, "memory get", |ctx| {
+        memory::get_entry(&ctx.conn, id)
+    })
+    .ok_or_else(|| mcp_error("Database not initialized"))?
+    .map_err(|e| mcp_store_error("Failed to get memory", e))?;
+    if let Some(entry) = memory_entry {
         if params.format.as_deref() == Some("history") {
-            let revisions = memory::get_revisions(&ctx.conn, &entry.id).unwrap_or_default();
+            let revisions =
+                crate::core::run_guarded_read(&mut ctx_guard, "memory revision history", |ctx| {
+                    memory::get_revisions(&ctx.conn, &entry.id)
+                })
+                .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?
+                .map_err(|e| mcp_store_error("Failed to read memory revisions", e))?;
             let output = if revisions.is_empty() {
                 format!("No revision history for '{}'", entry.id)
             } else {
@@ -1811,28 +1974,35 @@ pub async fn get_impl(
             conf, entry.confirmations, last_conf, entry.source_type
         );
 
-        let rev_line = memory::get_revision_summary(&ctx.conn, &entry.id)
-            .map(|s| {
-                if s.count == 0 {
-                    return String::new();
-                }
-                let dates: Vec<String> = s
-                    .dates
-                    .iter()
-                    .map(|&ts| {
-                        chrono::DateTime::from_timestamp(ts, 0)
-                            .map(|dt| dt.format("%Y-%m-%d").to_string())
-                            .unwrap_or_else(|| "?".to_string())
-                    })
-                    .collect();
-                format!(
-                    "\nHistory: {} revision{} ({})",
-                    s.count,
-                    if s.count == 1 { "" } else { "s" },
-                    dates.join(", ")
-                )
+        let (revision_summary, provenance, edges) =
+            crate::core::run_guarded_read(&mut ctx_guard, "memory metadata", |ctx| {
+                Ok((
+                    memory::get_revision_summary(&ctx.conn, &entry.id)?,
+                    memory::get_provenance(&ctx.conn, &entry.id)?,
+                    memory_graph::outgoing(&ctx.conn, &entry.id, None)?,
+                ))
             })
-            .unwrap_or_default();
+            .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?
+            .map_err(|e| mcp_store_error("Failed to read memory metadata", e))?;
+        let rev_line = if revision_summary.count == 0 {
+            String::new()
+        } else {
+            let dates: Vec<String> = revision_summary
+                .dates
+                .iter()
+                .map(|&ts| {
+                    chrono::DateTime::from_timestamp(ts, 0)
+                        .map(|dt| dt.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "?".to_string())
+                })
+                .collect();
+            format!(
+                "\nHistory: {} revision{} ({})",
+                revision_summary.count,
+                if revision_summary.count == 1 { "" } else { "s" },
+                dates.join(", ")
+            )
+        };
 
         let now = chrono::Utc::now().timestamp();
         let expired_marker = match entry.expires_at {
@@ -1848,8 +2018,8 @@ pub async fn get_impl(
             }
             None => String::new(),
         };
-        let prov_line = match memory::get_provenance(&ctx.conn, &entry.id) {
-            Ok((session, agent)) if session.is_some() || agent.is_some() => {
+        let prov_line = match provenance {
+            (session, agent) if session.is_some() || agent.is_some() => {
                 let mut parts = Vec::new();
                 if let Some(s) = session {
                     parts.push(format!("session {s}"));
@@ -1861,15 +2031,14 @@ pub async fn get_impl(
             }
             _ => String::new(),
         };
-        let edges_line = match memory_graph::outgoing(&ctx.conn, &entry.id, None) {
-            Ok(edges) if !edges.is_empty() => {
-                let rels: Vec<String> = edges
-                    .iter()
-                    .map(|e| format!("{} {}", e.relation, e.target_ref))
-                    .collect();
-                format!("\nEdges: {}", rels.join(", "))
-            }
-            _ => String::new(),
+        let edges_line = if edges.is_empty() {
+            String::new()
+        } else {
+            let rels: Vec<String> = edges
+                .iter()
+                .map(|e| format!("{} {}", e.relation, e.target_ref))
+                .collect();
+            format!("\nEdges: {}", rels.join(", "))
         };
         let output = format!(
             "# {}{} ({})\n\nType: {} | Status: {} | Tags: {}\nAccessed: {} times | {}{}{}{}{}\n\n{}",
@@ -1894,8 +2063,17 @@ pub async fn get_impl(
         return Ok((output, 1, false));
     }
 
-    if let Ok(doc) = resolve_document(&ctx.conn, id) {
-        let output = render_document_content(handle, ctx, &doc, params.lines.as_deref())?;
+    let resolved = crate::core::run_guarded_read(&mut ctx_guard, "document resolve", |ctx| {
+        resolve_document(&ctx.conn, id)
+    })
+    .ok_or_else(|| mcp_error("Database not initialized"))?;
+    if let Ok(doc) = resolved {
+        let ctx = ctx_guard
+            .as_ref()
+            .ok_or_else(|| mcp_error("Database closed for automatic recovery"))?;
+        let rendered = render_document_content(handle, ctx, &doc, params.lines.as_deref());
+        let output =
+            close_context_on_reported_corruption(&mut ctx_guard, "document render", rendered)?;
         return Ok((output, 1, false));
     }
 
@@ -2169,10 +2347,7 @@ pub async fn graph_impl(handle: &RepoHandle, params: &GraphParams) -> Result<Str
     use crate::store::graph;
 
     ensure_handle_context(handle).await?;
-    let ctx_guard = handle.ctx.lock().await;
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| mcp_error("Database not initialized"))?;
+    let mut ctx_guard = handle.ctx.lock().await;
 
     let relation = params.relation.as_deref();
     let entity = &params.entity;
@@ -2186,67 +2361,72 @@ pub async fn graph_impl(handle: &RepoHandle, params: &GraphParams) -> Result<Str
             .map(|r| r.parse::<MemoryRelation>())
             .transpose()
             .map_err(mcp_error)?;
-        let output = match params.direction.as_str() {
-            "links" => {
-                let edges = memory_graph::outgoing(&ctx.conn, entity, rel)
-                    .map_err(|e| mcp_error(e.to_string()))?;
-                format_memory_graph_edges(entity, "links", &edges)
-            }
-            "backlinks" => {
-                let edges = memory_graph::incoming(&ctx.conn, entity, rel)
-                    .map_err(|e| mcp_error(e.to_string()))?;
-                format_memory_graph_edges(entity, "backlinks", &edges)
-            }
-            other => {
-                return Err(mcp_error(format!(
-                    "scope=memory supports links and backlinks, not '{other}'."
-                )));
-            }
-        };
+        let direction = params.direction.as_str();
+        if !matches!(direction, "links" | "backlinks") {
+            return Err(mcp_error(format!(
+                "scope=memory supports links and backlinks, not '{direction}'."
+            )));
+        }
+        let output = crate::core::run_guarded_read(&mut ctx_guard, "memory graph query", |ctx| {
+            let edges = if direction == "links" {
+                memory_graph::outgoing(&ctx.conn, entity, rel)
+            } else {
+                memory_graph::incoming(&ctx.conn, entity, rel)
+            }?;
+            Ok(format_memory_graph_edges(entity, direction, &edges))
+        })
+        .ok_or_else(|| mcp_error("Database not initialized"))?
+        .map_err(|e| mcp_store_error("Memory graph query failed", e))?;
         return Ok(output);
     }
 
-    let output = match params.direction.as_str() {
-        "links" => {
-            let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
-            let edges = graph::get_outgoing(&ctx.conn, doc.id, relation)
-                .map_err(|e| mcp_error(e.to_string()))?;
-            let views =
-                graph::edge_views(&ctx.conn, &edges).map_err(|e| mcp_error(e.to_string()))?;
-            format_graph_edges(entity, "links", &views)
-        }
-        "backlinks" => {
-            let edges = graph::get_incoming(&ctx.conn, entity, relation)
-                .map_err(|e| mcp_error(e.to_string()))?;
-            let views =
-                graph::edge_views(&ctx.conn, &edges).map_err(|e| mcp_error(e.to_string()))?;
-            format_graph_edges(entity, "backlinks", &views)
-        }
-        "neighbors" => {
-            let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
-            let nbrs = graph::neighbors(&ctx.conn, doc.id, relation, params.depth)
-                .map_err(|e| mcp_error(e.to_string()))?;
-            format_graph_neighbors(entity, &nbrs)
-        }
-        "path" => {
-            let to = params
+    let direction = params.direction.as_str();
+    if !matches!(direction, "links" | "backlinks" | "neighbors" | "path") {
+        return Err(mcp_error(format!(
+            "Unknown direction '{direction}'. Use links, backlinks, neighbors, or path."
+        )));
+    }
+    let to = if direction == "path" {
+        Some(
+            params
                 .to
                 .as_deref()
-                .ok_or_else(|| mcp_error("direction=path requires 'to'"))?;
-            let doc = resolve_document(&ctx.conn, entity).map_err(|e| mcp_error(e.to_string()))?;
-            let path = graph::shortest_path(&ctx.conn, doc.id, to, GRAPH_MCP_MAX_HOPS)
-                .map_err(|e| mcp_error(e.to_string()))?;
-            match path {
-                Some(nodes) => format!("{}: {}", entity, nodes.join(" -> ")),
-                None => format!("No path from {entity} to {to}."),
-            }
-        }
-        other => {
-            return Err(mcp_error(format!(
-                "Unknown direction '{other}'. Use links, backlinks, neighbors, or path."
-            )));
-        }
+                .ok_or_else(|| mcp_error("direction=path requires 'to'"))?,
+        )
+    } else {
+        None
     };
+    let output = crate::core::run_guarded_read(&mut ctx_guard, "document graph query", |ctx| {
+        Ok(match direction {
+            "links" => {
+                let doc = resolve_document(&ctx.conn, entity)?;
+                let edges = graph::get_outgoing(&ctx.conn, doc.id, relation)?;
+                let views = graph::edge_views(&ctx.conn, &edges)?;
+                format_graph_edges(entity, "links", &views)
+            }
+            "backlinks" => {
+                let edges = graph::get_incoming(&ctx.conn, entity, relation)?;
+                let views = graph::edge_views(&ctx.conn, &edges)?;
+                format_graph_edges(entity, "backlinks", &views)
+            }
+            "neighbors" => {
+                let doc = resolve_document(&ctx.conn, entity)?;
+                let nbrs = graph::neighbors(&ctx.conn, doc.id, relation, params.depth)?;
+                format_graph_neighbors(entity, &nbrs)
+            }
+            "path" => {
+                let to = to.expect("path destination was validated");
+                let doc = resolve_document(&ctx.conn, entity)?;
+                match graph::shortest_path(&ctx.conn, doc.id, to, GRAPH_MCP_MAX_HOPS)? {
+                    Some(nodes) => format!("{}: {}", entity, nodes.join(" -> ")),
+                    None => format!("No path from {entity} to {to}."),
+                }
+            }
+            _ => unreachable!("direction was validated"),
+        })
+    })
+    .ok_or_else(|| mcp_error("Database not initialized"))?
+    .map_err(|e| mcp_store_error("Document graph query failed", e))?;
     Ok(output)
 }
 
@@ -2410,38 +2590,33 @@ pub async fn usage_impl(
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
-    let ctx_guard = handle.ctx.lock().await;
-    let ctx = ctx_guard
-        .as_ref()
-        .ok_or_else(|| mcp_error("Database not initialized"))?;
-
-    let session = if session_id > 0 {
-        stats::get_session(&ctx.conn, session_id)
-            .map_err(|e| mcp_error(format!("Failed to read session: {e}")))?
-    } else {
-        None
-    };
-    let session_tool_usage = if session_id > 0 {
-        stats::get_tool_usage(&ctx.conn, session_id)
-            .map_err(|e| mcp_error(format!("Failed to read tool usage: {e}")))?
-    } else {
-        Vec::new()
-    };
-
-    let lifetime = if params.session_only {
-        None
-    } else {
-        Some(
-            stats::get_aggregate_stats(&ctx.conn)
-                .map_err(|e| mcp_error(format!("Failed to read lifetime stats: {e}")))?,
-        )
-    };
-    let lifetime_tool_usage = if params.session_only {
-        Vec::new()
-    } else {
-        stats::get_aggregate_tool_usage(&ctx.conn)
-            .map_err(|e| mcp_error(format!("Failed to read lifetime tool usage: {e}")))?
-    };
+    let mut ctx_guard = handle.ctx.lock().await;
+    let (session, session_tool_usage, lifetime, lifetime_tool_usage) =
+        crate::core::run_guarded_read(&mut ctx_guard, "usage report", |ctx| {
+            let session = if session_id > 0 {
+                stats::get_session(&ctx.conn, session_id)?
+            } else {
+                None
+            };
+            let session_tool_usage = if session_id > 0 {
+                stats::get_tool_usage(&ctx.conn, session_id)?
+            } else {
+                Vec::new()
+            };
+            let lifetime = if params.session_only {
+                None
+            } else {
+                Some(stats::get_aggregate_stats(&ctx.conn)?)
+            };
+            let lifetime_tool_usage = if params.session_only {
+                Vec::new()
+            } else {
+                stats::get_aggregate_tool_usage(&ctx.conn)?
+            };
+            Ok((session, session_tool_usage, lifetime, lifetime_tool_usage))
+        })
+        .ok_or_else(|| mcp_error("Database not initialized"))?
+        .map_err(|e| mcp_error(format!("Failed to read usage: {e}")))?;
 
     let primary_tools = if params.session_only {
         &session_tool_usage
@@ -2934,15 +3109,15 @@ fn format_quarantine_banner(mdkb_dir: &std::path::Path, doc_count: i64) -> Optio
 /// — not on a hook that fires every session against thousands of files. Equal
 /// counts can still hide offsetting drift, which is exactly why this points at
 /// the command that checks properly instead of claiming the store is healthy.
-fn format_projection_drift_banner(ctx: &crate::core::Context) -> Option<String> {
-    let (files, rows) = crate::core::memory_sync::projection_file_and_row_counts(ctx).ok()?;
+fn format_projection_drift_banner(ctx: &crate::core::Context) -> crate::Result<Option<String>> {
+    let (files, rows) = crate::core::memory_sync::projection_file_and_row_counts(ctx)?;
     if files == rows {
-        return None;
+        return Ok(None);
     }
-    Some(format!(
+    Ok(Some(format!(
         "⚠️ mdkb memory projection out of sync: {files} entry file(s) on disk vs {rows} \
          active database row(s). Run `mdkb stats` for the breakdown, then `mdkb memory sync`.\n"
-    ))
+    )))
 }
 
 /// `session_cwd` is the validated session working directory (see
@@ -2960,30 +3135,33 @@ pub async fn hook_session_start_impl(
     if ensure_handle_context(handle).await.is_err() {
         return json!({});
     }
-    let ctx_guard = handle.ctx.lock().await;
-    let conn = match ctx_guard.as_ref() {
-        Some(c) => &c.conn,
-        None => return json!({}),
-    };
     let limit = cfg.warmup_limit.max(1);
-    let (due_lines, entries) = match get_warmup_entries(conn, limit) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("hook.session_start: get_warmup_entries failed: {e}");
+    let mut ctx_guard = handle.ctx.lock().await;
+    let startup_data =
+        crate::core::run_guarded_read(&mut ctx_guard, "hook session warmup", |ctx| {
+            let (due_lines, entries) = get_warmup_entries(&ctx.conn, limit)?;
+            let doc_count = crate::store::documents::count_documents(&ctx.conn)?;
+            let collection_names: Vec<String> = collections::list_collections(&ctx.conn)?
+                .into_iter()
+                .map(|c| c.name)
+                .collect();
+            let drift_banner = format_projection_drift_banner(ctx)?;
+            Ok((
+                due_lines,
+                entries,
+                doc_count,
+                collection_names,
+                drift_banner,
+            ))
+        });
+    let (due_lines, entries, doc_count, collection_names, drift_banner) = match startup_data {
+        Some(Ok(data)) => data,
+        Some(Err(error)) => {
+            tracing::warn!("hook.session_start warmup failed: {error}");
             return json!({});
         }
+        None => return json!({}),
     };
-    let doc_count = crate::store::documents::count_documents(conn).unwrap_or(0);
-    // Which of the store's projects this session is in. Read here, under the
-    // lock we already hold, so scoping costs one extra query on the hook path.
-    let collection_names: Vec<String> = collections::list_collections(conn)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|c| c.name)
-        .collect();
-    // Computed under the lock we already hold, so the check costs one readdir
-    // and one COUNT on a path that is already open.
-    let drift_banner = ctx_guard.as_ref().and_then(format_projection_drift_banner);
     drop(ctx_guard);
 
     let scope = project_scope_token(&handle.root, session_cwd, &collection_names);
@@ -3004,11 +3182,17 @@ pub async fn hook_session_start_impl(
     // it here is what stops a scoped session from correctly refusing a foreign
     // handoff and then silently getting none (story 009-686d).
     let anchor = {
-        let ctx_guard = handle.ctx.lock().await;
-        ctx_guard.as_ref().and_then(|c| {
-            crate::store::memory::newest_handoff_for_scope(&c.conn, scope.as_deref())
-                .unwrap_or(None)
-        })
+        let mut ctx_guard = handle.ctx.lock().await;
+        match crate::core::run_guarded_read(&mut ctx_guard, "hook handoff lookup", |ctx| {
+            crate::store::memory::newest_handoff_for_scope(&ctx.conn, scope.as_deref())
+        }) {
+            Some(Ok(anchor)) => anchor,
+            Some(Err(error)) => {
+                tracing::warn!("hook.session_start handoff lookup failed: {error}");
+                return json!({});
+            }
+            None => return json!({}),
+        }
     };
     let (handoff_body, entries) = strip_handoffs(entries, anchor.as_ref());
 
@@ -3032,10 +3216,14 @@ pub async fn hook_session_start_impl(
     // stored confidence.
     let mut stale_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     if ensure_handle_context(handle).await.is_ok() {
-        let ctx_guard = handle.ctx.lock().await;
-        if let Some(c) = ctx_guard.as_ref() {
-            let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
-            stale_ids = memory_graph::stale_dependency_ids(&c.conn, &ids).unwrap_or_default();
+        let mut ctx_guard = handle.ctx.lock().await;
+        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+        match crate::core::run_guarded_read(&mut ctx_guard, "hook stale dependencies", |ctx| {
+            memory_graph::stale_dependency_ids(&ctx.conn, &ids)
+        }) {
+            Some(Ok(ids)) => stale_ids = ids,
+            Some(Err(error)) => tracing::warn!("hook stale dependency lookup failed: {error}"),
+            None => {}
         }
     }
     lines.extend(ranked.iter().map(|e| {
@@ -3148,7 +3336,7 @@ fn expand_recall_neighbors(
     results: &[memory::MemoryEntry],
     seeds: usize,
     max_neighbors: usize,
-) -> Vec<String> {
+) -> crate::Result<Vec<String>> {
     let seen: std::collections::HashSet<&str> = results.iter().map(|e| e.id.as_str()).collect();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<String> = Vec::new();
@@ -3156,7 +3344,7 @@ fn expand_recall_neighbors(
         if out.len() >= max_neighbors {
             break;
         }
-        let edges = memory_graph::outgoing(conn, &seed.id, None).unwrap_or_default();
+        let edges = memory_graph::outgoing(conn, &seed.id, None)?;
         for edge in edges {
             if out.len() >= max_neighbors {
                 break;
@@ -3167,12 +3355,12 @@ fn expand_recall_neighbors(
             if seen.contains(edge.target_ref.as_str()) || !emitted.insert(edge.target_ref.clone()) {
                 continue;
             }
-            if let Ok(Some(n)) = memory_graph::resolve_active(conn, &edge.target_ref) {
+            if let Some(n) = memory_graph::resolve_active(conn, &edge.target_ref)? {
                 out.push(format!("- [{}] {} (via {})", n.id, n.title, edge.relation));
             }
         }
     }
-    out
+    Ok(out)
 }
 
 pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> Value {
@@ -3244,22 +3432,27 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         // (build_recall_query) is a pre-built OR-expression fed to the FTS leg
         // via `_fts`; embedding the FTS operators would be noise.
         let query_embedding = embed_query_off_lock(prompt).await;
-        let ctx_guard = handle.ctx.lock().await;
-        let conn = match ctx_guard.as_ref() {
-            Some(c) => &c.conn,
-            None => return json!({}),
-        };
+        let mut ctx_guard = handle.ctx.lock().await;
         let limit = cfg.recall_limit.max(1);
         let search_t0 = std::time::Instant::now();
-        results = memory::search_entries_hybrid_fts(
-            conn,
-            q,
-            query_embedding.as_deref(),
-            limit,
-            handle.config.search.memory.access_recency_weight,
-            handle.config.search.memory.recency_half_life_secs,
-        )
-        .unwrap_or_default();
+        let search = crate::core::run_guarded_read(&mut ctx_guard, "hook memory recall", |ctx| {
+            memory::search_entries_hybrid_fts(
+                &ctx.conn,
+                q,
+                query_embedding.as_deref(),
+                limit,
+                handle.config.search.memory.access_recency_weight,
+                handle.config.search.memory.recency_half_life_secs,
+            )
+        });
+        results = match search {
+            Some(Ok(entries)) => entries,
+            Some(Err(error)) => {
+                tracing::warn!("hook memory recall failed: {error}");
+                return json!({});
+            }
+            None => return json!({}),
+        };
 
         // Opt-in, privacy-safe telemetry: record the recall's shape (hash +
         // latency + count) but NEVER the prompt text. Off by default.
@@ -3273,8 +3466,12 @@ async fn hook_user_prompt_submit_impl_with_dedup(
                 top_score: None,
                 session_id: None,
             };
-            if let Err(e) = stats::record_query_event(conn, &ev) {
-                tracing::warn!("record_query_event failed: {e}");
+            if let Some(Err(error)) =
+                crate::core::run_guarded_write(&mut ctx_guard, "query event telemetry", |ctx| {
+                    stats::record_query_event(&ctx.conn, &ev)
+                })
+            {
+                tracing::warn!("record_query_event failed: {error}");
             }
         }
 
@@ -3283,26 +3480,29 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         // (a second embed would double the per-turn CPU cost). No score floor:
         // RRF normalization pins the top hit at 1.0, so a threshold would filter
         // nothing — `recall_docs_limit` is the control (0 = memory only).
-        if let Some(ctx) = ctx_guard.as_ref() {
-            let docs_limit = cfg.recall_docs_limit;
-            if docs_limit > 0 {
-                match crate::core::search::hybrid_search_fts(
+        let docs_limit = cfg.recall_docs_limit;
+        if docs_limit > 0 && ctx_guard.is_some() {
+            match crate::core::run_guarded_read(&mut ctx_guard, "hook document recall", |ctx| {
+                crate::core::search::hybrid_search_fts(
                     ctx,
                     q,
                     query_embedding.as_deref(),
                     docs_limit,
                     None,
                     false,
-                ) {
-                    Ok(hits) => {
-                        doc_hits = hits
-                            .into_iter()
-                            .map(|hit| (hit.path, hit.title.filter(|t| !t.is_empty())))
-                            .collect();
-                    }
-                    // Degrade silently (hooks must not block) but stay observable.
-                    Err(e) => tracing::debug!("recall doc search failed: {e}"),
+                )
+            }) {
+                Some(Ok(hits)) => {
+                    doc_hits = hits
+                        .into_iter()
+                        .map(|hit| (hit.path, hit.title.filter(|t| !t.is_empty())))
+                        .collect();
                 }
+                Some(Err(error)) => {
+                    // Degrade silently (hooks must not block) but stay observable.
+                    tracing::debug!("recall doc search failed: {error}");
+                }
+                None => {}
             }
         }
         drop(ctx_guard);
@@ -3331,16 +3531,26 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     let mut expanded: Vec<String> = Vec::new();
     let mut stale_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !results.is_empty() && ensure_handle_context(handle).await.is_ok() {
-        let ctx_guard = handle.ctx.lock().await;
-        if let Some(c) = ctx_guard.as_ref() {
-            expanded = expand_recall_neighbors(
-                &c.conn,
-                &results,
-                handle.config.graph.expand_seeds,
-                handle.config.graph.expand_neighbors,
-            );
-            let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
-            stale_ids = memory_graph::stale_dependency_ids(&c.conn, &ids).unwrap_or_default();
+        let mut ctx_guard = handle.ctx.lock().await;
+        let enrichment =
+            crate::core::run_guarded_read(&mut ctx_guard, "hook recall enrichment", |ctx| {
+                let expanded = expand_recall_neighbors(
+                    &ctx.conn,
+                    &results,
+                    handle.config.graph.expand_seeds,
+                    handle.config.graph.expand_neighbors,
+                )?;
+                let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
+                let stale_ids = memory_graph::stale_dependency_ids(&ctx.conn, &ids)?;
+                Ok((expanded, stale_ids))
+            });
+        match enrichment {
+            Some(Ok((found_expanded, found_stale_ids))) => {
+                expanded = found_expanded;
+                stale_ids = found_stale_ids;
+            }
+            Some(Err(error)) => tracing::debug!("hook recall enrichment failed: {error}"),
+            None => {}
         }
     }
 
@@ -3353,16 +3563,24 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         // it didn't (path-only prompt) so we don't re-acquire on the hot path.
         let ctx_ready = fts_query.is_some() || ensure_handle_context(handle).await.is_ok();
         if ctx_ready {
-            let ctx_guard = handle.ctx.lock().await;
-            if let Some(c) = ctx_guard.as_ref() {
-                let seen: std::collections::HashSet<String> =
-                    results.iter().map(|e| e.id.clone()).collect();
-                neighbors = doc_graph_neighbors(
-                    &c.conn,
-                    &path_tokens,
-                    &seen,
-                    handle.config.graph.doc_neighbor_cap,
-                );
+            let mut ctx_guard = handle.ctx.lock().await;
+            let seen: std::collections::HashSet<String> =
+                results.iter().map(|e| e.id.clone()).collect();
+            match crate::core::run_guarded_read(
+                &mut ctx_guard,
+                "hook document graph neighbors",
+                |ctx| {
+                    doc_graph_neighbors(
+                        &ctx.conn,
+                        &path_tokens,
+                        &seen,
+                        handle.config.graph.doc_neighbor_cap,
+                    )
+                },
+            ) {
+                Some(Ok(found)) => neighbors = found,
+                Some(Err(error)) => tracing::debug!("hook document neighbors failed: {error}"),
+                None => {}
             }
         }
     }
@@ -3497,11 +3715,13 @@ async fn prompt_prior_block(
     if ensure_handle_context(handle).await.is_err() {
         return None;
     }
-    let ctx_guard = handle.ctx.lock().await;
-    let conn = &ctx_guard.as_ref()?.conn;
+    let mut ctx_guard = handle.ctx.lock().await;
 
     let tctx = TriggerContext::Prompt { text: prompt };
-    let hits = match_injectable(conn, &tctx, now, max).ok()?;
+    let hits = crate::core::run_guarded_read(&mut ctx_guard, "prompt prior lookup", |ctx| {
+        match_injectable(&ctx.conn, &tctx, now, max)
+    })?
+    .ok()?;
     if hits.is_empty() {
         return None;
     }
@@ -3512,7 +3732,14 @@ async fn prompt_prior_block(
                 continue;
             }
         }
-        let _ = record_injection(conn, &c.id, now);
+        let prior_id = c.id.clone();
+        if let Some(Err(error)) =
+            crate::core::run_guarded_write(&mut ctx_guard, "prompt prior telemetry", |ctx| {
+                record_injection(&ctx.conn, &prior_id, now)
+            })
+        {
+            tracing::warn!("record prompt prior injection: {error}");
+        }
         if let Some((dctx, key)) = dedup {
             dctx.record_hook_prior(key, &c.id);
         }
@@ -3535,7 +3762,7 @@ fn doc_graph_neighbors(
     tokens: &[String],
     seen: &std::collections::HashSet<String>,
     cap: usize,
-) -> Vec<(String, String)> {
+) -> crate::Result<Vec<(String, String)>> {
     use crate::store::graph;
     let mut out: Vec<(String, String)> = Vec::new();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3543,17 +3770,10 @@ fn doc_graph_neighbors(
         if out.len() >= cap {
             break;
         }
-        let Ok(Some(doc_id)) = graph::resolve_ref_to_doc(conn, tok) else {
+        let Some(doc_id) = graph::resolve_ref_to_doc(conn, tok)? else {
             continue;
         };
-        let edges = match graph::get_outgoing(conn, doc_id, None) {
-            Ok(e) => e,
-            Err(e) => {
-                // Degrade silently (hooks must not block) but stay observable.
-                tracing::debug!("doc_graph_neighbors: get_outgoing({doc_id}) failed: {e}");
-                continue;
-            }
-        };
+        let edges = graph::get_outgoing(conn, doc_id, None)?;
         for edge in edges {
             if out.len() >= cap {
                 break;
@@ -3567,7 +3787,7 @@ fn doc_graph_neighbors(
             // whose targets are tags, not navigable docs — `resolve_to_path`
             // returns None for those, keeping the "related docs" block honest.
             // One resolution pass per edge.
-            let Ok(Some(path)) = graph::resolve_to_path(conn, &edge.target_ref) else {
+            let Some(path) = graph::resolve_to_path(conn, &edge.target_ref)? else {
                 continue;
             };
             if seen.contains(&path) || !emitted.insert(path.clone()) {
@@ -3576,7 +3796,7 @@ fn doc_graph_neighbors(
             out.push((path, edge.relation));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Number of trailing transcript lines that form the mined episode window.
@@ -3700,17 +3920,17 @@ async fn mine_episode(
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let guard = handle.ctx.lock().await;
-    if let Some(c) = guard.as_ref() {
-        if let Err(e) = integrate_distilled(
-            &c.conn,
+    let mut guard = handle.ctx.lock().await;
+    if let Some(Err(error)) = crate::core::run_mutation(&mut guard, "prior mining", |ctx| {
+        integrate_distilled(
+            &ctx.conn,
             &distilled,
             &session,
             now,
             lesson_embedding.as_deref(),
-        ) {
-            tracing::debug!("prior mining: integrate_distilled failed: {e}");
-        }
+        )
+    }) {
+        tracing::debug!("prior mining: integrate_distilled failed: {error}");
     }
 }
 
@@ -3876,21 +4096,30 @@ async fn pretool_prior_block(
     // never force a DB open (the same reason `code_index_hits` guards on
     // `.exists()`). In the daemon the context is warm after SessionStart, so
     // priors fire; a cold one-shot invocation skips them (best-effort).
-    let ctx_guard = handle.ctx.lock().await;
-    let conn = &ctx_guard.as_ref()?.conn;
+    let mut ctx_guard = handle.ctx.lock().await;
 
     let tctx = TriggerContext::PreTool {
         tool,
         path: path.as_deref(),
         command,
     };
-    let hits = match_injectable(conn, &tctx, now, max).ok()?;
+    let hits = crate::core::run_guarded_read(&mut ctx_guard, "pre-tool prior lookup", |ctx| {
+        match_injectable(&ctx.conn, &tctx, now, max)
+    })?
+    .ok()?;
     if hits.is_empty() {
         return None;
     }
     let mut lines = Vec::with_capacity(hits.len());
     for c in &hits {
-        let _ = record_injection(conn, &c.id, now);
+        let prior_id = c.id.clone();
+        if let Some(Err(error)) =
+            crate::core::run_guarded_write(&mut ctx_guard, "pre-tool prior telemetry", |ctx| {
+                record_injection(&ctx.conn, &prior_id, now)
+            })
+        {
+            tracing::warn!("record pre-tool prior injection: {error}");
+        }
         lines.push(format!("mdkb prior: {}", c.lesson));
     }
     Some(lines.join("\n"))
@@ -3949,17 +4178,16 @@ async fn code_index_hits(handle: &RepoHandle, symbol: &str, limit: usize) -> Opt
 /// `record_call` is three tiny local-SQLite writes (sub-millisecond).
 async fn record_hook_call(handle: &RepoHandle, method: &str) {
     let event = method.strip_prefix("hook.").unwrap_or(method);
-    let ctx_guard = handle.ctx.lock().await;
-    let Some(ctx) = ctx_guard.as_ref() else {
+    let mut ctx_guard = handle.ctx.lock().await;
+    if ctx_guard.is_none() {
         return;
-    };
-    match stats::find_or_create_agent_session(&ctx.conn, "hooks") {
-        Ok(sid) => {
-            if let Err(e) = stats::record_call(&ctx.conn, sid, event, 0, 0, false) {
-                tracing::warn!("record hook call: {e}");
-            }
-        }
-        Err(e) => tracing::warn!("hooks pseudo-session: {e}"),
+    }
+    let outcome = crate::core::run_guarded_write(&mut ctx_guard, "hook telemetry", |ctx| {
+        let sid = stats::find_or_create_agent_session(&ctx.conn, "hooks")?;
+        stats::record_call(&ctx.conn, sid, event, 0, 0, false)
+    });
+    if let Some(Err(error)) = outcome {
+        tracing::warn!("record hook call: {error}");
     }
 }
 
@@ -4019,12 +4247,12 @@ async fn cli_mutate_impl(
                             mcp_error(format!("--older-than '{raw}' is too large to compute a cutoff"))
                         })?;
                         Some(crate::core::ops::handle_prune_sessions(ctx, cutoff, export.as_deref())
-                            .map_err(|e| mcp_error(e.to_string()))?)
+                            .map_err(|e| mcp_store_error("Failed to prune sessions", e))?)
                     } else {
                         None
                     };
                     ctx.conn.execute_batch("VACUUM;")
-                        .map_err(|e| mcp_error(format!("vacuum index.sqlite: {e}")))?;
+                        .map_err(|e| mcp_store_error("Failed to vacuum index.sqlite", e))?;
                     Ok((prune, ctx.db_path.metadata().map(|m| m.len()).unwrap_or(0)))
                 })
                 .map_err(|e| mcp_error(format!("compact failed: {e}")))?
@@ -4055,7 +4283,7 @@ async fn cli_mutate_impl(
             let mut slot = handle.ctx.lock().await;
             run_handle_memory_mutation(&mut slot, "cli mutation", |ctx| {
                 crate::core::cli_mutation::execute_context_mutation(ctx, mutation)
-                    .map_err(|e| mcp_error(e.to_string()))
+                    .map_err(|e| mcp_store_error("CLI mutation failed", e))
             })
             .map_err(|e| mcp_error(format!("cli mutation failed: {e}")))
         }
@@ -5656,7 +5884,7 @@ mod tests {
         let mut best = u128::MAX;
         for _ in 0..50 {
             let t = std::time::Instant::now();
-            let out = expand_recall_neighbors(conn, &seeds, 2, 3);
+            let out = expand_recall_neighbors(conn, &seeds, 2, 3).unwrap();
             best = best.min(t.elapsed().as_micros());
             assert_eq!(out.len(), 3, "must expand exactly the 3 capped neighbors");
         }
@@ -5688,11 +5916,20 @@ mod tests {
         let seeds = vec![memory::get_entry(&conn, "n0").unwrap().unwrap()];
 
         // Defaults (2 seeds, 3 neighbors) surface all three edges.
-        assert_eq!(expand_recall_neighbors(&conn, &seeds, 2, 3).len(), 3);
+        assert_eq!(
+            expand_recall_neighbors(&conn, &seeds, 2, 3).unwrap().len(),
+            3
+        );
         // A tighter neighbor cap truncates.
-        assert_eq!(expand_recall_neighbors(&conn, &seeds, 2, 1).len(), 1);
+        assert_eq!(
+            expand_recall_neighbors(&conn, &seeds, 2, 1).unwrap().len(),
+            1
+        );
         // Zero seeds disables expansion entirely.
-        assert_eq!(expand_recall_neighbors(&conn, &seeds, 0, 3).len(), 0);
+        assert_eq!(
+            expand_recall_neighbors(&conn, &seeds, 0, 3).unwrap().len(),
+            0
+        );
     }
 
     #[tokio::test]

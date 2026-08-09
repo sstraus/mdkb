@@ -39,23 +39,9 @@ fn production_source(path: &Path) -> String {
     }
 }
 
-/// `#[ignore]`d because it currently FAILS, on purpose.
-///
-/// It is the executable definition of "done" for story 019-3248, written before
-/// the work rather than after, so the target is a command anyone can run rather
-/// than a paragraph someone has to interpret:
-///
-/// ```text
-/// cargo test --test layering -- --ignored
-/// ```
-///
-/// Five references remain, covering seven symbols: `handle_update`,
-/// `handle_session_index`, `handle_hybrid_search`, `handle_mget`,
-/// `hybrid_search_fts`, `sync_memory_files` and
-/// `projection_file_and_row_counts`. Unlike `Context`, these are not a
-/// mechanical move — `handle_update` is the whole indexing pipeline and the
-/// story requires it be split by responsibility, not relocated wholesale. Remove
-/// the `#[ignore]` in the commit that empties the list.
+/// Executable dependency-direction invariant completed by story 019-3248.
+/// Shared application logic belongs in `core`; adding a new production
+/// dependency on `cli::handlers` must fail the ordinary test suite.
 #[test]
 fn no_adapter_reaches_into_the_cli_adapter() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));

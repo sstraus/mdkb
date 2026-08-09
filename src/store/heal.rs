@@ -63,15 +63,32 @@ fn marker_path(db_path: &Path) -> PathBuf {
     with_suffix(db_path, ".integrity-ok")
 }
 
-/// True if `marker` was touched within `interval` of `now` — i.e. the probe can
-/// be skipped. A missing or unreadable marker forces a probe.
-fn checked_recently(marker: &Path, interval: Duration, now: SystemTime) -> bool {
+/// True if `marker` was touched within `interval` and is no older than the
+/// database generation it certifies.
+///
+/// Age alone is insufficient: a long-lived daemon can keep writing the DB/WAL
+/// after a successful probe. A marker older than either file must never suppress
+/// the next open-time integrity check.
+fn checked_recently(db_path: &Path, marker: &Path, interval: Duration, now: SystemTime) -> bool {
     let Ok(mtime) = std::fs::metadata(marker).and_then(|m| m.modified()) else {
         return false;
     };
-    now.duration_since(mtime)
+    let recent = now
+        .duration_since(mtime)
         .map(|age| age < interval)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !recent {
+        return false;
+    }
+
+    for path in [db_path.to_path_buf(), with_suffix(db_path, "-wal")] {
+        if let Ok(modified) = std::fs::metadata(path).and_then(|m| m.modified()) {
+            if modified > mtime {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// Record a successful probe by creating/truncating the marker (updates mtime).
@@ -135,7 +152,7 @@ pub fn verify_and_mark_throttled_at(
     interval: Duration,
     now: SystemTime,
 ) -> Result<()> {
-    if checked_recently(&marker_path(db_path), interval, now) {
+    if checked_recently(db_path, &marker_path(db_path), interval, now) {
         return Ok(());
     }
     if !db_path.exists() {
@@ -583,7 +600,7 @@ fn ensure_sound_at_locked(db_path: &Path, interval: Duration, now: SystemTime) -
         return Ok(Heal::Sound); // fresh database — nothing to probe
     }
     let marker = marker_path(db_path);
-    if checked_recently(&marker, interval, now) {
+    if checked_recently(db_path, &marker, interval, now) {
         return Ok(Heal::Sound);
     }
 
@@ -834,6 +851,25 @@ mod tests {
         let outcome = ensure_sound_at(&db, CHECK_INTERVAL, SystemTime::now()).unwrap();
         assert_eq!(outcome, Heal::Sound, "recent marker skips the probe");
         assert!(db.exists(), "throttled probe left the file untouched");
+    }
+
+    #[test]
+    fn ensure_sound_does_not_trust_a_marker_older_than_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        touch_marker(&marker_path(&db));
+
+        // The production incident had a marker from 10:10 and a DB modified at
+        // 12:09. Preserve that ordering at a much smaller scale.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&db, b"corrupt after the successful probe").unwrap();
+
+        let outcome = ensure_sound_at(&db, CHECK_INTERVAL, SystemTime::now()).unwrap();
+        assert!(
+            matches!(outcome, Heal::Quarantined { .. }),
+            "a post-marker DB write must force a fresh integrity probe"
+        );
     }
 
     #[test]

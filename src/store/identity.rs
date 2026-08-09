@@ -30,11 +30,7 @@ fn identity_path(db_path: &Path) -> std::path::PathBuf {
 
 /// True when both paths resolve to the same file on disk.
 fn same_file(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (std::fs::metadata(a), std::fs::metadata(b)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
-    }
+    same_file::is_same_file(a, b).unwrap_or(false)
 }
 
 /// Record `db_path` as this store's spelling, or refuse the open if another

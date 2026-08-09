@@ -1,7 +1,7 @@
 //! Database schema management and migrations.
 
 use crate::error::{Error, Result};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
 pub const SCHEMA_VERSION: i32 = 20;
@@ -360,6 +360,11 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // Enable foreign keys
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
 
+    // Refuse a store from the future before executing any schema or ranking
+    // statement. An older binary must not modify the database it says it cannot
+    // understand.
+    refuse_future_schema(conn)?;
+
     // Create schema
     conn.execute_batch(SCHEMA_SQL)?;
 
@@ -380,29 +385,26 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
             // Run migrations
             migrate_schema(conn, v)?;
         }
-        // A store written by a NEWER binary. Refusing is the whole point: there
-        // is nothing to migrate forward, so the old code would simply carry on
-        // reading and writing tables whose shape it does not know — and
-        // `SCHEMA_SQL` above has already re-run, leaving anything the newer
-        // version redefined as whichever definition this binary carries.
-        //
-        // In practice this is a long-lived daemon meeting a store that a
-        // freshly-built CLI migrated underneath it. Version skew is a second
-        // writer with a different mental model of the schema, and the damage is
-        // silent. Naming both versions is what makes it diagnosable.
-        Some(v) if v > SCHEMA_VERSION => {
-            return Err(Error::other(format!(
-                "store schema is v{v}, but this mdkb binary understands v{SCHEMA_VERSION}. \
-                 Refusing to open: a newer store served by an older binary corrupts it \
-                 silently. Upgrade mdkb, and restart any running daemon (`mdkb daemon \
-                 restart`) so it is not left on the old build."
-            )));
-        }
         _ => {
             // Up to date
         }
     }
 
+    Ok(())
+}
+
+/// Refuse a store created by a newer binary without modifying it.
+pub fn refuse_future_schema(conn: &Connection) -> Result<()> {
+    if let Some(v) = get_schema_version(conn)?
+        && v > SCHEMA_VERSION
+    {
+        return Err(Error::other(format!(
+            "store schema is v{v}, but this mdkb binary understands v{SCHEMA_VERSION}. \
+             Refusing to open: a newer store served by an older binary corrupts it \
+             silently. Upgrade mdkb, and restart any running daemon (`mdkb daemon \
+             restart`) so it is not left on the old build."
+        )));
+    }
     Ok(())
 }
 
@@ -809,23 +811,23 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
 /// Get the current schema version from the database.
 pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
     // Check if table exists first
-    let exists: bool = conn
+    let exists = conn
         .query_row(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'",
             [],
             |_| Ok(true),
         )
-        .unwrap_or(false);
+        .optional()?;
 
-    if !exists {
+    if exists.is_none() {
         return Ok(None);
     }
 
-    let version: Option<i32> = conn
+    let version = conn
         .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
             row.get(0)
         })
-        .ok();
+        .optional()?;
 
     Ok(version)
 }

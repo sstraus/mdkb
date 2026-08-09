@@ -844,7 +844,13 @@ pub fn handle_init(root: impl AsRef<Path>) -> Result<()> {
     }
 
     let ctx = Context::init(root)?;
-    apply_conventions(&ctx, root)?;
+    {
+        let _writer_guard =
+            crate::store::mutation_lock::acquire_writer(&ctx.db_path, "init conventions")?;
+        crate::store::heal::invalidate_marker(&ctx.db_path);
+        apply_conventions(&ctx, root)?;
+        crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
+    }
 
     // The store's own .gitignore is inert under a blanket `.mdkb/` rule above
     // it, and that failure is silent — say so at the one moment the user is
