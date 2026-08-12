@@ -67,7 +67,7 @@ async fn memory_search_payload_exposes_confidence_and_counters() {
             include_superseded: false,
             scope: Some("memory".to_string()),
             kind: None,
-            threshold: 0.5,
+            threshold: None,
             file: None,
             min_confidence: None,
         }))
@@ -140,7 +140,7 @@ async fn memory_search_payload_marks_never_confirmed_entries() {
             include_superseded: false,
             scope: Some("memory".to_string()),
             kind: None,
-            threshold: 0.5,
+            threshold: None,
             file: None,
             min_confidence: None,
         }))
@@ -210,7 +210,7 @@ async fn search_memory(server: &McpServer, query: &str, min_confidence: Option<f
             include_superseded: false,
             scope: Some("memory".to_string()),
             kind: None,
-            threshold: 0.5,
+            threshold: None,
             file: None,
             min_confidence,
         }))

@@ -44,14 +44,40 @@ use super::server::{
     resolve_document, truncate_text,
 };
 
+/// Pick the JSON-RPC code a store error must travel under.
+///
+/// `INTERNAL_ERROR` is the daemon's post-dispatch code: it tells the CLI that a
+/// method got as far as running, so the outcome is unknown and the CLI must NOT
+/// retry the write itself. A validation refusal never ran anything — see
+/// [`crate::error::ErrorKind::is_validation_refusal`] — so wearing that code
+/// made a rejected entry id report "the daemon may still be writing" and blocked
+/// the fallback that would have printed the real cause.
+fn store_error_code(error: &crate::Error) -> ErrorCode {
+    if error.is_validation_refusal() {
+        ErrorCode::INVALID_PARAMS
+    } else {
+        ErrorCode::INTERNAL_ERROR
+    }
+}
+
 fn mcp_store_error(context: &str, error: impl Into<crate::Error>) -> McpError {
     let error = error.into();
     McpError {
-        code: ErrorCode::INTERNAL_ERROR,
+        code: store_error_code(&error),
         message: format!("{context}: {error}").into(),
         data: error
             .is_index_corrupt()
             .then(|| json!({ "index_corrupt": true })),
+    }
+}
+
+/// A refusal that speaks for itself: the error text is already the whole story,
+/// so it travels unwrapped, under the code its kind earns.
+fn mcp_refusal(error: crate::Error) -> McpError {
+    McpError {
+        code: store_error_code(&error),
+        message: error.to_string().into(),
+        data: None,
     }
 }
 
@@ -579,7 +605,7 @@ pub async fn memory_delete_impl(
     id: &str,
     dry_run: bool,
 ) -> Result<String, McpError> {
-    memory::validate_entry_id(id).map_err(|e| mcp_error(e.to_string()))?;
+    memory::validate_entry_id(id).map_err(mcp_refusal)?;
     ensure_handle_context(handle).await?;
 
     if dry_run {
@@ -749,7 +775,7 @@ fn write_single_memory(
         on_conflict,
         dry_run,
     } = input;
-    memory::validate_entry_input(id, title, tags, content).map_err(|e| mcp_error(e.to_string()))?;
+    memory::validate_entry_input(id, title, tags, content).map_err(mcp_refusal)?;
 
     let existing = memory::get_entry_without_tracking(conn, id)
         .map_err(|e| mcp_store_error("Failed to check existing entry", e))?;
@@ -1334,30 +1360,16 @@ pub async fn search_impl(
             };
 
             if scope == Some("code") {
-                if !handle.config.code.semantic_search.enabled {
-                    return Err(mcp_error(
-                        "Semantic code search is disabled. Enable it in mdkb.toml: [code.semantic_search] enabled = true, then re-index.",
-                    ));
-                }
                 let code_limit = params.limit.min(5);
-                let mut results = facade
-                    .semantic_search(&params.query, code_limit, params.threshold)
-                    .map_err(|e| {
-                        tracing::error!("Semantic code search failed: {e}");
-                        mcp_error(
-                            "Semantic code search failed. The embedding model may not be installed — run `mdkb code index` to initialize.",
-                        )
-                    })?;
-
-                if let Some(ref kind_str) = params.kind {
-                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
-                        results.retain(|(s, _)| s.kind == kind);
-                    } else {
-                        return Err(mcp_error(format!(
-                            "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro"
-                        )));
-                    }
-                }
+                let results = crate::core::code::semantic_search_scoped(
+                    facade,
+                    &handle.config,
+                    &params.query,
+                    params.kind.as_deref(),
+                    code_limit,
+                    params.threshold,
+                )
+                .map_err(|e| mcp_error(e.to_string()))?;
 
                 if results.is_empty() {
                     return Ok(("No semantic matches found.".to_string(), 0));
@@ -1371,26 +1383,15 @@ pub async fn search_impl(
                 let count = results.len();
                 Ok((out, count))
             } else {
-                let mut symbols = if let Some(ref file_pattern) = params.file {
-                    let mut results = facade.find_symbols_by_file(file_pattern, params.limit * 2);
-                    if !params.query.is_empty() && params.query != "*" {
-                        let q = params.query.to_lowercase();
-                        results.retain(|s| s.name.to_lowercase().contains(&q));
-                    }
-                    results
-                } else {
-                    facade.search_symbols(&params.query, params.limit)
-                };
-
-                if let Some(ref kind_str) = params.kind {
-                    if let Ok(kind) = kind_str.parse::<crate::code::types::SymbolKind>() {
-                        symbols.retain(|s| s.kind == kind);
-                    } else {
-                        return Err(mcp_error(format!(
-                            "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, enum, trait, interface, class, module, variable, constant, field, parameter, type_alias, macro"
-                        )));
-                    }
-                }
+                let found = crate::core::code::search_symbols_scoped(
+                    facade,
+                    &params.query,
+                    params.kind.as_deref(),
+                    params.file.as_deref(),
+                    limit,
+                )
+                .map_err(|e| mcp_error(e.to_string()))?;
+                let symbols = found.symbols;
 
                 if symbols.is_empty() {
                     let total = facade.symbol_count();
@@ -1406,7 +1407,15 @@ pub async fn search_impl(
                     .into_iter()
                     .collect();
                 let token_map = facade.get_file_token_estimates(&rel_paths);
-                let mut out = format!("Found {} symbol(s):\n\n", symbols.len());
+                let mut out = if found.total > symbols.len() {
+                    format!(
+                        "Showing {} of {} symbol(s) — narrow with kind/file, or raise limit:\n\n",
+                        symbols.len(),
+                        found.total,
+                    )
+                } else {
+                    format!("Found {} symbol(s):\n\n", symbols.len())
+                };
                 for sym in &symbols {
                     out.push_str(&format_symbol_with_file_tokens(
                         sym,
@@ -2288,23 +2297,26 @@ pub async fn code_find_impl(
         return Err(mcp_error("code index not available — run `update` first"));
     };
 
-    let mut results = facade.find_symbols_by_name(&params.name);
-
-    if let Some(kind_str) = &params.kind {
-        let kind: crate::code::types::SymbolKind = kind_str
-            .parse()
-            .map_err(|_| mcp_error(format!("unknown symbol kind: {kind_str}")))?;
-        results.retain(|s| s.kind == kind);
-    }
-
-    if let Some(file_substr) = &params.file {
-        results.retain(|s| s.file_path.as_ref().contains(file_substr.as_str()));
-    }
-
+    let kind = crate::core::code::parse_kind_filter(params.kind.as_deref())
+        .map_err(|e| mcp_error(e.to_string()))?;
     let limit = params.limit.unwrap_or(50) as usize;
-    results.truncate(limit);
 
-    symbols_to_json_string(&results)
+    let (results, total) = facade.query_symbols(
+        crate::code::storage::NameMatch::Exact(&params.name),
+        kind.as_deref(),
+        params.file.as_deref(),
+        limit,
+    );
+
+    // `total` travels with the rows: a boilerplate name like `tests` matches
+    // hundreds of definitions, and a capped array alone reads as the whole set.
+    let json_symbols: Vec<serde_json::Value> = results.iter().map(symbol_to_json).collect();
+    serde_json::to_string(&serde_json::json!({
+        "total": total,
+        "showing": json_symbols.len(),
+        "symbols": json_symbols,
+    }))
+    .map_err(|e| mcp_error(format!("failed to serialize symbols: {e}")))
 }
 
 /// `symbol_at_position` — find the innermost symbol at a given file position.
@@ -4281,11 +4293,16 @@ async fn cli_mutate_impl(
         mutation => {
             ensure_handle_context(handle).await?;
             let mut slot = handle.ctx.lock().await;
+            // No outer wrap: `run_handle_memory_mutation` already returns an
+            // `McpError`, so re-wrapping stringified one error inside another and
+            // repeated both the code and the phrase, pushing the one fact the
+            // operator needs to the end of the line. It also flattened the code
+            // the inner error had earned, which is what tells the CLI whether the
+            // write started.
             run_handle_memory_mutation(&mut slot, "cli mutation", |ctx| {
                 crate::core::cli_mutation::execute_context_mutation(ctx, mutation)
                     .map_err(|e| mcp_store_error("CLI mutation failed", e))
             })
-            .map_err(|e| mcp_error(format!("cli mutation failed: {e}")))
         }
     }
 }
@@ -6674,13 +6691,13 @@ mod tests {
             .await
             .unwrap_err();
         assert!(
-            err.message.contains("ID must be"),
+            err.message.contains("entry id"),
             "should reject invalid ID: {}",
             err.message
         );
 
         let err2 = memory_delete_impl(&handle, "", false).await.unwrap_err();
-        assert!(err2.message.contains("ID must be"));
+        assert!(err2.message.contains("entry id"), "{}", err2.message);
     }
 
     #[tokio::test]
@@ -7362,7 +7379,7 @@ mod tests {
             include_superseded: false,
             scope: scope.map(str::to_string),
             kind: None,
-            threshold: 0.5,
+            threshold: None,
             file: None,
             min_confidence: None,
         }

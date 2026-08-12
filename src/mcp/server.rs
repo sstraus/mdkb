@@ -2907,7 +2907,7 @@ mod tests {
                 kind: None,
                 file: None,
                 min_confidence: None,
-                threshold: 0.3,
+                threshold: None,
                 root: None,
             }))
             .await
@@ -2963,7 +2963,7 @@ mod tests {
                 kind: None,
                 file: None,
                 min_confidence: None,
-                threshold: 0.3,
+                threshold: None,
                 root: None,
             }))
             .await
@@ -3234,7 +3234,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                 })),
             )
@@ -3263,7 +3263,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                 })),
             )
@@ -3291,7 +3291,7 @@ if (require.main === module) {
                     kind: Some("struct".to_string()),
                     file: None,
                     min_confidence: None,
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                 })),
             )
@@ -3323,7 +3323,7 @@ if (require.main === module) {
                     scope: Some("symbols".to_string()),
                     kind: None,
                     file: Some("lib.rs".to_string()),
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                     min_confidence: None,
                 })),
@@ -3353,7 +3353,7 @@ if (require.main === module) {
                     kind: Some("invalid_kind".to_string()),
                     file: None,
                     min_confidence: None,
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                 })),
             )
@@ -3379,7 +3379,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                 })),
             )
@@ -3493,7 +3493,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                 })),
             )
@@ -3543,7 +3543,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                 })),
             )
@@ -3562,7 +3562,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                 })),
             )
@@ -3615,7 +3615,7 @@ if (require.main === module) {
                     kind: None,
                     file: None,
                     min_confidence: None,
-                    threshold: 0.3,
+                    threshold: None,
                     root: None,
                 })),
             )
@@ -4180,7 +4180,7 @@ if (require.main === module) {
                 include_superseded: false,
                 scope: None,
                 kind: None,
-                threshold: 0.5,
+                threshold: None,
                 file: None,
                 min_confidence: None,
             }))
@@ -4266,7 +4266,7 @@ if (require.main === module) {
                 include_superseded: false,
                 scope: None,
                 kind: None,
-                threshold: 0.5,
+                threshold: None,
                 file: None,
                 min_confidence: None,
             })),
@@ -4337,7 +4337,7 @@ if (require.main === module) {
                 include_superseded: false,
                 scope: None,
                 kind: None,
-                threshold: 0.5,
+                threshold: None,
                 file: None,
                 min_confidence: None,
             })),
@@ -4405,7 +4405,7 @@ if (require.main === module) {
                 include_superseded: false,
                 scope: None,
                 kind: None,
-                threshold: 0.5,
+                threshold: None,
                 file: None,
                 min_confidence: None,
             })),

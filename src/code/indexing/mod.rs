@@ -454,6 +454,24 @@ impl IndexFacade {
         })
     }
 
+    /// Symbol lookup with name, kind and file filters applied in SQL.
+    ///
+    /// Returns the capped rows and the total number of matches before the cap.
+    pub fn query_symbols(
+        &self,
+        name: crate::code::storage::NameMatch<'_>,
+        kind: Option<&str>,
+        file_pattern: Option<&str>,
+        limit: usize,
+    ) -> (Vec<Symbol>, usize) {
+        self.db
+            .query_symbols(name, kind, file_pattern, limit)
+            .unwrap_or_else(|e| {
+                tracing::error!("DB error in query_symbols: {e}");
+                (Vec::new(), 0)
+            })
+    }
+
     /// Look up file token estimates for a set of relative paths.
     pub fn get_file_token_estimates(&self, rel_paths: &[String]) -> HashMap<String, u32> {
         self.db

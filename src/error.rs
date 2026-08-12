@@ -68,6 +68,12 @@ impl Error {
     pub fn is_index_corrupt(&self) -> bool {
         self.kind.is_index_corrupt()
     }
+
+    /// Returns true if this refusal was raised before the store was touched.
+    #[must_use]
+    pub fn is_validation_refusal(&self) -> bool {
+        self.kind.is_validation_refusal()
+    }
 }
 
 impl fmt::Debug for Error {
@@ -131,6 +137,21 @@ pub enum ErrorKind {
     #[error("database migration failed: {0}")]
     Migration(String),
 
+    /// The store is older than this binary and needs a migration first.
+    ///
+    /// Typed, not a formatted string, because a caller has to branch on it: a
+    /// read path cannot migrate — that would make every read a writer — so it
+    /// delegates to the writer and retries. Matching on message text is not a
+    /// contract. The opposite direction is NOT this variant: a store newer than
+    /// the binary is refused by [`crate::store::schema::refuse_future_schema`],
+    /// since no amount of migrating here can fix it.
+    #[error(
+        "store schema is v{found}, this mdkb binary expects v{expected}. A read-only command \
+         will not migrate — that would make every read a writer. Run `mdkb update` (or any \
+         write command) with a matching binary to migrate."
+    )]
+    SchemaStale { found: i32, expected: i32 },
+
     // Collection errors
     #[error("collection not found: {name}")]
     CollectionNotFound { name: String },
@@ -147,6 +168,13 @@ pub enum ErrorKind {
 
     #[error("document parse error in {path}: {message}")]
     DocumentParse { path: PathBuf, message: String },
+
+    // Memory entry validation errors
+    #[error("invalid entry id: {0}")]
+    InvalidEntryId(String),
+
+    #[error("invalid entry {field}: {message}")]
+    InvalidEntryField { field: String, message: String },
 
     // Search errors
     #[error("invalid search query: {0}")]
@@ -228,6 +256,31 @@ impl ErrorKind {
             ),
             _ => false,
         }
+    }
+
+    /// Returns true if this error is a refusal raised BEFORE the store was
+    /// touched, so the caller knows nothing was written.
+    ///
+    /// The daemon needs this distinction. It answers a failed mutation with one
+    /// of two codes, and the CLI keys on them: a refusal lets it run the
+    /// mutation itself, while a mid-dispatch failure does not, because a method
+    /// that got as far as running may have written before it failed. Reporting a
+    /// rejected entry id as the second kind told the operator "the daemon may
+    /// still be writing" about a write that provably never started.
+    ///
+    /// Only variants whose every propagating raise site is a pure precondition
+    /// check belong here. Both listed ones are raised solely by
+    /// `store::memory::validate_entry_id` and `validate_entry_input`, which take
+    /// no connection, perform no I/O, and are called at the top of their callers
+    /// before any store access. The import and sync loops also call them, but
+    /// collect the outcome into a per-item error list instead of propagating —
+    /// so no caller can surface one of these after a partial write.
+    #[must_use]
+    pub fn is_validation_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::InvalidEntryId(_) | Self::InvalidEntryField { .. }
+        )
     }
 }
 

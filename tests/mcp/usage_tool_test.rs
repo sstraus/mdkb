@@ -59,7 +59,7 @@ async fn server_with_activity() -> (tempfile::TempDir, McpServer) {
             include_superseded: false,
             scope: Some("memory".to_string()),
             kind: None,
-            threshold: 0.5,
+            threshold: None,
             file: None,
             min_confidence: None,
         }))

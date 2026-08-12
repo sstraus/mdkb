@@ -24,66 +24,77 @@ pub const MAX_CONTENT_SIZE: usize = 100_000;
 /// Checks ID format, title length, tag count/length, and content size.
 pub fn validate_entry_id(id: &str) -> Result<()> {
     if id.is_empty() || id.len() > MAX_ID_LEN {
-        return Err(ErrorKind::InvalidQuery(format!("ID must be 1-{MAX_ID_LEN} chars")).into());
+        return Err(ErrorKind::InvalidEntryId(format!("must be 1-{MAX_ID_LEN} chars")).into());
     }
     if !id
         .chars()
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
     {
-        return Err(ErrorKind::InvalidQuery(
-            "ID must be lowercase alphanumeric with hyphens".to_string(),
+        return Err(ErrorKind::InvalidEntryId(
+            "must be lowercase alphanumeric with hyphens".to_string(),
         )
         .into());
     }
     Ok(())
 }
 
+/// Build the error for an entry field that failed validation.
+fn invalid_field(field: &str, message: impl Into<String>) -> crate::error::Error {
+    ErrorKind::InvalidEntryField {
+        field: field.to_string(),
+        message: message.into(),
+    }
+    .into()
+}
+
 pub fn validate_entry_input(id: &str, title: &str, tags: &[String], content: &str) -> Result<()> {
     validate_entry_id(id)?;
     if title.is_empty() || title.len() > MAX_TITLE_LEN {
-        return Err(
-            ErrorKind::InvalidQuery(format!("Title must be 1-{MAX_TITLE_LEN} chars")).into(),
-        );
+        return Err(invalid_field(
+            "title",
+            format!("must be 1-{MAX_TITLE_LEN} chars"),
+        ));
     }
     if title
         .chars()
         .any(|c| c == '\n' || c == '\r' || c.is_control())
     {
-        return Err(ErrorKind::InvalidQuery(
-            "Title must not contain newlines or control characters".to_string(),
-        )
-        .into());
+        return Err(invalid_field(
+            "title",
+            "must not contain newlines or control characters",
+        ));
     }
     if tags.len() > MAX_TAGS {
-        return Err(ErrorKind::InvalidQuery(format!("Too many tags (max {MAX_TAGS})")).into());
+        return Err(invalid_field("tags", format!("too many (max {MAX_TAGS})")));
     }
     for tag in tags {
         if tag.len() > MAX_TAG_LEN {
-            return Err(ErrorKind::InvalidQuery(format!(
-                "Tag '{}' exceeds {MAX_TAG_LEN} chars",
-                &tag[..20.min(tag.len())]
-            ))
-            .into());
+            return Err(invalid_field(
+                "tags",
+                format!(
+                    "'{}' exceeds {MAX_TAG_LEN} chars",
+                    &tag[..20.min(tag.len())]
+                ),
+            ));
         }
         if tag
             .chars()
             .any(|c| c == '\n' || c == '\r' || c.is_control())
         {
-            return Err(ErrorKind::InvalidQuery(
-                "Tag must not contain newlines or control characters".to_string(),
-            )
-            .into());
+            return Err(invalid_field(
+                "tags",
+                "must not contain newlines or control characters",
+            ));
         }
     }
     if content.contains('\0') {
-        return Err(
-            ErrorKind::InvalidQuery("Content must not contain null bytes".to_string()).into(),
-        );
+        return Err(invalid_field("content", "must not contain null bytes"));
     }
     if content.len() > MAX_CONTENT_SIZE {
-        return Err(
-            ErrorKind::InvalidQuery(format!("Content exceeds {MAX_CONTENT_SIZE} bytes")).into(),
-        );
+        return Err(invalid_field(
+            "content",
+            format!("exceeds {MAX_CONTENT_SIZE} bytes"),
+        ));
     }
     Ok(())
 }
@@ -517,9 +528,16 @@ pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> 
         entry.status.to_string()
     };
 
+    // `confirmations` and `last_confirmed_at` are machine-local and never
+    // projected, so they must not move `updated_at`: that would rewrite the
+    // git-tracked file to record a counter git deliberately does not carry.
+    // `status` IS projected, so a restore from archived does move it.
+    let status_changed = new_status != entry.status.to_string();
     conn.execute(
-        "UPDATE memory_entries SET confirmations = MAX(0, CAST(confirmations AS INTEGER) + ?1), last_confirmed_at = ?2, status = ?3, updated_at = ?2 WHERE id = ?4",
-        params![delta, now, new_status, id],
+        "UPDATE memory_entries SET confirmations = MAX(0, CAST(confirmations AS INTEGER) + ?1), \
+         last_confirmed_at = ?2, status = ?3, \
+         updated_at = CASE WHEN ?5 THEN ?2 ELSE updated_at END WHERE id = ?4",
+        params![delta, now, new_status, id, status_changed],
     )?;
 
     let new_count = (i64::from(entry.confirmations) + i64::from(delta)).max(0) as u32;
@@ -588,8 +606,10 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
             "Corrected: {id} (correction appended, confidence boosted)"
         ))
     } else {
+        // No correction text, so nothing projected changed: bump the local
+        // counter and leave `updated_at` alone (see `adjust_confirmations`).
         conn.execute(
-            "UPDATE memory_entries SET confirmations = confirmations + 1, last_confirmed_at = ?1, updated_at = ?1 WHERE id = ?2",
+            "UPDATE memory_entries SET confirmations = confirmations + 1, last_confirmed_at = ?1 WHERE id = ?2",
             params![now, id],
         )?;
         Ok(format!("Corrected: {id} (confidence boosted)"))
@@ -1793,6 +1813,53 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
 mod tests {
     use super::*;
     use crate::store::schema::init_schema;
+
+    /// Entry validation shares a module with search, and it used to borrow
+    /// search's error kind: `memory add BADID` reported "invalid search query",
+    /// naming a subsystem the caller never touched. The kind carries the
+    /// contract, so assert the kind, not the rendered text.
+    #[test]
+    fn entry_validation_never_reports_a_search_error() {
+        let err = validate_entry_id("BADID").unwrap_err();
+        assert!(
+            matches!(err.kind(), ErrorKind::InvalidEntryId(_)),
+            "uppercase id must be an entry-id error, got: {err:?}"
+        );
+        assert!(
+            !err.to_string().contains("search"),
+            "message must not mention a search query, got: {err}"
+        );
+
+        // Empty and over-long ids are the same class of refusal.
+        assert!(matches!(
+            validate_entry_id("").unwrap_err().kind(),
+            ErrorKind::InvalidEntryId(_)
+        ));
+        assert!(matches!(
+            validate_entry_id(&"a".repeat(MAX_ID_LEN + 1))
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidEntryId(_)
+        ));
+
+        // The other entry fields shared the same wrong kind, and name the field
+        // that failed rather than a search.
+        let err = validate_entry_input("ok-id", "", &[], "body").unwrap_err();
+        assert!(
+            matches!(err.kind(), ErrorKind::InvalidEntryField { field, .. } if field == "title"),
+            "empty title must name the title field, got: {err:?}"
+        );
+        assert!(!err.to_string().contains("search"), "got: {err}");
+
+        let err = validate_entry_input("ok-id", "Title", &[], "bad\0content").unwrap_err();
+        assert!(
+            matches!(err.kind(), ErrorKind::InvalidEntryField { field, .. } if field == "content"),
+            "null byte must name the content field, got: {err:?}"
+        );
+
+        // A valid entry still passes.
+        assert!(validate_entry_input("ok-id", "Title", &["tag".to_string()], "body").is_ok());
+    }
 
     #[test]
     fn backfill_skips_failed_row_but_stops_on_cold_model() {
@@ -3291,14 +3358,14 @@ mod tests {
     #[test]
     fn test_validate_entry_empty_id() {
         let err = validate_entry_input("", "Title", &[], "content").unwrap_err();
-        assert!(err.to_string().contains("ID must be"), "{err}");
+        assert!(err.to_string().contains("entry id: must be 1-"), "{err}");
     }
 
     #[test]
     fn test_validate_entry_id_too_long() {
         let long_id = "a".repeat(MAX_ID_LEN + 1);
         let err = validate_entry_input(&long_id, "Title", &[], "content").unwrap_err();
-        assert!(err.to_string().contains("ID must be"), "{err}");
+        assert!(err.to_string().contains("entry id: must be 1-"), "{err}");
     }
 
     #[test]
@@ -3310,21 +3377,21 @@ mod tests {
     #[test]
     fn test_validate_entry_empty_title() {
         let err = validate_entry_input("ok-id", "", &[], "content").unwrap_err();
-        assert!(err.to_string().contains("Title must be"), "{err}");
+        assert!(err.to_string().contains("entry title: must be 1-"), "{err}");
     }
 
     #[test]
     fn test_validate_entry_title_too_long() {
         let long_title = "x".repeat(MAX_TITLE_LEN + 1);
         let err = validate_entry_input("ok-id", &long_title, &[], "content").unwrap_err();
-        assert!(err.to_string().contains("Title must be"), "{err}");
+        assert!(err.to_string().contains("entry title: must be 1-"), "{err}");
     }
 
     #[test]
     fn test_validate_entry_too_many_tags() {
         let tags: Vec<String> = (0..=MAX_TAGS).map(|i| format!("tag-{i}")).collect();
         let err = validate_entry_input("ok-id", "Title", &tags, "content").unwrap_err();
-        assert!(err.to_string().contains("Too many tags"), "{err}");
+        assert!(err.to_string().contains("entry tags: too many"), "{err}");
     }
 
     #[test]
@@ -3363,7 +3430,7 @@ mod tests {
     fn test_validate_entry_content_too_large() {
         let big = "x".repeat(MAX_CONTENT_SIZE + 1);
         let err = validate_entry_input("ok-id", "Title", &[], &big).unwrap_err();
-        assert!(err.to_string().contains("Content exceeds"), "{err}");
+        assert!(err.to_string().contains("entry content: exceeds"), "{err}");
     }
 
     #[test]
@@ -4089,6 +4156,33 @@ mod tests {
         assert!(
             updated.last_confirmed_at.is_some(),
             "should set last_confirmed_at"
+        );
+    }
+
+    /// `confirmations` is machine-local and stays out of the git-tracked
+    /// projection, so a bare correction must not move `updated_at` — that would
+    /// smuggle the untracked counter back into the tracked file as a timestamp.
+    /// Correction text changes `content`, which IS projected, so it must move.
+    #[test]
+    fn correction_moves_updated_at_only_when_content_changes() {
+        let conn = setup_db();
+        let authored = Utc::now().timestamp() - 1_000;
+        let entry = make_entry_at(authored, 0, 0, None, SourceType::UserStatement);
+        add_entry(&conn, &entry).unwrap();
+
+        correct_entry(&conn, "test", None).unwrap();
+        let bare = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        assert_eq!(
+            bare.updated_at, authored,
+            "a bare correction changes nothing projected, so updated_at must not move"
+        );
+        assert_eq!(bare.confirmations, 1, "the local counter still moves");
+
+        correct_entry(&conn, "test", Some("The API changed to v3")).unwrap();
+        let corrected = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        assert!(
+            corrected.updated_at > authored,
+            "correction text rewrites projected content, so updated_at must move"
         );
     }
 

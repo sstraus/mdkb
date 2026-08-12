@@ -234,6 +234,21 @@ pub(crate) fn gitignore_shadow(root: &Path, entries_dir: &Path) -> Option<String
     ))
 }
 
+/// Carry the DB row's machine-local state onto an entry rebuilt from disk.
+///
+/// The projection deliberately omits `expires_at` (see
+/// `store::memory_file::to_markdown`), so a file cannot state a TTL and reading
+/// one back yields `None`. Taking that `None` would let a file→DB adoption
+/// silently clear a live TTL — the same trap the counters avoid by being reset
+/// rather than forged. The row that already holds this machine's state keeps it.
+fn adopt_local_state(
+    mut from_disk: crate::store::memory::MemoryEntry,
+    db_row: &crate::store::memory::MemoryEntry,
+) -> crate::store::memory::MemoryEntry {
+    from_disk.expires_at = db_row.expires_at;
+    from_disk
+}
+
 /// A markdown file found in `entries/`, with the hash of its exact bytes.
 struct DiskEntry {
     hash: String,
@@ -429,7 +444,10 @@ pub fn sync_memory_files(ctx: &Context) -> Result<MemorySyncSummary> {
                             now
                         };
                         actions.push(SyncAction::Adopt {
-                            entry: Box::new(disk.file.into_fresh_entry()),
+                            entry: Box::new(adopt_local_state(
+                                disk.file.into_fresh_entry(),
+                                &row.entry,
+                            )),
                             updated_at,
                         });
                     }
@@ -441,7 +459,10 @@ pub fn sync_memory_files(ctx: &Context) -> Result<MemorySyncSummary> {
                     }
                     (true, true) => actions.push(SyncAction::Conflict {
                         id,
-                        file_entry: Box::new(disk.file.into_fresh_entry()),
+                        file_entry: Box::new(adopt_local_state(
+                            disk.file.into_fresh_entry(),
+                            &row.entry,
+                        )),
                         file_updated_at,
                     }),
                 }

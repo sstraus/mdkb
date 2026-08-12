@@ -404,13 +404,16 @@ impl Context {
                     db_path.display()
                 ))
             })?;
-        if found != schema::SCHEMA_VERSION {
-            return Err(Error::other(format!(
-                "store schema is v{found}, this mdkb binary expects v{}. A read-only \
-                 command will not migrate — that would make every read a writer. Run \
-                 `mdkb update` (or any write command) with a matching binary to migrate.",
-                schema::SCHEMA_VERSION
-            )));
+        // The two directions are not symmetric, and the old single `!=` branch
+        // told a store from the FUTURE to "run mdkb update to migrate" — advice
+        // that cannot work, since only a newer binary can read it at all.
+        schema::refuse_future_schema(&conn)?;
+        if found < schema::SCHEMA_VERSION {
+            return Err(ErrorKind::SchemaStale {
+                found,
+                expected: schema::SCHEMA_VERSION,
+            }
+            .into());
         }
 
         Ok(Self {
@@ -421,6 +424,36 @@ impl Context {
             corrupt_in_use: false,
             _live_guard: None,
         })
+    }
+
+    /// Open for reading, migrating first if the store is older than this binary.
+    ///
+    /// [`Self::open_read_only`] stays the primitive that refuses: a read that
+    /// migrates is a writer, and making every read a writer is the bug that path
+    /// exists to remove. But refusing outright blocked every read on a store no
+    /// one had written since the upgrade — a whole fleet stuck behind a store
+    /// nothing was going to touch on its own. So the read does not migrate
+    /// itself: it hands the job to [`Self::open`], which admits it through the
+    /// same project writer lock every other writer uses, and only then reads.
+    ///
+    /// The retry is exactly one, by construction rather than by a counter: a
+    /// store still stale after a successful migration means the migration did
+    /// not do what it says, and looping on that would spin forever instead of
+    /// reporting the fault. A store NEWER than the binary is not stale and never
+    /// reaches here — [`Self::open_read_only`] refuses it, and migrating could
+    /// not fix it anyway.
+    pub fn open_read_only_migrating(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        match Self::open_read_only(root) {
+            Err(e) if matches!(e.kind(), ErrorKind::SchemaStale { .. }) => {
+                tracing::info!("{e}; migrating under the writer lock, then retrying the read");
+                // Dropped immediately: the migration is the point, the write
+                // connection is not. The read below reopens read-only.
+                drop(Self::open(root)?);
+                Self::open_read_only(root)
+            }
+            other => other,
+        }
     }
 
     /// Initialize a new mdkb directory.

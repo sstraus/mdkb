@@ -2152,7 +2152,7 @@ async fn test_memory_search_repeated_get_ranks_above_untouched() {
             include_superseded: false,
             scope: Some("memory".to_string()),
             kind: None,
-            threshold: 0.5,
+            threshold: None,
             file: None,
             min_confidence: None,
         }))

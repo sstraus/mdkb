@@ -17,6 +17,18 @@ use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
 
 use super::schema;
 
+/// How [`CodeDb::query_symbols`] matches the symbol name.
+#[derive(Debug, Clone, Copy)]
+pub enum NameMatch<'a> {
+    /// Exact name equality — what `code find` looks up.
+    Exact(&'a str),
+    /// Substring match over name, signature and doc comment via the FTS5
+    /// trigram index — what `search --scope symbols` looks up.
+    Fuzzy(&'a str),
+    /// No name predicate; only the kind and file filters narrow the set.
+    Any,
+}
+
 /// SQLite-backed code intelligence index.
 ///
 /// Write-capable constructors initialize the schema; [`CodeDb::open_read_only`]
@@ -369,30 +381,87 @@ impl CodeDb {
         rows.collect()
     }
 
+    /// Symbol lookup with every filter applied in SQL.
+    ///
+    /// Returns the capped rows plus the total number of matches before the cap.
+    ///
+    /// Doing the filtering in SQL is what makes both numbers honest. Fetching
+    /// `limit` rows and then dropping the wrong kinds in Rust returns fewer
+    /// symbols than exist, because the cap already excluded the rows the filter
+    /// would have kept — and it leaves no way to know the real total.
+    pub fn query_symbols(
+        &self,
+        name: NameMatch<'_>,
+        kind: Option<&str>,
+        file_pattern: Option<&str>,
+        limit: usize,
+    ) -> rusqlite::Result<(Vec<Symbol>, usize)> {
+        let mut predicates: Vec<&str> = Vec::new();
+        let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        match name {
+            NameMatch::Exact(n) => {
+                predicates.push("s.name = ?");
+                args.push(Box::new(n.to_string()));
+            }
+            // Trigram needs >= 3 characters; below that, LIKE on the name.
+            NameMatch::Fuzzy(q) if q.len() < 3 => {
+                predicates.push("s.name LIKE ? ESCAPE '\\'");
+                args.push(Box::new(like_pattern(q)));
+            }
+            NameMatch::Fuzzy(q) => {
+                predicates.push(
+                    "s.id IN (SELECT rowid FROM code_symbols_fts WHERE code_symbols_fts MATCH ?)",
+                );
+                // Quote the term so FTS5 treats it as a literal, not syntax.
+                args.push(Box::new(format!("\"{}\"", q.replace('"', "\"\""))));
+            }
+            NameMatch::Any => {}
+        }
+
+        if let Some(kind) = kind {
+            predicates.push("s.kind = ?");
+            args.push(Box::new(kind.to_string()));
+        }
+
+        if let Some(file_pattern) = file_pattern {
+            predicates.push("s.file_path LIKE ? ESCAPE '\\'");
+            args.push(Box::new(like_pattern(file_pattern)));
+        }
+
+        let where_clause = if predicates.is_empty() {
+            "1=1".to_string()
+        } else {
+            predicates.join(" AND ")
+        };
+
+        let filter_args: Vec<&dyn rusqlite::ToSql> = args.iter().map(|a| a.as_ref()).collect();
+
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM code_symbols s WHERE {where_clause}"),
+            filter_args.as_slice(),
+            |row| row.get(0),
+        )?;
+
+        let limit = limit as i64;
+        let mut row_args = filter_args;
+        row_args.push(&limit);
+
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "{SYMBOL_COLUMNS_PREFIXED} FROM code_symbols s WHERE {where_clause} \
+             ORDER BY s.file_path, s.line_start LIMIT ?"
+        ))?;
+        let rows = stmt.query_map(row_args.as_slice(), row_to_symbol)?;
+        Ok((rows.collect::<rusqlite::Result<Vec<_>>>()?, total as usize))
+    }
+
     /// Substring search on symbol names/signatures/doc_comments via FTS5 trigram.
     ///
     /// For queries shorter than 3 characters, falls back to LIKE.
     pub fn search_symbols(&self, query: &str, limit: usize) -> rusqlite::Result<Vec<Symbol>> {
-        if query.len() < 3 {
-            // Trigram requires >= 3 chars; fall back to LIKE with escaped metacharacters
-            let escaped = query
-                .replace('\\', "\\\\")
-                .replace('%', "\\%")
-                .replace('_', "\\_");
-            let pattern = format!("%{escaped}%");
-            let mut stmt = self.conn.prepare_cached(&format!(
-                "{SYMBOL_COLUMNS} FROM code_symbols WHERE name LIKE ?1 ESCAPE '\\' LIMIT ?2"
-            ))?;
-            let rows = stmt.query_map(params![pattern, limit as i64], row_to_symbol)?;
-            return rows.collect();
-        }
-
-        // FTS5 trigram: escape embedded double-quotes to prevent query injection
-        let escaped = query.replace('"', "\"\"");
-        let fts_query = format!("\"{escaped}\"");
-        let mut stmt = self.conn.prepare_cached(SYMBOL_SELECT_FTS)?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], row_to_symbol)?;
-        rows.collect()
+        Ok(self
+            .query_symbols(NameMatch::Fuzzy(query), None, None, limit)?
+            .0)
     }
 
     /// Find all symbols in files matching a path substring.
@@ -401,16 +470,9 @@ impl CodeDb {
         file_pattern: &str,
         limit: usize,
     ) -> rusqlite::Result<Vec<Symbol>> {
-        let escaped = file_pattern
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("%{escaped}%");
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "{SYMBOL_COLUMNS} FROM code_symbols WHERE file_path LIKE ?1 ESCAPE '\\' ORDER BY file_path, line_start LIMIT ?2"
-        ))?;
-        let rows = stmt.query_map(params![pattern, limit as i64], row_to_symbol)?;
-        rows.collect()
+        Ok(self
+            .query_symbols(NameMatch::Any, None, Some(file_pattern), limit)?
+            .0)
     }
 
     /// Get all symbols in a specific file, ordered by line_start (for outline view).
@@ -734,12 +796,15 @@ const SYMBOL_SELECT_BY_NAME: &str = "SELECT id, name, kind, file_id, file_path, 
      line_end, col_end, visibility, signature, doc_comment, module_path, scope_context \
      FROM code_symbols WHERE name = ?1";
 
-const SYMBOL_SELECT_FTS: &str = "SELECT s.id, s.name, s.kind, s.file_id, s.file_path, s.line_start, s.col_start, \
-     s.line_end, s.col_end, s.visibility, s.signature, s.doc_comment, s.module_path, s.scope_context \
-     FROM code_symbols_fts f \
-     JOIN code_symbols s ON s.id = f.rowid \
-     WHERE code_symbols_fts MATCH ?1 \
-     LIMIT ?2";
+/// Wrap a substring in a LIKE pattern, escaping the LIKE metacharacters so a
+/// `%` or `_` in user input matches literally.
+fn like_pattern(substring: &str) -> String {
+    let escaped = substring
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
 
 /// Convert a row from the standard 14-column symbol SELECT to a `Symbol`.
 fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {

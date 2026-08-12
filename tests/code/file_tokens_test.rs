@@ -83,7 +83,7 @@ pub struct UniqueGreeterStruct {
             include_superseded: false,
             scope: Some("symbols".to_string()),
             kind: None,
-            threshold: 0.5,
+            threshold: None,
             file: None,
             min_confidence: None,
         }))

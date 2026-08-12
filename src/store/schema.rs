@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 20;
+pub const SCHEMA_VERSION: i32 = 21;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -244,6 +244,29 @@ ON memory_entries BEGIN
     INSERT INTO memory_fts(rowid, id, title, content, tags)
     VALUES (NEW.rowid, NEW.id, NEW.title, NEW.content,
             REPLACE(REPLACE(REPLACE(NEW.tags, '"', ''), '[', ''), ']', ''));
+END;
+
+-- `id TEXT PRIMARY KEY` is not `NOT NULL`: SQLite allows NULL in a PRIMARY KEY
+-- column for backward compatibility, and TEXT affinity does not convert a BLOB.
+-- One NULL-id row in the field broke `memory export` with InvalidColumnType,
+-- because every reader binds the column to String. Adding NOT NULL needs a table
+-- rebuild, which renumbers rowid and would detach memory_embeddings, vec_memory
+-- and memory_fts from their entries — so the invariant is a trigger instead.
+-- `typeof(id) = 'text'` is the exact condition those readers depend on.
+CREATE TRIGGER IF NOT EXISTS memory_entries_id_guard_bi
+BEFORE INSERT ON memory_entries
+WHEN typeof(NEW.id) <> 'text'
+     OR TRIM(NEW.id, ' ' || char(9) || char(10) || char(13)) = ''
+BEGIN
+    SELECT RAISE(ABORT, 'memory_entries.id must be non-blank text');
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_entries_id_guard_bu
+BEFORE UPDATE OF id ON memory_entries
+WHEN typeof(NEW.id) <> 'text'
+     OR TRIM(NEW.id, ' ' || char(9) || char(10) || char(13)) = ''
+BEGIN
+    SELECT RAISE(ABORT, 'memory_entries.id must be non-blank text');
 END;
 
 -- Memory revision history (max 3 per entry, stores diffs)
@@ -800,6 +823,32 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // import.
     if from_version < 20 {
         sweep_orphaned_legacy_priors(conn);
+    }
+
+    // Migration from v20 to v21: evict the rows the new id guard now makes
+    // impossible. The guard triggers live in SCHEMA_SQL, so they are already in
+    // place by the time this runs — they are BEFORE INSERT/UPDATE and do not
+    // block this DELETE.
+    //
+    // DELETE, not repair: an entry whose id is unreadable has no addressable
+    // identity, so nothing can reference it, no projection can name its file and
+    // no invented id would be the one the author meant. The row's cascade
+    // (memory_ad, memory_delete_embeddings) disposes of its FTS and vector rows,
+    // and every surviving rowid is untouched, so the rest of the store stays
+    // attached to its entries.
+    if from_version < 21 {
+        let purged = conn.execute(
+            "DELETE FROM memory_entries \
+             WHERE typeof(id) <> 'text' \
+                OR TRIM(id, ' ' || char(9) || char(10) || char(13)) = ''",
+            [],
+        )?;
+        if purged > 0 {
+            tracing::warn!(
+                "migration: deleted {purged} memory entr(ies) with an unreadable id; \
+                 they broke `memory export` and could not be addressed"
+            );
+        }
     }
 
     // Update schema version
@@ -2434,6 +2483,165 @@ mod tests {
         assert!(
             sess.is_none(),
             "migrated entry should have NULL created_session"
+        );
+    }
+
+    /// Insert a memory entry the way a caller with a broken id would, bypassing
+    /// the guard. The guard is what we are testing, so the fixture has to be
+    /// built without it — exactly the state a pre-v21 store is already in.
+    fn insert_bypassing_id_guard(conn: &Connection, id: Option<&str>, title: &str) {
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS memory_entries_id_guard_bi;
+             DROP TRIGGER IF EXISTS memory_entries_id_guard_bu;",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES (?1, ?2, 'Content', 'topic', '[]', 1000, 1000)",
+            rusqlite::params![id, title],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn id_guard_rejects_an_unreadable_id_on_insert_and_update() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        for bad in [None, Some(""), Some("   "), Some("\t\n")] {
+            let err = conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+                 VALUES (?1, 'T', 'C', 'topic', '[]', 1, 1)",
+                rusqlite::params![bad],
+            );
+            assert!(err.is_err(), "id {bad:?} must be rejected on insert");
+        }
+
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('good', 'T', 'C', 'topic', '[]', 1, 1)",
+            [],
+        )
+        .unwrap();
+        assert!(
+            conn.execute("UPDATE memory_entries SET id = NULL WHERE id = 'good'", [])
+                .is_err(),
+            "blanking an id of an existing row must be rejected too"
+        );
+        assert!(
+            conn.execute("UPDATE memory_entries SET id = '' WHERE id = 'good'", [])
+                .is_err()
+        );
+        // A rename to another readable id stays allowed.
+        conn.execute(
+            "UPDATE memory_entries SET id = 'better' WHERE id = 'good'",
+            [],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_migrate_v20_to_v21_purges_unreadable_ids_without_renumbering() {
+        crate::store::vectors::init_sqlite_vec();
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_schema(&conn).unwrap();
+        crate::store::vectors::init_vector_schema(&conn).unwrap();
+
+        // Two healthy entries straddle the broken ones, so a table rebuild would
+        // show up as a renumbered rowid on the second.
+        for id in ["keep-first", "keep-second"] {
+            conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+                 VALUES (?1, 'Keep', 'Findable content', 'topic', '[]', 1000, 1000)",
+                [id],
+            )
+            .unwrap();
+        }
+        insert_bypassing_id_guard(&conn, None, "Null id");
+        insert_bypassing_id_guard(&conn, Some("   "), "Blank id");
+
+        let rowid_of = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT rowid FROM memory_entries WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (first_before, second_before) = (rowid_of("keep-first"), rowid_of("keep-second"));
+
+        // A vector row on the *last* healthy entry: it is keyed by rowid, so a
+        // rebuild would silently point it at a different entry.
+        crate::store::vectors::store_memory_embedding(
+            &conn,
+            second_before,
+            &vec![0.1f32; 384],
+            "test-model",
+        )
+        .unwrap();
+
+        conn.execute_batch("UPDATE schema_version SET version = 20;")
+            .unwrap();
+        init_schema(&conn).expect("v20→v21 migration failed");
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        let unreadable: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_entries \
+                 WHERE typeof(id) <> 'text' \
+                    OR TRIM(id, ' ' || char(9) || char(10) || char(13)) = ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unreadable, 0, "migration must purge unreadable ids");
+
+        assert_eq!(
+            (rowid_of("keep-first"), rowid_of("keep-second")),
+            (first_before, second_before),
+            "no table rebuild: surviving rowids must be identical"
+        );
+
+        // Every reader binds id to String — that is the failure the guard prevents.
+        let ids: Vec<String> = conn
+            .prepare("SELECT id FROM memory_entries ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec!["keep-first", "keep-second"]);
+
+        // The three rowid-keyed sidecars are still attached to the right entry.
+        let embedded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_embeddings WHERE memory_rowid = ?1",
+                [second_before],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(embedded, 1, "embedding must stay on keep-second");
+        let vec_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM vec_memory WHERE memory_rowid = ?1",
+                [second_before],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vec_rows, 1, "vec_memory must stay on keep-second");
+
+        let fts_rowids: Vec<i64> = conn
+            .prepare("SELECT rowid FROM memory_fts WHERE memory_fts MATCH 'Findable'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            fts_rowids,
+            vec![first_before, second_before],
+            "FTS must still resolve both survivors by their own rowid"
         );
     }
 }

@@ -33,9 +33,9 @@ pub struct SearchParams {
     #[serde(default)]
     pub kind: Option<String>,
 
-    /// Minimum similarity score 0.0-1.0 when scope is "code" (default: 0.5).
-    #[serde(default = "default_threshold")]
-    pub threshold: f32,
+    /// Minimum similarity score 0.0-1.0 when scope is "code". Omit to use the configured code.semantic_search.threshold.
+    #[serde(default)]
+    pub threshold: Option<f32>,
 
     /// Filter by file path (substring match) when scope is "symbols".
     #[serde(default)]
@@ -348,10 +348,6 @@ fn default_max_depth() -> usize {
     3
 }
 
-fn default_threshold() -> f32 {
-    0.5
-}
-
 /// Parameters for the usage tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct UsageParams {
@@ -497,7 +493,10 @@ mod tests {
         assert_eq!(params.query, "auth handler");
         assert_eq!(params.scope.as_deref(), Some("code"));
         assert!(params.kind.is_none());
-        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
+        // Omitted threshold must stay absent, not pin a hardcoded default: the
+        // configured code.semantic_search.threshold is what fills it in, and a
+        // literal default here would silently override the user's setting.
+        assert!(params.threshold.is_none());
         assert!(params.file.is_none());
     }
 
@@ -508,7 +507,7 @@ mod tests {
         assert_eq!(params.query, "pool");
         assert_eq!(params.scope.as_deref(), Some("code"));
         assert_eq!(params.kind.as_deref(), Some("struct"));
-        assert!((params.threshold - 0.5).abs() < f32::EPSILON);
+        assert!((params.threshold.unwrap() - 0.5).abs() < f32::EPSILON);
     }
 
     #[test]

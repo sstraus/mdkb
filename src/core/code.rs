@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use crate::code::storage::NameMatch;
 use crate::error::{Error, Result};
 
 fn open_code_read_only(root: &Path) -> Result<crate::code::indexing::IndexFacade> {
@@ -139,50 +140,127 @@ pub fn reindex_paths(
         .reindex(&target)
         .map_err(|e| anyhow::anyhow!("Reindexing failed: {e}"))
 }
-/// Handle `mdkb code search` - fuzzy symbol search.
+/// Translate a `kind` filter to its stored spelling, with the message both the
+/// CLI and the MCP server report for an unknown kind.
+pub fn parse_kind_filter(kind_filter: Option<&str>) -> Result<Option<String>> {
+    let Some(kind_str) = kind_filter else {
+        return Ok(None);
+    };
+    let kind: crate::code::types::SymbolKind = kind_str.parse().map_err(|_| {
+        Error::other(format!(
+            "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, \
+             enum, trait, interface, class, module, variable, constant, field, \
+             parameter, type_alias, macro"
+        ))
+    })?;
+    Ok(Some(kind.to_string()))
+}
+/// Symbol search behind `scope=symbols`, shared by the CLI and the MCP server.
+///
+/// Both surfaces route here so they cannot answer the same query differently.
+/// The name match is fuzzy — substring over name, signature and doc comment.
+/// Exact lookup is [`handle_code_find`].
+pub fn search_symbols_scoped(
+    index: &crate::code::indexing::IndexFacade,
+    query: &str,
+    kind_filter: Option<&str>,
+    file_filter: Option<&str>,
+    limit: usize,
+) -> Result<CodeFindResult> {
+    let kind = parse_kind_filter(kind_filter)?;
+    // An empty or wildcard query means "whatever the other filters allow" —
+    // otherwise `--file src/mcp` alone could not list a file's symbols.
+    let name = if query.is_empty() || query == "*" {
+        NameMatch::Any
+    } else {
+        NameMatch::Fuzzy(query)
+    };
+
+    let (symbols, total) = index.query_symbols(name, kind.as_deref(), file_filter, limit);
+    Ok(CodeFindResult { symbols, total })
+}
+/// Semantic code search behind `scope=code`, shared by the CLI and the MCP
+/// server.
+///
+/// `threshold` is the caller's override; `None` takes the configured
+/// `code.semantic_search.threshold`.
+pub fn semantic_search_scoped(
+    index: &crate::code::indexing::IndexFacade,
+    config: &crate::config::Config,
+    query: &str,
+    kind_filter: Option<&str>,
+    limit: usize,
+    threshold: Option<f32>,
+) -> Result<Vec<(crate::code::symbol::Symbol, f32)>> {
+    if !config.code.semantic_search.enabled {
+        return Err(Error::other(
+            "Semantic code search is disabled. Enable it in .mdkb/config.toml: \
+             [code.semantic_search] enabled = true, then re-index.",
+        ));
+    }
+    let kind = parse_kind_filter(kind_filter)?;
+    let threshold = threshold.unwrap_or(config.code.semantic_search.threshold as f32);
+
+    let mut results = index
+        .semantic_search(query, limit, threshold)
+        .map_err(|e| Error::other(format!("Semantic code search failed: {e}")))?;
+
+    if let Some(kind) = kind {
+        results.retain(|(s, _)| s.kind.to_string() == kind);
+    }
+    Ok(results)
+}
+/// Handle `mdkb search --scope code` - semantic code search.
+pub fn handle_semantic_code_search(
+    root: &Path,
+    config_path: &Path,
+    query: &str,
+    kind_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(crate::code::symbol::Symbol, f32)>> {
+    let config = crate::config::Config::load_or_default(config_path);
+    let facade = open_code_read_only(root)?;
+    semantic_search_scoped(&facade, &config, query, kind_filter, limit, None)
+}
+/// Handle `mdkb search --scope symbols` - fuzzy symbol search.
+pub fn handle_symbol_search(
+    root: &Path,
+    query: &str,
+    kind_filter: Option<&str>,
+    file_filter: Option<&str>,
+    limit: usize,
+) -> Result<CodeFindResult> {
+    let facade = open_code_read_only(root)?;
+    search_symbols_scoped(&facade, query, kind_filter, file_filter, limit)
+}
+/// Handle `mdkb code search` - fuzzy symbol search without a file filter.
 pub fn handle_code_search(
     root: &Path,
     query: &str,
     limit: usize,
     kind_filter: Option<&str>,
-) -> Result<Vec<crate::code::symbol::Symbol>> {
-    let facade = open_code_read_only(root)?;
-
-    let mut results = facade.search_symbols(query, limit * 2);
-
-    if let Some(kind_str) = kind_filter {
-        let kind: crate::code::types::SymbolKind = kind_str
-            .parse()
-            .map_err(|_| Error::other(format!("Unknown symbol kind: {}", kind_str)))?;
-        results.retain(|s| s.kind == kind);
-    }
-
-    results.truncate(limit);
-    Ok(results)
+) -> Result<CodeFindResult> {
+    handle_symbol_search(root, query, kind_filter, None, limit)
 }
 /// Handle `mdkb code find` - exact symbol lookup.
+///
+/// A common name (`tests`, `new`) matches hundreds of definitions, so the list
+/// is capped at `limit`. `total` keeps the pre-cap count: the caller must
+/// report it, otherwise a capped list reads as the complete set.
 pub fn handle_code_find(
     root: &Path,
     name: &str,
     kind_filter: Option<&str>,
     file_filter: Option<&str>,
-) -> Result<Vec<crate::code::symbol::Symbol>> {
+    limit: usize,
+) -> Result<CodeFindResult> {
     let facade = open_code_read_only(root)?;
+    let kind = parse_kind_filter(kind_filter)?;
 
-    let mut results = facade.find_symbols_by_name(name);
+    let (symbols, total) =
+        facade.query_symbols(NameMatch::Exact(name), kind.as_deref(), file_filter, limit);
 
-    if let Some(kind_str) = kind_filter {
-        let kind: crate::code::types::SymbolKind = kind_str
-            .parse()
-            .map_err(|_| Error::other(format!("Unknown symbol kind: {}", kind_str)))?;
-        results.retain(|s| s.kind == kind);
-    }
-
-    if let Some(file_substr) = file_filter {
-        results.retain(|s| s.file_path.contains(file_substr));
-    }
-
-    Ok(results)
+    Ok(CodeFindResult { symbols, total })
 }
 /// Handle `mdkb code calls` - show what a symbol calls.
 pub fn handle_code_calls(
@@ -324,6 +402,13 @@ pub fn handle_code_parse(file: &Path) -> Result<Vec<crate::code::symbol::Symbol>
 
     let symbols = parser.parse(&code, file_id, &mut counter);
     Ok(symbols)
+}
+/// Result of `code find` command: the capped matches plus the match count
+/// before truncation.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CodeFindResult {
+    pub symbols: Vec<crate::code::symbol::Symbol>,
+    pub total: usize,
 }
 /// Result of `code info` command.
 #[derive(Debug, Clone, serde::Serialize)]

@@ -630,16 +630,21 @@ mod tests {
         assert_ne!(envelope["error"]["code"], DISPATCHED_ERROR_CODE);
     }
 
-    /// Refusals raised before dispatch must never wear [`DISPATCHED_ERROR_CODE`].
+    /// A refusal that wrote nothing must never wear [`DISPATCHED_ERROR_CODE`].
     ///
     /// `cli::hook_client` reads that code as "the daemon ran something and it
-    /// may have written". Every rejection here happens before `dispatch_call`
-    /// is entered, so reusing the code for one of them would tell a routed CLI
-    /// its mutation might be in flight when the daemon never looked at it —
-    /// turning an unwhitelisted repo, a typo'd method or a malformed frame into
-    /// a command that cannot be run at all.
+    /// may have written". Most rejections here happen before `dispatch_call` is
+    /// entered, so reusing the code for one of them would tell a routed CLI its
+    /// mutation might be in flight when the daemon never looked at it — turning
+    /// an unwhitelisted repo, a typo'd method or a malformed frame into a
+    /// command that cannot be run at all.
+    ///
+    /// The last case is the one story 032-6b8f added: input validation runs
+    /// INSIDE dispatch but still before the store is touched, so it belongs to
+    /// the same rule. Admission is not the boundary that matters — "did anything
+    /// get written" is.
     #[tokio::test]
-    async fn refusals_before_dispatch_never_use_the_dispatched_error_code() {
+    async fn refusals_that_wrote_nothing_never_use_the_dispatched_error_code() {
         let outside = TempDir::new().unwrap();
         let outside_root = outside.path().canonicalize().unwrap();
         let refusals: Vec<(&str, String)> = vec![
@@ -682,6 +687,37 @@ mod tests {
                 "{what} is refused before dispatch, so it must not claim the method ran: {resp}"
             );
         }
+
+        // A refusal from inside dispatch, on a repo the daemon does serve: the
+        // entry id is rejected by pure validation before any store access.
+        let served = TempDir::new().unwrap();
+        let served_root = served.path().canonicalize().unwrap();
+        crate::cli::handlers::handle_init(&served_root).expect("init store");
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","id":1,"method":"cli.mutate","params":{{"root":"{}","command":"memory_add","id":"Bad Id","title":"T","entry_type":"topic","content":"body"}}}}"#,
+            served_root.display()
+        );
+        let resp = dispatch_hook_message(body.as_bytes(), &make_registry(), &make_dctx()).await;
+        let envelope: Value = serde_json::from_str(&resp).unwrap();
+        let code = envelope["error"]["code"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("an invalid entry id must be refused: {resp}"));
+        assert_ne!(
+            code,
+            i64::from(DISPATCHED_ERROR_CODE),
+            "a rejected entry id wrote nothing, so it must not claim the method may \
+             have written: {resp}"
+        );
+        assert_eq!(
+            code, -32602,
+            "a validation refusal is INVALID_PARAMS: {resp}"
+        );
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("invalid entry id")),
+            "the refusal must carry the cause the CLI will print: {resp}"
+        );
     }
 
     #[tokio::test]

@@ -6,9 +6,9 @@
 //! runs CLI -> core rather than the inversion this module used to create.
 
 pub use crate::core::code::{
-    CodeInfoResult, handle_code_callers, handle_code_calls, handle_code_find, handle_code_impact,
-    handle_code_index, handle_code_info, handle_code_init, handle_code_parse, handle_code_reindex,
-    handle_code_search,
+    CodeFindResult, CodeInfoResult, handle_code_callers, handle_code_calls, handle_code_find,
+    handle_code_impact, handle_code_index, handle_code_info, handle_code_init, handle_code_parse,
+    handle_code_reindex, handle_code_search, handle_semantic_code_search, handle_symbol_search,
 };
 pub use crate::core::graph::{
     CollectionInfo, handle_collection_add, handle_collection_list, handle_collection_remove,

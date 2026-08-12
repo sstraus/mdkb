@@ -12,6 +12,7 @@
 
 use mdkb::cli::handlers::handle_init;
 use mdkb::core::Context;
+use mdkb::error::ErrorKind;
 use mdkb::store::schema::SCHEMA_VERSION;
 
 fn store() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -226,6 +227,12 @@ fn a_newer_store_is_refused_rather_than_migrated() {
         msg.contains(&future.to_string()) && msg.contains(&SCHEMA_VERSION.to_string()),
         "the error must name both versions: {msg}"
     );
+    // Deliberately NOT SchemaStale: migrating cannot fix a store from the future,
+    // so a caller must not mistake this for a delegate-and-retry condition.
+    assert!(
+        !matches!(err.kind(), ErrorKind::SchemaStale { .. }),
+        "a future store is refused outright, not reported as stale"
+    );
 }
 
 /// And an OLDER store must also be refused, not silently migrated.
@@ -240,6 +247,18 @@ fn an_older_store_is_refused_rather_than_migrated() {
     set_schema_version(&root, 11);
 
     let err = Context::open_read_only(&root).expect_err("must refuse");
+    // The variant is the contract: the read path delegates migration by matching
+    // on it, and a caller that matched on message text would break on a reword.
+    assert!(
+        matches!(
+            err.kind(),
+            ErrorKind::SchemaStale {
+                found: 11,
+                expected
+            } if *expected == SCHEMA_VERSION
+        ),
+        "an older store must report SchemaStale naming both versions, got: {err:?}"
+    );
     let msg = err.to_string();
     assert!(
         msg.contains("11") && msg.contains(&SCHEMA_VERSION.to_string()),

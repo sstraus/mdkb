@@ -1129,6 +1129,10 @@ pub enum CodeCommand {
         /// Filter by file path (substring match)
         #[arg(short, long)]
         file: Option<String>,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
     },
 
     /// Show what functions a symbol calls

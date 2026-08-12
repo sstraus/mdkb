@@ -882,6 +882,146 @@ fn smoke_code_lifecycle() {
     assert_ok(&out, "code impact");
 }
 
+#[test]
+fn smoke_code_find_caps_output_and_reports_total() {
+    let repo = Repo::new();
+
+    // A boilerplate name matches once per file. An uncapped list is what makes
+    // `search --scope symbols tests` dump hundreds of lines into a context
+    // window, so the cap must hold — and the dropped matches must still be
+    // reported, or a capped list reads as the complete set.
+    for n in 0..5 {
+        std::fs::write(
+            repo.root.join(format!("src/mod{n}.rs")),
+            "#[cfg(test)]\nmod tests {\n    fn case() {}\n}\n",
+        )
+        .unwrap();
+    }
+    run(&["code", "init"], &repo.root);
+    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+
+    let out = run(&["code", "find", "tests", "--limit", "2"], &repo.root);
+    assert_ok(&out, "code find --limit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches("sym#").count(),
+        2,
+        "--limit 2 must print 2 symbols, got: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Showing 2 of 5"),
+        "truncation must name the total, got: {stderr}"
+    );
+
+    // `search --scope symbols` shares the handler, and used to drop --limit.
+    let out = run(
+        &["search", "tests", "--scope", "symbols", "--limit", "3"],
+        &repo.root,
+    );
+    assert_ok(&out, "search --scope symbols --limit");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches("sym#").count(),
+        3,
+        "search --scope symbols must honour --limit, got: {stdout}"
+    );
+
+    // Nothing dropped, nothing to report.
+    let out = run(&["code", "find", "tests", "--limit", "10"], &repo.root);
+    assert_ok(&out, "code find under the cap");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("Showing"),
+        "no truncation notice when nothing was dropped, got: {stderr}"
+    );
+}
+
+#[test]
+fn smoke_kind_filter_fills_the_limit() {
+    let repo = Repo::new();
+
+    // 30 functions and 3 structs all match "probe". Filtering after a capped
+    // fetch would read the first few rows — nearly all functions — and return
+    // fewer than 3 structs, or none at all. The filter has to run before the
+    // cap, so a kind filter still fills the requested limit.
+    let mut source = String::new();
+    for n in 0..30 {
+        source.push_str(&format!("pub fn probe_fn_{n}() {{}}\n"));
+    }
+    for n in 0..3 {
+        source.push_str(&format!("pub struct probe_st_{n};\n"));
+    }
+    std::fs::write(repo.root.join("src/probes.rs"), source).unwrap();
+
+    run(&["code", "init"], &repo.root);
+    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+
+    let out = run(
+        &[
+            "code", "search", "probe", "--kind", "struct", "--limit", "3",
+        ],
+        &repo.root,
+    );
+    assert_ok(&out, "code search --kind");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        stdout.matches("sym#").count(),
+        3,
+        "kind filter must fill the limit, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Function"),
+        "kind=struct must exclude functions, got: {stdout}"
+    );
+}
+
+#[test]
+fn smoke_search_scope_symbols_is_fuzzy() {
+    let repo = Repo::new();
+    run(&["code", "init"], &repo.root);
+    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+
+    // The MCP server answers scope=symbols with a substring match. The CLI used
+    // to answer the same scope with exact name equality, so an agent got
+    // different results from the same query depending on the surface it used.
+    let out = run(&["search", "gree", "--scope", "symbols"], &repo.root);
+    assert_ok(&out, "search --scope symbols partial name");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("greet"),
+        "scope=symbols must match substrings like the MCP server does, got: {stdout}"
+    );
+}
+
+#[test]
+fn smoke_search_scope_code_is_semantic() {
+    let repo = Repo::new();
+    run(&["code", "init"], &repo.root);
+    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+
+    // `--scope code` used to run the same substring search as `--scope symbols`
+    // while the help promised semantic search. Disabling semantic search is the
+    // cheap proof it now takes the semantic path: a substring search would
+    // happily return `greet` and ignore the setting.
+    std::fs::write(
+        repo.root.join(".mdkb/config.toml"),
+        "[code.semantic_search]\nenabled = false\n",
+    )
+    .unwrap();
+
+    let out = run(&["search", "greet", "--scope", "code"], &repo.root);
+    assert!(
+        !out.status.success(),
+        "disabled semantic search must fail, not fall back to substring search"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Semantic code search is disabled"),
+        "error must name the disabled setting, got: {stderr}"
+    );
+}
+
 // ── Experiment ──────────────────────────────────────────────────────
 
 #[test]

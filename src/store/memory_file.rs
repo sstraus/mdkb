@@ -174,8 +174,15 @@ pub fn memory_dir_of(conn: &rusqlite::Connection) -> Option<std::path::PathBuf> 
 /// construction. `confirmations`/`last_confirmed_at` are counters git cannot sum,
 /// where last-writer-wins silently discards a clone's observations.
 ///
+/// `expires_at` is the same kind of field and joined them later: a TTL is
+/// refreshed whenever *this* machine re-observes the entry, so projecting it
+/// slid the timestamp — and rewrote the file — on every session that restated
+/// knowledge already recorded.
+///
 /// Those fields stay in `memory_entries` and are still *parsed* (see
-/// [`MemoryFileMeta`]) so hand-authored and pre-v19 files keep loading.
+/// [`MemoryFileMeta`]) so hand-authored and pre-v19 files keep loading. Because
+/// the file cannot carry them, the DB row keeps its own on a file → DB adoption
+/// (see `core::memory_sync`).
 ///
 /// Output layout:
 /// ```text
@@ -206,7 +213,6 @@ pub fn to_markdown(entry: &MemoryEntry) -> String {
     write_i64(&mut out, "updated_at", entry.updated_at);
     write_opt_scalar(&mut out, "source_path", entry.source_path.as_deref());
     write_opt_scalar(&mut out, "superseded_by", entry.superseded_by.as_deref());
-    write_opt_i64(&mut out, "expires_at", entry.expires_at);
     write_opt_i64(&mut out, "due_at", entry.due_at);
     out.push_str("---\n\n");
     out.push_str(&entry.content);
@@ -214,6 +220,23 @@ pub fn to_markdown(entry: &MemoryEntry) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Would projecting `next` write different bytes than projecting `previous`,
+/// ignoring `updated_at` itself?
+///
+/// `updated_at` is the timestamp *of* a durable change, so it must not be the
+/// thing that decides whether a durable change happened — stamping it
+/// unconditionally is what rewrote files for edits that edited nothing.
+/// Comparing the rendered projection keeps the answer honest: whatever
+/// [`to_markdown`] writes is exactly what this covers, with no second list of
+/// fields to keep in step.
+pub fn projection_differs(previous: &MemoryEntry, next: &MemoryEntry) -> bool {
+    let mut previous = previous.clone();
+    let mut next = next.clone();
+    previous.updated_at = 0;
+    next.updated_at = 0;
+    to_markdown(&previous) != to_markdown(&next)
 }
 
 /// Parse a memory file (YAML frontmatter + markdown body).
@@ -487,14 +510,64 @@ mod tests {
         assert_eq!(back.due_at, Some(1_700_999_999));
     }
 
+    /// A TTL is refreshed by local re-observation, so projecting it rewrote the
+    /// file on every session that restated known knowledge. It left the
+    /// projection with the counters — but parsing must keep working, or every
+    /// file written before the change would lose its TTL on the next read.
     #[test]
-    fn expired_entry_with_expires_at_round_trips() {
+    fn expires_at_is_not_projected_but_is_still_parsed() {
         let mut entry = sample_entry();
         entry.expires_at = Some(1_600_000_000);
         let text = to_markdown(&entry);
-        assert!(text.contains("expires_at: 1600000000"));
-        let back = from_markdown(&text).unwrap().into_entry();
+        assert!(
+            !text.contains("expires_at"),
+            "TTL must not reach the git-tracked file: {text}"
+        );
+
+        // A file that already carries the field still yields it.
+        let legacy = "---\nid: abc\ntitle: My Entry\nentry_type: topic\n\
+                      expires_at: 1600000000\n---\n\nBody.\n";
+        let back = from_markdown(legacy).unwrap().into_entry();
         assert_eq!(back.expires_at, Some(1_600_000_000));
+    }
+
+    /// The whole point of dropping those fields: restating what is already
+    /// recorded must produce byte-identical bytes, so git sees nothing.
+    #[test]
+    fn machine_local_state_never_changes_the_projection() {
+        let before = sample_entry();
+
+        let mut after = before.clone();
+        after.access_count += 7;
+        after.last_accessed = Some(1_800_000_000);
+        after.confirmations += 2;
+        after.last_confirmed_at = Some(1_800_000_000);
+        after.expires_at = Some(1_900_000_000);
+        assert_eq!(
+            to_markdown(&before),
+            to_markdown(&after),
+            "usage counters and TTL must not reach the file"
+        );
+        assert!(!projection_differs(&before, &after));
+
+        // `updated_at` alone is not a durable change either — it is the stamp of
+        // one, so it cannot be the evidence for one.
+        let mut touched = before.clone();
+        touched.updated_at += 5_000;
+        assert!(!projection_differs(&before, &touched));
+
+        // Real edits still register.
+        let mut edited = before.clone();
+        edited.content.push_str("\nnew knowledge\n");
+        assert!(projection_differs(&before, &edited));
+
+        let mut retagged = before.clone();
+        retagged.tags.push("extra".to_string());
+        assert!(projection_differs(&before, &retagged));
+
+        let mut archived = before.clone();
+        archived.status = EntryStatus::Archived;
+        assert!(projection_differs(&before, &archived));
     }
 
     #[test]

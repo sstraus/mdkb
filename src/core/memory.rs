@@ -90,6 +90,7 @@ pub fn handle_memory_add(
         ) {
             tracing::warn!("Failed to save revision for {id}: {e}");
         }
+        let previous = existing.clone();
         existing.title = entry.title;
         existing.content = entry.content;
         existing.entry_type = entry.entry_type;
@@ -103,7 +104,13 @@ pub fn handle_memory_add(
         if let Some(st) = parsed_source_type {
             existing.source_type = st;
         }
-        existing.updated_at = now;
+        // A re-write that restates what is already recorded is not an edit. The
+        // TTL still slides in the DB, but `updated_at` stays put, so the
+        // projection is byte-identical and produces no diff — a session that
+        // learned nothing new must not show up in the shared history.
+        if crate::store::memory_file::projection_differs(&previous, &existing) {
+            existing.updated_at = now;
+        }
         memory::update_entry(&ctx.conn, &existing)?;
         existing
     } else {

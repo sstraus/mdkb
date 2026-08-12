@@ -171,11 +171,13 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             // on the longest write in the program, which is the one most likely
             // to outlast a client's patience.
             Err(MutationFailure::Undetermined(e)) => {
+                // Cause first: it is the only part that changes between
+                // failures, and the only part the operator can act on. The
+                // explanation of why this is not retried here follows it.
                 return Err(mdkb::error::Error::other(format!(
-                    "cli.mutate: the daemon took this request and did not report back ({e}). \
-                     Not running it here — the daemon may still be writing. Check \
-                     `mdkb daemon status`; if no daemon is running, re-run with \
-                     MDKB_NO_DAEMON=1."
+                    "{e}. The daemon took this request and did not report back, so it may \
+                     still be writing — not running it here. Check `mdkb daemon status`; if \
+                     no daemon is running, re-run with MDKB_NO_DAEMON=1."
                 )));
             }
             Err(MutationFailure::Unstarted(e)) => {
@@ -207,7 +209,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Collection(cmd) => {
             let ctx = if matches!(&cmd, CollectionCommand::List) {
-                Context::open_read_only(&cwd)?
+                Context::open_read_only_migrating(&cwd)?
             } else {
                 Context::open_writer_admitted(&cwd)?
             };
@@ -247,7 +249,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             file,
             entry_type,
         } => {
-            let ctx = Context::open_read_only(&cwd)?;
+            let ctx = Context::open_read_only_migrating(&cwd)?;
             match scope.as_deref() {
                 Some("docs") => {
                     let results = handle_hybrid_search(
@@ -293,22 +295,25 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     }
                 }
                 Some("code") => {
-                    let symbols = mdkb::cli::handlers::handle_code_search(
+                    let scored = mdkb::cli::handlers::handle_semantic_code_search(
                         &cwd,
+                        &ctx.config_path,
                         &query,
-                        limit,
                         kind.as_deref(),
+                        limit,
                     )?;
-                    format_code_symbols(&symbols, cli.format);
+                    format_scored_symbols(&scored, cli.format);
                 }
                 Some("symbols") => {
-                    let symbols = mdkb::cli::handlers::handle_code_find(
+                    let found = mdkb::cli::handlers::handle_symbol_search(
                         &cwd,
                         &query,
                         kind.as_deref(),
                         file.as_deref(),
+                        limit,
                     )?;
-                    format_code_symbols(&symbols, cli.format);
+                    format_code_symbols(&found.symbols, cli.format);
+                    report_find_truncation(&found);
                 }
                 Some(invalid) => {
                     eprintln!(
@@ -321,7 +326,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Get { id, lines } => {
             use mdkb::cli::handlers::GetResult;
-            let ctx = Context::open_read_only(&cwd)?;
+            let ctx = Context::open_read_only_migrating(&cwd)?;
 
             // Detect glob pattern (contains * or ?)
             if id.contains('*') || id.contains('?') {
@@ -370,7 +375,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             pattern,
             collection,
         } => {
-            let ctx = Context::open_read_only(&cwd)?;
+            let ctx = Context::open_read_only_migrating(&cwd)?;
             let results = handle_mget(&ctx, &pattern, collection.as_deref())?;
             format_mget_results(&results, cli.format);
         }
@@ -506,7 +511,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Stats { no_color } => {
-            let ctx = Context::open_read_only(&cwd)?;
+            let ctx = Context::open_read_only_migrating(&cwd)?;
             let report = mdkb::cli::stats_report::collect_report(&ctx)?;
             if let mdkb::cli::OutputFormat::Json = cli.format {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -576,7 +581,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Metrics(cmd) => {
-            let ctx = Context::open_read_only(&cwd)?;
+            let ctx = Context::open_read_only_migrating(&cwd)?;
             match cmd {
                 MetricsCommand::Show { period } => {
                     let metrics = handle_metrics_show(&ctx, period)?;
@@ -631,7 +636,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     | MemoryCommand::History { .. }
                     | MemoryCommand::Export { .. }
             ) {
-                Context::open_read_only(&cwd)?
+                Context::open_read_only_migrating(&cwd)?
             } else {
                 Context::open_writer_admitted(&cwd)?
             };
@@ -684,11 +689,16 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     println!("Added memory entry '{id}'");
                 }
                 MemoryCommand::Show { id } => {
-                    if let Some(entry) = handle_memory_show(&ctx, &id)? {
-                        format_memory_entry(&entry, cli.format);
-                    } else {
-                        println!("Memory entry '{id}' not found");
-                    }
+                    // A miss exits non-zero, as `get` already does for the same
+                    // slug. Printing "not found" and exiting 0 makes a miss
+                    // indistinguishable from a hit to any caller that scripts
+                    // this command and reads only the status.
+                    let entry = handle_memory_show(&ctx, &id)?.ok_or_else(|| {
+                        mdkb::Error::from(mdkb::error::ErrorKind::DocumentNotFound {
+                            id: id.clone(),
+                        })
+                    })?;
+                    format_memory_entry(&entry, cli.format);
                 }
                 MemoryCommand::Confirm { id, outcome } => {
                     let result = handle_memory_confirm(&ctx, &id, &outcome)?;
@@ -874,12 +884,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::History { path } => {
-            let ctx = Context::open_read_only(&cwd)?;
+            let ctx = Context::open_read_only_migrating(&cwd)?;
             let history = handle_history(&ctx, &path)?;
             format_evolution_history(&history, cli.format);
         }
         Command::Current { path } => {
-            let ctx = Context::open_read_only(&cwd)?;
+            let ctx = Context::open_read_only_migrating(&cwd)?;
             if let Some(doc) = handle_current(&ctx, &path)? {
                 format_current_document(&doc, cli.format);
             } else {
@@ -887,12 +897,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::SupersededBy { path } => {
-            let ctx = Context::open_read_only(&cwd)?;
+            let ctx = Context::open_read_only_migrating(&cwd)?;
             let evolutions = handle_superseded_by(&ctx, &path)?;
             format_superseded_by(&evolutions, cli.format);
         }
         Command::Graph(cmd) => {
-            let ctx = Context::open_read_only(&cwd)?;
+            let ctx = Context::open_read_only_migrating(&cwd)?;
             match cmd {
                 GraphCommand::Links { entity, relation } => {
                     let edges = handle_graph_links(&ctx, &entity, relation.as_deref())?;
@@ -930,7 +940,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 &cmd,
                 ExperimentCommand::Status { .. } | ExperimentCommand::List { .. }
             ) {
-                Context::open_read_only(&cwd)?
+                Context::open_read_only_migrating(&cwd)?
             } else {
                 Context::open_writer_admitted(&cwd)?
             };
@@ -1023,10 +1033,11 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} search <query> --scope memory --entry-type TYPE    # filter by type
 {0} search <query> --scope docs                        # documents only
 {0} search <query> --scope symbols                     # symbol definitions (fuzzy)
-{0} search <query> --scope symbols --file '*hook*'     # symbols in matching files
+{0} search <query> --scope symbols --file hook         # path substring, not a glob
 {0} search <query> --scope code                        # semantic code search
 {0} get <id>                                           # full document/memory by ID
 {0} get <id> --lines 10:50                             # line range
+{0} mget <pattern>                                     # several documents at once
 
 # Memory (--entry-type: topic, problem, decision, reminder, prior)
 {0} memory add <id> --title T --content C              # create (default: topic)
@@ -1038,12 +1049,24 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} memory link <id> derived_from <path> --doc        # link to a document; --agent records provenance
 {0} memory rm <id>                                     # delete
 {0} memory list                                        # list active entries
+{0} memory show <id>                                   # one entry in full
+{0} memory search <query>                              # memory only, same as search --scope memory
+{0} memory warmup                                      # compact index to load at session start
+{0} memory history <id>                                # revisions, including versions a conflict superseded
+
+# Memory projection (entries live in the database; .mdkb/memory/entries/*.md is
+# the git-tracked copy, and the only copy that survives losing the database)
+{0} memory export                                      # write missing entries to disk; add --overwrite to refresh all
+{0} memory sync                                        # reconcile database and disk both ways
+{0} memory import <path>                               # load a JSON file or a folder of markdown
 
 # Code intelligence
 {0} code callers <symbol>                              # who calls this?
 {0} code calls <symbol>                                # what does this call?
 {0} code impact <symbol>                               # transitive dependency graph
 {0} code search <query>                                # fuzzy symbol search
+{0} code find <name>                                   # exact symbol lookup; --kind and --file narrow it
+{0} code info                                          # code index counts
 
 # Knowledge graph (frontmatter + wikilink edges; refs accept collection-prefixed paths)
 {0} graph links <entity>                               # outgoing edges (endpoints shown as paths, with 'via' relation)
@@ -1063,6 +1086,19 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} stats                                              # index health, hooks, mining, sessions
 {0} compact                                            # vacuum both databases
 {0} compact --prune-sessions --older-than 90d --export dir  # hard-delete archived transcripts (exports first)
+{0} memory prune --older-than 90d                      # archive entries nothing has read
+
+# Daemon (the daemon owns every write; the CLI routes mutations to it)
+{0} daemon status                                      # is it running, and against which store
+{0} daemon restart                                     # after upgrading the binary
+MDKB_NO_DAEMON=1 {0} <cmd>                             # run in-process instead, for debugging
+
+# Naming
+{0} surface                                            # each MCP tool next to its CLI equivalent
+{0} schema [COMMAND]                                   # the CLI as JSON, for machine callers
+
+# A store carries a schema version. When the binary is newer, read-only commands
+# refuse rather than migrate silently — run `{0} update` once to migrate it.
 ",
                 bin
             );
@@ -1095,18 +1131,26 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 format_code_index_stats(&stats, cli.format);
             }
             CodeCommand::Search { query, limit, kind } => {
-                let symbols =
+                let found =
                     mdkb::cli::handlers::handle_code_search(&cwd, &query, limit, kind.as_deref())?;
-                format_code_symbols(&symbols, cli.format);
+                format_code_symbols(&found.symbols, cli.format);
+                report_find_truncation(&found);
             }
-            CodeCommand::Find { name, kind, file } => {
-                let symbols = mdkb::cli::handlers::handle_code_find(
+            CodeCommand::Find {
+                name,
+                kind,
+                file,
+                limit,
+            } => {
+                let found = mdkb::cli::handlers::handle_code_find(
                     &cwd,
                     &name,
                     kind.as_deref(),
                     file.as_deref(),
+                    limit,
                 )?;
-                format_code_symbols(&symbols, cli.format);
+                format_code_symbols(&found.symbols, cli.format);
+                report_find_truncation(&found);
             }
             CodeCommand::Calls { name } => {
                 let (source, callees) = mdkb::cli::handlers::handle_code_calls(&cwd, &name)?;
@@ -3143,6 +3187,78 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
                 println!("Parse errors:     {} (see logs)", stats.parse_errors);
             }
         }
+    }
+}
+
+/// Render semantic search hits. The similarity score is the reason a hit is in
+/// the list at all, so it travels with the symbol rather than being dropped.
+fn format_scored_symbols(scored: &[(mdkb::code::symbol::Symbol, f32)], format: OutputFormat) {
+    match format {
+        OutputFormat::Json => {
+            let output: Vec<_> = scored
+                .iter()
+                .map(|(s, score)| serde_json::json!({ "symbol": s, "similarity": score }))
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id,name,kind,file,line,similarity");
+            for (s, score) in scored {
+                println!(
+                    "{},{},{},{},{},{:.3}",
+                    s.id.value(),
+                    s.name,
+                    s.kind,
+                    s.file_path,
+                    s.range.start_line,
+                    score,
+                );
+            }
+        }
+        OutputFormat::Markdown => {
+            println!("| ID | Name | Kind | File | Line | Similarity |");
+            println!("|----|------|------|------|------|------------|");
+            for (s, score) in scored {
+                println!(
+                    "| {} | `{}` | {} | {} | {} | {:.3} |",
+                    s.id.value(),
+                    s.name,
+                    s.kind,
+                    s.file_path,
+                    s.range.start_line,
+                    score,
+                );
+            }
+        }
+        OutputFormat::Text => {
+            if scored.is_empty() {
+                println!("No semantic matches found.");
+                return;
+            }
+            for (s, score) in scored {
+                println!(
+                    "  sym#{} {} {} in {}:{}  similarity: {:.3}",
+                    s.id.value(),
+                    s.kind,
+                    s.name,
+                    s.file_path,
+                    s.range.start_line,
+                    score,
+                );
+            }
+        }
+    }
+}
+
+/// Report a truncated `code find` result. It goes to stderr so that JSON and
+/// CSV output on stdout stays parseable.
+fn report_find_truncation(found: &mdkb::cli::handlers::CodeFindResult) {
+    if found.total > found.symbols.len() {
+        eprintln!(
+            "Showing {} of {} matches. Narrow with --kind/--file, or raise --limit.",
+            found.symbols.len(),
+            found.total,
+        );
     }
 }
 
