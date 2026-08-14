@@ -1,6 +1,6 @@
 [package]
 name = "mdkb"
-version = "3.7.14"
+version = "3.7.15"
 edition = "2024"
 description = "Persistent memory, hybrid search, and code intelligence for Claude Code and Codex — with CLI, lifecycle hooks, and MCP"
 license = "MIT"

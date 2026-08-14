@@ -1,5 +1,33 @@
 # Changelog
 
+## 3.7.15 (2026-08-14)
+
+### Fixed
+
+- **Outside a git repo, project root resolution no longer adopts a container
+  directory's store.** `resolve_project_root` bounded its upward search by the
+  git root, but only on the branch that found one. A cwd that is not inside a
+  repo — a directory that merely holds repos, such as `~/Gits`, `~/Gits/LS`, or a
+  worktree container like `~/Gits/LS/agent2__wt` — still walked up unbounded and
+  adopted the nearest stray `.mdkb/`. The daemon then anchored the whole
+  container tree and indexed every sibling repo, `target/` and `node_modules/`:
+  3.99 GB of `code.sqlite` in 15 minutes, followed by an embedding run that held
+  every core at 100% for 20 minutes and did not answer SIGTERM. The search is now
+  bounded by `project_hint` (the declared launch dir) and falls back to `cwd`,
+  never to an ancestor. This completes the fix shipped earlier for the same
+  failure inside a git repo, whose acceptance criterion covered only that branch.
+
+- **Embedding no longer nests two per-core thread pools.** fastembed parallelises
+  batches with `par_chunks` on rayon's global pool, while every ONNX session it
+  builds sets `with_intra_threads(available_parallelism())` — a knob `InitOptions`
+  does not expose. On an N-core host that is N rayon workers issuing concurrent
+  `Session::run()` into a single N-thread ORT pool; ORT's pool spin-waits, so the
+  contention burned every core instead of blocking. The rayon global pool is now
+  capped to one worker before the model is created, leaving parallelism to ORT,
+  which parallelises a single inference. This does not cause runaway indexing on
+  its own — it decides whether an accidental one costs a slow minute or an
+  unusable machine.
+
 ## 3.7.12 (2026-08-09)
 
 ### Fixed
