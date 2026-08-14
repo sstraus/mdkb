@@ -40,12 +40,33 @@ impl std::fmt::Debug for EmbeddingService {
     }
 }
 
+/// Cap rayon's global pool to one worker before the first fastembed call.
+///
+/// fastembed parallelises batches with `texts.par_chunks(..)` on rayon's GLOBAL
+/// pool — one worker per core — while every ONNX session it builds sets
+/// `with_intra_threads(available_parallelism())`, a second pool that is also one
+/// thread per core and that `InitOptions` exposes no knob for. Nesting the two
+/// means N rayon workers issuing concurrent `Session::run()` into a single
+/// N-thread ORT pool on N cores. ORT's pool spin-waits, so the contention burns
+/// every core instead of blocking: measured at 1250% CPU, ~0 system time, and no
+/// forward progress for 20 minutes.
+///
+/// Keep the parallelism where it pays — inside ORT, which parallelises a single
+/// inference — and let the batch loop run serially on top of it.
+///
+/// `build_global` returns Err if the pool is already initialised. That is benign:
+/// it only means the pool exists, which is the state we want to reach anyway.
+fn cap_rayon_global_pool() {
+    let _ = rayon::ThreadPoolBuilder::new().num_threads(1).build_global();
+}
+
 impl EmbeddingService {
     /// Create a new embedding service, downloading the model if needed.
     ///
     /// Models are cached in `~/.cache/fastembed/` (shared across all projects)
     /// instead of per-project `.fastembed_cache/` directories.
     pub fn new() -> Result<Self> {
+        cap_rayon_global_pool();
         let cache_dir = shared_cache_dir();
         let model = TextEmbedding::try_new(
             InitOptions::new(EmbeddingModel::AllMiniLML6V2)
@@ -152,6 +173,20 @@ mod tests {
         let b = vec![-1.0, 0.0, 0.0];
         let sim = cosine_similarity(&a, &b);
         assert!((sim + 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn cap_rayon_global_pool_limits_the_batch_loop_to_one_worker() {
+        // The nested-pool blowup needs a real ONNX session to reproduce, so
+        // assert the lever itself: once capped, fastembed's `par_chunks` batch
+        // loop can no longer fan out to one worker per core on top of ORT's own
+        // per-core pool.
+        cap_rayon_global_pool();
+        assert_eq!(rayon::current_num_threads(), 1);
+        // Idempotent: the second call hits the already-initialised pool and must
+        // neither panic nor change it.
+        cap_rayon_global_pool();
+        assert_eq!(rayon::current_num_threads(), 1);
     }
 
     #[test]
