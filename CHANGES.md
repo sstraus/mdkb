@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.7.15 (2026-08-14)
+## 3.7.16 (2026-08-14)
 
 ### Fixed
 
@@ -12,10 +12,12 @@
   adopted the nearest stray `.mdkb/`. The daemon then anchored the whole
   container tree and indexed every sibling repo, `target/` and `node_modules/`:
   3.99 GB of `code.sqlite` in 15 minutes, followed by an embedding run that held
-  every core at 100% for 20 minutes and did not answer SIGTERM. The search is now
-  bounded by `project_hint` (the declared launch dir) and falls back to `cwd`,
-  never to an ancestor. This completes the fix shipped earlier for the same
-  failure inside a git repo, whose acceptance criterion covered only that branch.
+  every core at 100% for 20 minutes and did not answer SIGTERM. The upward search
+  is kept — a non-git project must still find its own store from a sub-path — but
+  it now refuses a store that would anchor far more than a project: a directory
+  holding git repositories among its children, or `$HOME` and above. This
+  completes the fix shipped earlier for the same failure inside a git repo, whose
+  acceptance criterion covered only that branch.
 
 - **Embedding no longer nests two per-core thread pools.** fastembed parallelises
   batches with `par_chunks` on rayon's global pool, while every ONNX session it
