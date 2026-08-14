@@ -144,9 +144,11 @@ fn find_store_within(start: &Path, boundary: &Path) -> Option<PathBuf> {
 ///     root so a store is NEVER borrowed from a parent directory above the repo
 ///     (which would anchor the whole parent tree and reindex thousands of
 ///     unrelated files — including sibling repos and vendored dependencies);
-///  2. outside a git repo — the nearest existing `.mdkb/` ancestor;
-///  3. `project_hint` (e.g. `CLAUDE_PROJECT_DIR`, the stable launch dir) when set;
-///  4. `cwd` itself.
+///  2. outside a git repo — the nearest existing `.mdkb/` at or below
+///     `project_hint` (e.g. `CLAUDE_PROJECT_DIR`, the stable launch dir), else
+///     the hint itself. The launch dir is the only declared boundary outside a
+///     repo, so the same "never borrow a parent's store" rule applies;
+///  3. `cwd` itself, when there is no hint to bound the search.
 ///
 /// The chosen directory is then collapsed to the main worktree so that all
 /// worktrees of a repo share a single store. This makes the anchor immune to
@@ -158,11 +160,25 @@ pub fn resolve_project_root(cwd: &Path, project_hint: Option<&Path>) -> PathBuf 
         // root. Rediscover a drifted sub-path's store, but never climb past the
         // repo boundary.
         Some(git_root) => find_store_within(cwd, &git_root).unwrap_or(git_root),
-        // Not a git repo: no boundary to respect — fall back to any ancestor
-        // store, then the launch hint, then cwd.
-        None => find_existing_store(cwd)
-            .or_else(|| project_hint.map(Path::to_path_buf))
-            .unwrap_or_else(|| cwd.to_path_buf()),
+        // Not a git repo, so there is no repo boundary — but "no boundary" must
+        // not mean "climb anywhere". Container directories that merely HOLD
+        // repos are not repos themselves (`~/Gits`, `~/Gits/LS`, and worktree
+        // containers like `~/Gits/LS/agent2__wt`). An unbounded walk from such a
+        // cwd adopts the container's stray store and anchors the entire tree —
+        // every sibling repo, every `target/` and `node_modules/`. That is the
+        // same failure the git branch above is bounded to prevent.
+        //
+        // The launch dir is the only boundary declared outside a repo, so use
+        // it exactly as the git branch uses the repo root — and only when `cwd`
+        // is actually inside it, since `find_store_within` stops at `boundary`
+        // by equality and would otherwise walk to the filesystem root.
+        None => match project_hint {
+            Some(hint) if cwd.starts_with(hint) => {
+                find_store_within(cwd, hint).unwrap_or_else(|| hint.to_path_buf())
+            }
+            Some(hint) => hint.to_path_buf(),
+            None => cwd.to_path_buf(),
+        },
     };
     resolve_main_worktree(&chosen)
 }
@@ -460,6 +476,59 @@ mod tests {
         assert_eq!(resolve_project_root(&deep, None), repo);
         // Sanity: the unbounded walk WOULD have returned the parent.
         assert_eq!(find_existing_store(&deep), Some(parent.to_path_buf()));
+    }
+
+    #[test]
+    fn resolve_project_root_never_adopts_a_container_store_outside_a_repo() {
+        // Regression (2026-08-14): the sibling of the test above, for the case
+        // it never covered. A directory that merely HOLDS repos is not itself a
+        // repo, so `find_git_root` returns None — true for `~/Gits`, `~/Gits/LS`
+        // and worktree containers like `~/Gits/LS/agent2__wt`. The unbounded
+        // walk then adopted the stray `~/Gits/.mdkb` and anchored the whole
+        // tree: 3.99 GB of code.sqlite in 15 minutes, every core pegged.
+        let tmp = TempDir::new().unwrap();
+        let container = tmp.path(); // ~/Gits
+        std::fs::create_dir_all(container.join(".mdkb")).unwrap(); // stray store
+        let worktree_container = container.join("LS/agent2__wt"); // holds repos, is not one
+        std::fs::create_dir_all(&worktree_container).unwrap();
+
+        // No hint: anchor at cwd itself, never the container above it.
+        assert_eq!(
+            resolve_project_root(&worktree_container, None),
+            worktree_container
+        );
+        // Sanity: the unbounded walk WOULD have returned the container.
+        assert_eq!(
+            find_existing_store(&worktree_container),
+            Some(container.to_path_buf())
+        );
+    }
+
+    #[test]
+    fn resolve_project_root_no_git_bounds_store_search_to_the_hint() {
+        let tmp = TempDir::new().unwrap();
+        let container = tmp.path();
+        std::fs::create_dir_all(container.join(".mdkb")).unwrap(); // stray store ABOVE the hint
+        let launch = container.join("project");
+        let deep = launch.join("deep/sub");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        // A store above the declared launch dir is never adopted: the hint wins.
+        assert_eq!(resolve_project_root(&deep, Some(&launch)), launch);
+
+        // A store INSIDE the hint is still rediscovered from a drifted cwd —
+        // the bound restricts the walk, it does not disable it.
+        let nested = launch.join("nested");
+        std::fs::create_dir_all(nested.join(".mdkb")).unwrap();
+        let drifted = nested.join("x");
+        std::fs::create_dir_all(&drifted).unwrap();
+        assert_eq!(resolve_project_root(&drifted, Some(&launch)), nested);
+
+        // cwd outside the hint entirely: fall back to the hint, never walk up
+        // from cwd (find_store_within stops on equality and would run to `/`).
+        let outside = container.join("elsewhere/x");
+        std::fs::create_dir_all(&outside).unwrap();
+        assert_eq!(resolve_project_root(&outside, Some(&launch)), launch);
     }
 
     #[test]
