@@ -4,42 +4,83 @@
 
 # mdkb
 
-**Local memory, search, and code intelligence — integrated with Claude Code and Codex via CLI, lifecycle hooks, and MCP.**
+**Repository memory for coding agents.**
 
-mdkb indexes your project's docs, source code, and persistent knowledge into a local hybrid search engine — then exposes it to Claude Code, Codex, or any MCP client so the AI finds what it needs instead of guessing.
+mdkb gives Claude Code, Codex, and other MCP clients one local retrieval layer
+for the repository: durable project memory, Markdown documentation, source
+symbols, and call relationships.
 
-No cloud APIs. No token-heavy context dumps. Just fast, local, relevant retrieval.
+It combines hybrid search, knowledge graphs, code intelligence, and lifecycle
+hooks so an agent can recover what the team decided, find what the docs say, and
+trace what the code does without loading the repository into every prompt.
+
+Storage and inference stay local. mdkb uses SQLite, FTS5, tree-sitter, and a
+local ONNX embedding model; no memory API, hosted vector database, or LLM
+extraction service is required. The embedding model is downloaded on its first
+use and then runs on-device.
 
 ## Why mdkb
 
-- **Persistent across sessions, not a snapshot** — decisions, problems, and behavioral `prior`s carry over between conversations, with Bayesian confidence that decays over time and is reinforced on access. The knowledge graph captures *what your project is now*; mdkb also remembers *what you learned and decided*.
-- **Proactive — no tool call required** — relevant context is injected automatically at session start, on each prompt, and before code searches via lifecycle hooks. Value doesn't depend on the AI remembering to query a tool.
-- **Fully local, nothing leaves the machine** — no cloud APIs, no query logging, SQLite on disk, relative paths only. Safe for private and regulated repos.
-- **Code intelligence is a graph, not just text** — tree-sitter call graphs answer callers / callees / impact across 13 languages, deterministically and offline.
-- **One Rust binary, zero config** — auto-indexes on startup, watches for changes, self-repairs the index. No runtime, no daemon to babysit.
+- **Repository-first, not conversation-first** — docs, decisions, solved
+  problems, symbols, and dependencies are searchable as one project context.
+- **Memory designed to age well** — typed entries carry provenance, confidence
+  decay, confirmation/refutation signals, TTL, reminders, revisions,
+  supersession, and explicit relations. Stale knowledge is surfaced instead of
+  silently becoming permanent truth.
+- **Recall is not dependent on a lucky tool call** — hooks inject a compact
+  session warmup, provide opt-in prompt recall with a leading `*` by default,
+  redirect code searches to indexed symbols, and reindex after edits. Always-on
+  prompt recall is configurable.
+- **Code intelligence is structural** — tree-sitter indexes 14 languages and
+  persists symbols and call relationships, so callers, callees, and transitive
+  impact do not require repeated multi-file grep.
+- **Local and inspectable** — queries, indexes, and embeddings stay on the
+  machine. Durable authored memory is projected to reviewable Markdown for Git,
+  while machine-local counters and SQLite state stay untracked.
+- **Low operational weight** — one Rust binary owns CLI, MCP, hooks, watching,
+  and repair. On Unix, an auto-started local daemon shares indexes and serializes
+  writes; there is no separate LLM, vector, or graph service to provision.
+
+## How it differs from other memory systems
+
+"AI memory" covers products with very different jobs. mdkb deliberately
+optimizes for software repositories rather than trying to be a general-purpose
+personalization or conversation-memory platform.
+
+| Memory approach | Usually optimized for | mdkb's difference |
+|---|---|---|
+| Conversation-memory SDKs | Extracting user facts and preferences for an application | Works as an installed repository tool; no application integration, extraction LLM, or hosted service is required |
+| Markdown knowledge bases | Portable notes and human-editable knowledge graphs | Adds typed engineering-memory lifecycle, source indexing, symbol search, and a persistent call graph |
+| Session-recording plugins | Capturing tool activity and AI-compressing past conversations | Prioritizes curated project truth and retrieves it alongside docs and code; it does not require a second AI process to summarize memory |
+| Temporal knowledge graphs | Evolving entities, events, and point-in-time facts | Uses a lighter local stack and deterministic project relations; no graph database or ingestion LLM is required |
+
+Choose mdkb when the repository is the memory boundary and source-code impact is
+part of recall. A conversation-memory SDK is a better fit for end-user
+personalization; a temporal graph is a better fit for bi-temporal entity facts;
+and a session recorder is a better fit when automatic transcript compression is
+the primary requirement.
 
 ## What it does
 
-- **Hybrid search** — BM25 + semantic vectors over your markdown docs
-- **Code intelligence** — tree-sitter parsing for 13 languages, call graphs, symbol search
-- **Persistent memory** — AI-created knowledge entries that survive across sessions, including time-bound `reminder` entries with due-date surfacing and `prior` entries for behavioral patterns (30-day TTL default)
-- **Lifecycle hooks** — proactive context injection and reindex enqueue via Claude Code / Codex CLI hooks (no tool call required)
-- **Markdown-native memory** — export/import memory entries as a folder of `.md` files for review, git tracking, or bulk edit
-- **Unified diagnostics** — `mdkb stats` renders a static ASCII dashboard (index health, collections, memory, code, sessions, hooks)
-- **Zero config serving** — auto-indexes on startup, watches for file changes, auto-`VACUUM`s on drift
+- **Hybrid retrieval** — BM25 + local semantic vectors over documents and
+  memory, with result fusion and filters.
+- **Two knowledge graphs** — frontmatter/wikilink relations for project docs,
+  plus typed relations between memories and documents.
+- **Code intelligence** — tree-sitter parsing for 14 languages, symbol and
+  semantic code search, callers, callees, and transitive impact.
+- **Persistent memory** — `topic`, `problem`, `decision`, `reminder`, `prior`,
+  and `handoff` entries with duplicate detection and revision history.
+- **Lifecycle hooks** — session warmup, controlled prompt recall, code-search
+  guidance, and post-edit reindexing for Claude Code and Codex.
+- **Git-reviewable memory** — bidirectional synchronization between the local
+  store and `.mdkb/memory/entries/*.md` without projecting local usage churn.
+- **Unified diagnostics** — `mdkb stats` reports index health, collections,
+  memory, code, sessions, and hooks; `mdkb surface` maps MCP tools to CLI
+  commands.
+- **Self-maintaining indexes** — automatic watching, differential reindexing,
+  integrity checks, repair, and database maintenance.
 
-### Recent highlights (3.7.x / 3.1.0 / 3.0.0)
-
-Full details in [CHANGES.md](CHANGES.md).
-
-- **3.7.2** — Fixed `index.sqlite` pointer-map corruption (dropped `mmap`+`auto_vacuum`); autoheal rebuilds a corrupted code index on open instead of failing the session.
-- **3.7.1** — Full-codebase audit remediation: default-deny daemon whitelist in global mode, `source_file` confinement + HTTP auth on the MCP boundary, query embeddings off the context lock, `idx_files_rel_path` (kills O(n²) reindex), incremental re-embed of only changed symbols, honest code-index errors (no silent wipe), and recursion-depth guards across all parser walks.
-- **3.7.0** — UserPromptSubmit recall is opt-in by default (`*` sigil); non-aggressive auto-indexing + embedding backfill; mdkb×wiz synergy audit (schema v16/v17) revives the self-learning loop with embeddings on every write path.
-- **3.1.0** — Automatic `code.sqlite` repair on open — idempotent integrity checks fix NULL kinds, orphaned rows, and desynced FTS without user intervention.
-- **3.0.0 (breaking)** — Hook dispatch via daemon IPC (Unix socket JSON-RPC instead of in-process execution); `reindex-queue.jsonl` removed (PostToolUse sends paths directly to daemon watcher channel); hook event logging to `hook-events.jsonl`; per-event configurable latency thresholds; `spawn_blocking` for CPU-bound hook work.
-- **2.2.0** — `prior` entry type for behavioral patterns (30d TTL default, excluded from searches); `mdkb cheatsheet` AI-friendly command reference; `--entry-type` filter on `mdkb search`; PreToolUse Grep hook suggests CLI commands (works without MCP); optimized injected text (~185 fewer tokens per turn).
-- **2.0.0 (breaking)** — `mdkb status` removed (use `mdkb stats`); `mdkb memory export`/`import` round-trip entries as `.md` files with YAML frontmatter; unified ASCII stats dashboard with `--format json` and `--no-color`.
-- **1.4.0** — `reminder` entry type with `due_in` (surfaced in session warmup once due); schema migration v9 → v10; input hardening (reject control chars in titles/tags).
+See [CHANGES.md](CHANGES.md) for release history.
 
 ## Installation
 
@@ -84,7 +125,9 @@ Restart Claude Code after setup. The MCP server auto-indexes on startup and watc
 
 MCP gives the assistant tools; hooks make it use them. Hooks also work standalone without MCP — the `PreToolUse` Grep interceptor suggests CLI commands via `current_exe()`, and `SessionStart` points to `mdkb cheatsheet` for the full command reference.
 
-Register the lifecycle dispatcher so Claude gets a memory warmup at session start, relevant context on every prompt, and Grep-to-mdkb suggestions — without having to call `search` first:
+Register the lifecycle dispatcher so Claude gets a memory warmup at session
+start, prompt recall when requested, and Grep-to-mdkb suggestions — without
+having to call `search` first:
 
 ```bash
 # Claude Code, project-scoped (writes .claude/settings.local.json)
@@ -105,6 +148,12 @@ mdkb setup hooks claude --disable user-prompt-submit,post-tool-use
 ```
 
 Restart the host CLI after setup. Re-running is idempotent: existing hook entries are replaced, unrelated settings preserved. Events: `session-start`, `user-prompt-submit`, `pre-tool-use` (Grep interceptor), `post-tool-use`. Full contract, config, and opt-out in [docs/hooks.md](docs/hooks.md).
+
+Per-prompt recall is quiet by default: prefix a prompt with `*` to inject
+matching memory, documents, and graph hints. To make it always-on, set
+`user_prompt_submit_require_sigil = false` under `[hooks]` in
+`.mdkb/config.toml`. Session warmup and the other enabled hooks do not require
+the sigil.
 
 ### Binary path caveat
 
@@ -259,7 +308,7 @@ usage(session_only=false)  # lifetime aggregates across all sessions
 
 ## Code Intelligence
 
-Tree-sitter parsing for **13 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, and GDScript.
+Tree-sitter parsing for **14 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, and GDScript.
 
 - **Substring search** — find symbols by partial name (FTS5 trigram, works from 3 characters)
 - **Semantic code search** — find conceptually similar code using embeddings
@@ -398,7 +447,7 @@ mdkb stats --format json
 mdkb stats --no-color
 ```
 
-The report is stacked: header (repo, version, db size, last update) → index health → collections → memory (by entry type, reminders DUE / upcoming 7d) → code (by language, top files by tokens) → sessions (totals, top tools) → hooks (slow events last 7d, reindex queue pending). Output auto-detects whether stdout is a TTY; the JSON format is stable for scripting.
+The report is stacked: header (repo, version, db size, last update) → index health → collections → memory (by entry type, reminders DUE / upcoming 7d) → code (by language, top files by tokens) → sessions (totals, top tools) → hooks (invocations, hit rate, latency, prior mining, registration drift). Output auto-detects whether stdout is a TTY; the JSON format is stable for scripting.
 
 ## Configuration
 
@@ -458,7 +507,7 @@ Uses the same syntax as `.gitignore`, including `!pattern` for re-inclusion. Pla
 
 ## Storage
 
-All data stays local in `.mdkb/`:
+Project state stays local in `.mdkb/`:
 
 ```
 .mdkb/
@@ -468,7 +517,7 @@ All data stays local in `.mdkb/`:
 └── memory/           # Memory entries (markdown mirror + index.json cache)
 ```
 
-The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded on first use and cached locally.
+The embedding model (AllMiniLML6V2, ~30MB ONNX) is downloaded on first use and cached in the platform's user cache directory.
 
 Keep `.mdkb/*` ignored at the repository root, then re-include
 `.mdkb/.gitignore` and `.mdkb/memory/`. The generated store-level ignore file
