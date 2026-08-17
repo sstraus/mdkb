@@ -199,8 +199,9 @@ pub enum Command {
     Daemon(DaemonCommand),
 
     /// Connect Claude's stdio MCP transport to the mdkb daemon over its unix
-    /// socket. Auto-spawns the daemon if it isn't running. Set
-    /// `MDKB_NO_DAEMON=1` to bypass the daemon and run in-process instead.
+    /// socket. Auto-spawns the daemon if it isn't running. On platforms
+    /// without the daemon (Windows), serves MCP in-process instead. Set
+    /// `MDKB_NO_DAEMON=1` to force in-process mode anywhere.
     Mcp {
         /// Override the daemon socket path (default: ~/.mdkb/daemon.sock).
         #[arg(long)]

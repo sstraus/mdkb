@@ -1400,7 +1400,12 @@ enum McpRunMode {
 /// 1. MDKB_NO_DAEMON always wins — it exists to bypass the daemon anywhere,
 ///    so it takes precedence even over an explicit `--socket`.
 /// 2. On daemon-capable platforms the proxy is the default.
-/// 3. Otherwise the daemon does not exist here; refuse.
+/// 3. Without daemon support, an explicit `--socket` is refused loudly:
+///    silently ignoring a flag the user typed would hide a misconfiguration.
+/// 4. Otherwise fall back to in-process. This is the Windows default: the
+///    unix-socket daemon has no Windows port, and erroring here instead
+///    surfaced to MCP clients as an opaque CONNECTION_CLOSED at session
+///    start — from the exact config `mdkb setup mcp` writes.
 fn resolve_mcp_run_mode(
     no_daemon: bool,
     daemon_supported: bool,
@@ -1412,10 +1417,13 @@ fn resolve_mcp_run_mode(
     if daemon_supported {
         return Ok(McpRunMode::DaemonProxy);
     }
-    let _ = socket_requested;
-    Err(mdkb::Error::other(
-        "Daemon proxy requires Unix (use MDKB_NO_DAEMON=1 for in-process mode)",
-    ))
+    if socket_requested {
+        return Err(mdkb::Error::other(
+            "--socket selects the daemon proxy, which requires Unix; on this \
+             platform run `mdkb mcp` without --socket for the in-process server",
+        ));
+    }
+    Ok(McpRunMode::InProcess)
 }
 
 /// Serve MCP in global (multi-repo) mode over stdio, from this process.
