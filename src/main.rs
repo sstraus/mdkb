@@ -1405,7 +1405,7 @@ enum McpRunMode {
 /// 4. Otherwise fall back to in-process. This is the Windows default: the
 ///    unix-socket daemon has no Windows port, and erroring here instead
 ///    surfaced to MCP clients as an opaque CONNECTION_CLOSED at session
-///    start — from the exact config `mdkb setup mcp` writes.
+///    start — from the config `mdkb setup mcp` writes.
 fn resolve_mcp_run_mode(
     no_daemon: bool,
     daemon_supported: bool,
@@ -3728,7 +3728,7 @@ mod tests {
     #[test]
     fn mcp_no_daemon_env_forces_in_process_everywhere() {
         // The escape hatch wins on every platform, and over --socket too:
-        // MDKB_NO_DAEMON exists precisely to keep the daemon out of the path.
+        // MDKB_NO_DAEMON exists to keep the daemon out of the path.
         for (daemon_supported, socket_requested) in
             [(true, false), (true, true), (false, false), (false, true)]
         {
