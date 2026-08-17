@@ -57,7 +57,9 @@ impl std::fmt::Debug for EmbeddingService {
 /// `build_global` returns Err if the pool is already initialised. That is benign:
 /// it only means the pool exists, which is the state we want to reach anyway.
 fn cap_rayon_global_pool() {
-    let _ = rayon::ThreadPoolBuilder::new().num_threads(1).build_global();
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build_global();
 }
 
 impl EmbeddingService {
