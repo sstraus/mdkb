@@ -3727,16 +3727,30 @@ mod tests {
 
     #[test]
     fn mcp_no_daemon_env_forces_in_process_everywhere() {
-        // The escape hatch wins on every platform, and over --socket too:
-        // MDKB_NO_DAEMON exists to keep the daemon out of the path.
-        for (daemon_supported, socket_requested) in
-            [(true, false), (true, true), (false, false), (false, true)]
-        {
+        // The escape hatch wins on every platform: MDKB_NO_DAEMON exists to
+        // keep the daemon out of the path, daemon support or not.
+        for daemon_supported in [true, false] {
             assert_eq!(
-                resolve_mcp_run_mode(true, daemon_supported, socket_requested).unwrap(),
+                resolve_mcp_run_mode(true, daemon_supported, false).unwrap(),
                 McpRunMode::InProcess,
-                "MDKB_NO_DAEMON must win (daemon_supported={daemon_supported}, \
-                 socket_requested={socket_requested})"
+                "MDKB_NO_DAEMON must win (daemon_supported={daemon_supported})"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_no_daemon_env_refuses_explicit_socket() {
+        // One rule for both routes into in-process mode: a --socket the run
+        // cannot honour is an error, never a silent no-op. Before this,
+        // `MDKB_NO_DAEMON=1 mdkb mcp --socket /path` dropped the flag without
+        // a word on Unix, which reads as "the daemon is serving you" when it
+        // is not. Name both halves of the conflict so the user can cut either.
+        for daemon_supported in [true, false] {
+            let err = resolve_mcp_run_mode(true, daemon_supported, true).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("--socket") && msg.contains("MDKB_NO_DAEMON"),
+                "error must name the flag and the variable that conflict: {msg}"
             );
         }
     }
