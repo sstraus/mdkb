@@ -298,7 +298,7 @@ fn smoke_stats_json() {
 // ── Schema ─────────────────────────────────────────────────────────
 
 /// Unix-only for now: on Windows `mdkb schema` crashes with a main-thread
-/// stack overflow (exit 0xC00000FD) — (Windows main-thread stack is 1 MiB vs 
+/// stack overflow (exit 0xC00000FD) — (Windows main-thread stack is 1 MiB vs
 /// 8 MiB on Linux). Tracked for its own fix; ungate when the command survives.
 #[cfg(unix)]
 #[test]
@@ -317,7 +317,7 @@ fn smoke_schema_full() {
 }
 
 /// Unix-only for now: on Windows `mdkb schema` crashes with a main-thread
-/// stack overflow (exit 0xC00000FD) (Windows main-thread stack is 1 MiB vs 8 MiB on Linux). 
+/// stack overflow (exit 0xC00000FD) (Windows main-thread stack is 1 MiB vs 8 MiB on Linux).
 /// Tracked for its own fix; ungate when the command survives.
 #[cfg(unix)]
 #[test]
