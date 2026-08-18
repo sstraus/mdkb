@@ -417,22 +417,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 return Err(mdkb::Error::other("Daemon mode requires Unix"));
             } else if global {
                 // Global mode: single process serving multiple repos via MCP roots
-                let daemon_config =
-                    mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())?;
-                let registry =
-                    std::sync::Arc::new(mdkb::daemon::registry::RepoRegistry::new(daemon_config));
-                let server = mdkb::mcp::server::McpServer::global(registry);
-
-                tracing::info!("Starting mdkb MCP server in global mode (stdio)...");
-                let (stdin, stdout) = rmcp::transport::io::stdio();
-                let service = server
-                    .serve((stdin, stdout))
-                    .await
-                    .map_err(|e| mdkb::Error::other(format!("Failed to start server: {e}")))?;
-                service
-                    .waiting()
-                    .await
-                    .map_err(|e| mdkb::Error::other(format!("Server error: {e}")))?;
+                run_global_stdio_server("serve --global").await?;
             } else {
                 // Standalone mode: single repo from cwd (existing behavior).
                 //
@@ -469,44 +454,34 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Mcp { socket } => {
-            if std::env::var_os("MDKB_NO_DAEMON").is_some() {
-                // Bypass the daemon entirely: run rmcp in-process in global
-                // mode, talking over stdio. Same wire protocol; the only
-                // difference is the server instance lives in this process.
-                let daemon_config =
-                    mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())?;
-                let registry =
-                    std::sync::Arc::new(mdkb::daemon::registry::RepoRegistry::new(daemon_config));
-                let server = mdkb::mcp::server::McpServer::global(registry);
-
-                tracing::info!("Starting mdkb MCP in-process (MDKB_NO_DAEMON=1)...");
-                let (stdin, stdout) = rmcp::transport::io::stdio();
-                let service = server
-                    .serve((stdin, stdout))
-                    .await
-                    .map_err(|e| mdkb::Error::other(format!("Failed to start server: {e}")))?;
-                service
-                    .waiting()
-                    .await
-                    .map_err(|e| mdkb::Error::other(format!("Server error: {e}")))?;
-            } else {
-                #[cfg(unix)]
-                {
-                    let socket_path = socket.unwrap_or_else(|| {
-                        mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())
-                            .map(|c| c.socket_path())
-                            .unwrap_or_else(|_| {
-                                mdkb::DaemonConfig::daemon_home().join("daemon.sock")
-                            })
-                    });
-                    mdkb::cli::mcp_proxy::run_proxy(socket_path).await?;
+            // Resolve the three facts here so the mode decision itself stays
+            // a pure, unit-tested function (`resolve_mcp_run_mode`) — the
+            // command arm only carries them across.
+            let no_daemon = std::env::var_os("MDKB_NO_DAEMON").is_some();
+            match resolve_mcp_run_mode(no_daemon, cfg!(unix), socket.is_some())? {
+                McpRunMode::InProcess => {
+                    // Same wire protocol as the proxy path; the only
+                    // difference is the server instance lives in this process.
+                    run_global_stdio_server("mcp in-process, daemon bypassed").await?;
                 }
-                #[cfg(not(unix))]
-                {
-                    let _ = socket;
-                    return Err(mdkb::Error::other(
-                        "Daemon proxy requires Unix (use MDKB_NO_DAEMON=1 for in-process mode)",
-                    ));
+                McpRunMode::DaemonProxy => {
+                    #[cfg(unix)]
+                    {
+                        let socket_path = socket.unwrap_or_else(|| {
+                            mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())
+                                .map(|c| c.socket_path())
+                                .unwrap_or_else(|_| {
+                                    mdkb::DaemonConfig::daemon_home().join("daemon.sock")
+                                })
+                        });
+                        mdkb::cli::mcp_proxy::run_proxy(socket_path).await?;
+                    }
+                    // `resolve_mcp_run_mode` returns DaemonProxy only when
+                    // `daemon_supported` is true, and the caller feeds that
+                    // from `cfg!(unix)` — so this arm cannot be reached on a
+                    // non-unix build.
+                    #[cfg(not(unix))]
+                    unreachable!("DaemonProxy resolved on a platform without the daemon");
                 }
             }
         }
@@ -1393,6 +1368,88 @@ MDKB_NO_DAEMON=1 {0} <cmd>                             # run in-process instead,
         }
     }
 
+    Ok(())
+}
+
+/// How `mdkb mcp` runs on this invocation.
+///
+/// Kept as data (instead of branching inline in the command arm) so the
+/// platform/env/flag decision is a pure function with unit tests that run on
+/// every host: the daemon itself is unix-only, but the *rule* for picking a
+/// mode is portable and must stay visible to CI regardless of platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpRunMode {
+    /// Bridge the client's stdio transport to the singleton daemon over its
+    /// unix socket (the single-writer architecture; see the routing notes at
+    /// the top of `run_cli`).
+    DaemonProxy,
+    /// Serve MCP directly from this process — no daemon involved.
+    InProcess,
+}
+
+/// Decide how `mdkb mcp` runs, from the three facts that matter.
+///
+/// The caller resolves the facts; this function only applies the rules:
+/// - `no_daemon`: MDKB_NO_DAEMON is set (the explicit escape hatch),
+/// - `daemon_supported`: this platform has the unix-socket daemon
+///   (fed from `cfg!(unix)`),
+/// - `socket_requested`: `--socket` was passed (an explicit ask for the
+///   daemon proxy).
+///
+/// Rules, in order:
+/// 1. MDKB_NO_DAEMON always wins — it exists to bypass the daemon anywhere,
+///    so it takes precedence even over an explicit `--socket`.
+/// 2. On daemon-capable platforms the proxy is the default.
+/// 3. Without daemon support, an explicit `--socket` is refused loudly:
+///    silently ignoring a flag the user typed would hide a misconfiguration.
+/// 4. Otherwise fall back to in-process. This is the Windows default: the
+///    unix-socket daemon has no Windows port, and erroring here instead
+///    surfaced to MCP clients as an opaque CONNECTION_CLOSED at session
+///    start — from the config `mdkb setup mcp` writes.
+fn resolve_mcp_run_mode(
+    no_daemon: bool,
+    daemon_supported: bool,
+    socket_requested: bool,
+) -> Result<McpRunMode> {
+    if no_daemon {
+        return Ok(McpRunMode::InProcess);
+    }
+    if daemon_supported {
+        return Ok(McpRunMode::DaemonProxy);
+    }
+    if socket_requested {
+        return Err(mdkb::Error::other(
+            "--socket selects the daemon proxy, which requires Unix; on this \
+             platform run `mdkb mcp` without --socket for the in-process server",
+        ));
+    }
+    Ok(McpRunMode::InProcess)
+}
+
+/// Serve MCP in global (multi-repo) mode over stdio, from this process.
+///
+/// One body for every in-process stdio entry point — `mdkb serve --global`
+/// and the in-process path of `mdkb mcp`. The wire behavior must stay
+/// identical across those entry points, so they share this function instead
+/// of each carrying a copy of the setup.
+///
+/// `mode_note` only feeds the startup log line, so an operator reading logs
+/// can tell which entry point put the server in-process.
+async fn run_global_stdio_server(mode_note: &str) -> Result<()> {
+    let daemon_config = mdkb::DaemonConfig::load_or_default(&mdkb::DaemonConfig::config_path())?;
+    let registry = std::sync::Arc::new(mdkb::daemon::registry::RepoRegistry::new(daemon_config));
+    let server = mdkb::mcp::server::McpServer::global(registry);
+
+    tracing::info!("Starting mdkb MCP server in global mode (stdio, {mode_note})...");
+    let (stdin, stdout) = rmcp::transport::io::stdio();
+    let service = server
+        .serve((stdin, stdout))
+        .await
+        .map_err(|e| mdkb::Error::other(format!("Failed to start server: {e}")))?;
+    service
+        .waiting()
+        .await
+        .map_err(|e| mdkb::Error::other(format!("Server error: {e}")))?;
     Ok(())
 }
 
@@ -3623,6 +3680,7 @@ async fn wait_for_shutdown_signal() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::is_server_invocation;
+    use super::{McpRunMode, resolve_mcp_run_mode};
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -3652,5 +3710,58 @@ mod tests {
                 "one-shot invocation must not select the multi-thread runtime: {one_shot:?}"
             );
         }
+    }
+
+    // `resolve_mcp_run_mode(no_daemon, daemon_supported, socket_requested)`.
+    // The daemon is unix-only, but this rule is pure, so every platform's CI
+    // exercises the whole truth table — including the branches its own
+    // platform never takes.
+
+    #[test]
+    fn mcp_unix_default_uses_daemon_proxy() {
+        assert_eq!(
+            resolve_mcp_run_mode(false, true, false).unwrap(),
+            McpRunMode::DaemonProxy
+        );
+    }
+
+    #[test]
+    fn mcp_no_daemon_env_forces_in_process_everywhere() {
+        // The escape hatch wins on every platform, and over --socket too:
+        // MDKB_NO_DAEMON exists to keep the daemon out of the path.
+        for (daemon_supported, socket_requested) in
+            [(true, false), (true, true), (false, false), (false, true)]
+        {
+            assert_eq!(
+                resolve_mcp_run_mode(true, daemon_supported, socket_requested).unwrap(),
+                McpRunMode::InProcess,
+                "MDKB_NO_DAEMON must win (daemon_supported={daemon_supported}, \
+                 socket_requested={socket_requested})"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_without_daemon_support_falls_back_to_in_process() {
+        // Regression pin: on Windows, `mdkb mcp` (the config `mdkb setup mcp`
+        // writes) used to exit with an error, which MCP clients surface as an
+        // opaque CONNECTION_CLOSED at session start. The default must instead
+        // fall back to serving in-process.
+        assert_eq!(
+            resolve_mcp_run_mode(false, false, false).unwrap(),
+            McpRunMode::InProcess
+        );
+    }
+
+    #[test]
+    fn mcp_without_daemon_support_refuses_explicit_socket() {
+        // --socket is an explicit ask for the daemon proxy. Falling back
+        // silently would ignore a flag the user typed, hiding a
+        // misconfiguration — refuse loudly and name the flag instead.
+        let err = resolve_mcp_run_mode(false, false, true).unwrap_err();
+        assert!(
+            err.to_string().contains("--socket"),
+            "error must name the flag that selected the proxy: {err}"
+        );
     }
 }
