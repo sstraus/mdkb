@@ -1397,31 +1397,38 @@ enum McpRunMode {
 ///   daemon proxy).
 ///
 /// Rules, in order:
-/// 1. MDKB_NO_DAEMON always wins — it exists to bypass the daemon anywhere,
-///    so it takes precedence even over an explicit `--socket`.
-/// 2. On daemon-capable platforms the proxy is the default.
-/// 3. Without daemon support, an explicit `--socket` is refused loudly:
-///    silently ignoring a flag the user typed would hide a misconfiguration.
-/// 4. Otherwise fall back to in-process. This is the Windows default: the
-///    unix-socket daemon has no Windows port, and erroring here instead
-///    surfaced to MCP clients as an opaque CONNECTION_CLOSED at session
-///    start — from the config `mdkb setup mcp` writes.
+/// 1. The proxy runs only when the daemon is both wanted and available:
+///    MDKB_NO_DAEMON is the escape hatch that keeps the daemon out of the
+///    path anywhere, and a platform without the daemon has nothing to proxy
+///    to. Either one alone selects the in-process server. This is the
+///    Windows default: the unix-socket daemon has no Windows port, and
+///    erroring here instead surfaced to MCP clients as an opaque
+///    CONNECTION_CLOSED at session start — from the config `mdkb setup mcp`
+///    writes.
+/// 2. A `--socket` that the chosen mode cannot honour is an operational
+///    consistency error (by convention). The flag names the daemon proxy, so
+///    ignoring it leaves the user believing the daemon serves them while the
+///    in-process server does. The same rule covers both routes into
+///    in-process mode.
 fn resolve_mcp_run_mode(
     no_daemon: bool,
     daemon_supported: bool,
     socket_requested: bool,
 ) -> Result<McpRunMode> {
-    if no_daemon {
-        return Ok(McpRunMode::InProcess);
-    }
-    if daemon_supported {
+    if !no_daemon && daemon_supported {
         return Ok(McpRunMode::DaemonProxy);
     }
     if socket_requested {
-        return Err(mdkb::Error::other(
-            "--socket selects the daemon proxy, which requires Unix; on this \
-             platform run `mdkb mcp` without --socket for the in-process server",
-        ));
+        // Name the reason the proxy is out of reach — the two causes need
+        // different remedies, so one generic message would not help.
+        let reason = if no_daemon {
+            "MDKB_NO_DAEMON forces the in-process server; unset it or drop --socket"
+        } else {
+            "the daemon proxy requires Unix; drop --socket to serve in-process here"
+        };
+        return Err(mdkb::Error::other(format!(
+            "--socket selects the daemon proxy, but {reason}"
+        )));
     }
     Ok(McpRunMode::InProcess)
 }
@@ -3712,23 +3719,44 @@ mod tests {
         }
     }
 
-    // `resolve_mcp_run_mode(no_daemon, daemon_supported, socket_requested)`.
-    // The daemon is unix-only, but this rule is pure, so every platform's CI
-    // exercises the whole truth table — including the branches its own
-    // platform never takes.
+    // Truth table for `resolve_mcp_run_mode(no_daemon, daemon_supported,
+    // socket_requested)`. Three booleans, so eight rows; the tests below
+    // cover all eight between them:
+    //
+    //   no_daemon  daemon_supported  socket_requested  result
+    //   false      true              false             DaemonProxy
+    //   false      true              true              DaemonProxy
+    //   true       true              false             InProcess
+    //   true       false             false             InProcess
+    //   true       true              true              Err (--socket vs env)
+    //   true       false             true              Err (--socket vs env)
+    //   false      false             false             InProcess
+    //   false      false             true              Err (--socket vs platform)
+    //
+    // The daemon is unix-only, but this rule is a pure function, so Linux CI
+    // proves the Windows rows too.
 
     #[test]
     fn mcp_unix_default_uses_daemon_proxy() {
-        assert_eq!(
-            resolve_mcp_run_mode(false, true, false).unwrap(),
-            McpRunMode::DaemonProxy
-        );
+        // Proves: the control case is unchanged. --socket sets the path the
+        // proxy connects to; it never selects the mode. So with the daemon
+        // available and nothing bypassing it, the proxy runs whether or not
+        // the flag was typed, and the flag is honoured rather than refused.
+        // This is the row the refusal rule must NOT touch.
+        for socket_requested in [false, true] {
+            assert_eq!(
+                resolve_mcp_run_mode(false, true, socket_requested).unwrap(),
+                McpRunMode::DaemonProxy,
+                "unix default must proxy (socket_requested={socket_requested})"
+            );
+        }
     }
 
     #[test]
     fn mcp_no_daemon_env_forces_in_process_everywhere() {
-        // The escape hatch wins on every platform: MDKB_NO_DAEMON exists to
-        // keep the daemon out of the path, daemon support or not.
+        // Proves: MDKB_NO_DAEMON alone still selects the in-process server,
+        // on a daemon-capable platform and on one without. The refusal rule
+        // added below must not turn the plain escape hatch into an error.
         for daemon_supported in [true, false] {
             assert_eq!(
                 resolve_mcp_run_mode(true, daemon_supported, false).unwrap(),
@@ -3740,11 +3768,15 @@ mod tests {
 
     #[test]
     fn mcp_no_daemon_env_refuses_explicit_socket() {
-        // One rule for both routes into in-process mode: a --socket the run
-        // cannot honour is an error, never a silent no-op. Before this,
+        // Proves: the first of the two review notes on PR #2. Before this,
         // `MDKB_NO_DAEMON=1 mdkb mcp --socket /path` dropped the flag without
-        // a word on Unix, which reads as "the daemon is serving you" when it
-        // is not. Name both halves of the conflict so the user can cut either.
+        // a word on Unix, which reads as "the daemon is serving you" when the
+        // in-process server is. It is now an error on both platforms, so one
+        // rule covers both routes into in-process mode.
+        //
+        // The assertion is on the message, not just the Err: it has to name
+        // BOTH halves of the conflict (the flag and the variable) or the user
+        // cannot tell which side to cut.
         for daemon_supported in [true, false] {
             let err = resolve_mcp_run_mode(true, daemon_supported, true).unwrap_err();
             let msg = err.to_string();
@@ -3757,10 +3789,11 @@ mod tests {
 
     #[test]
     fn mcp_without_daemon_support_falls_back_to_in_process() {
-        // Regression pin: on Windows, `mdkb mcp` (the config `mdkb setup mcp`
-        // writes) used to exit with an error, which MCP clients surface as an
-        // opaque CONNECTION_CLOSED at session start. The default must instead
-        // fall back to serving in-process.
+        // Proves: the original PR #2 fix still holds. On Windows, `mdkb mcp`
+        // — the command `mdkb setup mcp` writes into the client config — used
+        // to exit with an error, which MCP clients surface as an opaque
+        // CONNECTION_CLOSED at session start. Without --socket it must fall
+        // back to serving in-process, silently and successfully.
         assert_eq!(
             resolve_mcp_run_mode(false, false, false).unwrap(),
             McpRunMode::InProcess
@@ -3769,9 +3802,10 @@ mod tests {
 
     #[test]
     fn mcp_without_daemon_support_refuses_explicit_socket() {
-        // --socket is an explicit ask for the daemon proxy. Falling back
-        // silently would ignore a flag the user typed, hiding a
-        // misconfiguration — refuse loudly and name the flag instead.
+        // Proves: the platform half of the same rule. --socket is an explicit
+        // ask for the daemon proxy, so falling back to in-process would ignore
+        // a flag the user typed and hide a misconfiguration. The error must
+        // name the flag, or the message does not tell the user what to remove.
         let err = resolve_mcp_run_mode(false, false, true).unwrap_err();
         assert!(
             err.to_string().contains("--socket"),

@@ -204,6 +204,8 @@ pub enum Command {
     /// `MDKB_NO_DAEMON=1` to force in-process mode anywhere.
     Mcp {
         /// Override the daemon socket path (default: ~/.mdkb/daemon.sock).
+        /// Unix only, and only when the daemon proxy runs: passing it where
+        /// MCP serves in-process is an error rather than a silent no-op.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
