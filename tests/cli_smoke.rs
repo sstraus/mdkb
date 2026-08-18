@@ -1103,9 +1103,8 @@ fn smoke_hook_session_start() {
     assert_hook_output_valid(&out, "hook session-start");
 }
 
-/// Unix-only: the command under test refuses on other platforms by design
-/// ("Daemon commands require Unix" / "Hook commands require Unix domain
-/// sockets"), so a passing smoke run is impossible there.
+/// Unix-only: refuses off-Unix by design — see the note on
+/// `smoke_hook_session_start`.
 #[cfg(unix)]
 #[test]
 fn smoke_hook_user_prompt_submit() {
@@ -1116,9 +1115,8 @@ fn smoke_hook_user_prompt_submit() {
     assert_hook_output_valid(&out, "hook user-prompt-submit");
 }
 
-/// Unix-only: the command under test refuses on other platforms by design
-/// ("Daemon commands require Unix" / "Hook commands require Unix domain
-/// sockets"), so a passing smoke run is impossible there.
+/// Unix-only: refuses off-Unix by design — see the note on
+/// `smoke_hook_session_start`.
 #[cfg(unix)]
 #[test]
 fn smoke_hook_post_tool_use() {
@@ -1129,9 +1127,8 @@ fn smoke_hook_post_tool_use() {
     assert_hook_output_valid(&out, "hook post-tool-use");
 }
 
-/// Unix-only: the command under test refuses on other platforms by design
-/// ("Daemon commands require Unix" / "Hook commands require Unix domain
-/// sockets"), so a passing smoke run is impossible there.
+/// Unix-only: refuses off-Unix by design — see the note on
+/// `smoke_hook_session_start`.
 #[cfg(unix)]
 #[test]
 fn smoke_hook_stop() {
@@ -1143,9 +1140,8 @@ fn smoke_hook_stop() {
     assert_hook_output_valid(&out, "hook stop");
 }
 
-/// Unix-only: the command under test refuses on other platforms by design
-/// ("Daemon commands require Unix" / "Hook commands require Unix domain
-/// sockets"), so a passing smoke run is impossible there.
+/// Unix-only: refuses off-Unix by design — see the note on
+/// `smoke_hook_session_start`.
 #[cfg(unix)]
 #[test]
 fn smoke_hook_events_tolerate_empty_stdin() {
@@ -1246,9 +1242,8 @@ fn smoke_session_index_no_sessions() {
 
 // ── Daemon (non-destructive) ────────────────────────────────────────
 
-/// Unix-only: the command under test refuses on other platforms by design
-/// ("Daemon commands require Unix" / "Hook commands require Unix domain
-/// sockets"), so a passing smoke run is impossible there.
+/// Unix-only: refuses off-Unix by design — see the note on
+/// `smoke_hook_session_start`.
 #[cfg(unix)]
 #[test]
 fn smoke_daemon_status() {

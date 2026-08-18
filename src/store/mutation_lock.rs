@@ -238,10 +238,9 @@ mod tests {
         waiter.join().unwrap();
     }
 
-    /// Unix-only: the live-connection probe rides on POSIX byte-range
-    /// locks. On Windows the same probe errors with os error 33 (lock
-    /// violation) while a connection is live — a real platform difference
-    /// in the probe, not a test artifact; it needs its own fix.
+    /// Unix-only: blocked by the Windows live-lock probe defect — see the
+    /// note on `corrupt_db_is_left_in_place_while_a_connection_is_live` in
+    /// `src/store/heal.rs`.
     #[cfg(unix)]
     #[test]
     fn live_holders_coexist_and_veto_the_exclusive_probe() {

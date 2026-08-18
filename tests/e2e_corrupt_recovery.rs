@@ -160,10 +160,9 @@ fn a_mutation_on_a_corrupt_index_reports_it_as_corruption() {
     );
 }
 
-/// Unix-only: the live-connection probe rides on POSIX byte-range locks.
-/// On Windows the probe errors with os error 33 (lock violation) while a
-/// connection is live, so heal/quarantine misbehaves there — a real
-/// platform difference tracked for its own fix, not a test artifact.
+/// Unix-only: blocked by the Windows live-lock probe defect — see the note
+/// on `corrupt_db_is_left_in_place_while_a_connection_is_live` in
+/// `src/store/heal.rs`.
 #[cfg(unix)]
 #[test]
 fn a_read_open_refuses_to_join_a_known_corrupt_generation() {
@@ -273,10 +272,9 @@ fn a_failed_read_releases_the_context_for_the_next_open() {
     );
 }
 
-/// Unix-only: the live-connection probe rides on POSIX byte-range locks.
-/// On Windows the probe errors with os error 33 (lock violation) while a
-/// connection is live, so heal/quarantine misbehaves there — a real
-/// platform difference tracked for its own fix, not a test artifact.
+/// Unix-only: blocked by the Windows live-lock probe defect — see the note
+/// on `corrupt_db_is_left_in_place_while_a_connection_is_live` in
+/// `src/store/heal.rs`.
 #[cfg(unix)]
 #[test]
 fn releasing_the_handle_lets_the_next_open_quarantine_salvage_and_rebuild() {
