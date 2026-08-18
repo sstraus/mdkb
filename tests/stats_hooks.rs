@@ -86,6 +86,9 @@ fn query_event_count(conn: &Connection) -> i64 {
         .expect("count query events")
 }
 
+/// Unix-only: drives `mdkb hook` dispatch, which refuses off-Unix, so the
+/// pseudo-session / query_event it asserts is never recorded there.
+#[cfg(unix)]
 #[test]
 fn hook_dispatch_records_call_under_hooks_pseudo_session() {
     let tmp = seed_repo();
@@ -137,6 +140,9 @@ fn query_events_off_by_default_records_nothing() {
     );
 }
 
+/// Unix-only: drives `mdkb hook` dispatch, which refuses off-Unix, so the
+/// pseudo-session / query_event it asserts is never recorded there.
+#[cfg(unix)]
 #[test]
 fn query_events_on_records_hash_but_never_text() {
     let tmp = seed_repo();

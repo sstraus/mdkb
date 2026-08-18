@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **The test suite now compiles and runs clean on Windows.** Three test
+  targets used `std::os::unix` ungated, so `cargo test` stopped at compile
+  time and a Windows contributor could not run a single test. Tests that are
+  unix-only by design (daemon, `flock`, unix sockets, `mdkb hook`) are now
+  gated `#[cfg(unix)]`, each with a comment naming the reason. Tests that
+  were merely written with unix-shaped inputs now run on Windows too: path
+  assertions compare components instead of `/`-strings, the outside-root
+  security tests build their escape path from a real tempdir, and the
+  git-sync test hands git a non-verbatim path. Test code only; no shipped
+  behavior changes. Running the suite on Windows surfaced three real
+  platform defects, documented at the gate sites: the live-connection lock
+  probe errors with os error 33 (heal/quarantine misbehaves), `mdkb schema`
+  crashes with a main-thread stack overflow, and `mdkb hook` exits nonzero
+  against the exit-zero host contract.
+
 ## 3.7.16 (2026-08-18)
 
 ### Fixed

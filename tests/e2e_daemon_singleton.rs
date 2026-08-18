@@ -3,6 +3,11 @@
 //! Validates that `acquire_singleton_lock` enforces one-at-a-time semantics
 //! via advisory file locking (`flock(LOCK_EX | LOCK_NB)` on Unix).
 
+// The lock under test is unix-only (`daemon::singleton` is `#[cfg(unix)]` in
+// the lib), so on other platforms this file compiles to an empty test binary
+// instead of failing the whole `cargo test` run.
+#![cfg(unix)]
+
 use mdkb::daemon::singleton::{AcquireError, acquire_singleton_lock};
 use tempfile::TempDir;
 

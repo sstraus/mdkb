@@ -10,6 +10,11 @@
 //! 3. `post-tool-use` enqueues the edited path into
 //!    `.mdkb/reindex-queue.jsonl`.
 
+// Unix-only: `mdkb hook` refuses on other platforms by design ("Hook
+// commands require Unix domain sockets"), so these end-to-end runs cannot
+// pass there.
+#![cfg(unix)]
+
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};

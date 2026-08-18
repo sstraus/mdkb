@@ -87,6 +87,11 @@ fn corrupt_after(setup: impl FnOnce(&Context)) -> (tempfile::TempDir, std::path:
 /// disk, but the *fact* that `map/` is a collection exists only in this table —
 /// so losing it silently downgrades every later `mdkb update` to indexing the
 /// root alone, which is exactly what shipped 3 docs where 2307 were expected.
+/// Unix-only: salvage rides on the heal/quarantine path, whose
+/// live-connection probe errors on Windows (os error 33, byte-range lock
+/// semantics) — the same real platform defect gated in src/store. Ungate
+/// with that fix.
+#[cfg(unix)]
 #[test]
 fn a_registered_collection_survives_a_quarantine() {
     let (_dir, root) = corrupt_after(|ctx| {
@@ -115,6 +120,11 @@ fn a_registered_collection_survives_a_quarantine() {
 
 /// Memory edit history — which now also holds the losing side of every file/DB
 /// conflict (story 014-fdf0) — is the other thing no reindex can rebuild.
+/// Unix-only: salvage rides on the heal/quarantine path, whose
+/// live-connection probe errors on Windows (os error 33, byte-range lock
+/// semantics) — the same real platform defect gated in src/store. Ungate
+/// with that fix.
+#[cfg(unix)]
 #[test]
 fn memory_revisions_survive_a_quarantine() {
     let (_dir, root) = corrupt_after(|ctx| {

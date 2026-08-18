@@ -12,6 +12,11 @@
 //! removes a whole family of causes by construction, which is what makes the
 //! remaining search space small enough to reason about.
 
+// The daemon these tests route to is unix-only, and two of them bind a fake
+// daemon `UnixListener`. Gate the file so `cargo test` compiles on platforms
+// without the daemon instead of failing the whole run.
+#![cfg(unix)]
+
 use mdkb::cli::Command;
 use mdkb::core::routing::{Routing, routing_for};
 

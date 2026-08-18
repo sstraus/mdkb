@@ -4033,8 +4033,18 @@ if (require.main === module) {
 
     #[test]
     fn test_uri_to_path_valid() {
-        let path = uri_to_path("file:///Users/me/project");
-        assert_eq!(path, Some(PathBuf::from("/Users/me/project")));
+        // What counts as an absolute path differs per OS, so each host
+        // asserts its own shape.
+        #[cfg(unix)]
+        {
+            let path = uri_to_path("file:///Users/me/project");
+            assert_eq!(path, Some(PathBuf::from("/Users/me/project")));
+        }
+        #[cfg(windows)]
+        {
+            let path = uri_to_path("file://C:/Users/me/project");
+            assert_eq!(path, Some(PathBuf::from("C:/Users/me/project")));
+        }
     }
 
     #[test]

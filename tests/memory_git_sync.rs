@@ -109,6 +109,13 @@ fn frontmatter_keys(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// A filesystem path in the shape git accepts as a local remote: on
+/// Windows, `canonicalize` yields a verbatim `\\?\C:\...` path whose
+/// prefix git reads as an SSH hostname. Stripping it is a no-op elsewhere.
+fn git_remote_path(p: &Path) -> String {
+    p.to_str().unwrap().trim_start_matches(r"\\?\").to_string()
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
@@ -665,7 +672,8 @@ fn two_clones_converge_without_a_manual_import() {
     // --- clone B ---
     let b_dir = tempfile::tempdir().expect("tempdir");
     let b_parent = b_dir.path().canonicalize().unwrap();
-    git(&b_parent, &["clone", origin.to_str().unwrap(), "b"]);
+    let origin_for_git = git_remote_path(&origin);
+    git(&b_parent, &["clone", &origin_for_git, "b"]);
     let b = b_parent.join("b");
     git(&b, &["config", "user.email", "t@example.com"]);
     git(&b, &["config", "user.name", "T"]);
@@ -703,7 +711,7 @@ fn two_clones_converge_without_a_manual_import() {
     git_commit_all(&origin, "A adds an entry");
     git(
         &origin,
-        &["pull", b.to_str().unwrap(), "main", "--no-rebase"],
+        &["pull", &git_remote_path(&b), "main", "--no-rebase"],
     );
 
     let a_ids = {
@@ -716,7 +724,7 @@ fn two_clones_converge_without_a_manual_import() {
     // --- B pulls back ---
     git(
         &b,
-        &["pull", origin.to_str().unwrap(), "main", "--no-rebase"],
+        &["pull", &git_remote_path(&origin), "main", "--no-rebase"],
     );
     let b_ids = {
         let ctx = Context::open(&b).expect("open B3");

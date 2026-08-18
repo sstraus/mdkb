@@ -78,6 +78,11 @@ mod tests {
     /// the live lock excludes the other writer, and the result is the
     /// doubly-referenced pages and freelist mismatch we kept recovering from.
     /// Opening through an alias must land on the identical path.
+    ///
+    /// Unix-only: creating the alias needs `std::os::unix::fs::symlink`;
+    /// the Windows equivalent requires Developer Mode or elevation, which
+    /// would make the test fail by machine setting rather than by code.
+    #[cfg(unix)]
     #[test]
     fn open_canonicalizes_the_store_so_every_lock_shares_one_identity() {
         let temp = setup_temp_dir();
@@ -837,7 +842,12 @@ mod tests {
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
-        let result = handle_collection_add(&ctx, "evil", "/etc", "**/*");
+        // A second tempdir gives an absolute path outside the root that is
+        // valid on every platform; a literal like "/etc" is not absolute on
+        // Windows, so the guard under test would never see an escape there.
+        let outside = setup_temp_dir();
+        let outside_path = outside.path().to_string_lossy().to_string();
+        let result = handle_collection_add(&ctx, "evil", &outside_path, "**/*");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("escapes root"));
@@ -1410,9 +1420,18 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
         handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
 
-        // Try to index a file outside the project root
-        let result = handle_update_files(&ctx, temp.path(), &["/etc/hosts".to_string()])
-            .expect("should succeed overall");
+        // Try to index a file outside the project root. The file lives in a
+        // second tempdir so the path is absolute-and-outside on every
+        // platform ("/etc/hosts" is not an absolute path on Windows).
+        let outside = setup_temp_dir();
+        let outside_file = outside.path().join("hosts");
+        std::fs::write(&outside_file, "outside").unwrap();
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &[outside_file.to_string_lossy().to_string()],
+        )
+        .expect("should succeed overall");
         assert_eq!(result.added, 0, "file outside root should not be indexed");
         assert!(
             result.errors.iter().any(|e| e.contains("path traversal")),
