@@ -1,8 +1,19 @@
 # Changelog
 
-## 3.7.16 (2026-08-14)
+## 3.7.16 (2026-08-18)
 
 ### Fixed
+
+- **On Windows, `mdkb mcp` now serves MCP in-process instead of exiting.** The
+  daemon is a unix-socket singleton, so `mdkb mcp` — the entry `mdkb setup mcp`
+  writes into the MCP client config — exited with `Daemon proxy requires Unix`.
+  MCP clients surface that as an opaque `CONNECTION_CLOSED` at session start,
+  with no cause, which made mdkb unusable on Windows out of the box. Every other
+  Windows path already runs in-process, so the default now falls back to the same
+  in-process global stdio server `MDKB_NO_DAEMON=1` selects. An explicit
+  `--socket` on a platform without the daemon still refuses and names the flag:
+  ignoring a typed flag would hide a misconfiguration. Unix behavior is
+  unchanged. Reported and fixed by Steve Muchow (@smuchow1962).
 
 - **Outside a git repo, project root resolution no longer adopts a container
   directory's store.** `resolve_project_root` bounded its upward search by the
