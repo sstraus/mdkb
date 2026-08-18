@@ -41,6 +41,17 @@
   its own — it decides whether an accidental one costs a slow minute or an
   unusable machine.
 
+### Added
+
+- **A unit test now pins that `--socket` overrides the default daemon socket
+  path.** The behavior already worked: when the daemon proxy runs, a typed
+  `--socket` path wins over `socket_path` in `~/.mdkb/daemon.toml` and the
+  `~/.mdkb/daemon.sock` fallback. But the mode resolver reduced the flag to a
+  boolean, so no test could see whether the path survived resolution. The
+  resolver now carries the path in `McpRunMode::DaemonProxy`, and a test
+  asserts the typed path comes back intact. Explicit testing of
+  already-working behavior, added to prevent future drift.
+
 ## 3.7.12 (2026-08-09)
 
 ### Fixed
