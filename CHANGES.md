@@ -1,5 +1,30 @@
 # Changelog
 
+## 3.7.17 (2026-08-19)
+
+### Fixed
+
+- **Outside a git repo, a store is no longer CREATED on a directory whose store
+  would be refused.** The 3.7.16 guard rejected *adopting* a container's
+  `.mdkb/`, but the fallback that picks the anchor when there is nothing to adopt
+  was never checked. The two disagree exactly when it matters: a session started
+  with `cwd = ~/Gits`, which holds every repo and is not one. No store existed
+  yet, so there was nothing to refuse; the walk returned nothing, no
+  `CLAUDE_PROJECT_DIR` was set, and `cwd` was handed back verbatim — anchoring a
+  brand-new store on the very directory adoption rejects. `code.sqlite` reached
+  2.9 GB in nine minutes and the daemon held ten of fourteen cores at 100% for
+  24 hours, silent (no log line after the first minutes), with the watcher
+  looping on `File watcher channel full — scheduling a full rescan to recover`.
+  The over-anchoring test now gates every anchor outside a repo — discovered,
+  hinted, or `cwd` — and `resolve_project_root` returns `Option`, so a refusal is
+  a refusal rather than a fallback: the CLI errors and names the directory, hooks
+  and MCP roots are skipped. `mdkb init` still bypasses resolution entirely, so a
+  store on a container remains possible when it is what you actually want.
+
+  The guard is deliberately absent from the git branch: inside a repo the anchor
+  is already bounded by the repo root, and `holds_git_repos` cannot distinguish a
+  container of projects from one repo that vendors submodules.
+
 ## 3.7.16 (2026-08-18)
 
 ### Fixed
