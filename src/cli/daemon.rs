@@ -4,6 +4,9 @@
 //! daemon via Unix signals. None of them require the daemon to be healthy —
 //! a stale pid file with a dead process is reported as "not running".
 
+// Both timeout consts below are unix-only, and `format_duration` is
+// unix-or-test, so this import follows the same condition.
+#[cfg(any(unix, test))]
 use std::time::Duration;
 
 use crate::error::{Error, Result};
@@ -193,6 +196,8 @@ pub async fn handle_restart() -> Result<()> {
     Err(Error::other("Daemon commands require Unix"))
 }
 
+// Used by the unix `platform` module, and by the tests on every host.
+#[cfg(any(unix, test))]
 fn format_duration(d: Duration) -> String {
     let secs = d.as_secs();
     if secs < 60 {
@@ -223,7 +228,9 @@ fn process_alive(pid: u32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(not(unix))]
+// The non-unix build has no caller outside the tests: every daemon command
+// refuses before it would probe a pid.
+#[cfg(all(not(unix), test))]
 fn process_alive(_pid: u32) -> bool {
     // Daemon is unix-only; on other platforms treat as dead.
     false
@@ -242,13 +249,6 @@ fn signal_term(pid: u32) -> Result<()> {
             std::io::Error::last_os_error()
         )))
     }
-}
-
-#[cfg(not(unix))]
-fn signal_term(_pid: u32) -> Result<()> {
-    Err(Error::other(
-        "daemon control not supported on this platform",
-    ))
 }
 
 /// Double-fork + setsid + stdio redirection. Must be called BEFORE tokio

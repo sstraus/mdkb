@@ -34,13 +34,18 @@ use mdkb::cli::handlers::{
 };
 #[cfg(unix)]
 use mdkb::cli::hook_client;
+// The `Command::Hook` arm is unix-only inside, so on Windows nothing here
+// has a caller.
+#[cfg(unix)]
+use mdkb::cli::HookCommand;
+#[cfg(unix)]
 use mdkb::cli::hook_logic;
 use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
     Cli, CollectionCommand, Command, DaemonCommand, EvalCommand, EvolveCommand, ExperimentCommand,
-    GraphCommand, HookCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat,
-    RemoveHooksCommand, RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand,
-    SetupMcpCommand, SetupRemoveCommand,
+    GraphCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat, RemoveHooksCommand,
+    RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand, SetupMcpCommand,
+    SetupRemoveCommand,
 };
 use mdkb::core::Context;
 use mdkb::core::indexing::{UpdateOutcome, UpdateRequest, report_code_stats, update_documents};
@@ -118,6 +123,8 @@ async fn run() -> Result<()> {
     result
 }
 
+// `cli` is mutated only by the unix daemon-routing block below.
+#[cfg_attr(not(unix), allow(unused_mut))]
 async fn run_cli(mut cli: Cli) -> Result<()> {
     // Set up tracing based on verbosity
     let level = match cli.verbose {
@@ -1658,6 +1665,8 @@ fn print_update_outcome_csv(outcome: &UpdateOutcome) {
 ///
 /// Every result remains structured across the socket; this CLI process owns
 /// all user-facing stdout and stderr formatting.
+// Called only by the unix daemon-routing block.
+#[cfg(unix)]
 fn print_routed_result(
     command: &Command,
     result: &mdkb::core::cli_mutation::CliMutationResult,
