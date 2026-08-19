@@ -1420,17 +1420,15 @@ enum McpRunMode {
 ///    in-process server does instead. The same rule covers both routes into
 ///    in-process mode.
 ///
-/// The steps in plain english:
-/// 1. Can we use the daemon? If the user did not say "no daemon" AND
-/// this computer supports it → use the daemon proxy. A typed --socket path
-/// rides along in the mode and overrides the config default. Done.
-/// 2. Daemon is disallowed, but the user asked for --socket. --socket only works with the daemon.
-/// So this is an error. The function tells the user WHY the daemon is out:
-///    - The MDKB_NO_DAEMON setting blocked it, or
-///    - This computer (not Unix) cannot do it.
-/// Each cause has its own fix, so each gets its own message.
-/// 3. Daemon is out, no --socket. Run in-process. Done.
-///
+/// The same three steps, stated plainly:
+/// 1. Is the daemon both allowed and available? If so, run the proxy. A
+///    typed `--socket` path rides along in the mode and replaces the config
+///    default.
+/// 2. Is the daemon out of reach, but `--socket` was typed? That is an
+///    error, because the flag works only with the proxy. The message names
+///    the cause — MDKB_NO_DAEMON, or a platform without the daemon —
+///    because each cause has its own remedy.
+/// 3. Otherwise run the in-process server.
 fn resolve_mcp_run_mode(
     no_daemon: bool,
     daemon_supported: bool,
@@ -3777,10 +3775,14 @@ mod tests {
     #[test]
     fn mcp_explicit_socket_overrides_default_when_daemon_runs() {
         // Proves: `mdkb mcp --socket /path` on a daemon-capable platform
-        // still proxies, AND the typed path rides through the mode — the
-        // proxy must connect to /path, not the config default. Before the
-        // path was threaded through here, only the bool survived resolution
-        // and no test could see whether the override was honored.
+        // still proxies, and the typed path survives resolution intact.
+        // Before the path was threaded through the mode, only a bool came
+        // back, so a refactor could drop the path and no test would notice.
+        //
+        // Scope: this pins the passthrough only. Whether the proxy then
+        // CONNECTS to that path instead of the config default is decided by
+        // the `unwrap_or_else` chain in the `Command::Mcp` arm, which no
+        // test reaches yet.
         let typed = std::path::PathBuf::from("/tmp/override.sock");
         assert_eq!(
             resolve_mcp_run_mode(false, true, Some(typed.clone())).unwrap(),
