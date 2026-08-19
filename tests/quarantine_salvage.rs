@@ -15,12 +15,20 @@
 //! directories are collections, what an entry used to say — must survive, or the
 //! quarantine turns a recoverable corruption into permanent data loss.
 
-use mdkb::cli::handlers::{handle_collection_add, handle_init, handle_memory_add};
+use mdkb::cli::handlers::{handle_collection_add, handle_init};
+// Only the quarantine tests write memory entries, and those are unix-only
+// (they need the daemon's file layout), so this import has no user on Windows.
+#[cfg(unix)]
+use mdkb::cli::handlers::handle_memory_add;
 use mdkb::core::Context;
 use mdkb::store::collections;
 
 /// Build a store, populate it, then tear the database file in half so the next
 /// open must quarantine and rebuild.
+///
+/// Gated with its callers: every test that corrupts a store is unix-only, so
+/// on Windows this helper would be dead code rather than a missing case.
+#[cfg(unix)]
 fn corrupt_after(setup: impl FnOnce(&Context)) -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().canonicalize().expect("canonicalize");

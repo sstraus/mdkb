@@ -70,6 +70,9 @@ fn open_index(dir: &Path) -> Connection {
     Connection::open(dir.join(".mdkb/index.sqlite")).expect("open index")
 }
 
+// Both callers are unix-only hook-dispatch tests, so this counts nothing on
+// Windows.
+#[cfg(unix)]
 fn hooks_call_count(conn: &Connection, tool: &str) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM call_log cl
