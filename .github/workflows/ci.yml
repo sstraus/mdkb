@@ -11,8 +11,20 @@ env:
 
 jobs:
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    # The suite runs on both platforms because the product has platform-only
+    # code: the daemon, its unix socket, and the routing around them are
+    # #[cfg(unix)], so the Windows branches are the ones no Ubuntu job can
+    # reach. Issue #1 was a Windows-only failure at every session start that
+    # shipped with every gate green, because no gate ran on Windows.
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # Report both platforms on a red run. Cancelling the survivor hides
+      # whether a failure is platform-specific, which is the question this
+      # matrix exists to answer.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -32,8 +44,15 @@ jobs:
         run: cargo test --all-features
 
   lint:
-    name: Lint
-    runs-on: ubuntu-latest
+    # Formatting is platform-independent, so it runs once. Clippy is not:
+    # code behind #[cfg(unix)] compiles out on Windows, which leaves its
+    # imports and helpers unused and warns only there.
+    name: Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -43,6 +62,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Check formatting
+        if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --check
 
       - name: Clippy
