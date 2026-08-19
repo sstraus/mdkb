@@ -6,8 +6,7 @@
 
 - **The test suite now compiles and runs clean on Windows.** Three test
   targets used `std::os::unix` ungated, so `cargo test` stopped at compile
-  time and a Windows contributor could not run a single test. Test code
-  only; no shipped behavior changes.
+  time and a Windows contributor could not run a single test.
   - Tests that are unix-only by design (daemon, `flock`, unix sockets,
     `mdkb hook`) are gated `#[cfg(unix)]`, each with a comment naming the
     reason.
@@ -23,6 +22,37 @@
       (heal/quarantine misbehaves);
     - `mdkb schema` crashes with a main-thread stack overflow;
     - `mdkb hook` exits nonzero against the exit-zero host contract.
+
+- **CI runs the test and clippy jobs on Windows as well as Ubuntu.** Every
+  job ran on `ubuntu-latest`, and `release.yml` shipped a Windows binary
+  built with `cargo build` and no test pass, so a Windows-only failure
+  could reach users with every gate green. `fail-fast: false` keeps a red
+  run reporting both platforms. `cargo fmt` still runs once, on Ubuntu.
+
+### Fixed
+
+- **`mdkb setup hooks codex` and `mdkb setup mcp codex` failed on Windows**
+  with "HOME environment variable not set". Windows sets `USERPROFILE`, not
+  `HOME`. `src/git.rs` already read both but kept the rule private, so seven
+  other call sites re-derived the unix-only read: four in `setup.rs`, one
+  each in `hook_logic.rs`, `embeddings.rs`, and `mcp/server.rs`. A shared
+  `src/home.rs` now owns it.
+  - Three of those sites failed quietly rather than loudly: the
+    `.mdkbignore-hooks` ancestor walk had no stop and climbed past the user
+    profile; the embedding model cache fell back to a cwd-relative
+    directory; the MCP startup session index read `.claude/projects`
+    relative to the working directory.
+  - Extracting the rule surfaced a latent bug in the original: it filtered
+    for emptiness after the fallback, so an empty `HOME` shadowed a usable
+    `USERPROFILE`.
+  - Found by the Windows CI job above, on its first run.
+
+### Changed
+
+- **Windows builds without warnings.** Seven warnings came from the
+  `#[cfg(unix)]` daemon-routing block compiling out and leaving its imports
+  and helpers without callers. Each now carries the condition that is
+  actually true, so the compiler keeps checking it.
 
 ## 3.7.16 (2026-08-18)
 
