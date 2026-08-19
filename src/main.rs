@@ -3789,7 +3789,7 @@ mod tests {
             McpRunMode::DaemonProxy {
                 socket_override: Some(typed)
             },
-            "--socket must override the config-default socket path"
+            "the resolver must return the typed --socket path unchanged"
         );
     }
 
