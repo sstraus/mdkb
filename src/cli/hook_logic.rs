@@ -163,7 +163,9 @@ pub fn canonicalize_under_cwd(base: &Path, raw: &str) -> Option<String> {
 /// Walk ancestors looking for `.mdkbignore-hooks` marker. Stops at the user's
 /// home directory (never walks above it) to avoid picking up unrelated markers.
 pub fn mdkbignore_hooks_present(start: &Path) -> bool {
-    let home: Option<PathBuf> = std::env::var_os("HOME").map(PathBuf::from);
+    // Without this the walk had no stop on Windows, where HOME is unset, so
+    // it climbed past the user profile into unrelated directories.
+    let home: Option<PathBuf> = crate::home::dir();
     let mut current: Option<&Path> = Some(start);
     while let Some(dir) = current {
         if dir.join(".mdkbignore-hooks").exists() {

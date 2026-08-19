@@ -142,8 +142,8 @@ fn shared_cache_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("FASTEMBED_CACHE_DIR") {
         return PathBuf::from(dir);
     }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".cache/fastembed");
+    if let Some(home) = crate::home::dir() {
+        return home.join(".cache/fastembed");
     }
     // Fallback: use CWD-relative (original fastembed behavior)
     PathBuf::from(".fastembed_cache")

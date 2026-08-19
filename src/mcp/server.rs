@@ -1046,9 +1046,12 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                             }
                         }
 
-                        let sessions_base =
-                            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                                .join(".claude/projects");
+                        // unwrap_or_default() here meant a missing HOME resolved to
+                        // ".claude/projects" relative to the cwd, so on Windows the
+                        // startup session index silently read the wrong directory.
+                        let sessions_base = crate::home::dir()
+                            .unwrap_or_default()
+                            .join(".claude/projects");
                         let project_root = startup_root.to_string_lossy().to_string();
                         match crate::core::sessions::handle_session_index(
                             &ctx,

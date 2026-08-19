@@ -352,13 +352,14 @@ pub fn claude_settings_path(
             let dir = if let Some(p) = profile_dir {
                 p.to_path_buf()
             } else {
-                let home = env::var_os("HOME").ok_or_else(|| {
+                let home = crate::home::dir().ok_or_else(|| {
                     Error::from(ErrorKind::Command {
                         command: "setup hooks claude".to_string(),
-                        message: "HOME environment variable not set".to_string(),
+                        message: "no home directory: neither HOME nor USERPROFILE is set"
+                            .to_string(),
                     })
                 })?;
-                std::path::PathBuf::from(home).join(".claude")
+                home.join(".claude")
             };
             Ok(dir.join("settings.json"))
         }
@@ -774,26 +775,22 @@ pub fn handle_setup_hooks_claude(
 
 /// Resolve the Codex hooks file path: `$HOME/.codex/hooks.json`.
 pub fn codex_hooks_path() -> Result<std::path::PathBuf> {
-    let home = env::var_os("HOME").ok_or_else(|| {
+    let home = crate::home::dir().ok_or_else(|| {
         Error::from(ErrorKind::Command {
             command: "setup hooks codex".to_string(),
-            message: "HOME environment variable not set".to_string(),
+            message: "no home directory: neither HOME nor USERPROFILE is set".to_string(),
         })
     })?;
-    Ok(std::path::PathBuf::from(home)
-        .join(".codex")
-        .join("hooks.json"))
+    Ok(home.join(".codex").join("hooks.json"))
 }
 
 /// Best-effort probe for `codex_hooks = true` in `$HOME/.codex/config.toml`.
 /// Missing file or missing flag both return `false`. Parse errors return `false`.
 fn probe_codex_hooks_flag() -> bool {
-    let Some(home) = env::var_os("HOME") else {
+    let Some(home) = crate::home::dir() else {
         return false;
     };
-    let cfg = std::path::PathBuf::from(home)
-        .join(".codex")
-        .join("config.toml");
+    let cfg = home.join(".codex").join("config.toml");
     let Ok(raw) = std::fs::read_to_string(&cfg) else {
         return false;
     };
@@ -878,15 +875,13 @@ pub struct McpCodexSetupResult {
 
 /// Resolve the Codex CLI config.toml path: `$HOME/.codex/config.toml`.
 pub fn codex_config_path() -> Result<std::path::PathBuf> {
-    let home = env::var_os("HOME").ok_or_else(|| {
+    let home = crate::home::dir().ok_or_else(|| {
         Error::from(ErrorKind::Command {
             command: "setup mcp codex".to_string(),
-            message: "HOME environment variable not set".to_string(),
+            message: "no home directory: neither HOME nor USERPROFILE is set".to_string(),
         })
     })?;
-    Ok(std::path::PathBuf::from(home)
-        .join(".codex")
-        .join("config.toml"))
+    Ok(home.join(".codex").join("config.toml"))
 }
 
 /// Register mdkb as an MCP server in Codex CLI's `~/.codex/config.toml`.

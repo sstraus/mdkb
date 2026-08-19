@@ -19,6 +19,7 @@ pub mod domain;
 pub mod error;
 pub mod eval;
 pub mod git;
+pub mod home;
 pub mod llm;
 pub mod mcp;
 pub mod metrics;

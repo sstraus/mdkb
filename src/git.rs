@@ -136,14 +136,10 @@ fn find_store_within(start: &Path, boundary: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The user's home directory, if the environment names one. `USERPROFILE` is
-/// the Windows spelling; an empty value is treated as absent so it cannot
-/// degrade into the filesystem root.
+/// The user's home directory. See `crate::home` for the rule; this module had
+/// the only correct copy of it, and now shares it rather than owning it.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    crate::home::dir()
 }
 
 /// True if `dir` holds git repositories among its immediate children — that is,
