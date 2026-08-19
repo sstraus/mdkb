@@ -170,6 +170,39 @@ fn is_home_or_above(dir: &Path, home: Option<&Path>) -> bool {
     home.is_some_and(|home| home.starts_with(dir))
 }
 
+/// True if anchoring a store at `dir` would cover far more than one project.
+///
+/// This must gate EVERY anchor outside a repo, not just an adopted one. Guarding
+/// adoption alone is what let the 2026-08-19 failure through: with no store yet
+/// on `~/Gits` there was nothing to refuse, and the unguarded `cwd` fallback then
+/// created one on the very directory adoption would have rejected.
+///
+/// It deliberately does NOT gate the git branch: inside a repo the anchor is
+/// bounded by the repo root, and a repo that vendors submodules as immediate
+/// children would otherwise be refused its own legitimate store.
+fn over_anchors(dir: &Path, home: Option<&Path>) -> bool {
+    is_home_or_above(dir, home) || holds_git_repos(dir)
+}
+
+/// The directory to anchor a store at when `cwd` is not inside a git repo, or
+/// `None` when every candidate here would over-anchor.
+///
+/// Not a git repo means there is no repo boundary — but "no boundary" must not
+/// mean "anchor anywhere". The walk still climbs, because a non-git project must
+/// keep working from a sub-path; the discovered store, the hint and the bare
+/// `cwd` are then held to the same rule, so refusing to adopt a container's
+/// store can no longer coexist with creating one in the same directory.
+fn anchor_outside_repo(
+    cwd: &Path,
+    project_hint: Option<&Path>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let anchor = find_project_store_above(cwd, home)
+        .or_else(|| project_hint.map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    (!over_anchors(&anchor, home)).then(|| resolve_main_worktree(&anchor))
+}
+
 /// Walk up from `start` (inclusive) to the nearest ancestor `.mdkb/` store that
 /// belongs to a *project*, so a drifted sub-path of a non-git project still
 /// re-discovers its own store instead of creating a second one beside it.
@@ -211,25 +244,27 @@ fn find_project_store_above(start: &Path, home: Option<&Path>) -> Option<PathBuf
 ///  3. `project_hint` (e.g. `CLAUDE_PROJECT_DIR`, the stable launch dir) when set;
 ///  4. `cwd` itself.
 ///
+/// Outside a repo, whichever of 2–4 wins is then checked with [`over_anchors`]:
+/// `None` means there is no directory here that may hold a store, and the caller
+/// must NOT invent one. `mdkb init` bypasses this function entirely, so a user
+/// who really wants a store on a container can still create it explicitly.
+///
 /// The chosen directory is then collapsed to the main worktree so that all
 /// worktrees of a repo share a single store. This makes the anchor immune to
 /// working-directory drift within the repo: `cwd` only matters as a starting
 /// point for the bounded upward walk and as the last-resort fallback.
-pub fn resolve_project_root(cwd: &Path, project_hint: Option<&Path>) -> PathBuf {
-    let chosen = match find_git_root(cwd) {
+pub fn resolve_project_root(cwd: &Path, project_hint: Option<&Path>) -> Option<PathBuf> {
+    let home = home_dir();
+    let home = home.as_deref();
+    match find_git_root(cwd) {
         // Inside a repo: a repo owns exactly one store, at (or below) its own
         // root. Rediscover a drifted sub-path's store, but never climb past the
         // repo boundary.
-        Some(git_root) => find_store_within(cwd, &git_root).unwrap_or(git_root),
-        // Not a git repo, so there is no repo boundary — but "no boundary" must
-        // not mean "adopt anything". The walk still climbs, because a non-git
-        // project must keep working from a sub-path; it just refuses stores that
-        // would anchor far more than the project (`~/Gits`, `$HOME`).
-        None => find_project_store_above(cwd, home_dir().as_deref())
-            .or_else(|| project_hint.map(Path::to_path_buf))
-            .unwrap_or_else(|| cwd.to_path_buf()),
-    };
-    resolve_main_worktree(&chosen)
+        Some(git_root) => Some(resolve_main_worktree(
+            &find_store_within(cwd, &git_root).unwrap_or(git_root),
+        )),
+        None => anchor_outside_repo(cwd, project_hint, home),
+    }
 }
 
 /// Discover ancestor `.mdkb/` stores **above** `primary`, for read-only
@@ -451,7 +486,7 @@ mod tests {
         let deep = proj.join("src");
         std::fs::create_dir_all(&deep).unwrap();
 
-        assert_eq!(resolve_project_root(&deep, None), proj);
+        assert_eq!(resolve_project_root(&deep, None), Some(proj));
     }
 
     #[test]
@@ -462,7 +497,7 @@ mod tests {
         let deep = repo.join("a/b");
         std::fs::create_dir_all(&deep).unwrap();
         // No .mdkb anywhere → create anchor is the git root.
-        assert_eq!(resolve_project_root(&deep, None), repo.to_path_buf());
+        assert_eq!(resolve_project_root(&deep, None), Some(repo.to_path_buf()));
     }
 
     #[test]
@@ -522,7 +557,7 @@ mod tests {
         std::fs::create_dir_all(&deep).unwrap();
 
         // Must anchor to the repo's own git root, not the parent's store.
-        assert_eq!(resolve_project_root(&deep, None), repo);
+        assert_eq!(resolve_project_root(&deep, None), Some(repo));
         // Sanity: the unbounded walk WOULD have returned the parent.
         assert_eq!(find_existing_store(&deep), Some(parent.to_path_buf()));
     }
@@ -546,7 +581,7 @@ mod tests {
             Some(project.clone())
         );
         // And through the public entry point, with no hint at all.
-        assert_eq!(resolve_project_root(&deep, None), project);
+        assert_eq!(resolve_project_root(&deep, None), Some(project));
     }
 
     #[test]
@@ -584,6 +619,78 @@ mod tests {
     }
 
     #[test]
+    fn resolve_project_root_refuses_to_anchor_a_new_store_on_a_repo_container() {
+        // Regression (2026-08-19): `~/Gits/.mdkb` reached 2.9 GB in nine minutes
+        // and held ten cores at 100% for 24 h. The 2026-08-14 guard refused to
+        // ADOPT a container's store, but the fallback that CREATES the anchor
+        // was never guarded — and the two disagree exactly when it matters.
+        //
+        // The session started with `cwd = ~/Gits`, which holds every repo and is
+        // not one. No store existed yet, so there was nothing to refuse; the
+        // walk returned None, no hint was set, and `cwd` was handed back
+        // verbatim. A brand-new store was anchored on the container — the very
+        // place adoption is refused. Refusing to adopt while freely creating is
+        // not a guard.
+        let tmp = TempDir::new().unwrap();
+        let container = tmp.path();
+        std::fs::create_dir_all(container.join("repo-a/.git")).unwrap();
+        std::fs::create_dir_all(container.join("repo-b/.git")).unwrap();
+        assert!(holds_git_repos(container), "the cwd IS the container");
+        assert!(
+            !container.join(".mdkb").exists(),
+            "nothing to adopt: the store does not exist yet"
+        );
+
+        assert_eq!(resolve_project_root(container, None), None);
+
+        // A hint pointing at the container must not smuggle it back in: the
+        // launch dir is a claim about where the agent started, not a licence to
+        // anchor a store over every repo underneath it.
+        assert_eq!(resolve_project_root(container, Some(container)), None);
+    }
+
+    #[test]
+    fn resolve_project_root_still_anchors_a_repo_that_vendors_submodules() {
+        // The guard is deliberately absent from the git branch, and this test
+        // is why. `holds_git_repos` cannot tell "container of projects" from
+        // "one repo that vendors submodules" — both have a child with `.git`.
+        // Extending the guard to the git branch therefore looks harmless and
+        // would silently deny a legitimate repo its own store. Inside a repo the
+        // anchor is already bounded by the repo root, so the guard is not needed.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("vendor-lib/.git")).unwrap();
+        assert!(holds_git_repos(repo), "a submodule looks like a container");
+
+        assert_eq!(
+            resolve_project_root(repo, None),
+            Some(repo.to_path_buf()),
+            "a repo owns its store even when it vendors submodules"
+        );
+    }
+
+    #[test]
+    fn over_anchors_covers_containers_and_home_alike() {
+        // Both halves in one place, since the fallback now depends on both and
+        // each alone leaves a hole: `$HOME` typically has no repo as an
+        // immediate child, and a container is usually well below `$HOME`.
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().join("home");
+        let container = home.join("Gits");
+        let project = container.join("proj");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+
+        assert!(over_anchors(&home, Some(&home)), "home itself");
+        assert!(over_anchors(tmp.path(), Some(&home)), "an ancestor of home");
+        assert!(over_anchors(&container, Some(&home)), "holds a repo");
+        assert!(
+            !over_anchors(&project, Some(&home)),
+            "the project itself is the one anchor that is allowed"
+        );
+    }
+
+    #[test]
     fn resolve_project_root_never_adopts_a_container_store_outside_a_repo() {
         // Regression (2026-08-14): the sibling of the test above, for the case
         // it never covered. A directory that merely HOLDS repos is not itself a
@@ -611,11 +718,15 @@ mod tests {
         )
         .unwrap();
 
-        // No hint: anchor at cwd itself, never the container above it.
-        assert_eq!(
-            resolve_project_root(&worktree_container, None),
-            worktree_container
-        );
+        // Neither the container's store nor the cwd: `worktree_container` holds
+        // 17 worktrees on the real tree, so anchoring there covers all of them.
+        //
+        // Until 2026-08-19 this asserted `Some(worktree_container)` — "anchor at
+        // cwd itself, never the container above it". That reads as a guard, but
+        // it only moves the anchor one level down: the cwd here IS a container.
+        // Declining to adopt while happily creating in the same class of
+        // directory is what let `~/Gits/.mdkb` be born.
+        assert_eq!(resolve_project_root(&worktree_container, None), None);
         // Sanity: the unbounded walk WOULD have returned the container — this is
         // the exact step the guard removes.
         assert_eq!(
@@ -632,8 +743,10 @@ mod tests {
         std::fs::create_dir_all(&drifted).unwrap();
 
         // No store, no git: hint (launch dir) wins over the drifted cwd.
-        assert_eq!(resolve_project_root(&drifted, Some(&launch)), launch);
-        // No hint either: fall back to cwd as-is.
-        assert_eq!(resolve_project_root(&drifted, None), drifted);
+        assert_eq!(resolve_project_root(&drifted, Some(&launch)), Some(launch));
+        // No hint either: fall back to cwd as-is. Neither directory holds a
+        // repo, so the guard stays out of the way — it refuses containers, not
+        // ordinary non-git projects.
+        assert_eq!(resolve_project_root(&drifted, None), Some(drifted));
     }
 }

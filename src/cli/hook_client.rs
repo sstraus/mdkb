@@ -145,15 +145,18 @@ pub async fn call_memory_confirm(id: String, outcome: String, root: Option<PathB
 /// Codex) and lets concurrent agents on one project share a single store.
 /// The result is collapsed to the main worktree and canonicalized (the
 /// daemon whitelist compares canonical paths).
-fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {
+/// `None` when the resolver refuses to anchor a store here (a directory holding
+/// git repositories, or `$HOME`) — the hook is then skipped rather than pointed
+/// at an invented root. An explicit root is user intent and always resolves.
+fn resolve_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
     let resolved = if let Some(path) = explicit {
         crate::git::resolve_main_worktree(&path)
     } else {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from);
-        crate::git::resolve_project_root(&cwd, hint.as_deref())
+        crate::git::resolve_project_root(&cwd, hint.as_deref())?
     };
-    resolved.canonicalize().unwrap_or(resolved)
+    Some(resolved.canonicalize().unwrap_or(resolved))
 }
 
 /// Resolve the target repository for a lifecycle hook event.
@@ -162,7 +165,11 @@ fn resolve_root(explicit: Option<PathBuf>) -> PathBuf {
 /// over the hook subprocess working directory: global hooks can be launched
 /// from a stale or unrelated cwd when several repositories are active in the
 /// same host process. An explicit root still has highest priority.
-pub fn resolve_hook_root(event: &Value, explicit: Option<PathBuf>) -> PathBuf {
+///
+/// `None` means no directory here may hold a store; the caller skips the event.
+/// When the event names a cwd, a refusal there is final — falling back to the
+/// subprocess cwd would only guess again, and it is usually the same directory.
+pub fn resolve_hook_root(event: &Value, explicit: Option<PathBuf>) -> Option<PathBuf> {
     if explicit.is_some() {
         return resolve_root(explicit);
     }
@@ -175,8 +182,8 @@ pub fn resolve_hook_root(event: &Value, explicit: Option<PathBuf>) -> PathBuf {
         let cwd = PathBuf::from(cwd);
         if cwd.is_absolute() && cwd.is_dir() {
             let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from);
-            let resolved = crate::git::resolve_project_root(&cwd, hint.as_deref());
-            return resolved.canonicalize().unwrap_or(resolved);
+            let resolved = crate::git::resolve_project_root(&cwd, hint.as_deref())?;
+            return Some(resolved.canonicalize().unwrap_or(resolved));
         }
     }
 
@@ -225,7 +232,10 @@ pub async fn call_hook_event(method: &str, event: Value, root: Option<PathBuf>) 
 /// Like `run` but routes through `emit_hook_response` (raw envelope → stdout)
 /// rather than `print_tool_text` (text extraction). Uses per-event timeouts.
 async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<()> {
-    let root = resolve_hook_root(&params, root);
+    let Some(root) = resolve_hook_root(&params, root) else {
+        tracing::debug!("hook {method}: no directory here may hold a store; skipping");
+        return Ok(());
+    };
     params["root"] = json!(root.display().to_string());
     let daemon_required = hook_requires_daemon(&root);
 
@@ -328,7 +338,10 @@ pub fn emit_hook_response(result: &Value) {
 /// Run a single JSON-RPC call. On any daemon-reported or transport error,
 /// log to stderr and return Ok(()) — the host hook must exit 0.
 async fn run(method: &str, mut params: Value, root: Option<PathBuf>) -> Result<()> {
-    let root = resolve_root(root);
+    let Some(root) = resolve_root(root) else {
+        eprintln!("mdkb hook {method}: no directory here may hold a store; skipping");
+        return Ok(());
+    };
     params["root"] = json!(root.display().to_string());
 
     if std::env::var_os("MDKB_NO_DAEMON").is_some() {
@@ -681,14 +694,16 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let explicit = tmp.path().to_path_buf();
         let got = resolve_root(Some(explicit.clone()));
-        assert_eq!(got, explicit.canonicalize().unwrap());
+        assert_eq!(got, Some(explicit.canonicalize().unwrap()));
     }
 
     #[tokio::test]
     async fn resolve_root_falls_back_to_cwd() {
         // resolve_root uses current_dir; just assert it returns an absolute
         // path (canonicalize guarantees that for existing dirs).
-        let got = resolve_root(None);
+        // The suite runs inside the mdkb repo, so the git branch resolves and
+        // the container guard never applies.
+        let got = resolve_root(None).expect("a repo checkout always anchors a store");
         assert!(got.is_absolute() || got.components().count() > 0);
     }
 
@@ -700,7 +715,7 @@ mod tests {
 
         let got = resolve_hook_root(&json!({"cwd": repo.to_string_lossy()}), None);
 
-        assert_eq!(got, repo.canonicalize().unwrap());
+        assert_eq!(got, Some(repo.canonicalize().unwrap()));
     }
 
     #[test]
@@ -716,7 +731,7 @@ mod tests {
             Some(explicit.clone()),
         );
 
-        assert_eq!(got, explicit.canonicalize().unwrap());
+        assert_eq!(got, Some(explicit.canonicalize().unwrap()));
     }
 
     #[test]

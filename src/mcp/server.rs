@@ -305,16 +305,23 @@ impl McpServer {
                         // (nearest existing store → git root → launch dir) so
                         // MCP and hooks converge on one store per project even
                         // when the client launched in a sub-directory.
-                        let path = crate::git::resolve_project_root(&path, None);
-                        match registry.get_or_open(&path) {
+                        let Some(anchor) = crate::git::resolve_project_root(&path, None) else {
+                            tracing::warn!(
+                                "Ignoring root {}: it holds git repositories (or is $HOME), so a \
+                                 store there would anchor every repo underneath it",
+                                path.display()
+                            );
+                            continue;
+                        };
+                        match registry.get_or_open(&anchor) {
                             Ok(_) => {
                                 tracing::info!(
                                     "Registered root from MCP client: {}",
-                                    path.display()
+                                    anchor.display()
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!("Failed to register root {}: {e}", path.display());
+                                tracing::warn!("Failed to register root {}: {e}", anchor.display());
                             }
                         }
                     } else {

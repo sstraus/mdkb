@@ -143,7 +143,14 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         mdkb::git::resolve_main_worktree(&raw_cwd)
     } else {
         let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(std::path::PathBuf::from);
-        mdkb::git::resolve_project_root(&raw_cwd, hint.as_deref())
+        mdkb::git::resolve_project_root(&raw_cwd, hint.as_deref()).ok_or_else(|| {
+            mdkb::Error::other(format!(
+                "refusing to anchor a store at {}: it holds git repositories (or is your home \
+                 directory), so a store here would index every repository underneath it. Run \
+                 mdkb from inside a project, or `mdkb init` here if you really mean it.",
+                raw_cwd.display()
+            ))
+        })?
     };
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
@@ -1284,50 +1291,11 @@ MDKB_NO_DAEMON=1 {0} <cmd>                             # run in-process instead,
         Command::Hook(hook_cmd) => {
             #[cfg(unix)]
             match hook_cmd {
-                HookCommand::SessionStart => {
-                    let input = hook_logic::read_stdin_best_effort();
-                    let event = hook_logic::parse_event(&input);
-                    let root = hook_client::resolve_hook_root(&event, None);
-                    if !hook_logic::mdkbignore_hooks_present(&root) {
-                        hook_client::call_hook_event("hook.session_start", event, Some(root))
-                            .await?;
-                    }
-                }
-                HookCommand::UserPromptSubmit => {
-                    let input = hook_logic::read_stdin_best_effort();
-                    let event = hook_logic::parse_event(&input);
-                    let root = hook_client::resolve_hook_root(&event, None);
-                    if !hook_logic::mdkbignore_hooks_present(&root) {
-                        hook_client::call_hook_event("hook.user_prompt_submit", event, Some(root))
-                            .await?;
-                    }
-                }
-                HookCommand::PostToolUse => {
-                    let input = hook_logic::read_stdin_best_effort();
-                    let event = hook_logic::parse_event(&input);
-                    let root = hook_client::resolve_hook_root(&event, None);
-                    if !hook_logic::mdkbignore_hooks_present(&root) {
-                        hook_client::call_hook_event("hook.post_tool_use", event, Some(root))
-                            .await?;
-                    }
-                }
-                HookCommand::PreToolUse => {
-                    let input = hook_logic::read_stdin_best_effort();
-                    let event = hook_logic::parse_event(&input);
-                    let root = hook_client::resolve_hook_root(&event, None);
-                    if !hook_logic::mdkbignore_hooks_present(&root) {
-                        hook_client::call_hook_event("hook.pre_tool_use", event, Some(root))
-                            .await?;
-                    }
-                }
-                HookCommand::Stop => {
-                    let input = hook_logic::read_stdin_best_effort();
-                    let event = hook_logic::parse_event(&input);
-                    let root = hook_client::resolve_hook_root(&event, None);
-                    if !hook_logic::mdkbignore_hooks_present(&root) {
-                        hook_client::call_hook_event("hook.stop", event, Some(root)).await?;
-                    }
-                }
+                HookCommand::SessionStart => dispatch_hook("hook.session_start").await?,
+                HookCommand::UserPromptSubmit => dispatch_hook("hook.user_prompt_submit").await?,
+                HookCommand::PostToolUse => dispatch_hook("hook.post_tool_use").await?,
+                HookCommand::PreToolUse => dispatch_hook("hook.pre_tool_use").await?,
+                HookCommand::Stop => dispatch_hook("hook.stop").await?,
                 HookCommand::Reindex { files, root } => {
                     hook_client::call_reindex(files, root).await?;
                 }
@@ -1369,6 +1337,26 @@ MDKB_NO_DAEMON=1 {0} <cmd>                             # run in-process instead,
     }
 
     Ok(())
+}
+
+/// Read one lifecycle event from stdin and forward it under the resolved store.
+///
+/// The five hook subcommands differed only by method name, so the skip rules
+/// live here once: `None` from the resolver means no directory here may hold a
+/// store (a container of repos, or `$HOME`), and `.mdkbignore` is the repo's own
+/// opt-out. Either way the hook exits quietly — hosts require exit 0.
+#[cfg(unix)]
+async fn dispatch_hook(method: &str) -> Result<()> {
+    let input = hook_logic::read_stdin_best_effort();
+    let event = hook_logic::parse_event(&input);
+    let Some(root) = hook_client::resolve_hook_root(&event, None) else {
+        tracing::debug!("{method}: no directory here may hold a store; skipping");
+        return Ok(());
+    };
+    if hook_logic::mdkbignore_hooks_present(&root) {
+        return Ok(());
+    }
+    hook_client::call_hook_event(method, event, Some(root)).await
 }
 
 /// How `mdkb mcp` runs on this invocation.
