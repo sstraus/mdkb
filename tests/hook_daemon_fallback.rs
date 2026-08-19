@@ -12,14 +12,11 @@
 //! assert the property the shell was reaching for: with no daemon reachable, the
 //! hook still does its work, and the host still sees exit 0.
 
-// Unix-only: `mdkb hook` refuses off-Unix ("Hook commands require Unix
-// domain sockets") with exit 1 — which also means the exit-zero host-hook
-// contract these tests pin does not hold for a Windows host with hooks
-// wired. That contract question needs its own upstream fix; these runs
-// cannot pass here until it lands.
-#![cfg(unix)]
-
+// Only the gated hook-runner tests spawn processes and take paths; the one
+// test that runs everywhere inspects a generated string.
+#[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
 use std::process::{Command, Output};
 
 #[cfg(unix)]
@@ -44,10 +41,12 @@ fn spawn_daemon_that_takes_the_request(daemon_dir: &Path) {
     });
 }
 
+#[cfg(unix)] // used only by the gated hook-runner tests above
 fn run_hook(root: &Path, event: &str, stdin: &str, daemon_dir: &Path) -> Output {
     run_hook_with_mode(root, event, stdin, daemon_dir, false)
 }
 
+#[cfg(unix)] // used only by the gated hook-runner tests above
 fn run_hook_with_mode(
     root: &Path,
     event: &str,
@@ -82,6 +81,7 @@ fn run_hook_with_mode(
     child.wait_with_output().expect("wait")
 }
 
+#[cfg(unix)] // used only by the gated hook-runner tests above
 fn store() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().canonicalize().expect("canonicalize");
@@ -94,6 +94,11 @@ fn store() -> (tempfile::TempDir, std::path::PathBuf) {
 /// This is the property the shell fallback was reaching for and could never
 /// deliver. A `session_start` against a store holding a memory entry has
 /// something to say; saying nothing is the silent failure being fixed.
+// `mdkb hook` refuses off-Unix ("Hook commands require Unix domain
+// sockets") with exit 1, so the exit-zero contract this pins cannot hold
+// on a Windows host yet. That needs its own fix; gated per test so the
+// rest of the file still runs on Windows.
+#[cfg(unix)]
 #[test]
 fn a_hook_still_works_with_no_daemon_reachable() {
     let (_dir, root) = store();
@@ -135,6 +140,11 @@ fn a_hook_still_works_with_no_daemon_reachable() {
 /// hold: the host CLI never sees a non-zero exit for an ordinary hook failure.
 /// The fallback is reachable now because it happens *inside* the process, not
 /// because the exit code changed.
+// `mdkb hook` refuses off-Unix ("Hook commands require Unix domain
+// sockets") with exit 1, so the exit-zero contract this pins cannot hold
+// on a Windows host yet. That needs its own fix; gated per test so the
+// rest of the file still runs on Windows.
+#[cfg(unix)]
 #[test]
 fn the_hook_still_exits_zero_with_no_daemon() {
     let (_dir, root) = store();
@@ -152,6 +162,11 @@ fn the_hook_still_exits_zero_with_no_daemon() {
     );
 }
 
+// `mdkb hook` refuses off-Unix ("Hook commands require Unix domain
+// sockets") with exit 1, so the exit-zero contract this pins cannot hold
+// on a Windows host yet. That needs its own fix; gated per test so the
+// rest of the file still runs on Windows.
+#[cfg(unix)]
 #[test]
 fn daemon_required_skips_the_in_process_fallback() {
     let (_dir, root) = store();
@@ -213,6 +228,10 @@ fn daemon_required_skips_the_in_process_fallback() {
 
 /// A dropped response after delivery is not proof that the hook did not run.
 /// Retrying in-process would put a second writer beside the daemon.
+// `mdkb hook` refuses off-Unix ("Hook commands require Unix domain
+// sockets") with exit 1, so the exit-zero contract this pins cannot hold
+// on a Windows host yet. That needs its own fix; gated per test so the
+// rest of the file still runs on Windows.
 #[cfg(unix)]
 #[test]
 fn a_delivered_hook_is_not_retried_in_process() {
@@ -260,6 +279,11 @@ fn a_delivered_hook_is_not_retried_in_process() {
 }
 
 /// A hook run outside any mdkb store must also exit 0 and not fabricate output.
+// `mdkb hook` refuses off-Unix ("Hook commands require Unix domain
+// sockets") with exit 1, so the exit-zero contract this pins cannot hold
+// on a Windows host yet. That needs its own fix; gated per test so the
+// rest of the file still runs on Windows.
+#[cfg(unix)]
 #[test]
 fn a_hook_outside_a_store_is_quiet_and_succeeds() {
     let dir = tempfile::tempdir().expect("tempdir");

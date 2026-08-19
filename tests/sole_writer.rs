@@ -12,11 +12,6 @@
 //! removes a whole family of causes by construction, which is what makes the
 //! remaining search space small enough to reason about.
 
-// The daemon these tests route to is unix-only, and two of them bind a fake
-// daemon `UnixListener`. Gate the file so `cargo test` compiles on platforms
-// without the daemon instead of failing the whole run.
-#![cfg(unix)]
-
 use mdkb::cli::Command;
 use mdkb::core::routing::{Routing, routing_for};
 
@@ -272,6 +267,11 @@ fn direct_cli_mutations_wait_for_the_outer_lock() {
 /// A successfully routed mutation must not open the main store in the CLI
 /// process. A fake daemon returns the typed success without touching SQLite;
 /// any WAL/SHM sidecar therefore proves the CLI opened its own writer.
+// Binds a fake daemon on a `UnixListener`, which has no Windows
+// equivalent here. Gated per test so the rest of the file — the
+// routing classification and the direct-write path, neither of them
+// unix-only — still runs on Windows.
+#[cfg(unix)]
 #[test]
 fn a_routed_mutation_creates_no_local_sqlite_sidecars() {
     use std::io::{Read, Write};
@@ -345,6 +345,11 @@ fn a_routed_mutation_creates_no_local_sqlite_sidecars() {
 /// minutes — so a client that retries in-process becomes the second writer the
 /// routing exists to remove, on the longest write in the program. Failing loudly
 /// is the only honest answer (invariant I3: no silent success).
+// Binds a fake daemon on a `UnixListener`, which has no Windows
+// equivalent here. Gated per test so the rest of the file — the
+// routing classification and the direct-write path, neither of them
+// unix-only — still runs on Windows.
+#[cfg(unix)]
 #[test]
 fn a_mutation_is_not_retried_after_the_daemon_took_the_request() {
     use std::io::Read;
