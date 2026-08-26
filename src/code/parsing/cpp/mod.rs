@@ -141,11 +141,11 @@ impl CppParser {
                 }
             }
 
-            "class_specifier" | "struct_specifier" => {
-                let kind_str = if node.kind() == "class_specifier" {
-                    "class"
-                } else {
-                    "struct"
+            "class_specifier" | "struct_specifier" | "union_specifier" => {
+                let kind_str = match node.kind() {
+                    "class_specifier" => "class",
+                    "union_specifier" => "union",
+                    _ => "struct",
                 };
                 let name = node
                     .child_by_field_name("name")
@@ -156,20 +156,25 @@ impl CppParser {
                     let sym_kind = if kind_str == "class" {
                         SymbolKind::Class
                     } else {
+                        // A union is a record type; there is no Union kind, and
+                        // Struct is the closest thing the index models.
                         SymbolKind::Struct
                     };
+                    // Read before `set_current_class` below, so a nested type is
+                    // qualified by its enclosing class and takes the access
+                    // section it was declared in — the same rule as a method.
+                    let qualified = match self.context.current_class() {
+                        Some(cls) => format!("{cls}::{n}"),
+                        None => n.clone(),
+                    };
+                    let visibility = self.member_visibility();
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        n.clone(),
+                        qualified,
                         sym_kind,
                         file_id,
                         node_range(node),
-                        (
-                            Some(format!("{kind_str} {n}")),
-                            doc,
-                            module_path,
-                            Visibility::Public,
-                        ),
+                        (Some(format!("{kind_str} {n}")), doc, module_path, visibility),
                     );
                     symbols.push(symbol);
                 }
@@ -234,9 +239,13 @@ impl CppParser {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = &code[name_node.byte_range()];
                     let doc = extract_cpp_doc(&node, code);
+                    let qualified = match self.context.current_class() {
+                        Some(cls) => format!("{cls}::{name}"),
+                        None => name.to_string(),
+                    };
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        name.to_string(),
+                        qualified,
                         SymbolKind::Enum,
                         file_id,
                         node_range(node),
@@ -244,7 +253,7 @@ impl CppParser {
                             Some(format!("enum {name}")),
                             doc,
                             module_path,
-                            Visibility::Public,
+                            self.member_visibility(),
                         ),
                     );
                     symbols.push(symbol);
@@ -252,6 +261,27 @@ impl CppParser {
             }
 
             "field_declaration" if self.context.is_in_class() => {
+                // A type declared inside a class body is a field declaration
+                // wrapping its specifier. Walk it, or neither the nested type
+                // nor any of its members is ever seen. A specifier with no body
+                // is a reference to a type declared elsewhere (`struct Point p;`)
+                // and must not be walked, or it invents a duplicate symbol.
+                if let Some(nested) = node.children(&mut node.walk()).find(|c| {
+                    matches!(
+                        c.kind(),
+                        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+                    ) && c.child_by_field_name("body").is_some()
+                }) {
+                    self.extract_symbols_from_node(
+                        nested,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        (module_path, depth + 1),
+                    );
+                }
+
                 // Method declarations inside class body
                 let has_function_declarator = node
                     .children(&mut node.walk())
@@ -722,34 +752,87 @@ private:
         assert_eq!(visibility_of(code, "Point::hidden"), Visibility::Private);
     }
 
-    /// A type declared inside a class body reaches the `field_declaration` arm,
-    /// which has no declarator to name and does not recurse, so neither the
-    /// nested type nor its members are extracted. Pinned here because the
-    /// access-section save/restore above exists to serve this case once the
-    /// nested type is walked; see story 032 for the extraction itself.
-    #[test]
-    fn a_type_nested_in_a_class_body_is_not_extracted_today() {
-        let code = r#"
+    /// Names of the symbols `code` yields.
+    fn names_of(code: &str) -> Vec<String> {
+        let mut parser = CppParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        parser
+            .parse_symbols(code, file_id, &mut counter)
+            .iter()
+            .map(|s| s.as_name().to_string())
+            .collect()
+    }
+
+    const NESTED: &str = r#"
 struct Outer {
     struct Inner {
     private:
         int innerHidden;
     };
-    int outerVisible;
+private:
+    class Guard {
+        int guarded;
+    };
+    int outerHidden;
 };
 "#;
-        let mut parser = CppParser::new().unwrap();
-        let file_id = FileId::new(1).unwrap();
-        let mut counter = SymbolCounter::new();
-        let names: Vec<_> = parser
-            .parse_symbols(code, file_id, &mut counter)
-            .iter()
-            .map(|s| s.as_name().to_string())
-            .collect();
 
-        assert!(!names.iter().any(|n| n.contains("Inner")), "{names:?}");
-        // The member after the nested type still reads its own section.
-        assert_eq!(visibility_of(code, "Outer::outerVisible"), Visibility::Public);
+    #[test]
+    fn a_type_nested_in_a_class_body_is_extracted() {
+        let names = names_of(NESTED);
+        assert!(names.iter().any(|n| n == "Outer::Inner"), "{names:?}");
+        assert!(names.iter().any(|n| n == "Outer::Guard"), "{names:?}");
+    }
+
+    #[test]
+    fn members_of_a_nested_type_are_qualified_by_it() {
+        let names = names_of(NESTED);
+        assert!(names.iter().any(|n| n == "Inner::innerHidden"), "{names:?}");
+        assert!(names.iter().any(|n| n == "Guard::guarded"), "{names:?}");
+    }
+
+    #[test]
+    fn a_nested_type_applies_its_own_access_default_to_its_members() {
+        // `Guard` is a class, so `guarded` is private even though the enclosing
+        // struct section it sits in is not.
+        assert_eq!(visibility_of(NESTED, "Guard::guarded"), Visibility::Private);
+        assert_eq!(
+            visibility_of(NESTED, "Inner::innerHidden"),
+            Visibility::Private
+        );
+    }
+
+    #[test]
+    fn the_enclosing_class_resumes_its_own_section_after_a_nested_type() {
+        // `Inner` sits in Outer's default public section; `Guard` and
+        // `outerHidden` follow a `private:` that the nested bodies must not reset.
+        assert_eq!(visibility_of(NESTED, "Outer::Inner"), Visibility::Public);
+        assert_eq!(visibility_of(NESTED, "Outer::Guard"), Visibility::Private);
+        assert_eq!(visibility_of(NESTED, "Outer::outerHidden"), Visibility::Private);
+    }
+
+    #[test]
+    fn a_nested_enum_or_union_produces_a_symbol() {
+        let names = names_of("struct Outer { enum Tag { A }; union Bits { int i; }; };\n");
+        assert!(names.iter().any(|n| n == "Outer::Tag"), "{names:?}");
+        assert!(names.iter().any(|n| n == "Outer::Bits"), "{names:?}");
+    }
+
+    #[test]
+    fn a_field_whose_type_is_a_named_struct_is_still_a_field() {
+        // `struct Point p;` names no new type — recursing into the specifier
+        // would invent a duplicate `Point` and lose the field.
+        let names = names_of("struct Outer { struct Point p; };\n");
+        assert!(names.iter().any(|n| n == "Outer::p"), "{names:?}");
+        assert!(!names.iter().any(|n| n.ends_with("::Point")), "{names:?}");
+    }
+
+    #[test]
+    fn a_nested_type_declared_with_a_variable_yields_both() {
+        let names = names_of("struct Outer { struct Inner { int q; } inner; };\n");
+        assert!(names.iter().any(|n| n == "Outer::Inner"), "{names:?}");
+        assert!(names.iter().any(|n| n == "Outer::inner"), "{names:?}");
     }
 
     #[test]
