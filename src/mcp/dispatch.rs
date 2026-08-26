@@ -2500,88 +2500,58 @@ fn format_graph_neighbors(entity: &str, neighbors: &[crate::store::graph::Neighb
     out
 }
 
+/// `code_graph` output: prose for agents, resolved symbols for programmatic
+/// callers.
+///
+/// Both come out of the same traversal. The prose is the agent-facing product
+/// and stays exactly as it reads today; `symbols` exists so a client that wants
+/// locations (an editor's "find references", say) never has to scrape the
+/// prose back apart. Only the hook socket ships both — the MCP tool keeps
+/// returning `text` alone.
+#[derive(Debug)]
+pub struct CodeGraphOutput {
+    pub text: String,
+    pub symbols: Vec<crate::code::symbol::Symbol>,
+}
+
 /// `code_graph` — call graph queries. Resolves the symbol then dispatches by
-/// direction (calls/callers/impact). Returns the formatted output text.
+/// direction (calls/callers/impact).
 pub async fn code_graph_impl(
     handle: &RepoHandle,
     params: &CodeGraphParams,
-) -> Result<String, McpError> {
+) -> Result<CodeGraphOutput, McpError> {
     let idx_guard = acquire_handle_code_index(handle).await?;
     let Some(facade) = idx_guard.as_ref() else {
-        return Ok("Code index is being rebuilt, retry shortly.".to_string());
+        return Ok(CodeGraphOutput {
+            text: "Code index is being rebuilt, retry shortly.".to_string(),
+            symbols: Vec::new(),
+        });
     };
 
     let symbol = super::server::McpServer::resolve_symbol(facade, &params.name, params.symbol_id)?;
 
-    let output = match params.direction.as_str() {
-        "calls" => {
-            let called = facade.get_called_functions(symbol.id);
-            if called.is_empty() {
-                format!(
-                    "{} ({:?}) does not call any indexed functions.",
-                    symbol.name, symbol.kind
-                )
-            } else {
-                let mut out = format!(
-                    "{} ({:?}) calls {} function(s):\n\n",
-                    symbol.name,
-                    symbol.kind,
-                    called.len()
-                );
-                for sym in &called {
-                    out.push_str(&format_symbol(sym));
-                    out.push('\n');
-                }
-                out
-            }
-        }
-        "callers" => {
-            let callers = facade.get_calling_functions(symbol.id);
-            if callers.is_empty() {
-                format!(
-                    "{} ({:?}) has no indexed callers.",
-                    symbol.name, symbol.kind
-                )
-            } else {
-                let mut out = format!(
-                    "{} ({:?}) is called by {} function(s):\n\n",
-                    symbol.name,
-                    symbol.kind,
-                    callers.len()
-                );
-                for sym in &callers {
-                    out.push_str(&format_symbol(sym));
-                    out.push('\n');
-                }
-                out
-            }
-        }
-        "impact" => {
-            let impacted_ids = facade.get_impact_radius(symbol.id, params.max_depth);
-            if impacted_ids.is_empty() {
-                format!(
-                    "{} ({:?}) has no reachable symbols within {} hop(s).",
-                    symbol.name, symbol.kind, params.max_depth
-                )
-            } else {
-                let mut out = format!(
-                    "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
-                    symbol.name,
-                    symbol.kind,
-                    impacted_ids.len(),
-                    params.max_depth
-                );
-                for sid in &impacted_ids {
-                    if let Some(sym) = facade.get_symbol(*sid) {
-                        out.push_str(&format_symbol(&sym));
-                        out.push('\n');
-                    } else {
-                        out.push_str(&format!("  sym#{} (not found in index)\n", sid.value()));
-                    }
-                }
-                out
-            }
-        }
+    // One entry per hit, `None` when `impact` returns an id the index no longer
+    // holds. Keeping the id alongside preserves that row in the prose instead of
+    // silently shortening the list.
+    let hits: Vec<(
+        crate::code::types::SymbolId,
+        Option<crate::code::symbol::Symbol>,
+    )> = match params.direction.as_str() {
+        "calls" => facade
+            .get_called_functions(symbol.id)
+            .into_iter()
+            .map(|s| (s.id, Some(s)))
+            .collect(),
+        "callers" => facade
+            .get_calling_functions(symbol.id)
+            .into_iter()
+            .map(|s| (s.id, Some(s)))
+            .collect(),
+        "impact" => facade
+            .get_impact_radius(symbol.id, params.max_depth)
+            .into_iter()
+            .map(|sid| (sid, facade.get_symbol(sid)))
+            .collect(),
         _ => {
             return Err(mcp_error(format!(
                 "Invalid direction: '{}'. Valid: calls, callers, impact.",
@@ -2590,7 +2560,60 @@ pub async fn code_graph_impl(
         }
     };
 
-    Ok(output)
+    // Unresolved ids carry no location, so they cannot appear in `symbols`.
+    let symbols: Vec<crate::code::symbol::Symbol> =
+        hits.iter().filter_map(|(_, s)| s.clone()).collect();
+
+    if hits.is_empty() {
+        let text = match params.direction.as_str() {
+            "calls" => format!(
+                "{} ({:?}) does not call any indexed functions.",
+                symbol.name, symbol.kind
+            ),
+            "callers" => format!(
+                "{} ({:?}) has no indexed callers.",
+                symbol.name, symbol.kind
+            ),
+            _ => format!(
+                "{} ({:?}) has no reachable symbols within {} hop(s).",
+                symbol.name, symbol.kind, params.max_depth
+            ),
+        };
+        return Ok(CodeGraphOutput { text, symbols });
+    }
+
+    let mut text = match params.direction.as_str() {
+        "calls" => format!(
+            "{} ({:?}) calls {} function(s):\n\n",
+            symbol.name,
+            symbol.kind,
+            hits.len()
+        ),
+        "callers" => format!(
+            "{} ({:?}) is called by {} function(s):\n\n",
+            symbol.name,
+            symbol.kind,
+            hits.len()
+        ),
+        _ => format!(
+            "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
+            symbol.name,
+            symbol.kind,
+            hits.len(),
+            params.max_depth
+        ),
+    };
+    for (sid, sym) in &hits {
+        match sym {
+            Some(s) => {
+                text.push_str(&format_symbol(s));
+                text.push('\n');
+            }
+            None => text.push_str(&format!("  sym#{} (not found in index)\n", sid.value())),
+        }
+    }
+
+    Ok(CodeGraphOutput { text, symbols })
 }
 
 /// `usage` — token economy audit. Reads session + lifetime stats and returns
@@ -4462,11 +4485,15 @@ pub async fn dispatch_call(
         "code_graph" => {
             let cp: CodeGraphParams = serde_json::from_value(params)
                 .map_err(|e| mcp_error(format!("code_graph: invalid params: {e}")))?;
-            let text = code_graph_impl(&handle, &cp).await?;
-            let tokens = count_tokens(&text);
+            let out = code_graph_impl(&handle, &cp).await?;
+            let tokens = count_tokens(&out.text);
             dctx.record_persistent_call(&handle, "code_graph", tokens, 1, false)
                 .await;
-            Ok(json!({ "text": text, "tokens": tokens }))
+            // `text` for the agents that read the prose, `symbols` for the
+            // programmatic clients that need locations — same shape as
+            // `symbols_in_file`, so neither side parses the other's output.
+            let symbols: Vec<Value> = out.symbols.iter().map(symbol_to_json).collect();
+            Ok(json!({ "text": out.text, "tokens": tokens, "symbols": symbols }))
         }
         "graph" => {
             let gp: GraphParams = serde_json::from_value(params)
@@ -7638,10 +7665,15 @@ mod tests {
             max_depth: 3,
         };
 
-        let text = code_graph_impl(&handle, &params)
+        let out = code_graph_impl(&handle, &params)
             .await
             .expect("code_graph impl");
-        assert!(text.contains("Code index is being rebuilt"), "text: {text}");
+        assert!(
+            out.text.contains("Code index is being rebuilt"),
+            "text: {}",
+            out.text
+        );
+        assert!(out.symbols.is_empty());
     }
 
     #[tokio::test]

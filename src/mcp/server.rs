@@ -797,7 +797,11 @@ impl McpServer {
         Parameters(params): Parameters<CodeGraphParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
-        let output = super::dispatch::code_graph_impl(&handle, &params).await?;
+        // MCP agents get the prose only; the resolved symbols ride the hook
+        // socket, where a programmatic client can use them.
+        let output = super::dispatch::code_graph_impl(&handle, &params)
+            .await?
+            .text;
         let tokens = count_tokens(&output);
         self.record_persistent_call("code_graph", tokens, 1, false)
             .await;

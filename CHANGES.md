@@ -1,5 +1,30 @@
 # Changelog
 
+## 3.7.18 (2026-08-26)
+
+### Added
+
+- **`code_graph` now answers the hook socket with resolved symbols, not only
+  prose.** `result.symbols` carries the same row shape as `symbols_in_file`
+  (`name`, `kind`, `file_path`, `line_start`, …) for the callers/calls/impact set,
+  alongside the unchanged `result.text`. The prose is written for agents to read
+  and has never been JSON, so a programmatic client — an editor's "find
+  references" — had no way to get locations except to scrape it. Both halves come
+  out of one traversal; the MCP tool still returns `text` alone, so nothing an
+  agent sees changes. "No callers" is `symbols: []`, never an absent field, so a
+  client can tell an empty result from a daemon too old to carry it.
+
+### Testing
+
+- The hook socket's code-intelligence methods now have their **response shapes**
+  pinned end to end, against a real daemon and a real code index — not just
+  "the call succeeded". The three shapes differ on purpose (`symbols_in_file` a
+  bare array, `code_find` a `{total, showing, symbols}` envelope, `code_graph`
+  prose plus `symbols`) and a client that assumes one shape for all of them
+  deserializes another into an empty list without erroring, on both ends. The
+  0-based range convention — the opposite of `symbol_at_position`'s 1-based
+  `line` *input* — is pinned in the same place.
+
 ## 3.7.17 (2026-08-19)
 
 ### Fixed
