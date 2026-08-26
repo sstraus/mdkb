@@ -123,7 +123,11 @@ impl LuaParser {
                     } else {
                         Visibility::Public
                     };
-                    let prefix = if is_local { "local function" } else { "function" };
+                    let prefix = if is_local {
+                        "local function"
+                    } else {
+                        "function"
+                    };
 
                     let symbol = self.create_symbol(
                         counter.next_id(),
