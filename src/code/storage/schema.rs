@@ -48,6 +48,15 @@ CREATE TABLE IF NOT EXISTS code_relationships (
     to_col INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS code_imports (
+    id INTEGER PRIMARY KEY,
+    file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
+    path TEXT NOT NULL,
+    alias TEXT,
+    is_glob INTEGER NOT NULL DEFAULT 0,
+    is_type_only INTEGER NOT NULL DEFAULT 0
+);
+
 CREATE TABLE IF NOT EXISTS code_metadata (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -63,6 +72,11 @@ CREATE INDEX IF NOT EXISTS idx_files_hash ON code_files(hash);
 -- insert_file DELETEs the legacy absolute-path row by rel_path on every insert;
 -- without this index each DELETE is a full table scan, making a full index O(n²).
 CREATE INDEX IF NOT EXISTS idx_files_rel_path ON code_files(rel_path);
+CREATE INDEX IF NOT EXISTS idx_imports_path ON code_imports(path);
+-- `alias` is nullable and SQLite treats NULLs as distinct, so a plain UNIQUE
+-- would let `use std::fmt;` be inserted twice. Fold NULL to '' in the key.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_imports_unique
+    ON code_imports(file_id, path, IFNULL(alias, ''));
 
 CREATE VIRTUAL TABLE IF NOT EXISTS code_symbols_fts USING fts5(
     name, doc_comment, signature,
@@ -175,6 +189,7 @@ mod tests {
             "code_files",
             "code_symbols",
             "code_relationships",
+            "code_imports",
             "code_metadata",
         ] {
             let exists: bool = conn

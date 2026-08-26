@@ -18,8 +18,8 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::code::indexing::hasher;
 use crate::code::indexing::types::{
-    CollectedRelationship, FileContent, FileRegistration, IndexBatch, IndexStats, ParsedFile,
-    RawRelationship, RawSymbol,
+    CollectedImport, CollectedRelationship, FileContent, FileRegistration, IndexBatch, IndexStats,
+    ParsedFile, RawImport, RawRelationship, RawSymbol,
 };
 use crate::code::indexing::walker;
 use crate::code::parsing::c_lang::CParser;
@@ -412,6 +412,18 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
         let extends = parser.find_extends(&fc.content);
         let uses = parser.find_uses(&fc.content);
         let defines = parser.find_defines(&fc.content);
+        // `find_imports` takes a file id only to stamp the `Import` it returns;
+        // COLLECT assigns the real one, so the dummy is discarded here.
+        let raw_imports: Vec<RawImport> = parser
+            .find_imports(&fc.content, dummy_file_id)
+            .into_iter()
+            .map(|i| RawImport {
+                path: i.path.into(),
+                alias: i.alias.map(Into::into),
+                is_glob: i.is_glob,
+                is_type_only: i.is_type_only,
+            })
+            .collect();
 
         // Convert symbols to RawSymbol (strip dummy IDs)
         let raw_symbols: Vec<RawSymbol> = symbols
@@ -487,6 +499,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
             token_estimate: fc.token_estimate,
             raw_symbols,
             raw_relationships,
+            raw_imports,
         };
 
         if tx.send(parsed).is_err() {
@@ -548,6 +561,10 @@ fn stage_collect(
             mtime,
             token_estimate: parsed.token_estimate,
         });
+
+        for import in parsed.raw_imports {
+            batch.imports.push(CollectedImport { file_id, import });
+        }
 
         // Convert raw symbols to Symbol with real IDs
         for raw in parsed.raw_symbols {
@@ -702,6 +719,23 @@ fn write_batch(db: &CodeDb, batch: &IndexBatch, stats: &mut IndexStats) -> anyho
         file_id_map.insert(reg.file_id.value(), real_id);
         stats.files_discovered += 1;
         stats.files_indexed += 1;
+    }
+
+    for collected in &batch.imports {
+        let real_file_id = *file_id_map.get(&collected.file_id.value()).ok_or_else(|| {
+            anyhow::anyhow!(
+                "import {:?} references file_id {} not registered in this batch",
+                collected.import.path,
+                collected.file_id.value(),
+            )
+        })?;
+        db.insert_import(
+            real_file_id,
+            &collected.import.path,
+            collected.import.alias.as_deref(),
+            collected.import.is_glob,
+            collected.import.is_type_only,
+        )?;
     }
 
     // Map pipeline symbol IDs to real SQLite rowids

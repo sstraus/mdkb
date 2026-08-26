@@ -916,6 +916,60 @@ pub fn world() {
         (src_dir, db_dir, facade)
     }
 
+    const IMPORTS_RS: &str = "use std::fmt;\n\
+                              use std::io::Read as R;\n\
+                              use std::collections::*;\n\
+                              pub fn go() {}\n";
+
+    /// Every stored import row, as `(path, alias, is_glob)`, ordered by path.
+    fn import_rows(facade: &IndexFacade) -> Vec<(String, Option<String>, bool)> {
+        let mut stmt = facade
+            .db
+            .conn()
+            .prepare("SELECT path, alias, is_glob FROM code_imports ORDER BY path")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn imports_are_stored_with_their_alias_and_glob_flag() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join("lib.rs"), IMPORTS_RS).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+
+        facade.index_directory(src_dir.path()).unwrap();
+
+        assert_eq!(
+            import_rows(&facade),
+            vec![
+                ("std::collections".to_string(), None, true),
+                ("std::fmt".to_string(), None, false),
+                ("std::io::Read".to_string(), Some("R".to_string()), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn reindexing_a_file_does_not_duplicate_import_rows() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let path = src_dir.path().join("lib.rs");
+        fs::write(&path, IMPORTS_RS).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+
+        facade.index_directory(src_dir.path()).unwrap();
+        let first = import_rows(&facade);
+        // Touch the body so the mtime check sees a change and re-parses.
+        fs::write(&path, format!("{IMPORTS_RS}pub fn also() {{}}\n")).unwrap();
+        facade.reindex_files(src_dir.path(), &[path]).unwrap();
+
+        assert_eq!(import_rows(&facade), first);
+    }
+
     #[test]
     fn indexing_a_subdirectory_keys_files_from_the_project_root() {
         let (src_dir, _db_dir, mut facade) = project_with_a_source_subdir();

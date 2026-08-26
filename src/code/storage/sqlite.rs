@@ -173,6 +173,27 @@ impl CodeDb {
         Ok(id)
     }
 
+    /// Record an import statement found in `file_id`.
+    ///
+    /// `OR IGNORE` against `idx_imports_unique`: a file re-indexed without its
+    /// row being deleted first would otherwise accumulate a second copy of every
+    /// import, and a file may legitimately name the same path twice.
+    pub fn insert_import(
+        &self,
+        file_id: i64,
+        path: &str,
+        alias: Option<&str>,
+        is_glob: bool,
+        is_type_only: bool,
+    ) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO code_imports (file_id, path, alias, is_glob, is_type_only) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![file_id, path, alias, is_glob, is_type_only],
+        )?;
+        Ok(())
+    }
+
     /// Delete a file and all its symbols/relationships (via CASCADE).
     pub fn delete_by_file(&self, path: &str) -> rusqlite::Result<usize> {
         // Delete symbols explicitly first so the FTS5 delete trigger fires.

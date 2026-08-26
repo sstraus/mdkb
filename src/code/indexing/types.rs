@@ -50,6 +50,15 @@ pub struct RawRelationship {
     pub kind: RelationKind,
 }
 
+/// An import extracted from parsing, before file ID assignment.
+#[derive(Debug)]
+pub struct RawImport {
+    pub path: Box<str>,
+    pub alias: Option<Box<str>>,
+    pub is_glob: bool,
+    pub is_type_only: bool,
+}
+
 /// All parse results for a single file.
 #[derive(Debug)]
 pub struct ParsedFile {
@@ -59,6 +68,7 @@ pub struct ParsedFile {
     pub token_estimate: u32,
     pub raw_symbols: Vec<RawSymbol>,
     pub raw_relationships: Vec<RawRelationship>,
+    pub raw_imports: Vec<RawImport>,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,12 +101,20 @@ pub struct CollectedRelationship {
     pub to_range: Option<Range>,
 }
 
+/// An import with the file it was found in resolved to a pipeline ID.
+#[derive(Debug)]
+pub struct CollectedImport {
+    pub file_id: FileId,
+    pub import: RawImport,
+}
+
 /// A batch of index data ready for SQLite writes.
 #[derive(Debug)]
 pub struct IndexBatch {
     pub symbols: Vec<(Symbol, PathBuf)>,
     pub unresolved_relationships: Vec<CollectedRelationship>,
     pub file_registrations: Vec<FileRegistration>,
+    pub imports: Vec<CollectedImport>,
 }
 
 impl IndexBatch {
@@ -111,6 +129,7 @@ impl Default for IndexBatch {
             symbols: Vec::new(),
             unresolved_relationships: Vec::new(),
             file_registrations: Vec::new(),
+            imports: Vec::new(),
         }
     }
 }
