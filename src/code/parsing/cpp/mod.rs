@@ -12,6 +12,10 @@ use tree_sitter::Node;
 pub struct CppParser {
     parser: CachingParser,
     context: ParserContext,
+    /// Access section currently in force inside a class body. C++ access is
+    /// stateful: `private:` applies to every member after it until the next
+    /// specifier, so it cannot be read off an individual member node.
+    current_access: Visibility,
 }
 
 impl std::fmt::Debug for CppParser {
@@ -32,7 +36,19 @@ impl CppParser {
         Ok(Self {
             parser: CachingParser::new(ts_parser),
             context: ParserContext::new(),
+            current_access: Visibility::Public,
         })
+    }
+
+    /// Visibility for the member being extracted. Inside a class body that is
+    /// the access section in force; at namespace scope a free function is
+    /// public.
+    fn member_visibility(&self) -> Visibility {
+        if self.context.is_in_class() {
+            self.current_access
+        } else {
+            Visibility::Public
+        }
     }
 
     fn create_symbol(
@@ -161,6 +177,14 @@ impl CppParser {
                 self.context.enter_scope(ScopeType::Class);
                 let saved_cls = self.context.current_class().map(|s| s.to_string());
                 self.context.set_current_class(name);
+                // A class starts private, a struct public. Saved and restored so
+                // a nested type cannot leak its section to the enclosing body.
+                let saved_access = self.current_access;
+                self.current_access = if kind_str == "class" {
+                    Visibility::Private
+                } else {
+                    Visibility::Public
+                };
 
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
@@ -177,6 +201,7 @@ impl CppParser {
 
                 self.context.exit_scope();
                 self.context.set_current_class(saved_cls);
+                self.current_access = saved_access;
             }
 
             "namespace_definition" => {
@@ -259,7 +284,14 @@ impl CppParser {
             }
 
             "access_specifier" => {
-                // public:, private:, protected: - tracked via context
+                let text = &code[node.byte_range()];
+                self.current_access = if text.contains("public") {
+                    Visibility::Public
+                } else if text.contains("protected") {
+                    Visibility::Module
+                } else {
+                    Visibility::Private
+                };
             }
 
             _ => {
@@ -317,7 +349,7 @@ impl CppParser {
             kind,
             file_id,
             node_range(node),
-            (Some(sig), doc, module_path, Visibility::Public),
+            (Some(sig), doc, module_path, self.member_visibility()),
         ))
     }
 
@@ -335,7 +367,7 @@ impl CppParser {
             .find(|c| c.kind() == "function_declarator")?;
         let name = extract_cpp_declarator_name(func_decl, code)?;
         let doc = extract_cpp_doc(&node, code);
-        let visibility = determine_cpp_member_visibility(node, code);
+        let visibility = self.member_visibility();
 
         let qualified_name = if let Some(cls) = self.context.current_class() {
             format!("{cls}::{name}")
@@ -391,7 +423,7 @@ impl CppParser {
                         ),
                         None,
                         module_path,
-                        Visibility::Private,
+                        self.member_visibility(),
                     ),
                 );
                 symbols.push(symbol);
@@ -549,28 +581,6 @@ fn extract_cpp_doc(node: &Node, code: &str) -> Option<String> {
     }
 }
 
-fn determine_cpp_member_visibility(node: Node, code: &str) -> Visibility {
-    // Look at preceding siblings for access specifiers
-    let mut prev = node.prev_sibling();
-    while let Some(sib) = prev {
-        if sib.kind() == "access_specifier" {
-            let text = &code[sib.byte_range()];
-            if text.contains("public") {
-                return Visibility::Public;
-            }
-            if text.contains("protected") {
-                return Visibility::Module;
-            }
-            if text.contains("private") {
-                return Visibility::Private;
-            }
-        }
-        prev = sib.prev_sibling();
-    }
-    // Default: private for class, public for struct (simplified to private)
-    Visibility::Private
-}
-
 impl LanguageParser for CppParser {
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
@@ -613,6 +623,142 @@ impl LanguageParser for CppParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Visibility recorded for a symbol, by name.
+    fn visibility_of(code: &str, name: &str) -> Visibility {
+        let mut parser = CppParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        symbols
+            .iter()
+            .find(|s| s.name.as_ref() == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no symbol {name}, got {:?}",
+                    symbols.iter().map(|s| s.as_name()).collect::<Vec<_>>()
+                )
+            })
+            .visibility
+    }
+
+    const SECTIONS: &str = r#"
+class Widget {
+    void implicitlyPrivate() {}
+public:
+    int pubField;
+    void pubMethod() {}
+    void pubProto();
+protected:
+    int protField;
+    void protMethod() {}
+    void protProto();
+private:
+    int privField;
+    void privMethod() {}
+};
+"#;
+
+    #[test]
+    fn a_method_with_a_body_takes_its_access_section() {
+        assert_eq!(
+            visibility_of(SECTIONS, "Widget::privMethod"),
+            Visibility::Private
+        );
+        assert_eq!(
+            visibility_of(SECTIONS, "Widget::pubMethod"),
+            Visibility::Public
+        );
+    }
+
+    #[test]
+    fn a_defined_method_and_a_declared_one_agree_on_visibility() {
+        assert_eq!(
+            visibility_of(SECTIONS, "Widget::protMethod"),
+            visibility_of(SECTIONS, "Widget::protProto"),
+        );
+        assert_eq!(
+            visibility_of(SECTIONS, "Widget::pubMethod"),
+            visibility_of(SECTIONS, "Widget::pubProto"),
+        );
+    }
+
+    #[test]
+    fn a_field_takes_its_access_section() {
+        assert_eq!(
+            visibility_of(SECTIONS, "Widget::pubField"),
+            Visibility::Public
+        );
+        assert_eq!(
+            visibility_of(SECTIONS, "Widget::protField"),
+            visibility_of(SECTIONS, "Widget::protMethod"),
+        );
+        assert_eq!(
+            visibility_of(SECTIONS, "Widget::privField"),
+            Visibility::Private
+        );
+    }
+
+    #[test]
+    fn a_class_member_before_any_specifier_is_private() {
+        assert_eq!(
+            visibility_of(SECTIONS, "Widget::implicitlyPrivate"),
+            Visibility::Private
+        );
+    }
+
+    #[test]
+    fn a_struct_member_before_any_specifier_is_public() {
+        let code = r#"
+struct Point {
+    int x;
+    void translate() {}
+private:
+    int hidden;
+};
+"#;
+        assert_eq!(visibility_of(code, "Point::x"), Visibility::Public);
+        assert_eq!(visibility_of(code, "Point::translate"), Visibility::Public);
+        assert_eq!(visibility_of(code, "Point::hidden"), Visibility::Private);
+    }
+
+    /// A type declared inside a class body reaches the `field_declaration` arm,
+    /// which has no declarator to name and does not recurse, so neither the
+    /// nested type nor its members are extracted. Pinned here because the
+    /// access-section save/restore above exists to serve this case once the
+    /// nested type is walked; see story 032 for the extraction itself.
+    #[test]
+    fn a_type_nested_in_a_class_body_is_not_extracted_today() {
+        let code = r#"
+struct Outer {
+    struct Inner {
+    private:
+        int innerHidden;
+    };
+    int outerVisible;
+};
+"#;
+        let mut parser = CppParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        let names: Vec<_> = parser
+            .parse_symbols(code, file_id, &mut counter)
+            .iter()
+            .map(|s| s.as_name().to_string())
+            .collect();
+
+        assert!(!names.iter().any(|n| n.contains("Inner")), "{names:?}");
+        // The member after the nested type still reads its own section.
+        assert_eq!(visibility_of(code, "Outer::outerVisible"), Visibility::Public);
+    }
+
+    #[test]
+    fn a_free_function_stays_public() {
+        assert_eq!(
+            visibility_of("void standalone() {}\n", "standalone"),
+            Visibility::Public
+        );
+    }
 
     #[test]
     fn test_parse_class_with_methods() {
