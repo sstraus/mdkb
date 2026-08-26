@@ -669,6 +669,10 @@ impl RustParser {
 
         while let Some(sibling) = current {
             match sibling.kind() {
+                // Attributes sit between the doc comment and the item they
+                // decorate (`/// doc` → `#[derive(Debug)]` → `struct`). Walk
+                // past them, or every attributed item loses its documentation.
+                "attribute_item" => {}
                 "line_comment" | "block_comment" => {
                     if let Ok(text) = sibling.utf8_text(code.as_bytes()) {
                         if Self::is_outer_doc(text) {
@@ -751,7 +755,7 @@ impl RustParser {
             return Vec::new();
         };
         let mut calls = Vec::new();
-        Self::find_calls_in_node(tree.root_node(), code, None, 0, &mut calls);
+        Self::find_calls_in_node(tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -791,8 +795,42 @@ impl RustParser {
             }
         }
 
+        // A macro invocation is a call too: `println!`, `anyhow!`,
+        // `tracing::warn!`. It is a separate node kind, so the branch above
+        // never sees it.
+        if node.kind() == "macro_invocation" {
+            if let (Some(name_node), Some(caller)) = (Self::macro_name_node(node), current_fn) {
+                calls.push((caller, &code[name_node.byte_range()], node_range(node)));
+            }
+        }
+
         for child in node.children(&mut node.walk()) {
             Self::find_calls_in_node(child, code, current_fn, depth + 1, calls);
+        }
+    }
+
+    /// The name node of a macro invocation: `println` in `println!("x")`,
+    /// `tracing::warn` in `tracing::warn!("x")`.
+    fn macro_name_node(node: Node) -> Option<Node> {
+        node.child_by_field_name("macro")
+    }
+
+    /// Record a call to a plain or `::`-scoped name. A scoped name becomes a
+    /// static call on its qualifier, so `Type::f()` and `path::m!()` both keep
+    /// a receiver.
+    fn push_plain_or_scoped_call(
+        caller: &str,
+        full: &str,
+        range: Range,
+        calls: &mut Vec<MethodCall>,
+    ) {
+        match full.rfind("::") {
+            Some(pos) => calls.push(
+                MethodCall::new(caller, &full[pos + 2..], range)
+                    .with_receiver(&full[..pos])
+                    .static_method(),
+            ),
+            None => calls.push(MethodCall::new(caller, full, range)),
         }
     }
 
@@ -803,7 +841,7 @@ impl RustParser {
             return Vec::new();
         };
         let mut calls = Vec::new();
-        Self::find_method_calls_in_node(tree.root_node(), code, None, 0, &mut calls);
+        Self::find_method_calls_in_node(tree.root_node(), code, Some("<module>"), 0, &mut calls);
         calls
     }
 
@@ -831,9 +869,13 @@ impl RustParser {
 
                 if let Some(caller) = current_fn {
                     match fn_node.kind() {
-                        "identifier" => {
-                            let name = &code[fn_node.byte_range()];
-                            calls.push(MethodCall::new(caller, name, range));
+                        "identifier" | "scoped_identifier" => {
+                            Self::push_plain_or_scoped_call(
+                                caller,
+                                &code[fn_node.byte_range()],
+                                range,
+                                calls,
+                            );
                         }
                         "field_expression" => {
                             if let Some(field) = fn_node.child_by_field_name("field") {
@@ -847,21 +889,20 @@ impl RustParser {
                                 }
                             }
                         }
-                        "scoped_identifier" => {
-                            let full = &code[fn_node.byte_range()];
-                            if let Some(pos) = full.rfind("::") {
-                                let type_name = &full[..pos];
-                                let method_name = &full[pos + 2..];
-                                calls.push(
-                                    MethodCall::new(caller, method_name, range)
-                                        .with_receiver(type_name)
-                                        .static_method(),
-                                );
-                            }
-                        }
                         _ => {}
                     }
                 }
+            }
+        }
+
+        if node.kind() == "macro_invocation" {
+            if let (Some(name_node), Some(caller)) = (Self::macro_name_node(node), current_fn) {
+                Self::push_plain_or_scoped_call(
+                    caller,
+                    &code[name_node.byte_range()],
+                    node_range(node),
+                    calls,
+                );
             }
         }
 
@@ -1525,6 +1566,198 @@ fn main() {
         assert!(calls.iter().any(|c| c.caller == "main"
             && c.method_name == "validate"
             && c.receiver.as_deref() == Some("self")));
+    }
+
+    /// Extract the doc comment recorded for a named symbol.
+    fn doc_of(code: &str, name: &str) -> Option<String> {
+        let mut parser = RustParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        symbols
+            .iter()
+            .find(|s| s.name.as_ref() == name)
+            .and_then(|s| s.doc_comment.as_ref().map(|d| d.to_string()))
+    }
+
+    #[test]
+    fn doc_comment_survives_a_derive_attribute() {
+        let code = r#"
+/// Documented struct.
+#[derive(Debug, Clone)]
+pub struct Attributed { pub a: u32 }
+        "#;
+        assert_eq!(
+            doc_of(code, "Attributed").as_deref(),
+            Some("Documented struct.")
+        );
+    }
+
+    #[test]
+    fn doc_comment_survives_stacked_attributes() {
+        let code = r#"
+/// First line.
+/// Second line.
+#[derive(Debug)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct Stacked { pub a: u32 }
+        "#;
+        assert_eq!(
+            doc_of(code, "Stacked").as_deref(),
+            Some("First line.\nSecond line.")
+        );
+    }
+
+    #[test]
+    fn doc_comment_survives_an_attribute_on_a_function() {
+        let code = r#"
+/// Documented function.
+#[inline]
+pub fn attributed_fn() {}
+        "#;
+        assert_eq!(
+            doc_of(code, "attributed_fn").as_deref(),
+            Some("Documented function.")
+        );
+    }
+
+    #[test]
+    fn quadruple_slash_before_an_attribute_is_not_a_doc_comment() {
+        let code = r#"
+//// Not a doc comment.
+#[inline]
+fn not_documented() {}
+        "#;
+        assert_eq!(doc_of(code, "not_documented"), None);
+    }
+
+    #[test]
+    fn a_plain_comment_between_doc_and_item_still_stops_the_walk() {
+        let code = r#"
+/// Real doc.
+// Plain note.
+#[inline]
+fn interrupted() {}
+        "#;
+        assert_eq!(doc_of(code, "interrupted"), None);
+    }
+
+    const MACRO_CODE: &str = r#"
+fn m() {
+    println!("hi");
+    tracing::warn!("x");
+    let e = anyhow!("boom");
+}
+        "#;
+
+    #[test]
+    fn bare_macro_invocation_is_a_call() {
+        let mut parser = RustParser::new().unwrap();
+        let calls = parser.find_calls_impl(MACRO_CODE);
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "m" && *target == "println"),
+            "expected m -> println, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_macro_invocation_keeps_its_path() {
+        let mut parser = RustParser::new().unwrap();
+        let calls = parser.find_calls_impl(MACRO_CODE);
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "m" && *target == "tracing::warn"),
+            "expected m -> tracing::warn, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn macro_invocation_in_a_let_initializer_is_a_call() {
+        let mut parser = RustParser::new().unwrap();
+        let calls = parser.find_calls_impl(MACRO_CODE);
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "m" && *target == "anyhow"),
+            "expected m -> anyhow, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn method_calls_report_macro_invocations() {
+        let mut parser = RustParser::new().unwrap();
+        let calls = parser.find_method_calls_impl(MACRO_CODE);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.caller == "m" && c.method_name == "println"),
+            "expected bare macro in method calls, got {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c.caller == "m"
+                && c.method_name == "warn"
+                && c.receiver.as_deref() == Some("tracing")
+                && c.is_static),
+            "expected scoped macro as static call on `tracing`, got {calls:?}"
+        );
+    }
+
+    const TOP_LEVEL_CODE: &str = r#"
+static REG: u32 = compute();
+const LIMIT: usize = derive_limit();
+fn inside() { helper(); }
+        "#;
+
+    #[test]
+    fn a_call_in_a_static_initializer_is_attributed_to_the_module() {
+        let mut parser = RustParser::new().unwrap();
+        let calls = parser.find_calls_impl(TOP_LEVEL_CODE);
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "<module>" && *target == "compute"),
+            "expected <module> -> compute, got {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "<module>" && *target == "derive_limit"),
+            "expected <module> -> derive_limit, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_inside_a_function_keeps_the_function_as_caller() {
+        let mut parser = RustParser::new().unwrap();
+        let calls = parser.find_calls_impl(TOP_LEVEL_CODE);
+        assert!(
+            calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "inside" && *target == "helper"),
+            "expected inside -> helper, got {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(caller, target, _)| *caller == "<module>" && *target == "helper"),
+            "helper() must not be attributed to the module, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn method_calls_are_seeded_with_the_module_caller_too() {
+        let mut parser = RustParser::new().unwrap();
+        let calls = parser.find_method_calls_impl(TOP_LEVEL_CODE);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.caller == "<module>" && c.method_name == "compute"),
+            "expected <module> -> compute, got {calls:?}"
+        );
     }
 
     #[test]
