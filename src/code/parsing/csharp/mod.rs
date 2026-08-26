@@ -478,7 +478,7 @@ impl CSharpParser {
         let target = match node.kind() {
             "invocation_expression" => node
                 .child_by_field_name("function")
-                .map(|n| &code[n.byte_range()]),
+                .and_then(|f| Self::call_target_name(f, code)),
             // Construction is a dependency on the constructed type. An
             // implicit `new()` names no type and is left alone.
             "object_creation_expression" => node
@@ -493,6 +493,31 @@ impl CSharpParser {
 
         for child in node.children(&mut node.walk()) {
             Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
+        }
+    }
+
+    /// Bare member name invoked by the `function` part of a call.
+    ///
+    /// Relationships resolve by matching the stored target against a symbol
+    /// name, so the receiver has to be dropped: `items.Select(..)` depends on
+    /// `Select`, and storing `items.Select` matches nothing. Returns `None` when
+    /// the callee is a computed value — `Func()()` invokes what the inner call
+    /// returned and names no member of its own.
+    fn call_target_name<'a>(func: Node, code: &'a str) -> Option<&'a str> {
+        match func.kind() {
+            "identifier" | "generic_name" => Some(last_name_segment(func, code)),
+            "member_access_expression" => func
+                .child_by_field_name("name")
+                .map(|n| last_name_segment(n, code)),
+            // `a?.b` hangs the member off a trailing `member_binding_expression`;
+            // the `condition` field holds the receiver.
+            "conditional_access_expression" => func
+                .children(&mut func.walk())
+                .filter(|c| c.kind() == "member_binding_expression")
+                .last()
+                .and_then(|b| b.child_by_field_name("name"))
+                .map(|n| last_name_segment(n, code)),
+            _ => None,
         }
     }
 
@@ -784,5 +809,53 @@ class App {
             "type arguments must not shadow the constructed type: {edges:?}"
         );
         assert!(edges.contains(&("Run", "Helper")), "plain call: {edges:?}");
+    }
+
+    /// Relationships resolve by matching the stored target against a symbol
+    /// name, so a target that carries its receiver ("items.Select") can never
+    /// match anything.
+    #[test]
+    fn qualified_call_targets_are_stored_as_bare_member_names() {
+        let mut parser = CSharpParser::new().unwrap();
+
+        let code = r#"
+class App {
+    void Run() {
+        other?.Bar();
+        MyEvent?.Invoke(this);
+        items.Select(x => x);
+        Ns.Static.Deep.Call();
+        obj.Generic<int>();
+        a?.b?.c();
+        Helper();
+        Func()();
+    }
+}
+"#;
+
+        let calls = parser.find_calls_impl(code);
+        let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
+
+        for target in [
+            "Bar", "Invoke", "Select", "Call", "Generic", "c", "Helper", "Func",
+        ] {
+            assert!(
+                edges.contains(&("Run", target)),
+                "missing bare target {target}: {edges:?}"
+            );
+        }
+        assert!(
+            !edges
+                .iter()
+                .any(|(_, t)| t.contains('.') || t.contains('<')),
+            "no target may carry its receiver or type arguments: {edges:?}"
+        );
+        // `Func()()` invokes the value the inner call returned. There is no name
+        // to point at, and the inner call is already recorded on its own.
+        assert_eq!(
+            edges.iter().filter(|(_, t)| *t == "Func").count(),
+            1,
+            "invoking a returned delegate must not duplicate the target: {edges:?}"
+        );
     }
 }
