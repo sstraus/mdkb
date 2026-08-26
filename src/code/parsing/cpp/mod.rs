@@ -174,7 +174,12 @@ impl CppParser {
                         sym_kind,
                         file_id,
                         node_range(node),
-                        (Some(format!("{kind_str} {n}")), doc, module_path, visibility),
+                        (
+                            Some(format!("{kind_str} {n}")),
+                            doc,
+                            module_path,
+                            visibility,
+                        ),
                     );
                     symbols.push(symbol);
                 }
@@ -219,6 +224,27 @@ impl CppParser {
                     _ => module_path.to_string(),
                 };
 
+                // The namespace is a symbol in its own right, not just a prefix
+                // for the things inside it. Named by its full path, so `inner`
+                // in two different outers stays two symbols.
+                if ns_name.is_some() {
+                    let doc = extract_cpp_doc(&node, code);
+                    let symbol = self.create_symbol(
+                        counter.next_id(),
+                        new_path.clone(),
+                        SymbolKind::Module,
+                        file_id,
+                        node_range(node),
+                        (
+                            Some(format!("namespace {new_path}")),
+                            doc,
+                            module_path,
+                            Visibility::Public,
+                        ),
+                    );
+                    symbols.push(symbol);
+                }
+
                 self.context.enter_scope(ScopeType::Namespace);
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
@@ -258,6 +284,57 @@ impl CppParser {
                     );
                     symbols.push(symbol);
                 }
+                self.process_enumerators(node, code, file_id, counter, symbols, module_path);
+            }
+
+            "alias_declaration" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = &code[name_node.byte_range()];
+                    let doc = extract_cpp_doc(&node, code);
+                    let qualified = match self.context.current_class() {
+                        Some(cls) => format!("{cls}::{name}"),
+                        None => name.to_string(),
+                    };
+                    let symbol = self.create_symbol(
+                        counter.next_id(),
+                        qualified,
+                        SymbolKind::TypeAlias,
+                        file_id,
+                        node_range(node),
+                        (
+                            Some(
+                                code[node.byte_range()]
+                                    .trim_end_matches(';')
+                                    .trim()
+                                    .to_string(),
+                            ),
+                            doc,
+                            module_path,
+                            self.member_visibility(),
+                        ),
+                    );
+                    symbols.push(symbol);
+                }
+            }
+
+            "preproc_def" | "preproc_function_def" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let doc = extract_cpp_doc(&node, code);
+                    let symbol = self.create_symbol(
+                        counter.next_id(),
+                        code[name_node.byte_range()].to_string(),
+                        SymbolKind::Macro,
+                        file_id,
+                        node_range(node),
+                        (
+                            Some(code[node.byte_range()].trim_end().to_string()),
+                            doc,
+                            module_path,
+                            Visibility::Public,
+                        ),
+                    );
+                    symbols.push(symbol);
+                }
             }
 
             "field_declaration" if self.context.is_in_class() => {
@@ -269,7 +346,10 @@ impl CppParser {
                 if let Some(nested) = node.children(&mut node.walk()).find(|c| {
                     matches!(
                         c.kind(),
-                        "class_specifier" | "struct_specifier" | "union_specifier" | "enum_specifier"
+                        "class_specifier"
+                            | "struct_specifier"
+                            | "union_specifier"
+                            | "enum_specifier"
                     ) && c.child_by_field_name("body").is_some()
                 }) {
                     self.extract_symbols_from_node(
@@ -458,6 +538,52 @@ impl CppParser {
                 );
                 symbols.push(symbol);
             }
+        }
+    }
+
+    /// Enumerators, named `Enum::member`. Valid for a scoped enum and, since
+    /// C++11, for an unscoped one too, so it is always a spelling source can use
+    /// — and unlike a bare name it tells two enums' `None` apart. Qualified by
+    /// the immediate enum only, matching how members of a nested type are named.
+    fn process_enumerators(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        module_path: &str,
+    ) {
+        let (Some(name_node), Some(body)) = (
+            node.child_by_field_name("name"),
+            node.child_by_field_name("body"),
+        ) else {
+            return;
+        };
+        let enum_name = &code[name_node.byte_range()];
+        let visibility = self.member_visibility();
+
+        for member in body.children(&mut body.walk()) {
+            if member.kind() != "enumerator" {
+                continue;
+            }
+            let Some(member_name) = member.child_by_field_name("name") else {
+                continue;
+            };
+            let symbol = self.create_symbol(
+                counter.next_id(),
+                format!("{enum_name}::{}", &code[member_name.byte_range()]),
+                SymbolKind::Constant,
+                file_id,
+                node_range(member),
+                (
+                    Some(code[member.byte_range()].to_string()),
+                    None,
+                    module_path,
+                    visibility,
+                ),
+            );
+            symbols.push(symbol);
         }
     }
 
@@ -778,6 +904,68 @@ private:
 };
 "#;
 
+    /// The `name`/`kind` pairs the symbols of `code` carry.
+    fn kinds_of(code: &str) -> Vec<(String, SymbolKind)> {
+        let mut parser = CppParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        parser
+            .parse_symbols(code, file_id, &mut counter)
+            .iter()
+            .map(|s| (s.as_name().to_string(), s.kind))
+            .collect()
+    }
+
+    #[test]
+    fn a_namespace_produces_a_module_symbol() {
+        let kinds = kinds_of("namespace outer { namespace inner { int x; } }\n");
+        assert!(
+            kinds.contains(&("outer".into(), SymbolKind::Module)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("outer::inner".into(), SymbolKind::Module)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn a_using_alias_produces_a_type_alias_symbol() {
+        let kinds = kinds_of("using MyAlias = int;\n");
+        assert!(
+            kinds.contains(&("MyAlias".into(), SymbolKind::TypeAlias)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn enum_members_are_qualified_by_their_enum() {
+        // `Level::High` is valid for a scoped enum and, since C++11, for an
+        // unscoped one too — so qualifying is always a spelling source can use.
+        let kinds = kinds_of("enum class Level { Low, High = 3 };\nenum Color { RED };\n");
+        assert!(
+            kinds.contains(&("Level::High".into(), SymbolKind::Constant)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("Color::RED".into(), SymbolKind::Constant)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn both_define_forms_produce_macro_symbols() {
+        let kinds = kinds_of("#define MAX 10\n#define SQ(x) ((x)*(x))\n");
+        assert!(
+            kinds.contains(&("MAX".into(), SymbolKind::Macro)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("SQ".into(), SymbolKind::Macro)),
+            "{kinds:?}"
+        );
+    }
+
     #[test]
     fn a_type_nested_in_a_class_body_is_extracted() {
         let names = names_of(NESTED);
@@ -809,7 +997,10 @@ private:
         // `outerHidden` follow a `private:` that the nested bodies must not reset.
         assert_eq!(visibility_of(NESTED, "Outer::Inner"), Visibility::Public);
         assert_eq!(visibility_of(NESTED, "Outer::Guard"), Visibility::Private);
-        assert_eq!(visibility_of(NESTED, "Outer::outerHidden"), Visibility::Private);
+        assert_eq!(
+            visibility_of(NESTED, "Outer::outerHidden"),
+            Visibility::Private
+        );
     }
 
     #[test]

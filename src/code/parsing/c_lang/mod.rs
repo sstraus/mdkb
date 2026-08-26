@@ -123,15 +123,32 @@ impl CParser {
                 }
             }
 
-            "struct_specifier" => {
-                if let Some(symbol) = self.process_struct(node, code, file_id, counter, module_path)
+            "struct_specifier" | "union_specifier" => {
+                if let Some(symbol) = self.process_record(node, code, file_id, counter, module_path)
                 {
+                    let record = symbol.name.as_ref().to_string();
                     symbols.push(symbol);
+                    self.process_record_fields(
+                        node,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        (&record, module_path),
+                    );
                 }
             }
 
             "enum_specifier" => {
                 if let Some(symbol) = self.process_enum(node, code, file_id, counter, module_path) {
+                    symbols.push(symbol);
+                }
+                self.process_enumerators(node, code, file_id, counter, symbols, module_path);
+            }
+
+            "preproc_def" | "preproc_function_def" => {
+                if let Some(symbol) = self.process_macro(node, code, file_id, counter, module_path)
+                {
                     symbols.push(symbol);
                 }
             }
@@ -205,7 +222,9 @@ impl CParser {
         ))
     }
 
-    fn process_struct(
+    /// A `struct` or `union` declaration. Both are record types with a name and
+    /// a field list; the index has no Union kind, so both map to Struct.
+    fn process_record(
         &self,
         node: Node,
         code: &str,
@@ -216,6 +235,11 @@ impl CParser {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
         let doc = extract_c_doc(&node, code);
+        let keyword = if node.kind() == "union_specifier" {
+            "union"
+        } else {
+            "struct"
+        };
 
         Some(self.create_symbol(
             counter.next_id(),
@@ -224,7 +248,119 @@ impl CParser {
             file_id,
             node_range(node),
             (
-                Some(format!("struct {name}")),
+                Some(format!("{keyword} {name}")),
+                doc,
+                module_path,
+                Visibility::Public,
+            ),
+        ))
+    }
+
+    /// Members of a record, named `Record.field` — the spelling C uses to reach
+    /// them, and the only one that tells two structs' `x` apart.
+    fn process_record_fields(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        tail: (&str, &str),
+    ) {
+        let (record, module_path) = tail;
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        for decl in body.children(&mut body.walk()) {
+            if decl.kind() != "field_declaration" {
+                continue;
+            }
+            for field in decl.children(&mut decl.walk()) {
+                if field.kind() != "field_identifier" {
+                    continue;
+                }
+                let symbol = self.create_symbol(
+                    counter.next_id(),
+                    format!("{record}.{}", &code[field.byte_range()]),
+                    SymbolKind::Field,
+                    file_id,
+                    node_range(decl),
+                    (
+                        Some(
+                            code[decl.byte_range()]
+                                .trim_end_matches(';')
+                                .trim()
+                                .to_string(),
+                        ),
+                        None,
+                        module_path,
+                        Visibility::Public,
+                    ),
+                );
+                symbols.push(symbol);
+            }
+        }
+    }
+
+    /// Enumerators, named bare: C puts them in the enclosing scope, so `RED` is
+    /// the only way source can spell one.
+    fn process_enumerators(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        module_path: &str,
+    ) {
+        let Some(body) = node.child_by_field_name("body") else {
+            return;
+        };
+        for member in body.children(&mut body.walk()) {
+            if member.kind() != "enumerator" {
+                continue;
+            }
+            let Some(name_node) = member.child_by_field_name("name") else {
+                continue;
+            };
+            let symbol = self.create_symbol(
+                counter.next_id(),
+                code[name_node.byte_range()].to_string(),
+                SymbolKind::Constant,
+                file_id,
+                node_range(member),
+                (
+                    Some(code[member.byte_range()].to_string()),
+                    None,
+                    module_path,
+                    Visibility::Public,
+                ),
+            );
+            symbols.push(symbol);
+        }
+    }
+
+    /// A `#define`, object-like or function-like. Both carry the macro name in
+    /// the `name` field and differ only in whether a parameter list follows.
+    fn process_macro(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        module_path: &str,
+    ) -> Option<Symbol> {
+        let name_node = node.child_by_field_name("name")?;
+        let doc = extract_c_doc(&node, code);
+
+        Some(self.create_symbol(
+            counter.next_id(),
+            code[name_node.byte_range()].to_string(),
+            SymbolKind::Macro,
+            file_id,
+            node_range(node),
+            (
+                Some(code[node.byte_range()].trim_end().to_string()),
                 doc,
                 module_path,
                 Visibility::Public,
@@ -440,12 +576,10 @@ fn extract_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
         // A typedef alias arrives as `type_identifier`, an object name as
         // `identifier`. Both are the end of the declarator chain.
         "identifier" | "type_identifier" => Some(&code[node.byte_range()]),
-        "init_declarator"
-        | "pointer_declarator"
-        | "array_declarator"
-        | "function_declarator" => node
-            .child_by_field_name("declarator")
-            .and_then(|d| extract_declarator_name(d, code)),
+        "init_declarator" | "pointer_declarator" | "array_declarator" | "function_declarator" => {
+            node.child_by_field_name("declarator")
+                .and_then(|d| extract_declarator_name(d, code))
+        }
         // The grammar labels no field on `(*fp)`, so the chain has to be
         // followed by node kind. Descending by field here returns None and
         // loses every function pointer in the file.
@@ -553,6 +687,79 @@ mod tests {
         let names = names_of("int *ptr = 0;\nint arr[10];\n");
         assert!(names.iter().any(|n| n == "ptr"), "{names:?}");
         assert!(names.iter().any(|n| n == "arr"), "{names:?}");
+    }
+
+    /// The `name`/`kind` pairs the symbols of `code` carry.
+    fn kinds_of(code: &str) -> Vec<(String, SymbolKind)> {
+        let mut parser = CParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        parser
+            .parse_symbols(code, file_id, &mut counter)
+            .iter()
+            .map(|s| (s.as_name().to_string(), s.kind))
+            .collect()
+    }
+
+    #[test]
+    fn a_union_produces_a_symbol_with_its_fields() {
+        let kinds = kinds_of("union Bits { int i; float f; };\n");
+        assert!(
+            kinds.contains(&("Bits".into(), SymbolKind::Struct)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("Bits.i".into(), SymbolKind::Field)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("Bits.f".into(), SymbolKind::Field)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn a_struct_produces_symbols_for_its_fields() {
+        let kinds = kinds_of("struct Point { int x; int y; };\n");
+        assert!(
+            kinds.contains(&("Point.x".into(), SymbolKind::Field)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("Point.y".into(), SymbolKind::Field)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn both_define_forms_produce_macro_symbols() {
+        let kinds = kinds_of("#define MAX 10\n#define SQ(x) ((x)*(x))\n");
+        assert!(
+            kinds.contains(&("MAX".into(), SymbolKind::Macro)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("SQ".into(), SymbolKind::Macro)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn enum_members_produce_symbols() {
+        let kinds = kinds_of("enum Color { RED, GREEN = 2 };\n");
+        assert!(
+            kinds.contains(&("Color".into(), SymbolKind::Enum)),
+            "{kinds:?}"
+        );
+        // C puts enumerators in the enclosing scope: `RED`, never `Color::RED`.
+        assert!(
+            kinds.contains(&("RED".into(), SymbolKind::Constant)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("GREEN".into(), SymbolKind::Constant)),
+            "{kinds:?}"
+        );
     }
 
     #[test]
