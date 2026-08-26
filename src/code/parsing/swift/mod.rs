@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, find_modifier_keyword, node_range,
+    LanguageParser, check_recursion_depth, find_modifier_keyword, last_name_segment, node_range,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -99,36 +99,30 @@ impl SwiftParser {
         }
 
         match node.kind() {
-            // tree-sitter-swift 0.7 uses class_declaration for class, struct, and enum.
-            // The keyword (class/struct/enum) is an anonymous child node.
+            // tree-sitter-swift uses class_declaration for class, struct, enum
+            // and extension alike; the `declaration_kind` field holds the
+            // keyword that tells them apart.
             "class_declaration" => {
-                // Determine actual kind from keyword child
-                let mut kind = SymbolKind::Class;
-                let mut keyword = "class";
-                for i in 0..node.child_count() as u32 {
-                    if let Some(child) = node.child(i) {
-                        match child.kind() {
-                            "struct" => {
-                                kind = SymbolKind::Struct;
-                                keyword = "struct";
-                                break;
-                            }
-                            "enum" => {
-                                kind = SymbolKind::Enum;
-                                keyword = "enum";
-                                break;
-                            }
-                            "class" => break,
-                            _ => {}
-                        }
-                    }
-                }
+                let keyword = node
+                    .child_by_field_name("declaration_kind")
+                    .map(|n| &code[n.byte_range()])
+                    .unwrap_or("class");
+                let kind = match keyword {
+                    "struct" => SymbolKind::Struct,
+                    "enum" => SymbolKind::Enum,
+                    _ => SymbolKind::Class,
+                };
 
+                // An extension names the type it extends, which may be written
+                // as a `user_type` rather than a bare identifier.
                 let name = node
                     .child_by_field_name("name")
-                    .map(|n| code[n.byte_range()].to_string());
+                    .map(|n| last_name_segment(n, code).to_string());
 
-                if let Some(ref n) = name {
+                // An extension adds members to a type declared elsewhere; it
+                // declares no type itself. Emitting one would put a phantom
+                // Class next to the real symbol and split name resolution.
+                if let Some(n) = name.as_ref().filter(|_| keyword != "extension") {
                     let doc = extract_swift_doc(&node, code);
                     let vis = determine_swift_visibility(node, code);
                     let symbol = self.create_symbol(
@@ -536,5 +530,64 @@ import UIKit
         let imports = parser.find_imports(code, file_id);
         assert!(imports.iter().any(|i| i.path == "Foundation"));
         assert!(imports.iter().any(|i| i.path == "UIKit"));
+    }
+
+    /// tree-sitter-swift parses `extension Foo` as a class_declaration, the same
+    /// node kind as a real class. An extension adds members to a type declared
+    /// elsewhere; it declares no type of its own, so emitting one puts a ghost
+    /// next to the real symbol and makes name resolution pick between them.
+    #[test]
+    fn an_extension_declares_no_type_of_its_own() {
+        let mut parser = SwiftParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+protocol Greetable {
+}
+
+extension Greetable {
+    func greet() -> String { return "hi" }
+}
+
+class Real {
+    func run() {}
+}
+
+struct Point {}
+enum Shape {}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let found: Vec<(&str, SymbolKind)> =
+            symbols.iter().map(|s| (s.name.as_ref(), s.kind)).collect();
+
+        assert_eq!(
+            found.iter().filter(|(n, _)| *n == "Greetable").count(),
+            1,
+            "the protocol and its extension must yield one symbol: {found:?}"
+        );
+        assert!(
+            found.contains(&("Greetable", SymbolKind::Interface)),
+            "the surviving symbol is the protocol: {found:?}"
+        );
+        assert!(
+            found.contains(&("Greetable.greet", SymbolKind::Method)),
+            "extension members are still attributed to the extended type: {found:?}"
+        );
+
+        // Every real declaration still emits its own symbol.
+        assert!(
+            found.contains(&("Real", SymbolKind::Class)),
+            "class: {found:?}"
+        );
+        assert!(
+            found.contains(&("Point", SymbolKind::Struct)),
+            "struct: {found:?}"
+        );
+        assert!(
+            found.contains(&("Shape", SymbolKind::Enum)),
+            "enum: {found:?}"
+        );
     }
 }
