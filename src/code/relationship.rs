@@ -24,6 +24,11 @@ pub enum RelationKind {
     DefinedIn,
     References,
     ReferencedBy,
+    /// A macro invocation. Separate from [`Calls`](Self::Calls) because a macro
+    /// is not a function: counted as a call, `assert!` and `println!` are 4 921
+    /// edges of this repository's index pointing at functions that do not exist.
+    Expands,
+    ExpandedBy,
 }
 
 impl RelationKind {
@@ -43,6 +48,8 @@ impl RelationKind {
             Self::DefinedIn => Self::Defines,
             Self::References => Self::ReferencedBy,
             Self::ReferencedBy => Self::References,
+            Self::Expands => Self::ExpandedBy,
+            Self::ExpandedBy => Self::Expands,
         }
     }
 }
@@ -62,6 +69,8 @@ impl fmt::Display for RelationKind {
             Self::DefinedIn => "DefinedIn",
             Self::References => "References",
             Self::ReferencedBy => "ReferencedBy",
+            Self::Expands => "Expands",
+            Self::ExpandedBy => "ExpandedBy",
         })
     }
 }
@@ -85,6 +94,8 @@ mod tests {
             RelationKind::DefinedIn,
             RelationKind::References,
             RelationKind::ReferencedBy,
+            RelationKind::Expands,
+            RelationKind::ExpandedBy,
         ];
         for kind in all {
             assert_eq!(

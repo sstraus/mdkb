@@ -820,17 +820,51 @@ impl RustParser {
             }
         }
 
-        // A macro invocation is a call too: `println!`, `anyhow!`,
-        // `tracing::warn!`. It is a separate node kind, so the branch above
-        // never sees it.
+        for child in node.children(&mut node.walk()) {
+            Self::find_calls_in_node(child, code, current_fn, depth + 1, calls);
+        }
+    }
+
+    /// Macro invocations: `println!`, `anyhow!`, `tracing::warn!`.
+    ///
+    /// A separate node kind from `call_expression`, so this walk and
+    /// [`find_calls_in_node`](Self::find_calls_in_node) never see each other's
+    /// nodes and a name cannot land in both.
+    fn find_macro_expansions_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        Self::find_macros_in_node(tree.root_node(), code, Some("<module>"), 0, &mut found);
+        found
+    }
+
+    fn find_macros_in_node<'a>(
+        node: Node,
+        code: &'a str,
+        current_fn: Option<&'a str>,
+        depth: usize,
+        found: &mut Vec<(&'a str, &'a str, Range)>,
+    ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+        let current_fn = if node.kind() == "function_item" {
+            node.child_by_field_name("name")
+                .map(|n| &code[n.byte_range()])
+                .or(current_fn)
+        } else {
+            current_fn
+        };
+
         if node.kind() == "macro_invocation" {
             if let (Some(name_node), Some(caller)) = (Self::macro_name_node(node), current_fn) {
-                calls.push((caller, &code[name_node.byte_range()], node_range(node)));
+                found.push((caller, &code[name_node.byte_range()], node_range(node)));
             }
         }
 
         for child in node.children(&mut node.walk()) {
-            Self::find_calls_in_node(child, code, current_fn, depth + 1, calls);
+            Self::find_macros_in_node(child, code, current_fn, depth + 1, found);
         }
     }
 
@@ -920,16 +954,9 @@ impl RustParser {
             }
         }
 
-        if node.kind() == "macro_invocation" {
-            if let (Some(name_node), Some(caller)) = (Self::macro_name_node(node), current_fn) {
-                Self::push_plain_or_scoped_call(
-                    caller,
-                    &code[name_node.byte_range()],
-                    node_range(node),
-                    calls,
-                );
-            }
-        }
+        // A macro invocation is not a call and is reported by
+        // `find_macro_expansions`. Two APIs that disagree about that would put
+        // `println` in one answer and not the other.
 
         for child in node.children(&mut node.walk()) {
             Self::find_method_calls_in_node(child, code, current_fn, depth + 1, calls);
@@ -1282,6 +1309,10 @@ impl LanguageParser for RustParser {
 
     fn find_method_calls(&mut self, code: &str) -> Vec<MethodCall> {
         self.find_method_calls_impl(code)
+    }
+
+    fn find_macro_expansions<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        self.find_macro_expansions_impl(code)
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
@@ -1751,57 +1782,92 @@ fn m() {
         "#;
 
     #[test]
-    fn bare_macro_invocation_is_a_call() {
+    fn a_bare_macro_invocation_is_an_expansion() {
         let mut parser = RustParser::new().unwrap();
-        let calls = parser.find_calls_impl(MACRO_CODE);
+        let found = parser.find_macro_expansions_impl(MACRO_CODE);
         assert!(
-            calls
+            found
                 .iter()
                 .any(|(caller, target, _)| *caller == "m" && *target == "println"),
-            "expected m -> println, got {calls:?}"
+            "expected m -> println, got {found:?}"
         );
     }
 
     #[test]
-    fn scoped_macro_invocation_keeps_its_path() {
+    fn a_scoped_macro_invocation_keeps_its_path() {
         let mut parser = RustParser::new().unwrap();
-        let calls = parser.find_calls_impl(MACRO_CODE);
+        let found = parser.find_macro_expansions_impl(MACRO_CODE);
         assert!(
-            calls
+            found
                 .iter()
                 .any(|(caller, target, _)| *caller == "m" && *target == "tracing::warn"),
-            "expected m -> tracing::warn, got {calls:?}"
+            "expected m -> tracing::warn, got {found:?}"
         );
     }
 
     #[test]
-    fn macro_invocation_in_a_let_initializer_is_a_call() {
+    fn a_macro_invocation_in_a_let_initializer_is_an_expansion() {
+        let mut parser = RustParser::new().unwrap();
+        let found = parser.find_macro_expansions_impl(MACRO_CODE);
+        assert!(
+            found
+                .iter()
+                .any(|(caller, target, _)| *caller == "m" && *target == "anyhow"),
+            "expected m -> anyhow, got {found:?}"
+        );
+    }
+
+    /// The point of the split: a macro must not also be reported as a call, in
+    /// either call API. `println` names no function, and an edge to it is an
+    /// edge to nothing.
+    #[test]
+    fn a_macro_invocation_is_not_reported_as_a_call() {
         let mut parser = RustParser::new().unwrap();
         let calls = parser.find_calls_impl(MACRO_CODE);
         assert!(
-            calls
+            !calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "m" && *target == "anyhow"),
-            "expected m -> anyhow, got {calls:?}"
+                .any(|(_, target, _)| matches!(*target, "println" | "anyhow" | "tracing::warn")),
+            "macros must not appear among calls, got {calls:?}"
+        );
+
+        let method_calls = parser.find_method_calls_impl(MACRO_CODE);
+        assert!(
+            !method_calls
+                .iter()
+                .any(|c| matches!(c.method_name.as_str(), "println" | "anyhow" | "warn")),
+            "macros must not appear among method calls, got {method_calls:?}"
         );
     }
 
+    /// A function is still a call even when a macro of the same name exists.
+    /// The distinction is the invocation form, not the name.
     #[test]
-    fn method_calls_report_macro_invocations() {
+    fn a_function_sharing_a_macro_name_is_still_a_call() {
         let mut parser = RustParser::new().unwrap();
-        let calls = parser.find_method_calls_impl(MACRO_CODE);
+        let code = "fn write() {}\nfn m() { write(); write!(f, \"x\"); }\n";
+
+        let calls = parser.find_calls_impl(code);
         assert!(
             calls
                 .iter()
-                .any(|c| c.caller == "m" && c.method_name == "println"),
-            "expected bare macro in method calls, got {calls:?}"
+                .any(|(caller, target, _)| *caller == "m" && *target == "write"),
+            "the function call must stay a call, got {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(caller, target, _)| *caller == "m" && *target == "write")
+                .count(),
+            1,
+            "the macro must not add a second call edge, got {calls:?}"
         );
         assert!(
-            calls.iter().any(|c| c.caller == "m"
-                && c.method_name == "warn"
-                && c.receiver.as_deref() == Some("tracing")
-                && c.is_static),
-            "expected scoped macro as static call on `tracing`, got {calls:?}"
+            parser
+                .find_macro_expansions_impl(code)
+                .iter()
+                .any(|(caller, target, _)| *caller == "m" && *target == "write"),
+            "the macro invocation must still be recorded as an expansion"
         );
     }
 

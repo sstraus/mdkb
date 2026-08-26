@@ -1683,6 +1683,58 @@ pub fn world() {
         relationship_rows(&facade)
     }
 
+    /// A macro invocation is not a function call. Counted as one, `assert!` and
+    /// `println!` become edges to functions that do not exist — 4 921 of them on
+    /// a fresh index of these sources, the largest single block of the
+    /// unresolved bucket.
+    #[test]
+    fn macro_invocations_are_stored_as_expansions_not_calls() {
+        let rows = relationships_for(
+            "lib.rs",
+            "macro_rules! shout { () => {} }\n\
+             fn shout() {}\n\
+             fn m() { shout(); shout!(); println!(\"hi\"); }\n",
+        );
+
+        assert!(
+            rows.contains(&("m".into(), "shout".into(), "Expands".into())),
+            "the macro invocation must be stored as an expansion: {rows:?}"
+        );
+        assert!(
+            rows.contains(&("m".into(), "println".into(), "Expands".into())),
+            "an external macro is still an expansion: {rows:?}"
+        );
+        assert!(
+            rows.contains(&("m".into(), "shout".into(), "Calls".into())),
+            "the function of the same name is still a call: {rows:?}"
+        );
+        assert!(
+            !rows.contains(&("m".into(), "println".into(), "Calls".into())),
+            "a macro must not also be stored as a call: {rows:?}"
+        );
+    }
+
+    /// The distinction has to reach the queries, not just the table: `calls`
+    /// and `callers` select on `kind = 'Calls'`, so an expansion must be
+    /// invisible to them.
+    #[test]
+    fn a_macro_invocation_is_not_reported_as_a_caller() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            src_dir.path().join("lib.rs"),
+            "macro_rules! shout { () => {} }\nfn m() { shout!(); }\n",
+        )
+        .unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        assert!(
+            facade.db.get_calling_functions("shout").unwrap().is_empty(),
+            "a macro expansion must not answer `who calls shout`"
+        );
+    }
+
     /// Index one file and return `(symbol name, scope_context JSON)` for every
     /// symbol stored as a member of a type.
     fn class_members_for(name: &str, source: &str) -> Vec<(String, String)> {

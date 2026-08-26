@@ -39,6 +39,23 @@ pub trait LanguageParser: Send {
             .collect()
     }
 
+    /// Find macro invocations: (invoker_name, macro_name, range).
+    ///
+    /// Empty by default, because most languages cannot tell one at parse time.
+    /// C and C++ are the clear case: `MAX(a, b)` and `max(a, b)` are the same
+    /// `call_expression` until the preprocessor has run, so their parsers index
+    /// `#define`s as symbols and still report a use of one as a call.
+    ///
+    /// Where the grammar does distinguish it — Rust's `macro_invocation` — the
+    /// invocation belongs here and not in
+    /// [`find_calls`](LanguageParser::find_calls): a macro is not a function,
+    /// and reporting `assert!` as a call to a missing `assert` is 4 921 wrong
+    /// edges in this repository's own index.
+    fn find_macro_expansions<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        let _ = code;
+        Vec::new()
+    }
+
     /// Find trait/interface implementations: (type_name, trait_name, range).
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)>;
 

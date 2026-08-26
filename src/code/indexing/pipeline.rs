@@ -408,6 +408,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
 
         let symbols = parser.parse(&fc.content, dummy_file_id, &mut counter);
         let calls = parser.find_calls(&fc.content);
+        let macro_expansions = parser.find_macro_expansions(&fc.content);
         let implementations = parser.find_implementations(&fc.content);
         let extends = parser.find_extends(&fc.content);
         let uses = parser.find_uses(&fc.content);
@@ -449,6 +450,16 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 to_name: callee.into(),
                 to_range: range,
                 kind: RelationKind::Calls,
+            });
+        }
+
+        for (invoker, macro_name, range) in macro_expansions {
+            raw_relationships.push(RawRelationship {
+                from_name: invoker.into(),
+                from_range: range,
+                to_name: macro_name.into(),
+                to_range: range,
+                kind: RelationKind::Expands,
             });
         }
 
