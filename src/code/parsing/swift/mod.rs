@@ -158,20 +158,57 @@ impl SwiftParser {
             }
 
             "protocol_declaration" => {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = &code[name_node.byte_range()];
+                let name = node
+                    .child_by_field_name("name")
+                    .map(|n| code[n.byte_range()].to_string());
+
+                if let Some(ref n) = name {
                     let doc = extract_swift_doc(&node, code);
                     let vis = determine_swift_visibility(node, code);
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        name.to_string(),
+                        n.clone(),
                         SymbolKind::Interface,
                         file_id,
                         node_range(node),
-                        (Some(format!("protocol {name}")), doc, module_path, vis),
+                        (Some(format!("protocol {n}")), doc, module_path, vis),
                     );
                     symbols.push(symbol);
                 }
+
+                // The requirements a protocol states are what makes it answer
+                // "who implements what"; without walking the body they are lost.
+                self.context.enter_scope(ScopeType::Class);
+                let saved_cls = self.context.current_class().map(|s| s.to_string());
+                self.context.set_current_class(name);
+
+                if let Some(body) = node.child_by_field_name("body") {
+                    for child in body.children(&mut body.walk()) {
+                        self.extract_symbols_from_node(
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            (module_path, depth + 1),
+                        );
+                    }
+                }
+
+                self.context.exit_scope();
+                self.context.set_current_class(saved_cls);
+            }
+
+            // Members the grammar leaves unnamed, or names through a nested
+            // node rather than a plain identifier.
+            "protocol_function_declaration"
+            | "protocol_property_declaration"
+            | "associatedtype_declaration"
+            | "subscript_declaration"
+            | "deinit_declaration"
+            | "typealias_declaration"
+            | "enum_entry" => {
+                self.process_member(node, code, file_id, counter, symbols, module_path);
             }
 
             "function_declaration" => {
@@ -186,24 +223,11 @@ impl SwiftParser {
                         SymbolKind::Function
                     };
 
-                    let qualified_name = if let Some(cls) = self.context.current_class() {
-                        format!("{cls}.{name}")
-                    } else {
-                        name.to_string()
-                    };
-
-                    let sig = code[node.byte_range()]
-                        .lines()
-                        .next()
-                        .unwrap_or("")
-                        .trim()
-                        .trim_end_matches('{')
-                        .trim()
-                        .to_string();
+                    let sig = first_line(node, code);
 
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        qualified_name,
+                        self.qualified(name),
                         kind,
                         file_id,
                         node_range(node),
@@ -233,12 +257,6 @@ impl SwiftParser {
                     let name = &code[name_node.byte_range()];
                     let vis = determine_swift_visibility(node, code);
 
-                    let qualified_name = if let Some(cls) = self.context.current_class() {
-                        format!("{cls}.{name}")
-                    } else {
-                        name.to_string()
-                    };
-
                     let is_let = code[node.byte_range()].starts_with("let ")
                         || code[node.byte_range()].contains(" let ");
 
@@ -250,7 +268,7 @@ impl SwiftParser {
 
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        qualified_name,
+                        self.qualified(name),
                         kind,
                         file_id,
                         node_range(node),
@@ -272,6 +290,84 @@ impl SwiftParser {
                     );
                 }
             }
+        }
+    }
+
+    /// Symbols for members that carry no plain `name` field.
+    ///
+    /// `subscript` and `deinit` have no name at all in the source and are named
+    /// after the keyword that declares them. An enum case may declare several
+    /// names in one `case`, so every `name` field is read, not just the first.
+    fn process_member(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        module_path: &str,
+    ) {
+        let vis = determine_swift_visibility(node, code);
+        let doc = extract_swift_doc(&node, code);
+        let mut push = |name: String, kind: SymbolKind, signature: String| {
+            symbols.push(self.create_symbol(
+                counter.next_id(),
+                self.qualified(&name),
+                kind,
+                file_id,
+                node_range(node),
+                (Some(signature), doc.clone(), module_path, vis),
+            ));
+        };
+
+        let named = |field: &str| {
+            node.child_by_field_name(field)
+                .map(|n| code[n.byte_range()].to_string())
+        };
+
+        match node.kind() {
+            "protocol_function_declaration" => {
+                if let Some(name) = named("name") {
+                    push(name, SymbolKind::Method, first_line(node, code));
+                }
+            }
+            // The requirement is named through a `pattern`, which holds the
+            // identifier in its `bound_identifier` field.
+            "protocol_property_declaration" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|p| p.child_by_field_name("bound_identifier"))
+                    .map(|n| code[n.byte_range()].to_string())
+                {
+                    push(name, SymbolKind::Field, first_line(node, code));
+                }
+            }
+            "associatedtype_declaration" | "typealias_declaration" => {
+                if let Some(name) = named("name") {
+                    push(name, SymbolKind::TypeAlias, first_line(node, code));
+                }
+            }
+            "subscript_declaration" => push(
+                "subscript".to_string(),
+                SymbolKind::Method,
+                first_line(node, code),
+            ),
+            "deinit_declaration" => push("deinit".to_string(), SymbolKind::Method, "deinit".into()),
+            "enum_entry" => {
+                for name_node in node.children_by_field_name("name", &mut node.walk()) {
+                    let name = code[name_node.byte_range()].to_string();
+                    push(name.clone(), SymbolKind::Constant, format!("case {name}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Member name qualified by the type currently being walked.
+    fn qualified(&self, name: &str) -> String {
+        match self.context.current_class() {
+            Some(cls) => format!("{cls}.{name}"),
+            None => name.to_string(),
         }
     }
 
@@ -352,6 +448,21 @@ fn determine_swift_visibility(node: Node, code: &str) -> Visibility {
         Some("private") => Visibility::Private,
         _ => Visibility::Crate, // Swift default is internal
     }
+}
+
+/// First line of a declaration, trimmed of its opening brace.
+///
+/// Swift signatures are written on one line and the grammar has no field that
+/// spans just them, so the source line is the signature.
+fn first_line(node: Node, code: &str) -> String {
+    code[node.byte_range()]
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches('{')
+        .trim()
+        .to_string()
 }
 
 fn extract_swift_doc(node: &Node, code: &str) -> Option<String> {
@@ -588,6 +699,75 @@ enum Shape {}
         assert!(
             found.contains(&("Shape", SymbolKind::Enum)),
             "enum: {found:?}"
+        );
+    }
+
+    /// A protocol whose requirements are invisible cannot answer who implements
+    /// what, and four more member forms produced nothing at all.
+    #[test]
+    fn protocol_requirements_enum_cases_and_unnamed_members_produce_symbols() {
+        let mut parser = SwiftParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+protocol Greetable {
+    func greet() -> String
+    var name: String { get }
+    associatedtype Item
+}
+
+class Real {
+    subscript(i: Int) -> Int { return i }
+    deinit { }
+}
+
+typealias Handler = (Int) -> Void
+
+enum Shape {
+    case circle
+    case rect(w: Int, h: Int)
+}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let found: Vec<(&str, SymbolKind)> =
+            symbols.iter().map(|s| (s.name.as_ref(), s.kind)).collect();
+        let has = |name: &str, kind: SymbolKind| found.contains(&(name, kind));
+
+        assert!(
+            has("Greetable.greet", SymbolKind::Method),
+            "protocol method requirement: {found:?}"
+        );
+        assert!(
+            has("Greetable.name", SymbolKind::Field),
+            "protocol property requirement: {found:?}"
+        );
+        assert!(
+            has("Greetable.Item", SymbolKind::TypeAlias),
+            "associated type: {found:?}"
+        );
+
+        // A subscript and a deinitialiser have no name in the source; they are
+        // named after the keyword that declares them.
+        assert!(
+            has("Real.subscript", SymbolKind::Method),
+            "subscript: {found:?}"
+        );
+        assert!(has("Real.deinit", SymbolKind::Method), "deinit: {found:?}");
+
+        assert!(
+            has("Handler", SymbolKind::TypeAlias),
+            "typealias: {found:?}"
+        );
+
+        assert!(
+            has("Shape.circle", SymbolKind::Constant),
+            "enum case: {found:?}"
+        );
+        assert!(
+            has("Shape.rect", SymbolKind::Constant),
+            "enum case with associated values: {found:?}"
         );
     }
 }
