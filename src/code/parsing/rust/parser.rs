@@ -274,7 +274,9 @@ impl RustParser {
                 self.context.set_current_class(saved_cls);
                 return;
             }
-            "struct_item" => {
+            // A union has the same shape as a struct — a name and a field list —
+            // and the index has no Union kind, so it is recorded as one.
+            "struct_item" | "union_item" => {
                 let struct_name = node
                     .child_by_field_name("name")
                     .map(|n| code[n.byte_range()].to_string());
@@ -409,22 +411,21 @@ impl RustParser {
                     self.context.enter_scope(ScopeType::Class);
                     if let Some(body) = node.child_by_field_name("body") {
                         for child in body.children(&mut body.walk()) {
-                            if child.kind() == "function_signature_item"
-                                || child.kind() == "function_item"
-                            {
-                                if let Some(mn) = child.child_by_field_name("name") {
-                                    if let Some(mut ms) = self.create_symbol(
-                                        counter,
-                                        child,
-                                        mn,
-                                        SymbolKind::Method,
-                                        file_id,
-                                        code,
-                                    ) {
-                                        ms =
-                                            ms.with_signature(Self::extract_signature(child, code));
-                                        symbols.push(ms);
-                                    }
+                            // A trait body holds more than methods: `type Out;`
+                            // and `const N: usize;` are part of its contract and
+                            // were dropped along with every mention of them.
+                            let kind = match child.kind() {
+                                "function_signature_item" | "function_item" => SymbolKind::Method,
+                                "associated_type" => SymbolKind::TypeAlias,
+                                "const_item" => SymbolKind::Constant,
+                                _ => continue,
+                            };
+                            if let Some(mn) = child.child_by_field_name("name") {
+                                if let Some(mut ms) =
+                                    self.create_symbol(counter, child, mn, kind, file_id, code)
+                                {
+                                    ms = ms.with_signature(Self::extract_signature(child, code));
+                                    symbols.push(ms);
                                 }
                             }
                         }
@@ -473,6 +474,24 @@ impl RustParser {
                     }
                 }
                 return;
+            }
+            // A body-less `fn` declaration inside an `extern "C"` block. The
+            // trait arm handles its own signature items and returns before
+            // recursing, so only foreign declarations reach here.
+            "function_signature_item" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Some(mut sym) = self.create_symbol(
+                        counter,
+                        node,
+                        name_node,
+                        SymbolKind::Function,
+                        file_id,
+                        code,
+                    ) {
+                        sym = sym.with_signature(Self::extract_signature(node, code));
+                        symbols.push(sym);
+                    }
+                }
             }
             "macro_definition" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
@@ -980,20 +999,28 @@ impl RustParser {
                     let struct_name = &code[name_node.byte_range()];
                     if let Some(body) = node.child_by_field_name("body") {
                         for child in body.children(&mut body.walk()) {
-                            if child.kind() == "field_declaration" {
-                                if let Some(type_node) = child.child_by_field_name("type") {
-                                    if let Some(type_name) =
-                                        Self::extract_type_name(type_node, code)
-                                    {
-                                        let range = Range::new(
-                                            type_node.start_position().row as u32,
-                                            type_node.start_position().column as u16,
-                                            type_node.end_position().row as u32,
-                                            type_node.end_position().column as u16,
-                                        );
-                                        uses.push((struct_name, type_name, range));
-                                    }
+                            // A named struct wraps each field in a
+                            // `field_declaration` with a `type` field. A tuple
+                            // struct has no names, so the types sit directly in
+                            // the ordered list and there is nothing to unwrap.
+                            let type_node = match child.kind() {
+                                "field_declaration" => child.child_by_field_name("type"),
+                                _ if body.kind() == "ordered_field_declaration_list" => {
+                                    Some(child).filter(|c| c.is_named())
                                 }
+                                _ => None,
+                            };
+                            let Some(type_node) = type_node else {
+                                continue;
+                            };
+                            if let Some(type_name) = Self::extract_type_name(type_node, code) {
+                                let range = Range::new(
+                                    type_node.start_position().row as u32,
+                                    type_node.start_position().column as u16,
+                                    type_node.end_position().row as u32,
+                                    type_node.end_position().column as u16,
+                                );
+                                uses.push((struct_name, type_name, range));
                             }
                         }
                     }
@@ -1279,6 +1306,72 @@ impl LanguageParser for RustParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `name`/`kind` pairs the symbols of `code` carry.
+    fn kinds_of(code: &str) -> Vec<(String, SymbolKind)> {
+        let mut parser = RustParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        parser
+            .parse_symbols(code, file_id, &mut counter)
+            .iter()
+            .map(|s| (s.name.as_ref().to_string(), s.kind))
+            .collect()
+    }
+
+    #[test]
+    fn a_union_produces_a_struct_symbol_with_its_fields() {
+        let kinds = kinds_of("pub union Bits { i: i32, f: f32 }\n");
+        assert!(
+            kinds.contains(&("Bits".into(), SymbolKind::Struct)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("i".into(), SymbolKind::Field)),
+            "{kinds:?}"
+        );
+        assert!(
+            kinds.contains(&("f".into(), SymbolKind::Field)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn a_trait_associated_type_produces_a_type_alias_symbol() {
+        let kinds = kinds_of("pub trait T { type Out; }\n");
+        assert!(
+            kinds.contains(&("Out".into(), SymbolKind::TypeAlias)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn a_trait_associated_const_produces_a_constant_symbol() {
+        let kinds = kinds_of("pub trait T { const N: usize; }\n");
+        assert!(
+            kinds.contains(&("N".into(), SymbolKind::Constant)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn an_extern_function_declaration_produces_a_function_symbol() {
+        let kinds = kinds_of("unsafe extern \"C\" { pub fn c_fn(x: i32) -> i32; }\n");
+        assert!(
+            kinds.contains(&("c_fn".into(), SymbolKind::Function)),
+            "{kinds:?}"
+        );
+    }
+
+    #[test]
+    fn tuple_struct_field_types_produce_uses_relationships() {
+        let mut parser = RustParser::new().unwrap();
+        let uses = parser.find_uses("pub struct Wrapper(pub String, Inner);\n");
+        let pairs: Vec<(&str, &str)> = uses.iter().map(|(a, b, _)| (*a, *b)).collect();
+        // Exact: `pub` is a named sibling of the types in the ordered list and
+        // must not become a use of its own.
+        assert_eq!(pairs, vec![("Wrapper", "String"), ("Wrapper", "Inner")]);
+    }
 
     #[test]
     fn test_parse_functions_and_structs() {
