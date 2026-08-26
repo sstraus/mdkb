@@ -312,7 +312,11 @@ impl GdscriptParser {
             current_fn
         };
 
-        if node.kind() == "call" {
+        // A bare `helper()` is a `call`; anything reached through a dot —
+        // `$Node.play()`, `super._ready()`, the tail of `get_tree().timer()` —
+        // is an `attribute_call` under an `attribute`. Both hold the callee as
+        // their first child, and GDScript is written mostly in the dotted form.
+        if matches!(node.kind(), "call" | "attribute_call") {
             if let Some(func) = node.children(&mut node.walk()).next() {
                 let target = &code[func.byte_range()];
                 if let Some(ctx) = fn_ctx {
@@ -406,6 +410,69 @@ impl LanguageParser for GdscriptParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CALLS: &str = "\
+extends Node
+
+func _ready():
+\thelper()
+\t$Sprite2D.play()
+\tget_tree().create_timer(1.0)
+\tsuper._ready()
+\temit_signal(\"died\")
+
+func helper():
+\tpass
+";
+
+    /// Call targets recorded for `caller`.
+    fn targets_of(code: &str, caller: &str) -> Vec<String> {
+        let mut parser = GdscriptParser::new().unwrap();
+        parser
+            .find_calls_impl(code)
+            .iter()
+            .filter(|(c, _, _)| *c == caller)
+            .map(|(_, target, _)| (*target).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_call_on_a_node_path_is_recorded() {
+        let targets = targets_of(CALLS, "_ready");
+        assert!(
+            targets.iter().any(|t| t == "play"),
+            "expected play, got {targets:?}"
+        );
+    }
+
+    #[test]
+    fn both_halves_of_a_chained_call_are_recorded() {
+        let targets = targets_of(CALLS, "_ready");
+        assert!(
+            targets.iter().any(|t| t == "get_tree"),
+            "expected get_tree, got {targets:?}"
+        );
+        assert!(
+            targets.iter().any(|t| t == "create_timer"),
+            "expected create_timer, got {targets:?}"
+        );
+    }
+
+    #[test]
+    fn a_super_call_is_recorded() {
+        let targets = targets_of(CALLS, "_ready");
+        assert!(
+            targets.iter().any(|t| t == "_ready"),
+            "expected the super call to _ready, got {targets:?}"
+        );
+    }
+
+    #[test]
+    fn bare_calls_are_still_recorded() {
+        let targets = targets_of(CALLS, "_ready");
+        assert!(targets.iter().any(|t| t == "helper"), "{targets:?}");
+        assert!(targets.iter().any(|t| t == "emit_signal"), "{targets:?}");
+    }
 
     #[test]
     fn test_parse_functions() {
