@@ -108,19 +108,37 @@ impl JavaParser {
         }
 
         match node.kind() {
-            "class_declaration" => {
-                let class_name = node
+            // Java's five type declarations differ only in the symbol they
+            // produce; the scope handling below is identical for all of them.
+            "class_declaration"
+            | "interface_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+            | "enum_declaration" => {
+                let type_name = node
                     .child_by_field_name("name")
                     .map(|n| code[n.byte_range()].to_string());
 
-                if let Some(symbol) = self.process_class(node, code, file_id, counter, module_path)
-                {
+                if let Some(symbol) = self.process_type(node, code, file_id, counter, module_path) {
                     symbols.push(symbol);
                 }
 
                 self.context.enter_scope(ScopeType::Class);
                 let saved_cls = self.context.current_class().map(|s| s.to_string());
-                self.context.set_current_class(class_name);
+                self.context.set_current_class(type_name);
+
+                // A record declares its components in the parameter list, which
+                // is where its fields live; every other type has only a body.
+                if node.kind() == "record_declaration" {
+                    self.process_record_components(
+                        node,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                    );
+                }
 
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
@@ -139,45 +157,17 @@ impl JavaParser {
                 self.context.set_current_class(saved_cls);
             }
 
-            "interface_declaration" => {
-                let iface_name = node
-                    .child_by_field_name("name")
-                    .map(|n| code[n.byte_range()].to_string());
-
+            "enum_constant" => {
                 if let Some(symbol) =
-                    self.process_interface(node, code, file_id, counter, module_path)
+                    self.process_enum_constant(node, code, file_id, counter, module_path)
                 {
                     symbols.push(symbol);
                 }
-
-                self.context.enter_scope(ScopeType::Class);
-                let saved_cls = self.context.current_class().map(|s| s.to_string());
-                self.context.set_current_class(iface_name);
-
-                if let Some(body) = node.child_by_field_name("body") {
-                    for child in body.children(&mut body.walk()) {
-                        self.extract_symbols_from_node(
-                            child,
-                            code,
-                            file_id,
-                            counter,
-                            symbols,
-                            (module_path, depth + 1),
-                        );
-                    }
-                }
-
-                self.context.exit_scope();
-                self.context.set_current_class(saved_cls);
             }
 
-            "enum_declaration" => {
-                if let Some(symbol) = self.process_enum(node, code, file_id, counter, module_path) {
-                    symbols.push(symbol);
-                }
-            }
-
-            "method_declaration" => {
+            // An annotation element is a method in the language, and the type it
+            // declares is its return type.
+            "annotation_type_element_declaration" | "method_declaration" => {
                 let method_name = node
                     .child_by_field_name("name")
                     .map(|n| code[n.byte_range()].to_string());
@@ -238,7 +228,13 @@ impl JavaParser {
 
     // ── Symbol processors ───────────────────────────────────────────────
 
-    fn process_class(
+    /// Symbol for any of Java's five type declarations.
+    ///
+    /// An annotation type is an interface in the language, so it is indexed as
+    /// one. A record carries data like a class and is indexed as a class; its
+    /// components become fields, handled separately because they sit in the
+    /// parameter list rather than the body.
+    fn process_type(
         &self,
         node: Node,
         code: &str,
@@ -246,23 +242,77 @@ impl JavaParser {
         counter: &mut SymbolCounter,
         module_path: &str,
     ) -> Option<Symbol> {
+        let (kind, keyword) = match node.kind() {
+            "class_declaration" => (SymbolKind::Class, "class"),
+            "interface_declaration" => (SymbolKind::Interface, "interface"),
+            "record_declaration" => (SymbolKind::Class, "record"),
+            "annotation_type_declaration" => (SymbolKind::Interface, "@interface"),
+            "enum_declaration" => (SymbolKind::Enum, "enum"),
+            _ => return None,
+        };
+
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
         let visibility = determine_java_visibility(node, code);
-        let signature = build_class_signature(node, code, "class");
+        let signature = build_class_signature(node, code, keyword);
         let doc = extract_javadoc(&node, code);
 
         Some(self.create_symbol(
             counter.next_id(),
             name.to_string(),
-            SymbolKind::Class,
+            kind,
             file_id,
             node_range(node),
             (Some(signature), doc, module_path, visibility),
         ))
     }
 
-    fn process_interface(
+    /// Fields declared by a record's component list.
+    fn process_record_components(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        module_path: &str,
+    ) {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        for param in params.children(&mut params.walk()) {
+            if param.kind() != "formal_parameter" {
+                continue;
+            }
+            let (Some(name_node), Some(type_node)) = (
+                param.child_by_field_name("name"),
+                param.child_by_field_name("type"),
+            ) else {
+                continue;
+            };
+            let name = &code[name_node.byte_range()];
+            let type_str = &code[type_node.byte_range()];
+
+            symbols.push(self.create_symbol(
+                counter.next_id(),
+                self.qualified(name),
+                SymbolKind::Field,
+                file_id,
+                node_range(param),
+                (
+                    Some(format!("{type_str} {name}")),
+                    None,
+                    module_path,
+                    // A record component is always public: the accessor the
+                    // compiler generates for it is.
+                    Visibility::Public,
+                ),
+            ));
+        }
+    }
+
+    /// Symbol for one enum constant. Each is an immutable instance of its enum.
+    fn process_enum_constant(
         &self,
         node: Node,
         code: &str,
@@ -272,41 +322,24 @@ impl JavaParser {
     ) -> Option<Symbol> {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
-        let visibility = determine_java_visibility(node, code);
-        let signature = build_class_signature(node, code, "interface");
         let doc = extract_javadoc(&node, code);
 
         Some(self.create_symbol(
             counter.next_id(),
-            name.to_string(),
-            SymbolKind::Interface,
+            self.qualified(name),
+            SymbolKind::Constant,
             file_id,
             node_range(node),
-            (Some(signature), doc, module_path, visibility),
+            (Some(name.to_string()), doc, module_path, Visibility::Public),
         ))
     }
 
-    fn process_enum(
-        &self,
-        node: Node,
-        code: &str,
-        file_id: FileId,
-        counter: &mut SymbolCounter,
-        module_path: &str,
-    ) -> Option<Symbol> {
-        let name_node = node.child_by_field_name("name")?;
-        let name = &code[name_node.byte_range()];
-        let visibility = determine_java_visibility(node, code);
-        let doc = extract_javadoc(&node, code);
-
-        Some(self.create_symbol(
-            counter.next_id(),
-            name.to_string(),
-            SymbolKind::Enum,
-            file_id,
-            node_range(node),
-            (Some(format!("enum {name}")), doc, module_path, visibility),
-        ))
+    /// Member name qualified by the type currently being walked.
+    fn qualified(&self, name: &str) -> String {
+        match self.context.current_class() {
+            Some(cls) => format!("{cls}.{name}"),
+            None => name.to_string(),
+        }
     }
 
     fn process_method(
@@ -323,12 +356,6 @@ impl JavaParser {
         let signature = build_method_signature(node, code);
         let doc = extract_javadoc(&node, code);
 
-        let qualified_name = if let Some(cls) = self.context.current_class() {
-            format!("{cls}.{name}")
-        } else {
-            name.to_string()
-        };
-
         let kind = if self.context.is_in_class() {
             SymbolKind::Method
         } else {
@@ -337,7 +364,7 @@ impl JavaParser {
 
         Some(self.create_symbol(
             counter.next_id(),
-            qualified_name,
+            self.qualified(name),
             kind,
             file_id,
             node_range(node),
@@ -363,15 +390,9 @@ impl JavaParser {
             .map(|n| &code[n.byte_range()])
             .unwrap_or("()");
 
-        let qualified_name = if let Some(cls) = self.context.current_class() {
-            format!("{cls}.{name}")
-        } else {
-            name.to_string()
-        };
-
         Some(self.create_symbol(
             counter.next_id(),
-            qualified_name,
+            self.qualified(name),
             SymbolKind::Method,
             file_id,
             node_range(node),
@@ -412,15 +433,9 @@ impl JavaParser {
                         SymbolKind::Field
                     };
 
-                    let qualified_name = if let Some(cls) = self.context.current_class() {
-                        format!("{cls}.{name}")
-                    } else {
-                        name.to_string()
-                    };
-
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        qualified_name,
+                        self.qualified(name),
                         kind,
                         file_id,
                         node_range(child),
@@ -1202,5 +1217,83 @@ class App extends Base {
         assert!(edges.contains(&("App", "Base")), "super(): {edges:?}");
         // Existing behaviour is untouched.
         assert!(edges.contains(&("run", "helper")), "plain call: {edges:?}");
+    }
+
+    /// Records, annotation types and everything inside an enum body fell through
+    /// to generic recursion, so a record produced not even its own type symbol.
+    #[test]
+    fn records_annotation_types_and_enum_bodies_produce_symbols() {
+        let mut parser = JavaParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+public record Point(int x, String label) implements Shape {
+    public double area() { return 0; }
+}
+
+@interface MyAnnotation {
+    String value() default "";
+    int count();
+}
+
+public enum Color {
+    RED("r"), GREEN("g");
+    private final String code;
+    Color(String c) { this.code = c; }
+    public String get() { return code; }
+}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let found: Vec<(&str, SymbolKind)> =
+            symbols.iter().map(|s| (s.name.as_ref(), s.kind)).collect();
+
+        let has = |name: &str, kind: SymbolKind| found.contains(&(name, kind));
+
+        assert!(has("Point", SymbolKind::Class), "record type: {found:?}");
+        assert!(
+            has("Point.x", SymbolKind::Field),
+            "record component: {found:?}"
+        );
+        assert!(
+            has("Point.label", SymbolKind::Field),
+            "record component: {found:?}"
+        );
+        assert!(
+            has("Point.area", SymbolKind::Method),
+            "record method: {found:?}"
+        );
+
+        assert!(
+            has("MyAnnotation", SymbolKind::Interface),
+            "annotation type: {found:?}"
+        );
+        assert!(
+            has("MyAnnotation.value", SymbolKind::Method),
+            "annotation element: {found:?}"
+        );
+
+        assert!(has("Color", SymbolKind::Enum), "enum type: {found:?}");
+        assert!(
+            has("Color.RED", SymbolKind::Constant),
+            "enum constant: {found:?}"
+        );
+        assert!(
+            has("Color.GREEN", SymbolKind::Constant),
+            "enum constant: {found:?}"
+        );
+        assert!(
+            has("Color.code", SymbolKind::Field),
+            "enum field: {found:?}"
+        );
+        assert!(
+            has("Color.Color", SymbolKind::Method),
+            "enum constructor: {found:?}"
+        );
+        assert!(
+            has("Color.get", SymbolKind::Method),
+            "enum method: {found:?}"
+        );
     }
 }
