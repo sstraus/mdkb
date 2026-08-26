@@ -103,18 +103,30 @@ impl IndexFacade {
     /// Uses content hashes to skip unchanged files and deletes stale entries
     /// for changed files before re-indexing, preventing duplicates.
     pub fn index_directory(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
+        self.index_scope(root, root)
+    }
+
+    /// Index the files under `scope`, keying them relative to `root`.
+    ///
+    /// `mdkb code index src/` must not change what a file is called in the
+    /// database. Walking and keying are therefore separate: `scope` bounds the
+    /// walk, `root` is the prefix every stored path is relative to. Collapse the
+    /// two and the same file lands under `lib.rs` from one command and
+    /// `src/lib.rs` from another, which `insert_file` cannot tell apart.
+    pub fn index_scope(&mut self, root: &Path, scope: &Path) -> anyhow::Result<IndexStats> {
+        let files_removed = self.prune_vanished_files(root)?;
         let indexed_mtimes = self.db.get_file_mtimes()?;
 
         let stats = if indexed_mtimes.is_empty() {
             // Fresh index — no dedup needed. Embed the whole symbol table.
-            let stats = pipeline::index_directory(root, &self.db, &self.config)?;
+            let stats = pipeline::index_scope(root, scope, &self.db, &self.config)?;
             self.generate_symbol_embeddings();
             stats
         } else {
             // Incremental — discover files, filter by mtime, delete stale, re-index.
             // Uses mtime comparison (filesystem metadata) to avoid reading file contents.
             let discovered = walker::discover_files(
-                root,
+                scope,
                 &self.config.ignore_patterns,
                 self.config.respect_gitignore,
             );
@@ -129,14 +141,16 @@ impl IndexFacade {
                 }
             }
 
-            // No prune pass here: `mdkb code index <subdir>` calls this with a
-            // subdirectory as `root`, so "indexed but absent from the walk" also
-            // covers the rest of the project. Deletion detection lives in
-            // `update`, whose walk is always the whole tree.
+            // No walk-based prune pass here: `scope` may be a subdirectory, so
+            // "indexed but absent from the walk" would also cover the rest of the
+            // project. Deletion detection lives in `update`, whose walk is always
+            // the whole tree, and in `prune_vanished_files` above, which asks the
+            // filesystem instead of the walk.
             if changed.is_empty() {
                 self.db.mark_index_scan_completed()?;
                 return Ok(IndexStats {
                     files_discovered: discovered.len() as u32,
+                    files_removed,
                     ..IndexStats::default()
                 });
             }
@@ -161,7 +175,31 @@ impl IndexFacade {
 
         self.db.mark_index_scan_completed()?;
         self.verify_sound()?;
-        Ok(stats)
+        Ok(IndexStats {
+            files_removed: stats.files_removed + files_removed,
+            ..stats
+        })
+    }
+
+    /// Drop every indexed file that is no longer on disk under `root`.
+    ///
+    /// Unlike [`Self::prune_missing_files`] this asks the filesystem rather than
+    /// a walk, so it is safe when only a subdirectory is being indexed. It is
+    /// also the repair for indexes written before paths were keyed from the
+    /// project root: a row stored as `lib.rs` for a file living at `src/lib.rs`
+    /// resolves to nothing and is dropped, instead of lingering as a duplicate
+    /// of the row this run is about to write.
+    fn prune_vanished_files(&mut self, root: &Path) -> anyhow::Result<u32> {
+        let vanished: Vec<String> = self
+            .db
+            .get_file_mtimes()?
+            .into_keys()
+            .filter(|rel| !root.join(rel).exists())
+            .collect();
+        for rel in &vanished {
+            self.delete_by_rel_path(rel)?;
+        }
+        Ok(vanished.len() as u32)
     }
 
     /// Probe the index for structural damage, throttled to one scan per
@@ -207,6 +245,11 @@ impl IndexFacade {
 
     /// Re-index a directory (full reindex, discarding previous data).
     pub fn reindex(&mut self, root: &Path) -> anyhow::Result<IndexStats> {
+        self.reindex_scope(root, root)
+    }
+
+    /// Full reindex of `scope`, keyed relative to `root`. See [`Self::index_scope`].
+    pub fn reindex_scope(&mut self, root: &Path, scope: &Path) -> anyhow::Result<IndexStats> {
         // Roll back any dangling transaction from a previous failed reindex.
         let _ = self.db.conn().execute_batch("ROLLBACK");
         self.db.clear()?;
@@ -219,7 +262,7 @@ impl IndexFacade {
             }
         }
 
-        self.index_directory(root)
+        self.index_scope(root, scope)
     }
 
     /// Index specific files (not a full directory walk).
@@ -861,6 +904,65 @@ pub fn world() {
         assert!(stats.symbols_indexed >= 2);
         assert!(facade.symbol_count() >= 2);
         assert_eq!(facade.file_count(), 1);
+    }
+
+    /// A project tree with one file at `src/lib.rs`, plus an open facade.
+    fn project_with_a_source_subdir() -> (tempfile::TempDir, tempfile::TempDir, IndexFacade) {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(src_dir.path().join("src")).unwrap();
+        fs::write(src_dir.path().join("src/lib.rs"), "pub fn hello() {}").unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        (src_dir, db_dir, facade)
+    }
+
+    #[test]
+    fn indexing_a_subdirectory_keys_files_from_the_project_root() {
+        let (src_dir, _db_dir, mut facade) = project_with_a_source_subdir();
+        let root = src_dir.path();
+
+        facade.index_scope(root, &root.join("src")).unwrap();
+
+        let keys: Vec<String> = facade.db.get_file_mtimes().unwrap().into_keys().collect();
+        assert_eq!(keys, vec!["src/lib.rs".to_string()]);
+    }
+
+    #[test]
+    fn indexing_a_subdirectory_then_the_whole_tree_leaves_one_row_per_file() {
+        let (src_dir, _db_dir, mut facade) = project_with_a_source_subdir();
+        let root = src_dir.path();
+
+        facade.index_scope(root, &root.join("src")).unwrap();
+        facade.index_directory(root).unwrap();
+
+        assert_eq!(facade.file_count(), 1);
+    }
+
+    #[test]
+    fn a_symbol_indexed_through_a_subdirectory_is_found_by_its_root_relative_path() {
+        let (src_dir, _db_dir, mut facade) = project_with_a_source_subdir();
+        let root = src_dir.path();
+
+        facade.index_scope(root, &root.join("src")).unwrap();
+
+        let found = facade.find_symbols_by_file("src/lib.rs", 10);
+        assert!(
+            found.iter().any(|s| s.name.as_ref() == "hello"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn an_index_row_whose_file_no_longer_exists_is_dropped() {
+        let (src_dir, _db_dir, mut facade) = project_with_a_source_subdir();
+        let root = src_dir.path();
+        facade.index_directory(root).unwrap();
+        assert_eq!(facade.file_count(), 1);
+
+        fs::remove_file(root.join("src/lib.rs")).unwrap();
+        facade.index_directory(root).unwrap();
+
+        assert_eq!(facade.file_count(), 0);
     }
 
     #[test]

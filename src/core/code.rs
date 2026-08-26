@@ -65,7 +65,9 @@ pub fn handle_code_index(
 /// definition.
 ///
 /// Each path is canonicalized and checked against the root, so a `../` in a
-/// user-supplied path cannot make the indexer walk outside the project.
+/// user-supplied path cannot make the indexer walk outside the project. The
+/// argument bounds the walk only: stored paths stay relative to the project
+/// root, so indexing `src/` and indexing the whole tree agree on every name.
 pub fn index_paths(
     facade: &mut crate::code::indexing::IndexFacade,
     root: &Path,
@@ -84,7 +86,7 @@ pub fn index_paths(
             anyhow::bail!("Path '{p}' escapes project root");
         }
         let stats = facade
-            .index_directory(&canonical)
+            .index_scope(&root_canonical, &canonical)
             .map_err(|e| anyhow::anyhow!("Indexing '{p}' failed: {e}"))?;
         total.files_discovered += stats.files_discovered;
         total.files_indexed += stats.files_indexed;
@@ -114,12 +116,12 @@ pub fn reindex_paths(
     root: &Path,
     paths: &[String],
 ) -> anyhow::Result<crate::code::indexing::types::IndexStats> {
-    let target = if paths.is_empty() {
-        root.to_path_buf()
+    let root_canonical = root
+        .canonicalize()
+        .map_err(|e| anyhow::anyhow!("Cannot resolve root: {e}"))?;
+    let scope = if paths.is_empty() {
+        root_canonical.clone()
     } else {
-        let root_canonical = root
-            .canonicalize()
-            .map_err(|e| anyhow::anyhow!("Cannot resolve root: {e}"))?;
         // Validate all paths, use first (reindex clears DB so multiple passes don't combine)
         for p in paths {
             let candidate = root.join(p);
@@ -137,7 +139,7 @@ pub fn reindex_paths(
     };
 
     facade
-        .reindex(&target)
+        .reindex_scope(&root_canonical, &scope)
         .map_err(|e| anyhow::anyhow!("Reindexing failed: {e}"))
 }
 /// Translate a `kind` filter to its stored spelling, with the message both the

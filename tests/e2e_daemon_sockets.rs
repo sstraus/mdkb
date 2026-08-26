@@ -82,12 +82,11 @@ impl DaemonProc {
         )
         .unwrap();
 
-        // Index from the repo root, not `src/`: the indexer stores paths
-        // relative to the argument, so `code index src/` would file the symbols
-        // under `lib.rs` while the daemon's own watcher files them under
-        // `src/lib.rs` — two copies of every symbol, and every lookup by name
-        // then fails as ambiguous.
-        for args in [vec!["init"], vec!["code", "index", "."]] {
+        // Index `src/`, not the repo root: an argument bounds the walk but must
+        // not change what a file is called. Key these symbols under `lib.rs`
+        // instead of `src/lib.rs` and the daemon's own watcher files a second
+        // copy of every one of them, leaving every lookup by name ambiguous.
+        for args in [vec!["init"], vec!["code", "index", "src"]] {
             let out = Command::new(BIN)
                 .args(&args)
                 .current_dir(&root)

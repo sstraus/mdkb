@@ -133,7 +133,20 @@ pub fn index_directory(
     db: &CodeDb,
     config: &PipelineConfig,
 ) -> anyhow::Result<IndexStats> {
-    let (batch_rx, handles) = spawn_pipeline_stages(root, None, config)?;
+    index_scope(root, root, db, config)
+}
+
+/// Walk `scope`, but store every path relative to `root`.
+///
+/// Indexing a subdirectory must not rename its files in the database, so the
+/// directory to walk and the prefix paths are relative to are separate inputs.
+pub fn index_scope(
+    root: &Path,
+    scope: &Path,
+    db: &CodeDb,
+    config: &PipelineConfig,
+) -> anyhow::Result<IndexStats> {
+    let (batch_rx, handles) = spawn_pipeline_stages(root, scope, None, config)?;
     run_index_stage(db, batch_rx, handles)
 }
 
@@ -151,7 +164,7 @@ pub fn index_files(
         return Ok(IndexStats::default());
     }
 
-    let (batch_rx, handles) = spawn_pipeline_stages(root, Some(paths), config)?;
+    let (batch_rx, handles) = spawn_pipeline_stages(root, root, Some(paths), config)?;
     run_index_stage(db, batch_rx, handles)
 }
 
@@ -181,6 +194,7 @@ fn run_index_stage(
 /// Returns the batch receiver for the INDEX stage to consume.
 fn spawn_pipeline_stages(
     root: &Path,
+    scope: &Path,
     explicit_paths: Option<&[PathBuf]>,
     config: &PipelineConfig,
 ) -> anyhow::Result<(Receiver<IndexBatch>, StageHandles)> {
@@ -202,7 +216,7 @@ fn spawn_pipeline_stages(
             }
         })
     } else {
-        let discover_root = root.clone();
+        let discover_root = scope.to_path_buf();
         let discover_patterns = config.ignore_patterns.clone();
         let discover_respect_gitignore = config.respect_gitignore;
         thread::spawn(move || {
