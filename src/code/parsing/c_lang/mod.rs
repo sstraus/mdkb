@@ -304,48 +304,44 @@ impl CParser {
         symbols: &mut Vec<Symbol>,
         module_path: &str,
     ) {
-        // Look for variable declarators
-        for child in node.children(&mut node.walk()) {
-            if child.kind() == "init_declarator" || child.kind() == "identifier" {
-                let name = if child.kind() == "identifier" {
-                    &code[child.byte_range()]
-                } else if let Some(decl) = child.child_by_field_name("declarator") {
-                    if let Some(n) = extract_declarator_name(decl, code) {
-                        n
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                };
-
-                let is_const = code[node.byte_range()].contains("const ");
-                let kind = if is_const {
-                    SymbolKind::Constant
-                } else {
-                    SymbolKind::Variable
-                };
-
-                let symbol = self.create_symbol(
-                    counter.next_id(),
-                    name.to_string(),
-                    kind,
-                    file_id,
-                    node_range(node),
-                    (
-                        Some(
-                            code[node.byte_range()]
-                                .trim_end_matches(';')
-                                .trim()
-                                .to_string(),
-                        ),
-                        None,
-                        module_path,
-                        Visibility::Public,
-                    ),
-                );
-                symbols.push(symbol);
+        // The declarator field names every object shape — plain, pointer,
+        // array, initialised, function pointer — and a single declaration can
+        // carry several of them (`int a, b;`). Scanning children by kind
+        // instead reaches only the two simplest shapes.
+        for declarator in node.children_by_field_name("declarator", &mut node.walk()) {
+            if is_function_prototype(declarator) {
+                continue;
             }
+            let Some(name) = extract_declarator_name(declarator, code) else {
+                continue;
+            };
+
+            let is_const = code[node.byte_range()].contains("const ");
+            let kind = if is_const {
+                SymbolKind::Constant
+            } else {
+                SymbolKind::Variable
+            };
+
+            let symbol = self.create_symbol(
+                counter.next_id(),
+                name.to_string(),
+                kind,
+                file_id,
+                node_range(node),
+                (
+                    Some(
+                        code[node.byte_range()]
+                            .trim_end_matches(';')
+                            .trim()
+                            .to_string(),
+                    ),
+                    None,
+                    module_path,
+                    Visibility::Public,
+                ),
+            );
+            symbols.push(symbol);
         }
     }
 
@@ -420,16 +416,46 @@ impl CParser {
 // ── Free helpers ────────────────────────────────────────────────────────
 
 /// Extract the name from a C declarator (handles pointer declarators, function declarators, etc).
+/// Is this declarator a function prototype (`int f(int);`) rather than an object?
+///
+/// A prototype and a function pointer both reach a `function_declarator`. They
+/// part company one level below it: the pointer parenthesises its name —
+/// `int (*fp)(int)` — while the prototype names it directly. The return type
+/// can wrap either in pointers or arrays first (`int *ptr_ret(void);`), so the
+/// chain has to be walked rather than inspected one level deep.
+fn is_function_prototype(declarator: Node) -> bool {
+    match declarator.kind() {
+        "function_declarator" => declarator
+            .child_by_field_name("declarator")
+            .is_some_and(|d| d.kind() != "parenthesized_declarator"),
+        "init_declarator" | "pointer_declarator" | "array_declarator" => declarator
+            .child_by_field_name("declarator")
+            .is_some_and(is_function_prototype),
+        _ => false,
+    }
+}
+
 fn extract_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
-        "identifier" => Some(&code[node.byte_range()]),
-        "pointer_declarator" | "array_declarator" | "parenthesized_declarator" => node
+        // A typedef alias arrives as `type_identifier`, an object name as
+        // `identifier`. Both are the end of the declarator chain.
+        "identifier" | "type_identifier" => Some(&code[node.byte_range()]),
+        "init_declarator"
+        | "pointer_declarator"
+        | "array_declarator"
+        | "function_declarator" => node
             .child_by_field_name("declarator")
             .and_then(|d| extract_declarator_name(d, code)),
-        "function_declarator" => node
-            .child_by_field_name("declarator")
-            .and_then(|d| extract_declarator_name(d, code)),
-        _ => None,
+        // The grammar labels no field on `(*fp)`, so the chain has to be
+        // followed by node kind. Descending by field here returns None and
+        // loses every function pointer in the file.
+        "parenthesized_declarator" => node
+            .children(&mut node.walk())
+            .find_map(|c| extract_declarator_name(c, code)),
+        _ => {
+            tracing::debug!(kind = node.kind(), "C declarator shape not recognised");
+            None
+        }
     }
 }
 
@@ -491,6 +517,58 @@ impl LanguageParser for CParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Names of the symbols `code` yields.
+    fn names_of(code: &str) -> Vec<String> {
+        let mut parser = CParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        parser
+            .parse_symbols(code, file_id, &mut counter)
+            .iter()
+            .map(|s| s.as_name().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_function_pointer_typedef_produces_a_symbol() {
+        let names = names_of("typedef void (*FuncPtr)(int);\n");
+        assert!(names.iter().any(|n| n == "FuncPtr"), "{names:?}");
+    }
+
+    #[test]
+    fn a_function_pointer_variable_produces_a_symbol() {
+        let names = names_of("int (*global_fp)(int) = 0;\n");
+        assert!(names.iter().any(|n| n == "global_fp"), "{names:?}");
+    }
+
+    #[test]
+    fn a_plain_typedef_produces_a_symbol() {
+        let names = names_of("typedef int MyInt;\n");
+        assert!(names.iter().any(|n| n == "MyInt"), "{names:?}");
+    }
+
+    #[test]
+    fn pointer_and_array_declarators_still_resolve() {
+        let names = names_of("int *ptr = 0;\nint arr[10];\n");
+        assert!(names.iter().any(|n| n == "ptr"), "{names:?}");
+        assert!(names.iter().any(|n| n == "arr"), "{names:?}");
+    }
+
+    #[test]
+    fn a_function_prototype_is_not_recorded_as_a_variable() {
+        let names = names_of("int plain(int x);\nint *ptr_ret(void);\n");
+        assert!(!names.iter().any(|n| n == "plain"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "ptr_ret"), "{names:?}");
+    }
+
+    #[test]
+    fn every_declarator_of_a_multi_name_declaration_produces_a_symbol() {
+        let names = names_of("int a, b = 2, *c;\n");
+        for expected in ["a", "b", "c"] {
+            assert!(names.iter().any(|n| n == expected), "{names:?}");
+        }
+    }
 
     #[test]
     fn test_parse_functions_and_structs() {
