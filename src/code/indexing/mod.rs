@@ -1657,4 +1657,111 @@ pub fn world() {
             "caller() -> helper() relationship must survive re-index"
         );
     }
+
+    /// Every stored relationship, as `(from_name, to_name, kind)`.
+    fn relationship_rows(facade: &IndexFacade) -> Vec<(String, String, String)> {
+        let mut stmt = facade
+            .db
+            .conn()
+            .prepare(
+                "SELECT from_name, to_name, kind FROM code_relationships ORDER BY kind, to_name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// Index one file of the given name and return its relationship rows.
+    fn relationships_for(name: &str, source: &str) -> Vec<(String, String, String)> {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join(name), source).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        relationship_rows(&facade)
+    }
+
+    /// A Godot script declares its base class on the first line. The hierarchy of
+    /// a whole project is missing from the index if that never reaches storage.
+    #[test]
+    fn gdscript_extends_reaches_the_stored_relationships() {
+        let rows = relationships_for(
+            "player.gd",
+            "extends Node2D\nclass_name Player\n\nclass Inner extends Resource:\n\tvar x: int\n",
+        );
+
+        assert!(
+            rows.contains(&("Player".into(), "Node2D".into(), "Extends".into())),
+            "file-level extends: {rows:?}"
+        );
+        assert!(
+            rows.contains(&("Inner".into(), "Resource".into(), "Extends".into())),
+            "inner class extends: {rows:?}"
+        );
+    }
+
+    /// A script with no `class_name` is still a class and still has a base; the
+    /// per-file `<module>` symbol is what names it.
+    #[test]
+    fn gdscript_extends_is_recorded_for_an_unnamed_script() {
+        let rows = relationships_for("enemy.gd", "extends Node\n\nfunc _ready():\n\tpass\n");
+
+        assert!(
+            rows.contains(&("<module>".into(), "Node".into(), "Extends".into())),
+            "unnamed script extends: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn php_inheritance_and_type_uses_reach_the_stored_relationships() {
+        let rows = relationships_for(
+            "Repo.php",
+            "<?php\n\
+             class Repo extends BaseRepo implements Countable, JsonSerializable {\n\
+                 private Logger $logger;\n\
+                 public ?Cache $cache = null;\n\
+                 public function find(int $id, Query $q): Entity { return null; }\n\
+             }\n",
+        );
+
+        assert!(
+            rows.contains(&("Repo".into(), "BaseRepo".into(), "Extends".into())),
+            "extends: {rows:?}"
+        );
+        for iface in ["Countable", "JsonSerializable"] {
+            assert!(
+                rows.contains(&("Repo".into(), iface.into(), "Implements".into())),
+                "implements {iface}: {rows:?}"
+            );
+        }
+        for used in ["Logger", "Cache", "Query", "Entity"] {
+            assert!(
+                rows.iter()
+                    .any(|(_, to, kind)| to == used && kind == "Uses"),
+                "uses {used}: {rows:?}"
+            );
+        }
+        // `int` is a builtin, not a symbol anything can resolve to.
+        assert!(
+            !rows.iter().any(|(_, to, _)| to == "int"),
+            "a primitive type is not a used symbol: {rows:?}"
+        );
+    }
+
+    /// Lua has no classes, interfaces or type annotations, so calls are the only
+    /// relationship it can produce. This pins that they still reach storage.
+    #[test]
+    fn lua_calls_reach_the_stored_relationships() {
+        let rows = relationships_for(
+            "main.lua",
+            "function helper() end\nfunction caller() helper() end\n",
+        );
+
+        assert!(
+            rows.contains(&("caller".into(), "helper".into(), "Calls".into())),
+            "lua call: {rows:?}"
+        );
+    }
 }

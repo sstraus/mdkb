@@ -294,6 +294,143 @@ impl GdscriptParser {
         calls
     }
 
+    fn find_extends_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
+        };
+        let root = tree.root_node();
+        // A script is itself a class: its `extends` sits at the top level and the
+        // derived side is whatever names the file. `class_name` is optional and
+        // most scripts omit it, so fall back to the per-file `<module>` symbol
+        // rather than dropping the base class of the whole project.
+        let script_name = extract_gdscript_class_name_ref(root, code).unwrap_or("<module>");
+
+        let mut extends = Vec::new();
+        Self::find_extends_in_node(root, code, script_name, 0, &mut extends);
+        extends
+    }
+
+    fn find_extends_in_node<'a>(
+        node: Node,
+        code: &'a str,
+        derived: &'a str,
+        depth: usize,
+        extends: &mut Vec<(&'a str, &'a str, Range)>,
+    ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+
+        // An inner class renames the derived side for everything below it.
+        let derived = if node.kind() == "class_definition" {
+            node.child_by_field_name("name")
+                .map(|n| &code[n.byte_range()])
+                .unwrap_or(derived)
+        } else {
+            derived
+        };
+
+        if node.kind() == "extends_statement" {
+            // `extends "res://base.gd"` names a file, not a symbol; only the
+            // `type` form can resolve against the index.
+            if let Some(base) = node.children(&mut node.walk()).find(|c| c.kind() == "type") {
+                extends.push((derived, &code[base.byte_range()], node_range(base)));
+            }
+        }
+
+        for child in node.children(&mut node.walk()) {
+            Self::find_extends_in_node(child, code, derived, depth + 1, extends);
+        }
+    }
+
+    fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
+        };
+        let root = tree.root_node();
+        let script_name = extract_gdscript_class_name_ref(root, code).unwrap_or("<module>");
+        let mut uses = Vec::new();
+        Self::find_uses_in_node(root, code, script_name, 0, &mut uses);
+        uses
+    }
+
+    fn find_uses_in_node<'a>(
+        node: Node,
+        code: &'a str,
+        context: &'a str,
+        depth: usize,
+        uses: &mut Vec<(&'a str, &'a str, Range)>,
+    ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+
+        // The innermost named thing owns the types written inside it, the same
+        // rule `find_calls` uses for the caller side.
+        let context = match node.kind() {
+            "class_definition" | "function_definition" => node
+                .child_by_field_name("name")
+                .map(|n| &code[n.byte_range()])
+                .unwrap_or(context),
+            _ => context,
+        };
+
+        match node.kind() {
+            "variable_statement" | "typed_parameter" => {
+                push_gdscript_type(node.child_by_field_name("type"), context, code, uses);
+            }
+            "function_definition" => {
+                push_gdscript_type(node.child_by_field_name("return_type"), context, code, uses);
+            }
+            _ => {}
+        }
+
+        for child in node.children(&mut node.walk()) {
+            Self::find_uses_in_node(child, code, context, depth + 1, uses);
+        }
+    }
+
+    fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
+        };
+        let root = tree.root_node();
+        let script_name = extract_gdscript_class_name_ref(root, code).unwrap_or("<module>");
+        let mut defines = Vec::new();
+        Self::find_defines_in_node(root, code, script_name, 0, &mut defines);
+        defines
+    }
+
+    fn find_defines_in_node<'a>(
+        node: Node,
+        code: &'a str,
+        owner: &'a str,
+        depth: usize,
+        defines: &mut Vec<(&'a str, &'a str, Range)>,
+    ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+
+        let owner = if node.kind() == "class_definition" {
+            node.child_by_field_name("name")
+                .map(|n| &code[n.byte_range()])
+                .unwrap_or(owner)
+        } else {
+            owner
+        };
+
+        if node.kind() == "function_definition" {
+            if let Some(name) = node.child_by_field_name("name") {
+                defines.push((owner, &code[name.byte_range()], node_range(node)));
+            }
+        }
+
+        for child in node.children(&mut node.walk()) {
+            Self::find_defines_in_node(child, code, owner, depth + 1, defines);
+        }
+    }
+
     fn find_calls_in_node<'a>(
         node: &Node,
         code: &'a str,
@@ -333,12 +470,37 @@ impl GdscriptParser {
 
 // ── Free helpers ────────────────────────────────────────────────────────
 
+/// Record an annotated type as a use, unless it is a Variant primitive.
+///
+/// `int`, `float`, `bool` and `void` are built into the language and are never
+/// indexed as symbols, so an edge to them can only ever be noise. Everything
+/// else — including `Vector2` and `String` — is a real Godot class.
+fn push_gdscript_type<'a>(
+    type_node: Option<Node>,
+    context: &'a str,
+    code: &'a str,
+    uses: &mut Vec<(&'a str, &'a str, Range)>,
+) {
+    let Some(type_node) = type_node else {
+        return;
+    };
+    let name = &code[type_node.byte_range()];
+    if matches!(name, "int" | "float" | "bool" | "void") {
+        return;
+    }
+    uses.push((context, name, node_range(type_node)));
+}
+
 fn extract_gdscript_class_name(root: Node, code: &str) -> Option<String> {
+    extract_gdscript_class_name_ref(root, code).map(str::to_string)
+}
+
+fn extract_gdscript_class_name_ref<'a>(root: Node, code: &'a str) -> Option<&'a str> {
     for child in root.children(&mut root.walk()) {
         if child.kind() == "class_name_statement" {
             for gc in child.children(&mut child.walk()) {
                 if gc.kind() == "name" || gc.kind() == "identifier" {
-                    return Some(code[gc.byte_range()].to_string());
+                    return Some(&code[gc.byte_range()]);
                 }
             }
         }
@@ -391,15 +553,19 @@ impl LanguageParser for GdscriptParser {
     }
 
     fn find_implementations<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
+        Vec::new() // GDScript has no interfaces: a script only ever `extends`.
     }
 
-    fn find_uses<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
+    fn find_extends<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        self.find_extends_impl(code)
     }
 
-    fn find_defines<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
+    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        self.find_uses_impl(code)
+    }
+
+    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        self.find_defines_impl(code)
     }
 
     fn find_imports(&mut self, _code: &str, _file_id: FileId) -> Vec<Import> {
@@ -531,6 +697,78 @@ func outer_func():
             symbols
                 .iter()
                 .any(|s| s.name.as_ref() == "outer_func" && s.kind == SymbolKind::Function)
+        );
+    }
+
+    /// Type annotations are the only place a Godot script names another class
+    /// outside its `extends` line, and every `func` it declares is part of its
+    /// contract.
+    #[test]
+    fn typed_declarations_and_functions_are_recorded() {
+        let mut parser = GdscriptParser::new().unwrap();
+
+        let code = "extends Node2D\n\
+                    class_name Player\n\
+                    \n\
+                    var speed: float = 1.0\n\
+                    @export var target: Enemy\n\
+                    \n\
+                    func hit(other: Enemy, n: int) -> Damage:\n\
+                    \tpass\n\
+                    \n\
+                    class Inner extends Resource:\n\
+                    \tvar pos: Vector2\n\
+                    \tfunc go() -> void:\n\
+                    \t\tpass\n";
+
+        let uses: Vec<(&str, &str)> = parser
+            .find_uses(code)
+            .iter()
+            .map(|(c, t, _)| (*c, *t))
+            .collect();
+
+        assert!(
+            uses.contains(&("Player", "Enemy")),
+            "script property: {uses:?}"
+        );
+        assert!(uses.contains(&("hit", "Enemy")), "parameter: {uses:?}");
+        assert!(uses.contains(&("hit", "Damage")), "return type: {uses:?}");
+        assert!(
+            uses.contains(&("Inner", "Vector2")),
+            "inner class property: {uses:?}"
+        );
+        // Variant primitives are built into the language and never indexed.
+        assert!(
+            !uses
+                .iter()
+                .any(|(_, t)| matches!(*t, "int" | "float" | "void")),
+            "a primitive is not a used class: {uses:?}"
+        );
+
+        let defines: Vec<(&str, &str)> = parser
+            .find_defines(code)
+            .iter()
+            .map(|(c, t, _)| (*c, *t))
+            .collect();
+        assert!(
+            defines.contains(&("Player", "hit")),
+            "script method: {defines:?}"
+        );
+        assert!(
+            defines.contains(&("Inner", "go")),
+            "inner class method: {defines:?}"
+        );
+    }
+
+    /// `extends "res://base.gd"` names a file. There is no symbol to point at,
+    /// so recording the path as a base class would only create a dead edge.
+    #[test]
+    fn extends_by_script_path_records_nothing() {
+        let mut parser = GdscriptParser::new().unwrap();
+        assert!(
+            parser
+                .find_extends("extends \"res://base.gd\"\nclass_name Player\n")
+                .is_empty()
         );
     }
 }

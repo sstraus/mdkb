@@ -390,6 +390,12 @@ impl LanguageParser for LuaParser {
         self.find_calls_impl(code)
     }
 
+    // Lua has no declaration syntax for any of the three relationships below.
+    // Inheritance and "classes" are a convention built out of tables and
+    // `setmetatable` at run time, and there are no type annotations to read.
+    // Guessing a hierarchy out of those idioms would record edges the language
+    // does not state, so calls stay the only relationship Lua can prove.
+
     fn find_implementations<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         Vec::new()
     }

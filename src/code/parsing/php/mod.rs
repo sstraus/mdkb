@@ -429,6 +429,152 @@ impl PhpParser {
         }
     }
 
+    /// Inheritance and interface conformance, which share one traversal because
+    /// the grammar puts both clauses on the same declaration node.
+    fn find_inheritance_impl<'a>(
+        &mut self,
+        code: &'a str,
+        clause: &str,
+    ) -> Vec<(&'a str, &'a str, Range)> {
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
+        };
+        let mut found = Vec::new();
+        Self::find_inheritance_in_node(tree.root_node(), code, clause, 0, &mut found);
+        found
+    }
+
+    fn find_inheritance_in_node<'a>(
+        node: Node,
+        code: &'a str,
+        clause: &str,
+        depth: usize,
+        found: &mut Vec<(&'a str, &'a str, Range)>,
+    ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+
+        if matches!(
+            node.kind(),
+            "class_declaration" | "interface_declaration" | "enum_declaration"
+        ) {
+            if let Some(name) = node.child_by_field_name("name") {
+                let derived = &code[name.byte_range()];
+                for c in node.children(&mut node.walk()) {
+                    if c.kind() != clause {
+                        continue;
+                    }
+                    // Both clauses list their bases as bare `name` children;
+                    // `implements` may list several.
+                    for base in c.children(&mut c.walk()) {
+                        if matches!(base.kind(), "name" | "qualified_name") {
+                            found.push((derived, last_name_segment(base, code), node_range(base)));
+                        }
+                    }
+                }
+            }
+        }
+
+        for child in node.children(&mut node.walk()) {
+            Self::find_inheritance_in_node(child, code, clause, depth + 1, found);
+        }
+    }
+
+    fn find_uses_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
+        };
+        let mut uses = Vec::new();
+        Self::find_uses_in_node(tree.root_node(), code, "<module>", 0, &mut uses);
+        uses
+    }
+
+    fn find_uses_in_node<'a>(
+        node: Node,
+        code: &'a str,
+        context: &'a str,
+        depth: usize,
+        uses: &mut Vec<(&'a str, &'a str, Range)>,
+    ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+
+        // The innermost named thing owns the types written inside it: a property
+        // belongs to its class, a parameter and a return type to their function.
+        let context = match node.kind() {
+            "class_declaration"
+            | "interface_declaration"
+            | "trait_declaration"
+            | "enum_declaration"
+            | "function_definition"
+            | "method_declaration" => node
+                .child_by_field_name("name")
+                .map(|n| &code[n.byte_range()])
+                .unwrap_or(context),
+            _ => context,
+        };
+
+        match node.kind() {
+            "property_declaration" | "simple_parameter" | "property_promotion_parameter" => {
+                push_php_types(node.child_by_field_name("type"), context, code, uses);
+            }
+            "function_definition" | "method_declaration" => {
+                push_php_types(node.child_by_field_name("return_type"), context, code, uses);
+            }
+            _ => {}
+        }
+
+        for child in node.children(&mut node.walk()) {
+            Self::find_uses_in_node(child, code, context, depth + 1, uses);
+        }
+    }
+
+    fn find_defines_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        let Some(tree) = self.parser.parse_cached(code) else {
+            return Vec::new();
+        };
+        let mut defines = Vec::new();
+        Self::find_defines_in_node(tree.root_node(), code, 0, &mut defines);
+        defines
+    }
+
+    fn find_defines_in_node<'a>(
+        node: Node,
+        code: &'a str,
+        depth: usize,
+        defines: &mut Vec<(&'a str, &'a str, Range)>,
+    ) {
+        if !check_recursion_depth(depth, node) {
+            return;
+        }
+
+        if matches!(
+            node.kind(),
+            "class_declaration" | "interface_declaration" | "trait_declaration"
+        ) {
+            if let (Some(name), Some(body)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("body"),
+            ) {
+                let owner = &code[name.byte_range()];
+                for member in body.children(&mut body.walk()) {
+                    if member.kind() != "method_declaration" {
+                        continue;
+                    }
+                    if let Some(mn) = member.child_by_field_name("name") {
+                        defines.push((owner, &code[mn.byte_range()], node_range(member)));
+                    }
+                }
+            }
+        }
+
+        for child in node.children(&mut node.walk()) {
+            Self::find_defines_in_node(child, code, depth + 1, defines);
+        }
+    }
+
     fn extract_imports_impl(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
         let Some(tree) = self.parser.parse_cached(code) else {
             return Vec::new();
@@ -456,6 +602,34 @@ impl PhpParser {
 }
 
 // ── Free helpers ────────────────────────────────────────────────────────
+
+/// Record every class named by a type annotation as a use.
+///
+/// A declared type is a tree, not a token: `?Cache` wraps a `named_type`, and
+/// `Foo|Bar` holds two of them. Only `named_type` nodes are collected, so
+/// `int`, `string` and the other primitives — which are built into the language
+/// and never indexed as symbols — drop out without a keyword list.
+fn push_php_types<'a>(
+    type_node: Option<Node>,
+    context: &'a str,
+    code: &'a str,
+    uses: &mut Vec<(&'a str, &'a str, Range)>,
+) {
+    let Some(type_node) = type_node else {
+        return;
+    };
+    if type_node.kind() == "named_type" {
+        uses.push((
+            context,
+            last_name_segment(type_node, code),
+            node_range(type_node),
+        ));
+        return;
+    }
+    for child in type_node.children(&mut type_node.walk()) {
+        push_php_types(Some(child), context, code, uses);
+    }
+}
 
 fn extract_php_namespace(root: Node, code: &str) -> Option<String> {
     for child in root.children(&mut root.walk()) {
@@ -506,16 +680,20 @@ impl LanguageParser for PhpParser {
         self.find_calls_impl(code)
     }
 
-    fn find_implementations<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
+    fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        self.find_inheritance_impl(code, "class_interface_clause")
     }
 
-    fn find_uses<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
+    fn find_extends<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        self.find_inheritance_impl(code, "base_clause")
     }
 
-    fn find_defines<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
+    fn find_uses<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        self.find_uses_impl(code)
+    }
+
+    fn find_defines<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
+        self.find_defines_impl(code)
     }
 
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
@@ -688,5 +866,61 @@ class App extends Base {
         // Existing behaviour is untouched.
         assert!(edges.contains(&("run", "helper")), "plain call: {edges:?}");
         assert!(edges.contains(&("run", "method")), "member call: {edges:?}");
+    }
+
+    /// An interface states a contract and a class states its members; both are
+    /// `Defines` edges from the owner to the method.
+    #[test]
+    fn interface_and_class_methods_are_recorded_as_defines() {
+        let mut parser = PhpParser::new().unwrap();
+
+        let code = "<?php\n\
+                    interface Countable { public function count(): int; }\n\
+                    trait Loggable { public function log(string $m) {} }\n\
+                    class Repo implements Countable { public function count(): int { return 0; } }\n";
+
+        let defines: Vec<(&str, &str)> = parser
+            .find_defines(code)
+            .iter()
+            .map(|(c, t, _)| (*c, *t))
+            .collect();
+
+        assert!(
+            defines.contains(&("Countable", "count")),
+            "interface: {defines:?}"
+        );
+        assert!(defines.contains(&("Loggable", "log")), "trait: {defines:?}");
+        assert!(defines.contains(&("Repo", "count")), "class: {defines:?}");
+    }
+
+    /// A declared type is a tree: `?Cache` wraps its class and `Foo|Bar` holds
+    /// two. Reading only the outer node would miss both.
+    #[test]
+    fn nullable_and_union_property_types_are_all_recorded() {
+        let mut parser = PhpParser::new().unwrap();
+
+        let code = "<?php\n\
+                    class Box {\n\
+                        public ?Cache $cache = null;\n\
+                        private Foo|Bar $either;\n\
+                        public function set(int|Baz $v): void {}\n\
+                    }\n";
+
+        let uses: Vec<(&str, &str)> = parser
+            .find_uses(code)
+            .iter()
+            .map(|(c, t, _)| (*c, *t))
+            .collect();
+
+        assert!(uses.contains(&("Box", "Cache")), "nullable: {uses:?}");
+        assert!(
+            uses.contains(&("Box", "Foo")) && uses.contains(&("Box", "Bar")),
+            "union: {uses:?}"
+        );
+        assert!(uses.contains(&("set", "Baz")), "union parameter: {uses:?}");
+        assert!(
+            !uses.iter().any(|(_, t)| matches!(*t, "int" | "void")),
+            "a primitive is not a used class: {uses:?}"
+        );
     }
 }
