@@ -4,7 +4,9 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, extract_c_family_doc, node_range,
+};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -193,7 +195,7 @@ impl CParser {
     ) -> Option<Symbol> {
         let declarator = node.child_by_field_name("declarator")?;
         let name = extract_declarator_name(declarator, code)?;
-        let doc = extract_c_doc(&node, code);
+        let doc = extract_c_family_doc(&node, code);
 
         // Build signature from return type + declarator
         let type_node = node.child_by_field_name("type");
@@ -234,7 +236,7 @@ impl CParser {
     ) -> Option<Symbol> {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
-        let doc = extract_c_doc(&node, code);
+        let doc = extract_c_family_doc(&node, code);
         let keyword = if node.kind() == "union_specifier" {
             "union"
         } else {
@@ -351,7 +353,7 @@ impl CParser {
         module_path: &str,
     ) -> Option<Symbol> {
         let name_node = node.child_by_field_name("name")?;
-        let doc = extract_c_doc(&node, code);
+        let doc = extract_c_family_doc(&node, code);
 
         Some(self.create_symbol(
             counter.next_id(),
@@ -378,7 +380,7 @@ impl CParser {
     ) -> Option<Symbol> {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
-        let doc = extract_c_doc(&node, code);
+        let doc = extract_c_family_doc(&node, code);
 
         Some(self.create_symbol(
             counter.next_id(),
@@ -406,7 +408,7 @@ impl CParser {
         // typedef has the alias name as the last identifier child before ';'
         let declarator = node.child_by_field_name("declarator")?;
         let name = extract_declarator_name(declarator, code)?;
-        let doc = extract_c_doc(&node, code);
+        let doc = extract_c_family_doc(&node, code);
 
         Some(
             self.create_symbol(
@@ -593,27 +595,6 @@ fn extract_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
     }
 }
 
-/// Extract doc comment (/** ... */ or /// style) from preceding sibling.
-fn extract_c_doc(node: &Node, code: &str) -> Option<String> {
-    let sibling = node.prev_sibling()?;
-    if sibling.kind() != "comment" {
-        return None;
-    }
-    let text = &code[sibling.byte_range()];
-    if text.starts_with("/**") {
-        crate::code::parsing::parser::strip_block_doc_comment(text)
-    } else if text.starts_with("///") {
-        let inner = text.trim_start_matches("///").trim();
-        if inner.is_empty() {
-            None
-        } else {
-            Some(inner.to_string())
-        }
-    } else {
-        None
-    }
-}
-
 impl LanguageParser for CParser {
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
@@ -624,7 +605,7 @@ impl LanguageParser for CParser {
     }
 
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String> {
-        extract_c_doc(node, code)
+        extract_c_family_doc(node, code)
     }
 
     fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
@@ -699,6 +680,41 @@ mod tests {
             .iter()
             .map(|s| (s.as_name().to_string(), s.kind))
             .collect()
+    }
+
+    /// The doc comment recorded for the symbol named `name`.
+    fn doc_of(code: &str, name: &str) -> Option<String> {
+        let mut parser = CParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        symbols
+            .iter()
+            .find(|s| s.name.as_ref() == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no symbol {name}, got {:?}",
+                    symbols.iter().map(|s| s.as_name()).collect::<Vec<_>>()
+                )
+            })
+            .doc_comment
+            .as_ref()
+            .map(|d| d.to_string())
+    }
+
+    const GUARDED: &str = "/** Guarded. */\n#ifdef X\nint f(void) { return 1; }\n\
+                           int g(void) { return 2; }\n#endif\n";
+
+    #[test]
+    fn a_function_inside_an_ifdef_keeps_a_doc_written_before_the_directive() {
+        assert_eq!(doc_of(GUARDED, "f").as_deref(), Some("Guarded."));
+    }
+
+    #[test]
+    fn only_the_first_declaration_in_an_ifdef_claims_the_doc() {
+        // The comment describes `f`. `g` follows a real declaration, so nothing
+        // above the directive belongs to it.
+        assert_eq!(doc_of(GUARDED, "g"), None);
     }
 
     #[test]

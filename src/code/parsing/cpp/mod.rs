@@ -4,7 +4,9 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, extract_c_family_doc, node_range,
+};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -152,7 +154,7 @@ impl CppParser {
                     .map(|n| code[n.byte_range()].to_string());
 
                 if let Some(ref n) = name {
-                    let doc = extract_cpp_doc(&node, code);
+                    let doc = extract_c_family_doc(&node, code);
                     let sym_kind = if kind_str == "class" {
                         SymbolKind::Class
                     } else {
@@ -228,7 +230,7 @@ impl CppParser {
                 // for the things inside it. Named by its full path, so `inner`
                 // in two different outers stays two symbols.
                 if ns_name.is_some() {
-                    let doc = extract_cpp_doc(&node, code);
+                    let doc = extract_c_family_doc(&node, code);
                     let symbol = self.create_symbol(
                         counter.next_id(),
                         new_path.clone(),
@@ -264,7 +266,7 @@ impl CppParser {
             "enum_specifier" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = &code[name_node.byte_range()];
-                    let doc = extract_cpp_doc(&node, code);
+                    let doc = extract_c_family_doc(&node, code);
                     let qualified = match self.context.current_class() {
                         Some(cls) => format!("{cls}::{name}"),
                         None => name.to_string(),
@@ -290,7 +292,7 @@ impl CppParser {
             "alias_declaration" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
                     let name = &code[name_node.byte_range()];
-                    let doc = extract_cpp_doc(&node, code);
+                    let doc = extract_c_family_doc(&node, code);
                     let qualified = match self.context.current_class() {
                         Some(cls) => format!("{cls}::{name}"),
                         None => name.to_string(),
@@ -319,7 +321,7 @@ impl CppParser {
 
             "preproc_def" | "preproc_function_def" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
-                    let doc = extract_cpp_doc(&node, code);
+                    let doc = extract_c_family_doc(&node, code);
                     let symbol = self.create_symbol(
                         counter.next_id(),
                         code[name_node.byte_range()].to_string(),
@@ -429,7 +431,7 @@ impl CppParser {
     ) -> Option<Symbol> {
         let declarator = node.child_by_field_name("declarator")?;
         let name = extract_cpp_declarator_name(declarator, code)?;
-        let doc = extract_cpp_doc(&node, code);
+        let doc = extract_c_family_doc(&node, code);
 
         let type_node = node.child_by_field_name("type");
         let sig = match type_node {
@@ -476,7 +478,7 @@ impl CppParser {
             .children(&mut node.walk())
             .find(|c| c.kind() == "function_declarator")?;
         let name = extract_cpp_declarator_name(func_decl, code)?;
-        let doc = extract_cpp_doc(&node, code);
+        let doc = extract_c_family_doc(&node, code);
         let visibility = self.member_visibility();
 
         let qualified_name = if let Some(cls) = self.context.current_class() {
@@ -717,26 +719,6 @@ fn extract_cpp_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str>
     }
 }
 
-fn extract_cpp_doc(node: &Node, code: &str) -> Option<String> {
-    let sibling = node.prev_sibling()?;
-    if sibling.kind() != "comment" {
-        return None;
-    }
-    let text = &code[sibling.byte_range()];
-    if text.starts_with("/**") {
-        crate::code::parsing::parser::strip_block_doc_comment(text)
-    } else if text.starts_with("///") {
-        let inner = text.trim_start_matches("///").trim();
-        if inner.is_empty() {
-            None
-        } else {
-            Some(inner.to_string())
-        }
-    } else {
-        None
-    }
-}
-
 impl LanguageParser for CppParser {
     fn parse(&mut self, code: &str, file_id: FileId, counter: &mut SymbolCounter) -> Vec<Symbol> {
         self.parse_symbols(code, file_id, counter)
@@ -747,7 +729,7 @@ impl LanguageParser for CppParser {
     }
 
     fn extract_doc_comment(&self, node: &Node, code: &str) -> Option<String> {
-        extract_cpp_doc(node, code)
+        extract_c_family_doc(node, code)
     }
 
     fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
@@ -914,6 +896,53 @@ private:
             .iter()
             .map(|s| (s.as_name().to_string(), s.kind))
             .collect()
+    }
+
+    /// The doc comment recorded for the symbol named `name`.
+    fn doc_of(code: &str, name: &str) -> Option<String> {
+        let mut parser = CppParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        symbols
+            .iter()
+            .find(|s| s.name.as_ref() == name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no symbol {name}, got {:?}",
+                    symbols.iter().map(|s| s.as_name()).collect::<Vec<_>>()
+                )
+            })
+            .doc_comment
+            .as_ref()
+            .map(|d| d.to_string())
+    }
+
+    #[test]
+    fn a_documented_template_function_keeps_its_doc() {
+        let doc = doc_of(
+            "/** Identity. */\ntemplate<typename T> T identity(T x) { return x; }\n",
+            "identity",
+        );
+        assert_eq!(doc.as_deref(), Some("Identity."));
+    }
+
+    #[test]
+    fn a_documented_template_class_keeps_its_doc() {
+        let doc = doc_of(
+            "/** A box. */\ntemplate<typename T> class Box { T v; };\n",
+            "Box",
+        );
+        assert_eq!(doc.as_deref(), Some("A box."));
+    }
+
+    #[test]
+    fn a_non_doc_comment_above_a_template_yields_no_doc() {
+        let doc = doc_of(
+            "// just a note\ntemplate<typename T> T identity(T x) { return x; }\n",
+            "identity",
+        );
+        assert_eq!(doc, None);
     }
 
     #[test]

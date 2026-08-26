@@ -122,6 +122,75 @@ pub fn strip_block_doc_comment(text: &str) -> Option<String> {
     if inner.is_empty() { None } else { Some(inner) }
 }
 
+/// Doc comment for a C or C++ declaration, read from the comment above it.
+///
+/// Shared by the C and C++ extractors, which each carried a byte-identical copy.
+/// Accepts `/** ... */` and `///`; any other comment yields `None`.
+pub fn extract_c_family_doc(node: &Node, code: &str) -> Option<String> {
+    let sibling = doc_anchor(*node).prev_sibling()?;
+    if sibling.kind() != "comment" {
+        return None;
+    }
+    let text = &code[sibling.byte_range()];
+    if text.starts_with("/**") {
+        strip_block_doc_comment(text)
+    } else if text.starts_with("///") {
+        let inner = text.trim_start_matches("///").trim();
+        if inner.is_empty() {
+            None
+        } else {
+            Some(inner.to_string())
+        }
+    } else {
+        None
+    }
+}
+
+/// The node whose previous sibling the doc comment for `node` would be.
+///
+/// A doc comment is written above the whole declaration, but the node carrying
+/// the name often sits inside a wrapper: `/** doc */ template<typename T> T f(T)`
+/// puts the comment before the `template_declaration`, so the
+/// `function_definition` inside sees the parameter list as its previous sibling
+/// and never finds the doc. The same happens to a function guarded by `#ifdef`.
+///
+/// Climbing stops at the first wrapper holding an earlier declaration: in
+/// `/** doc */ #ifdef X  int f(); int g(); #endif` the comment describes `f`,
+/// and `g` must not claim it too.
+fn doc_anchor(node: Node<'_>) -> Node<'_> {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        let transparent = matches!(
+            parent.kind(),
+            "template_declaration" | "preproc_ifdef" | "linkage_specification"
+        );
+        if !transparent || !is_first_item_in(parent, current) {
+            break;
+        }
+        current = parent;
+    }
+    current
+}
+
+/// Does nothing precede `child` inside `parent` except the wrapper's own syntax?
+///
+/// The allowed kinds are the named parts of the three wrappers above: a template
+/// parameter list, the macro name after `#ifdef`, and the `"C"` of a linkage
+/// specification. Anything else — a comment, an earlier declaration — means the
+/// comment above `parent` was not written about `child`.
+fn is_first_item_in(parent: Node, child: Node) -> bool {
+    parent
+        .children(&mut parent.walk())
+        .take_while(|c| c.id() != child.id())
+        .all(|c| {
+            !c.is_named()
+                || matches!(
+                    c.kind(),
+                    "template_parameter_list" | "identifier" | "string_literal"
+                )
+        })
+}
+
 /// Find a visibility/access keyword among a declaration node's modifier child
 /// nodes, checking a `modifiers` container one level deep.
 ///
