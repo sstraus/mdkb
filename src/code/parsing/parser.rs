@@ -218,6 +218,27 @@ pub fn find_modifier_keyword<'a>(node: Node, code: &'a str, keywords: &[&str]) -
     None
 }
 
+/// Last segment of a possibly-qualified, possibly-generic type name
+/// (`Outer.Inner` → `Inner`, `\Ns\Bar` → `Bar`, `List<Foo>` → `List`).
+///
+/// Relationships are stored and resolved by bare name, so a qualified target has
+/// to be reduced to the segment a symbol is indexed under or the edge resolves to
+/// nothing. Grammar-agnostic: it walks named children rather than fields, because
+/// Java, C#, C++ and PHP each name the parts differently (or not at all).
+///
+/// Type arguments are skipped: `new List<Foo>()` constructs a `List`, and taking
+/// the literal last child would name `Foo` instead.
+pub fn last_name_segment<'a>(node: Node, code: &'a str) -> &'a str {
+    let last = node
+        .children(&mut node.walk())
+        .filter(|c| c.is_named() && !c.kind().contains("argument"))
+        .last();
+    match last {
+        Some(last) => last_name_segment(last, code),
+        None => &code[node.byte_range()],
+    }
+}
+
 /// Safely truncate a UTF-8 string at a character boundary.
 #[inline]
 pub fn safe_truncate_str(s: &str, max_bytes: usize) -> &str {

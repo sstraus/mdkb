@@ -4,7 +4,9 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, last_name_segment, node_range,
+};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -473,13 +475,20 @@ impl CSharpParser {
             current_fn
         };
 
-        if node.kind() == "invocation_expression" {
-            if let Some(func) = node.child_by_field_name("function") {
-                let target = &code[func.byte_range()];
-                if let Some(ctx) = fn_ctx {
-                    calls.push((ctx, target, node_range(*node)));
-                }
-            }
+        let target = match node.kind() {
+            "invocation_expression" => node
+                .child_by_field_name("function")
+                .map(|n| &code[n.byte_range()]),
+            // Construction is a dependency on the constructed type. An
+            // implicit `new()` names no type and is left alone.
+            "object_creation_expression" => node
+                .child_by_field_name("type")
+                .map(|n| last_name_segment(n, code)),
+            _ => None,
+        };
+
+        if let (Some(target), Some(ctx)) = (target, fn_ctx) {
+            calls.push((ctx, target, node_range(*node)));
         }
 
         for child in node.children(&mut node.walk()) {
@@ -746,5 +755,34 @@ namespace MyApp.Models {
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
         let cls = symbols.iter().find(|s| s.name.as_ref() == "User").unwrap();
         assert_eq!(cls.module_path.as_deref(), Some("MyApp.Models"));
+    }
+
+    /// `invocation_expression` alone misses every `new`, so construction was
+    /// invisible to the call graph.
+    #[test]
+    fn construction_produces_call_edges() {
+        let mut parser = CSharpParser::new().unwrap();
+
+        let code = r#"
+class App {
+    void Run() {
+        var f = new Foo();
+        var g = new Foo.Bar(1);
+        var h = new List<Foo>();
+        Helper();
+    }
+}
+"#;
+
+        let calls = parser.find_calls_impl(code);
+        let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
+
+        assert!(edges.contains(&("Run", "Foo")), "new Foo(): {edges:?}");
+        assert!(edges.contains(&("Run", "Bar")), "new Foo.Bar(): {edges:?}");
+        assert!(
+            edges.contains(&("Run", "List")),
+            "type arguments must not shadow the constructed type: {edges:?}"
+        );
+        assert!(edges.contains(&("Run", "Helper")), "plain call: {edges:?}");
     }
 }

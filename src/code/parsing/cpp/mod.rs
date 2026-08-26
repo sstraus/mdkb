@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, extract_c_family_doc, node_range,
+    LanguageParser, check_recursion_depth, extract_c_family_doc, last_name_segment, node_range,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -616,18 +616,49 @@ impl CppParser {
             current_fn
         };
 
-        if node.kind() == "call_expression" {
-            if let Some(func) = node.child_by_field_name("function") {
-                let target = &code[func.byte_range()];
-                if let Some(ctx) = fn_ctx {
-                    calls.push((ctx, target, node_range(*node)));
-                }
-            }
+        let target = match node.kind() {
+            "call_expression" => node
+                .child_by_field_name("function")
+                .map(|n| &code[n.byte_range()]),
+            "new_expression" => node
+                .child_by_field_name("type")
+                .map(|n| last_name_segment(n, code)),
+            // `Widget w(1, 2)` and `Point p{3}` construct just as `new` does, but
+            // the grammar spells them as an ordinary declaration.
+            "declaration" => Self::direct_init_type(*node, code),
+            _ => None,
+        };
+
+        if let (Some(target), Some(ctx)) = (target, fn_ctx) {
+            calls.push((ctx, target, node_range(*node)));
         }
 
         for child in node.children(&mut node.walk()) {
             Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
+    }
+
+    /// Type constructed by a direct- or brace-initialised declaration.
+    ///
+    /// Returns `None` unless the declared type is a user-defined one: `int x(6)`
+    /// initialises a builtin and constructs nothing, so an edge to `int` would be
+    /// noise. A `function_declarator` is a prototype, not an initialiser, and the
+    /// grammar keeps the two apart by the kind of the `value` field.
+    fn direct_init_type<'a>(node: Node, code: &'a str) -> Option<&'a str> {
+        let type_node = node.child_by_field_name("type")?;
+        if !matches!(
+            type_node.kind(),
+            "type_identifier" | "qualified_identifier" | "template_type"
+        ) {
+            return None;
+        }
+        let declarator = node.child_by_field_name("declarator")?;
+        if declarator.kind() != "init_declarator" {
+            return None;
+        }
+        let value = declarator.child_by_field_name("value")?;
+        matches!(value.kind(), "argument_list" | "initializer_list")
+            .then(|| last_name_segment(type_node, code))
     }
 
     fn find_implementations_in_node<'a>(
@@ -1155,5 +1186,45 @@ class Derived : public Base {};
         let imports = parser.find_imports(code, file_id);
         assert!(imports.iter().any(|i| i.path == "iostream"));
         assert!(imports.iter().any(|i| i.path == "mylib.h"));
+    }
+
+    /// `call_expression` alone misses `new T()` and direct-initialisation, which
+    /// are the two ordinary ways to construct an object in C++.
+    #[test]
+    fn construction_produces_call_edges() {
+        let mut parser = CppParser::new().unwrap();
+
+        let code = r#"
+void run() {
+    T* p = new T();
+    A<B>* q = new A<B>();
+    Widget w(1, 2);
+    ns::Gadget g(3);
+    Point pt{4, 5};
+    int plain(6);
+    helper();
+}
+"#;
+
+        let calls = parser.find_calls_impl(code);
+        let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
+
+        assert!(edges.contains(&("run", "T")), "new T(): {edges:?}");
+        assert!(
+            edges.contains(&("run", "A")),
+            "template arguments must not shadow the constructed type: {edges:?}"
+        );
+        assert!(edges.contains(&("run", "Widget")), "direct-init: {edges:?}");
+        assert!(
+            edges.contains(&("run", "Gadget")),
+            "qualified direct-init: {edges:?}"
+        );
+        assert!(edges.contains(&("run", "Point")), "brace-init: {edges:?}");
+        // A parenthesised initialiser of a builtin constructs nothing.
+        assert!(
+            !edges.iter().any(|(_, t)| *t == "int"),
+            "builtin initialisation is not a call: {edges:?}"
+        );
+        assert!(edges.contains(&("run", "helper")), "plain call: {edges:?}");
     }
 }

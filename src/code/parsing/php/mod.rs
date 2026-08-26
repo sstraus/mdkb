@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, find_modifier_keyword, node_range,
+    LanguageParser, check_recursion_depth, find_modifier_keyword, last_name_segment, node_range,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -403,20 +403,25 @@ impl PhpParser {
             _ => current_fn,
         };
 
-        if node.kind() == "function_call_expression" {
-            if let Some(func) = node.child_by_field_name("function") {
-                let target = &code[func.byte_range()];
-                if let Some(ctx) = fn_ctx {
-                    calls.push((ctx, target, node_range(*node)));
-                }
-            }
-        } else if node.kind() == "member_call_expression" {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let target = &code[name_node.byte_range()];
-                if let Some(ctx) = fn_ctx {
-                    calls.push((ctx, target, node_range(*node)));
-                }
-            }
+        let target = match node.kind() {
+            "function_call_expression" => node
+                .child_by_field_name("function")
+                .map(|n| &code[n.byte_range()]),
+            // `$o->method()` and `Foo::bar()` are both named by their `name` field.
+            "member_call_expression" | "scoped_call_expression" => node
+                .child_by_field_name("name")
+                .map(|n| &code[n.byte_range()]),
+            // Construction is a dependency on the constructed class. `new $cls()`
+            // picks its class at run time; naming the variable would invent an edge.
+            "object_creation_expression" => node
+                .children(&mut node.walk())
+                .find(|c| matches!(c.kind(), "name" | "qualified_name"))
+                .map(|n| last_name_segment(n, code)),
+            _ => None,
+        };
+
+        if let (Some(target), Some(ctx)) = (target, fn_ctx) {
+            calls.push((ctx, target, node_range(*node)));
         }
 
         for child in node.children(&mut node.walk()) {
@@ -639,5 +644,49 @@ function helper(int $x): int {
                 .iter()
                 .any(|s| s.name.as_ref() == "helper" && s.kind == SymbolKind::Function)
         );
+    }
+
+    /// `new` and `::` were both invisible: only free calls and `->` calls were
+    /// recorded, so static and constructed dependencies vanished.
+    #[test]
+    fn construction_and_static_calls_produce_call_edges() {
+        let mut parser = PhpParser::new().unwrap();
+
+        let code = r#"<?php
+class App extends Base {
+    function run($cls) {
+        $f = new Foo();
+        $g = new \Ns\Bar(1);
+        $dynamic = new $cls();
+        Baz::make();
+        parent::__construct();
+        helper();
+        $this->method();
+    }
+}
+"#;
+
+        let calls = parser.find_calls_impl(code);
+        let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
+
+        assert!(edges.contains(&("run", "Foo")), "new Foo(): {edges:?}");
+        assert!(
+            edges.contains(&("run", "Bar")),
+            "new \\Ns\\Bar(): {edges:?}"
+        );
+        assert!(edges.contains(&("run", "make")), "static call: {edges:?}");
+        assert!(
+            edges.contains(&("run", "__construct")),
+            "parent call: {edges:?}"
+        );
+        // `new $cls()` names a class only at run time; guessing a target here
+        // would invent an edge to the variable.
+        assert!(
+            !edges.iter().any(|(_, t)| *t == "cls"),
+            "dynamic construction must not invent a target: {edges:?}"
+        );
+        // Existing behaviour is untouched.
+        assert!(edges.contains(&("run", "helper")), "plain call: {edges:?}");
+        assert!(edges.contains(&("run", "method")), "member call: {edges:?}");
     }
 }

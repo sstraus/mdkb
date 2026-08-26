@@ -5,7 +5,9 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::method_call::MethodCall;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, last_name_segment, node_range,
+};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -514,18 +516,59 @@ impl JavaParser {
             _ => current_fn,
         };
 
-        if node.kind() == "method_invocation" {
-            if let Some(name_node) = node.child_by_field_name("name") {
-                let target = &code[name_node.byte_range()];
-                if let Some(ctx) = fn_ctx {
-                    calls.push((ctx, target, node_range(*node)));
-                }
-            }
+        let target = match node.kind() {
+            "method_invocation" => node
+                .child_by_field_name("name")
+                .map(|n| &code[n.byte_range()]),
+            // Construction is a dependency on the constructed type.
+            "object_creation_expression" => node
+                .child_by_field_name("type")
+                .map(|n| last_name_segment(n, code)),
+            // `Foo::bar` names the method it defers to.
+            "method_reference" => node
+                .children(&mut node.walk())
+                .filter(|c| c.is_named())
+                .last()
+                .map(|n| &code[n.byte_range()]),
+            // `this(..)` delegates to a constructor of the same class and
+            // `super(..)` to one of the superclass; both are indexed under the
+            // class name, so name the class rather than the keyword.
+            "explicit_constructor_invocation" => node
+                .child_by_field_name("constructor")
+                .and_then(|kw| Self::delegation_target(*node, &code[kw.byte_range()], code)),
+            _ => None,
+        };
+
+        if let (Some(target), Some(ctx)) = (target, fn_ctx) {
+            calls.push((ctx, target, node_range(*node)));
         }
 
         for child in node.children(&mut node.walk()) {
             Self::find_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
         }
+    }
+
+    /// Class named by a `this`/`super` constructor delegation.
+    ///
+    /// Walks up to the enclosing `class_declaration` rather than threading class
+    /// context through the whole traversal: delegation is rare, so paying for it
+    /// only where it occurs is cheaper than carrying two more parameters.
+    fn delegation_target<'a>(node: Node, keyword: &str, code: &'a str) -> Option<&'a str> {
+        let mut current = node.parent();
+        while let Some(parent) = current {
+            if parent.kind() == "class_declaration" {
+                let field = if keyword == "super" {
+                    "superclass"
+                } else {
+                    "name"
+                };
+                return parent
+                    .child_by_field_name(field)
+                    .map(|n| last_name_segment(n, code));
+            }
+            current = parent.parent();
+        }
+        None
     }
 
     // ── Method calls ────────────────────────────────────────────────────
@@ -1115,5 +1158,49 @@ public class Config {
                 .iter()
                 .any(|s| s.name.as_ref() == "Config.name" && s.kind == SymbolKind::Field)
         );
+    }
+
+    /// Construction is a dependency: an index that only records `method_invocation`
+    /// hides every `new`, every method reference and every constructor delegation.
+    #[test]
+    fn construction_and_delegation_produce_call_edges() {
+        let mut parser = JavaParser::new().unwrap();
+
+        let code = r#"
+class App extends Base {
+    App() { super(); }
+    App(int x) { this(); }
+    void run() {
+        Foo f = new Foo();
+        Outer.Inner i = new Outer.Inner(1);
+        java.util.List<String> l = new java.util.ArrayList<String>();
+        Runnable r = Foo::bar;
+        helper();
+    }
+}
+"#;
+
+        let calls = parser.find_calls_impl(code);
+        let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
+
+        assert!(edges.contains(&("run", "Foo")), "new Foo(): {edges:?}");
+        assert!(
+            edges.contains(&("run", "Inner")),
+            "new Outer.Inner(): {edges:?}"
+        );
+        assert!(
+            edges.contains(&("run", "ArrayList")),
+            "type arguments must not shadow the constructed type: {edges:?}"
+        );
+        assert!(
+            edges.contains(&("run", "bar")),
+            "method reference: {edges:?}"
+        );
+        // `this()` targets a constructor of the same class, `super()` one of the
+        // superclass, so both resolve to a symbol that is actually indexed.
+        assert!(edges.contains(&("App", "App")), "this(): {edges:?}");
+        assert!(edges.contains(&("App", "Base")), "super(): {edges:?}");
+        // Existing behaviour is untouched.
+        assert!(edges.contains(&("run", "helper")), "plain call: {edges:?}");
     }
 }
