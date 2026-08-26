@@ -99,28 +99,35 @@ impl CSharpParser {
         }
 
         match node.kind() {
-            "class_declaration" | "record_declaration" => {
+            // C#'s five type declarations differ only in the symbol they
+            // produce; the scope handling below is identical for all of them.
+            "class_declaration"
+            | "record_declaration"
+            | "interface_declaration"
+            | "struct_declaration"
+            | "enum_declaration" => {
                 let name = node
                     .child_by_field_name("name")
                     .map(|n| code[n.byte_range()].to_string());
 
-                if let Some(ref n) = name {
-                    let doc = extract_csharp_doc(&node, code);
-                    let vis = determine_csharp_visibility(node, code);
-                    let symbol = self.create_symbol(
-                        counter.next_id(),
-                        n.clone(),
-                        SymbolKind::Class,
-                        file_id,
-                        node_range(node),
-                        (Some(format!("class {n}")), doc, module_path, vis),
-                    );
+                if let Some(symbol) = self.process_type(node, code, file_id, counter, module_path) {
                     symbols.push(symbol);
                 }
 
                 self.context.enter_scope(ScopeType::Class);
                 let saved_cls = self.context.current_class().map(|s| s.to_string());
                 self.context.set_current_class(name);
+
+                // A positional record declares its members in a parameter list,
+                // which no other type has and which is not the body.
+                self.process_positional_components(
+                    node,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    module_path,
+                );
 
                 if let Some(body) = node.child_by_field_name("body") {
                     for child in body.children(&mut body.walk()) {
@@ -137,93 +144,6 @@ impl CSharpParser {
 
                 self.context.exit_scope();
                 self.context.set_current_class(saved_cls);
-            }
-
-            "interface_declaration" => {
-                let name = node
-                    .child_by_field_name("name")
-                    .map(|n| code[n.byte_range()].to_string());
-
-                if let Some(ref n) = name {
-                    let doc = extract_csharp_doc(&node, code);
-                    let vis = determine_csharp_visibility(node, code);
-                    let symbol = self.create_symbol(
-                        counter.next_id(),
-                        n.clone(),
-                        SymbolKind::Interface,
-                        file_id,
-                        node_range(node),
-                        (Some(format!("interface {n}")), doc, module_path, vis),
-                    );
-                    symbols.push(symbol);
-                }
-
-                self.context.enter_scope(ScopeType::Class);
-                let saved_cls = self.context.current_class().map(|s| s.to_string());
-                self.context.set_current_class(name);
-
-                if let Some(body) = node.child_by_field_name("body") {
-                    for child in body.children(&mut body.walk()) {
-                        self.extract_symbols_from_node(
-                            child,
-                            code,
-                            file_id,
-                            counter,
-                            symbols,
-                            (module_path, depth + 1),
-                        );
-                    }
-                }
-
-                self.context.exit_scope();
-                self.context.set_current_class(saved_cls);
-            }
-
-            "struct_declaration" => {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = &code[name_node.byte_range()];
-                    let doc = extract_csharp_doc(&node, code);
-                    let vis = determine_csharp_visibility(node, code);
-                    let symbol = self.create_symbol(
-                        counter.next_id(),
-                        name.to_string(),
-                        SymbolKind::Struct,
-                        file_id,
-                        node_range(node),
-                        (Some(format!("struct {name}")), doc, module_path, vis),
-                    );
-                    symbols.push(symbol);
-                }
-
-                self.context.enter_scope(ScopeType::Class);
-                for child in node.children(&mut node.walk()) {
-                    self.extract_symbols_from_node(
-                        child,
-                        code,
-                        file_id,
-                        counter,
-                        symbols,
-                        (module_path, depth + 1),
-                    );
-                }
-                self.context.exit_scope();
-            }
-
-            "enum_declaration" => {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = &code[name_node.byte_range()];
-                    let doc = extract_csharp_doc(&node, code);
-                    let vis = determine_csharp_visibility(node, code);
-                    let symbol = self.create_symbol(
-                        counter.next_id(),
-                        name.to_string(),
-                        SymbolKind::Enum,
-                        file_id,
-                        node_range(node),
-                        (Some(format!("enum {name}")), doc, module_path, vis),
-                    );
-                    symbols.push(symbol);
-                }
             }
 
             "namespace_declaration" | "file_scoped_namespace_declaration" => {
@@ -270,12 +190,6 @@ impl CSharpParser {
                     let doc = extract_csharp_doc(&node, code);
                     let vis = determine_csharp_visibility(node, code);
 
-                    let qualified_name = if let Some(cls) = self.context.current_class() {
-                        format!("{cls}.{name}")
-                    } else {
-                        name.to_string()
-                    };
-
                     let return_type = node
                         .child_by_field_name("type")
                         .map(|n| &code[n.byte_range()])
@@ -287,7 +201,7 @@ impl CSharpParser {
 
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        qualified_name,
+                        self.qualified(name),
                         SymbolKind::Method,
                         file_id,
                         node_range(node),
@@ -300,6 +214,21 @@ impl CSharpParser {
                     );
                     symbols.push(symbol);
                 }
+
+                // A method body can declare local functions, which are symbols
+                // in their own right.
+                if let Some(body) = node.child_by_field_name("body") {
+                    for child in body.children(&mut body.walk()) {
+                        self.extract_symbols_from_node(
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            (module_path, depth + 1),
+                        );
+                    }
+                }
             }
 
             "constructor_declaration" => {
@@ -311,15 +240,9 @@ impl CSharpParser {
                         .map(|n| &code[n.byte_range()])
                         .unwrap_or("()");
 
-                    let qualified_name = if let Some(cls) = self.context.current_class() {
-                        format!("{cls}.{name}")
-                    } else {
-                        name.to_string()
-                    };
-
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        qualified_name,
+                        self.qualified(name),
                         SymbolKind::Method,
                         file_id,
                         node_range(node),
@@ -334,12 +257,6 @@ impl CSharpParser {
                     let name = &code[name_node.byte_range()];
                     let vis = determine_csharp_visibility(node, code);
 
-                    let qualified_name = if let Some(cls) = self.context.current_class() {
-                        format!("{cls}.{name}")
-                    } else {
-                        name.to_string()
-                    };
-
                     let type_str = node
                         .child_by_field_name("type")
                         .map(|n| &code[n.byte_range()])
@@ -347,7 +264,7 @@ impl CSharpParser {
 
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        qualified_name,
+                        self.qualified(name),
                         SymbolKind::Field,
                         file_id,
                         node_range(node),
@@ -357,8 +274,35 @@ impl CSharpParser {
                 }
             }
 
-            "field_declaration" => {
+            "field_declaration" | "event_field_declaration" => {
                 self.process_field(node, code, file_id, counter, symbols, module_path);
+            }
+
+            // Members that are named by something other than a `name` field, or
+            // that are not members of the enclosing type at all.
+            "enum_member_declaration"
+            | "event_declaration"
+            | "delegate_declaration"
+            | "indexer_declaration"
+            | "operator_declaration"
+            | "conversion_operator_declaration"
+            | "local_function_statement" => {
+                if let Some(symbol) = self.process_member(node, code, file_id, counter, module_path)
+                {
+                    symbols.push(symbol);
+                }
+                // A local function may hold another one, and an accessor body
+                // may hold a local function too.
+                for child in node.children(&mut node.walk()) {
+                    self.extract_symbols_from_node(
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        (module_path, depth + 1),
+                    );
+                }
             }
 
             _ => {
@@ -373,6 +317,195 @@ impl CSharpParser {
                     );
                 }
             }
+        }
+    }
+
+    /// Symbol for any of C#'s five type declarations.
+    ///
+    /// `record struct` is spelled as a `record_declaration` too, so the keyword
+    /// is read back from the source rather than guessed from the node kind.
+    fn process_type(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        module_path: &str,
+    ) -> Option<Symbol> {
+        let (kind, keyword) = match node.kind() {
+            "class_declaration" => (SymbolKind::Class, "class"),
+            "record_declaration" => (SymbolKind::Class, "record"),
+            "interface_declaration" => (SymbolKind::Interface, "interface"),
+            "struct_declaration" => (SymbolKind::Struct, "struct"),
+            "enum_declaration" => (SymbolKind::Enum, "enum"),
+            _ => return None,
+        };
+
+        let name_node = node.child_by_field_name("name")?;
+        let name = &code[name_node.byte_range()];
+
+        Some(self.create_symbol(
+            counter.next_id(),
+            name.to_string(),
+            kind,
+            file_id,
+            node_range(node),
+            (
+                Some(format!("{keyword} {name}")),
+                extract_csharp_doc(&node, code),
+                module_path,
+                determine_csharp_visibility(node, code),
+            ),
+        ))
+    }
+
+    /// Fields declared by a positional record's parameter list.
+    fn process_positional_components(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        module_path: &str,
+    ) {
+        let Some(params) = node
+            .children(&mut node.walk())
+            .find(|c| c.kind() == "parameter_list")
+        else {
+            return;
+        };
+        for param in params.children(&mut params.walk()) {
+            if param.kind() != "parameter" {
+                continue;
+            }
+            let (Some(name_node), Some(type_node)) = (
+                param.child_by_field_name("name"),
+                param.child_by_field_name("type"),
+            ) else {
+                continue;
+            };
+            let name = &code[name_node.byte_range()];
+            let type_str = &code[type_node.byte_range()];
+
+            symbols.push(self.create_symbol(
+                counter.next_id(),
+                self.qualified(name),
+                SymbolKind::Field,
+                file_id,
+                node_range(param),
+                (
+                    Some(format!("{type_str} {name}")),
+                    None,
+                    module_path,
+                    // The property the compiler generates for a positional
+                    // component is public.
+                    Visibility::Public,
+                ),
+            ));
+        }
+    }
+
+    /// Symbol for a member the grammar does not name with a plain `name` field.
+    fn process_member(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        module_path: &str,
+    ) -> Option<Symbol> {
+        let named = |field: &str| {
+            node.child_by_field_name(field)
+                .map(|n| &code[n.byte_range()])
+        };
+        let type_str = named("type").unwrap_or("void");
+        let params = named("parameters").unwrap_or("");
+
+        let (name, kind, signature) = match node.kind() {
+            "enum_member_declaration" => {
+                let name = named("name")?;
+                (name.to_string(), SymbolKind::Constant, name.to_string())
+            }
+            "event_declaration" => {
+                let name = named("name")?;
+                (
+                    name.to_string(),
+                    SymbolKind::Field,
+                    format!("event {type_str} {name}"),
+                )
+            }
+            // A delegate declares a named function type, so it is indexed as a
+            // type alias rather than as a member of the enclosing class.
+            "delegate_declaration" => {
+                let name = named("name")?;
+                (
+                    name.to_string(),
+                    SymbolKind::TypeAlias,
+                    format!("delegate {type_str} {name}{params}"),
+                )
+            }
+            // An indexer has no name in the source: it is written `this[..]`.
+            "indexer_declaration" => (
+                "this[]".to_string(),
+                SymbolKind::Field,
+                format!("{type_str} this{}", named("parameters").unwrap_or("[]")),
+            ),
+            "operator_declaration" => {
+                let op = named("operator")?;
+                (
+                    format!("operator {op}"),
+                    SymbolKind::Method,
+                    format!("{type_str} operator {op}{params}"),
+                )
+            }
+            // A conversion operator is named by the type it converts to.
+            "conversion_operator_declaration" => (
+                format!("operator {type_str}"),
+                SymbolKind::Method,
+                format!("operator {type_str}{params}"),
+            ),
+            // A local function lives in a method body, not in the type, so it is
+            // deliberately left unqualified.
+            "local_function_statement" => {
+                let name = named("name")?;
+                return Some(self.create_symbol(
+                    counter.next_id(),
+                    name.to_string(),
+                    SymbolKind::Function,
+                    file_id,
+                    node_range(node),
+                    (
+                        Some(format!("{type_str} {name}{params}")),
+                        extract_csharp_doc(&node, code),
+                        module_path,
+                        Visibility::Private,
+                    ),
+                ));
+            }
+            _ => return None,
+        };
+
+        Some(self.create_symbol(
+            counter.next_id(),
+            self.qualified(&name),
+            kind,
+            file_id,
+            node_range(node),
+            (
+                Some(signature),
+                extract_csharp_doc(&node, code),
+                module_path,
+                determine_csharp_visibility(node, code),
+            ),
+        ))
+    }
+
+    /// Member name qualified by the type currently being walked.
+    fn qualified(&self, name: &str) -> String {
+        match self.context.current_class() {
+            Some(cls) => format!("{cls}.{name}"),
+            None => name.to_string(),
         }
     }
 
@@ -400,15 +533,9 @@ impl CSharpParser {
                                 SymbolKind::Field
                             };
 
-                            let qualified_name = if let Some(cls) = self.context.current_class() {
-                                format!("{cls}.{name}")
-                            } else {
-                                name.to_string()
-                            };
-
                             let symbol = self.create_symbol(
                                 counter.next_id(),
-                                qualified_name,
+                                self.qualified(name),
                                 kind,
                                 file_id,
                                 node_range(node),
@@ -856,6 +983,89 @@ class App {
             edges.iter().filter(|(_, t)| *t == "Func").count(),
             1,
             "invoking a returned delegate must not duplicate the target: {edges:?}"
+        );
+    }
+
+    /// Six member forms fell through to generic recursion and produced nothing,
+    /// so an event, a delegate, an indexer, an operator, a local function and
+    /// every enum member were invisible.
+    #[test]
+    fn events_delegates_indexers_operators_and_local_functions_produce_symbols() {
+        let mut parser = CSharpParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+public record Vec(double X, double Y) {
+    public event EventHandler MyEvent;
+    public event EventHandler Other { add {} remove {} }
+    public delegate void MyDelegate(int a);
+    public int this[int index] { get => 0; }
+    public static Vec operator +(Vec a, Vec b) => a;
+    public static implicit operator string(Vec v) => "";
+    void Run() {
+        void Local() { }
+    }
+}
+
+public enum Color { Red = 1, Green }
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let found: Vec<(&str, SymbolKind)> =
+            symbols.iter().map(|s| (s.name.as_ref(), s.kind)).collect();
+        let has = |name: &str, kind: SymbolKind| found.contains(&(name, kind));
+
+        assert!(has("Vec", SymbolKind::Class), "record type: {found:?}");
+        assert!(
+            has("Vec.X", SymbolKind::Field),
+            "positional component: {found:?}"
+        );
+        assert!(
+            has("Vec.Y", SymbolKind::Field),
+            "positional component: {found:?}"
+        );
+
+        // A field-style event and an accessor-style event are the same member
+        // written two ways.
+        assert!(
+            has("Vec.MyEvent", SymbolKind::Field),
+            "event field: {found:?}"
+        );
+        assert!(
+            has("Vec.Other", SymbolKind::Field),
+            "event accessors: {found:?}"
+        );
+
+        assert!(
+            has("Vec.MyDelegate", SymbolKind::TypeAlias),
+            "delegate: {found:?}"
+        );
+        assert!(has("Vec.this[]", SymbolKind::Field), "indexer: {found:?}");
+        assert!(
+            has("Vec.operator +", SymbolKind::Method),
+            "operator: {found:?}"
+        );
+        assert!(
+            has("Vec.operator string", SymbolKind::Method),
+            "conversion operator: {found:?}"
+        );
+
+        // A local function belongs to the method body, not to the type, so it is
+        // not qualified by the class.
+        assert!(
+            has("Local", SymbolKind::Function),
+            "local function: {found:?}"
+        );
+
+        assert!(has("Color", SymbolKind::Enum), "enum type: {found:?}");
+        assert!(
+            has("Color.Red", SymbolKind::Constant),
+            "enum member: {found:?}"
+        );
+        assert!(
+            has("Color.Green", SymbolKind::Constant),
+            "enum member: {found:?}"
         );
     }
 }
