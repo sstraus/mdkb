@@ -121,7 +121,9 @@ impl ParserContext {
                     };
                 }
                 ScopeType::Class => {
-                    return ScopeContext::ClassMember { class_name: None };
+                    return ScopeContext::ClassMember {
+                        class_name: self.current_class.as_deref().map(Into::into),
+                    };
                 }
                 ScopeType::Package | ScopeType::Namespace => {
                     return ScopeContext::Package;
@@ -200,10 +202,14 @@ mod tests {
         ctx.enter_scope(ScopeType::Class);
         ctx.set_current_class(Some("MyClass".to_string()));
 
-        assert!(matches!(
+        // The name, not just the variant: a member of nothing is what this
+        // used to record, and `matches!` could not tell the difference.
+        assert_eq!(
             ctx.current_scope_context(),
-            ScopeContext::ClassMember { .. }
-        ));
+            ScopeContext::ClassMember {
+                class_name: Some("MyClass".into()),
+            }
+        );
         assert!(ctx.is_in_class());
         assert!(!ctx.is_module_level());
         assert_eq!(ctx.current_class(), Some("MyClass"));
@@ -233,6 +239,19 @@ mod tests {
 
         ctx.exit_scope();
         assert_eq!(ctx.current_scope_context(), ScopeContext::Module);
+    }
+
+    /// An anonymous type scope must report no owner rather than borrow the name
+    /// of whatever type was open around it.
+    #[test]
+    fn a_class_scope_with_no_name_records_no_owner() {
+        let mut ctx = ParserContext::new();
+        ctx.enter_scope(ScopeType::Class);
+
+        assert_eq!(
+            ctx.current_scope_context(),
+            ScopeContext::ClassMember { class_name: None }
+        );
     }
 
     #[test]

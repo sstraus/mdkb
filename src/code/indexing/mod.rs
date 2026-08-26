@@ -1683,6 +1683,82 @@ pub fn world() {
         relationship_rows(&facade)
     }
 
+    /// Index one file and return `(symbol name, scope_context JSON)` for every
+    /// symbol stored as a member of a type.
+    fn class_members_for(name: &str, source: &str) -> Vec<(String, String)> {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(src_dir.path().join(name), source).unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        let mut stmt = facade
+            .db
+            .conn()
+            .prepare(
+                "SELECT name, scope_context FROM code_symbols \
+                 WHERE scope_context LIKE '%ClassMember%' ORDER BY name",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// A member has to record which type it belongs to. Stored without the
+    /// owner, `open` is a method of nothing: no caller can tell `Store::open`
+    /// from `Config::open`, which is the whole reason two symbols share a name.
+    ///
+    /// Rust states ownership three different ways — an inherent `impl`, a trait
+    /// `impl` and the trait's own body — and all three have to answer.
+    #[test]
+    fn rust_members_record_the_type_they_belong_to() {
+        let members = class_members_for(
+            "lib.rs",
+            "pub struct Store { pub path: String }\n\
+             pub trait Open { fn open(&self); }\n\
+             impl Store { pub fn load(&self) {} }\n\
+             impl Open for Store { fn open(&self) {} }\n",
+        );
+
+        for (name, owner) in [("path", "Store"), ("load", "Store"), ("open", "Store")] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(n, scope)| n == name && scope.contains(owner)),
+                "{name} must be recorded as a member of {owner}: {members:?}"
+            );
+        }
+        // The trait's own requirement belongs to the trait, not to any impl.
+        assert!(
+            members
+                .iter()
+                .any(|(n, scope)| n == "open" && scope.contains("Open")),
+            "the trait requirement must be recorded as a member of Open: {members:?}"
+        );
+    }
+
+    /// Same requirement, a language whose members are found by a different
+    /// parser: this is shared context tracking, not a Rust detail.
+    #[test]
+    fn python_methods_record_the_class_they_belong_to() {
+        let members = class_members_for(
+            "app.py",
+            "class Store:\n    def load(self):\n        pass\n\nclass Cache:\n    def load(self):\n        pass\n",
+        );
+
+        // The Python parser already qualifies the symbol name; the scope has to
+        // agree with it rather than leave the owner to be parsed back out.
+        for (name, owner) in [("Store.load", "Store"), ("Cache.load", "Cache")] {
+            assert!(
+                members
+                    .iter()
+                    .any(|(n, scope)| n == name && scope.contains(owner)),
+                "{name} must be recorded as a member of {owner}: {members:?}"
+            );
+        }
+    }
+
     /// A Godot script declares its base class on the first line. The hierarchy of
     /// a whole project is missing from the index if that never reaches storage.
     #[test]

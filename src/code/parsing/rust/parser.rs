@@ -409,6 +409,11 @@ impl RustParser {
                     }
 
                     self.context.enter_scope(ScopeType::Class);
+                    // The requirements below belong to the trait, not to
+                    // whatever type happened to be open around it.
+                    let saved_cls = self.context.current_class().map(str::to_string);
+                    self.context
+                        .set_current_class(Some(code[name_node.byte_range()].to_string()));
                     if let Some(body) = node.child_by_field_name("body") {
                         for child in body.children(&mut body.walk()) {
                             // A trait body holds more than methods: `type Out;`
@@ -431,6 +436,7 @@ impl RustParser {
                         }
                     }
                     self.context.exit_scope();
+                    self.context.set_current_class(saved_cls);
                 }
                 return;
             }
