@@ -113,11 +113,17 @@ impl LuaParser {
                         (SymbolKind::Function, name.to_string())
                     };
 
-                    let visibility = if name.starts_with('_') {
+                    // `local function f()` is a plain function_declaration
+                    // carrying a `local` token — the grammar has no separate
+                    // node kind for it, so lexical scope is the only signal
+                    // that the function is private.
+                    let is_local = has_child_of_kind(node, "local");
+                    let visibility = if is_local || name.starts_with('_') {
                         Visibility::Private
                     } else {
                         Visibility::Public
                     };
+                    let prefix = if is_local { "local function" } else { "function" };
 
                     let symbol = self.create_symbol(
                         counter.next_id(),
@@ -126,7 +132,7 @@ impl LuaParser {
                         file_id,
                         node_range(node),
                         (
-                            Some(format!("function {name}{params}")),
+                            Some(format!("{prefix} {name}{params}")),
                             doc,
                             module_path,
                             visibility,
@@ -136,59 +142,25 @@ impl LuaParser {
                 }
             }
 
-            "local_function" => {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = &code[name_node.byte_range()];
-                    let doc = extract_lua_doc(&node, code);
-                    let params = node
-                        .child_by_field_name("parameters")
-                        .map(|n| &code[n.byte_range()])
-                        .unwrap_or("()");
-
-                    let symbol = self.create_symbol(
-                        counter.next_id(),
-                        name.to_string(),
-                        SymbolKind::Function,
-                        file_id,
-                        node_range(node),
-                        (
-                            Some(format!("local function {name}{params}")),
-                            doc,
-                            module_path,
-                            Visibility::Private,
-                        ),
-                    );
-                    symbols.push(symbol);
-                }
-            }
-
-            "variable_declaration" => {
-                // local x = ... or local x, y = ...
-                let is_local = code[node.byte_range()].starts_with("local ");
-                for child in node.children(&mut node.walk()) {
-                    if child.kind() == "assignment_statement" || child.kind() == "variable_list" {
-                        for gc in child.children(&mut child.walk()) {
-                            if gc.kind() == "identifier" {
-                                let name = &code[gc.byte_range()];
-                                let visibility = if is_local || name.starts_with('_') {
-                                    Visibility::Private
-                                } else {
-                                    Visibility::Public
-                                };
-                                let symbol = self.create_symbol(
-                                    counter.next_id(),
-                                    name.to_string(),
-                                    SymbolKind::Variable,
-                                    file_id,
-                                    node_range(node),
-                                    (None, None, module_path, visibility),
-                                );
-                                symbols.push(symbol);
-                                break; // Only first identifier in declaration
-                            }
-                        }
-                    }
-                }
+            "variable_declaration" | "assignment_statement" => {
+                // `local x = 1` is a variable_declaration wrapping an
+                // assignment_statement; a bare `y = 1` is that assignment on its
+                // own. Either way the names live in a variable_list one level
+                // below the assignment, never as its direct children.
+                let is_local = node.kind() == "variable_declaration";
+                let owner = if is_local {
+                    child_of_kind(node, "assignment_statement").unwrap_or(node)
+                } else {
+                    node
+                };
+                self.extract_assigned_symbols(
+                    owner,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    (module_path, is_local),
+                );
             }
 
             _ => {
@@ -203,6 +175,104 @@ impl LuaParser {
                     );
                 }
             }
+        }
+    }
+
+    /// Emit a Variable symbol per assigned name, plus a symbol for any function
+    /// stored in a table literal on the right-hand side.
+    ///
+    /// Lua assigns positionally (`a, b = f, g`), so name *i* pairs with value
+    /// *i*.
+    fn extract_assigned_symbols(
+        &mut self,
+        owner: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        tail: (&str, bool),
+    ) {
+        let (module_path, is_local) = tail;
+        let names = children_of_kind(child_of_kind(owner, "variable_list"), "identifier");
+        let values = child_of_kind(owner, "expression_list")
+            .map(|list| list.named_children(&mut list.walk()).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for (i, name_node) in names.iter().enumerate() {
+            let name = &code[name_node.byte_range()];
+            let visibility = if is_local || name.starts_with('_') {
+                Visibility::Private
+            } else {
+                Visibility::Public
+            };
+
+            symbols.push(self.create_symbol(
+                counter.next_id(),
+                name.to_string(),
+                SymbolKind::Variable,
+                file_id,
+                node_range(owner),
+                (None, None, module_path, visibility),
+            ));
+
+            if let Some(value) = values.get(i) {
+                self.extract_table_functions(
+                    *value,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    (name, module_path, visibility),
+                );
+            }
+        }
+    }
+
+    /// Emit a symbol for every function held in a table literal, named
+    /// `<table>.<field>` so it reads like the `M.foo` form already recorded as a
+    /// method.
+    fn extract_table_functions(
+        &mut self,
+        value: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        tail: (&str, &str, Visibility),
+    ) {
+        let (table, module_path, visibility) = tail;
+        if value.kind() != "table_constructor" {
+            return;
+        }
+        for field in value.children(&mut value.walk()) {
+            if field.kind() != "field" {
+                continue;
+            }
+            let (Some(name_node), Some(function)) = (
+                field.child_by_field_name("name"),
+                child_of_kind(field, "function_definition"),
+            ) else {
+                continue;
+            };
+            let params = function
+                .child_by_field_name("parameters")
+                .map(|n| &code[n.byte_range()])
+                .unwrap_or("()");
+            let name = format!("{table}.{}", &code[name_node.byte_range()]);
+
+            symbols.push(self.create_symbol(
+                counter.next_id(),
+                name,
+                SymbolKind::Method,
+                file_id,
+                node_range(field),
+                (
+                    Some(format!("function{params}")),
+                    extract_lua_doc(&field, code),
+                    module_path,
+                    visibility,
+                ),
+            ));
         }
     }
 
@@ -226,7 +296,7 @@ impl LuaParser {
             return;
         }
         let fn_ctx = match node.kind() {
-            "function_declaration" | "local_function" => node
+            "function_declaration" => node
                 .child_by_field_name("name")
                 .map(|n| &code[n.byte_range()])
                 .or(current_fn),
@@ -249,6 +319,28 @@ impl LuaParser {
 }
 
 // ── Free helpers ────────────────────────────────────────────────────────
+
+/// The first child of `node` with the given kind.
+fn child_of_kind<'a>(node: Node<'a>, kind: &str) -> Option<Node<'a>> {
+    node.children(&mut node.walk()).find(|c| c.kind() == kind)
+}
+
+/// Whether `node` has a direct child of the given kind.
+fn has_child_of_kind(node: Node, kind: &str) -> bool {
+    child_of_kind(node, kind).is_some()
+}
+
+/// Every child of `parent` with the given kind, or an empty list when `parent`
+/// is absent.
+fn children_of_kind<'a>(parent: Option<Node<'a>>, kind: &str) -> Vec<Node<'a>> {
+    parent
+        .map(|p| {
+            p.children(&mut p.walk())
+                .filter(|c| c.kind() == kind)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 fn extract_lua_doc(node: &Node, code: &str) -> Option<String> {
     // Lua uses --- doc comments (LDoc/EmmyLua style)
@@ -347,6 +439,81 @@ end
                 .iter()
                 .any(|s| s.name.as_ref() == "MyModule:update" && s.kind == SymbolKind::Method)
         );
+    }
+
+    /// Parse `code` and return the symbols it yields.
+    fn symbols_of(code: &str) -> Vec<Symbol> {
+        let mut parser = LuaParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+        parser.parse_symbols(code, file_id, &mut counter)
+    }
+
+    #[test]
+    fn a_local_variable_produces_a_symbol() {
+        let symbols = symbols_of("local x = 5\n");
+        assert!(
+            symbols.iter().any(|s| s.name.as_ref() == "x"
+                && s.kind == SymbolKind::Variable
+                && s.visibility == Visibility::Private),
+            "expected a private variable x, got {:?}",
+            symbols.iter().map(|s| s.as_name()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_global_assignment_produces_a_symbol() {
+        let symbols = symbols_of("y = 10\n");
+        assert!(
+            symbols.iter().any(|s| s.name.as_ref() == "y"
+                && s.kind == SymbolKind::Variable
+                && s.visibility == Visibility::Public),
+            "expected a public variable y, got {:?}",
+            symbols.iter().map(|s| s.as_name()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_name_in_a_multiple_assignment_produces_a_symbol() {
+        let symbols = symbols_of("local a, b = 1, 2\n");
+        assert!(symbols.iter().any(|s| s.name.as_ref() == "a"));
+        assert!(
+            symbols.iter().any(|s| s.name.as_ref() == "b"),
+            "second name dropped, got {:?}",
+            symbols.iter().map(|s| s.as_name()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_function_stored_in_a_table_literal_produces_a_symbol() {
+        let symbols = symbols_of("local t = { fn = function() end }\n");
+        assert!(
+            symbols.iter().any(|s| s.name.as_ref() == "t.fn"),
+            "expected t.fn, got {:?}",
+            symbols.iter().map(|s| s.as_name()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_local_function_is_private_and_says_so_in_its_signature() {
+        let symbols = symbols_of("local function priv() end\n");
+        let priv_fn = symbols
+            .iter()
+            .find(|s| s.name.as_ref() == "priv")
+            .expect("expected a symbol for priv");
+        assert_eq!(priv_fn.visibility, Visibility::Private);
+        assert_eq!(priv_fn.as_signature(), Some("local function priv()"));
+    }
+
+    #[test]
+    fn a_global_function_stays_public() {
+        let symbols = symbols_of("function pub() end\n");
+        let pub_fn = symbols
+            .iter()
+            .find(|s| s.name.as_ref() == "pub")
+            .expect("expected a symbol for pub");
+        assert_eq!(pub_fn.visibility, Visibility::Public);
+        assert_eq!(pub_fn.as_signature(), Some("function pub()"));
     }
 
     #[test]
