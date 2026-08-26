@@ -8,16 +8,18 @@
 //!   is `u32_le(body_len) ++ body_bytes`. Methods are routed through
 //!   `mcp::dispatch::dispatch_call` against the per-request `params.root`.
 //!
-//! Both sockets are chmod'd to `0600` via explicit `set_permissions` after
-//! bind — umask is not a reliable guarantee across platforms.
+//! Both sockets are bound under a staging name, chmod'd to `0600` there and
+//! then renamed into place, so neither path is ever visible at the umask
+//! default — umask is not a reliable guarantee across platforms, and mutating
+//! it from a running multi-threaded process is not an option.
 //!
 //! # TOCTOU mitigation
 //!
 //! The `~/.mdkb` base directory is created (or corrected) with mode `0700`
 //! before any socket operations. This prevents a local attacker from placing
-//! a file at the socket path in the window between `remove_if_exists` and
-//! `UnixListener::bind`, because unprivileged processes cannot write into a
-//! directory they do not own when its mode is `0700`.
+//! a file at the staging path before `UnixListener::bind`, because
+//! unprivileged processes cannot write into a directory they do not own when
+//! its mode is `0700`.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -62,6 +64,14 @@ pub enum IpcError {
         source: std::io::Error,
     },
 
+    #[error("rename {from} -> {to}: {source}")]
+    Rename {
+        from: PathBuf,
+        to: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
     #[error("mkdir {path}: {source}")]
     Mkdir {
         path: PathBuf,
@@ -94,20 +104,8 @@ pub async fn serve(
     let mcp_path = base_dir.join(MCP_SOCKET_NAME);
     let hook_path = base_dir.join(HOOK_SOCKET_NAME);
 
-    remove_if_exists(&mcp_path)?;
-    remove_if_exists(&hook_path)?;
-
-    let mcp_listener = UnixListener::bind(&mcp_path).map_err(|e| IpcError::Bind {
-        path: mcp_path.clone(),
-        source: e,
-    })?;
-    chmod_0600(&mcp_path)?;
-
-    let hook_listener = UnixListener::bind(&hook_path).map_err(|e| IpcError::Bind {
-        path: hook_path.clone(),
-        source: e,
-    })?;
-    chmod_0600(&hook_path)?;
+    let mcp_listener = bind_socket_0600(&mcp_path)?;
+    let hook_listener = bind_socket_0600(&hook_path)?;
 
     tracing::info!(
         "ipc: listening on {} (mcp) and {} (hook)",
@@ -190,6 +188,47 @@ fn remove_if_exists(path: &Path) -> Result<(), IpcError> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(IpcError::Io(e)),
     }
+}
+
+/// Bind a listening socket at `path`, which is never visible at a mode wider
+/// than `0600`.
+///
+/// `bind` honours the umask, so a socket created directly at `path` carries
+/// whatever the umask allows (typically `0755`) until the following `chmod`
+/// lands. A client that watches for the socket file to appear can observe that
+/// window. Tightening the umask instead would not help: it is process-global
+/// state and the tokio workers are already running.
+///
+/// So the socket is bound under a staging name, tightened there, and then
+/// `rename`d onto `path`. Rename is atomic and keeps the inode, so the listener
+/// goes on serving and `path` only ever appears already at `0600` — replacing a
+/// socket left behind by a previous run in the same step. The staging name
+/// carries the pid so two daemons sharing a base directory cannot collide on it.
+fn bind_socket_0600(path: &Path) -> Result<UnixListener, IpcError> {
+    let mut staging = path.as_os_str().to_owned();
+    staging.push(format!(".{}.tmp", std::process::id()));
+    let staging = PathBuf::from(staging);
+    remove_if_exists(&staging)?;
+
+    let listener = UnixListener::bind(&staging).map_err(|e| IpcError::Bind {
+        path: staging.clone(),
+        source: e,
+    })?;
+
+    // Anything that fails from here on leaves a bound socket at the staging
+    // path, which no client knows to look for; unlink it rather than leak it.
+    let published = chmod_0600(&staging).and_then(|()| {
+        std::fs::rename(&staging, path).map_err(|e| IpcError::Rename {
+            from: staging.clone(),
+            to: path.to_path_buf(),
+            source: e,
+        })
+    });
+    if let Err(e) = published {
+        let _ = std::fs::remove_file(&staging);
+        return Err(e);
+    }
+    Ok(listener)
 }
 
 fn chmod_0600(path: &Path) -> Result<(), IpcError> {
@@ -470,6 +509,70 @@ mod tests {
             mode, 0o700,
             "base dir mode should be 0700 after tightening, got {mode:o}"
         );
+    }
+
+    /// The socket path must never be observable at a mode wider than `0600` —
+    /// not even for the instant between creating the file and tightening it.
+    ///
+    /// A client discovers the daemon by watching for the socket file to appear
+    /// (`wait_for_sockets` in the e2e suite does exactly this), so "the file
+    /// exists" and "the file is safe to expose" have to become true together.
+    /// The watcher below samples the path as fast as it can while the socket is
+    /// rebound repeatedly: one bind is a couple of syscalls wide, so the window
+    /// only shows up under repetition.
+    #[tokio::test]
+    async fn socket_path_is_never_observable_wider_than_0600() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(MCP_SOCKET_NAME);
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let watcher = {
+            let path = path.clone();
+            let stop = Arc::clone(&stop);
+            let seen = Arc::clone(&seen);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Ok(meta) = std::fs::metadata(&path) {
+                        seen.lock().unwrap().push(meta.permissions().mode() & 0o777);
+                    }
+                    std::thread::yield_now();
+                }
+            })
+        };
+
+        for _ in 0..200 {
+            drop(bind_socket_0600(&path).unwrap());
+        }
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().unwrap();
+
+        let seen = seen.lock().unwrap();
+        assert!(!seen.is_empty(), "watcher never observed the socket file");
+        let modes: std::collections::BTreeSet<String> =
+            seen.iter().map(|m| format!("{m:o}")).collect();
+        assert!(
+            seen.iter().all(|m| *m == 0o600),
+            "socket observed at modes {modes:?} over {} samples",
+            seen.len()
+        );
+    }
+
+    /// A socket bound through `bind_socket_0600` must actually serve at `path`:
+    /// tightening the mode is worthless if the listener ends up answering
+    /// somewhere else.
+    #[tokio::test]
+    async fn a_socket_bound_at_0600_accepts_connections_at_its_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(MCP_SOCKET_NAME);
+
+        let listener = bind_socket_0600(&path).unwrap();
+        let accepted = tokio::spawn(async move { listener.accept().await.map(|_| ()) });
+
+        UnixStream::connect(&path).await.expect("connect");
+        accepted.await.unwrap().expect("accept");
     }
 
     /// After `serve()` binds, the socket files must have mode `0600`.

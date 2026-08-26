@@ -37,7 +37,7 @@ impl DaemonProc {
             .stderr(Stdio::piped())
             .spawn()
             .expect("spawn daemon");
-        let d = DaemonProc { child, home };
+        let mut d = DaemonProc { child, home };
         d.wait_for_sockets();
         d
     }
@@ -54,7 +54,7 @@ impl DaemonProc {
         self.base().join("daemon-hook.sock")
     }
 
-    fn wait_for_sockets(&self) {
+    fn wait_for_sockets(&mut self) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if self.mcp_socket().exists() && self.hook_socket().exists() {
@@ -62,7 +62,42 @@ impl DaemonProc {
             }
             sleep(Duration::from_millis(50));
         }
-        panic!("daemon did not create sockets within 5s");
+        panic!(
+            "daemon did not create sockets within 5s\n{}",
+            self.diagnose()
+        );
+    }
+
+    /// Report why the daemon never became ready: exit status, what landed in
+    /// the base directory, and everything it wrote to stderr. Without this a
+    /// daemon that refused to start is indistinguishable from a slow machine.
+    fn diagnose(&mut self) -> String {
+        let status = match self.child.try_wait() {
+            Ok(Some(s)) => format!("exited: {s}"),
+            Ok(None) => {
+                let _ = self.child.kill();
+                "still running (killed)".to_string()
+            }
+            Err(e) => format!("try_wait failed: {e}"),
+        };
+        let mut stderr = String::new();
+        if let Some(mut pipe) = self.child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        let listing = std::fs::read_dir(self.base())
+            .map(|rd| {
+                let mut names: Vec<_> = rd
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect();
+                names.sort();
+                names.join(", ")
+            })
+            .unwrap_or_else(|e| format!("<unreadable: {e}>"));
+        format!(
+            "daemon {status}\n{} contains: [{listing}]\nstderr:\n{stderr}",
+            self.base().display()
+        )
     }
 
     /// Seed a repo with a code index the daemon is allowed to open.
@@ -144,6 +179,58 @@ fn daemon_creates_both_sockets_mode_0600() {
         file_mode(&d.hook_socket()),
         0o600,
         "hook socket must be 0600"
+    );
+}
+
+/// A daemon that cannot publish its sockets must exit and say why.
+///
+/// It holds the singleton lock the whole time, so hanging here is the worst
+/// possible outcome: every later client waits out a connect timeout against a
+/// socket that will never appear, no second daemon can take over, and the real
+/// error is reported by nobody.
+#[test]
+fn a_daemon_that_cannot_bind_exits_with_the_reason() {
+    let home = TempDir::new().unwrap();
+    // A directory cannot be replaced by a socket, so publishing must fail.
+    std::fs::create_dir_all(home.path().join(".mdkb").join("daemon.sock")).unwrap();
+
+    let mut child = Command::new(BIN)
+        .arg("serve")
+        .arg("--daemon")
+        .env("HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait().unwrap() {
+            Some(status) => break status,
+            None if Instant::now() < deadline => sleep(Duration::from_millis(50)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("daemon kept running after it failed to bind");
+            }
+        }
+    };
+
+    assert!(
+        !status.success(),
+        "a daemon that published no socket must not exit 0: {status}"
+    );
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(
+        stderr.contains("daemon.sock"),
+        "stderr must name the socket it could not publish: {stderr}"
     );
 }
 

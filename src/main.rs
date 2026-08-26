@@ -3548,7 +3548,16 @@ async fn run_daemon() -> Result<()> {
     let ipc_registry = Arc::clone(&registry);
     let ipc_dctx = Arc::clone(&dctx);
     let ipc_task = tokio::spawn(async move {
-        ipc_server::serve(&ipc_base, ipc_shutdown, ipc_registry, ipc_dctx).await
+        // A failure to bind has to wake the shutdown select below. Without the
+        // cancel the daemon keeps the singleton lock and waits for a signal it
+        // will never get, serving nothing: clients then see a connect timeout
+        // and the real error is never reported by anyone.
+        let result =
+            ipc_server::serve(&ipc_base, ipc_shutdown.clone(), ipc_registry, ipc_dctx).await;
+        if result.is_err() {
+            ipc_shutdown.cancel();
+        }
+        result
     });
 
     // Retire when the executable this process was launched from is replaced.
@@ -3593,14 +3602,14 @@ async fn run_daemon() -> Result<()> {
     }
 
     shutdown.cancel();
-    match ipc_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!("ipc server shutdown error: {e}"),
-        Err(e) => tracing::warn!("ipc server join error: {e}"),
-    }
+    let served = match ipc_task.await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(mdkb::Error::other(format!("ipc server: {e}"))),
+        Err(e) => Err(mdkb::Error::other(format!("ipc server join: {e}"))),
+    };
 
     drop(guard);
-    Ok(())
+    served
 }
 
 /// True when stdin is not attached to a terminal. Used by the `mdkb serve`
