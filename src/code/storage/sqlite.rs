@@ -4,7 +4,7 @@
 //! and file metadata. FTS5 with trigram tokenizer enables substring
 //! matching on symbol names ("Archive" finds "ArchiveAppService").
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -562,6 +562,18 @@ impl CodeDb {
             .prepare(&format!("{SYMBOL_COLUMNS} FROM code_symbols"))?;
         let rows = stmt.query_map([], row_to_symbol)?;
         rows.collect()
+    }
+
+    /// Every live symbol id.
+    ///
+    /// One id column rather than [`Self::all_symbols`] because the caller that
+    /// needs this — the vector-store sweep — only asks "does this id still
+    /// exist", and building the full symbols would read every name, signature
+    /// and doc comment to answer it.
+    pub fn all_symbol_ids(&self) -> rusqlite::Result<HashSet<u32>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM code_symbols")?;
+        let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.map(|id| id.map(|id| id as u32)).collect()
     }
 
     /// Get symbols whose `file_path` is in `paths`.

@@ -158,9 +158,17 @@ impl VectorStore {
         if ids.is_empty() {
             return Ok(0);
         }
+        self.retain(|id| !ids.contains(&id))
+    }
+
+    /// Drop every entry whose id `keep` rejects, returning how many went.
+    ///
+    /// The file is rewritten only when something was dropped, so a store with
+    /// no orphans in it costs one read and no write.
+    pub fn retain(&self, keep: impl Fn(u32) -> bool) -> anyhow::Result<usize> {
         let mut entries = self.load()?;
         let before = entries.len();
-        entries.retain(|(id, _)| !ids.contains(id));
+        entries.retain(|(id, _)| keep(*id));
         let removed = before - entries.len();
         if removed > 0 {
             self.write_all(&entries)?;
@@ -541,6 +549,14 @@ impl SemanticSearch {
         }
         self.invalidate_cache();
         self.store.remove_by_ids(ids)
+    }
+
+    /// Drop every embedding whose symbol id is not in `live`, returning how many
+    /// went. No embedding model is needed: this only reads and rewrites the
+    /// store.
+    pub fn retain_embeddings(&self, live: &HashSet<u32>) -> anyhow::Result<usize> {
+        self.invalidate_cache();
+        self.store.retain(|id| live.contains(&id))
     }
 
     /// Clear the vector store and invalidate the cache.

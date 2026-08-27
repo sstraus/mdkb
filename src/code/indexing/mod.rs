@@ -117,6 +117,9 @@ impl IndexFacade {
     /// `src/lib.rs` from another, which `insert_file` cannot tell apart.
     pub fn index_scope(&mut self, root: &Path, scope: &Path) -> anyhow::Result<IndexStats> {
         let files_removed = self.prune_vanished_files(root)?;
+        // Before the branch, so it also runs on the run that finds nothing
+        // changed — that is the run an accumulated store most needs.
+        self.sweep_orphan_vectors();
         let indexed_mtimes = self.db.get_file_mtimes()?;
 
         let stats = if indexed_mtimes.is_empty() {
@@ -189,6 +192,38 @@ impl IndexFacade {
         })
     }
 
+    /// Drop every vector whose symbol id is gone from the database.
+    ///
+    /// Nothing else ever asks the database which ids are still live: the
+    /// incremental embed preserves every id outside its own batch, faithfully
+    /// including dead ones. Measured on this repository before the sweep
+    /// existed: 29492 vectors for 6237 symbols, 45 MB where 9.5 MB was live,
+    /// loaded and rewritten on every run. SQLite also hands out `max(rowid)+1`,
+    /// so an orphan can end up answering under an id that later belongs to an
+    /// unrelated symbol.
+    ///
+    /// Costs one id query and one store read; the store is rewritten only when
+    /// there was something to drop.
+    fn sweep_orphan_vectors(&self) {
+        let Some(semantic) = self.ensure_semantic() else {
+            return;
+        };
+        let live = match self.db.all_symbol_ids() {
+            Ok(live) => live,
+            Err(e) => {
+                tracing::error!("Failed to read symbol ids: {e}. Orphan vectors were not swept.");
+                return;
+            }
+        };
+        match semantic.retain_embeddings(&live) {
+            Ok(0) => {}
+            Ok(dropped) => {
+                tracing::info!("Dropped {dropped} vectors of symbols that no longer exist");
+            }
+            Err(e) => tracing::error!("Failed to sweep orphan vectors: {e}"),
+        }
+    }
+
     /// Drop every indexed file that is no longer on disk under `root`.
     ///
     /// Unlike [`Self::prune_missing_files`] this asks the filesystem rather than
@@ -245,6 +280,7 @@ impl IndexFacade {
         // file removed from disk is absent from the walk — so only this caller,
         // which knows `all_files` is the complete tree, can drop it.
         let files_removed = self.prune_missing_files(root, &all_files)?;
+        self.sweep_orphan_vectors();
         let mut stats = self.reindex_files(root, &all_files)?;
         stats.files_removed = files_removed;
         self.verify_sound()?;
@@ -261,8 +297,9 @@ impl IndexFacade {
         // Roll back any dangling transaction from a previous failed reindex.
         let _ = self.db.conn().execute_batch("ROLLBACK");
         self.db.clear()?;
-        // Only clear semantic if already initialized (don't trigger lazy load for a clear)
-        if let Some(Some(semantic)) = self.semantic.get() {
+        // Opening the store does not load the embedding model — see
+        // `delete_by_rel_path`.
+        if let Some(semantic) = self.ensure_semantic() {
             if let Err(e) = semantic.clear() {
                 tracing::error!(
                     "Failed to clear semantic index: {e}. Impact: old embeddings may persist."
@@ -323,9 +360,11 @@ impl IndexFacade {
 
         self.db.delete_by_file(rel_path)?;
 
-        // Only remove embeddings if semantic is already initialized;
-        // avoid triggering lazy model load (~300-800 MB) for a delete operation.
-        if let Some(Some(semantic)) = self.semantic.get() {
+        // Opening the semantic store costs a file handle, not the embedding
+        // model: the model is acquired inside `generate_*`, which a delete never
+        // reaches. Skipping the open when it happened not to be warm left the
+        // vectors of every deleted file behind — the watcher never warms it.
+        if let Some(semantic) = self.ensure_semantic() {
             if let Err(e) = semantic.remove_embeddings(&symbol_ids) {
                 tracing::error!(
                     error = %e,
@@ -1954,6 +1993,113 @@ pub fn world() {
                 stored.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// Ids the vector store answers for, live or not.
+    fn stored_vector_ids(facade: &IndexFacade) -> HashSet<u32> {
+        facade
+            .ensure_semantic()
+            .unwrap()
+            .store_load_filtered(|_| true)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// A vector under an id no symbol holds any more is dead weight that is
+    /// loaded and rewritten on every run — 23255 of them, 45 MB where 9.5 MB was
+    /// live, measured on this repository. Worse, SQLite reuses rowids after a
+    /// delete, so an orphan can end up answering for an unrelated symbol.
+    #[test]
+    fn an_index_run_drops_the_vectors_of_symbols_that_no_longer_exist() {
+        let index = seeded_two_file_index();
+        let src = index.src.path().to_path_buf();
+        let mut facade = index.facade;
+
+        // An id no symbol will ever hold: ids are handed out from 1 upwards.
+        let orphan = 900_001;
+        facade
+            .ensure_semantic()
+            .unwrap()
+            .generate_embeddings_incremental(
+                &[(
+                    orphan,
+                    vec![SEED_MARKER; crate::code::semantic::EMBEDDING_DIM],
+                )],
+                &[],
+            )
+            .unwrap();
+        assert!(stored_vector_ids(&facade).contains(&orphan), "seeded");
+
+        facade.index_directory(&src).unwrap();
+
+        assert!(
+            !stored_vector_ids(&facade).contains(&orphan),
+            "the orphan survived the run"
+        );
+    }
+
+    /// The sweep must not turn a no-op run into an embedding run: it asks the
+    /// database for ids and filters the store, and never reaches the model.
+    #[test]
+    fn a_run_that_changes_nothing_leaves_every_vector_where_it_was() {
+        let index = seeded_two_file_index();
+        let src = index.src.path().to_path_buf();
+        let mut facade = index.facade;
+
+        let stats = facade.index_directory(&src).unwrap();
+        assert_eq!(stats.files_indexed, 0, "nothing changed on disk");
+
+        let stored: HashMap<u32, Vec<f32>> = facade
+            .ensure_semantic()
+            .unwrap()
+            .store_load_filtered(|_| true)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            stored.len(),
+            index.seeded_ids.len(),
+            "the store gained or lost entries"
+        );
+        for id in &index.seeded_ids {
+            assert_eq!(
+                stored.get(id).map(|v| v[0]),
+                Some(SEED_MARKER),
+                "{id} was re-embedded instead of left alone"
+            );
+        }
+    }
+
+    /// The vectors of a deleted file used to survive unless something else had
+    /// already opened the semantic store. Opening it costs a file handle, not
+    /// the embedding model — the model is acquired inside `generate_*`, which a
+    /// delete never reaches.
+    #[test]
+    fn deleting_a_file_removes_its_vectors_from_a_cold_store() {
+        let src = tempfile::tempdir().unwrap();
+        fs::write(
+            src.path().join("lib.rs"),
+            "pub fn add() {}
+",
+        )
+        .unwrap();
+
+        let db = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src.path()).unwrap();
+        let seeded = seed_recognisable_vectors(&facade, &["lib.rs"]);
+        assert_eq!(seeded.len(), 1);
+
+        // A facade that has never touched the semantic store: exactly the state
+        // the watcher is in when it deletes a file.
+        let mut cold = IndexFacade::open_or_create(db.path().join("code.sqlite")).unwrap();
+        cold.delete_by_file(&src.path().join("lib.rs"), src.path())
+            .unwrap();
+
+        assert!(
+            !stored_vector_ids(&cold).contains(&seeded[0]),
+            "the deleted symbol kept its vector"
+        );
     }
 
     /// The `mdkb code index` path, which decides what changed by mtime.
