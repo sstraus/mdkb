@@ -23,6 +23,11 @@ enum DocCommentType {
 pub struct RustParser {
     parser: CachingParser,
     context: ParserContext,
+    /// Names of the `mod` blocks open around the node being visited, outermost
+    /// first. A file's address comes from its path, but everything a `mod` block
+    /// declares sits below that — without this, every file's `tests` module
+    /// collapses onto the address of the file holding it.
+    module_nesting: Vec<String>,
 }
 
 impl std::fmt::Debug for RustParser {
@@ -43,6 +48,7 @@ impl RustParser {
         Ok(Self {
             parser: CachingParser::new(ts_parser),
             context: ParserContext::new(),
+            module_nesting: Vec::new(),
         })
     }
 
@@ -200,6 +206,7 @@ impl RustParser {
         counter: &mut SymbolCounter,
     ) -> Vec<Symbol> {
         self.context = ParserContext::new();
+        self.module_nesting.clear();
         let Some(tree) = self.parser.parse_cached(code) else {
             return Vec::new();
         };
@@ -462,7 +469,13 @@ impl RustParser {
                 return;
             }
             "mod_item" => {
+                let mod_name = node
+                    .child_by_field_name("name")
+                    .map(|n| code[n.byte_range()].to_string());
+
                 if let Some(name_node) = node.child_by_field_name("name") {
+                    // Created before the push: `mod inner` is declared *in* the
+                    // enclosing module, not in itself.
                     if let Some(sym) = self.create_symbol(
                         counter,
                         node,
@@ -474,10 +487,18 @@ impl RustParser {
                         symbols.push(sym);
                     }
                 }
+
+                let nested = mod_name.is_some();
+                if let Some(name) = mod_name {
+                    self.module_nesting.push(name);
+                }
                 for child in node.children(&mut node.walk()) {
                     if child.kind() != "identifier" {
                         self.extract_symbols(child, code, file_id, symbols, counter, depth + 1);
                     }
+                }
+                if nested {
+                    self.module_nesting.pop();
                 }
                 return;
             }
@@ -546,6 +567,11 @@ impl RustParser {
 
         let mut symbol = Symbol::new(id, name, kind, file_id, range);
         symbol.scope_context = Some(self.context.current_scope_context());
+
+        // Relative to the file: COLLECT joins it onto the address the path gives.
+        if !self.module_nesting.is_empty() {
+            symbol = symbol.with_module_path(self.module_nesting.join("::"));
+        }
 
         // Check visibility modifier.
         if let Some(parent) = name_node.parent() {

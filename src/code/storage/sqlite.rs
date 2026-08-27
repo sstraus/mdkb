@@ -613,50 +613,66 @@ impl CodeDb {
     /// Get symbols called by the given symbol.
     pub fn get_called_functions(&self, symbol_id: i64) -> rusqlite::Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare_cached(&format!(
-            "{SYMBOL_COLUMNS_PREFIXED} \
-                 FROM code_relationships r \
-                 JOIN code_symbols s ON s.name = r.to_name \
-                 WHERE r.from_symbol_id = ?1 AND r.kind = 'Calls'"
+            "SELECT DISTINCT {SYMBOL_COLUMNS_BARE} \
+                 FROM ({}) c \
+                 JOIN code_symbols s ON s.id = c.sym_id \
+                 WHERE c.tier = c.nearest",
+            resolved_edges("r.from_symbol_id = ?1")
         ))?;
         let rows = stmt.query_map([symbol_id], row_to_symbol)?;
         rows.collect()
     }
 
-    /// Get symbols that call the given symbol name.
-    pub fn get_calling_functions(&self, symbol_name: &str) -> rusqlite::Result<Vec<Symbol>> {
+    /// Get symbols whose calls resolve to the given symbol.
+    ///
+    /// Takes an id, not a name: two symbols can share a name, and which of them
+    /// a call meant is the whole question the cascade answers.
+    pub fn get_calling_functions(&self, symbol_id: i64) -> rusqlite::Result<Vec<Symbol>> {
         let mut stmt = self.conn.prepare_cached(&format!(
-            "{SYMBOL_COLUMNS_PREFIXED} \
-                 FROM code_relationships r \
-                 JOIN code_symbols s ON s.id = r.from_symbol_id \
-                 WHERE r.to_name = ?1 AND r.kind = 'Calls'"
+            "SELECT DISTINCT {SYMBOL_COLUMNS_BARE} \
+                 FROM ({}) c \
+                 JOIN code_symbols s ON s.id = c.from_id \
+                 WHERE c.tier = c.nearest AND c.sym_id = ?1",
+            resolved_edges("r.to_name = (SELECT name FROM code_symbols WHERE id = ?1)")
         ))?;
-        let rows = stmt.query_map([symbol_name], row_to_symbol)?;
+        let rows = stmt.query_map([symbol_id], row_to_symbol)?;
         rows.collect()
     }
 
     /// Transitive impact radius: all symbols that directly or indirectly
     /// depend on the given symbol, up to `max_depth` hops.
+    ///
+    /// Walked hop by hop through [`get_calling_functions`] rather than in one
+    /// recursive statement. The cascade needs a window function to pick the
+    /// nearest scope per edge, and SQLite allows neither that nor a correlated
+    /// subquery inside the recursive arm of a CTE. Iterating keeps one
+    /// implementation of the rules instead of a second, divergent one; the cost
+    /// is a query per newly reached symbol, bounded by `seen`.
     pub fn get_impact_radius(
         &self,
-        symbol_name: &str,
+        symbol_id: i64,
         max_depth: u32,
     ) -> rusqlite::Result<Vec<Symbol>> {
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "WITH RECURSIVE impact(sym_id, depth) AS ( \
-                     SELECT r.from_symbol_id, 0 FROM code_relationships r WHERE r.to_name = ?1 \
-                     UNION \
-                     SELECT r.from_symbol_id, i.depth + 1 \
-                     FROM impact i \
-                     JOIN code_symbols cs ON cs.id = i.sym_id \
-                     JOIN code_relationships r ON r.to_name = cs.name \
-                     WHERE i.depth < ?2 \
-                 ) \
-                 SELECT DISTINCT {SYMBOL_COLUMNS_BARE} \
-                 FROM impact i \
-                 JOIN code_symbols s ON s.id = i.sym_id"
-        ))?;
-        let rows = stmt.query_map(params![symbol_name, max_depth], row_to_symbol)?;
-        rows.collect()
+        let mut seen: HashMap<i64, Symbol> = HashMap::new();
+        let mut frontier = vec![symbol_id];
+
+        // `max_depth` counts hops beyond the direct callers, which are depth 0.
+        for _ in 0..=max_depth {
+            let mut next = Vec::new();
+            for id in frontier {
+                for caller in self.get_calling_functions(id)? {
+                    let caller_id = i64::from(caller.id.value());
+                    if seen.insert(caller_id, caller).is_none() {
+                        next.push(caller_id);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        Ok(seen.into_values().collect())
     }
 
     /// Begin a transaction for batch operations.
@@ -796,6 +812,41 @@ fn io_as_sqlite(operation: &str, error: std::io::Error) -> rusqlite::Error {
 }
 
 // --- SQL fragments ---
+
+/// How near the scope a candidate was found in is to the call site: rules 4, 5
+/// and 6 of `plans/qualified-symbol-resolution.md` §3, lower being nearer.
+///
+/// `r` is the call, `fs` the symbol that made it, `s` a symbol whose bare name
+/// matches the target. Tier 7 is "no rule placed it": those candidates are kept
+/// rather than dropped, because a call the index cannot place is still better
+/// answered with every same-named symbol than with an empty list. Rules 1 to 3
+/// need the qualifier the call site wrote, which is not stored yet.
+const RESOLUTION_TIER: &str = "CASE \
+     WHEN s.file_id = r.file_id THEN 4 \
+     WHEN s.module_path IS NOT NULL AND EXISTS ( \
+         SELECT 1 FROM code_imports i WHERE i.file_id = r.file_id AND ( \
+             i.path = s.module_path \
+             OR i.path = s.module_path || '::' || s.name \
+             OR i.path = s.module_path || '.' || s.name)) THEN 5 \
+     WHEN s.module_path IS NOT NULL AND s.module_path = fs.module_path THEN 6 \
+     ELSE 7 END";
+
+/// Every `Calls` edge matching `filter`, paired with each candidate target and
+/// the nearest tier any candidate of that same edge reached.
+///
+/// Callers keep the rows where `tier = nearest`: that is the first rule of the
+/// cascade to yield anything, and no later rule runs once one has.
+fn resolved_edges(filter: &str) -> String {
+    format!(
+        "SELECT r.from_symbol_id AS from_id, s.id AS sym_id, \
+                {RESOLUTION_TIER} AS tier, \
+                MIN({RESOLUTION_TIER}) OVER (PARTITION BY r.id) AS nearest \
+         FROM code_relationships r \
+         JOIN code_symbols fs ON fs.id = r.from_symbol_id \
+         JOIN code_symbols s ON s.name = r.to_name \
+         WHERE r.kind = 'Calls' AND {filter}"
+    )
+}
 
 /// Standard 14-column SELECT list for symbol queries (no table prefix).
 const SYMBOL_COLUMNS: &str = "SELECT id, name, kind, file_id, file_path, line_start, col_start, \
@@ -1467,6 +1518,217 @@ mod tests {
         assert!(names.contains(&"callee_b"));
     }
 
+    /// Insert a function symbol, returning its id.
+    fn function_in(
+        db: &CodeDb,
+        name: &str,
+        (file_id, file_path): (i64, &str),
+        module: &str,
+        line: u32,
+    ) -> i64 {
+        db.insert_symbol(
+            name,
+            "Function",
+            file_id,
+            file_path,
+            line,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            Some(module),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// A fresh file with one function in it: `(file_id, symbol_id)`.
+    fn file_with_function(db: &CodeDb, name: &str, file: &str, module: &str) -> (i64, i64) {
+        let file_id = db
+            .insert_file(file, file, "hash", Some("Rust"), None, None)
+            .unwrap();
+        (file_id, function_in(db, name, (file_id, file), module, 1))
+    }
+
+    /// `caller` in `crate::here`, and a `helper` in each of two other modules —
+    /// one the calling file will import, one it will not. Every test below adds
+    /// the third `helper` that the cascade is supposed to prefer.
+    fn a_caller_and_two_distant_helpers(db: &CodeDb) -> (i64, i64, i64, i64) {
+        let (here_file, caller) = file_with_function(db, "caller", "here.rs", "crate::here");
+        let (_, imported) = file_with_function(db, "helper", "imported.rs", "crate::imported");
+        let (_, elsewhere) = file_with_function(db, "helper", "other.rs", "crate::other");
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "helper",
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+        (here_file, caller, imported, elsewhere)
+    }
+
+    fn called_ids(db: &CodeDb, caller: i64) -> Vec<i64> {
+        db.get_called_functions(caller)
+            .unwrap()
+            .iter()
+            .map(|s| i64::from(s.id.value()))
+            .collect()
+    }
+
+    /// Three files define `helper` and `caller` calls it. Bare-name matching
+    /// answers "all three", which is two wrong answers and no way to tell which.
+    /// Rule 4 keeps the one declared in the calling file.
+    #[test]
+    fn a_call_resolves_to_the_definition_in_its_own_file() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller, imported, elsewhere) = a_caller_and_two_distant_helpers(&db);
+        let local = function_in(&db, "helper", (here_file, "here.rs"), "crate::here", 10);
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![local],
+            "expected only the local helper, not {imported} or {elsewhere}"
+        );
+    }
+
+    /// Nothing local to prefer, so rule 5 takes over: the file imports one of the
+    /// two modules, and only that one can be what the call meant.
+    #[test]
+    fn a_call_with_no_local_definition_resolves_through_an_import() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller, imported, elsewhere) = a_caller_and_two_distant_helpers(&db);
+        db.insert_import(here_file, "crate::imported::helper", None, false, false)
+            .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![imported],
+            "expected the imported helper, not {elsewhere}"
+        );
+    }
+
+    /// A glob import names the module rather than the item, and has to narrow
+    /// just the same.
+    #[test]
+    fn a_glob_import_narrows_a_call_to_that_module() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller, imported, elsewhere) = a_caller_and_two_distant_helpers(&db);
+        db.insert_import(here_file, "crate::imported", None, true, false)
+            .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![imported],
+            "expected the imported helper, not {elsewhere}"
+        );
+    }
+
+    /// Neither local nor imported, so rule 6: a file of the same module is nearer
+    /// than a file of an unrelated one. `src/a.rs` and `src/a/mod.rs` are one
+    /// module, and so are two classes of one Java package.
+    #[test]
+    fn a_call_with_no_import_resolves_within_its_own_module() {
+        let (_dir, db) = temp_db();
+        let (_, caller, _imported, elsewhere) = a_caller_and_two_distant_helpers(&db);
+        let (_, sibling) = file_with_function(&db, "helper", "sibling.rs", "crate::here");
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![sibling],
+            "expected the helper of the calling module, not {elsewhere}"
+        );
+    }
+
+    /// No rule fires. The candidates stay as they are rather than collapsing to
+    /// nothing: a call whose target the index cannot place is still better
+    /// answered with every same-named symbol than with an empty list.
+    #[test]
+    fn a_call_that_matches_no_rule_keeps_every_candidate() {
+        let (_dir, db) = temp_db();
+        let (_, caller, imported, elsewhere) = a_caller_and_two_distant_helpers(&db);
+
+        let mut got = called_ids(&db, caller);
+        got.sort_unstable();
+        let mut want = vec![imported, elsewhere];
+        want.sort_unstable();
+        assert_eq!(got, want);
+    }
+
+    /// An index written before symbols had an address answers as it always did.
+    /// The cascade must degrade to bare-name matching on `module_path IS NULL`,
+    /// not resolve to nothing: until the reparse runs, every row looks like this.
+    #[test]
+    fn an_index_without_addresses_answers_as_it_did_before() {
+        let (_dir, db) = temp_db();
+        let here_file = db
+            .insert_file("here.rs", "here.rs", "hash", Some("Rust"), None, None)
+            .unwrap();
+        let other_file = db
+            .insert_file("other.rs", "other.rs", "hash", Some("Rust"), None, None)
+            .unwrap();
+        let caller = db
+            .insert_symbol(
+                "caller", "Function", here_file, "here.rs", 1, None, None, None, 0, None, None,
+                None, None,
+            )
+            .unwrap();
+        // The far one only: nothing in the calling file to prefer.
+        let far = db
+            .insert_symbol(
+                "helper", "Function", other_file, "other.rs", 1, None, None, None, 0, None, None,
+                None, None,
+            )
+            .unwrap();
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "helper",
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(called_ids(&db, caller), vec![far]);
+        assert_eq!(
+            db.get_calling_functions(far)
+                .unwrap()
+                .iter()
+                .map(|s| s.as_name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["caller"]
+        );
+    }
+
+    /// The reverse direction has to agree with the forward one. `caller` calls
+    /// the `helper` in its own file, so the two distant ones have no callers at
+    /// all — reporting one for them is how a rename breaks the wrong code.
+    #[test]
+    fn callers_are_reported_only_for_the_definition_the_call_resolved_to() {
+        let (_dir, db) = temp_db();
+        let (here_file, _caller, imported, elsewhere) = a_caller_and_two_distant_helpers(&db);
+        let local = function_in(&db, "helper", (here_file, "here.rs"), "crate::here", 10);
+
+        assert_eq!(
+            db.get_calling_functions(local)
+                .unwrap()
+                .iter()
+                .map(|s| s.as_name().to_string())
+                .collect::<Vec<_>>(),
+            vec!["caller"]
+        );
+        for (label, id) in [("imported", imported), ("unrelated", elsewhere)] {
+            assert!(
+                db.get_calling_functions(id).unwrap().is_empty(),
+                "the {label} helper is called by nobody"
+            );
+        }
+    }
+
     #[test]
     fn test_get_calling_functions() {
         let (_dir, db) = temp_db();
@@ -1477,11 +1739,12 @@ mod tests {
                 None,
             )
             .unwrap();
-        db.insert_symbol(
-            "callee", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None, None,
-            None,
-        )
-        .unwrap();
+        let callee_id = db
+            .insert_symbol(
+                "callee", "Function", file_id, "test.rs", 10, None, None, None, 0, None, None,
+                None, None,
+            )
+            .unwrap();
         db.insert_relationship(
             Some(caller_id),
             "caller",
@@ -1492,7 +1755,7 @@ mod tests {
         )
         .unwrap();
 
-        let callers = db.get_calling_functions("callee").unwrap();
+        let callers = db.get_calling_functions(callee_id).unwrap();
         assert_eq!(callers.len(), 1);
         assert_eq!(callers[0].as_name(), "caller");
     }
@@ -1503,7 +1766,7 @@ mod tests {
         let file_id = insert_test_file(&db);
 
         // Chain: c -> b -> a (c calls b, b calls a)
-        let _a_id = db
+        let a_id = db
             .insert_symbol(
                 "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
             )
@@ -1527,12 +1790,12 @@ mod tests {
             .unwrap();
 
         // Impact of "a" with depth 0: just "b" (direct caller)
-        let impact = db.get_impact_radius("a", 0).unwrap();
+        let impact = db.get_impact_radius(a_id, 0).unwrap();
         assert_eq!(impact.len(), 1);
         assert_eq!(impact[0].as_name(), "b");
 
         // Impact of "a" with depth 1: "b" and "c" (transitive)
-        let impact = db.get_impact_radius("a", 1).unwrap();
+        let impact = db.get_impact_radius(a_id, 1).unwrap();
         assert_eq!(impact.len(), 2);
         let names: Vec<&str> = impact.iter().map(|s| s.as_name()).collect();
         assert!(names.contains(&"b"));
@@ -1819,13 +2082,14 @@ mod tests {
     fn test_get_impact_radius_no_callers() {
         let (_dir, db) = temp_db();
         let file_id = insert_test_file(&db);
-        db.insert_symbol(
-            "orphan", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None,
-            None,
-        )
-        .unwrap();
+        let orphan_id = db
+            .insert_symbol(
+                "orphan", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
 
-        let impact = db.get_impact_radius("orphan", 5).unwrap();
+        let impact = db.get_impact_radius(orphan_id, 5).unwrap();
         assert!(impact.is_empty());
     }
 
@@ -1850,8 +2114,8 @@ mod tests {
         db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, (None, None))
             .unwrap();
 
-        // UNION in the CTE deduplicates, so this should terminate
-        let impact = db.get_impact_radius("a", 10).unwrap();
+        // The walk stops at symbols already seen, so this terminates.
+        let impact = db.get_impact_radius(a_id, 10).unwrap();
         assert!(impact.len() <= 2);
     }
 

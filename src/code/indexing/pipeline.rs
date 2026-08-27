@@ -17,6 +17,7 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 use crate::code::indexing::hasher;
+use crate::code::indexing::module_path::module_path_for;
 use crate::code::indexing::types::{
     CollectedImport, CollectedRelationship, FileContent, FileRegistration, IndexBatch, IndexStats,
     ParsedFile, RawImport, RawRelationship, RawSymbol,
@@ -437,6 +438,7 @@ fn stage_parse(rx: &Receiver<FileContent>, tx: &Sender<ParsedFile>) -> u32 {
                 doc_comment: s.doc_comment,
                 visibility: s.visibility,
                 scope_context: s.scope_context,
+                module_path: s.module_path.unwrap_or_default(),
             })
             .collect();
 
@@ -598,7 +600,7 @@ fn stage_collect(
                 file_path: file_path_str.clone(),
                 signature: raw.signature,
                 doc_comment: raw.doc_comment,
-                module_path: None,
+                module_path: module_path_for(parsed.language, &file_path_str, &raw.module_path),
                 visibility: raw.visibility,
                 scope_context: raw.scope_context,
             };
@@ -631,7 +633,9 @@ fn stage_collect(
                 file_path: file_path_str.clone(),
                 signature: None,
                 doc_comment: None,
-                module_path: None,
+                // It stands for the file itself, so it takes the file's address
+                // and never a declared one — there is no declaration to read.
+                module_path: module_path_for(parsed.language, &file_path_str, ""),
                 visibility: Visibility::Private,
                 scope_context: None,
             };

@@ -7,6 +7,7 @@
 //! provides query methods over the SQLite index.
 
 pub mod hasher;
+pub mod module_path;
 pub mod pipeline;
 pub mod types;
 pub mod walker;
@@ -537,11 +538,8 @@ impl IndexFacade {
 
     /// Get functions/methods that call the given symbol.
     pub fn get_calling_functions(&self, symbol_id: SymbolId) -> Vec<Symbol> {
-        let Some(symbol) = self.get_symbol(symbol_id) else {
-            return Vec::new();
-        };
         self.db
-            .get_calling_functions(symbol.as_name())
+            .get_calling_functions(i64::from(symbol_id.value()))
             .unwrap_or_else(|e| {
                 tracing::error!("DB error in get_calling_functions({symbol_id:?}): {e}");
                 Vec::new()
@@ -551,12 +549,9 @@ impl IndexFacade {
     /// Compute the impact radius: all symbols reachable from the given one
     /// within `max_depth` hops via call relationships.
     pub fn get_impact_radius(&self, start: SymbolId, max_depth: usize) -> Vec<SymbolId> {
-        let Some(symbol) = self.get_symbol(start) else {
-            return Vec::new();
-        };
         let impact = self
             .db
-            .get_impact_radius(symbol.as_name(), max_depth as u32)
+            .get_impact_radius(i64::from(start.value()), max_depth as u32)
             .unwrap_or_else(|e| {
                 tracing::error!("DB error in get_impact_radius({start:?}): {e}");
                 Vec::new()
@@ -1729,8 +1724,14 @@ pub fn world() {
         let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
         facade.index_directory(src_dir.path()).unwrap();
 
+        let shout = facade.db.find_symbols_by_name("shout").unwrap();
+        assert_eq!(shout.len(), 1, "the macro definition: {shout:?}");
         assert!(
-            facade.db.get_calling_functions("shout").unwrap().is_empty(),
+            facade
+                .db
+                .get_calling_functions(i64::from(shout[0].id.value()))
+                .unwrap()
+                .is_empty(),
             "a macro expansion must not answer `who calls shout`"
         );
     }
@@ -1807,6 +1808,86 @@ pub fn world() {
                     .iter()
                     .any(|(n, scope)| n == name && scope.contains(owner)),
                 "{name} must be recorded as a member of {owner}: {members:?}"
+            );
+        }
+    }
+
+    /// Index `files` as `(relative path, source)` and return every stored
+    /// `(name, module_path)`, ordered by name.
+    fn module_paths_for(files: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
+        let src_dir = tempfile::tempdir().unwrap();
+        for (rel_path, source) in files {
+            let target = src_dir.path().join(rel_path);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            fs::write(target, source).unwrap();
+        }
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+        let mut stmt = facade
+            .db
+            .conn()
+            .prepare("SELECT name, module_path FROM code_symbols ORDER BY name")
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    /// The address of a symbol has to reach storage, or two symbols of the same
+    /// name in different modules stay indistinguishable — which is the whole
+    /// reason a call to `open` matches every `open` in the repository.
+    ///
+    /// Rust and Python take their address from the path; Java takes it from its
+    /// `package` declaration and ignores the path. Both halves are checked here
+    /// because only one of the two was ever wired.
+    #[test]
+    fn every_symbol_records_the_module_it_belongs_to() {
+        let symbols = module_paths_for(&[
+            ("src/store/db.rs", "pub fn open() {}\n"),
+            ("pkg/cache.py", "def load():\n    pass\n"),
+            (
+                "deep/nested/Thing.java",
+                "package com.acme.thing;\npublic class Thing {}\n",
+            ),
+        ]);
+
+        for (name, expected) in [
+            ("open", "crate::store::db"),
+            ("load", "pkg.cache"),
+            ("Thing", "com.acme.thing"),
+        ] {
+            assert!(
+                symbols
+                    .iter()
+                    .any(|(n, path)| n == name && path.as_deref() == Some(expected)),
+                "{name} must be addressed as {expected}: {symbols:?}"
+            );
+        }
+    }
+
+    /// `mod` nesting inside a file has to extend the file's address rather than
+    /// be dropped: every Rust file has a `tests` module, and without the nesting
+    /// they all collapse onto the one address of their parent file.
+    #[test]
+    fn a_nested_module_extends_the_address_of_its_file() {
+        let symbols = module_paths_for(&[(
+            "src/store.rs",
+            "pub fn open() {}\n\
+             mod inner {\n    pub fn helper() {}\n    mod deeper { pub fn leaf() {} }\n}\n",
+        )]);
+
+        for (name, expected) in [
+            ("open", "crate::store"),
+            ("helper", "crate::store::inner"),
+            ("leaf", "crate::store::inner::deeper"),
+        ] {
+            assert!(
+                symbols
+                    .iter()
+                    .any(|(n, path)| n == name && path.as_deref() == Some(expected)),
+                "{name} must be addressed as {expected}: {symbols:?}"
             );
         }
     }

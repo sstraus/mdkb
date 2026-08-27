@@ -38,6 +38,10 @@ pub struct RawSymbol {
     pub doc_comment: Option<Box<str>>,
     pub visibility: Visibility,
     pub scope_context: Option<ScopeContext>,
+    /// The namespace the parser read out of the source, empty when the language
+    /// declares none. COLLECT combines it with the address derived from the
+    /// file's path — see [`module_path_for`](super::module_path::module_path_for).
+    pub module_path: Box<str>,
 }
 
 /// A relationship extracted from parsing, before symbol ID resolution.
