@@ -88,6 +88,18 @@ CREATE VIRTUAL TABLE IF NOT EXISTS code_symbols_fts USING fts5(
 
 pub const LAST_INDEX_SCAN_KEY: &str = "last_index_scan_at";
 
+pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
+
+/// What this binary extracts from source, as a number an index can be compared
+/// against.
+///
+/// Bump it whenever the parsers start recording something an older index does
+/// not hold — version 1 is `module_path`, which the call resolver needs to tell
+/// two same-named functions apart. Without the bump an index keeps the wider,
+/// pre-contract answers for every file that is never edited again, which is
+/// most of a codebase.
+pub const RESOLUTION_VERSION: i64 = 1;
+
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///
 /// Separate from `CREATE_TABLES` because triggers cannot use `IF NOT EXISTS`.
@@ -140,7 +152,47 @@ pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     }
 
     super::repair::run_repairs(conn);
+    migrate_resolution_version(conn)?;
 
+    Ok(())
+}
+
+/// Mark every indexed file as changed when the index predates the parse
+/// contract this binary implements.
+///
+/// Nothing is deleted: the symbols stay queryable, and both change detectors
+/// are simply made to disagree with disk. `index_scope` compares `mtime` while
+/// `update` and `reindex_files` compare `hash`, so touching one alone leaves
+/// half the entry points ignoring the migration. The reparse that follows
+/// carries the embeddings over ([`split_by_reuse`](crate::code::indexing)), so
+/// what it costs is parsing, not the ONNX pass that made a full reindex
+/// unaffordable.
+///
+/// `mtime` is stamped to the epoch rather than cleared. `get_file_mtimes` skips
+/// NULLs, so clearing it empties the map and `index_scope` concludes the index
+/// is brand new — which takes the branch that re-embeds every symbol from
+/// scratch, the exact cost this migration exists to avoid. Measured: 51 s wall
+/// and 484 s CPU with 0 vectors carried over.
+fn migrate_resolution_version(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::OptionalExtension;
+
+    let stored: Option<i64> = conn
+        .query_row(
+            "SELECT CAST(value AS INTEGER) FROM code_metadata WHERE key=?1",
+            [RESOLUTION_VERSION_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if stored.is_some_and(|version| version >= RESOLUTION_VERSION) {
+        return Ok(());
+    }
+
+    conn.execute("UPDATE code_files SET hash = '', mtime = 0", [])?;
+    conn.execute(
+        "INSERT INTO code_metadata (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![RESOLUTION_VERSION_KEY, RESOLUTION_VERSION],
+    )?;
     Ok(())
 }
 
@@ -201,6 +253,107 @@ mod tests {
                 .unwrap();
             assert!(exists, "table {table} should exist");
         }
+    }
+
+    /// An index written before the parse contract existed holds symbols without
+    /// a `module_path`, and a file that is never edited again would keep them
+    /// forever: both change detectors would go on agreeing with disk. Opening it
+    /// has to make them disagree — and it must not touch the symbols, which stay
+    /// the only answer available until the reparse runs.
+    #[test]
+    fn an_index_older_than_the_parse_contract_is_marked_for_reparse() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "DELETE FROM code_metadata WHERE key=?1",
+            [RESOLUTION_VERSION_KEY],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_files (path, rel_path, hash, mtime) VALUES ('lib.rs', 'lib.rs', 'h1', 42)",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let (hash, mtime): (String, Option<i64>) = conn
+            .query_row("SELECT hash, mtime FROM code_files", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(hash, "", "`update` compares hashes and must see a mismatch");
+        assert_eq!(
+            mtime,
+            Some(0),
+            "`index_scope` compares mtimes and must too — but the row has to stay \
+             visible to `get_file_mtimes`, which skips NULLs"
+        );
+        assert_eq!(stored_resolution_version(&conn), Some(RESOLUTION_VERSION));
+    }
+
+    /// The reparse is expensive enough that repeating it on every open would be
+    /// worse than the staleness it fixes: the daemon opens the index on every
+    /// watch event.
+    #[test]
+    fn an_index_at_the_current_contract_is_left_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO code_files (path, rel_path, hash, mtime) VALUES ('lib.rs', 'lib.rs', 'h1', 42)",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let (hash, mtime): (String, Option<i64>) = conn
+            .query_row("SELECT hash, mtime FROM code_files", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((hash.as_str(), mtime), ("h1", Some(42)));
+    }
+
+    /// A newer index opened by an older binary must not be dragged backwards:
+    /// its files already carry more than this binary knows how to ask for.
+    #[test]
+    fn an_index_ahead_of_this_binary_is_left_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "UPDATE code_metadata SET value = ?2 WHERE key = ?1",
+            rusqlite::params![RESOLUTION_VERSION_KEY, RESOLUTION_VERSION + 1],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO code_files (path, rel_path, hash, mtime) VALUES ('lib.rs', 'lib.rs', 'h1', 42)",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let hash: String = conn
+            .query_row("SELECT hash FROM code_files", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(hash, "h1");
+        assert_eq!(
+            stored_resolution_version(&conn),
+            Some(RESOLUTION_VERSION + 1),
+            "the newer version survives"
+        );
+    }
+
+    fn stored_resolution_version(conn: &Connection) -> Option<i64> {
+        use rusqlite::OptionalExtension;
+        conn.query_row(
+            "SELECT CAST(value AS INTEGER) FROM code_metadata WHERE key=?1",
+            [RESOLUTION_VERSION_KEY],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
     }
 
     #[test]

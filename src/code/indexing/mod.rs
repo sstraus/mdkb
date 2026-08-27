@@ -156,6 +156,12 @@ impl IndexFacade {
                 });
             }
 
+            // Snapshot the vectors of the files about to be reparsed, while the
+            // ids the store is keyed by still exist. Most of a reparse produces
+            // byte-identical symbol text, and re-embedding it is the only slow
+            // part of the whole operation.
+            let reusable = self.embeddings_by_text(&changed, root);
+
             // Delete stale entries for changed files
             for path in &changed {
                 self.delete_by_file(path, root)?;
@@ -170,7 +176,7 @@ impl IndexFacade {
             // Re-embed ONLY the changed files' symbols, reusing existing vectors
             // for everything else — a 1-file change must not re-run ONNX over the
             // entire symbol table (PERF-D3).
-            self.generate_symbol_embeddings_for_files(&changed, root);
+            self.generate_symbol_embeddings_for_files(&changed, root, &reusable);
             stats
         };
 
@@ -270,8 +276,25 @@ impl IndexFacade {
     ///
     /// Like `index_directory` but takes explicit file paths instead of walking.
     pub fn index_files(&mut self, root: &Path, paths: &[PathBuf]) -> anyhow::Result<IndexStats> {
+        // Before the pipeline replaces them: see `embeddings_by_text`.
+        let reusable = self.embeddings_by_text(paths, root);
+        self.index_files_reusing(root, paths, &reusable)
+    }
+
+    /// Index specific files, carrying over the vectors in `reusable`.
+    ///
+    /// Callers that delete the old rows themselves must take the snapshot
+    /// first and come through here: [`Self::embeddings_by_text`] reads the
+    /// symbols it is snapshotting, so once they are deleted there is nothing
+    /// left to carry over and every symbol is embedded again.
+    fn index_files_reusing(
+        &mut self,
+        root: &Path,
+        paths: &[PathBuf],
+        reusable: &HashMap<String, Vec<f32>>,
+    ) -> anyhow::Result<IndexStats> {
         let stats = pipeline::index_files(paths, root, &self.db, &self.config)?;
-        self.generate_symbol_embeddings_for_files(paths, root);
+        self.generate_symbol_embeddings_for_files(paths, root, reusable);
         self.db.mark_index_scan_completed()?;
         Ok(stats)
     }
@@ -410,6 +433,10 @@ impl IndexFacade {
             deleted.len()
         );
 
+        // Snapshot before the delete loop, which takes the symbols the vectors
+        // are keyed by with it.
+        let reusable = self.embeddings_by_text(&changed, root);
+
         // Delete old data for changed and deleted files
         for path in deleted.iter().chain(changed.iter()) {
             self.delete_by_file(path, root)?;
@@ -424,7 +451,7 @@ impl IndexFacade {
             });
         }
 
-        let mut stats = self.index_files(root, &changed)?;
+        let mut stats = self.index_files_reusing(root, &changed, &reusable)?;
         // `index_files` scopes DISCOVER to `changed`, so it reports
         // files_discovered == files_indexed. Override with the true repo-wide
         // count (`paths`, the full walk `update()` passed in) so "discovered"
@@ -652,21 +679,65 @@ impl IndexFacade {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    /// Generate embeddings only for symbols in the given files.
-    fn generate_symbol_embeddings_for_files(&self, paths: &[PathBuf], root: &Path) {
-        let Some(semantic) = self.ensure_semantic() else {
-            return;
-        };
-
-        let rel_paths: HashSet<String> = paths
+    /// The relative keys under which `paths` are stored, deduplicated.
+    fn rel_keys(paths: &[PathBuf], root: &Path) -> HashSet<String> {
+        paths
             .iter()
             .filter_map(|p| {
                 p.strip_prefix(root)
                     .ok()
                     .map(|r| r.to_string_lossy().to_string())
             })
-            .collect();
+            .collect()
+    }
 
+    /// Vectors already computed for the symbols of `paths`, keyed by the text
+    /// they were computed from.
+    ///
+    /// Call this BEFORE the old rows are deleted. A vector is a pure function of
+    /// [`format_symbol_text`], so a symbol whose text survives a reparse keeps a
+    /// valid vector even though its id does not — and the id is the only thing
+    /// the store is keyed by, so the link has to be captured while both still
+    /// exist. Recomputing instead is the entire cost of a reparse: 71 s wall and
+    /// 626 s CPU over 177 files of this repository, for text that did not change.
+    fn embeddings_by_text(&self, paths: &[PathBuf], root: &Path) -> HashMap<String, Vec<f32>> {
+        let Some(semantic) = self.ensure_semantic() else {
+            return HashMap::new();
+        };
+        let rel_paths = Self::rel_keys(paths, root);
+        let rel_path_strs: Vec<&str> = rel_paths.iter().map(|s| s.as_str()).collect();
+        let symbols = self
+            .db
+            .symbols_for_files(&rel_path_strs)
+            .unwrap_or_default();
+        if symbols.is_empty() {
+            return HashMap::new();
+        }
+
+        let text_by_id: HashMap<u32, String> = symbols
+            .iter()
+            .map(|s| (s.id.value(), symbol_embed_text(s)))
+            .collect();
+        semantic
+            .store_load_filtered(|id| text_by_id.contains_key(&id))
+            .into_iter()
+            .filter_map(|(id, vector)| text_by_id.get(&id).map(|t| (t.clone(), vector)))
+            .collect()
+    }
+
+    /// Generate embeddings only for symbols in the given files, carrying over
+    /// any vector in `reusable` whose text is unchanged.
+    fn generate_symbol_embeddings_for_files(
+        &self,
+        paths: &[PathBuf],
+        root: &Path,
+        reusable: &HashMap<String, Vec<f32>>,
+    ) {
+        let Some(semantic) = self.ensure_semantic() else {
+            return;
+        };
+
+        let rel_paths = Self::rel_keys(paths, root);
         let rel_path_strs: Vec<&str> = rel_paths.iter().map(|s| s.as_str()).collect();
         let symbols: Vec<Symbol> = self
             .db
@@ -678,27 +749,18 @@ impl IndexFacade {
         }
 
         // Load existing embeddings, filter out the ones we're regenerating,
-        // then append new ones
+        // then append the carried-over and the newly embedded ones.
         let changed_ids: HashSet<u32> = symbols.iter().map(|s| s.id.value()).collect();
-        let existing = semantic.store_load_filtered(|id| !changed_ids.contains(&id));
+        let mut existing = semantic.store_load_filtered(|id| !changed_ids.contains(&id));
 
-        let embed_inputs: Vec<(u32, String)> = symbols
-            .iter()
-            .map(|sym| {
-                let text = format_symbol_text(
-                    sym.kind,
-                    sym.as_name(),
-                    sym.as_signature(),
-                    sym.as_doc_comment(),
-                );
-                (sym.id.value(), text)
-            })
-            .collect();
-
+        let (carried, embed_inputs) = split_by_reuse(&symbols, reusable);
         tracing::info!(
-            "Generating semantic embeddings for {} symbols (incremental)...",
-            embed_inputs.len()
+            "Generating semantic embeddings for {} symbols ({} carried over, {} untouched)...",
+            embed_inputs.len(),
+            carried.len(),
+            existing.len(),
         );
+        existing.extend(carried);
 
         if let Err(e) = semantic.generate_embeddings_incremental(&existing, &embed_inputs) {
             tracing::error!(
@@ -819,6 +881,45 @@ fn is_corruption(err: &anyhow::Error) -> bool {
 ///
 /// Returns `None` if initialization fails (logged as error with impact).
 /// Does NOT load the ONNX model — that happens lazily on first use.
+/// The text a symbol's embedding is computed from.
+fn symbol_embed_text(symbol: &Symbol) -> String {
+    format_symbol_text(
+        symbol.kind,
+        symbol.as_name(),
+        symbol.as_signature(),
+        symbol.as_doc_comment(),
+    )
+}
+
+/// A vector kept from before a reparse, under the symbol's new id.
+type CarriedVector = (u32, Vec<f32>);
+/// A symbol id and the text the model still has to embed for it.
+type EmbedInput = (u32, String);
+
+/// Split `symbols` into `(vectors carried over, symbols still to embed)`.
+///
+/// A vector is carried over when the exact text it was computed from appears
+/// again, which is the only condition under which it is still the right answer:
+/// [`format_symbol_text`] reads the kind, name, signature and doc comment, so a
+/// match means all four are unchanged. A symbol whose text changed is embedded
+/// again — serving the old vector would answer a semantic search with the
+/// meaning the code used to have.
+fn split_by_reuse(
+    symbols: &[Symbol],
+    reusable: &HashMap<String, Vec<f32>>,
+) -> (Vec<CarriedVector>, Vec<EmbedInput>) {
+    let mut carried = Vec::new();
+    let mut to_embed = Vec::new();
+    for symbol in symbols {
+        let text = symbol_embed_text(symbol);
+        match reusable.get(&text) {
+            Some(vector) => carried.push((symbol.id.value(), vector.clone())),
+            None => to_embed.push((symbol.id.value(), text)),
+        }
+    }
+    (carried, to_embed)
+}
+
 fn init_semantic(db_path: &Path) -> Option<SemanticSearch> {
     // vectors.bin lives next to code.sqlite in the .mdkb directory
     let vectors_path = db_path.parent()?.join("vectors.bin");
@@ -1733,6 +1834,226 @@ pub fn world() {
                 .unwrap()
                 .is_empty(),
             "a macro expansion must not answer `who calls shout`"
+        );
+    }
+
+    /// Write one recognisable vector per indexed symbol and return them keyed by
+    /// the text they stand for.
+    ///
+    /// No embedding model produces a constant vector, so a value that survives a
+    /// reparse proves it was carried over rather than recomputed. Seeding by hand
+    /// also keeps the test independent of the ONNX model, which is a 90 MB
+    /// download the rest of the suite does not make.
+    fn seed_recognisable_vectors(facade: &IndexFacade, rel_paths: &[&str]) -> Vec<u32> {
+        let symbols = facade.db.symbols_for_files(rel_paths).unwrap();
+        assert!(!symbols.is_empty(), "nothing indexed in {rel_paths:?}");
+
+        let entries: Vec<(u32, Vec<f32>)> = symbols
+            .iter()
+            .map(|s| {
+                (
+                    s.id.value(),
+                    vec![SEED_MARKER; crate::code::semantic::EMBEDDING_DIM],
+                )
+            })
+            .collect();
+        facade
+            .ensure_semantic()
+            .expect("the vector store opens without the model")
+            .generate_embeddings_incremental(&entries, &[])
+            .unwrap();
+        entries.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// A value no embedding produces: components are L2-normalised, so none can
+    /// be 7.
+    const SEED_MARKER: f32 = 7.0;
+
+    /// A two-file index with a recognisable vector on every symbol, ready for
+    /// `lib.rs` alone to be reparsed.
+    ///
+    /// The files are indexed in two passes on purpose: SQLite hands out
+    /// `max(rowid) + 1`, so deleting the *lowest* ids leaves the counter where
+    /// the second file put it and the reparsed symbols come back under ids that
+    /// never held a vector. Reparse both at once instead and the old rowids are
+    /// handed straight back, so the seeded vectors would look reused whatever
+    /// the code did.
+    struct SeededIndex {
+        src: tempfile::TempDir,
+        _db: tempfile::TempDir,
+        facade: IndexFacade,
+        seeded_ids: Vec<u32>,
+    }
+
+    fn seeded_two_file_index() -> SeededIndex {
+        let src = tempfile::tempdir().unwrap();
+        let source = "/// Adds two numbers.\npub fn add(a: i32, b: i32) -> i32 { a + b }\n\
+                      /// Subtracts.\npub fn sub(a: i32, b: i32) -> i32 { a - b }\n";
+        fs::write(src.path().join("lib.rs"), source).unwrap();
+
+        let db = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src.path()).unwrap();
+
+        fs::write(src.path().join("other.rs"), "pub fn untouched() {}\n").unwrap();
+        facade.index_directory(src.path()).unwrap();
+        let seeded_ids = seed_recognisable_vectors(&facade, &["lib.rs", "other.rs"]);
+
+        SeededIndex {
+            src,
+            _db: db,
+            facade,
+            seeded_ids,
+        }
+    }
+
+    /// Every symbol of `lib.rs` answers under its post-reparse id with the
+    /// vector seeded before it — which is only possible if the reparse carried
+    /// it over, since the delete that precedes the reparse drops the vectors of
+    /// the ids it removes.
+    fn assert_lib_kept_its_vectors(index: &SeededIndex) {
+        let symbols = index.facade.db.symbols_for_files(&["lib.rs"]).unwrap();
+        assert_eq!(symbols.len(), 2, "the reparse found the same symbols");
+        let new_ids: Vec<u32> = symbols.iter().map(|s| s.id.value()).collect();
+        assert!(
+            new_ids.iter().all(|id| !index.seeded_ids.contains(id)),
+            "the reparsed symbols must have fresh ids or this proves nothing: \
+             {new_ids:?} against {:?}",
+            index.seeded_ids
+        );
+
+        let stored: HashMap<u32, Vec<f32>> = index
+            .facade
+            .ensure_semantic()
+            .unwrap()
+            .store_load_filtered(|_| true)
+            .into_iter()
+            .collect();
+        for symbol in &symbols {
+            assert_eq!(
+                stored.get(&symbol.id.value()).map(|v| v[0]),
+                Some(SEED_MARKER),
+                "{} kept its vector under its new id: {:?}",
+                symbol.as_name(),
+                stored.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// The `mdkb code index` path, which decides what changed by mtime.
+    ///
+    /// Re-embedding is the whole cost of a reparse: on 177 files of this
+    /// repository it was 71 s wall and 626 s CPU for text that was
+    /// byte-identical before and after.
+    #[test]
+    fn a_reparse_of_unchanged_content_reuses_its_embeddings() {
+        let mut index = seeded_two_file_index();
+
+        // Same bytes, different mtime: the indexer sees a changed file and
+        // reparses it, which is what a parse-contract migration does to every
+        // file. The stamp is written rather than waited for — `file_mtime` has
+        // one-second resolution, so a rewrite here would land in the same second
+        // and be skipped.
+        let stamp = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        fs::File::options()
+            .write(true)
+            .open(index.src.path().join("lib.rs"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(stamp))
+            .unwrap();
+
+        let src = index.src.path().to_path_buf();
+        let stats = index.facade.index_directory(&src).unwrap();
+        assert_eq!(stats.files_indexed, 1, "only the stamped file was reparsed");
+
+        assert_lib_kept_its_vectors(&index);
+    }
+
+    /// The watcher path, which decides what changed by hash and deletes the old
+    /// rows itself before handing over to the indexer.
+    ///
+    /// This is how the migration actually reaches most indexes, and it broke
+    /// once: the snapshot was taken inside `index_files`, by which point
+    /// `reindex_files` had already deleted the symbols it reads. Measured on
+    /// 177 files: 0 vectors carried over, 49 s wall, 492 s CPU.
+    #[test]
+    fn a_hash_driven_reindex_reuses_its_embeddings_too() {
+        let mut index = seeded_two_file_index();
+
+        // What `migrate_resolution_version` does: the content is untouched, only
+        // the record of it disagrees with disk.
+        index
+            .facade
+            .db
+            .conn()
+            .execute(
+                "UPDATE code_files SET hash = '' WHERE rel_path = 'lib.rs'",
+                [],
+            )
+            .unwrap();
+
+        let src = index.src.path().to_path_buf();
+        let files = vec![src.join("lib.rs"), src.join("other.rs")];
+        let stats = index.facade.reindex_files(&src, &files).unwrap();
+        assert_eq!(stats.files_indexed, 1, "only lib.rs disagreed with disk");
+
+        assert_lib_kept_its_vectors(&index);
+    }
+
+    /// Reuse is keyed by the text the vector was computed from. A symbol whose
+    /// doc comment changed must be embedded again — serving the old vector would
+    /// answer a semantic search with the meaning the code used to have.
+    #[test]
+    fn a_symbol_whose_text_changed_is_not_carried_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = CodeDb::create(dir.path().join("code.sqlite")).unwrap();
+        let file_id = db
+            .insert_file("lib.rs", "lib.rs", "h", Some("Rust"), None, None)
+            .unwrap();
+        let make = |name: &str, doc: &str, line: u32| {
+            let id = db
+                .insert_symbol(
+                    name,
+                    "Function",
+                    file_id,
+                    "lib.rs",
+                    line,
+                    None,
+                    None,
+                    None,
+                    0,
+                    None,
+                    Some(doc),
+                    None,
+                    None,
+                )
+                .unwrap();
+            db.get_symbol(id).unwrap().unwrap()
+        };
+        let unchanged = make("add", "Adds two numbers.", 1);
+        let redocumented = make("sub", "Multiplies, actually.", 10);
+
+        // What the store holds: the text `sub` used to have, not the one it has.
+        let reusable = HashMap::from([
+            (symbol_embed_text(&unchanged), vec![SEED_MARKER; 384]),
+            (
+                format_symbol_text(redocumented.kind, "sub", None, Some("Subtracts.")),
+                vec![SEED_MARKER; 384],
+            ),
+        ]);
+
+        let (carried, to_embed) =
+            split_by_reuse(&[unchanged.clone(), redocumented.clone()], &reusable);
+
+        assert_eq!(
+            carried.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![unchanged.id.value()],
+            "only the symbol whose text is unchanged"
+        );
+        assert_eq!(
+            to_embed.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![redocumented.id.value()],
+            "the redocumented symbol has to be embedded again"
         );
     }
 

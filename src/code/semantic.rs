@@ -14,7 +14,10 @@ use crate::code::types::SymbolKind;
 use crate::llm::EmbeddingService;
 
 /// Embedding dimensionality for AllMiniLML6V2.
-const EMBEDDING_DIM: usize = 384;
+///
+/// Public because [`VectorStore::write_all`] rejects any other length: a caller
+/// building entries has to know the one width the store accepts.
+pub const EMBEDDING_DIM: usize = 384;
 
 /// Magic bytes identifying our vector store file format.
 const MAGIC: &[u8; 4] = b"MDVS";
