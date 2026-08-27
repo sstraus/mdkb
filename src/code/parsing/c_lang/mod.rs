@@ -208,11 +208,7 @@ impl CParser {
             None => code[declarator.byte_range()].to_string(),
         };
 
-        let visibility = if name.starts_with('_') {
-            Visibility::Private
-        } else {
-            Visibility::Public
-        };
+        let visibility = c_visibility(node, code, name);
 
         Some(self.create_symbol(
             counter.next_id(),
@@ -476,7 +472,7 @@ impl CParser {
                     ),
                     None,
                     module_path,
-                    Visibility::Public,
+                    c_visibility(node, code, name),
                 ),
             );
             symbols.push(symbol);
@@ -559,6 +555,27 @@ impl CParser {
 /// A prototype and a function pointer both reach a `function_declarator`. They
 /// part company one level below it: the pointer parenthesises its name —
 /// `int (*fp)(int)` — while the prototype names it directly. The return type
+/// The access a C declaration grants, from its storage class.
+///
+/// `static` is C's own word for "not visible outside this translation unit", so
+/// it is the ground truth and outranks the naming convention. Without a storage
+/// class the name is all there is to go on, and a leading underscore is the
+/// convention the codebase already read that way.
+fn c_visibility(node: Node, code: &str, name: &str) -> Visibility {
+    let storage = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "storage_class_specifier")
+        .map(|c| &code[c.byte_range()]);
+    match storage {
+        Some("static") => Visibility::Module,
+        // `extern` states the opposite explicitly; it outranks the convention
+        // too, or a declared-elsewhere `_impl` would read as file-local.
+        Some("extern") => Visibility::Public,
+        _ if name.starts_with('_') => Visibility::Private,
+        _ => Visibility::Public,
+    }
+}
+
 /// can wrap either in pointers or arrays first (`int *ptr_ret(void);`), so the
 /// chain has to be walked rather than inspected one level deep.
 fn is_function_prototype(declarator: Node) -> bool {
@@ -632,6 +649,43 @@ impl LanguageParser for CParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `static` is internal linkage: the symbol cannot be named from another
+    /// translation unit. Reporting it as Public put every file-local helper in
+    /// the answer to "what does this library export".
+    #[test]
+    fn storage_class_decides_visibility_over_the_naming_convention() {
+        let mut parser = CParser::new().unwrap();
+        let code = "static int hidden(void) { return 0; }\n\
+                    int visible(void) { return 0; }\n\
+                    static int g_hidden = 1;\n\
+                    extern int g_vis;\n\
+                    int _by_convention(void) { return 0; }\n\
+                    extern int _declared_elsewhere;\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+
+        let level = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} not parsed: {:?}",
+                        symbols.iter().map(Symbol::as_name).collect::<Vec<_>>()
+                    )
+                })
+                .visibility
+        };
+        assert_eq!(level("hidden"), Visibility::Module, "static function");
+        assert_eq!(level("visible"), Visibility::Public, "no storage class");
+        assert_eq!(level("g_hidden"), Visibility::Module, "static global");
+        assert_eq!(level("g_vis"), Visibility::Public, "extern global");
+        // The convention still decides when the language says nothing.
+        assert_eq!(level("_by_convention"), Visibility::Private);
+        // ...and never outranks an explicit `extern`.
+        assert_eq!(level("_declared_elsewhere"), Visibility::Public);
+    }
 
     /// Names of the symbols `code` yields.
     fn names_of(code: &str) -> Vec<String> {

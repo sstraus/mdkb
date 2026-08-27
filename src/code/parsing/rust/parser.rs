@@ -10,6 +10,24 @@ use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
 
+/// The access level a Rust `visibility_modifier` grants.
+///
+/// `pub` alone is the only one that leaves the crate. `pub(crate)` stops at the
+/// crate and `pub(super)` and `pub(in <path>)` stop at a module, so reporting
+/// all four as `Public` puts internal items in every answer about the public
+/// API surface. `pub(self)` is `pub` restricted to the current module, which is
+/// what no modifier at all already means.
+fn rust_visibility(modifier: &str) -> Visibility {
+    match modifier.trim() {
+        "pub" => Visibility::Public,
+        "pub(crate)" => Visibility::Crate,
+        "pub(self)" => Visibility::Private,
+        // `pub(super)` and `pub(in <path>)`: visible up to some module, not the
+        // whole crate.
+        _ => Visibility::Module,
+    }
+}
+
 /// Classification for Rust doc comment types.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum DocCommentType {
@@ -577,7 +595,7 @@ impl RustParser {
         if let Some(parent) = name_node.parent() {
             for child in parent.children(&mut parent.walk()) {
                 if child.kind() == "visibility_modifier" {
-                    symbol = symbol.with_visibility(Visibility::Public);
+                    symbol = symbol.with_visibility(rust_visibility(&code[child.byte_range()]));
                     break;
                 }
             }
@@ -1369,6 +1387,36 @@ impl LanguageParser for RustParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `pub`, `pub(crate)` and `pub(super)` are three different answers to
+    /// "is this part of the public API", and reporting all three as Public put
+    /// every internal item in that answer.
+    #[test]
+    fn each_visibility_modifier_maps_to_its_own_level() {
+        let mut parser = RustParser::new().unwrap();
+        let code = "pub fn a() {}\n\
+                    pub(crate) fn b() {}\n\
+                    pub(super) fn c() {}\n\
+                    pub(in crate::x) fn d() {}\n\
+                    pub(self) fn e() {}\n\
+                    fn f() {}\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+
+        let level = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+                .visibility
+        };
+        assert_eq!(level("a"), Visibility::Public);
+        assert_eq!(level("b"), Visibility::Crate);
+        assert_eq!(level("c"), Visibility::Module);
+        assert_eq!(level("d"), Visibility::Module);
+        assert_eq!(level("e"), Visibility::Private);
+        assert_eq!(level("f"), Visibility::Private);
+    }
 
     /// The `name`/`kind` pairs the symbols of `code` carry.
     fn kinds_of(code: &str) -> Vec<(String, SymbolKind)> {
