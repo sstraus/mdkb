@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
-use crate::code::symbol::{Symbol, Visibility};
+use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
 
@@ -135,9 +135,11 @@ impl PythonParser {
             }
 
             "class_definition" => {
+                // Qualified, so that everything in this body is named through
+                // every class that holds it, however deep the nesting goes.
                 let class_name = node
                     .child_by_field_name("name")
-                    .map(|n| code[n.byte_range()].to_string());
+                    .map(|n| self.qualified_name(&code[n.byte_range()]));
 
                 if let Some(symbol) = self.process_class(node, code, file_id, counter, module_path)
                 {
@@ -208,6 +210,31 @@ impl PythonParser {
 
     // ── Symbol processors ───────────────────────────────────────────────
 
+    /// The class this declaration is written in, if it is written directly in
+    /// one.
+    ///
+    /// Being *somewhere* under a class is not the same thing: a closure inside
+    /// a method belongs to that call, not to the class, and neither does a
+    /// local. Only the innermost scope decides.
+    fn enclosing_class(&self) -> Option<String> {
+        match self.context.current_scope_context() {
+            ScopeContext::ClassMember { class_name } => class_name.map(|n| n.to_string()),
+            _ => None,
+        }
+    }
+
+    /// The name a declaration is indexed under: its class, then its own name.
+    ///
+    /// Nesting composes, because the class name is already qualified by the
+    /// time its body is walked — so `NAME` inside `Inner` inside `Outer` is
+    /// `Outer.Inner.NAME`, and cannot be confused with anyone else's `NAME`.
+    fn qualified_name(&self, name: &str) -> String {
+        match self.enclosing_class() {
+            Some(class) => format!("{class}.{name}"),
+            None => name.to_string(),
+        }
+    }
+
     fn process_function(
         &mut self,
         node: Node,
@@ -219,7 +246,7 @@ impl PythonParser {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
 
-        let is_method = self.context.is_in_class();
+        let is_method = self.enclosing_class().is_some();
         let kind = if is_method {
             SymbolKind::Method
         } else {
@@ -230,22 +257,11 @@ impl PythonParser {
         let signature = build_function_signature(node, code, is_async);
         let docstring = extract_function_docstring(node, code);
 
-        // Qualify method names with class name
-        let qualified_name = if is_method {
-            if let Some(cls) = self.context.current_class() {
-                format!("{cls}.{name}")
-            } else {
-                name.to_string()
-            }
-        } else {
-            name.to_string()
-        };
-
         let visibility = determine_python_visibility(name);
 
         Some(self.create_symbol(
             counter.next_id(),
-            qualified_name,
+            self.qualified_name(name),
             kind,
             file_id,
             node_range(node),
@@ -270,7 +286,7 @@ impl PythonParser {
 
         Some(self.create_symbol(
             counter.next_id(),
-            name.to_string(),
+            self.qualified_name(name),
             SymbolKind::Class,
             file_id,
             node_range(node),
@@ -305,7 +321,7 @@ impl PythonParser {
 
         let symbol = self.create_symbol(
             counter.next_id(),
-            name.to_string(),
+            self.qualified_name(name),
             kind,
             file_id,
             node_range(node),
@@ -336,7 +352,7 @@ impl PythonParser {
 
         Some(self.create_symbol(
             counter.next_id(),
-            name.to_string(),
+            self.qualified_name(name),
             SymbolKind::TypeAlias,
             file_id,
             node_range(node),
@@ -895,6 +911,59 @@ class MyClass:
                 .iter()
                 .any(|s| s.name.as_ref() == "MyClass.greet" && s.kind == SymbolKind::Method)
         );
+    }
+
+    #[test]
+    fn a_class_member_is_indexed_under_its_class() {
+        // Methods already carried their class. Everything else in a class body
+        // did not, so `NAME` was indexed as `NAME` — indistinguishable from a
+        // module-level constant, and from `NAME` in any other class.
+        let mut parser = PythonParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+DEFAULT = 1
+
+class Outer:
+    LIMIT = 10
+
+    class Inner:
+        NAME = "x"
+
+        def run(self):
+            temp = 1
+
+            def helper():
+                pass
+
+            return temp
+
+def free():
+    local = 2
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_ref()).collect();
+        let kind = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("no symbol named {name}, got {names:?}"))
+                .kind
+        };
+
+        assert_eq!(kind("DEFAULT"), SymbolKind::Constant);
+        assert_eq!(kind("Outer.LIMIT"), SymbolKind::Constant);
+        // A nested class is reached through the one that holds it.
+        assert_eq!(kind("Outer.Inner"), SymbolKind::Class);
+        assert_eq!(kind("Outer.Inner.NAME"), SymbolKind::Constant);
+        assert_eq!(kind("Outer.Inner.run"), SymbolKind::Method);
+        // Inside a method the class is no longer the scope: a local and a
+        // closure belong to the call, not to the class.
+        assert_eq!(kind("temp"), SymbolKind::Variable);
+        assert_eq!(kind("helper"), SymbolKind::Function);
+        assert_eq!(kind("local"), SymbolKind::Variable);
     }
 
     #[test]

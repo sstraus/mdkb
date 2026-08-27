@@ -115,11 +115,13 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// used to swallow a trailing comment, a toolchain directive and anything a
 /// blank line above, and to hand a group comment to every type in the group;
 /// version 9 is Python visibility, which used to read one underscore and two
-/// as the same thing and to call every dunder private.
+/// as the same thing and to call every dunder private; version 10 is Python
+/// qualification, where a nested class, a class attribute and a class-level
+/// alias were all stored under their bare name.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 9;
+pub const RESOLUTION_VERSION: i64 = 10;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///
