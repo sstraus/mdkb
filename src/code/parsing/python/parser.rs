@@ -4,7 +4,6 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -534,67 +533,6 @@ impl PythonParser {
         calls
     }
 
-    // ── Method calls ────────────────────────────────────────────────────
-
-    fn find_method_calls_in_node(
-        node: &Node,
-        code: &str,
-        current_fn: Option<&str>,
-        depth: usize,
-        calls: &mut Vec<MethodCall>,
-    ) {
-        if !check_recursion_depth(depth, *node) {
-            return;
-        }
-
-        let fn_ctx = match node.kind() {
-            "function_definition" => node
-                .child_by_field_name("name")
-                .map(|n| &code[n.byte_range()])
-                .or(current_fn),
-            _ => current_fn,
-        };
-
-        if node.kind() == "call" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                if function_node.kind() == "attribute" {
-                    if let Some(ctx) = fn_ctx {
-                        let method_name = function_node
-                            .child_by_field_name("attribute")
-                            .map(|n| &code[n.byte_range()]);
-                        let receiver = function_node
-                            .child_by_field_name("object")
-                            .map(|n| &code[n.byte_range()]);
-
-                        if let Some(method) = method_name {
-                            calls.push(MethodCall {
-                                caller: ctx.to_string(),
-                                method_name: method.to_string(),
-                                receiver: receiver.map(|r| r.to_string()),
-                                is_static: false,
-                                range: node_range(*node),
-                                caller_range: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        for child in node.children(&mut node.walk()) {
-            Self::find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
-        }
-    }
-
-    fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
-
     // ── Implementations (inheritance) ───────────────────────────────────
 
     fn find_implementations_in_node<'a>(
@@ -666,35 +604,6 @@ impl PythonParser {
 
         for child in node.children(&mut node.walk()) {
             Self::find_defines_in_node(&child, code, depth + 1, defines);
-        }
-    }
-
-    // ── Variable types ──────────────────────────────────────────────────
-
-    fn find_variable_types_in_node<'a>(
-        node: &Node,
-        code: &'a str,
-        depth: usize,
-        types: &mut Vec<(&'a str, &'a str, Range)>,
-    ) {
-        if !check_recursion_depth(depth, *node) {
-            return;
-        }
-
-        if node.kind() == "assignment" {
-            if let Some(type_node) = node.child_by_field_name("type") {
-                let var_name = node
-                    .child_by_field_name("left")
-                    .and_then(|n| extract_variable_name(n, code));
-                if let Some(name) = var_name {
-                    let type_str = &code[type_node.byte_range()];
-                    types.push((name, type_str, node_range(type_node)));
-                }
-            }
-        }
-
-        for child in node.children(&mut node.walk()) {
-            Self::find_variable_types_in_node(&child, code, depth + 1, types);
         }
     }
 }
@@ -850,17 +759,6 @@ fn extract_call_target<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
     }
 }
 
-/// Extract variable name from assignment left side.
-fn extract_variable_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
-    match node.kind() {
-        "identifier" => Some(&code[node.byte_range()]),
-        "attribute" => node
-            .child_by_field_name("attribute")
-            .map(|n| &code[n.byte_range()]),
-        _ => None,
-    }
-}
-
 /// Extract base class names from superclasses argument list.
 fn extract_base_class_names<'a>(
     superclasses: &Node,
@@ -905,10 +803,6 @@ impl LanguageParser for PythonParser {
         self.find_calls_impl(code)
     }
 
-    fn find_method_calls(&mut self, code: &str) -> Vec<MethodCall> {
-        self.find_method_calls_impl(code)
-    }
-
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         let Some(tree) = self.parser.parse_cached(code) else {
             return Vec::new();
@@ -933,15 +827,6 @@ impl LanguageParser for PythonParser {
 
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
         self.extract_imports_impl(code, file_id)
-    }
-
-    fn find_variable_types<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut types = Vec::new();
-        Self::find_variable_types_in_node(&tree.root_node(), code, 0, &mut types);
-        types
     }
 }
 
@@ -1092,8 +977,10 @@ def get_data():
         );
     }
 
+    /// The same calls through the surviving API: `find_method_calls` held a
+    /// second, parallel representation of what `find_calls` already records.
     #[test]
-    fn test_find_method_calls() {
+    fn a_method_call_on_a_local_is_recorded() {
         let mut parser = PythonParser::new().unwrap();
 
         let code = r#"
@@ -1107,11 +994,12 @@ def main():
     print("hello")
 "#;
 
-        let calls = parser.find_method_calls_impl(code);
+        let calls = parser.find_calls_impl(code);
         assert!(
             calls
                 .iter()
-                .any(|c| c.caller == "main" && c.method_name == "start")
+                .any(|(caller, target, _)| *caller == "main" && *target == "s.start"),
+            "got {calls:?}"
         );
     }
 

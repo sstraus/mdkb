@@ -6,7 +6,6 @@
 
 use super::import::Import;
 use super::language::Language;
-use super::method_call::MethodCall;
 use crate::code::symbol::Symbol;
 use crate::code::types::{FileId, Range, SymbolCounter};
 
@@ -28,16 +27,6 @@ pub trait LanguageParser: Send {
 
     /// Find function/method calls: (caller_name, callee_name, range).
     fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)>;
-
-    /// Find method calls with structured receiver information.
-    ///
-    /// Default converts from [`find_calls`](LanguageParser::find_calls).
-    fn find_method_calls(&mut self, code: &str) -> Vec<MethodCall> {
-        self.find_calls(code)
-            .into_iter()
-            .map(|(caller, target, range)| MethodCall::new(caller, target, range))
-            .collect()
-    }
 
     /// Find macro invocations: (invoker_name, macro_name, range).
     ///
@@ -72,17 +61,6 @@ pub trait LanguageParser: Send {
 
     /// Find import statements.
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import>;
-
-    /// Extract variable-to-type bindings: (var_name, type_name, range).
-    fn find_variable_types<'a>(&mut self, _code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        Vec::new()
-    }
-
-    /// Find methods defined directly on types (not via traits):
-    /// (type_name, method_name, range).
-    fn find_inherent_methods(&mut self, _code: &str) -> Vec<(String, String, Range)> {
-        Vec::new()
-    }
 }
 
 /// Maximum recursion depth for AST traversal to prevent stack overflow.

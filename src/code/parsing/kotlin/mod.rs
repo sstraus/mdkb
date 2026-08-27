@@ -7,7 +7,6 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{
     LanguageParser, check_recursion_depth, is_plain_path, node_range,
 };
@@ -722,74 +721,6 @@ impl KotlinParser {
         }
     }
 
-    // ── Method calls ────────────────────────────────────────────────────
-
-    fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
-
-    fn find_method_calls_in_node(
-        node: &Node,
-        code: &str,
-        current_fn: Option<&str>,
-        depth: usize,
-        calls: &mut Vec<MethodCall>,
-    ) {
-        if !check_recursion_depth(depth, *node) {
-            return;
-        }
-
-        let fn_ctx = match node.kind() {
-            "function_declaration" => find_simple_identifier_ref(*node, code).or(current_fn),
-            "secondary_constructor" => Some("constructor"),
-            _ => current_fn,
-        };
-
-        if node.kind() == "call_expression" {
-            if let Some(ctx) = fn_ctx {
-                if let Some(callee_node) = node.child(0) {
-                    match callee_node.kind() {
-                        "simple_identifier" => {
-                            let method = &code[callee_node.byte_range()];
-                            calls.push(MethodCall {
-                                caller: ctx.to_string(),
-                                method_name: method.to_string(),
-                                receiver: None,
-                                is_static: false,
-                                range: node_range(*node),
-                                caller_range: None,
-                            });
-                        }
-                        "navigation_expression" => {
-                            let receiver = extract_nav_receiver(callee_node, code);
-                            let method = extract_nav_method_name(callee_node, code);
-                            if let Some(method) = method {
-                                calls.push(MethodCall {
-                                    caller: ctx.to_string(),
-                                    method_name: method.to_string(),
-                                    receiver: receiver.map(|r| r.to_string()),
-                                    is_static: false,
-                                    range: node_range(*node),
-                                    caller_range: None,
-                                });
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        for child in node.children(&mut node.walk()) {
-            Self::find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
-        }
-    }
-
     // ── Implementations (: interface) ───────────────────────────────────
 
     fn find_implementations_in_node<'a>(
@@ -1129,18 +1060,6 @@ fn extract_nav_method_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
     None
 }
 
-/// Extract the receiver from a navigation_expression (the left side).
-fn extract_nav_receiver<'a>(node: Node, code: &'a str) -> Option<&'a str> {
-    // First child of navigation_expression is the receiver
-    let first = node.child(0)?;
-    match first.kind() {
-        "simple_identifier" => Some(&code[first.byte_range()]),
-        "this_expression" => Some("this"),
-        "super_expression" => Some("super"),
-        _ => None,
-    }
-}
-
 /// Extract type names from a delegation_specifier.
 fn extract_delegation_type<'a>(
     node: Node,
@@ -1189,10 +1108,6 @@ impl LanguageParser for KotlinParser {
 
     fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         self.find_calls_impl(code)
-    }
-
-    fn find_method_calls(&mut self, code: &str) -> Vec<MethodCall> {
-        self.find_method_calls_impl(code)
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {

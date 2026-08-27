@@ -15,7 +15,6 @@ pub mod java;
 pub mod kotlin;
 pub mod language;
 pub mod lua;
-pub mod method_call;
 pub mod parser;
 pub mod php;
 pub mod python;

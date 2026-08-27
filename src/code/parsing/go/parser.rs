@@ -4,7 +4,6 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{
     LanguageParser, check_recursion_depth, node_range, receiver_call_target,
 };
@@ -1156,71 +1155,6 @@ impl GoParser {
         calls
     }
 
-    // ── Method calls ────────────────────────────────────────────────────
-
-    #[allow(clippy::only_used_in_recursion)]
-    fn extract_method_calls_recursive(
-        node: &Node,
-        code: &str,
-        current_function: Option<&str>,
-        calls: &mut Vec<MethodCall>,
-        depth: usize,
-    ) {
-        if !check_recursion_depth(depth, *node) {
-            return;
-        }
-        let function_context = if node.kind() == "function_declaration"
-            || node.kind() == "method_declaration"
-            || node.kind() == "func_literal"
-        {
-            node.child_by_field_name("name")
-                .map(|n| &code[n.byte_range()])
-                .or(current_function)
-        } else {
-            current_function
-        };
-
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                if function_node.kind() == "selector_expression" {
-                    if let Some((receiver, method_name, is_static)) =
-                        extract_method_signature(&function_node, code)
-                    {
-                        if let Some(context) = function_context {
-                            calls.push(MethodCall {
-                                caller: context.to_string(),
-                                method_name: method_name.to_string(),
-                                receiver: receiver.map(|r| r.to_string()),
-                                is_static,
-                                range: node_range(*node),
-                                caller_range: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        for child in node.children(&mut node.walk()) {
-            Self::extract_method_calls_recursive(&child, code, function_context, calls, depth + 1);
-        }
-    }
-
-    fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::extract_method_calls_recursive(
-            &tree.root_node(),
-            code,
-            Some("<module>"),
-            &mut calls,
-            0,
-        );
-        calls
-    }
-
     // ── Type uses ───────────────────────────────────────────────────────
 
     #[allow(clippy::only_used_in_recursion)]
@@ -1454,23 +1388,6 @@ fn extract_function_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
     }
 }
 
-fn extract_method_signature<'a>(
-    selector_expr: &Node,
-    code: &'a str,
-) -> Option<(Option<&'a str>, &'a str, bool)> {
-    let operand = selector_expr.child_by_field_name("operand");
-    let field = selector_expr.child_by_field_name("field");
-
-    match (operand, field) {
-        (Some(obj), Some(prop)) => {
-            let receiver = &code[obj.byte_range()];
-            let method_name = &code[prop.byte_range()];
-            Some((Some(receiver), method_name, false))
-        }
-        _ => None,
-    }
-}
-
 fn extract_go_type_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
         "type_identifier" | "qualified_type" => Some(&code[node.byte_range()]),
@@ -1508,10 +1425,6 @@ impl LanguageParser for GoParser {
 
     fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         self.find_calls_impl(code)
-    }
-
-    fn find_method_calls(&mut self, code: &str) -> Vec<MethodCall> {
-        self.find_method_calls_impl(code)
     }
 
     /// Go uses implicit interface implementation (duck typing).
@@ -1872,8 +1785,10 @@ func getData() string { return "" }
         );
     }
 
+    /// The same calls through the surviving API: `find_method_calls` held a
+    /// second, parallel representation of what `find_calls` already records.
     #[test]
-    fn test_find_method_calls() {
+    fn a_method_call_and_a_package_call_are_both_recorded() {
         let mut parser = GoParser::new().unwrap();
 
         let code = r#"
@@ -1892,16 +1807,18 @@ func main() {
 }
 "#;
 
-        let calls = parser.find_method_calls_impl(code);
+        let calls = parser.find_calls_impl(code);
         assert!(
             calls
                 .iter()
-                .any(|c| c.caller == "main" && c.method_name == "Start")
+                .any(|(caller, target, _)| *caller == "main" && *target == "s.Start"),
+            "got {calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.caller == "main" && c.method_name == "Println")
+                .any(|(caller, target, _)| *caller == "main" && *target == "fmt.Println"),
+            "got {calls:?}"
         );
     }
 

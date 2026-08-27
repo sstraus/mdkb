@@ -4,7 +4,6 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{
     LanguageParser, check_recursion_depth, last_name_segment, node_range, receiver_call_target,
 };
@@ -588,63 +587,6 @@ impl JavaParser {
         None
     }
 
-    // ── Method calls ────────────────────────────────────────────────────
-
-    fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_method_calls_in_node(&tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
-
-    fn find_method_calls_in_node(
-        node: &Node,
-        code: &str,
-        current_fn: Option<&str>,
-        depth: usize,
-        calls: &mut Vec<MethodCall>,
-    ) {
-        if !check_recursion_depth(depth, *node) {
-            return;
-        }
-
-        let fn_ctx = match node.kind() {
-            "method_declaration" | "constructor_declaration" => node
-                .child_by_field_name("name")
-                .map(|n| &code[n.byte_range()])
-                .or(current_fn),
-            _ => current_fn,
-        };
-
-        if node.kind() == "method_invocation" {
-            if let Some(ctx) = fn_ctx {
-                let method_name = node
-                    .child_by_field_name("name")
-                    .map(|n| &code[n.byte_range()]);
-                let receiver = node
-                    .child_by_field_name("object")
-                    .map(|n| &code[n.byte_range()]);
-
-                if let Some(method) = method_name {
-                    calls.push(MethodCall {
-                        caller: ctx.to_string(),
-                        method_name: method.to_string(),
-                        receiver: receiver.map(|r| r.to_string()),
-                        is_static: false,
-                        range: node_range(*node),
-                        caller_range: None,
-                    });
-                }
-            }
-        }
-
-        for child in node.children(&mut node.walk()) {
-            Self::find_method_calls_in_node(&child, code, fn_ctx, depth + 1, calls);
-        }
-    }
-
     // ── Implementations (extends/implements) ────────────────────────────
 
     fn find_implementations_in_node<'a>(
@@ -931,10 +873,6 @@ impl LanguageParser for JavaParser {
 
     fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         self.find_calls_impl(code)
-    }
-
-    fn find_method_calls(&mut self, code: &str) -> Vec<MethodCall> {
-        self.find_method_calls_impl(code)
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {

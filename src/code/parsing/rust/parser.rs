@@ -4,7 +4,6 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -660,48 +659,6 @@ impl RustParser {
         }
     }
 
-    /// Full type name including generic parameters (owned).
-    #[allow(clippy::only_used_in_recursion)]
-    fn extract_full_type_name(node: Node, code: &str) -> String {
-        match node.kind() {
-            "type_identifier" | "primitive_type" | "scoped_type_identifier" => {
-                code[node.byte_range()].to_string()
-            }
-            "generic_type" => {
-                let mut result = String::new();
-                if let Some(t) = node.child_by_field_name("type") {
-                    result.push_str(&Self::extract_full_type_name(t, code));
-                }
-                if let Some(args) = node.child_by_field_name("type_arguments") {
-                    result.push('<');
-                    let mut first = true;
-                    for child in args.children(&mut args.walk()) {
-                        if child.kind() != "," && child.kind() != "<" && child.kind() != ">" {
-                            if !first {
-                                result.push_str(", ");
-                            }
-                            result.push_str(&Self::extract_full_type_name(child, code));
-                            first = false;
-                        }
-                    }
-                    result.push('>');
-                }
-                result
-            }
-            "reference_type" => {
-                let mut r = String::from("&");
-                if node.child_by_field_name("mutable").is_some() {
-                    r.push_str("mut ");
-                }
-                if let Some(t) = node.child_by_field_name("type") {
-                    r.push_str(&Self::extract_full_type_name(t, code));
-                }
-                r
-            }
-            _ => code[node.byte_range()].to_string(),
-        }
-    }
-
     // ── Doc comments ────────────────────────────────────────────────────
 
     fn classify_doc_comment(text: &str) -> DocCommentType {
@@ -918,95 +875,6 @@ impl RustParser {
         node.child_by_field_name("macro")
     }
 
-    /// Record a call to a plain or `::`-scoped name. A scoped name becomes a
-    /// static call on its qualifier, so `Type::f()` and `path::m!()` both keep
-    /// a receiver.
-    fn push_plain_or_scoped_call(
-        caller: &str,
-        full: &str,
-        range: Range,
-        calls: &mut Vec<MethodCall>,
-    ) {
-        match full.rfind("::") {
-            Some(pos) => calls.push(
-                MethodCall::new(caller, &full[pos + 2..], range)
-                    .with_receiver(&full[..pos])
-                    .static_method(),
-            ),
-            None => calls.push(MethodCall::new(caller, full, range)),
-        }
-    }
-
-    // ── Method calls (structured) ───────────────────────────────────────
-
-    fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::find_method_calls_in_node(tree.root_node(), code, Some("<module>"), 0, &mut calls);
-        calls
-    }
-
-    fn find_method_calls_in_node<'a>(
-        node: Node,
-        code: &'a str,
-        current_fn: Option<&'a str>,
-        depth: usize,
-        calls: &mut Vec<MethodCall>,
-    ) {
-        if !check_recursion_depth(depth, node) {
-            return;
-        }
-        let current_fn = if node.kind() == "function_item" {
-            node.child_by_field_name("name")
-                .map(|n| &code[n.byte_range()])
-                .or(current_fn)
-        } else {
-            current_fn
-        };
-
-        if node.kind() == "call_expression" {
-            if let Some(fn_node) = node.child_by_field_name("function") {
-                let range = node_range(node);
-
-                if let Some(caller) = current_fn {
-                    match fn_node.kind() {
-                        "identifier" | "scoped_identifier" => {
-                            Self::push_plain_or_scoped_call(
-                                caller,
-                                &code[fn_node.byte_range()],
-                                range,
-                                calls,
-                            );
-                        }
-                        "field_expression" => {
-                            if let Some(field) = fn_node.child_by_field_name("field") {
-                                let method_name = &code[field.byte_range()];
-                                if let Some(value) = fn_node.child_by_field_name("value") {
-                                    let receiver = &code[value.byte_range()];
-                                    calls.push(
-                                        MethodCall::new(caller, method_name, range)
-                                            .with_receiver(receiver),
-                                    );
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // A macro invocation is not a call and is reported by
-        // `find_macro_expansions`. Two APIs that disagree about that would put
-        // `println` in one answer and not the other.
-
-        for child in node.children(&mut node.walk()) {
-            Self::find_method_calls_in_node(child, code, current_fn, depth + 1, calls);
-        }
-    }
-
     // ── Implementations ─────────────────────────────────────────────────
 
     fn find_implementations_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
@@ -1215,114 +1083,6 @@ impl RustParser {
             Self::find_defines_in_node(child, code, depth + 1, defines);
         }
     }
-
-    // ── Variable types ──────────────────────────────────────────────────
-
-    fn find_variable_types_impl<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut bindings = Vec::new();
-        Self::find_variable_types_in_node(tree.root_node(), code, 0, &mut bindings);
-        bindings
-    }
-
-    fn find_variable_types_in_node<'a>(
-        node: Node,
-        code: &'a str,
-        depth: usize,
-        bindings: &mut Vec<(&'a str, &'a str, Range)>,
-    ) {
-        if !check_recursion_depth(depth, node) {
-            return;
-        }
-        if node.kind() == "let_declaration" {
-            if let Some(pat) = node.child_by_field_name("pattern") {
-                if pat.kind() == "identifier" {
-                    let var_name = &code[pat.byte_range()];
-                    if let Some(val) = node.child_by_field_name("value") {
-                        if let Some(type_name) = Self::extract_value_type(val, code) {
-                            let range = Range::new(
-                                node.start_position().row as u32,
-                                node.start_position().column as u16,
-                                node.end_position().row as u32,
-                                node.end_position().column as u16,
-                            );
-                            bindings.push((var_name, type_name, range));
-                        }
-                    }
-                }
-            }
-        }
-        for child in node.children(&mut node.walk()) {
-            Self::find_variable_types_in_node(child, code, depth + 1, bindings);
-        }
-    }
-
-    fn extract_value_type<'a>(node: Node, code: &'a str) -> Option<&'a str> {
-        match node.kind() {
-            "struct_expression" => node
-                .child_by_field_name("name")
-                .and_then(|n| Self::extract_type_name(n, code)),
-            "call_expression" => node
-                .child_by_field_name("function")
-                .filter(|f| f.kind() == "scoped_identifier")
-                .and_then(|f| {
-                    let full = &code[f.byte_range()];
-                    full.find("::").map(|pos| &full[..pos])
-                }),
-            _ => None,
-        }
-    }
-
-    // ── Inherent methods ────────────────────────────────────────────────
-
-    fn find_inherent_methods_impl(&mut self, code: &str) -> Vec<(String, String, Range)> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut methods = Vec::new();
-        Self::find_inherent_methods_in_node(tree.root_node(), code, 0, &mut methods);
-        methods
-    }
-
-    fn find_inherent_methods_in_node(
-        node: Node,
-        code: &str,
-        depth: usize,
-        methods: &mut Vec<(String, String, Range)>,
-    ) {
-        if !check_recursion_depth(depth, node) {
-            return;
-        }
-        if node.kind() == "impl_item" && node.child_by_field_name("trait").is_none() {
-            if let Some(type_node) = node.child_by_field_name("type") {
-                let type_name = Self::extract_full_type_name(type_node, code);
-                if let Some(body) = node.child_by_field_name("body") {
-                    for child in body.children(&mut body.walk()) {
-                        if child.kind() == "function_item" {
-                            if let Some(mn) = child.child_by_field_name("name") {
-                                let range = Range::new(
-                                    child.start_position().row as u32,
-                                    child.start_position().column as u16,
-                                    child.end_position().row as u32,
-                                    child.end_position().column as u16,
-                                );
-                                methods.push((
-                                    type_name.clone(),
-                                    code[mn.byte_range()].to_string(),
-                                    range,
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for child in node.children(&mut node.walk()) {
-            Self::find_inherent_methods_in_node(child, code, depth + 1, methods);
-        }
-    }
 }
 
 // ── LanguageParser trait ────────────────────────────────────────────────
@@ -1351,10 +1111,6 @@ impl LanguageParser for RustParser {
         self.find_calls_impl(code)
     }
 
-    fn find_method_calls(&mut self, code: &str) -> Vec<MethodCall> {
-        self.find_method_calls_impl(code)
-    }
-
     fn find_macro_expansions<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         self.find_macro_expansions_impl(code)
     }
@@ -1373,14 +1129,6 @@ impl LanguageParser for RustParser {
 
     fn find_imports(&mut self, code: &str, file_id: FileId) -> Vec<Import> {
         self.extract_imports(code, file_id)
-    }
-
-    fn find_variable_types<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
-        self.find_variable_types_impl(code)
-    }
-
-    fn find_inherent_methods(&mut self, code: &str) -> Vec<(String, String, Range)> {
-        self.find_inherent_methods_impl(code)
     }
 }
 
@@ -1747,31 +1495,6 @@ fn not_documented() {}
         assert!(no_doc.doc_comment.is_none());
     }
 
-    #[test]
-    fn test_method_calls_structured() {
-        let mut parser = RustParser::new().unwrap();
-        let code = r#"
-fn main() {
-    let data = Vec::new();
-    data.push(42);
-    self.validate();
-}
-        "#;
-
-        let calls = parser.find_method_calls_impl(code);
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.caller == "main" && c.method_name == "new" && c.is_static)
-        );
-        assert!(calls.iter().any(|c| c.caller == "main"
-            && c.method_name == "push"
-            && c.receiver.as_deref() == Some("data")));
-        assert!(calls.iter().any(|c| c.caller == "main"
-            && c.method_name == "validate"
-            && c.receiver.as_deref() == Some("self")));
-    }
-
     /// Extract the doc comment recorded for a named symbol.
     fn doc_of(code: &str, name: &str) -> Option<String> {
         let mut parser = RustParser::new().unwrap();
@@ -1891,9 +1614,8 @@ fn m() {
         );
     }
 
-    /// The point of the split: a macro must not also be reported as a call, in
-    /// either call API. `println` names no function, and an edge to it is an
-    /// edge to nothing.
+    /// A macro must not also be reported as a call: `println` names no
+    /// function, and an edge to it is an edge to nothing.
     #[test]
     fn a_macro_invocation_is_not_reported_as_a_call() {
         let mut parser = RustParser::new().unwrap();
@@ -1903,14 +1625,6 @@ fn m() {
                 .iter()
                 .any(|(_, target, _)| matches!(*target, "println" | "anyhow" | "tracing::warn")),
             "macros must not appear among calls, got {calls:?}"
-        );
-
-        let method_calls = parser.find_method_calls_impl(MACRO_CODE);
-        assert!(
-            !method_calls
-                .iter()
-                .any(|c| matches!(c.method_name.as_str(), "println" | "anyhow" | "warn")),
-            "macros must not appear among method calls, got {method_calls:?}"
         );
     }
 
@@ -1985,71 +1699,5 @@ fn inside() { helper(); }
                 .any(|(caller, target, _)| *caller == "<module>" && *target == "helper"),
             "helper() must not be attributed to the module, got {calls:?}"
         );
-    }
-
-    #[test]
-    fn method_calls_are_seeded_with_the_module_caller_too() {
-        let mut parser = RustParser::new().unwrap();
-        let calls = parser.find_method_calls_impl(TOP_LEVEL_CODE);
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.caller == "<module>" && c.method_name == "compute"),
-            "expected <module> -> compute, got {calls:?}"
-        );
-    }
-
-    #[test]
-    fn test_variable_types() {
-        let mut parser = RustParser::new().unwrap();
-        let code = r#"
-fn main() {
-    let config = Config::new();
-    let server = Server { port: 8080 };
-    let name = "test";
-}
-        "#;
-
-        let bindings = parser.find_variable_types_impl(code);
-        assert!(
-            bindings
-                .iter()
-                .any(|(var, typ, _)| *var == "config" && *typ == "Config")
-        );
-        assert!(
-            bindings
-                .iter()
-                .any(|(var, typ, _)| *var == "server" && *typ == "Server")
-        );
-        // Literals don't produce type bindings.
-        assert!(!bindings.iter().any(|(var, _, _)| *var == "name"));
-    }
-
-    #[test]
-    fn test_inherent_methods() {
-        let mut parser = RustParser::new().unwrap();
-        let code = r#"
-struct MyType;
-impl MyType {
-    fn method_a(&self) {}
-    fn method_b() {}
-}
-trait Foo { fn foo(&self); }
-impl Foo for MyType { fn foo(&self) {} }
-        "#;
-
-        let methods = parser.find_inherent_methods_impl(code);
-        assert!(
-            methods
-                .iter()
-                .any(|(t, m, _)| t == "MyType" && m == "method_a")
-        );
-        assert!(
-            methods
-                .iter()
-                .any(|(t, m, _)| t == "MyType" && m == "method_b")
-        );
-        // Trait impl methods should NOT appear in inherent methods.
-        assert!(!methods.iter().any(|(_, m, _)| m == "foo"));
     }
 }

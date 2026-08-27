@@ -6,7 +6,6 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{
     LanguageParser, check_recursion_depth, find_modifier_keyword, node_range, receiver_call_target,
 };
@@ -849,74 +848,6 @@ impl TypeScriptParser {
         calls
     }
 
-    // ── Method calls ────────────────────────────────────────────────────
-
-    #[allow(clippy::only_used_in_recursion)]
-    fn extract_method_calls_recursive(
-        node: &Node,
-        code: &str,
-        current_fn: Option<&str>,
-        calls: &mut Vec<MethodCall>,
-        depth: usize,
-    ) {
-        if !check_recursion_depth(depth, *node) {
-            return;
-        }
-        let fn_ctx = match node.kind() {
-            "function_declaration" | "generator_function_declaration" | "method_definition" => node
-                .child_by_field_name("name")
-                .map(|n| &code[n.byte_range()])
-                .or(current_fn),
-            "arrow_function" => node
-                .parent()
-                .filter(|p| p.kind() == "variable_declarator")
-                .and_then(|p| p.child_by_field_name("name"))
-                .map(|n| &code[n.byte_range()])
-                .or(current_fn),
-            _ => current_fn,
-        };
-
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
-                if function_node.kind() == "member_expression" {
-                    if let Some((receiver, method_name)) =
-                        extract_ts_method_parts(&function_node, code)
-                    {
-                        if let Some(ctx) = fn_ctx {
-                            calls.push(MethodCall {
-                                caller: ctx.to_string(),
-                                method_name: method_name.to_string(),
-                                receiver: Some(receiver.to_string()),
-                                is_static: false,
-                                range: node_range(*node),
-                                caller_range: None,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        for child in node.children(&mut node.walk()) {
-            Self::extract_method_calls_recursive(&child, code, fn_ctx, calls, depth + 1);
-        }
-    }
-
-    fn find_method_calls_impl(&mut self, code: &str) -> Vec<MethodCall> {
-        let Some(tree) = self.parser.parse_cached(code) else {
-            return Vec::new();
-        };
-        let mut calls = Vec::new();
-        Self::extract_method_calls_recursive(
-            &tree.root_node(),
-            code,
-            Some("<module>"),
-            &mut calls,
-            0,
-        );
-        calls
-    }
-
     // ── Implementations / extends ───────────────────────────────────────
 
     fn find_implementations_in_node<'a>(
@@ -1241,12 +1172,6 @@ fn extract_ts_function_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
     }
 }
 
-fn extract_ts_method_parts<'a>(node: &Node, code: &'a str) -> Option<(&'a str, &'a str)> {
-    let obj = node.child_by_field_name("object")?;
-    let prop = node.child_by_field_name("property")?;
-    Some((&code[obj.byte_range()], &code[prop.byte_range()]))
-}
-
 fn extract_ts_type_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
         "type_identifier" | "identifier" | "nested_type_identifier" => {
@@ -1314,10 +1239,6 @@ impl LanguageParser for TypeScriptParser {
 
     fn find_calls<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
         self.find_calls_impl(code)
-    }
-
-    fn find_method_calls(&mut self, code: &str) -> Vec<MethodCall> {
-        self.find_method_calls_impl(code)
     }
 
     fn find_implementations<'a>(&mut self, code: &'a str) -> Vec<(&'a str, &'a str, Range)> {
@@ -1655,8 +1576,10 @@ class C {
         assert_eq!(rp.visibility, Visibility::Module);
     }
 
+    /// The same calls through the surviving API: `find_method_calls` held a
+    /// second, parallel representation of what `find_calls` already records.
     #[test]
-    fn test_find_method_calls() {
+    fn a_method_call_and_a_console_call_are_both_recorded() {
         let mut parser = TypeScriptParser::new().unwrap();
 
         let code = r#"
@@ -1671,16 +1594,18 @@ function main(): void {
 }
 "#;
 
-        let calls = parser.find_method_calls_impl(code);
+        let calls = parser.find_calls_impl(code);
         assert!(
             calls
                 .iter()
-                .any(|c| c.caller == "main" && c.method_name == "start")
+                .any(|(caller, target, _)| *caller == "main" && *target == "s.start"),
+            "got {calls:?}"
         );
         assert!(
             calls
                 .iter()
-                .any(|c| c.caller == "main" && c.method_name == "log")
+                .any(|(caller, target, _)| *caller == "main" && *target == "console.log"),
+            "got {calls:?}"
         );
     }
 
