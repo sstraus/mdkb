@@ -107,11 +107,13 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// Kotlin extensions named after the type they extend; version 5 finishes that
 /// round — PHP enum cases, promoted properties and namespaces, and the Actor and
 /// Signal kinds, which a Swift actor and a GDScript signal used to be stored
-/// under the wrong number for.
+/// under the wrong number for; version 6 is Go visibility, where every
+/// unexported name used to be stored as private and every function-local one
+/// answered by the case of its first letter.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 5;
+pub const RESOLUTION_VERSION: i64 = 6;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///

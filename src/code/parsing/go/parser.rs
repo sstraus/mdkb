@@ -254,6 +254,23 @@ impl GoParser {
 
     // ── Symbol creation helper ──────────────────────────────────────────
 
+    /// How far a declared name reaches.
+    ///
+    /// Go has one rule: a package-level name whose first letter is upper case
+    /// is exported, and every other one is reachable from the whole package —
+    /// there is no level below that, so nothing here is ever private by name.
+    /// Inside a function body the rule does not apply at all: a local called
+    /// `Total` is exported by nothing, and the parser walks into bodies.
+    fn visibility_of(&self, name: &str) -> Visibility {
+        if self.context.is_in_function() {
+            Visibility::Private
+        } else if name.starts_with(|c: char| c.is_uppercase()) {
+            Visibility::Public
+        } else {
+            Visibility::Package
+        }
+    }
+
     fn create_symbol(
         &self,
         id: crate::code::types::SymbolId,
@@ -294,7 +311,7 @@ impl GoParser {
 
         let signature = Self::extract_signature(node, code);
         let doc_comment = Self::extract_doc_comment_impl(&node, code);
-        let visibility = determine_go_visibility(name);
+        let visibility = self.visibility_of(name);
 
         Some(self.create_symbol(
             counter.next_id(),
@@ -319,7 +336,7 @@ impl GoParser {
 
         let signature = Self::extract_method_signature(node, code);
         let doc_comment = Self::extract_doc_comment_impl(&node, code);
-        let visibility = determine_go_visibility(name);
+        let visibility = self.visibility_of(name);
 
         Some(self.create_symbol(
             counter.next_id(),
@@ -370,7 +387,7 @@ impl GoParser {
             "struct_type" => {
                 let signature = Self::extract_struct_signature(node, code);
                 let doc_comment = Self::extract_doc_comment_impl(&node, code);
-                let visibility = determine_go_visibility(name);
+                let visibility = self.visibility_of(name);
 
                 let symbol = self.create_symbol(
                     counter.next_id(),
@@ -394,7 +411,7 @@ impl GoParser {
             "interface_type" => {
                 let signature = Self::extract_interface_signature(node, code);
                 let doc_comment = Self::extract_doc_comment_impl(&node, code);
-                let visibility = determine_go_visibility(name);
+                let visibility = self.visibility_of(name);
 
                 let symbol = self.create_symbol(
                     counter.next_id(),
@@ -419,7 +436,7 @@ impl GoParser {
                 // Type alias
                 let signature = code[node.byte_range()].to_string();
                 let doc_comment = Self::extract_doc_comment_impl(&node, code);
-                let visibility = determine_go_visibility(name);
+                let visibility = self.visibility_of(name);
 
                 let symbol = self.create_symbol(
                     counter.next_id(),
@@ -491,7 +508,7 @@ impl GoParser {
         }
 
         for field_name in field_names {
-            let visibility = determine_go_visibility(field_name);
+            let visibility = self.visibility_of(field_name);
             let signature = match field_type {
                 Some(typ) => format!("{field_name} {typ}"),
                 None => field_name.to_string(),
@@ -553,7 +570,7 @@ impl GoParser {
 
         if let Some(name) = method_name {
             let signature = code[method_node.byte_range()].to_string();
-            let visibility = determine_go_visibility(name);
+            let visibility = self.visibility_of(name);
             let qualified_name = format!("{interface_name}.{name}");
 
             let symbol = self.create_symbol(
@@ -612,7 +629,7 @@ impl GoParser {
         }
 
         for var_name in var_names {
-            let visibility = determine_go_visibility(var_name);
+            let visibility = self.visibility_of(var_name);
             let signature = match var_type {
                 Some(typ) => format!("var {var_name} {typ}"),
                 None => format!("var {var_name}"),
@@ -672,7 +689,7 @@ impl GoParser {
         }
 
         for const_name in const_names {
-            let visibility = determine_go_visibility(const_name);
+            let visibility = self.visibility_of(const_name);
             let signature = match const_type {
                 Some(typ) => format!("const {const_name} {typ}"),
                 None => format!("const {const_name}"),
@@ -718,7 +735,7 @@ impl GoParser {
         }
 
         for var_name in var_names {
-            let visibility = determine_go_visibility(var_name);
+            let visibility = self.visibility_of(var_name);
             let signature = format!("{var_name} := ...");
 
             let mut symbol = self.create_symbol(
@@ -769,7 +786,7 @@ impl GoParser {
                 }
 
                 if let Some(name) = receiver_name {
-                    let visibility = determine_go_visibility(name);
+                    let visibility = self.visibility_of(name);
                     let signature = match receiver_type {
                         Some(typ) => format!("{name} {typ}"),
                         None => name.to_string(),
@@ -818,7 +835,7 @@ impl GoParser {
                 }
 
                 for param_name in param_names {
-                    let visibility = determine_go_visibility(param_name);
+                    let visibility = self.visibility_of(param_name);
                     let signature = match param_type {
                         Some(typ) => format!("{param_name} {typ}"),
                         None => param_name.to_string(),
@@ -877,7 +894,7 @@ impl GoParser {
         }
 
         for (i, var_name) in range_vars.iter().enumerate() {
-            let visibility = determine_go_visibility(var_name);
+            let visibility = self.visibility_of(var_name);
             let signature = if i == 0 {
                 format!("{var_name} := range (index)")
             } else {
@@ -1361,14 +1378,6 @@ fn extract_receiver_type<'a>(receiver: Node, code: &'a str) -> Option<&'a str> {
     None
 }
 
-fn determine_go_visibility(name: &str) -> Visibility {
-    if name.starts_with(|c: char| c.is_uppercase()) {
-        Visibility::Public
-    } else {
-        Visibility::Private
-    }
-}
-
 fn is_go_type_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -1547,7 +1556,7 @@ type MyStruct struct {
             && s.visibility == Visibility::Public));
         assert!(symbols.iter().any(|s| s.name.as_ref() == "privateFunction"
             && s.kind == SymbolKind::Function
-            && s.visibility == Visibility::Private));
+            && s.visibility == Visibility::Package));
         assert!(symbols.iter().any(|s| s.name.as_ref() == "MyStruct"
             && s.kind == SymbolKind::Struct
             && s.visibility == Visibility::Public));
@@ -1556,7 +1565,7 @@ type MyStruct struct {
             && s.visibility == Visibility::Public));
         assert!(symbols.iter().any(|s| s.name.as_ref() == "MyStruct.age"
             && s.kind == SymbolKind::Field
-            && s.visibility == Visibility::Private));
+            && s.visibility == Visibility::Package));
     }
 
     #[test]
@@ -1628,7 +1637,7 @@ var privateVariable = 42
             && s.visibility == Visibility::Public));
         assert!(symbols.iter().any(|s| s.name.as_ref() == "privateConstant"
             && s.kind == SymbolKind::Constant
-            && s.visibility == Visibility::Private));
+            && s.visibility == Visibility::Package));
         assert!(
             symbols
                 .iter()
@@ -1702,17 +1711,17 @@ type privateStruct struct {
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
 
-        let public: Vec<_> = symbols
+        let exported: Vec<_> = symbols
             .iter()
             .filter(|s| s.visibility == Visibility::Public)
             .collect();
-        let private: Vec<_> = symbols
+        let unexported: Vec<_> = symbols
             .iter()
-            .filter(|s| s.visibility == Visibility::Private)
+            .filter(|s| s.visibility == Visibility::Package)
             .collect();
 
-        assert!(!public.is_empty());
-        assert!(!private.is_empty());
+        assert!(!exported.is_empty());
+        assert!(!unexported.is_empty());
 
         assert!(
             symbols
@@ -1721,9 +1730,98 @@ type privateStruct struct {
         );
         assert!(
             symbols.iter().any(
-                |s| s.name.as_ref() == "privateFunction" && s.visibility == Visibility::Private
+                |s| s.name.as_ref() == "privateFunction" && s.visibility == Visibility::Package
             )
         );
+    }
+
+    #[test]
+    fn an_unexported_package_level_name_is_reachable_from_its_whole_package() {
+        // Go has no private level. An unexported name is reachable from every
+        // file of its package, which is exactly `Package`. Calling it private
+        // makes a legitimate call from a sibling file look like a reach into
+        // something's inside.
+        let mut parser = GoParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+package store
+
+const limit = 10
+
+var registry map[string]int
+
+type config struct {
+    name string
+}
+
+func (c *config) load() error { return nil }
+
+func helper() {}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+
+        for name in [
+            "limit",
+            "registry",
+            "config",
+            "config.name",
+            "load",
+            "helper",
+        ] {
+            let symbol = symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("no symbol named {name}"));
+            assert_eq!(
+                symbol.visibility,
+                Visibility::Package,
+                "{name} is unexported, not private"
+            );
+        }
+    }
+
+    #[test]
+    fn the_export_rule_does_not_reach_inside_a_function_body() {
+        // The case of a name says something only where the name is package
+        // level. A local called `Total` is not exported by anything, and the
+        // parser walks into function bodies, so it must not ask.
+        let mut parser = GoParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+package store
+
+func Run(Input string) int {
+    Total := 0
+    var Buffer []byte
+    const Step = 2
+    for Index := range Input {
+        Total += Index + Step + len(Buffer)
+    }
+    return Total
+}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+
+        for name in ["Input", "Total", "Buffer", "Step", "Index"] {
+            let symbol = symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("no symbol named {name}"));
+            assert_eq!(
+                symbol.visibility,
+                Visibility::Private,
+                "{name} is local to Run, whatever its first letter"
+            );
+        }
+
+        let run = symbols.iter().find(|s| s.name.as_ref() == "Run").unwrap();
+        assert_eq!(run.visibility, Visibility::Public);
     }
 
     #[test]
