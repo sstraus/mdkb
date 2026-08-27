@@ -499,20 +499,37 @@ impl GoParser {
                 "field_identifier" => {
                     field_names.push(&code[child.byte_range()]);
                 }
-                "type_identifier" | "pointer_type" | "array_type" | "slice_type" | "map_type"
-                | "channel_type" => {
-                    field_type = Some(&code[child.byte_range()]);
+                kind if is_go_type_kind(kind) => {
+                    field_type = Some(child);
                 }
                 _ => {}
             }
         }
 
-        for field_name in field_names {
-            let visibility = self.visibility_of(field_name);
-            let signature = match field_type {
-                Some(typ) => format!("{field_name} {typ}"),
-                None => field_name.to_string(),
-            };
+        // A field with a type and no name of its own is embedded. Go reaches it
+        // by the unqualified type name, and its signature is the declaration as
+        // written, which is what says it is embedded and whether by pointer.
+        let fields: Vec<(String, String)> = match (field_names.is_empty(), field_type) {
+            (true, Some(typ)) => {
+                let name = embedded_field_name(&code[typ.byte_range()]);
+                let signature = code[field_node.start_byte()..typ.end_byte()].trim();
+                vec![(name.to_string(), signature.to_string())]
+            }
+            (true, None) => Vec::new(),
+            (false, _) => field_names
+                .iter()
+                .map(|name| {
+                    let signature = match field_type {
+                        Some(typ) => format!("{name} {}", &code[typ.byte_range()]),
+                        None => (*name).to_string(),
+                    };
+                    ((*name).to_string(), signature)
+                })
+                .collect(),
+        };
+
+        for (field_name, signature) in fields {
+            let visibility = self.visibility_of(&field_name);
             let qualified_name = format!("{struct_name}.{field_name}");
 
             let symbol = self.create_symbol(
@@ -1378,10 +1395,26 @@ fn extract_receiver_type<'a>(receiver: Node, code: &'a str) -> Option<&'a str> {
     None
 }
 
+/// The name an embedded field is reached by.
+///
+/// Go promotes an embedded field under its unqualified type name, without the
+/// package and without the pointer: `*sync.Mutex` is reached as `Mutex`.
+fn embedded_field_name(field_type: &str) -> &str {
+    field_type
+        .trim_start_matches('*')
+        .rsplit('.')
+        .next()
+        .unwrap_or(field_type)
+        .trim()
+}
+
 fn is_go_type_kind(kind: &str) -> bool {
     matches!(
         kind,
         "type_identifier"
+            // A qualified type is a type. Leaving it out made `sync.Mutex`
+            // invisible wherever a type is looked for.
+            | "qualified_type"
             | "pointer_type"
             | "array_type"
             | "slice_type"
@@ -1781,6 +1814,49 @@ func helper() {}
                 "{name} is unexported, not private"
             );
         }
+    }
+
+    #[test]
+    fn an_embedded_field_is_indexed_under_the_name_it_is_reached_by() {
+        // Embedding is how Go composes. An embedded field has no name of its
+        // own, so a parser that only collects `field_identifier` drops it
+        // entirely — and with it the answer to "what does Server hold?".
+        let mut parser = GoParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+package store
+
+type Base struct{ ID int }
+
+type Server struct {
+    Base
+    *sync.Mutex
+    io.Reader
+    mu sync.Locker
+}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let field = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name && s.kind == SymbolKind::Field)
+                .unwrap_or_else(|| panic!("no field named {name}"))
+                .signature
+                .as_deref()
+                .unwrap_or("")
+                .to_string()
+        };
+
+        // Go promotes an embedded field under its unqualified type name, so
+        // that is the name a caller writes, and the name to index it under.
+        assert_eq!(field("Server.Base"), "Base");
+        assert_eq!(field("Server.Mutex"), "*sync.Mutex");
+        assert_eq!(field("Server.Reader"), "io.Reader");
+        // A qualified type is a type: it belongs in a named field's signature.
+        assert_eq!(field("Server.mu"), "mu sync.Locker");
     }
 
     #[test]
