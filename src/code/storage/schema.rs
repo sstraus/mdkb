@@ -111,11 +111,13 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// unexported name used to be stored as private and every function-local one
 /// answered by the case of its first letter; version 7 is Go embedded fields,
 /// which produced no symbol at all, and qualified types, which were invisible
-/// wherever the parser looked for a type.
+/// wherever the parser looked for a type; version 8 is Go doc comments, which
+/// used to swallow a trailing comment, a toolchain directive and anything a
+/// blank line above, and to hand a group comment to every type in the group.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 7;
+pub const RESOLUTION_VERSION: i64 = 8;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///

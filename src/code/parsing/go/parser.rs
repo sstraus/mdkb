@@ -645,6 +645,8 @@ impl GoParser {
             }
         }
 
+        let doc_comment = Self::extract_doc_comment_impl(&node, code);
+
         for var_name in var_names {
             let visibility = self.visibility_of(var_name);
             let signature = match var_type {
@@ -658,7 +660,12 @@ impl GoParser {
                 SymbolKind::Variable,
                 file_id,
                 node_range(node),
-                (Some(signature), None, module_path, visibility),
+                (
+                    Some(signature),
+                    doc_comment.clone(),
+                    module_path,
+                    visibility,
+                ),
             );
             symbols.push(symbol);
         }
@@ -705,6 +712,8 @@ impl GoParser {
             }
         }
 
+        let doc_comment = Self::extract_doc_comment_impl(&node, code);
+
         for const_name in const_names {
             let visibility = self.visibility_of(const_name);
             let signature = match const_type {
@@ -718,7 +727,12 @@ impl GoParser {
                 SymbolKind::Constant,
                 file_id,
                 node_range(node),
-                (Some(signature), None, module_path, visibility),
+                (
+                    Some(signature),
+                    doc_comment.clone(),
+                    module_path,
+                    visibility,
+                ),
             );
             symbols.push(symbol);
         }
@@ -991,36 +1005,56 @@ impl GoParser {
     // ── Doc comments ────────────────────────────────────────────────────
 
     fn extract_doc_comment_impl(node: &Node, code: &str) -> Option<String> {
-        // For type_spec nodes, check the parent type_declaration for comments
-        let search_node = if node.kind() == "type_spec" {
-            node.parent()?
-        } else {
-            *node
-        };
+        // A `type Kind int` keeps its comment above the declaration, not above
+        // the spec, so a spec has to look one level up as well. Its own comment
+        // comes first: inside `type (...)` each member may carry one, and the
+        // one above the group speaks only for the members that do not.
+        if matches!(node.kind(), "type_spec" | "var_spec" | "const_spec") {
+            return Self::doc_above(*node, code).or_else(|| Self::doc_above(node.parent()?, code));
+        }
+        Self::doc_above(*node, code)
+    }
 
+    /// The comment block written directly above `search_node`, as Go reads it.
+    fn doc_above(search_node: Node, code: &str) -> Option<String> {
         let mut doc_lines = Vec::new();
         let mut current = search_node.prev_sibling();
+        // The doc is the block of comment lines *touching* the declaration.
+        // Anything a blank line away belongs to whatever came before: a license
+        // header, a build tag, someone else's paragraph.
+        let mut documented_row = search_node.start_position().row;
 
         while let Some(sibling) = current {
-            if sibling.kind() == "comment" {
-                let comment_text = &code[sibling.byte_range()];
-                if comment_text.starts_with("//") {
-                    let content = comment_text.trim_start_matches("//").trim();
-                    doc_lines.insert(0, content.to_string());
-                    current = sibling.prev_sibling();
-                } else {
-                    break;
-                }
-            } else {
+            if sibling.kind() != "comment" {
                 break;
             }
+            if sibling.end_position().row + 1 != documented_row {
+                break;
+            }
+            // A comment trailing code belongs to that line, not to the next
+            // declaration: `var seed = 1 // seeded once` is not Kind's doc.
+            if !is_own_line_comment(sibling, code) {
+                break;
+            }
+            let comment_text = &code[sibling.byte_range()];
+            if !comment_text.starts_with("//") {
+                break;
+            }
+            doc_lines.insert(0, comment_text.trim_start_matches("//").trim().to_string());
+            documented_row = sibling.start_position().row;
+            current = sibling.prev_sibling();
         }
 
         if doc_lines.is_empty() {
             return None;
         }
 
-        let filtered: Vec<String> = doc_lines.into_iter().filter(|l| !l.is_empty()).collect();
+        let filtered: Vec<String> = doc_lines
+            .into_iter()
+            // `//go:generate` and friends instruct the toolchain; godoc leaves
+            // them out of the documentation, and so do we.
+            .filter(|l| !l.is_empty() && !is_go_directive(l))
+            .collect();
         if filtered.is_empty() {
             return None;
         }
@@ -1393,6 +1427,22 @@ fn extract_receiver_type<'a>(receiver: Node, code: &'a str) -> Option<&'a str> {
         }
     }
     None
+}
+
+/// Whether the comment stands on a line of its own.
+///
+/// A comment sharing a line with code documents that line, and has nothing to
+/// say about the declaration that happens to follow it.
+fn is_own_line_comment(comment: Node, code: &str) -> bool {
+    let start = comment.start_byte();
+    let line_start = code[..start].rfind('\n').map_or(0, |newline| newline + 1);
+    code[line_start..start].trim().is_empty()
+}
+
+/// Whether the comment body is an instruction to the Go toolchain rather than
+/// prose — `//go:generate`, `//go:build`, and the older `// +build`.
+fn is_go_directive(content: &str) -> bool {
+    content.starts_with("go:") || content.starts_with("+build")
 }
 
 /// The name an embedded field is reached by.
@@ -2049,6 +2099,112 @@ func ProcessData(data []byte) error {
         let doc = process_fn.doc_comment.as_deref().unwrap();
         assert!(doc.contains("ProcessData handles data processing"));
         assert!(doc.contains("byte slice"));
+    }
+
+    #[test]
+    fn a_doc_comment_stops_where_the_documentation_stops() {
+        // Go's rule: the doc is the comment block touching the declaration.
+        // A toolchain directive, a blank line, and a comment trailing someone
+        // else's code are all outside it.
+        let mut parser = GoParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"//go:build linux
+
+// Copyright 2026 nobody.
+// SPDX-License-Identifier: MIT
+
+package store
+
+var seed = 1 // seeded once
+// Kind is a kind.
+type Kind int
+
+//go:generate stringer -type=Level
+
+// Level is a level.
+type Level int
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let doc = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("no symbol named {name}"))
+                .doc_comment
+                .as_deref()
+                .unwrap_or("")
+                .to_string()
+        };
+
+        assert_eq!(doc("Kind"), "Kind is a kind.");
+        assert_eq!(doc("Level"), "Level is a level.");
+    }
+
+    #[test]
+    fn each_member_of_a_group_keeps_its_own_doc_comment() {
+        // The comment above `type (` documents the group, so it is the best
+        // answer for a member that says nothing about itself — but it must not
+        // silence the one a member does carry.
+        let mut parser = GoParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+package store
+
+// Group doc.
+type (
+    // Reader reads.
+    Reader interface{}
+    Writer interface{}
+)
+
+const (
+    // Limit is the cap.
+    Limit = 10
+    Floor = 0
+)
+
+// Registry holds them.
+var Registry map[string]int
+
+// Kind is a kind.
+type Kind int
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let symbol = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("no symbol named {name}"))
+        };
+
+        assert_eq!(
+            symbol("Reader").doc_comment.as_deref(),
+            Some("Reader reads.")
+        );
+        // Writer says nothing about itself, so what the group says stands.
+        assert_eq!(symbol("Writer").doc_comment.as_deref(), Some("Group doc."));
+        // A constant and a variable are documented like anything else.
+        assert_eq!(
+            symbol("Limit").doc_comment.as_deref(),
+            Some("Limit is the cap.")
+        );
+        assert_eq!(symbol("Floor").doc_comment.as_deref(), None);
+        assert_eq!(
+            symbol("Registry").doc_comment.as_deref(),
+            Some("Registry holds them.")
+        );
+        // An ungrouped spec still inherits from its declaration, which is
+        // where its comment sits.
+        assert_eq!(
+            symbol("Kind").doc_comment.as_deref(),
+            Some("Kind is a kind.")
+        );
     }
 
     #[test]
