@@ -8,7 +8,7 @@ use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, find_modifier_keyword, node_range,
+    LanguageParser, check_recursion_depth, find_modifier_keyword, node_range, receiver_call_target,
 };
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -798,11 +798,10 @@ impl TypeScriptParser {
             return;
         }
         let fn_ctx = match node.kind() {
-            "function_declaration" | "generator_function_declaration" | "method_declaration" => {
-                node.child_by_field_name("name")
-                    .map(|n| &code[n.byte_range()])
-                    .or(current_fn)
-            }
+            "function_declaration" | "generator_function_declaration" | "method_definition" => node
+                .child_by_field_name("name")
+                .map(|n| &code[n.byte_range()])
+                .or(current_fn),
             "arrow_function" => {
                 // Check parent for variable name
                 node.parent()
@@ -816,12 +815,22 @@ impl TypeScriptParser {
 
         if node.kind() == "call_expression" {
             if let Some(function_node) = node.child_by_field_name("function") {
-                if function_node.kind() != "member_expression" {
-                    if let Some(fn_name) = extract_ts_function_name(&function_node, code) {
-                        if let Some(ctx) = fn_ctx {
-                            calls.push((ctx, fn_name, node_range(*node)));
-                        }
-                    }
+                let target = if function_node.kind() == "member_expression" {
+                    // `Namespace.other`, `this.helper`: kept whole so the object
+                    // becomes the qualifier. Skipping these used to drop every
+                    // method call and every promise chain.
+                    receiver_call_target(
+                        function_node,
+                        code,
+                        "object",
+                        "property",
+                        "member_expression",
+                    )
+                } else {
+                    extract_ts_function_name(&function_node, code)
+                };
+                if let (Some(target), Some(ctx)) = (target, fn_ctx) {
+                    calls.push((ctx, target, node_range(*node)));
                 }
             }
         }
@@ -854,11 +863,10 @@ impl TypeScriptParser {
             return;
         }
         let fn_ctx = match node.kind() {
-            "function_declaration" | "generator_function_declaration" | "method_declaration" => {
-                node.child_by_field_name("name")
-                    .map(|n| &code[n.byte_range()])
-                    .or(current_fn)
-            }
+            "function_declaration" | "generator_function_declaration" | "method_definition" => node
+                .child_by_field_name("name")
+                .map(|n| &code[n.byte_range()])
+                .or(current_fn),
             "arrow_function" => node
                 .parent()
                 .filter(|p| p.kind() == "variable_declarator")
@@ -1346,6 +1354,50 @@ impl LanguageParser for TypeScriptParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Calls through a member expression used to be dropped, which in
+    /// TypeScript means every method call and every promise chain.
+    #[test]
+    fn a_call_through_a_member_expression_keeps_the_object() {
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = "function m() {\n  Namespace.other();\n  helper();\n}\n";
+
+        let calls: Vec<(&str, &str)> = parser
+            .find_calls(code)
+            .into_iter()
+            .map(|(caller, callee, _)| (caller, callee))
+            .collect();
+
+        assert!(
+            calls.contains(&("m", "Namespace.other")),
+            "expected the qualified call, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("m", "helper")),
+            "the bare call must still be there, got {calls:?}"
+        );
+    }
+
+    /// `method_declaration` is a node kind tree-sitter-typescript never
+    /// produces — the real one is `method_definition`. Matching the wrong name
+    /// attributed every call in a class method to whatever scope enclosed it.
+    #[test]
+    fn a_call_inside_a_class_method_is_attributed_to_that_method() {
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = "class K {\n  m() {\n    return this.helper();\n  }\n}\n";
+
+        let calls: Vec<(&str, &str)> = parser
+            .find_calls(code)
+            .into_iter()
+            .map(|(caller, callee, _)| (caller, callee))
+            .collect();
+
+        assert_eq!(
+            calls,
+            vec![("m", "this.helper")],
+            "the caller is the method, not the module"
+        );
+    }
 
     #[test]
     fn test_parse_functions_and_classes() {

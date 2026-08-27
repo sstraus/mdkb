@@ -256,6 +256,47 @@ pub fn last_name_segment<'a>(node: Node, code: &'a str) -> &'a str {
     }
 }
 
+/// The call target for a call made through a receiver: `fmt.Println`,
+/// `this.helper`, `Namespace.other`.
+///
+/// Returns the whole path when the receiver is a plain identifier chain, so
+/// [`split_call_target`] can keep it as the qualifier. When the receiver is
+/// computed — `build().Close()`, `items[0].Close()` — there is no name to
+/// qualify with, so only the member is returned and the call resolves as a bare
+/// name. Either way an edge is produced: a call the index cannot place is still
+/// a call that happened, and dropping it is how Go and TypeScript came to
+/// record no method calls at all.
+///
+/// `receiver_field` and `member_field` are the grammar's field names — Go says
+/// `operand`/`field`, TypeScript says `object`/`property` — and `chain_kind` is
+/// the node kind that nests, so `a.b.c` is recognised as one path.
+pub fn receiver_call_target<'a>(
+    node: Node,
+    code: &'a str,
+    receiver_field: &str,
+    member_field: &str,
+    chain_kind: &str,
+) -> Option<&'a str> {
+    let member = node.child_by_field_name(member_field)?;
+    if is_identifier_path(node, receiver_field, chain_kind) {
+        Some(&code[node.byte_range()])
+    } else {
+        Some(&code[member.byte_range()])
+    }
+}
+
+/// Is everything left of the last separator a chain of plain names?
+fn is_identifier_path(node: Node, receiver_field: &str, chain_kind: &str) -> bool {
+    let Some(receiver) = node.child_by_field_name(receiver_field) else {
+        return false;
+    };
+    match receiver.kind() {
+        "identifier" | "type_identifier" | "field_identifier" | "this" | "super" => true,
+        kind if kind == chain_kind => is_identifier_path(receiver, receiver_field, chain_kind),
+        _ => false,
+    }
+}
+
 /// Split a call target into the bare name it is indexed under and the qualifier
 /// the call site wrote.
 ///

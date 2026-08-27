@@ -5,7 +5,9 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::method_call::MethodCall;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, node_range, receiver_call_target,
+};
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -1120,12 +1122,22 @@ impl GoParser {
 
         if node.kind() == "call_expression" {
             if let Some(function_node) = node.child_by_field_name("function") {
-                if function_node.kind() != "selector_expression" {
-                    if let Some(fn_name) = extract_function_name(&function_node, code) {
-                        if let Some(context) = function_context {
-                            calls.push((context, fn_name, node_range(*node)));
-                        }
-                    }
+                let target = if function_node.kind() == "selector_expression" {
+                    // `fmt.Println`, `s.Close`: kept whole so the receiver
+                    // becomes the qualifier. Skipping these used to drop most
+                    // of the call graph — in Go a bare call is the exception.
+                    receiver_call_target(
+                        function_node,
+                        code,
+                        "operand",
+                        "field",
+                        "selector_expression",
+                    )
+                } else {
+                    extract_function_name(&function_node, code)
+                };
+                if let (Some(target), Some(context)) = (target, function_context) {
+                    calls.push((context, target, node_range(*node)));
                 }
             }
         }
@@ -1529,6 +1541,69 @@ impl LanguageParser for GoParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every call through a receiver used to be dropped on the floor. In Go
+    /// that is most calls there are: `fmt.Println`, every package function,
+    /// every method. The receiver is kept as the qualifier, which is what lets
+    /// `fmt.Println` resolve to the `fmt` package rather than to a local
+    /// `Println`.
+    #[test]
+    fn a_call_through_a_receiver_keeps_the_receiver() {
+        let mut parser = GoParser::new().unwrap();
+        let code =
+            "package main\nimport \"fmt\"\nfunc m() {\n  fmt.Println(helper())\n  s.Close()\n}\n";
+
+        let calls: Vec<(&str, &str)> = parser
+            .find_calls(code)
+            .into_iter()
+            .map(|(caller, callee, _)| (caller, callee))
+            .collect();
+
+        assert!(
+            calls.contains(&("m", "fmt.Println")),
+            "expected the package call, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("m", "s.Close")),
+            "expected the method call, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("m", "helper")),
+            "the bare call must still be there, got {calls:?}"
+        );
+    }
+
+    /// A receiver that is itself a call has no name to qualify with. The member
+    /// is still recorded — a call the index cannot place is not a call that did
+    /// not happen.
+    #[test]
+    fn a_call_on_a_computed_receiver_keeps_only_the_method_name() {
+        let mut parser = GoParser::new().unwrap();
+        let code = "package main\nfunc m() {\n  build().Close()\n  items[0].Close()\n}\n";
+
+        let calls: Vec<&str> = parser
+            .find_calls(code)
+            .into_iter()
+            .map(|(_, callee, _)| callee)
+            .collect();
+
+        assert_eq!(
+            calls.iter().filter(|c| **c == "Close").count(),
+            2,
+            "both computed receivers give a bare method name, got {calls:?}"
+        );
+    }
+
+    /// One edge per call site. The receiver form is extracted twice in this
+    /// file — once here and once for `find_method_calls` — and if both reached
+    /// the pipeline every method call would be counted double.
+    #[test]
+    fn a_receiver_call_is_recorded_once() {
+        let mut parser = GoParser::new().unwrap();
+        let code = "package main\nfunc m() {\n  fmt.Println(1)\n}\n";
+
+        assert_eq!(parser.find_calls(code).len(), 1);
+    }
 
     #[test]
     fn test_parse_functions_and_structs() {
