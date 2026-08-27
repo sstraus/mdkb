@@ -88,6 +88,15 @@ impl PhpParser {
         symbols
     }
 
+    /// The name a member is indexed under: `Class::member` inside a class,
+    /// the bare name outside one.
+    fn qualified(&self, name: &str) -> String {
+        match self.context.current_class() {
+            Some(cls) => format!("{cls}::{name}"),
+            None => name.to_string(),
+        }
+    }
+
     fn extract_symbols_from_node(
         &mut self,
         node: Node,
@@ -231,22 +240,100 @@ impl PhpParser {
             }
 
             "enum_declaration" => {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    let name = &code[name_node.byte_range()];
+                let name = node
+                    .child_by_field_name("name")
+                    .map(|n| code[n.byte_range()].to_string());
+
+                if let Some(ref n) = name {
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        name.to_string(),
+                        n.clone(),
                         SymbolKind::Enum,
                         file_id,
                         node_range(node),
                         (
-                            Some(format!("enum {name}")),
-                            None,
+                            Some(format!("enum {n}")),
+                            extract_phpdoc(&node, code),
                             module_path,
                             Visibility::Public,
                         ),
                     );
                     symbols.push(symbol);
+                }
+
+                // The body was never walked, so an enum's cases, methods and
+                // constants did not exist as far as the index was concerned.
+                self.context.enter_scope(ScopeType::Class);
+                let saved_cls = self.context.current_class().map(|s| s.to_string());
+                self.context.set_current_class(name);
+
+                if let Some(body) = node.child_by_field_name("body") {
+                    for child in body.children(&mut body.walk()) {
+                        self.extract_symbols_from_node(
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            (module_path, depth + 1),
+                        );
+                    }
+                }
+
+                self.context.exit_scope();
+                self.context.set_current_class(saved_cls);
+            }
+
+            "enum_case" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = &code[name_node.byte_range()];
+                    let symbol = self.create_symbol(
+                        counter.next_id(),
+                        self.qualified(name),
+                        SymbolKind::Constant,
+                        file_id,
+                        node_range(node),
+                        (
+                            Some(code[node.byte_range()].trim_end_matches(';').to_string()),
+                            extract_phpdoc(&node, code),
+                            module_path,
+                            Visibility::Public,
+                        ),
+                    );
+                    symbols.push(symbol);
+                }
+            }
+
+            "namespace_definition" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    let name = &code[name_node.byte_range()];
+                    let symbol = self.create_symbol(
+                        counter.next_id(),
+                        name.to_string(),
+                        SymbolKind::Module,
+                        file_id,
+                        node_range(node),
+                        (
+                            Some(format!("namespace {name}")),
+                            extract_phpdoc(&node, code),
+                            module_path,
+                            Visibility::Public,
+                        ),
+                    );
+                    symbols.push(symbol);
+                }
+
+                // A braced `namespace App { ... }` holds the declarations it
+                // scopes, so the walk has to carry on through it.
+                for child in node.children(&mut node.walk()) {
+                    self.extract_symbols_from_node(
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        (module_path, depth + 1),
+                    );
                 }
             }
 
@@ -260,18 +347,10 @@ impl PhpParser {
                         .map(|n| &code[n.byte_range()])
                         .unwrap_or("()");
 
-                    let qualified_name = if let Some(cls) = self.context.current_class() {
-                        format!("{cls}::{name}")
-                    } else {
-                        name.to_string()
-                    };
-
-                    let kind = SymbolKind::Method;
-
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        qualified_name,
-                        kind,
+                        self.qualified(name),
+                        SymbolKind::Method,
                         file_id,
                         node_range(node),
                         (
@@ -283,6 +362,15 @@ impl PhpParser {
                     );
                     symbols.push(symbol);
                 }
+
+                self.process_promoted_properties(
+                    node,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    module_path,
+                );
             }
 
             "property_declaration" => {
@@ -323,24 +411,73 @@ impl PhpParser {
                 for gc in child.children(&mut child.walk()) {
                     if gc.kind() == "variable_name" {
                         let name = &code[gc.byte_range()];
-                        let qualified_name = if let Some(cls) = self.context.current_class() {
-                            format!("{cls}::{name}")
-                        } else {
-                            name.to_string()
-                        };
+                        // Everything the declaration says before this element,
+                        // then the element: `readonly` and the declared type
+                        // have no other home, and `public int $a, $b;` declares
+                        // two properties that share only the prefix.
+                        let prefix = code[node.start_byte()..child.start_byte()].trim();
+                        let element = code[child.byte_range()].trim();
 
                         let symbol = self.create_symbol(
                             counter.next_id(),
-                            qualified_name,
+                            self.qualified(name),
                             SymbolKind::Field,
                             file_id,
                             node_range(node),
-                            (None, None, module_path, vis),
+                            (
+                                Some(format!("{prefix} {element}").trim().to_string()),
+                                None,
+                                module_path,
+                                vis,
+                            ),
                         );
                         symbols.push(symbol);
                     }
                 }
             }
+        }
+    }
+
+    /// Properties declared inside a constructor's parameter list.
+    ///
+    /// `__construct(public readonly int $x)` declares a property as well as a
+    /// parameter, but it lives in `formal_parameters` and so was only ever read
+    /// as part of the `__construct` signature.
+    fn process_promoted_properties(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        module_path: &str,
+    ) {
+        let Some(params) = node.child_by_field_name("parameters") else {
+            return;
+        };
+        for param in params.children(&mut params.walk()) {
+            if param.kind() != "property_promotion_parameter" {
+                continue;
+            }
+            let Some(name_node) = param.child_by_field_name("name") else {
+                continue;
+            };
+            let name = &code[name_node.byte_range()];
+
+            let symbol = self.create_symbol(
+                counter.next_id(),
+                self.qualified(name),
+                SymbolKind::Field,
+                file_id,
+                node_range(param),
+                (
+                    Some(code[param.byte_range()].trim().to_string()),
+                    None,
+                    module_path,
+                    determine_php_visibility(param, code),
+                ),
+            );
+            symbols.push(symbol);
         }
     }
 
@@ -357,15 +494,9 @@ impl PhpParser {
             if child.kind() == "const_element" {
                 if let Some(name_node) = child.child_by_field_name("name") {
                     let name = &code[name_node.byte_range()];
-                    let qualified_name = if let Some(cls) = self.context.current_class() {
-                        format!("{cls}::{name}")
-                    } else {
-                        name.to_string()
-                    };
-
                     let symbol = self.create_symbol(
                         counter.next_id(),
-                        qualified_name,
+                        self.qualified(name),
                         SymbolKind::Constant,
                         file_id,
                         node_range(node),
@@ -932,5 +1063,73 @@ class App extends Base {
             !uses.iter().any(|(_, t)| matches!(*t, "int" | "void")),
             "a primitive is not a used class: {uses:?}"
         );
+    }
+
+    /// The declarations PHP added after the parser was written and the one it
+    /// never emitted. An enum body was never walked, so `Suit::Hearts` did not
+    /// exist; a promoted constructor parameter is a property declared inside
+    /// the parameter list and was only ever read as part of `__construct`;
+    /// `readonly` had nowhere to be recorded because fields carried no
+    /// signature; and a namespace was used as a prefix but never named.
+    #[test]
+    fn modern_php_declarations_all_produce_symbols() {
+        let mut parser = PhpParser::new().unwrap();
+        let mut counter = SymbolCounter::new();
+        let code = "<?php\n\
+                    namespace App\\Domain;\n\
+                    \n\
+                    enum Suit: string {\n\
+                        case Hearts = 'H';\n\
+                        case Spades = 'S';\n\
+                    }\n\
+                    \n\
+                    class Point {\n\
+                        public readonly int $frozen;\n\
+                        private int $loose;\n\
+                        public function __construct(public readonly int $x, private int $y) {}\n\
+                    }\n";
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let named = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} not parsed, got {:?}",
+                        symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                    )
+                })
+        };
+
+        assert_eq!(named("Suit::Hearts").kind, SymbolKind::Constant);
+        assert_eq!(named("Suit::Spades").kind, SymbolKind::Constant);
+
+        assert_eq!(named("Point::$x").kind, SymbolKind::Field);
+        assert_eq!(named("Point::$x").visibility, Visibility::Public);
+        assert_eq!(named("Point::$y").visibility, Visibility::Private);
+
+        // Nothing else can tell the two apart: both are public int fields.
+        assert_ne!(
+            named("Point::$frozen").signature,
+            named("Point::$loose").signature
+        );
+        assert!(
+            named("Point::$frozen")
+                .signature
+                .as_deref()
+                .is_some_and(|s| s.contains("readonly")),
+            "got {:?}",
+            named("Point::$frozen").signature
+        );
+        assert!(
+            named("Point::$x")
+                .signature
+                .as_deref()
+                .is_some_and(|s| s.contains("readonly")),
+            "a promoted parameter can be readonly too, got {:?}",
+            named("Point::$x").signature
+        );
+
+        assert_eq!(named("App\\Domain").kind, SymbolKind::Module);
     }
 }
