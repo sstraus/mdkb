@@ -1378,6 +1378,47 @@ mod tests {
         );
     }
 
+    /// A receiver is kept only when it is a name. A chained call and an index
+    /// are neither, so the member is recorded on its own rather than qualified
+    /// by an expression no symbol is named after.
+    #[test]
+    fn a_call_on_a_computed_receiver_keeps_only_the_method_name() {
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = "function m(arr) {\n  a.b().c();\n  arr[0].run();\n}\n";
+
+        let targets: Vec<&str> = parser
+            .find_calls(code)
+            .into_iter()
+            .map(|(_, callee, _)| callee)
+            .collect();
+
+        assert!(targets.contains(&"c"), "expected a bare c, got {targets:?}");
+        assert!(
+            targets.contains(&"run"),
+            "expected a bare run, got {targets:?}"
+        );
+        assert!(
+            targets.contains(&"a.b"),
+            "the named receiver of the inner call is kept, got {targets:?}"
+        );
+    }
+
+    /// The member call is reached twice while walking — once as the call, once
+    /// through its own member expression — and used to be recorded both times.
+    #[test]
+    fn a_receiver_call_is_recorded_once() {
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = "function m() {\n  Namespace.other();\n}\n";
+
+        let targets: Vec<&str> = parser
+            .find_calls(code)
+            .into_iter()
+            .map(|(_, callee, _)| callee)
+            .collect();
+
+        assert_eq!(targets, vec!["Namespace.other"], "got {targets:?}");
+    }
+
     /// `method_declaration` is a node kind tree-sitter-typescript never
     /// produces — the real one is `method_definition`. Matching the wrong name
     /// attributed every call in a class method to whatever scope enclosed it.
