@@ -1135,8 +1135,10 @@ MDKB_NO_DAEMON=1 {0} <cmd>                             # run in-process instead,
                 report_find_truncation(&found);
             }
             CodeCommand::Calls { name } => {
-                let (source, callees) = mdkb::cli::handlers::handle_code_calls(&cwd, &name)?;
+                let (source, callees, unplaced) =
+                    mdkb::cli::handlers::handle_code_calls(&cwd, &name)?;
                 format_code_graph("Calls", &source, &callees, cli.format);
+                format_unplaced_calls(&unplaced, cli.format);
             }
             CodeCommand::Callers { name } => {
                 let (target, callers) = mdkb::cli::handlers::handle_code_callers(&cwd, &name)?;
@@ -3403,6 +3405,32 @@ fn format_code_graph(
                 }
             }
         }
+    }
+}
+
+/// Report the calls that resolved to nothing in this index, so an empty callee
+/// list is never read as "this calls nothing".
+///
+/// Silent on the structured formats: `format_code_graph` has already printed a
+/// complete JSON or CSV document, and appending to it would produce output no
+/// parser accepts.
+fn format_unplaced_calls(unplaced: &mdkb::core::code::UnplacedCalls, format: OutputFormat) {
+    if !matches!(format, OutputFormat::Markdown | OutputFormat::Text) {
+        return;
+    }
+    if !unplaced.external.is_empty() {
+        println!(
+            "  {} target(s) outside this index: {}",
+            unplaced.external.len(),
+            unplaced.external.join(", "),
+        );
+    }
+    if !unplaced.unknown.is_empty() {
+        println!(
+            "  {} call(s) on a receiver whose type is not indexed: {}",
+            unplaced.unknown.len(),
+            unplaced.unknown.join(", "),
+        );
     }
 }
 

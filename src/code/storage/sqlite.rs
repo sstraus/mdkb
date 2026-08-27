@@ -12,6 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, ErrorCode, OpenFlags, params};
 
+use crate::code::relationship::CallTarget;
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
 
@@ -309,11 +310,18 @@ impl CodeDb {
         module_path: Option<&str>,
         scope_context: Option<&str>,
     ) -> rusqlite::Result<i64> {
+        // `owner_name` is projected out of the scope JSON by SQLite rather than
+        // passed in beside it. A member's owner is already in `scope_context`,
+        // and the column exists only so the resolver can match it through an
+        // index — `LIKE '%"class_name":"X"%'` cannot use one, and would turn
+        // every edge resolution into a full scan of `code_symbols`. Projecting
+        // it here is what keeps the two from ever disagreeing.
         self.conn.execute(
             "INSERT OR REPLACE INTO code_symbols \
              (name, kind, file_id, file_path, line_start, col_start, line_end, col_end, \
-              visibility, signature, doc_comment, module_path, scope_context) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              visibility, signature, doc_comment, module_path, scope_context, owner_name) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                     json_extract(?13, '$.ClassMember.class_name'))",
             params![
                 name,
                 kind,
@@ -336,11 +344,17 @@ impl CodeDb {
     // --- Relationship operations ---
 
     /// Insert a relationship between symbols.
+    ///
+    /// `to_qualifier` is everything the call site wrote before the last
+    /// separator, `None` for a bare name — see
+    /// [`split_call_target`](crate::code::parsing::parser::split_call_target).
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_relationship(
         &self,
         from_symbol_id: Option<i64>,
         from_name: &str,
         to_name: &str,
+        to_qualifier: Option<&str>,
         kind: &str,
         file_id: i64,
         to_position: (Option<u32>, Option<u16>),
@@ -348,8 +362,8 @@ impl CodeDb {
         let (to_line, to_col) = to_position;
         self.conn.execute(
             "INSERT INTO code_relationships \
-             (from_symbol_id, from_name, to_name, kind, file_id, to_line, to_col) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             (from_symbol_id, from_name, to_name, kind, file_id, to_line, to_col, to_qualifier) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 from_symbol_id,
                 from_name,
@@ -358,6 +372,7 @@ impl CodeDb {
                 file_id,
                 to_line,
                 to_col.map(i64::from),
+                to_qualifier,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -616,11 +631,76 @@ impl CodeDb {
             "SELECT DISTINCT {SYMBOL_COLUMNS_BARE} \
                  FROM ({}) c \
                  JOIN code_symbols s ON s.id = c.sym_id \
-                 WHERE c.tier = c.nearest",
+                 WHERE c.tier = c.nearest AND c.tier <> {TIER_EXTERNAL}",
             resolved_edges("r.from_symbol_id = ?1")
         ))?;
         let rows = stmt.query_map([symbol_id], row_to_symbol)?;
         rows.collect()
+    }
+
+    /// Every `Calls` edge leaving `symbol_id`, classified.
+    ///
+    /// One entry per edge, in call-site order. Unlike
+    /// [`Self::get_called_functions`] this never silently drops an edge: a call
+    /// the index cannot place comes back as `External` or `Unknown` rather than
+    /// as nothing, which is the difference between "this calls nothing here"
+    /// and "this calls nothing".
+    pub fn get_call_targets(&self, symbol_id: i64) -> rusqlite::Result<Vec<CallTarget>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT r.id, r.to_name, r.to_qualifier, s.id, {RESOLUTION_TIER} \
+             FROM code_relationships r \
+             JOIN code_symbols fs ON fs.id = r.from_symbol_id \
+             LEFT JOIN code_symbols s ON s.name = r.to_name \
+             WHERE r.kind = 'Calls' AND r.from_symbol_id = ?1 \
+             ORDER BY r.id"
+        ))?;
+        let rows = stmt.query_map([symbol_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })?;
+
+        // Grouped in Rust rather than in SQL: the classification needs the whole
+        // candidate set of an edge at once, and the tier that wins is the
+        // nearest any candidate reached.
+        let mut edges: Vec<CandidateEdge> = Vec::new();
+        for row in rows {
+            let (rid, name, qualifier, sym_id, tier) = row?;
+            if edges.last().map(|(id, ..)| *id) != Some(rid) {
+                edges.push((rid, name, qualifier, Vec::new()));
+            }
+            if let Some(sym_id) = sym_id {
+                edges
+                    .last_mut()
+                    .expect("just pushed")
+                    .3
+                    .push((tier, sym_id));
+            }
+        }
+
+        Ok(edges
+            .into_iter()
+            .map(|(_, name, qualifier, candidates)| {
+                let nearest = candidates.iter().map(|(tier, _)| *tier).min();
+                match (nearest, qualifier) {
+                    (Some(TIER_EXTERNAL) | None, Some(qualifier)) => {
+                        CallTarget::External { qualifier, name }
+                    }
+                    (None, None) => CallTarget::Unknown { name },
+                    (Some(nearest), _) => CallTarget::Resolved(
+                        candidates
+                            .iter()
+                            .filter(|(tier, _)| *tier == nearest)
+                            .filter_map(|(_, id)| SymbolId::new(*id as u32))
+                            .collect(),
+                    ),
+                }
+            })
+            .collect())
     }
 
     /// Get symbols whose calls resolve to the given symbol.
@@ -632,7 +712,7 @@ impl CodeDb {
             "SELECT DISTINCT {SYMBOL_COLUMNS_BARE} \
                  FROM ({}) c \
                  JOIN code_symbols s ON s.id = c.from_id \
-                 WHERE c.tier = c.nearest AND c.sym_id = ?1",
+                 WHERE c.tier = c.nearest AND c.tier <> {TIER_EXTERNAL} AND c.sym_id = ?1",
             resolved_edges("r.to_name = (SELECT name FROM code_symbols WHERE id = ?1)")
         ))?;
         let rows = stmt.query_map([symbol_id], row_to_symbol)?;
@@ -813,15 +893,40 @@ fn io_as_sqlite(operation: &str, error: std::io::Error) -> rusqlite::Error {
 
 // --- SQL fragments ---
 
-/// How near the scope a candidate was found in is to the call site: rules 4, 5
-/// and 6 of `plans/qualified-symbol-resolution.md` §3, lower being nearer.
+/// How near the scope a candidate was found in is to the call site: the cascade
+/// of `plans/qualified-symbol-resolution.md` §3, lower being nearer.
 ///
 /// `r` is the call, `fs` the symbol that made it, `s` a symbol whose bare name
-/// matches the target. Tier 7 is "no rule placed it": those candidates are kept
-/// rather than dropped, because a call the index cannot place is still better
-/// answered with every same-named symbol than with an empty list. Rules 1 to 3
-/// need the qualifier the call site wrote, which is not stored yet.
+/// matches the target.
+///
+/// Tiers 1 to 3 read the qualifier the call site wrote. They are what keeps a
+/// qualifier narrowing and never widening: an edge that carries one resolves
+/// through its owner (1) or its module (2), or through nothing at all (3) — it
+/// never falls through to the unqualified rules and picks up a same-named local
+/// symbol. 3041 edges in this repository would gain a target they never called
+/// if it did.
+///
+/// Tier 7 is "no rule placed it": those candidates are kept rather than
+/// dropped, because a call the index cannot place is still better answered with
+/// every same-named symbol than with an empty list. Tier 3 is the opposite —
+/// the index CAN place the call, outside itself — so `resolved_edges` drops it.
 const RESOLUTION_TIER: &str = "CASE \
+     WHEN r.to_qualifier IS NOT NULL THEN ( CASE \
+         WHEN s.owner_name IS NOT NULL AND ( \
+             r.to_qualifier = s.owner_name \
+             OR r.to_qualifier LIKE '%::' || s.owner_name \
+             OR r.to_qualifier LIKE '%.' || s.owner_name \
+             OR r.to_qualifier LIKE '%\' || s.owner_name) THEN 1 \
+         WHEN s.module_path IS NOT NULL AND ( \
+             s.module_path = r.to_qualifier \
+             OR (( s.module_path LIKE '%::' || r.to_qualifier \
+                   OR s.module_path LIKE '%.' || r.to_qualifier) \
+                 AND EXISTS ( \
+                     SELECT 1 FROM code_imports i WHERE i.file_id = r.file_id AND ( \
+                         i.path = s.module_path \
+                         OR i.path = s.module_path || '::' || s.name \
+                         OR i.path = s.module_path || '.' || s.name)))) THEN 2 \
+         ELSE 3 END ) \
      WHEN s.file_id = r.file_id THEN 4 \
      WHEN s.module_path IS NOT NULL AND EXISTS ( \
          SELECT 1 FROM code_imports i WHERE i.file_id = r.file_id AND ( \
@@ -830,6 +935,16 @@ const RESOLUTION_TIER: &str = "CASE \
              OR i.path = s.module_path || '.' || s.name)) THEN 5 \
      WHEN s.module_path IS NOT NULL AND s.module_path = fs.module_path THEN 6 \
      ELSE 7 END";
+
+/// One `Calls` edge with every candidate the bare-name join found for it:
+/// `(edge id, target name, qualifier, [(tier, symbol id)])`.
+type CandidateEdge = (i64, String, Option<String>, Vec<(i64, i64)>);
+
+/// The tier that says "the target is named, and it is not in this index".
+///
+/// Its candidates are not targets; they are same-named symbols the qualifier
+/// ruled out.
+pub const TIER_EXTERNAL: i64 = 3;
 
 /// Every `Calls` edge matching `filter`, paired with each candidate target and
 /// the nearest tier any candidate of that same edge reached.
@@ -1269,6 +1384,7 @@ mod tests {
                 Some(sym_id),
                 "caller",
                 "callee",
+                None,
                 "Calls",
                 file_id,
                 (Some(5), Some(10)),
@@ -1496,6 +1612,7 @@ mod tests {
             Some(caller_id),
             "caller",
             "callee_a",
+            None,
             "Calls",
             file_id,
             (None, None),
@@ -1505,6 +1622,7 @@ mod tests {
             Some(caller_id),
             "caller",
             "callee_b",
+            None,
             "Calls",
             file_id,
             (None, None),
@@ -1563,6 +1681,7 @@ mod tests {
             Some(caller),
             "caller",
             "helper",
+            None,
             "Calls",
             here_file,
             (None, None),
@@ -1577,6 +1696,217 @@ mod tests {
             .iter()
             .map(|s| i64::from(s.id.value()))
             .collect()
+    }
+
+    /// Three calls, three fates. An answer that reported only the first would
+    /// say "calls one function" for a symbol that makes three calls, and an
+    /// answer that reported none of them would say "calls nothing".
+    #[test]
+    fn every_call_is_reported_as_resolved_external_or_unknown() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let local = function_in(&db, "helper", (here_file, "here.rs"), "crate::here", 10);
+        for (name, qualifier) in [
+            ("helper", None),
+            ("write", Some("std::fs")),
+            ("unwrap", None),
+        ] {
+            db.insert_relationship(
+                Some(caller),
+                "caller",
+                name,
+                qualifier,
+                "Calls",
+                here_file,
+                (None, None),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            db.get_call_targets(caller).unwrap(),
+            vec![
+                CallTarget::Resolved(vec![SymbolId::new(local as u32).unwrap()]),
+                CallTarget::External {
+                    qualifier: "std::fs".to_string(),
+                    name: "write".to_string(),
+                },
+                CallTarget::Unknown {
+                    name: "unwrap".to_string(),
+                },
+            ]
+        );
+    }
+
+    /// A qualifier that named something real, whose member is not there, is
+    /// still external — the target is named, just not indexed. Falling back to
+    /// the same-named local symbol is the one answer that must not happen.
+    #[test]
+    fn a_qualified_call_with_no_matching_member_is_external_not_local() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        function_in(&db, "open", (here_file, "here.rs"), "crate::here", 10);
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "open",
+            Some("Store"),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.get_call_targets(caller).unwrap(),
+            vec![CallTarget::External {
+                qualifier: "Store".to_string(),
+                name: "open".to_string(),
+            }]
+        );
+    }
+
+    /// A member of `class`, addressed by `owner_name` through its scope JSON.
+    fn method_in(
+        db: &CodeDb,
+        name: &str,
+        class: &str,
+        (file_id, file_path): (i64, &str),
+        module: &str,
+        line: u32,
+    ) -> i64 {
+        db.insert_symbol(
+            name,
+            "Method",
+            file_id,
+            file_path,
+            line,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            Some(module),
+            Some(&format!(r#"{{"ClassMember":{{"class_name":"{class}"}}}}"#)),
+        )
+        .unwrap()
+    }
+
+    /// `caller` calls `Store::open` while its own file also defines a free
+    /// `open`. The unqualified rules would answer with the local one — the call
+    /// site said which `open` it meant, and rule 1 is what listens.
+    #[test]
+    fn a_qualified_call_resolves_to_the_member_of_the_type_it_named() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let local = function_in(&db, "open", (here_file, "here.rs"), "crate::here", 10);
+        let (store_file, _) = file_with_function(&db, "unrelated", "store.rs", "crate::store");
+        let member = method_in(
+            &db,
+            "open",
+            "Store",
+            (store_file, "store.rs"),
+            "crate::store",
+            5,
+        );
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "open",
+            Some("Store"),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![member],
+            "expected Store::open, not the local open {local}"
+        );
+    }
+
+    /// `std::fs::write` names a target this index does not contain. Answering it
+    /// with this crate's own `write` is the single worst thing the resolver can
+    /// do — it invents a call that was never made, and 3041 edges of this
+    /// repository have exactly that shape.
+    #[test]
+    fn a_call_qualified_by_something_unindexed_is_not_given_a_local_target() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        function_in(&db, "write", (here_file, "here.rs"), "crate::here", 10);
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "write",
+            Some("std::fs"),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            Vec::<i64>::new(),
+            "a qualifier narrows the candidates and must never widen them"
+        );
+    }
+
+    /// The qualifier names a module rather than a type. It is the tail of an
+    /// indexed `module_path` that the calling file imports, so rule 2 places the
+    /// call there instead of on the same-named function next to the caller.
+    #[test]
+    fn a_qualified_call_resolves_through_the_module_the_file_imported() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let local = function_in(&db, "helper", (here_file, "here.rs"), "crate::here", 10);
+        let (_, imported) = file_with_function(&db, "helper", "imported.rs", "crate::imported");
+        db.insert_import(here_file, "crate::imported", None, false, false)
+            .unwrap();
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "helper",
+            Some("imported"),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![imported],
+            "expected the imported module's helper, not the local one {local}"
+        );
+    }
+
+    /// A caller is reported only for the call that actually resolved to it: the
+    /// external classification has to hold from both ends, or `callers` answers
+    /// with calls that never reached the symbol.
+    #[test]
+    fn callers_exclude_a_call_whose_qualifier_ruled_this_symbol_out() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let local = function_in(&db, "write", (here_file, "here.rs"), "crate::here", 10);
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "write",
+            Some("std::fs"),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert!(
+            db.get_calling_functions(local).unwrap().is_empty(),
+            "std::fs::write is not a call into this crate's write"
+        );
     }
 
     /// Three files define `helper` and `caller` calls it. Bare-name matching
@@ -1687,6 +2017,7 @@ mod tests {
             Some(caller),
             "caller",
             "helper",
+            None,
             "Calls",
             here_file,
             (None, None),
@@ -1749,6 +2080,7 @@ mod tests {
             Some(caller_id),
             "caller",
             "callee",
+            None,
             "Calls",
             file_id,
             (None, None),
@@ -1784,9 +2116,9 @@ mod tests {
             )
             .unwrap();
 
-        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, (None, None))
+        db.insert_relationship(Some(b_id), "b", "a", None, "Calls", file_id, (None, None))
             .unwrap();
-        db.insert_relationship(Some(c_id), "c", "b", "Calls", file_id, (None, None))
+        db.insert_relationship(Some(c_id), "c", "b", None, "Calls", file_id, (None, None))
             .unwrap();
 
         // Impact of "a" with depth 0: just "b" (direct caller)
@@ -1810,7 +2142,7 @@ mod tests {
             "a", "Function", file_id, "test.rs", 1, None, None, None, 0, None, None, None, None,
         )
         .unwrap();
-        db.insert_relationship(None, "a", "b", "Calls", file_id, (None, None))
+        db.insert_relationship(None, "a", "b", None, "Calls", file_id, (None, None))
             .unwrap();
 
         db.clear().unwrap();
@@ -1829,8 +2161,16 @@ mod tests {
                 None,
             )
             .unwrap();
-        db.insert_relationship(Some(sym_id), "fn1", "fn2", "Calls", file_id, (None, None))
-            .unwrap();
+        db.insert_relationship(
+            Some(sym_id),
+            "fn1",
+            "fn2",
+            None,
+            "Calls",
+            file_id,
+            (None, None),
+        )
+        .unwrap();
 
         assert_eq!(db.symbol_count().unwrap(), 1);
         assert_eq!(db.relationship_count().unwrap(), 1);
@@ -1856,7 +2196,7 @@ mod tests {
         .unwrap();
         assert_eq!(db.symbol_count().unwrap(), 1);
 
-        db.insert_relationship(None, "a", "b", "Calls", file_id, (None, None))
+        db.insert_relationship(None, "a", "b", None, "Calls", file_id, (None, None))
             .unwrap();
         assert_eq!(db.relationship_count().unwrap(), 1);
     }
@@ -2109,9 +2449,9 @@ mod tests {
                 None,
             )
             .unwrap();
-        db.insert_relationship(Some(a_id), "a", "b", "Calls", file_id, (None, None))
+        db.insert_relationship(Some(a_id), "a", "b", None, "Calls", file_id, (None, None))
             .unwrap();
-        db.insert_relationship(Some(b_id), "b", "a", "Calls", file_id, (None, None))
+        db.insert_relationship(Some(b_id), "b", "a", None, "Calls", file_id, (None, None))
             .unwrap();
 
         // The walk stops at symbols already seen, so this terminates.

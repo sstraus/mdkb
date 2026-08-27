@@ -31,6 +31,36 @@ pub enum RelationKind {
     ExpandedBy,
 }
 
+/// What a `Calls` edge turned out to point at.
+///
+/// A call the index cannot place is not the same as a call to nothing, and
+/// reporting both as an empty list is the failure this type removes: 31 503 of
+/// this repository's 44 202 `Calls` edges used to answer "no callers", which
+/// reads as "nothing calls this" and is wrong for all but a few of them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CallTarget {
+    /// The cascade placed the call inside this index. More than one id means
+    /// the rules narrowed it that far and no further.
+    Resolved(Vec<crate::code::types::SymbolId>),
+    /// The call site named an owner or module this index does not contain:
+    /// `std::fs::write`, `tempfile::tempdir`. Nameable, not indexable.
+    External { qualifier: String, name: String },
+    /// A bare name with no candidate — a method on a receiver whose type the
+    /// index does not know.
+    Unknown { name: String },
+}
+
+impl CallTarget {
+    /// The symbols this call was placed on, empty unless it resolved.
+    #[must_use]
+    pub fn resolved(&self) -> &[crate::code::types::SymbolId] {
+        match self {
+            Self::Resolved(ids) => ids,
+            _ => &[],
+        }
+    }
+}
+
 impl RelationKind {
     /// Get the inverse relationship kind.
     #[must_use]

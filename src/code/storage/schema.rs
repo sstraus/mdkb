@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS code_symbols (
     signature TEXT,
     doc_comment TEXT,
     module_path TEXT,
+    owner_name TEXT,
     scope_context TEXT,
     UNIQUE(name, file_id, line_start)
 );
@@ -45,7 +46,8 @@ CREATE TABLE IF NOT EXISTS code_relationships (
     kind TEXT NOT NULL,
     file_id INTEGER NOT NULL REFERENCES code_files(id) ON DELETE CASCADE,
     to_line INTEGER,
-    to_col INTEGER
+    to_col INTEGER,
+    to_qualifier TEXT
 );
 
 CREATE TABLE IF NOT EXISTS code_imports (
@@ -95,10 +97,12 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 ///
 /// Bump it whenever the parsers start recording something an older index does
 /// not hold — version 1 is `module_path`, which the call resolver needs to tell
-/// two same-named functions apart. Without the bump an index keeps the wider,
+/// two same-named functions apart; version 2 is `owner_name` and
+/// `to_qualifier`, which tell it that `std::fs::write` is not this crate's
+/// `write`. Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 1;
+pub const RESOLUTION_VERSION: i64 = 2;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///
@@ -123,6 +127,36 @@ CREATE TRIGGER code_symbols_fts_update AFTER UPDATE ON code_symbols BEGIN
 END;
 "#;
 
+/// The indexes over the columns [`init_schema`] adds after the fact.
+///
+/// They cannot live in `CREATE_TABLES`: that batch runs before the columns
+/// exist on a database written by an older binary, and `CREATE INDEX` on a
+/// missing column is an error, not a no-op.
+const CREATE_ADDED_INDEXES: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_symbols_addr ON code_symbols(name, owner_name, module_path);
+CREATE INDEX IF NOT EXISTS idx_rels_to_qual ON code_relationships(to_name, to_qualifier);
+"#;
+
+/// Add `column` to `table` unless it is already there.
+///
+/// `ALTER TABLE ADD COLUMN` has no `IF NOT EXISTS`, so the probe is the guard.
+fn add_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    decl: &str,
+) -> rusqlite::Result<()> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        [table, column],
+        |row| row.get(0),
+    )?;
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    }
+    Ok(())
+}
+
 /// Initialize the code index schema on an open connection.
 ///
 /// Idempotent: safe to call on an already-initialized database.
@@ -131,15 +165,13 @@ pub fn init_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
     conn.execute_batch(CREATE_TABLES)?;
 
-    // Additive migration: ensure token_estimate column exists on pre-existing DBs.
-    let has_token_estimate: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('code_files') WHERE name='token_estimate')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !has_token_estimate {
-        conn.execute_batch("ALTER TABLE code_files ADD COLUMN token_estimate INTEGER")?;
-    }
+    // Additive migrations: a column added to CREATE_TABLES only reaches a
+    // database that does not exist yet, so every one of them also has to be
+    // added here for the indexes already on disk.
+    add_column(conn, "code_files", "token_estimate", "INTEGER")?;
+    add_column(conn, "code_symbols", "owner_name", "TEXT")?;
+    add_column(conn, "code_relationships", "to_qualifier", "TEXT")?;
+    conn.execute_batch(CREATE_ADDED_INDEXES)?;
 
     // Triggers don't support IF NOT EXISTS — check before creating.
     let trigger_exists: bool = conn.query_row(

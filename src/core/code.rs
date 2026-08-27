@@ -264,6 +264,22 @@ pub fn handle_code_find(
 
     Ok(CodeFindResult { symbols, total })
 }
+/// The calls a symbol makes that the index could not place on a symbol of its
+/// own.
+///
+/// Reported beside the resolved callees because an empty callee list means two
+/// very different things — "this calls nothing" and "everything it calls lives
+/// outside this index" — and the second is by far the more common.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnplacedCalls {
+    /// Targets the call site named in full, which this index does not contain:
+    /// `std::fs::write`.
+    pub external: Vec<String>,
+    /// Bare names with no candidate — a method on a receiver whose type the
+    /// index does not know.
+    pub unknown: Vec<String>,
+}
+
 /// Handle `mdkb code calls` - show what a symbol calls.
 pub fn handle_code_calls(
     root: &Path,
@@ -271,7 +287,10 @@ pub fn handle_code_calls(
 ) -> Result<(
     crate::code::symbol::Symbol,
     Vec<crate::code::symbol::Symbol>,
+    UnplacedCalls,
 )> {
+    use crate::code::relationship::CallTarget;
+
     let facade = open_code_read_only(root)?;
 
     let symbol = facade
@@ -279,7 +298,21 @@ pub fn handle_code_calls(
         .ok_or_else(|| Error::other(format!("Symbol '{}' not found", name)))?;
 
     let callees = facade.get_called_functions(symbol.id);
-    Ok((symbol, callees))
+    let mut unplaced = UnplacedCalls::default();
+    for target in facade.get_call_targets(symbol.id) {
+        match target {
+            CallTarget::Resolved(_) => {}
+            CallTarget::External { qualifier, name } => {
+                unplaced.external.push(format!("{qualifier}::{name}"));
+            }
+            CallTarget::Unknown { name } => unplaced.unknown.push(name),
+        }
+    }
+    unplaced.external.sort_unstable();
+    unplaced.external.dedup();
+    unplaced.unknown.sort_unstable();
+    unplaced.unknown.dedup();
+    Ok((symbol, callees, unplaced))
 }
 /// Handle `mdkb code callers` - show what calls a symbol.
 pub fn handle_code_callers(

@@ -50,6 +50,11 @@ pub struct RawRelationship {
     pub from_name: Box<str>,
     pub from_range: Range,
     pub to_name: Box<str>,
+    /// What the call site wrote before the target's last segment, `None` for a
+    /// bare name. It narrows the target and never widens it: a qualifier that
+    /// names nothing indexed makes the target external rather than letting it
+    /// match a same-named local symbol.
+    pub to_qualifier: Option<Box<str>>,
     pub to_range: Range,
     pub kind: RelationKind,
 }
@@ -100,6 +105,7 @@ pub struct CollectedRelationship {
     pub from_id: Option<SymbolId>,
     pub from_name: Box<str>,
     pub to_name: Box<str>,
+    pub to_qualifier: Option<Box<str>>,
     pub file_id: FileId,
     pub kind: RelationKind,
     pub to_range: Option<Range>,

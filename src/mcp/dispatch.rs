@@ -2564,11 +2564,24 @@ pub async fn code_graph_impl(
     let symbols: Vec<crate::code::symbol::Symbol> =
         hits.iter().filter_map(|(_, s)| s.clone()).collect();
 
+    // What the call graph could not place, for the `calls` direction only —
+    // it is the direction that has targets at all. Without this an answer of
+    // "does not call any indexed functions" reads as "calls nothing", which is
+    // wrong for the majority of symbols: most of what code calls lives in
+    // another crate or on a receiver whose type is not indexed.
+    let unplaced = if params.direction == "calls" {
+        unplaced_calls(facade, symbol.id)
+    } else {
+        crate::core::code::UnplacedCalls::default()
+    };
+
     if hits.is_empty() {
         let text = match params.direction.as_str() {
             "calls" => format!(
-                "{} ({:?}) does not call any indexed functions.",
-                symbol.name, symbol.kind
+                "{} ({:?}) calls no indexed function.{}",
+                symbol.name,
+                symbol.kind,
+                unplaced_suffix(&unplaced)
             ),
             "callers" => format!(
                 "{} ({:?}) has no indexed callers.",
@@ -2584,10 +2597,11 @@ pub async fn code_graph_impl(
 
     let mut text = match params.direction.as_str() {
         "calls" => format!(
-            "{} ({:?}) calls {} function(s):\n\n",
+            "{} ({:?}) calls {} indexed function(s).{}\n\n",
             symbol.name,
             symbol.kind,
-            hits.len()
+            hits.len(),
+            unplaced_suffix(&unplaced)
         ),
         "callers" => format!(
             "{} ({:?}) is called by {} function(s):\n\n",
@@ -2614,6 +2628,56 @@ pub async fn code_graph_impl(
     }
 
     Ok(CodeGraphOutput { text, symbols })
+}
+
+/// The calls of `symbol_id` that no rule placed on an indexed symbol.
+fn unplaced_calls(
+    facade: &crate::code::indexing::IndexFacade,
+    symbol_id: crate::code::types::SymbolId,
+) -> crate::core::code::UnplacedCalls {
+    use crate::code::relationship::CallTarget;
+
+    let mut unplaced = crate::core::code::UnplacedCalls::default();
+    for target in facade.get_call_targets(symbol_id) {
+        match target {
+            CallTarget::Resolved(_) => {}
+            CallTarget::External { qualifier, name } => {
+                unplaced.external.push(format!("{qualifier}::{name}"));
+            }
+            CallTarget::Unknown { name } => unplaced.unknown.push(name),
+        }
+    }
+    unplaced.external.sort_unstable();
+    unplaced.external.dedup();
+    unplaced.unknown.sort_unstable();
+    unplaced.unknown.dedup();
+    unplaced
+}
+
+/// One sentence naming what fell outside the index, empty when nothing did.
+///
+/// Names the external targets rather than only counting them: knowing a symbol
+/// calls `std::fs::write` is what tells Claude to stop looking for it here.
+fn unplaced_suffix(unplaced: &crate::core::code::UnplacedCalls) -> String {
+    let mut parts = Vec::new();
+    if !unplaced.external.is_empty() {
+        parts.push(format!(
+            "{} outside this index ({})",
+            unplaced.external.len(),
+            unplaced.external.join(", ")
+        ));
+    }
+    if !unplaced.unknown.is_empty() {
+        parts.push(format!(
+            "{} on receivers of unindexed type",
+            unplaced.unknown.len()
+        ));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" Also calls {}.", parts.join(", "))
+    }
 }
 
 /// `usage` — token economy audit. Reads session + lifetime stats and returns

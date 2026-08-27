@@ -256,6 +256,44 @@ pub fn last_name_segment<'a>(node: Node, code: &'a str) -> &'a str {
     }
 }
 
+/// Split a call target into the bare name it is indexed under and the qualifier
+/// the call site wrote.
+///
+/// `Store::open` gives `("open", Some("Store"))`, `std::fs::write` gives
+/// `("write", Some("std::fs"))`, `open` gives `("open", None)`. The qualifier is
+/// what lets a call be narrowed to one owner instead of matching every symbol of
+/// that name — and, when it names nothing indexed, what tells an external target
+/// apart from a local one. Dropping it to widen the match is measurably wrong:
+/// 3041 edges in this repository would gain a target they never called, starting
+/// with `std::fs::write` pointing at this crate's own `write`.
+///
+/// The three separators are taken together rather than per language because a
+/// call target only ever holds one of them, and PHP writes both (`\App\Util` and
+/// `Util::run` in the same expression).
+///
+/// A receiver pronoun is not a qualifier: `self.helper()` names no type, so
+/// keeping `self` would class every Python method call as external. Stripping it
+/// leaves the call unqualified, which enters the cascade at "declared in the
+/// calling file" — where the method it means almost always is.
+pub fn split_call_target(target: &str) -> (&str, Option<&str>) {
+    let split = ["::", "\\", "."]
+        .iter()
+        .filter_map(|sep| target.rfind(sep).map(|at| (at, sep.len())))
+        .max_by_key(|(at, _)| *at);
+
+    let Some((at, sep_len)) = split else {
+        return (target, None);
+    };
+    let (qualifier, name) = (&target[..at], &target[at + sep_len..]);
+    if name.is_empty() {
+        return (target, None);
+    }
+    match qualifier {
+        "" | "self" | "this" | "Self" | "cls" => (name, None),
+        _ => (name, Some(qualifier)),
+    }
+}
+
 /// Safely truncate a UTF-8 string at a character boundary.
 #[inline]
 pub fn safe_truncate_str(s: &str, max_bytes: usize) -> &str {
@@ -303,5 +341,42 @@ mod tests {
     fn test_truncate_for_display() {
         assert_eq!(truncate_for_display("This is long", 7), "This is...");
         assert_eq!(truncate_for_display("Short", 10), "Short");
+    }
+    #[test]
+    fn a_qualified_call_keeps_the_owner_the_call_site_named() {
+        assert_eq!(split_call_target("Store::open"), ("open", Some("Store")));
+        assert_eq!(
+            split_call_target("std::fs::write"),
+            ("write", Some("std::fs"))
+        );
+        assert_eq!(split_call_target("os.path.join"), ("join", Some("os.path")));
+        assert_eq!(
+            split_call_target("\\App\\Util::run"),
+            ("run", Some("\\App\\Util"))
+        );
+    }
+
+    #[test]
+    fn a_bare_call_has_no_qualifier() {
+        assert_eq!(split_call_target("open"), ("open", None));
+    }
+
+    /// A receiver pronoun names no type. Keeping it would make every method call
+    /// on `self` a call to something outside the index.
+    #[test]
+    fn a_receiver_pronoun_is_not_a_qualifier() {
+        assert_eq!(split_call_target("self.helper"), ("helper", None));
+        assert_eq!(split_call_target("this.helper"), ("helper", None));
+        assert_eq!(split_call_target("Self::helper"), ("helper", None));
+        assert_eq!(split_call_target("cls.helper"), ("helper", None));
+    }
+
+    /// Nothing a parser can emit should come back as an empty name: an edge with
+    /// no target name matches every symbol or none, and both are wrong.
+    #[test]
+    fn a_target_that_is_only_a_separator_is_left_whole() {
+        assert_eq!(split_call_target("foo::"), ("foo::", None));
+        assert_eq!(split_call_target("."), (".", None));
+        assert_eq!(split_call_target(""), ("", None));
     }
 }
