@@ -151,6 +151,8 @@ impl KotlinParser {
             }
 
             "companion_object" => {
+                symbols.push(self.process_companion(node, code, file_id, counter, module_path));
+
                 // Companion objects define static-like members on the enclosing class
                 if let Some(body) = find_child_by_kind(node, "class_body") {
                     for child in body.children(&mut body.walk()) {
@@ -410,6 +412,57 @@ impl KotlinParser {
         ))
     }
 
+    /// The name a declaration is indexed under: every scope that names it, then
+    /// the name. The enclosing class comes first because that is where the
+    /// declaration lives; the extended type comes next because it is part of
+    /// what the declaration is called at the call site.
+    fn qualified_name(&self, node: Node, code: &str, name: &str) -> String {
+        let mut parts = Vec::new();
+        if let Some(cls) = self.context.current_class() {
+            parts.push(cls);
+        }
+        if let Some(receiver) = extension_receiver(node, code) {
+            parts.push(receiver);
+        }
+        parts.push(name);
+        parts.join(".")
+    }
+
+    /// The symbol for a companion object itself.
+    ///
+    /// An unnamed companion is not anonymous: Kotlin calls it `Companion` and
+    /// `Box.Companion` is writable in source, so that is the name to index. Its
+    /// members stay flattened onto the enclosing class, because `Box.make()` is
+    /// what a call site writes and `Box.make` is therefore what resolves.
+    fn process_companion(
+        &self,
+        node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        module_path: &str,
+    ) -> Symbol {
+        let name = find_type_identifier(node, code).unwrap_or_else(|| "Companion".to_string());
+        let qualified = match self.context.current_class() {
+            Some(cls) => format!("{cls}.{name}"),
+            None => name.clone(),
+        };
+
+        self.create_symbol(
+            counter.next_id(),
+            qualified,
+            SymbolKind::Class,
+            file_id,
+            node_range(node),
+            (
+                Some(format!("companion object {name}")),
+                extract_kdoc(&node, code),
+                module_path,
+                determine_kotlin_visibility(node, code),
+            ),
+        )
+    }
+
     fn process_function(
         &self,
         node: Node,
@@ -423,11 +476,7 @@ impl KotlinParser {
         let signature = build_function_signature(node, code);
         let doc = extract_kdoc(&node, code);
 
-        let qualified_name = if let Some(cls) = self.context.current_class() {
-            format!("{cls}.{name}")
-        } else {
-            name
-        };
+        let qualified_name = self.qualified_name(node, code, &name);
 
         let kind = if self.context.is_in_class() {
             SymbolKind::Method
@@ -506,14 +555,16 @@ impl KotlinParser {
                 SymbolKind::Variable
             };
 
-            let qualified = if let Some(cls) = self.context.current_class() {
-                format!("{cls}.{name}")
-            } else {
-                name.to_string()
-            };
+            let qualified = self.qualified_name(node, code, name);
 
+            // The receiver belongs in the signature for the same reason it
+            // belongs in the name: `loud: Int` does not say what it extends.
+            let written = match extension_receiver(node, code) {
+                Some(receiver) => format!("{receiver}.{name}"),
+                None => name.to_string(),
+            };
             let type_str = extract_property_type(node, code);
-            let sig = type_str.map(|t| format!("{name}: {t}"));
+            let sig = type_str.map(|t| format!("{written}: {t}"));
 
             symbols.push(self.create_symbol(
                 counter.next_id(),
@@ -864,6 +915,17 @@ impl KotlinParser {
 
 // ── Free helpers ────────────────────────────────────────────────────────
 
+/// The type an extension declaration extends, if it is one.
+///
+/// `fun String.shout()` and `val String.loud` both hang the extended type off a
+/// `receiver` field, next to the plain name rather than inside it. Reading only
+/// the name records the declaration as `shout`, which an unrelated top-level
+/// `fun shout()` is also called.
+fn extension_receiver<'a>(node: Node, code: &'a str) -> Option<&'a str> {
+    let receiver = node.child_by_field_name("receiver")?;
+    Some(code[receiver.byte_range()].trim())
+}
+
 /// Find the first `type_identifier` child of a node (used for class/object names).
 fn find_type_identifier(node: Node, code: &str) -> Option<String> {
     find_type_identifier_ref(node, code).map(|s| s.to_string())
@@ -976,7 +1038,13 @@ fn build_class_signature(node: Node, code: &str, kind: SymbolKind) -> String {
 
 /// Build a function signature.
 fn build_function_signature(node: Node, code: &str) -> String {
-    let name = find_simple_identifier(node, code).unwrap_or_else(|| "?".to_string());
+    let bare = find_simple_identifier(node, code).unwrap_or_else(|| "?".to_string());
+    // `fun shout(): String` is the signature of a different function from
+    // `fun String.shout(): String`.
+    let name = match extension_receiver(node, code) {
+        Some(receiver) => format!("{receiver}.{bare}"),
+        None => bare,
+    };
 
     let params = find_child_by_kind(node, "function_value_parameters")
         .map(|n| code[n.byte_range()].to_string())
@@ -1577,6 +1645,80 @@ fun greet() {}
             greet.module_path.as_deref(),
             Some("com.example.app"),
             "expected module_path from package header"
+        );
+    }
+
+    /// A companion object is a real object with a real name — `Box.Companion`
+    /// is writable in source — and the parser used to recurse into its body
+    /// without ever emitting it, so nothing in the index said the class had one.
+    /// Its members stay flattened onto the class on purpose: `Box.make()` is
+    /// what a call site writes, so `Box.make` is the name that resolves.
+    #[test]
+    fn a_companion_object_produces_its_own_symbol() {
+        let mut parser = KotlinParser::new().unwrap();
+        let mut counter = SymbolCounter::new();
+        let code = r"
+class Box {
+    companion object Factory {
+        fun make(): Box = Box()
+    }
+}
+
+class Plain {
+    companion object {
+        val N = 1
+    }
+}
+";
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let named = |name: &str| symbols.iter().find(|s| s.name.as_ref() == name);
+
+        assert_eq!(
+            named("Box.Factory").map(|s| s.kind),
+            Some(SymbolKind::Class),
+            "named companion, got {:?}",
+            symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            named("Plain.Companion").map(|s| s.kind),
+            Some(SymbolKind::Class),
+            "an unnamed companion is called Companion in Kotlin"
+        );
+        assert!(named("Box.make").is_some(), "members stay on the class");
+    }
+
+    /// `fun String.shout()` and `fun shout()` are different functions. Reading
+    /// only the `simple_identifier` recorded both as `shout`, so every extension
+    /// in a file was indistinguishable from an unrelated function of the same
+    /// name — and extensions are idiomatic Kotlin, not a corner case.
+    #[test]
+    fn an_extension_records_the_type_it_extends() {
+        let mut parser = KotlinParser::new().unwrap();
+        let mut counter = SymbolCounter::new();
+        let code = r#"
+fun String.shout(): String = this
+val String.loud: Int get() = 1
+fun shout(): String = ""
+val loud: Int = 2
+"#;
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_ref()).collect();
+
+        assert!(names.contains(&"String.shout"), "got {names:?}");
+        assert!(names.contains(&"String.loud"), "got {names:?}");
+        assert!(names.contains(&"shout"), "the plain function survives");
+        assert!(names.contains(&"loud"), "the plain property survives");
+
+        let ext = symbols
+            .iter()
+            .find(|s| s.name.as_ref() == "String.shout")
+            .expect("extension parsed");
+        assert!(
+            ext.signature
+                .as_deref()
+                .is_some_and(|s| s.contains("String.shout")),
+            "the receiver belongs in the signature too, got {:?}",
+            ext.signature
         );
     }
 }

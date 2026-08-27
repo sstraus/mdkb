@@ -100,11 +100,15 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// two same-named functions apart; version 2 is `owner_name` and
 /// `to_qualifier`, which tell it that `std::fs::write` is not this crate's
 /// `write`; version 3 is the qualifier itself reaching every language, which
-/// eight of the thirteen parsers used to drop before it was ever stored.
+/// eight of the thirteen parsers used to drop before it was ever stored;
+/// version 4 is a round of parser fixes that each change what a stored row
+/// says — six visibility levels instead of four, GDScript doc comments on
+/// declarations that never carried one, Kotlin companion objects as symbols and
+/// Kotlin extensions named after the type they extend.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 3;
+pub const RESOLUTION_VERSION: i64 = 4;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///
