@@ -2533,6 +2533,11 @@ pub async fn code_graph_impl(
     // One entry per hit, `None` when `impact` returns an id the index no longer
     // holds. Keeping the id alongside preserves that row in the prose instead of
     // silently shortening the list.
+    // How many entries got here on the strength of a bare name alone. Counted
+    // during the walk because the tier is what the walk returns; reporting it is
+    // the useful statement on this side, where every edge is resolved by
+    // construction and a `CallTarget` would say `Resolved` every time.
+    let mut unplaced_arrivals = 0usize;
     let hits: Vec<(
         crate::code::types::SymbolId,
         Option<crate::code::symbol::Symbol>,
@@ -2543,14 +2548,20 @@ pub async fn code_graph_impl(
             .map(|s| (s.id, Some(s)))
             .collect(),
         "callers" => facade
-            .get_calling_functions(symbol.id)
+            .get_callers_by_tier(symbol.id)
             .into_iter()
-            .map(|s| (s.id, Some(s)))
+            .map(|(s, tier)| {
+                unplaced_arrivals += usize::from(tier == crate::code::storage::TIER_UNPLACED);
+                (s.id, Some(s))
+            })
             .collect(),
         "impact" => facade
-            .get_impact_radius(symbol.id, params.max_depth)
+            .get_impact_by_tier(symbol.id, params.max_depth)
             .into_iter()
-            .map(|sid| (sid, facade.get_symbol(sid)))
+            .map(|(sid, tier)| {
+                unplaced_arrivals += usize::from(tier == crate::code::storage::TIER_UNPLACED);
+                (sid, facade.get_symbol(sid))
+            })
             .collect(),
         _ => {
             return Err(mcp_error(format!(
@@ -2604,17 +2615,19 @@ pub async fn code_graph_impl(
             unplaced_suffix(&unplaced)
         ),
         "callers" => format!(
-            "{} ({:?}) is called by {} function(s):\n\n",
-            symbol.name,
-            symbol.kind,
-            hits.len()
-        ),
-        _ => format!(
-            "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s):\n\n",
+            "{} ({:?}) is called by {} function(s).{}\n\n",
             symbol.name,
             symbol.kind,
             hits.len(),
-            params.max_depth
+            unplaced_suffix_arrivals(unplaced_arrivals, &symbol.name)
+        ),
+        _ => format!(
+            "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s).{}\n\n",
+            symbol.name,
+            symbol.kind,
+            hits.len(),
+            params.max_depth,
+            unplaced_suffix_arrivals(unplaced_arrivals, &symbol.name)
         ),
     };
     for (sid, sym) in &hits {
@@ -2628,6 +2641,16 @@ pub async fn code_graph_impl(
     }
 
     Ok(CodeGraphOutput { text, symbols })
+}
+
+/// How far to trust a callers or impact list: the entries that arrived through
+/// a call no rule could place name this symbol only because they name *a*
+/// symbol of this name.
+fn unplaced_suffix_arrivals(unplaced: usize, name: &str) -> String {
+    if unplaced == 0 {
+        return String::new();
+    }
+    format!(" {unplaced} arrived through an unqualified call and may belong to another `{name}`.")
 }
 
 /// The calls of `symbol_id` that no rule placed on an indexed symbol.

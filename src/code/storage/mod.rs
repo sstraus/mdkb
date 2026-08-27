@@ -4,4 +4,4 @@ pub mod repair;
 pub mod schema;
 
 mod sqlite;
-pub use sqlite::{CodeDb, NameMatch};
+pub use sqlite::{CodeDb, NameMatch, TIER_UNPLACED};

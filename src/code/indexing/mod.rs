@@ -628,20 +628,38 @@ impl IndexFacade {
             })
     }
 
+    /// Get functions/methods that call the given symbol, each with the nearest
+    /// resolution tier its call reached.
+    pub fn get_callers_by_tier(&self, symbol_id: SymbolId) -> Vec<(Symbol, i64)> {
+        self.db
+            .get_callers_by_tier(i64::from(symbol_id.value()))
+            .unwrap_or_else(|e| {
+                tracing::error!("DB error in get_callers_by_tier({symbol_id:?}): {e}");
+                Vec::new()
+            })
+    }
+
     /// Compute the impact radius: all symbols reachable from the given one
     /// within `max_depth` hops via call relationships.
     pub fn get_impact_radius(&self, start: SymbolId, max_depth: usize) -> Vec<SymbolId> {
-        let impact = self
-            .db
-            .get_impact_radius(i64::from(start.value()), max_depth as u32)
-            .unwrap_or_else(|e| {
-                tracing::error!("DB error in get_impact_radius({start:?}): {e}");
-                Vec::new()
-            });
-        impact
+        self.get_impact_by_tier(start, max_depth)
             .into_iter()
-            .map(|s| s.id)
-            .filter(|&id| id != start)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// The impact radius with the nearest resolution tier each symbol was
+    /// reached by.
+    pub fn get_impact_by_tier(&self, start: SymbolId, max_depth: usize) -> Vec<(SymbolId, i64)> {
+        self.db
+            .get_impact_by_tier(i64::from(start.value()), max_depth as u32)
+            .unwrap_or_else(|e| {
+                tracing::error!("DB error in get_impact_by_tier({start:?}): {e}");
+                Vec::new()
+            })
+            .into_iter()
+            .map(|(symbol, tier)| (symbol.id, tier))
+            .filter(|&(id, _)| id != start)
             .collect()
     }
 

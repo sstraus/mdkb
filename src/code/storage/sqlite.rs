@@ -720,41 +720,81 @@ impl CodeDb {
     /// Takes an id, not a name: two symbols can share a name, and which of them
     /// a call meant is the whole question the cascade answers.
     pub fn get_calling_functions(&self, symbol_id: i64) -> rusqlite::Result<Vec<Symbol>> {
+        Ok(self
+            .get_callers_by_tier(symbol_id)?
+            .into_iter()
+            .map(|(caller, _)| caller)
+            .collect())
+    }
+
+    /// Callers of `symbol_id`, each with the nearest tier its call reached.
+    ///
+    /// [`TIER_UNPLACED`] means no rule placed the call: the caller wrote a bare
+    /// name that this symbol happens to match, and so may every other symbol of
+    /// that name. The count of those is the only thing worth saying on the
+    /// callers side — an incoming edge is resolved by construction, so a
+    /// `CallTarget` here would be `Resolved` every time and distinguish nothing.
+    ///
+    /// A caller reached by more than one edge keeps the nearest: one firmly
+    /// placed call is enough to know it really calls this symbol.
+    pub fn get_callers_by_tier(&self, symbol_id: i64) -> rusqlite::Result<Vec<(Symbol, i64)>> {
         let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT DISTINCT {SYMBOL_COLUMNS_BARE} \
+            "SELECT {SYMBOL_COLUMNS_BARE}, MIN(c.tier) \
                  FROM ({}) c \
                  JOIN code_symbols s ON s.id = c.from_id \
-                 WHERE c.tier = c.nearest AND c.tier <> {TIER_EXTERNAL} AND c.sym_id = ?1",
+                 WHERE c.tier = c.nearest AND c.tier <> {TIER_EXTERNAL} AND c.sym_id = ?1 \
+                 GROUP BY s.id",
             resolved_edges("r.to_name = (SELECT name FROM code_symbols WHERE id = ?1)")
         ))?;
-        let rows = stmt.query_map([symbol_id], row_to_symbol)?;
+        let rows = stmt.query_map([symbol_id], |row| Ok((row_to_symbol(row)?, row.get(14)?)))?;
         rows.collect()
     }
 
     /// Transitive impact radius: all symbols that directly or indirectly
     /// depend on the given symbol, up to `max_depth` hops.
     ///
-    /// Walked hop by hop through [`get_calling_functions`] rather than in one
-    /// recursive statement. The cascade needs a window function to pick the
-    /// nearest scope per edge, and SQLite allows neither that nor a correlated
-    /// subquery inside the recursive arm of a CTE. Iterating keeps one
-    /// implementation of the rules instead of a second, divergent one; the cost
-    /// is a query per newly reached symbol, bounded by `seen`.
+    /// Walked hop by hop through [`get_callers_by_tier`](Self::get_callers_by_tier)
+    /// rather than in one recursive statement. The cascade needs a window
+    /// function to pick the nearest scope per edge, and SQLite allows neither
+    /// that nor a correlated subquery inside the recursive arm of a CTE.
+    /// Iterating keeps one implementation of the rules instead of a second,
+    /// divergent one; the cost is a query per newly reached symbol, bounded by
+    /// `seen`.
     pub fn get_impact_radius(
         &self,
         symbol_id: i64,
         max_depth: u32,
     ) -> rusqlite::Result<Vec<Symbol>> {
-        let mut seen: HashMap<i64, Symbol> = HashMap::new();
+        Ok(self
+            .get_impact_by_tier(symbol_id, max_depth)?
+            .into_iter()
+            .map(|(symbol, _)| symbol)
+            .collect())
+    }
+
+    /// The impact radius with the nearest tier each symbol was reached by.
+    ///
+    /// A symbol reached again by a nearer rule keeps the nearer tier, so
+    /// [`TIER_UNPLACED`] survives only for symbols that no walk placed any
+    /// better than "wrote this name somewhere".
+    pub fn get_impact_by_tier(
+        &self,
+        symbol_id: i64,
+        max_depth: u32,
+    ) -> rusqlite::Result<Vec<(Symbol, i64)>> {
+        let mut seen: HashMap<i64, (Symbol, i64)> = HashMap::new();
         let mut frontier = vec![symbol_id];
 
         // `max_depth` counts hops beyond the direct callers, which are depth 0.
         for _ in 0..=max_depth {
             let mut next = Vec::new();
             for id in frontier {
-                for caller in self.get_calling_functions(id)? {
+                for (caller, tier) in self.get_callers_by_tier(id)? {
                     let caller_id = i64::from(caller.id.value());
-                    if seen.insert(caller_id, caller).is_none() {
+                    if let Some((_, best)) = seen.get_mut(&caller_id) {
+                        *best = (*best).min(tier);
+                    } else {
+                        seen.insert(caller_id, (caller, tier));
                         next.push(caller_id);
                     }
                 }
@@ -957,6 +997,14 @@ type CandidateEdge = (i64, String, Option<String>, Vec<(i64, i64)>);
 /// Its candidates are not targets; they are same-named symbols the qualifier
 /// ruled out.
 pub const TIER_EXTERNAL: i64 = 3;
+
+/// The tier that says "no rule placed this call".
+///
+/// Its candidates are every symbol of that name anywhere in the index. Measured
+/// on this repository: 5230 edges at an average of 6.95 candidates each, against
+/// 1.03 to 1.54 for the tiers a rule reached. Narrowing them needs the type of
+/// the receiver, which is story 012-a344, not another rule over names.
+pub const TIER_UNPLACED: i64 = 7;
 
 /// Every `Calls` edge matching `filter`, paired with each candidate target and
 /// the nearest tier any candidate of that same edge reached.
@@ -1918,6 +1966,46 @@ mod tests {
         assert!(
             db.get_calling_functions(local).unwrap().is_empty(),
             "std::fs::write is not a call into this crate's write"
+        );
+    }
+
+    /// Two files define `helper`, neither in the calling file and neither
+    /// imported, so no rule places the call: both are reported as callers and
+    /// both arrivals are tier 7. Without the count the list reads as two callers
+    /// known to call this `helper`, when at most one of them does.
+    #[test]
+    fn a_caller_that_no_rule_placed_is_counted_as_such() {
+        let (_dir, db) = temp_db();
+        let (_, caller, imported, _elsewhere) = a_caller_and_two_distant_helpers(&db);
+
+        let arrivals = db.get_callers_by_tier(imported).unwrap();
+        assert_eq!(arrivals.len(), 1, "the caller is reported");
+        assert_eq!(
+            arrivals[0].1, TIER_UNPLACED,
+            "no rule placed it: {:?}",
+            arrivals[0].1
+        );
+        assert_eq!(
+            i64::from(arrivals[0].0.id.value()),
+            caller,
+            "the caller is the one that wrote the name"
+        );
+    }
+
+    /// A call the calling file itself defines is placed by rule 4, so nothing on
+    /// that list is reported as a bare-name arrival.
+    #[test]
+    fn a_caller_a_rule_placed_is_not_counted_as_unplaced() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller, _, _) = a_caller_and_two_distant_helpers(&db);
+        let local = function_in(&db, "helper", (here_file, "here.rs"), "crate::here", 10);
+
+        let arrivals = db.get_callers_by_tier(local).unwrap();
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(i64::from(arrivals[0].0.id.value()), caller);
+        assert_ne!(
+            arrivals[0].1, TIER_UNPLACED,
+            "rule 4 placed this call in the calling file"
         );
     }
 

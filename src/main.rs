@@ -1141,13 +1141,16 @@ MDKB_NO_DAEMON=1 {0} <cmd>                             # run in-process instead,
                 format_unplaced_calls(&unplaced, cli.format);
             }
             CodeCommand::Callers { name } => {
-                let (target, callers) = mdkb::cli::handlers::handle_code_callers(&cwd, &name)?;
+                let (target, callers, unplaced) =
+                    mdkb::cli::handlers::handle_code_callers(&cwd, &name)?;
                 format_code_graph("Called by", &target, &callers, cli.format);
+                format_unplaced_arrivals(unplaced, &target, cli.format);
             }
             CodeCommand::Impact { name, depth } => {
-                let (source, impacted) =
+                let (source, impacted, unplaced) =
                     mdkb::cli::handlers::handle_code_impact(&cwd, &name, depth)?;
                 format_code_graph("Impact radius", &source, &impacted, cli.format);
+                format_unplaced_arrivals(unplaced, &source, cli.format);
             }
             CodeCommand::Info => {
                 let info = mdkb::cli::handlers::handle_code_info(&cwd)?;
@@ -3432,6 +3435,25 @@ fn format_unplaced_calls(unplaced: &mdkb::core::code::UnplacedCalls, format: Out
             unplaced.unknown.join(", "),
         );
     }
+}
+
+/// Report how many entries arrived through a call no rule could place, so a
+/// long list is never read as more certain than it is.
+///
+/// Silent on the structured formats for the same reason as
+/// [`format_unplaced_calls`].
+fn format_unplaced_arrivals(
+    unplaced: usize,
+    target: &mdkb::code::symbol::Symbol,
+    format: OutputFormat,
+) {
+    if unplaced == 0 || !matches!(format, OutputFormat::Markdown | OutputFormat::Text) {
+        return;
+    }
+    println!(
+        "  {unplaced} of these arrived through an unqualified call and may belong to another `{}`",
+        target.name,
+    );
 }
 
 fn format_code_info(info: &mdkb::cli::handlers::CodeInfoResult, format: OutputFormat) {

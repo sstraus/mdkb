@@ -315,12 +315,18 @@ pub fn handle_code_calls(
     Ok((symbol, callees, unplaced))
 }
 /// Handle `mdkb code callers` - show what calls a symbol.
+///
+/// Returns the callers and how many of them arrived through a call no rule
+/// could place. That count is what tells the reader how far to trust the list:
+/// an unplaced call names this symbol only because it names *a* symbol of this
+/// name, and every other one of that name is just as good a candidate.
 pub fn handle_code_callers(
     root: &Path,
     name: &str,
 ) -> Result<(
     crate::code::symbol::Symbol,
     Vec<crate::code::symbol::Symbol>,
+    usize,
 )> {
     let facade = open_code_read_only(root)?;
 
@@ -328,10 +334,19 @@ pub fn handle_code_callers(
         .get_symbol_by_name(name)
         .ok_or_else(|| Error::other(format!("Symbol '{}' not found", name)))?;
 
-    let callers = facade.get_calling_functions(symbol.id);
-    Ok((symbol, callers))
+    let by_tier = facade.get_callers_by_tier(symbol.id);
+    let unplaced = by_tier
+        .iter()
+        .filter(|(_, tier)| *tier == crate::code::storage::TIER_UNPLACED)
+        .count();
+    let callers = by_tier.into_iter().map(|(caller, _)| caller).collect();
+    Ok((symbol, callers, unplaced))
 }
 /// Handle `mdkb code impact` - impact analysis from a symbol.
+///
+/// Reports the same unplaced count as [`handle_code_callers`], over the whole
+/// radius: a symbol no rule placed any better than the name it wrote is in the
+/// list on the strength of that name alone.
 pub fn handle_code_impact(
     root: &Path,
     name: &str,
@@ -339,6 +354,7 @@ pub fn handle_code_impact(
 ) -> Result<(
     crate::code::symbol::Symbol,
     Vec<crate::code::symbol::Symbol>,
+    usize,
 )> {
     let facade = open_code_read_only(root)?;
 
@@ -346,13 +362,17 @@ pub fn handle_code_impact(
         .get_symbol_by_name(name)
         .ok_or_else(|| Error::other(format!("Symbol '{}' not found", name)))?;
 
-    let impacted_ids = facade.get_impact_radius(symbol.id, depth);
-    let impacted: Vec<_> = impacted_ids
+    let by_tier = facade.get_impact_by_tier(symbol.id, depth);
+    let unplaced = by_tier
         .iter()
-        .filter_map(|&id| facade.get_symbol(id))
+        .filter(|(_, tier)| *tier == crate::code::storage::TIER_UNPLACED)
+        .count();
+    let impacted: Vec<_> = by_tier
+        .iter()
+        .filter_map(|&(id, _)| facade.get_symbol(id))
         .collect();
 
-    Ok((symbol, impacted))
+    Ok((symbol, impacted, unplaced))
 }
 /// Handle `mdkb code info` - show index statistics.
 pub fn handle_code_info(root: &Path) -> Result<CodeInfoResult> {
