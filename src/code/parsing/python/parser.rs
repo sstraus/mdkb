@@ -4,7 +4,9 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, node_range, unnamed_call_target,
+};
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -527,7 +529,9 @@ impl PythonParser {
 
         if node.kind() == "call" {
             if let Some(function_node) = node.child_by_field_name("function") {
-                if let Some(target) = extract_call_target(&function_node, code) {
+                if let Some(target) = extract_call_target(&function_node, code)
+                    .or_else(|| unnamed_call_target(function_node, code, &["lambda"]))
+                {
                     if let Some(ctx) = fn_ctx {
                         calls.push((ctx, target, node_range(*node)));
                     }
@@ -1022,6 +1026,45 @@ from pathlib import *
                 .any(|i| i.path == "collections.OrderedDict" && i.alias == Some("OD".to_string()))
         );
         assert!(imports.iter().any(|i| i.path == "pathlib" && i.is_glob));
+    }
+
+    #[test]
+    fn a_call_with_no_name_is_still_a_call() {
+        // Python dispatches through dicts and factories. Accepting only an
+        // identifier or an attribute meant those call sites left no trace, so a
+        // registry-driven module read as if it called nothing.
+        let mut parser = PythonParser::new().unwrap();
+
+        let code = r#"
+def f():
+    handlers[key]()
+    get_handler()()
+    (lambda x: x)(5)
+"#;
+
+        let calls: Vec<(&str, &str)> = parser
+            .find_calls_impl(code)
+            .into_iter()
+            .map(|(caller, target, _)| (caller, target))
+            .collect();
+
+        assert!(
+            calls.contains(&("f", "handlers[key]")),
+            "the indexed call must be recorded, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("f", "get_handler()")),
+            "the call on a returned callable must be recorded, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("f", "get_handler")),
+            "the inner call must still be there, got {calls:?}"
+        );
+        // A lambda literal calls nobody but itself.
+        assert!(
+            !calls.iter().any(|(_, target)| target.contains("lambda")),
+            "an immediately invoked lambda is not a call to anything, got {calls:?}"
+        );
     }
 
     #[test]

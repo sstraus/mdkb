@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, node_range, receiver_call_target,
+    LanguageParser, check_recursion_depth, node_range, receiver_call_target, unnamed_call_target,
 };
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -1202,7 +1202,8 @@ impl GoParser {
                     )
                 } else {
                     extract_function_name(&function_node, code)
-                };
+                }
+                .or_else(|| unnamed_call_target(function_node, code, &["func_literal"]));
                 if let (Some(target), Some(context)) = (target, function_context) {
                     calls.push((context, target, node_range(*node)));
                 }
@@ -1546,6 +1547,40 @@ impl LanguageParser for GoParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_call_with_no_name_is_still_a_call() {
+        // Go dispatches through maps and function values. Accepting only an
+        // identifier or a selector meant those call sites left no trace at all,
+        // so a function reading as "calls nothing" was really calling three.
+        let mut parser = GoParser::new().unwrap();
+        let code =
+            "package main\nfunc f() {\n\thandlers[k]()\n\t(*fn)()\n\tfunc() { run() }()\n}\n";
+
+        let calls: Vec<(&str, &str)> = parser
+            .find_calls(code)
+            .into_iter()
+            .map(|(caller, callee, _)| (caller, callee))
+            .collect();
+
+        assert!(
+            calls.contains(&("f", "handlers[k]")),
+            "the indexed call must be recorded, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("f", "(*fn)")),
+            "the call through a function value must be recorded, got {calls:?}"
+        );
+        // The literal calls nobody but itself; what it does call is recorded.
+        assert!(
+            !calls.iter().any(|(_, callee)| callee.starts_with("func(")),
+            "an immediately invoked literal is not a call to anything, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("f", "run")),
+            "the call inside the literal must still be there, got {calls:?}"
+        );
+    }
 
     /// Every call through a receiver used to be dropped on the floor. In Go
     /// that is most calls there are: `fmt.Println`, every package function,

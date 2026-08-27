@@ -285,6 +285,36 @@ pub fn receiver_call_target<'a>(
     }
 }
 
+/// How a callee with no name is written, when writing it down is worth an edge.
+///
+/// `handlers[key]()` and `(*fn)()` call something no name can be resolved to,
+/// but the call is there, and the expression is how the source refers to it.
+/// Recording it keeps "what does this function call" honest — dynamic dispatch
+/// shows up instead of vanishing — and it matches no symbol, so it cannot
+/// invent an edge to a map or a variable that is not a function.
+///
+/// Two callees give nothing back. One written over more than one line would put
+/// a paragraph where a name goes. One that *is* the function — an IIFE, a
+/// lambda literal — calls nothing a reader could look up, and `literal_kinds`
+/// names those per grammar.
+pub fn unnamed_call_target<'a>(
+    node: Node,
+    code: &'a str,
+    literal_kinds: &[&str],
+) -> Option<&'a str> {
+    if node.start_position().row != node.end_position().row {
+        return None;
+    }
+    let inner = match node.kind() {
+        "parenthesized_expression" => node.named_child(0).unwrap_or(node),
+        _ => node,
+    };
+    if literal_kinds.contains(&inner.kind()) {
+        return None;
+    }
+    Some(code[node.byte_range()].trim())
+}
+
 /// Is everything left of the last separator a chain of plain names?
 fn is_identifier_path(node: Node, receiver_field: &str, chain_kind: &str) -> bool {
     let Some(receiver) = node.child_by_field_name(receiver_field) else {

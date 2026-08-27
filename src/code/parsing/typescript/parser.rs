@@ -8,6 +8,7 @@ use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
     LanguageParser, check_recursion_depth, find_modifier_keyword, node_range, receiver_call_target,
+    unnamed_call_target,
 };
 use crate::code::symbol::{ScopeContext, Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -934,8 +935,13 @@ impl TypeScriptParser {
             _ => current_fn,
         };
 
-        if node.kind() == "call_expression" {
-            if let Some(function_node) = node.child_by_field_name("function") {
+        // `new Svc()` is a call to `Svc`, and its own node kind: recording only
+        // call_expression left out the most common call form the language has.
+        if matches!(node.kind(), "call_expression" | "new_expression") {
+            let callee = node
+                .child_by_field_name("function")
+                .or_else(|| node.child_by_field_name("constructor"));
+            if let Some(function_node) = callee {
                 let target = if function_node.kind() == "member_expression" {
                     // `Namespace.other`, `this.helper`: kept whole so the object
                     // becomes the qualifier. Skipping these used to drop every
@@ -949,7 +955,14 @@ impl TypeScriptParser {
                     )
                 } else {
                     extract_ts_function_name(&function_node, code)
-                };
+                }
+                .or_else(|| {
+                    unnamed_call_target(
+                        function_node,
+                        code,
+                        &["function_expression", "arrow_function"],
+                    )
+                });
                 if let (Some(target), Some(ctx)) = (target, fn_ctx) {
                     calls.push((ctx, target, node_range(*node)));
                 }
@@ -1608,6 +1621,53 @@ import './styles.css';
                 .any(|i| i.path == "./config" && i.is_type_only)
         );
         assert!(imports.iter().any(|i| i.path == "./styles.css"));
+    }
+
+    #[test]
+    fn constructing_something_is_calling_it() {
+        // `new_expression` is its own node kind, so a gate on `call_expression`
+        // alone recorded no constructor call anywhere — in TypeScript that is
+        // most of the graph. The indexed call has no name to resolve to, but it
+        // is still a call, and saying so beats a function that reads as calling
+        // nothing.
+        let mut parser = TypeScriptParser::new().unwrap();
+
+        let code = r#"
+function boot() {
+    new Service();
+    new pkg.Deep();
+    handlers[key]();
+    (() => run())();
+}
+"#;
+
+        let calls: Vec<(&str, &str)> = parser
+            .find_calls_impl(code)
+            .into_iter()
+            .map(|(caller, target, _)| (caller, target))
+            .collect();
+
+        assert!(
+            calls.contains(&("boot", "Service")),
+            "a constructor call is a call, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("boot", "pkg.Deep")),
+            "a qualified constructor keeps its qualifier, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("boot", "handlers[key]")),
+            "the indexed call must be recorded, got {calls:?}"
+        );
+        // The arrow calls nobody but itself; what it does call is recorded.
+        assert!(
+            !calls.iter().any(|(_, target)| target.contains("=>")),
+            "an immediately invoked arrow is not a call to anything, got {calls:?}"
+        );
+        assert!(
+            calls.contains(&("boot", "run")),
+            "the call inside the arrow must still be there, got {calls:?}"
+        );
     }
 
     #[test]
