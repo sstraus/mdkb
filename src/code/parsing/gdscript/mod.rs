@@ -217,7 +217,7 @@ impl GdscriptParser {
                             node_range(node),
                             (
                                 Some(code[node.byte_range()].trim().to_string()),
-                                None,
+                                extract_gdscript_doc(&node, code),
                                 module_path,
                                 visibility,
                             ),
@@ -239,7 +239,7 @@ impl GdscriptParser {
                         node_range(node),
                         (
                             Some(format!("enum {name}")),
-                            None,
+                            extract_gdscript_doc(&node, code),
                             module_path,
                             Visibility::Public,
                         ),
@@ -261,7 +261,7 @@ impl GdscriptParser {
                             node_range(node),
                             (
                                 Some(format!("signal {name}")),
-                                None,
+                                extract_gdscript_doc(&node, code),
                                 module_path,
                                 Visibility::Public,
                             ),
@@ -525,6 +525,13 @@ fn extract_gdscript_doc(node: &Node, code: &str) -> Option<String> {
     let mut lines = Vec::new();
     let mut prev = node.prev_sibling();
     while let Some(sib) = prev {
+        // `@rpc("any_peer")` and friends sit between the `##` block and the
+        // declaration as top-level siblings, so stopping at the first non-
+        // comment loses the documentation of every annotated declaration.
+        if sib.kind() == "annotation" {
+            prev = sib.prev_sibling();
+            continue;
+        }
         if sib.kind() == "comment" {
             let text = &code[sib.byte_range()];
             if text.starts_with("##") {
@@ -588,6 +595,52 @@ impl LanguageParser for GdscriptParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only classes and functions could carry documentation, and an annotation
+    /// between the `##` block and the declaration stopped even those: the
+    /// sibling walk broke on the first non-comment it met.
+    #[test]
+    fn every_documented_declaration_keeps_its_doc_comment() {
+        let mut parser = GdscriptParser::new().unwrap();
+        let code = "## Doc for rpc.\n\
+                    @rpc(\"any_peer\")\n\
+                    func handler():\n\
+                    \tpass\n\
+                    \n\
+                    ## Doc for var.\n\
+                    var speed := 1.0\n\
+                    \n\
+                    ## Doc for const.\n\
+                    const MAX = 10\n\
+                    \n\
+                    ## Doc for signal.\n\
+                    signal died\n\
+                    \n\
+                    ## Doc for enum.\n\
+                    enum State { IDLE, RUN }\n\
+                    \n\
+                    # Not a doc comment.\n\
+                    var plain := 2\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let doc = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+                .doc_comment
+                .as_ref()
+                .map(std::string::ToString::to_string)
+        };
+
+        assert_eq!(doc("handler"), Some("Doc for rpc.".to_string()));
+        assert_eq!(doc("speed"), Some("Doc for var.".to_string()));
+        assert_eq!(doc("MAX"), Some("Doc for const.".to_string()));
+        assert_eq!(doc("died"), Some("Doc for signal.".to_string()));
+        assert_eq!(doc("State"), Some("Doc for enum.".to_string()));
+        // A single `#` is a comment, not documentation.
+        assert_eq!(doc("plain"), None);
+    }
 
     const CALLS: &str = "\
 extends Node
