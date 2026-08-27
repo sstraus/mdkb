@@ -119,11 +119,13 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// qualification, where a nested class, a class attribute and a class-level
 /// alias were all stored under their bare name; version 11 is TypeScript
 /// documentation on a decorated method, which was dropped whenever a decorator
-/// was written between the comment and the method.
+/// was written between the comment and the method; version 12 is the
+/// TypeScript members that produced no symbol at all - interface signatures,
+/// abstract signatures, namespaces and whatever a static block declares.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 11;
+pub const RESOLUTION_VERSION: i64 = 12;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///

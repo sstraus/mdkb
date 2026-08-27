@@ -190,10 +190,70 @@ impl TypeScriptParser {
             }
 
             "interface_declaration" => {
+                let interface_name = node
+                    .child_by_field_name("name")
+                    .map(|n| code[n.byte_range()].to_string());
+
                 if let Some(symbol) =
                     self.process_interface(node, code, file_id, counter, module_path)
                 {
                     symbols.push(symbol);
+                    self.context.enter_scope(ScopeType::Class);
+                    let saved_cls = self.context.current_class().map(|s| s.to_string());
+                    self.context.set_current_class(interface_name);
+
+                    self.extract_interface_members(
+                        node,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        module_path,
+                    );
+
+                    self.context.exit_scope();
+                    self.context.set_current_class(saved_cls);
+                }
+            }
+
+            // `namespace App { ... }`, which reaches here wrapped in an
+            // expression_statement. It is what everything inside it belongs
+            // to, so it carries the module path for its body.
+            "internal_module" => {
+                let name = node
+                    .child_by_field_name("name")
+                    .map(|n| code[n.byte_range()].to_string());
+                let Some(name) = name else { return };
+
+                let symbol = self.create_symbol(
+                    counter.next_id(),
+                    name.clone(),
+                    SymbolKind::Module,
+                    file_id,
+                    node_range(node),
+                    (
+                        Some(format!("namespace {name}")),
+                        extract_jsdoc(&node, code),
+                        module_path,
+                        determine_ts_visibility(node, code),
+                    ),
+                );
+                symbols.push(symbol);
+
+                let inner_path = if module_path.is_empty() {
+                    name
+                } else {
+                    format!("{module_path}.{name}")
+                };
+                for child in node.children(&mut node.walk()) {
+                    self.extract_symbols_from_node(
+                        child,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        (&inner_path, depth + 1),
+                    );
                 }
             }
 
@@ -348,7 +408,9 @@ impl TypeScriptParser {
         if let Some(body) = class_node.child_by_field_name("body") {
             for child in body.children(&mut body.walk()) {
                 match child.kind() {
-                    "method_definition" => {
+                    // An abstract signature declares a member as much as a
+                    // definition does; it just has no body to walk.
+                    "method_definition" | "abstract_method_signature" => {
                         let method_name = child
                             .child_by_field_name("name")
                             .map(|n| code[n.byte_range()].to_string());
@@ -385,8 +447,68 @@ impl TypeScriptParser {
                             symbols.push(symbol);
                         }
                     }
+                    // A static block runs once when the class is defined.
+                    // What it declares is declared.
+                    "class_static_block" => {
+                        self.extract_symbols_from_node(
+                            child,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            (module_path, depth + 1),
+                        );
+                    }
                     _ => {}
                 }
+            }
+        }
+    }
+
+    /// The members an interface declares.
+    ///
+    /// They are named like class members — bare, with the interface in their
+    /// scope — because that is what every other member of a type is stored as.
+    fn extract_interface_members(
+        &mut self,
+        interface_node: Node,
+        code: &str,
+        file_id: FileId,
+        counter: &mut SymbolCounter,
+        symbols: &mut Vec<Symbol>,
+        module_path: &str,
+    ) {
+        let Some(body) = interface_node.child_by_field_name("body") else {
+            return;
+        };
+        for child in body.children(&mut body.walk()) {
+            let symbol = match child.kind() {
+                "method_signature" => {
+                    self.process_method(child, code, file_id, counter, module_path)
+                }
+                "property_signature" => {
+                    self.process_property(child, code, file_id, counter, module_path)
+                }
+                // An index signature has no name to be found by, so it is
+                // filed under the only handle it has. Its signature carries
+                // what it actually says.
+                "index_signature" => Some(self.create_symbol(
+                    counter.next_id(),
+                    "[index]".to_string(),
+                    SymbolKind::Field,
+                    file_id,
+                    node_range(child),
+                    (
+                        Some(code[child.byte_range()].trim().to_string()),
+                        None,
+                        module_path,
+                        Visibility::Public,
+                    ),
+                )),
+                _ => None,
+            };
+            if let Some(symbol) = symbol {
+                symbols.push(symbol);
             }
         }
     }
@@ -1745,6 +1867,100 @@ function processData(data: string[]): string[] {
                 .unwrap()
                 .contains("Process data")
         );
+    }
+
+    #[test]
+    fn every_member_a_type_declares_produces_a_symbol() {
+        // An interface body was never walked, a namespace produced nothing at
+        // all, and an abstract signature and a static block fell to the
+        // catch-all — so the parser's answer to "what does this file declare"
+        // left out most of what a typed TypeScript codebase writes.
+        let mut parser = TypeScriptParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+namespace App {
+    export const VERSION = "1";
+
+    namespace Inner {
+        export function boot(): void {}
+    }
+}
+
+interface Repo {
+    /** Finds one. */
+    find(id: string): User;
+    readonly size: number;
+    [key: string]: unknown;
+}
+
+abstract class Base {
+    abstract run(): void;
+
+    static {
+        const started = true;
+    }
+}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_ref()).collect();
+        let symbol = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("no symbol named {name}, got {names:?}"))
+        };
+
+        assert_eq!(symbol("App").kind, SymbolKind::Module);
+        assert_eq!(symbol("Inner").kind, SymbolKind::Module);
+        // A namespace is what its contents belong to, which is what a module
+        // path is for — `VERSION` in `App` is not the `VERSION` next door.
+        assert_eq!(symbol("Inner").module_path.as_deref(), Some("App"));
+        assert_eq!(symbol("VERSION").module_path.as_deref(), Some("App"));
+        assert_eq!(symbol("boot").module_path.as_deref(), Some("App.Inner"));
+
+        assert_eq!(symbol("find").kind, SymbolKind::Method);
+        assert_eq!(symbol("find").doc_comment.as_deref(), Some("Finds one."));
+        assert_eq!(symbol("size").kind, SymbolKind::Field);
+        assert_eq!(symbol("[index]").kind, SymbolKind::Field);
+
+        assert_eq!(symbol("run").kind, SymbolKind::Method);
+        // A static block runs at class definition time; what it declares is
+        // still declared.
+        assert_eq!(symbol("started").kind, SymbolKind::Constant);
+    }
+
+    #[test]
+    fn parse_symbols_and_find_defines_name_the_same_members() {
+        // The two walks answer the same question from different sides. When
+        // they disagree, a call resolves to a member the symbol table says
+        // does not exist.
+        let mut parser = TypeScriptParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+interface Repo {
+    find(id: string): User;
+}
+
+abstract class Base {
+    abstract run(): void;
+    stop(): void {}
+}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_ref()).collect();
+
+        for (owner, member, _) in parser.find_defines_impl(code) {
+            assert!(
+                names.contains(&member),
+                "find_defines reports {owner}.{member}, but parse_symbols does not: {names:?}"
+            );
+        }
     }
 
     #[test]
