@@ -113,11 +113,13 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// which produced no symbol at all, and qualified types, which were invisible
 /// wherever the parser looked for a type; version 8 is Go doc comments, which
 /// used to swallow a trailing comment, a toolchain directive and anything a
-/// blank line above, and to hand a group comment to every type in the group.
+/// blank line above, and to hand a group comment to every type in the group;
+/// version 9 is Python visibility, which used to read one underscore and two
+/// as the same thing and to call every dunder private.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 8;
+pub const RESOLUTION_VERSION: i64 = 9;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///

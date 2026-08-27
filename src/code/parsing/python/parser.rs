@@ -611,9 +611,22 @@ impl PythonParser {
 // ── Free helpers ────────────────────────────────────────────────────────
 
 /// Python visibility: underscore prefix = private, dunder = private.
+/// How far a Python name reaches, by the three conventions Python has for it.
+///
+/// `__init__` and its kind are the language's own protocol: the runtime calls
+/// them from outside, and every caller of the class relies on them, so they are
+/// public however many underscores they wear. A leading `__` without the
+/// closing pair is mangled by the compiler into `_Class__name` and cannot be
+/// reached from outside its class — that one really is private. A single
+/// leading underscore is the soft convention: internal to the module, and left
+/// out of `from x import *`.
 fn determine_python_visibility(name: &str) -> Visibility {
-    if name.starts_with('_') {
+    if name.starts_with("__") && name.ends_with("__") {
+        Visibility::Public
+    } else if name.starts_with("__") {
         Visibility::Private
+    } else if name.starts_with('_') {
+        Visibility::Module
     } else {
         Visibility::Public
     }
@@ -865,7 +878,7 @@ class MyClass:
                 .iter()
                 .any(|s| s.name.as_ref() == "_private_function"
                     && s.kind == SymbolKind::Function
-                    && s.visibility == Visibility::Private)
+                    && s.visibility == Visibility::Module)
         );
         assert!(
             symbols
@@ -1152,33 +1165,44 @@ def sync_function():
         let file_id = FileId::new(1).unwrap();
         let mut counter = SymbolCounter::new();
 
+        // Python has three underscore conventions, and they say three
+        // different things. Reading them as two makes `__init__` — which every
+        // caller of the class uses — look as unreachable as a mangled name.
         let code = r#"
 def public_func():
     pass
 
-def _private_func():
+def _internal_func():
     pass
 
-def __dunder_func():
-    pass
+class Widget:
+    def __init__(self):
+        pass
+
+    def __repr__(self):
+        return ""
+
+    def __mangled(self):
+        pass
 "#;
 
         let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let visibility = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref().ends_with(name))
+                .unwrap_or_else(|| panic!("no symbol named {name}"))
+                .visibility
+        };
 
-        assert!(
-            symbols
-                .iter()
-                .any(|s| s.name.as_ref() == "public_func" && s.visibility == Visibility::Public)
-        );
-        assert!(
-            symbols
-                .iter()
-                .any(|s| s.name.as_ref() == "_private_func" && s.visibility == Visibility::Private)
-        );
-        assert!(
-            symbols
-                .iter()
-                .any(|s| s.name.as_ref() == "__dunder_func" && s.visibility == Visibility::Private)
-        );
+        assert_eq!(visibility("public_func"), Visibility::Public);
+        // A single underscore asks callers outside the module to stay away. It
+        // does not hide anything from the module itself.
+        assert_eq!(visibility("_internal_func"), Visibility::Module);
+        // The runtime calls these. They are the class's public surface.
+        assert_eq!(visibility("__init__"), Visibility::Public);
+        assert_eq!(visibility("__repr__"), Visibility::Public);
+        // This one the compiler renames. Nothing outside the class can reach it.
+        assert_eq!(visibility("__mangled"), Visibility::Private);
     }
 }
