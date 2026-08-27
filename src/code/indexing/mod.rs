@@ -428,6 +428,11 @@ impl IndexFacade {
 
         let mut changed: Vec<PathBuf> = Vec::new();
         let mut deleted: Vec<PathBuf> = Vec::new();
+        // How many of the changed files were marked changed by a migration
+        // rather than by an edit. Without this a contract bump and a genuine
+        // mass edit produce the same line in the log, and a full reparse nobody
+        // asked for cannot be told from one that was earned.
+        let mut migrated = 0usize;
 
         for path in paths {
             let rel_key = rel_key(path, root);
@@ -454,6 +459,11 @@ impl IndexFacade {
                     // Unchanged — skip
                 }
                 _ => {
+                    // The empty hash is what `migrate_resolution_version`
+                    // writes; a file that was merely edited still holds the
+                    // hash it was indexed under.
+                    migrated +=
+                        usize::from(indexed_hashes.get(&rel_key).is_some_and(String::is_empty));
                     changed.push(path.clone());
                 }
             }
@@ -468,7 +478,7 @@ impl IndexFacade {
         }
 
         tracing::info!(
-            "Incremental reindex: {} changed, {} deleted",
+            "Incremental reindex: {} changed ({migrated} marked by a parse-contract migration), {} deleted",
             changed.len(),
             deleted.len()
         );
@@ -1684,6 +1694,45 @@ pub fn world() {
         let stats = facade.update(src_dir.path()).unwrap();
         assert_eq!(stats.files_removed, 0);
         assert_eq!(facade.file_count(), 1);
+    }
+
+    /// A parse-contract migration and a mass edit both hand `reindex_files` the
+    /// whole tree. Only the log can tell them apart, and the difference decides
+    /// whether a full reparse was earned or was nobody's intention.
+    #[test]
+    fn a_file_marked_by_a_migration_is_counted_apart_from_an_edit() {
+        let src = tempfile::tempdir().unwrap();
+        fs::write(src.path().join("a.rs"), "pub fn aaa() {}").unwrap();
+        fs::write(src.path().join("b.rs"), "pub fn bbb() {}").unwrap();
+
+        let db = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src.path()).unwrap();
+
+        // `a.rs` as a migration leaves it: same bytes, no stored hash.
+        facade
+            .db
+            .conn()
+            .execute(
+                "UPDATE code_files SET hash = '' WHERE rel_path = 'a.rs'",
+                [],
+            )
+            .unwrap();
+        // `b.rs` as an edit leaves it: a stored hash that no longer matches.
+        fs::write(src.path().join("b.rs"), "pub fn ccc() {}").unwrap();
+
+        let paths = vec![src.path().join("a.rs"), src.path().join("b.rs")];
+        let stats = facade.reindex_files(src.path(), &paths).unwrap();
+
+        assert_eq!(stats.files_indexed, 2, "both were reparsed");
+        assert!(
+            facade.get_symbol_by_name("aaa").is_some(),
+            "the migrated file kept its symbol"
+        );
+        assert!(
+            facade.get_symbol_by_name("ccc").is_some(),
+            "the edit landed"
+        );
     }
 
     #[test]
