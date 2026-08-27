@@ -255,8 +255,7 @@ impl GdscriptParser {
                         let symbol = self.create_symbol(
                             counter.next_id(),
                             name.to_string(),
-                            SymbolKind::Variable,
-                            // signals as variables
+                            SymbolKind::Signal,
                             file_id,
                             node_range(node),
                             (
@@ -640,6 +639,29 @@ mod tests {
         assert_eq!(doc("State"), Some("Doc for enum.".to_string()));
         // A single `#` is a comment, not documentation.
         assert_eq!(doc("plain"), None);
+    }
+
+    /// A signal is a declared event, not state: nothing reads it and nothing
+    /// assigns it. Recording it as a Variable made every signal in a project
+    /// answer a question about variables.
+    #[test]
+    fn a_signal_is_not_reported_as_a_variable() {
+        let mut parser = GdscriptParser::new().unwrap();
+        let code = "signal died\n\
+                    signal hit(damage: int)\n\
+                    var health := 10\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+        };
+
+        assert_eq!(of("died").kind, SymbolKind::Signal);
+        assert_eq!(of("hit").kind, SymbolKind::Signal);
+        assert_eq!(of("health").kind, SymbolKind::Variable);
     }
 
     const CALLS: &str = "\

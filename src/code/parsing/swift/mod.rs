@@ -110,6 +110,10 @@ impl SwiftParser {
                 let kind = match keyword {
                     "struct" => SymbolKind::Struct,
                     "enum" => SymbolKind::Enum,
+                    // An actor is a reference type like a class, but its state
+                    // is isolated and reached asynchronously from outside, so
+                    // it is not one of the answers to a question about classes.
+                    "actor" => SymbolKind::Actor,
                     _ => SymbolKind::Class,
                 };
 
@@ -570,6 +574,32 @@ mod tests {
         assert_eq!(level("e"), Visibility::Private);
         assert_eq!(level("f"), Visibility::Crate, "Swift default is internal");
         assert_ne!(level("b"), level("c"), "the story's criterion 2");
+    }
+
+    /// An `actor` is not a class: its state is isolated and every access to it
+    /// from outside is asynchronous. The keyword check knew only `struct` and
+    /// `enum`, so every actor answered as a Class.
+    #[test]
+    fn an_actor_is_not_reported_as_a_class() {
+        let mut parser = SwiftParser::new().unwrap();
+        let code = "actor Counter {}\n\
+                    class Plain {}\n\
+                    struct Point {}\n\
+                    enum Suit {}\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let of = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+        };
+
+        assert_eq!(of("Counter").kind, SymbolKind::Actor);
+        assert_eq!(of("Plain").kind, SymbolKind::Class);
+        assert_eq!(of("Point").kind, SymbolKind::Struct);
+        assert_eq!(of("Suit").kind, SymbolKind::Enum);
+        assert_eq!(of("Counter").signature.as_deref(), Some("actor Counter"));
     }
 
     #[test]

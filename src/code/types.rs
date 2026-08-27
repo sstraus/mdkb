@@ -30,6 +30,9 @@ pub struct Range {
 }
 
 /// Classification of a symbol extracted from source code.
+///
+/// The order is the storage format: `as_u8` is the declaration position, so a
+/// new kind goes on the end even when it would read better next to a relative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     Function,
@@ -46,6 +49,14 @@ pub enum SymbolKind {
     Parameter,
     TypeAlias,
     Macro,
+    /// Swift's `actor`: a reference type whose state is isolated. Reporting it
+    /// as a Class makes it answer a question about classes that it is not one
+    /// of the answers to.
+    Actor,
+    /// A declared event: GDScript's `signal`. It is not a variable — nothing
+    /// reads or assigns it — and recording it as one made every signal
+    /// indistinguishable from ordinary state.
+    Signal,
 }
 
 /// Heap-allocated compact string for symbol names and paths.
@@ -137,7 +148,7 @@ impl fmt::Display for Range {
 
 impl SymbolKind {
     /// Total number of symbol kind variants.
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 16;
 
     /// Convert to a u8 discriminant for compact storage.
     pub fn as_u8(self) -> u8 {
@@ -161,6 +172,8 @@ impl SymbolKind {
             11 => Some(Self::Parameter),
             12 => Some(Self::TypeAlias),
             13 => Some(Self::Macro),
+            14 => Some(Self::Actor),
+            15 => Some(Self::Signal),
             _ => None,
         }
     }
@@ -185,6 +198,8 @@ impl FromStr for SymbolKind {
             "Parameter" | "parameter" => Ok(Self::Parameter),
             "TypeAlias" | "type_alias" => Ok(Self::TypeAlias),
             "Macro" | "macro" => Ok(Self::Macro),
+            "Actor" | "actor" => Ok(Self::Actor),
+            "Signal" | "signal" => Ok(Self::Signal),
             _ => Err("Unknown symbol kind"),
         }
     }
@@ -207,6 +222,8 @@ impl fmt::Display for SymbolKind {
             Self::Parameter => "Parameter",
             Self::TypeAlias => "TypeAlias",
             Self::Macro => "Macro",
+            Self::Actor => "Actor",
+            Self::Signal => "Signal",
         })
     }
 }
@@ -329,6 +346,8 @@ mod tests {
             SymbolKind::Parameter,
             SymbolKind::TypeAlias,
             SymbolKind::Macro,
+            SymbolKind::Actor,
+            SymbolKind::Signal,
         ];
         assert_eq!(kinds.len(), SymbolKind::COUNT);
     }
@@ -339,7 +358,7 @@ mod tests {
             let kind = SymbolKind::from_u8(i).unwrap();
             assert_eq!(kind.as_u8(), i);
         }
-        assert!(SymbolKind::from_u8(14).is_none());
+        assert!(SymbolKind::from_u8(16).is_none());
     }
 
     #[test]

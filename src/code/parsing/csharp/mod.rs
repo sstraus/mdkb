@@ -344,6 +344,15 @@ impl CSharpParser {
         let name_node = node.child_by_field_name("name")?;
         let name = &code[name_node.byte_range()];
 
+        // A partial type is one type written in several places, and each
+        // fragment gets its own symbol because a symbol holds one file and one
+        // range. Saying `partial` is what stops each fragment from reading as
+        // the whole declaration.
+        let is_partial = node
+            .children(&mut node.walk())
+            .any(|c| c.kind() == "modifier" && &code[c.byte_range()] == "partial");
+        let modifier = if is_partial { "partial " } else { "" };
+
         Some(self.create_symbol(
             counter.next_id(),
             name.to_string(),
@@ -351,7 +360,7 @@ impl CSharpParser {
             file_id,
             node_range(node),
             (
-                Some(format!("{keyword} {name}")),
+                Some(format!("{modifier}{keyword} {name}")),
                 extract_csharp_doc(&node, code),
                 module_path,
                 determine_csharp_visibility(node, code),
@@ -857,6 +866,31 @@ class App {
 
         assert_eq!(level("Local"), Visibility::Module);
         assert_ne!(level("Local"), level("Other"));
+    }
+
+    /// A partial class is one type written in several places. The parser emits
+    /// one symbol per fragment, and a symbol carries a single file and range,
+    /// so it cannot emit one symbol for the whole type. What it can do is stop
+    /// each fragment from claiming to be the whole class.
+    #[test]
+    fn a_partial_fragment_says_it_is_one() {
+        let mut parser = CSharpParser::new().unwrap();
+        let code = "partial class Point { }\nclass Whole { }\npartial struct Pair { }\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let sig = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+                .signature
+                .as_deref()
+                .map(str::to_string)
+        };
+
+        assert_eq!(sig("Point"), Some("partial class Point".to_string()));
+        assert_eq!(sig("Whole"), Some("class Whole".to_string()));
+        assert_eq!(sig("Pair"), Some("partial struct Pair".to_string()));
     }
 
     #[test]

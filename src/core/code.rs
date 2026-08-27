@@ -152,7 +152,7 @@ pub fn parse_kind_filter(kind_filter: Option<&str>) -> Result<Option<String>> {
         Error::other(format!(
             "Unknown symbol kind: '{kind_str}'. Valid kinds: function, method, struct, \
              enum, trait, interface, class, module, variable, constant, field, \
-             parameter, type_alias, macro"
+             parameter, type_alias, macro, actor, signal"
         ))
     })?;
     Ok(Some(kind.to_string()))

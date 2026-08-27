@@ -104,11 +104,14 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// version 4 is a round of parser fixes that each change what a stored row
 /// says — six visibility levels instead of four, GDScript doc comments on
 /// declarations that never carried one, Kotlin companion objects as symbols and
-/// Kotlin extensions named after the type they extend.
+/// Kotlin extensions named after the type they extend; version 5 finishes that
+/// round — PHP enum cases, promoted properties and namespaces, and the Actor and
+/// Signal kinds, which a Swift actor and a GDScript signal used to be stored
+/// under the wrong number for.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 4;
+pub const RESOLUTION_VERSION: i64 = 5;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///
