@@ -822,11 +822,11 @@ fn determine_java_visibility(node: Node, code: &str) -> Visibility {
                 return Visibility::Private;
             }
             // package-private (no modifier)
-            return Visibility::Crate;
+            return Visibility::Package;
         }
     }
     // No modifiers = package-private
-    Visibility::Crate
+    Visibility::Package
 }
 
 /// Check if a field is `static final` (constant).
@@ -1018,6 +1018,39 @@ public class Calculator {
                 .iter()
                 .any(|s| s.name.as_ref() == "Calculator.value" && s.kind == SymbolKind::Field)
         );
+    }
+
+    /// Java's default access is the package, not the whole compilation unit.
+    /// While the enum had no `Package` level it landed on `Crate`, which is what
+    /// Kotlin's `internal` and C#'s `internal` mean: a whole module. The two are
+    /// different reaches and an answer about the API surface of a package cannot
+    /// tell them apart while they share a level.
+    #[test]
+    fn package_private_is_not_the_same_reach_as_a_whole_module() {
+        let mut parser = JavaParser::new().unwrap();
+        let mut counter = SymbolCounter::new();
+        let code = r"
+class Hidden {
+    void helper() {}
+    static void util() {}
+    public void exposed() {}
+}
+";
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let level = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+                .visibility
+        };
+
+        assert_eq!(level("Hidden"), Visibility::Package);
+        assert_eq!(level("Hidden.helper"), Visibility::Package);
+        // `static` is a modifier but not an access one, so this reaches the
+        // decision through the other branch and must land on the same level.
+        assert_eq!(level("Hidden.util"), Visibility::Package);
+        assert_eq!(level("Hidden.exposed"), Visibility::Public);
     }
 
     #[test]

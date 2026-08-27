@@ -705,6 +705,8 @@ fn determine_csharp_visibility(node: Node, code: &str) -> Visibility {
         if child.kind() == "modifier" {
             match &code[child.byte_range()] {
                 "public" => return Visibility::Public,
+                // `file` (C# 11) is the same reach as Swift's `fileprivate`.
+                "file" => return Visibility::Module,
                 "protected" => protected = true,
                 "internal" => internal = true,
                 "private" => private = true,
@@ -834,6 +836,27 @@ class App {
         assert_eq!(level("G"), Visibility::Private, "C# default");
         assert_ne!(level("B"), level("D"), "the story's criterion 3");
         assert_ne!(level("C"), level("F"), "the story's criterion 4");
+    }
+
+    /// `file` (C# 11) confines a type to its source file. It is not an access
+    /// modifier the collector above knows, so it used to fall through to the
+    /// `private` default and become indistinguishable from a private member.
+    #[test]
+    fn a_file_scoped_type_is_not_reported_as_private() {
+        let mut parser = CSharpParser::new().unwrap();
+        let code = "file class Local {}\nclass Other {}\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let level = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+                .visibility
+        };
+
+        assert_eq!(level("Local"), Visibility::Module);
+        assert_ne!(level("Local"), level("Other"));
     }
 
     #[test]
