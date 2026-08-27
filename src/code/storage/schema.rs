@@ -117,11 +117,13 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// version 9 is Python visibility, which used to read one underscore and two
 /// as the same thing and to call every dunder private; version 10 is Python
 /// qualification, where a nested class, a class attribute and a class-level
-/// alias were all stored under their bare name.
+/// alias were all stored under their bare name; version 11 is TypeScript
+/// documentation on a decorated method, which was dropped whenever a decorator
+/// was written between the comment and the method.
 /// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 10;
+pub const RESOLUTION_VERSION: i64 = 11;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///

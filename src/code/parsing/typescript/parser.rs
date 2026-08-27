@@ -1154,7 +1154,12 @@ fn extract_jsdoc(node: &Node, code: &str) -> Option<String> {
         *node
     };
 
-    let sibling = search_node.prev_sibling()?;
+    // Inside a class body the decorators are siblings written between the
+    // comment and the method, so step over as many as there are.
+    let mut sibling = search_node.prev_sibling()?;
+    while sibling.kind() == "decorator" {
+        sibling = sibling.prev_sibling()?;
+    }
     if sibling.kind() != "comment" {
         return None;
     }
@@ -1740,5 +1745,51 @@ function processData(data: string[]): string[] {
                 .unwrap()
                 .contains("Process data")
         );
+    }
+
+    #[test]
+    fn a_decorator_does_not_stand_between_a_method_and_its_doc() {
+        // In a class body the decorators are siblings written between the
+        // comment and the method, so a lookup that takes exactly one step back
+        // lands on `@Log()` and gives up. Decorated methods are the norm in
+        // Angular and NestJS, so this is most of the documentation in a
+        // codebase, not an edge case.
+        let mut parser = TypeScriptParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+class Service {
+    /** Runs the job. */
+    @Log()
+    @Retry(3)
+    run(): void {}
+
+    /** Stops the job. */
+    stop(): void {}
+
+    // Not documentation, just a note.
+    @Log()
+    reset(): void {}
+}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let doc = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref().ends_with(name))
+                .unwrap_or_else(|| panic!("no symbol named {name}"))
+                .doc_comment
+                .as_deref()
+                .unwrap_or("")
+                .to_string()
+        };
+
+        assert_eq!(doc("run"), "Runs the job.");
+        assert_eq!(doc("stop"), "Stops the job.");
+        // Stepping over the decorator must not turn a plain comment into
+        // documentation: only `/**` is a doc comment.
+        assert_eq!(doc("reset"), "");
     }
 }
