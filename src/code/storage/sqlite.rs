@@ -1091,10 +1091,14 @@ fn row_to_symbol(row: &rusqlite::Row<'_>) -> rusqlite::Result<Symbol> {
         line_end.unwrap_or(line_start),
         col_end.map_or(0, |v| v as u16),
     );
+    // The numbers are the enum's own discriminants, which are pinned in its
+    // declaration precisely because they are stored here.
     let visibility = match visibility_val {
         0 => Visibility::Public,
         1 => Visibility::Crate,
         2 => Visibility::Module,
+        4 => Visibility::Package,
+        5 => Visibility::Restricted,
         _ => Visibility::Private,
     };
     let scope_context = scope_context_str.and_then(|s| {

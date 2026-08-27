@@ -693,18 +693,33 @@ fn determine_csharp_visibility(node: Node, code: &str) -> Visibility {
     // Inspect the declaration's `modifier` AST children rather than substring-
     // matching the whole text (BUG-C1): `private string publicKey;` must not be
     // read as Public. tree-sitter-c-sharp emits each modifier as a `modifier` node.
+    // Collected rather than returned on the first hit: two of C#'s six levels
+    // are written as a pair, and the first word of each pair is the *wrong*
+    // answer on its own. `protected internal` is the assembly OR any derived
+    // type, which is wider than either half; `private protected` is a derived
+    // type AND the same assembly, which is narrower than either.
+    let mut protected = false;
+    let mut internal = false;
+    let mut private = false;
     for child in node.children(&mut node.walk()) {
         if child.kind() == "modifier" {
             match &code[child.byte_range()] {
                 "public" => return Visibility::Public,
-                "internal" => return Visibility::Crate,
-                "protected" => return Visibility::Module,
-                "private" => return Visibility::Private,
+                "protected" => protected = true,
+                "internal" => internal = true,
+                "private" => private = true,
                 _ => {}
             }
         }
     }
-    Visibility::Private // C# default is private
+    match (protected, internal, private) {
+        (true, true, _) => Visibility::Package,
+        (true, _, true) => Visibility::Restricted,
+        (true, ..) => Visibility::Module,
+        (_, true, _) => Visibility::Crate,
+        // C# default is private, and so is a bare `private`.
+        _ => Visibility::Private,
+    }
 }
 
 fn extract_csharp_doc(node: &Node, code: &str) -> Option<String> {
@@ -781,6 +796,45 @@ impl LanguageParser for CSharpParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two of C#'s six levels are written as a pair, and returning on the first
+    /// modifier reported each pair as its first word: `protected internal` as
+    /// `protected` (narrower than it is) and `private protected` as `private`
+    /// (narrower still).
+    #[test]
+    fn a_composite_access_level_is_not_reported_as_its_first_word() {
+        let mut parser = CSharpParser::new().unwrap();
+        let code = r#"
+class App {
+    public int A;
+    protected internal int B;
+    private protected int C;
+    protected int D;
+    internal int E;
+    private int F;
+    int G;
+}
+"#;
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let level = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref().ends_with(name))
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+                .visibility
+        };
+
+        assert_eq!(level("A"), Visibility::Public);
+        assert_eq!(level("B"), Visibility::Package, "protected internal");
+        assert_eq!(level("C"), Visibility::Restricted, "private protected");
+        assert_eq!(level("D"), Visibility::Module, "protected");
+        assert_eq!(level("E"), Visibility::Crate, "internal");
+        assert_eq!(level("F"), Visibility::Private);
+        assert_eq!(level("G"), Visibility::Private, "C# default");
+        assert_ne!(level("B"), level("D"), "the story's criterion 3");
+        assert_ne!(level("C"), level("F"), "the story's criterion 4");
+    }
 
     #[test]
     fn test_parse_class_with_methods() {

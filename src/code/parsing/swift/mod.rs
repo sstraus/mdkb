@@ -438,12 +438,23 @@ impl SwiftParser {
 
 fn determine_swift_visibility(node: Node, code: &str) -> Visibility {
     // Inspect modifier AST nodes, not substrings of the declaration text (BUG-C1).
+    // `package` (Swift 5.9) has to be in this list or it never reaches the match
+    // and lands on the `internal` default, which is a narrower level than it
+    // means.
     match find_modifier_keyword(
         node,
         code,
-        &["public", "open", "internal", "fileprivate", "private"],
+        &[
+            "public",
+            "open",
+            "package",
+            "internal",
+            "fileprivate",
+            "private",
+        ],
     ) {
         Some("public" | "open") => Visibility::Public,
+        Some("package") => Visibility::Package,
         Some("fileprivate") => Visibility::Module,
         Some("private") => Visibility::Private,
         _ => Visibility::Crate, // Swift default is internal
@@ -529,6 +540,37 @@ impl LanguageParser for SwiftParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `package` arrived in Swift 5.9 and was absent from the keyword list, so
+    /// it fell through to the `internal` default and became indistinguishable
+    /// from it — a narrower level than the source declares.
+    #[test]
+    fn package_is_distinguishable_from_internal() {
+        let mut parser = SwiftParser::new().unwrap();
+        let code = "public func a() {}\n\
+                    package func b() {}\n\
+                    internal func c() {}\n\
+                    fileprivate func d() {}\n\
+                    private func e() {}\n\
+                    func f() {}\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let level = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+                .visibility
+        };
+
+        assert_eq!(level("a"), Visibility::Public);
+        assert_eq!(level("b"), Visibility::Package);
+        assert_eq!(level("c"), Visibility::Crate);
+        assert_eq!(level("d"), Visibility::Module);
+        assert_eq!(level("e"), Visibility::Private);
+        assert_eq!(level("f"), Visibility::Crate, "Swift default is internal");
+        assert_ne!(level("b"), level("c"), "the story's criterion 2");
+    }
 
     #[test]
     fn test_parse_class_and_struct() {

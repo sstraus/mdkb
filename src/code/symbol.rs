@@ -10,13 +10,34 @@ use std::fmt;
 use super::types::compact_string;
 use super::types::{CompactString, FileId, Range, SymbolId, SymbolKind};
 
-/// Visibility of a symbol.
+/// Visibility of a symbol, declared widest first.
+///
+/// The discriminants are written explicitly because they are stored: the
+/// indexing pipeline writes `visibility as u8` into `code_symbols`. Keeping the
+/// original four on 0-3 lets the two later levels be declared in their proper
+/// place on the ladder without changing what an existing index means.
+///
+/// Six levels rather than four because four cannot tell Swift's `package` from
+/// its `internal`, nor C#'s `protected internal` from plain `protected`, and
+/// folding them together reports a symbol as narrower or wider than it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Visibility {
-    Public,
-    Crate,
-    Module,
-    Private,
+    /// Reachable from anywhere: Rust `pub`, Swift `public`/`open`, C# `public`.
+    Public = 0,
+    /// Reachable from a group of modules: Swift `package`, and C#'s
+    /// `protected internal`, which is the assembly *or* any derived type.
+    Package = 4,
+    /// Reachable within one compilation unit: Rust `pub(crate)`, Swift
+    /// `internal`, C# `internal`.
+    Crate = 1,
+    /// Reachable within one module, file or type hierarchy: Rust `pub(super)`
+    /// and `pub(in <path>)`, Swift `fileprivate`, C `static`, C# `protected`.
+    Module = 2,
+    /// Narrower than a module but not fully private: C# `private protected`,
+    /// which is a derived type *and* the same assembly.
+    Restricted = 5,
+    /// Reachable only where it is declared.
+    Private = 3,
 }
 
 /// Scope context where a symbol is defined.
