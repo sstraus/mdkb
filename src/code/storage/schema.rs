@@ -99,10 +99,12 @@ pub const RESOLUTION_VERSION_KEY: &str = "resolution_version";
 /// not hold — version 1 is `module_path`, which the call resolver needs to tell
 /// two same-named functions apart; version 2 is `owner_name` and
 /// `to_qualifier`, which tell it that `std::fs::write` is not this crate's
-/// `write`. Without the bump an index keeps the wider,
+/// `write`; version 3 is the qualifier itself reaching every language, which
+/// eight of the thirteen parsers used to drop before it was ever stored.
+/// Without the bump an index keeps the wider,
 /// pre-contract answers for every file that is never edited again, which is
 /// most of a codebase.
-pub const RESOLUTION_VERSION: i64 = 2;
+pub const RESOLUTION_VERSION: i64 = 3;
 
 /// Triggers to keep the FTS5 index in sync with `code_symbols`.
 ///

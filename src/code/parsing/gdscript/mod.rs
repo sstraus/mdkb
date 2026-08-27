@@ -4,7 +4,9 @@ use crate::code::parsing::caching_parser::CachingParser;
 use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, is_plain_path, node_range,
+};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -455,7 +457,17 @@ impl GdscriptParser {
         // their first child, and GDScript is written mostly in the dotted form.
         if matches!(node.kind(), "call" | "attribute_call") {
             if let Some(func) = node.children(&mut node.walk()).next() {
-                let target = &code[func.byte_range()];
+                // The receiver is not inside the `attribute_call`: it is an
+                // earlier child of the enclosing `attribute`, so the path is
+                // read from where that starts. `$Node.play` keeps `$Node` as
+                // its qualifier; `get_tree().timer` is not a name and keeps
+                // only `timer`.
+                let whole = node
+                    .parent()
+                    .filter(|p| p.kind() == "attribute")
+                    .map(|p| &code[p.start_byte()..func.end_byte()])
+                    .filter(|text| is_plain_path(text));
+                let target = whole.unwrap_or(&code[func.byte_range()]);
                 if let Some(ctx) = fn_ctx {
                     calls.push((ctx, target, node_range(*node)));
                 }
@@ -603,11 +615,11 @@ func helper():
     }
 
     #[test]
-    fn a_call_on_a_node_path_is_recorded() {
+    fn a_call_on_a_node_path_keeps_the_node_it_named() {
         let targets = targets_of(CALLS, "_ready");
         assert!(
-            targets.iter().any(|t| t == "play"),
-            "expected play, got {targets:?}"
+            targets.iter().any(|t| t == "$Sprite2D.play"),
+            "expected $Sprite2D.play, got {targets:?}"
         );
     }
 
@@ -628,8 +640,18 @@ func helper():
     fn a_super_call_is_recorded() {
         let targets = targets_of(CALLS, "_ready");
         assert!(
-            targets.iter().any(|t| t == "_ready"),
+            targets.iter().any(|t| t == "super._ready"),
             "expected the super call to _ready, got {targets:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_on_a_computed_receiver_keeps_only_the_method_name() {
+        // `get_tree()` is a call, not a name: there is nothing to qualify with.
+        let targets = targets_of(CALLS, "_ready");
+        assert!(
+            targets.iter().any(|t| t == "create_timer"),
+            "expected a bare create_timer, got {targets:?}"
         );
     }
 

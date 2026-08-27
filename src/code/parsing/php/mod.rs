@@ -6,6 +6,7 @@ use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
     LanguageParser, check_recursion_depth, find_modifier_keyword, last_name_segment, node_range,
+    receiver_call_target,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -407,10 +408,16 @@ impl PhpParser {
             "function_call_expression" => node
                 .child_by_field_name("function")
                 .map(|n| &code[n.byte_range()]),
-            // `$o->method()` and `Foo::bar()` are both named by their `name` field.
-            "member_call_expression" | "scoped_call_expression" => node
-                .child_by_field_name("name")
-                .map(|n| &code[n.byte_range()]),
+            // `$o->method()` and `Foo::bar()` are both named by their `name`
+            // field, and both keep what stands before it when that is a name
+            // rather than a variable: `\App\Util::run` resolves through the
+            // class, `$o->run` cannot until the receiver's type is known.
+            "member_call_expression" => {
+                receiver_call_target(*node, code, "object", "name", "member_call_expression")
+            }
+            "scoped_call_expression" => {
+                receiver_call_target(*node, code, "scope", "name", "scoped_call_expression")
+            }
             // Construction is a dependency on the constructed class. `new $cls()`
             // picks its class at run time; naming the variable would invent an edge.
             "object_creation_expression" => node
@@ -852,7 +859,10 @@ class App extends Base {
             edges.contains(&("run", "Bar")),
             "new \\Ns\\Bar(): {edges:?}"
         );
-        assert!(edges.contains(&("run", "make")), "static call: {edges:?}");
+        assert!(
+            edges.contains(&("run", "Baz::make")),
+            "static call keeps its class: {edges:?}"
+        );
         assert!(
             edges.contains(&("run", "__construct")),
             "parent call: {edges:?}"

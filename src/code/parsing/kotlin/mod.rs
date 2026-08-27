@@ -8,7 +8,9 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::method_call::MethodCall;
-use crate::code::parsing::parser::{LanguageParser, check_recursion_depth, node_range};
+use crate::code::parsing::parser::{
+    LanguageParser, check_recursion_depth, is_plain_path, node_range,
+};
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
 use tree_sitter::Node;
@@ -645,9 +647,16 @@ impl KotlinParser {
             if let Some(callee_node) = node.child(0) {
                 let target = match callee_node.kind() {
                     "simple_identifier" => Some(&code[callee_node.byte_range()]),
+                    // `Other.stat` keeps its receiver so the call resolves to
+                    // that type; `build().stat` has no name to keep, so only
+                    // the method is recorded.
                     "navigation_expression" => {
-                        // Get the last simple_identifier (the method name)
-                        extract_nav_method_name(callee_node, code)
+                        let whole = &code[callee_node.byte_range()];
+                        if is_plain_path(whole) {
+                            Some(whole)
+                        } else {
+                            extract_nav_method_name(callee_node, code)
+                        }
                     }
                     _ => None,
                 };
@@ -1361,6 +1370,35 @@ class App {
                 .iter()
                 .any(|(caller, target, _)| *caller == "main" && *target == "println"),
             "expected main->println call"
+        );
+    }
+
+    #[test]
+    fn a_call_through_a_receiver_keeps_the_receiver() {
+        let mut parser = KotlinParser::new().unwrap();
+
+        let code = r#"
+class App {
+    fun main() {
+        Other.stat()
+        build().stat()
+    }
+}
+"#;
+
+        let targets: Vec<&str> = parser
+            .find_calls_impl(code)
+            .iter()
+            .map(|(_, t, _)| *t)
+            .collect();
+        assert!(
+            targets.contains(&"Other.stat"),
+            "a named receiver must be kept: {targets:?}"
+        );
+        // `build()` is a call, not a name: there is nothing to qualify with.
+        assert!(
+            targets.contains(&"stat"),
+            "a computed receiver leaves only the method: {targets:?}"
         );
     }
 

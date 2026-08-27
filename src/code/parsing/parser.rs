@@ -256,6 +256,24 @@ pub fn last_name_segment<'a>(node: Node, code: &'a str) -> &'a str {
     }
 }
 
+/// Is `text` a plain dotted path — `a.b.c`, `System.out.println` — with nothing
+/// computed in it?
+///
+/// The node-based [`receiver_call_target`] is preferable and is used wherever
+/// the grammar names its fields. Kotlin's `navigation_expression` and C#'s
+/// `member_access_expression` chains do not, so their receivers are judged on
+/// the text they span: anything holding a call, an index or an operator is not
+/// a name and cannot be a qualifier.
+pub fn is_plain_path(text: &str) -> bool {
+    !text.is_empty()
+        && !text.starts_with('.')
+        && !text.ends_with('.')
+        && !text.contains("..")
+        && text
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+}
+
 /// The call target for a call made through a receiver: `fmt.Println`,
 /// `this.helper`, `Namespace.other`.
 ///
@@ -279,7 +297,11 @@ pub fn receiver_call_target<'a>(
 ) -> Option<&'a str> {
     let member = node.child_by_field_name(member_field)?;
     if is_identifier_path(node, receiver_field, chain_kind) {
-        Some(&code[node.byte_range()])
+        // From the start of the receiver to the end of the member, not the end
+        // of `node`: Java's `method_invocation` and PHP's call expressions span
+        // the argument list too, and `System.out.println(helper())` is not a
+        // name.
+        Some(&code[node.start_byte()..member.end_byte()])
     } else {
         Some(&code[member.byte_range()])
     }
@@ -291,7 +313,10 @@ fn is_identifier_path(node: Node, receiver_field: &str, chain_kind: &str) -> boo
         return false;
     };
     match receiver.kind() {
-        "identifier" | "type_identifier" | "field_identifier" | "this" | "super" => true,
+        // One kind per grammar that means "a plain name": PHP writes `name`
+        // and `qualified_name`, Java `identifier`, TypeScript `this`.
+        "identifier" | "type_identifier" | "field_identifier" | "name" | "qualified_name"
+        | "this" | "super" => true,
         kind if kind == chain_kind => is_identifier_path(receiver, receiver_field, chain_kind),
         _ => false,
     }
@@ -315,11 +340,18 @@ fn is_identifier_path(node: Node, receiver_field: &str, chain_kind: &str) -> boo
 /// A receiver pronoun is not a qualifier: `self.helper()` names no type, so
 /// keeping `self` would class every Python method call as external. Stripping it
 /// leaves the call unqualified, which enters the cascade at "declared in the
-/// calling file" — where the method it means almost always is.
+/// calling file" — where the method it means almost always is. The ancestor
+/// pronouns — `super`, C#'s `base`, PHP's `parent` — are stripped for the same
+/// reason: they name a type the call site never wrote, and the method they reach
+/// carries the name that is written, so the name is all there is to match on.
 pub fn split_call_target(target: &str) -> (&str, Option<&str>) {
-    let split = ["::", "\\", "."]
+    let split = ["::", "\\", ".", ":"]
         .iter()
         .filter_map(|sep| target.rfind(sep).map(|at| (at, sep.len())))
+        // A lone `:` is Lua's method call, `obj:meth`. Inside a `::` it is half
+        // of a path separator and splitting there would leave the qualifier
+        // ending in a colon.
+        .filter(|&(at, len)| len > 1 || !is_inside_double_colon(target, at))
         .max_by_key(|(at, _)| *at);
 
     let Some((at, sep_len)) = split else {
@@ -330,9 +362,16 @@ pub fn split_call_target(target: &str) -> (&str, Option<&str>) {
         return (target, None);
     }
     match qualifier {
-        "" | "self" | "this" | "Self" | "cls" => (name, None),
+        "" | "self" | "this" | "Self" | "cls" | "super" | "base" | "parent" => (name, None),
         _ => (name, Some(qualifier)),
     }
+}
+
+/// Is the byte at `at` one half of a `::`?
+fn is_inside_double_colon(target: &str, at: usize) -> bool {
+    let bytes = target.as_bytes();
+    bytes.get(at) == Some(&b':')
+        && (bytes.get(at + 1) == Some(&b':') || (at > 0 && bytes[at - 1] == b':'))
 }
 
 /// Safely truncate a UTF-8 string at a character boundary.
@@ -397,6 +436,18 @@ mod tests {
         );
     }
 
+    /// Lua writes a method call with a colon. It must not disturb `::`, where
+    /// splitting on the second colon would leave `std::fs:` as the qualifier.
+    #[test]
+    fn a_lua_method_call_splits_on_its_colon() {
+        assert_eq!(split_call_target("obj:meth"), ("meth", Some("obj")));
+        assert_eq!(
+            split_call_target("std::fs::write"),
+            ("write", Some("std::fs"))
+        );
+        assert_eq!(split_call_target("Store::open"), ("open", Some("Store")));
+    }
+
     #[test]
     fn a_bare_call_has_no_qualifier() {
         assert_eq!(split_call_target("open"), ("open", None));
@@ -410,6 +461,15 @@ mod tests {
         assert_eq!(split_call_target("this.helper"), ("helper", None));
         assert_eq!(split_call_target("Self::helper"), ("helper", None));
         assert_eq!(split_call_target("cls.helper"), ("helper", None));
+    }
+
+    /// An ancestor pronoun names a type the call site never wrote, so it cannot
+    /// narrow the target the way a written owner does.
+    #[test]
+    fn an_ancestor_pronoun_is_not_a_qualifier_either() {
+        assert_eq!(split_call_target("super._ready"), ("_ready", None));
+        assert_eq!(split_call_target("base.Dispose"), ("Dispose", None));
+        assert_eq!(split_call_target("parent::run"), ("run", None));
     }
 
     /// Nothing a parser can emit should come back as an empty name: an edge with

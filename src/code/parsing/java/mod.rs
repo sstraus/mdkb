@@ -6,7 +6,7 @@ use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::method_call::MethodCall;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, last_name_segment, node_range,
+    LanguageParser, check_recursion_depth, last_name_segment, node_range, receiver_call_target,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -532,9 +532,11 @@ impl JavaParser {
         };
 
         let target = match node.kind() {
-            "method_invocation" => node
-                .child_by_field_name("name")
-                .map(|n| &code[n.byte_range()]),
+            // `System.out.println` keeps its receiver: the qualifier is what
+            // tells the resolver this is not some local `println`.
+            "method_invocation" => {
+                receiver_call_target(*node, code, "object", "name", "field_access")
+            }
             // Construction is a dependency on the constructed type.
             "object_creation_expression" => node
                 .child_by_field_name("type")
@@ -1067,6 +1069,36 @@ import static java.lang.Math.PI;
         assert!(imports.iter().any(|i| i.path == "java.io.*" && i.is_glob));
     }
 
+    /// The receiver is only kept when it is a name. `list.get(0).trim()` has a
+    /// call in it, so `trim` is recorded on its own rather than qualified by an
+    /// expression no symbol is named after.
+    #[test]
+    fn a_call_on_a_computed_receiver_keeps_only_the_method_name() {
+        let mut parser = JavaParser::new().unwrap();
+
+        let code = r#"
+public class App {
+    public void main(java.util.List<String> list) {
+        list.get(0).trim();
+    }
+}
+"#;
+
+        let targets: Vec<&str> = parser
+            .find_calls_impl(code)
+            .iter()
+            .map(|(_, t, _)| *t)
+            .collect();
+        assert!(
+            targets.contains(&"trim"),
+            "expected a bare trim: {targets:?}"
+        );
+        assert!(
+            targets.contains(&"list.get"),
+            "the named receiver of the inner call is kept: {targets:?}"
+        );
+    }
+
     #[test]
     fn test_find_calls() {
         let mut parser = JavaParser::new().unwrap();
@@ -1088,10 +1120,12 @@ public class App {
                 .iter()
                 .any(|(caller, target, _)| *caller == "main" && *target == "process")
         );
+        // The receiver is kept: `System.out` is what tells this `println` apart
+        // from any other one the index holds.
         assert!(
             calls
                 .iter()
-                .any(|(caller, target, _)| *caller == "main" && *target == "println")
+                .any(|(caller, target, _)| *caller == "main" && *target == "System.out.println")
         );
     }
 

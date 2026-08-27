@@ -5,7 +5,7 @@ use crate::code::parsing::context::{ParserContext, ScopeType};
 use crate::code::parsing::import::Import;
 use crate::code::parsing::language::Language;
 use crate::code::parsing::parser::{
-    LanguageParser, check_recursion_depth, last_name_segment, node_range,
+    LanguageParser, check_recursion_depth, is_plain_path, last_name_segment, node_range,
 };
 use crate::code::symbol::{Symbol, Visibility};
 use crate::code::types::{FileId, Range, SymbolCounter, SymbolKind};
@@ -633,9 +633,17 @@ impl CSharpParser {
     fn call_target_name<'a>(func: Node, code: &'a str) -> Option<&'a str> {
         match func.kind() {
             "identifier" | "generic_name" => Some(last_name_segment(func, code)),
-            "member_access_expression" => func
-                .child_by_field_name("name")
-                .map(|n| last_name_segment(n, code)),
+            // `Console.WriteLine` keeps its receiver when the receiver is a
+            // name: without it the call matches every `WriteLine` indexed.
+            "member_access_expression" => {
+                let whole = &code[func.byte_range()];
+                if is_plain_path(whole) {
+                    Some(whole)
+                } else {
+                    func.child_by_field_name("name")
+                        .map(|n| last_name_segment(n, code))
+                }
+            }
             // `a?.b` hangs the member off a trailing `member_binding_expression`;
             // the `condition` field holds the receiver.
             "conditional_access_expression" => func
@@ -938,11 +946,12 @@ class App {
         assert!(edges.contains(&("Run", "Helper")), "plain call: {edges:?}");
     }
 
-    /// Relationships resolve by matching the stored target against a symbol
-    /// name, so a target that carries its receiver ("items.Select") can never
-    /// match anything.
+    /// A written receiver is kept so the call can be narrowed to one owner;
+    /// anything that is not a plain name — a conditional access, a type argument
+    /// list, a call — leaves only the member name, because there is no name to
+    /// qualify with.
     #[test]
-    fn qualified_call_targets_are_stored_as_bare_member_names() {
+    fn qualified_call_targets_keep_a_receiver_that_is_a_name() {
         let mut parser = CSharpParser::new().unwrap();
 
         let code = r#"
@@ -964,18 +973,26 @@ class App {
         let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
 
         for target in [
-            "Bar", "Invoke", "Select", "Call", "Generic", "c", "Helper", "Func",
+            // A receiver that is a name is kept.
+            "items.Select",
+            "Ns.Static.Deep.Call",
+            // `?.` is not part of a name, `<int>` is not part of one either, and
+            // `Func()` is a call: all four keep only the member.
+            "Bar",
+            "Invoke",
+            "Generic",
+            "c",
+            "Helper",
+            "Func",
         ] {
             assert!(
                 edges.contains(&("Run", target)),
-                "missing bare target {target}: {edges:?}"
+                "missing target {target}: {edges:?}"
             );
         }
         assert!(
-            !edges
-                .iter()
-                .any(|(_, t)| t.contains('.') || t.contains('<')),
-            "no target may carry its receiver or type arguments: {edges:?}"
+            !edges.iter().any(|(_, t)| t.contains('<')),
+            "no target may carry its type arguments: {edges:?}"
         );
         // `Func()()` invokes the value the inner call returned. There is no name
         // to point at, and the inner call is already recorded on its own.
