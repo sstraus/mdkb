@@ -168,3 +168,69 @@ pub struct IndexStats {
     /// rather than silently reported as a clean success.
     pub parse_errors: u32,
 }
+
+impl IndexStats {
+    /// Fold another run's numbers into this one.
+    ///
+    /// A caller indexing several paths sums their totals. Doing that field by
+    /// field at the call site is how `parse_errors` came to be the one number
+    /// left behind — every other field was summed, so a run that skipped files
+    /// still reported a clean index. Summing here means a field added later is
+    /// added once, next to its own declaration, instead of at every call site
+    /// that must not forget it.
+    pub fn absorb(&mut self, other: &IndexStats) {
+        let IndexStats {
+            files_discovered,
+            files_indexed,
+            files_removed,
+            symbols_indexed,
+            relationships_collected,
+            parse_errors,
+        } = other;
+        self.files_discovered += files_discovered;
+        self.files_indexed += files_indexed;
+        self.files_removed += files_removed;
+        self.symbols_indexed += symbols_indexed;
+        self.relationships_collected += relationships_collected;
+        self.parse_errors += parse_errors;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::IndexStats;
+
+    /// Indexing two paths reports what both runs did. `parse_errors` is the
+    /// number this guards: summing by hand once left it out, so indexing an
+    /// explicit path reported a clean success over files it had skipped.
+    #[test]
+    fn absorbing_a_run_carries_every_number_it_reported() {
+        let mut total = IndexStats::default();
+        total.absorb(&IndexStats {
+            files_discovered: 3,
+            files_indexed: 2,
+            files_removed: 1,
+            symbols_indexed: 20,
+            relationships_collected: 7,
+            parse_errors: 1,
+        });
+        total.absorb(&IndexStats {
+            files_discovered: 4,
+            files_indexed: 4,
+            files_removed: 0,
+            symbols_indexed: 30,
+            relationships_collected: 9,
+            parse_errors: 2,
+        });
+
+        assert_eq!(total.files_discovered, 7);
+        assert_eq!(total.files_indexed, 6);
+        assert_eq!(total.files_removed, 1);
+        assert_eq!(total.symbols_indexed, 50);
+        assert_eq!(total.relationships_collected, 16);
+        assert_eq!(
+            total.parse_errors, 3,
+            "a run that skipped files must not total up as a clean index"
+        );
+    }
+}

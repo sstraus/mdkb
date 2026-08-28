@@ -88,11 +88,7 @@ pub fn index_paths(
         let stats = facade
             .index_scope(&root_canonical, &canonical)
             .map_err(|e| anyhow::anyhow!("Indexing '{p}' failed: {e}"))?;
-        total.files_discovered += stats.files_discovered;
-        total.files_indexed += stats.files_indexed;
-        total.files_removed += stats.files_removed;
-        total.symbols_indexed += stats.symbols_indexed;
-        total.relationships_collected += stats.relationships_collected;
+        total.absorb(&stats);
     }
     Ok(total)
 }
