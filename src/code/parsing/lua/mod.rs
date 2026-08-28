@@ -197,12 +197,21 @@ impl LuaParser {
         tail: (&str, bool),
     ) {
         let (module_path, is_local) = tail;
-        let names = children_of_kind(child_of_kind(owner, "variable_list"), "identifier");
+        // Every target holds its position, including the ones that are not plain
+        // names: `t.field, u = 1, {...}` assigns the table to `u`, and dropping
+        // `t.field` from this list before pairing would hand it to whoever moved
+        // up into slot 1.
+        let targets = child_of_kind(owner, "variable_list")
+            .map(|list| list.named_children(&mut list.walk()).collect::<Vec<_>>())
+            .unwrap_or_default();
         let values = child_of_kind(owner, "expression_list")
             .map(|list| list.named_children(&mut list.walk()).collect::<Vec<_>>())
             .unwrap_or_default();
 
-        for (i, name_node) in names.iter().enumerate() {
+        for (i, name_node) in targets.iter().enumerate() {
+            if name_node.kind() != "identifier" {
+                continue;
+            }
             let name = &code[name_node.byte_range()];
             let visibility = if is_local || name.starts_with('_') {
                 Visibility::Private
@@ -334,18 +343,6 @@ fn has_child_of_kind(node: Node, kind: &str) -> bool {
     child_of_kind(node, kind).is_some()
 }
 
-/// Every child of `parent` with the given kind, or an empty list when `parent`
-/// is absent.
-fn children_of_kind<'a>(parent: Option<Node<'a>>, kind: &str) -> Vec<Node<'a>> {
-    parent
-        .map(|p| {
-            p.children(&mut p.walk())
-                .filter(|c| c.kind() == kind)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 fn extract_lua_doc(node: &Node, code: &str) -> Option<String> {
     // Lua uses --- doc comments (LDoc/EmmyLua style)
     let mut lines = Vec::new();
@@ -416,6 +413,32 @@ impl LanguageParser for LuaParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lua assigns positionally, so the *i*th name takes the *i*th value. A
+    /// target that is not a plain name — `t.field`, `t[k]` — still occupies its
+    /// position. Dropping it from the name list while keeping every value shifts
+    /// the two out of step, and the table then lands on whichever name moved up
+    /// into its slot: not a missing symbol but an invented one, which reads
+    /// exactly like a real one.
+    #[test]
+    fn a_dotted_target_does_not_shift_the_values_under_the_names_after_it() {
+        let mut parser = LuaParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = "t.field, u, v = 1, { fn = function() end }, 2\n";
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_ref()).collect();
+
+        assert!(
+            names.contains(&"u.fn"),
+            "the table belongs to u, got {names:?}"
+        );
+        assert!(
+            !names.contains(&"v.fn"),
+            "v was assigned 2, not the table, got {names:?}"
+        );
+    }
 
     #[test]
     fn test_parse_functions() {
