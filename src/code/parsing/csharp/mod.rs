@@ -512,10 +512,7 @@ impl CSharpParser {
 
     /// Member name qualified by the type currently being walked.
     fn qualified(&self, name: &str) -> String {
-        match self.context.current_class() {
-            Some(cls) => format!("{cls}.{name}"),
-            None => name.to_string(),
-        }
+        self.context.qualified(name, ".")
     }
 
     fn process_field(
