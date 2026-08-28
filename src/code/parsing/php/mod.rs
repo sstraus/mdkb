@@ -406,16 +406,21 @@ impl PhpParser {
         module_path: &str,
     ) {
         let vis = determine_php_visibility(node, code);
+        // Everything the declaration says before its *first* element: `readonly`
+        // and the declared type have no other home, and `public int $a, $b;`
+        // declares two properties that share exactly that much. Measuring up to
+        // each element in turn would instead give the second one the first one's
+        // own text.
+        let prefix = node
+            .children(&mut node.walk())
+            .find(|c| c.kind() == "property_element")
+            .map(|first| code[node.start_byte()..first.start_byte()].trim())
+            .unwrap_or_default();
         for child in node.children(&mut node.walk()) {
             if child.kind() == "property_element" {
                 for gc in child.children(&mut child.walk()) {
                     if gc.kind() == "variable_name" {
                         let name = &code[gc.byte_range()];
-                        // Everything the declaration says before this element,
-                        // then the element: `readonly` and the declared type
-                        // have no other home, and `public int $a, $b;` declares
-                        // two properties that share only the prefix.
-                        let prefix = code[node.start_byte()..child.start_byte()].trim();
                         let element = code[child.byte_range()].trim();
 
                         let symbol = self.create_symbol(
@@ -747,25 +752,25 @@ impl PhpParser {
 /// `Foo|Bar` holds two of them. Only `named_type` nodes are collected, so
 /// `int`, `string` and the other primitives — which are built into the language
 /// and never indexed as symbols — drop out without a keyword list.
+/// Walked with an explicit stack rather than by recursion: nothing bounds the
+/// depth of the subtree handed in, and a stack overflow aborts the process
+/// instead of failing one file.
 fn push_php_types<'a>(
     type_node: Option<Node>,
     context: &'a str,
     code: &'a str,
     uses: &mut Vec<(&'a str, &'a str, Range)>,
 ) {
-    let Some(type_node) = type_node else {
-        return;
-    };
-    if type_node.kind() == "named_type" {
-        uses.push((
-            context,
-            last_name_segment(type_node, code),
-            node_range(type_node),
-        ));
-        return;
-    }
-    for child in type_node.children(&mut type_node.walk()) {
-        push_php_types(Some(child), context, code, uses);
+    let mut pending: Vec<Node> = type_node.into_iter().collect();
+    while let Some(node) = pending.pop() {
+        if node.kind() == "named_type" {
+            uses.push((context, last_name_segment(node, code), node_range(node)));
+            continue;
+        }
+        // Pushed in reverse so the stack pops them in source order, which is
+        // the order the recursive walk reported them in.
+        let children: Vec<Node> = node.children(&mut node.walk()).collect();
+        pending.extend(children.into_iter().rev());
     }
 }
 
@@ -842,6 +847,35 @@ impl LanguageParser for PhpParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `public int $a, $b;` declares two properties out of one modifier list and
+    /// one type. What they share is everything written *before the first* of
+    /// them; measuring up to each element in turn instead hands the second one
+    /// the first one's own text, so `$b` reads as `public int $a, $b`.
+    #[test]
+    fn properties_sharing_a_declaration_share_only_what_precedes_them() {
+        let mut parser = PhpParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = "<?php\nclass C {\n    public int $a, $b;\n}\n";
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let sig = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.as_name() == name)
+                .unwrap_or_else(|| panic!("no {name} in {symbols:?}"))
+                .signature
+                .clone()
+        };
+
+        assert_eq!(sig("C::$a").as_deref(), Some("public int $a"));
+        assert_eq!(
+            sig("C::$b").as_deref(),
+            Some("public int $b"),
+            "the second property must not inherit the first one's text"
+        );
+    }
 
     #[test]
     fn test_parse_class_and_methods() {
