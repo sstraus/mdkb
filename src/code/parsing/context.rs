@@ -172,6 +172,18 @@ impl ParserContext {
         self.current_function.as_deref()
     }
 
+    /// The name a member is indexed under: the type being walked, the language's
+    /// separator, then the member. Outside a type, the bare name.
+    ///
+    /// The separator is the caller's because it is the only part that differs:
+    /// PHP writes `Class::member`, Java, C# and Swift write `Class.member`.
+    pub fn qualified(&self, name: &str, separator: &str) -> String {
+        match self.current_class() {
+            Some(class) => format!("{class}{separator}{name}"),
+            None => name.to_string(),
+        }
+    }
+
     /// Scope context for a parameter symbol.
     pub fn parameter_scope_context() -> ScopeContext {
         ScopeContext::Parameter

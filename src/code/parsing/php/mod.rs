@@ -91,10 +91,7 @@ impl PhpParser {
     /// The name a member is indexed under: `Class::member` inside a class,
     /// the bare name outside one.
     fn qualified(&self, name: &str) -> String {
-        match self.context.current_class() {
-            Some(cls) => format!("{cls}::{name}"),
-            None => name.to_string(),
-        }
+        self.context.qualified(name, "::")
     }
 
     fn extract_symbols_from_node(
