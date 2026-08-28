@@ -699,6 +699,13 @@ impl CSharpParser {
 // ── Free helpers ────────────────────────────────────────────────────────
 
 fn determine_csharp_visibility(node: Node, code: &str) -> Visibility {
+    // An enum member cannot carry an access modifier: C# gives it the reach of
+    // the enum that declares it. Looking for modifiers it is not allowed to have
+    // finds none and falls through to the type-member default below, private,
+    // which is the one answer that is never right for one.
+    if node.kind() == "enum_member_declaration" {
+        return Visibility::Public;
+    }
     // Inspect the declaration's `modifier` AST children rather than substring-
     // matching the whole text (BUG-C1): `private string publicKey;` must not be
     // read as Public. tree-sitter-c-sharp emits each modifier as a `modifier` node.
@@ -1195,5 +1202,29 @@ public enum Color { Red = 1, Green }
             has("Color.Green", SymbolKind::Constant),
             "enum member: {found:?}"
         );
+    }
+
+    /// C# forbids an access modifier on an enum member: it is reachable wherever
+    /// the enum is. Reading its visibility off modifiers it cannot carry finds
+    /// none and falls to the default for a *type member*, private — so every
+    /// enum member in every indexed C# file was reported as unreachable.
+    #[test]
+    fn an_enum_member_is_as_reachable_as_its_enum() {
+        let mut parser = CSharpParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = "public enum Color { Red, Green }\n";
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let vis = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.as_name() == name)
+                .unwrap_or_else(|| panic!("no {name} in {symbols:?}"))
+                .visibility
+        };
+
+        assert_eq!(vis("Color.Red"), Visibility::Public);
+        assert_eq!(vis("Color.Green"), Visibility::Public);
     }
 }
