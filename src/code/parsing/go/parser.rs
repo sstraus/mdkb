@@ -491,27 +491,24 @@ impl GoParser {
         tail: (&str, &str),
     ) {
         let (module_path, struct_name) = tail;
-        let mut field_names = Vec::new();
-        let mut field_type = None;
-
-        for child in field_node.children(&mut field_node.walk()) {
-            match child.kind() {
-                "field_identifier" => {
-                    field_names.push(&code[child.byte_range()]);
-                }
-                kind if is_go_type_kind(kind) => {
-                    field_type = Some(child);
-                }
-                _ => {}
-            }
-        }
+        let field_names: Vec<&str> = field_node
+            .children_by_field_name("name", &mut field_node.walk())
+            .map(|name| &code[name.byte_range()])
+            .collect();
+        // The grammar names the type, so ask it for the type. Recognising a
+        // type from a list of node kinds drops every kind the list forgot,
+        // and the list forgot generics and func types.
+        let field_type = field_node.child_by_field_name("type");
 
         // A field with a type and no name of its own is embedded. Go reaches it
         // by the unqualified type name, and its signature is the declaration as
         // written, which is what says it is embedded and whether by pointer.
         let fields: Vec<(String, String)> = match (field_names.is_empty(), field_type) {
             (true, Some(typ)) => {
-                let name = embedded_field_name(&code[typ.byte_range()]);
+                // `Cache[string, T]` is embedded as `Cache`: the base name the
+                // AST already isolates, not the text with its type arguments.
+                let base = extract_go_type_name(&typ, code).unwrap_or(&code[typ.byte_range()]);
+                let name = embedded_field_name(base);
                 let signature = code[field_node.start_byte()..typ.end_byte()].trim();
                 vec![(name.to_string(), signature.to_string())]
             }
@@ -1269,10 +1266,8 @@ impl GoParser {
                     .find(|n| n.kind() == "identifier")
                 {
                     let var_name = &code[identifier.byte_range()];
-                    for child in node.children(&mut node.walk()) {
-                        if is_go_type_kind(child.kind()) {
-                            Self::extract_go_type_reference(&child, code, var_name, uses);
-                        }
+                    if let Some(typ) = node.child_by_field_name("type") {
+                        Self::extract_go_type_reference(&typ, code, var_name, uses);
                     }
                 }
             }
@@ -1282,8 +1277,10 @@ impl GoParser {
                     let func_name = &code[function_node.byte_range()];
                     for child in node.children(&mut node.walk()) {
                         if child.kind() == "type_arguments" {
-                            for type_arg in child.children(&mut child.walk()) {
-                                if is_go_type_kind(type_arg.kind()) {
+                            // The grammar wraps each argument in a `type_elem`,
+                            // so the types are one level below the arguments.
+                            for elem in child.named_children(&mut child.walk()) {
+                                for type_arg in elem.named_children(&mut elem.walk()) {
                                     Self::extract_go_type_reference(
                                         &type_arg, code, func_name, uses,
                                     );
@@ -1310,10 +1307,8 @@ impl GoParser {
     ) {
         for param in params_node.children(&mut params_node.walk()) {
             if param.kind() == "parameter_declaration" {
-                for child in param.children(&mut param.walk()) {
-                    if is_go_type_kind(child.kind()) {
-                        Self::extract_go_type_reference(&child, code, context_name, uses);
-                    }
+                if let Some(typ) = param.child_by_field_name("type") {
+                    Self::extract_go_type_reference(&typ, code, context_name, uses);
                 }
             }
         }
@@ -1325,10 +1320,8 @@ impl GoParser {
         context_name: &'a str,
         uses: &mut Vec<(&'a str, &'a str, Range)>,
     ) {
-        for child in field_node.children(&mut field_node.walk()) {
-            if is_go_type_kind(child.kind()) {
-                Self::extract_go_type_reference(&child, code, context_name, uses);
-            }
+        if let Some(typ) = field_node.child_by_field_name("type") {
+            Self::extract_go_type_reference(&typ, code, context_name, uses);
         }
     }
 
@@ -1459,21 +1452,6 @@ fn embedded_field_name(field_type: &str) -> &str {
         .trim()
 }
 
-fn is_go_type_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "type_identifier"
-            // A qualified type is a type. Leaving it out made `sync.Mutex`
-            // invisible wherever a type is looked for.
-            | "qualified_type"
-            | "pointer_type"
-            | "array_type"
-            | "slice_type"
-            | "map_type"
-            | "channel_type"
-    )
-}
-
 fn extract_function_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
         "identifier" | "selector_expression" => Some(&code[node.byte_range()]),
@@ -1484,6 +1462,11 @@ fn extract_function_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
 fn extract_go_type_name<'a>(node: &Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
         "type_identifier" | "qualified_type" => Some(&code[node.byte_range()]),
+        // An instantiation is a use of the type it instantiates: `Container[T]`
+        // says something about `Container`, and nothing is named `Container[T]`.
+        "generic_type" => node
+            .child_by_field_name("type")
+            .and_then(|base| extract_go_type_name(&base, code)),
         "pointer_type" => node
             .children(&mut node.walk())
             .nth(1)
@@ -1942,6 +1925,65 @@ type Server struct {
         assert_eq!(field("Server.Reader"), "io.Reader");
         // A qualified type is a type: it belongs in a named field's signature.
         assert_eq!(field("Server.mu"), "mu sync.Locker");
+    }
+
+    #[test]
+    fn a_generic_or_function_type_is_a_type_like_any_other() {
+        // Generics have been in the language since 1.18 and a func-typed field
+        // is older than that. A parser that recognises types from a list of
+        // node kinds silently drops both: the field keeps no type, and an
+        // embedded generic keeps no name, so it produces no symbol at all.
+        let mut parser = GoParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+package store
+
+type Store[T any] struct {
+    Cache[string, T]
+    items   Container[T]
+    onEvict func(T) error
+}
+
+func Load[T any](c Container[T]) Result[T] {
+    return Result[T]{}
+}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let field = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name && s.kind == SymbolKind::Field)
+                .unwrap_or_else(|| panic!("no field named {name}"))
+                .signature
+                .as_deref()
+                .unwrap_or("")
+                .to_string()
+        };
+
+        // Go promotes `Cache[string, T]` under `Cache`: the type arguments are
+        // not part of the name the field is reached by.
+        assert_eq!(field("Store.Cache"), "Cache[string, T]");
+        assert_eq!(field("Store.items"), "items Container[T]");
+        assert_eq!(field("Store.onEvict"), "onEvict func(T) error");
+
+        // A generic type used in a signature is a use of its base type.
+        let uses = parser.find_uses(code);
+        let edges: Vec<(&str, &str)> = uses.iter().map(|(c, t, _)| (*c, *t)).collect();
+        assert!(
+            edges.contains(&("Load", "Container")),
+            "generic parameter type: {edges:?}"
+        );
+        assert!(
+            edges.contains(&("Load", "Result")),
+            "generic result type: {edges:?}"
+        );
+        assert!(
+            edges.contains(&("struct", "Container")),
+            "generic field type: {edges:?}"
+        );
     }
 
     #[test]
