@@ -960,7 +960,11 @@ impl TypeScriptParser {
                     unnamed_call_target(
                         function_node,
                         code,
-                        &["function_expression", "arrow_function"],
+                        &[
+                            "function_expression",
+                            "generator_function",
+                            "arrow_function",
+                        ],
                     )
                 });
                 if let (Some(target), Some(ctx)) = (target, fn_ctx) {
@@ -1278,16 +1282,17 @@ fn determine_member_visibility(node: Node, code: &str) -> Visibility {
 
 /// Extract JSDoc comment (/** ... */) from preceding sibling.
 fn extract_jsdoc(node: &Node, code: &str) -> Option<String> {
-    // For exported declarations, check the parent's previous sibling
-    let search_node = if let Some(parent) = node.parent() {
-        if parent.kind() == "export_statement" {
-            parent
-        } else {
-            *node
+    // The comment is a sibling of whatever the grammar makes the statement.
+    // `export` wraps a declaration in an export_statement, and a namespace
+    // arrives wrapped in an expression_statement; in both the comment sits
+    // above the wrapper, not above the declaration.
+    let mut search_node = *node;
+    while let Some(parent) = search_node.parent() {
+        if !matches!(parent.kind(), "export_statement" | "expression_statement") {
+            break;
         }
-    } else {
-        *node
-    };
+        search_node = parent;
+    }
 
     // Inside a class body the decorators are siblings written between the
     // comment and the method, so step over as many as there are.
@@ -1926,6 +1931,83 @@ function processData(data: string[]): string[] {
                 .as_deref()
                 .unwrap()
                 .contains("Process data")
+        );
+    }
+
+    #[test]
+    fn a_namespace_keeps_the_doc_comment_written_above_it() {
+        // The grammar wraps a namespace in an expression_statement, so the
+        // comment is the statement's sibling, not the namespace's. Looking
+        // only at the namespace finds a `{` and gives up.
+        let mut parser = TypeScriptParser::new().unwrap();
+        let file_id = FileId::new(1).unwrap();
+        let mut counter = SymbolCounter::new();
+
+        let code = r#"
+/** Everything the app owns. */
+namespace App {}
+
+/** Everything it lends out. */
+export namespace Ext {}
+"#;
+
+        let symbols = parser.parse_symbols(code, file_id, &mut counter);
+        let doc = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name && s.kind == SymbolKind::Module)
+                .unwrap_or_else(|| panic!("no namespace named {name}"))
+                .doc_comment
+                .as_deref()
+                .unwrap_or("")
+                .to_string()
+        };
+
+        assert_eq!(doc("App"), "Everything the app owns.");
+        assert_eq!(doc("Ext"), "Everything it lends out.");
+    }
+
+    #[test]
+    fn a_receiver_chain_deeper_than_the_ast_limit_does_not_end_the_process() {
+        // Minified and generated sources nest further than anything written by
+        // hand. Every walker in this file stops at MAX_AST_DEPTH; the receiver
+        // walk did not, and a stack overflow aborts the whole daemon rather
+        // than failing one file.
+        let mut parser = TypeScriptParser::new().unwrap();
+
+        let chain = "a".to_string()
+            + &".b".repeat(crate::code::parsing::parser::MAX_AST_DEPTH * 40);
+        let code = format!("function run() {{ {chain}.c(); }}");
+
+        let calls = parser.find_calls_impl(&code);
+        assert_eq!(calls.len(), 1, "the call is still recorded");
+    }
+
+    #[test]
+    fn an_immediately_invoked_generator_is_not_a_call_to_its_own_source() {
+        // A callee with no name gets no edge — writing its source text as the
+        // target names a symbol that cannot exist. Generators were left off
+        // the list of function literals, so they got exactly that.
+        let mut parser = TypeScriptParser::new().unwrap();
+
+        let code = r#"
+function run() {
+    (function* () { yield 1; })();
+    (function () { return 1; })();
+    (() => 2)();
+}
+"#;
+
+        let calls = parser.find_calls_impl(code);
+        let targets: Vec<&str> = calls.iter().map(|(_, t, _)| *t).collect();
+
+        assert!(
+            !targets.iter().any(|t| t.contains("yield")),
+            "an inline generator is not a named target: {targets:?}"
+        );
+        assert!(
+            !targets.iter().any(|t| t.contains("=>") || t.contains('{')),
+            "no inline function literal is a named target: {targets:?}"
         );
     }
 
