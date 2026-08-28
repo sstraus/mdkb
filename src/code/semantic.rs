@@ -107,28 +107,7 @@ impl VectorStore {
         let data = std::fs::read(&self.path)
             .with_context(|| format!("Failed to read vector store: {}", self.path.display()))?;
 
-        if data.len() < HEADER_SIZE {
-            bail!("Vector store file too small");
-        }
-
-        validate_header(&data[..HEADER_SIZE])?;
-        let count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
-        let entry_sz = entry_size();
-
-        let expected_data_size = count
-            .checked_mul(entry_sz)
-            .and_then(|s| s.checked_add(HEADER_SIZE))
-            .ok_or_else(|| {
-                anyhow::anyhow!("Vector store count overflow: {count} entries * {entry_sz} bytes")
-            })?;
-
-        ensure!(
-            data.len() == expected_data_size,
-            "Vector store size mismatch: expected {} bytes, got {}",
-            expected_data_size,
-            data.len()
-        );
-
+        let count = self.entry_count_of(&data)?;
         let mut entries = Vec::with_capacity(count);
         let mut offset = HEADER_SIZE;
 
@@ -165,15 +144,77 @@ impl VectorStore {
     ///
     /// The file is rewritten only when something was dropped, so a store with
     /// no orphans in it costs one read and no write.
+    ///
+    /// The entries are never materialised. `load` turns each one into its own
+    /// `Vec<f32>`, so sweeping a store of 1.5M vectors — the size a 10k-file
+    /// repository reaches — used to allocate 1.5M vectors to decide which four
+    /// bytes of each to look at. This reads the ids in place and, when there is
+    /// something to drop, copies the survivors' bytes straight through: the
+    /// stored form is the written form.
+    ///
+    /// One thing this deliberately does not do is validate the floats. `load`
+    /// rejects a non-finite value and still does; the sweep is not the pass
+    /// that should decide a store is corrupt, and refusing to drop orphans
+    /// because of an unrelated bad entry left the store growing.
     pub fn retain(&self, keep: impl Fn(u32) -> bool) -> anyhow::Result<usize> {
-        let mut entries = self.load()?;
-        let before = entries.len();
-        entries.retain(|(id, _)| keep(*id));
-        let removed = before - entries.len();
-        if removed > 0 {
-            self.write_all(&entries)?;
+        let data = std::fs::read(&self.path)
+            .with_context(|| format!("Failed to read vector store: {}", self.path.display()))?;
+        let count = self.entry_count_of(&data)?;
+        let entry_sz = entry_size();
+        let id_at = |i: usize| {
+            let offset = HEADER_SIZE + i * entry_sz;
+            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
+        };
+
+        let removed = (0..count).filter(|i| !keep(id_at(*i))).count();
+        if removed == 0 {
+            return Ok(0);
         }
+
+        let kept = count - removed;
+        let mut buf = Vec::with_capacity(HEADER_SIZE + kept * entry_sz);
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
+        buf.extend_from_slice(&(kept as u32).to_le_bytes());
+        for i in 0..count {
+            if keep(id_at(i)) {
+                let offset = HEADER_SIZE + i * entry_sz;
+                buf.extend_from_slice(&data[offset..offset + entry_sz]);
+            }
+        }
+
+        atomic_write(&self.path, &buf)?;
         Ok(removed)
+    }
+
+    /// How many entries `data` holds, once its header and length agree.
+    ///
+    /// Shared by [`Self::load`] and [`Self::retain`]: a truncated or overlong
+    /// file must be refused the same way by both, or the sweep would index past
+    /// the end of a file the reader rejects.
+    fn entry_count_of(&self, data: &[u8]) -> anyhow::Result<usize> {
+        if data.len() < HEADER_SIZE {
+            bail!("Vector store file too small");
+        }
+        validate_header(&data[..HEADER_SIZE])?;
+        let count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+        let expected_data_size = count
+            .checked_mul(entry_size())
+            .and_then(|s| s.checked_add(HEADER_SIZE))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Vector store count overflow: {count} entries * {} bytes",
+                    entry_size()
+                )
+            })?;
+        ensure!(
+            data.len() == expected_data_size,
+            "Vector store size mismatch: expected {} bytes, got {}",
+            expected_data_size,
+            data.len()
+        );
+        Ok(count)
     }
 
     /// Clear the store (reset to empty header).
@@ -605,6 +646,39 @@ mod tests {
         assert!((loaded[1].1[0] - 0.2).abs() < f32::EPSILON);
         assert!((loaded[2].1[0] - 0.3).abs() < f32::EPSILON);
         assert_eq!(loaded[0].1.len(), EMBEDDING_DIM);
+    }
+
+    /// The sweep is the only thing that reads the whole store on a run that
+    /// changed nothing, so what it keeps, drops, and leaves untouched is worth
+    /// pinning independently of how it walks the file.
+    #[test]
+    fn retaining_keeps_the_survivors_byte_for_byte_and_leaves_a_full_store_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let store = VectorStore::open(&path).unwrap();
+
+        let entries: Vec<(u32, Vec<f32>)> = (1..=5)
+            .map(|i| (i, vec![i as f32 / 10.0; EMBEDDING_DIM]))
+            .collect();
+        store.write_all(&entries).unwrap();
+
+        // Nothing to drop: the file must not be rewritten at all.
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(store.retain(|_| true).unwrap(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before, "no write was needed");
+
+        // Dropping keeps the survivors in order, with their vectors intact.
+        assert_eq!(store.retain(|id| id % 2 == 1).unwrap(), 2);
+        let left = store.load().unwrap();
+        assert_eq!(left.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [1, 3, 5]);
+        assert!((left[1].1[0] - 0.3).abs() < f32::EPSILON);
+        assert_eq!(left[1].1.len(), EMBEDDING_DIM);
+        assert_eq!(store.count().unwrap(), 3, "the header count follows");
+
+        // Dropping everything leaves a valid, empty store.
+        assert_eq!(store.retain(|_| false).unwrap(), 3);
+        assert!(store.load().unwrap().is_empty());
+        assert_eq!(store.count().unwrap(), 0);
     }
 
     #[test]
