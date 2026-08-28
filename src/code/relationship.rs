@@ -50,17 +50,6 @@ pub enum CallTarget {
     Unknown { name: String },
 }
 
-impl CallTarget {
-    /// The symbols this call was placed on, empty unless it resolved.
-    #[must_use]
-    pub fn resolved(&self) -> &[crate::code::types::SymbolId] {
-        match self {
-            Self::Resolved(ids) => ids,
-            _ => &[],
-        }
-    }
-}
-
 impl RelationKind {
     /// Get the inverse relationship kind.
     #[must_use]
