@@ -223,14 +223,21 @@ pub fn find_modifier_keyword<'a>(node: Node, code: &'a str, keywords: &[&str]) -
 ///
 /// Type arguments are skipped: `new List<Foo>()` constructs a `List`, and taking
 /// the literal last child would name `Foo` instead.
+///
+/// The descent is a loop, not a recursion: it follows one child per step down a
+/// subtree whose depth the caller's [`MAX_AST_DEPTH`] guard does not bound, and
+/// a stack overflow aborts the process instead of failing one file.
 pub fn last_name_segment<'a>(node: Node, code: &'a str) -> &'a str {
-    let last = node
-        .children(&mut node.walk())
-        .filter(|c| c.is_named() && !c.kind().contains("argument"))
-        .last();
-    match last {
-        Some(last) => last_name_segment(last, code),
-        None => &code[node.byte_range()],
+    let mut current = node;
+    loop {
+        let last = current
+            .children(&mut current.walk())
+            .filter(|c| c.is_named() && !c.kind().contains("argument"))
+            .last();
+        match last {
+            Some(last) => current = last,
+            None => return &code[current.byte_range()],
+        }
     }
 }
 
@@ -316,17 +323,24 @@ pub fn unnamed_call_target<'a>(
 }
 
 /// Is everything left of the last separator a chain of plain names?
+///
+/// Walked as a loop: `a.b.c…` nests once per separator, and minified sources
+/// nest far past [`MAX_AST_DEPTH`]. Recursing here overflowed the stack, which
+/// aborts the process rather than failing one file.
 fn is_identifier_path(node: Node, receiver_field: &str, chain_kind: &str) -> bool {
-    let Some(receiver) = node.child_by_field_name(receiver_field) else {
-        return false;
-    };
-    match receiver.kind() {
-        // One kind per grammar that means "a plain name": PHP writes `name`
-        // and `qualified_name`, Java `identifier`, TypeScript `this`.
-        "identifier" | "type_identifier" | "field_identifier" | "name" | "qualified_name"
-        | "this" | "super" => true,
-        kind if kind == chain_kind => is_identifier_path(receiver, receiver_field, chain_kind),
-        _ => false,
+    let mut current = node;
+    loop {
+        let Some(receiver) = current.child_by_field_name(receiver_field) else {
+            return false;
+        };
+        match receiver.kind() {
+            // One kind per grammar that means "a plain name": PHP writes `name`
+            // and `qualified_name`, Java `identifier`, TypeScript `this`.
+            "identifier" | "type_identifier" | "field_identifier" | "name" | "qualified_name"
+            | "this" | "super" => return true,
+            kind if kind == chain_kind => current = receiver,
+            _ => return false,
+        }
     }
 }
 
