@@ -738,16 +738,63 @@ impl CodeDb {
     /// A caller reached by more than one edge keeps the nearest: one firmly
     /// placed call is enough to know it really calls this symbol.
     pub fn get_callers_by_tier(&self, symbol_id: i64) -> rusqlite::Result<Vec<(Symbol, i64)>> {
-        let mut stmt = self.conn.prepare_cached(&format!(
-            "SELECT {SYMBOL_COLUMNS_BARE}, MIN(c.tier) \
-                 FROM ({}) c \
-                 JOIN code_symbols s ON s.id = c.from_id \
-                 WHERE c.tier = c.nearest AND c.tier <> {TIER_EXTERNAL} AND c.sym_id = ?1 \
-                 GROUP BY s.id",
-            resolved_edges("r.to_name = (SELECT name FROM code_symbols WHERE id = ?1)")
-        ))?;
-        let rows = stmt.query_map([symbol_id], |row| Ok((row_to_symbol(row)?, row.get(14)?)))?;
-        rows.collect()
+        self.callers_of_any(&[symbol_id])
+    }
+
+    /// Callers of any of `symbol_ids`, each once, at the nearest tier any of
+    /// them was reached by.
+    ///
+    /// The whole set is asked for in one statement because a hop of the impact
+    /// walk asks about every symbol it just reached, and one query per symbol
+    /// runs the resolution cascade — a window function over every `Calls` edge
+    /// of that name — once per symbol instead of once per hop. Measured on this
+    /// repository (6310 symbols, 52 712 relationships), a depth-10 walk from a
+    /// hot name issued ~2400 statements and took 1.5 s.
+    ///
+    /// Widening the name filter does not change any edge's tier: the candidate
+    /// join is per edge, and `nearest` partitions by edge, so admitting more
+    /// edges leaves each surviving row exactly as it was.
+    fn callers_of_any(&self, symbol_ids: &[i64]) -> rusqlite::Result<Vec<(Symbol, i64)>> {
+        let mut best: HashMap<i64, (Symbol, i64)> = HashMap::new();
+        // Chunked into groups of 999 to stay within SQLite's variable limit.
+        for chunk in symbol_ids.chunks(999) {
+            // The same placeholders are read twice — once to narrow the edges
+            // by name, once to keep the candidates that are the targets — so
+            // each id is bound once.
+            let placeholders = (1..=chunk.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let mut stmt = self.conn.prepare_cached(&format!(
+                "SELECT {SYMBOL_COLUMNS_BARE}, MIN(c.tier) \
+                     FROM ({}) c \
+                     JOIN code_symbols s ON s.id = c.from_id \
+                     WHERE c.tier = c.nearest AND c.tier <> {TIER_EXTERNAL} \
+                       AND c.sym_id IN ({placeholders}) \
+                     GROUP BY s.id",
+                resolved_edges(&format!(
+                    "r.to_name IN (SELECT name FROM code_symbols WHERE id IN ({placeholders}))"
+                ))
+            ))?;
+            let sql_params: Vec<&dyn rusqlite::types::ToSql> = chunk
+                .iter()
+                .map(|id| id as &dyn rusqlite::types::ToSql)
+                .collect();
+            let rows = stmt.query_map(sql_params.as_slice(), |row| {
+                Ok((row_to_symbol(row)?, row.get::<_, i64>(14)?))
+            })?;
+            for row in rows {
+                let (caller, tier) = row?;
+                let caller_id = i64::from(caller.id.value());
+                match best.get_mut(&caller_id) {
+                    Some((_, nearest)) => *nearest = (*nearest).min(tier),
+                    None => {
+                        best.insert(caller_id, (caller, tier));
+                    }
+                }
+            }
+        }
+        Ok(best.into_values().collect())
     }
 
     /// Transitive impact radius: all symbols that directly or indirectly
@@ -786,17 +833,16 @@ impl CodeDb {
         let mut frontier = vec![symbol_id];
 
         // `max_depth` counts hops beyond the direct callers, which are depth 0.
+        // A hop is one query for the whole frontier, not one per symbol in it.
         for _ in 0..=max_depth {
             let mut next = Vec::new();
-            for id in frontier {
-                for (caller, tier) in self.get_callers_by_tier(id)? {
-                    let caller_id = i64::from(caller.id.value());
-                    if let Some((_, best)) = seen.get_mut(&caller_id) {
-                        *best = (*best).min(tier);
-                    } else {
-                        seen.insert(caller_id, (caller, tier));
-                        next.push(caller_id);
-                    }
+            for (caller, tier) in self.callers_of_any(&frontier)? {
+                let caller_id = i64::from(caller.id.value());
+                if let Some((_, best)) = seen.get_mut(&caller_id) {
+                    *best = (*best).min(tier);
+                } else {
+                    seen.insert(caller_id, (caller, tier));
+                    next.push(caller_id);
                 }
             }
             if next.is_empty() {
@@ -2351,6 +2397,88 @@ mod tests {
         let names: Vec<&str> = impact.iter().map(|s| s.as_name()).collect();
         assert!(names.contains(&"b"));
         assert!(names.contains(&"c"));
+    }
+
+    /// A hop reaching several symbols at once must report each caller exactly
+    /// once, at the nearest tier any of them reached it by. Walking the hop one
+    /// target at a time and walking it in one query have to agree on that, so
+    /// this pins it independently of how the hop is issued.
+    #[test]
+    fn a_caller_reached_twice_in_one_hop_keeps_its_nearest_tier() {
+        let (_dir, db) = temp_db();
+        let near_file = insert_test_file(&db);
+        let far_file = db
+            .insert_file("far.rs", "far.rs", "hash456", Some("Rust"), None, None)
+            .unwrap();
+
+        // `root` is called by both `near` and `far`; each of those is called by
+        // the same `shared`, from `near`'s file. So `shared` is reached twice
+        // in the second hop: tier 4 (same file as `near`) and tier 7 (nothing
+        // places the call to `far`).
+        let root = db
+            .insert_symbol(
+                "root", "Function", near_file, "test.rs", 1, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
+        let near = db
+            .insert_symbol(
+                "near", "Function", near_file, "test.rs", 10, None, None, None, 0, None, None,
+                None, None,
+            )
+            .unwrap();
+        let far = db
+            .insert_symbol(
+                "far", "Function", far_file, "far.rs", 10, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
+        let shared = db
+            .insert_symbol(
+                "shared", "Function", near_file, "test.rs", 20, None, None, None, 0, None, None,
+                None, None,
+            )
+            .unwrap();
+
+        db.insert_relationship(Some(near), "near", "root", None, "Calls", near_file, (None, None))
+            .unwrap();
+        db.insert_relationship(Some(far), "far", "root", None, "Calls", far_file, (None, None))
+            .unwrap();
+        db.insert_relationship(
+            Some(shared),
+            "shared",
+            "near",
+            None,
+            "Calls",
+            near_file,
+            (None, None),
+        )
+        .unwrap();
+        db.insert_relationship(
+            Some(shared),
+            "shared",
+            "far",
+            None,
+            "Calls",
+            near_file,
+            (None, None),
+        )
+        .unwrap();
+
+        let by_tier = db.get_impact_by_tier(root, 1).unwrap();
+        let tier_of = |name: &str| {
+            by_tier
+                .iter()
+                .filter(|(s, _)| s.as_name() == name)
+                .map(|(_, tier)| *tier)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(tier_of("near"), vec![4], "near is in root's file");
+        assert_eq!(tier_of("far"), vec![TIER_UNPLACED], "far is not placed");
+        // One entry, and the nearer of the two tiers it was reached by.
+        assert_eq!(tier_of("shared"), vec![4], "nearest tier wins, once");
+        assert_eq!(by_tier.len(), 3, "no symbol is reported twice");
     }
 
     #[test]
