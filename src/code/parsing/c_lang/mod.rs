@@ -553,12 +553,6 @@ impl CParser {
 
 // ── Free helpers ────────────────────────────────────────────────────────
 
-/// Extract the name from a C declarator (handles pointer declarators, function declarators, etc).
-/// Is this declarator a function prototype (`int f(int);`) rather than an object?
-///
-/// A prototype and a function pointer both reach a `function_declarator`. They
-/// part company one level below it: the pointer parenthesises its name —
-/// `int (*fp)(int)` — while the prototype names it directly. The return type
 /// The access a C declaration grants, from its storage class.
 ///
 /// `static` is C's own word for "not visible outside this translation unit", so
@@ -580,6 +574,11 @@ fn c_visibility(node: Node, code: &str, name: &str) -> Visibility {
     }
 }
 
+/// Is this declarator a function prototype (`int f(int);`) rather than an object?
+///
+/// A prototype and a function pointer both reach a `function_declarator`. They
+/// part company one level below it: the pointer parenthesises its name —
+/// `int (*fp)(int)` — while the prototype names it directly. The return type
 /// can wrap either in pointers or arrays first (`int *ptr_ret(void);`), so the
 /// chain has to be walked rather than inspected one level deep.
 fn is_function_prototype(declarator: Node) -> bool {
@@ -594,6 +593,8 @@ fn is_function_prototype(declarator: Node) -> bool {
     }
 }
 
+/// The name a C declarator declares, whatever wraps it: a pointer, an array,
+/// a function declarator, an initialiser, or a parenthesised nest of those.
 fn extract_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
         // A typedef alias arrives as `type_identifier`, an object name as
