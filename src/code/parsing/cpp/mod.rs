@@ -511,9 +511,12 @@ impl CppParser {
         symbols: &mut Vec<Symbol>,
         module_path: &str,
     ) {
-        for child in node.children(&mut node.walk()) {
-            if child.kind() == "field_identifier" {
-                let name = &code[child.byte_range()];
+        // One declaration can name several members (`int a, b;`), and each name
+        // sits at the end of its own declarator: `int *p;` and `int arr[4];` put
+        // a level between the two. A bitfield names itself directly and reaches
+        // the same arm.
+        for child in node.children_by_field_name("declarator", &mut node.walk()) {
+            if let Some(name) = extract_cpp_declarator_name(child, code) {
                 let qualified_name = if let Some(cls) = self.context.current_class() {
                     format!("{cls}::{name}")
                 } else {
@@ -644,6 +647,9 @@ impl CppParser {
     /// initialises a builtin and constructs nothing, so an edge to `int` would be
     /// noise. A `function_declarator` is a prototype, not an initialiser, and the
     /// grammar keeps the two apart by the kind of the `value` field.
+    ///
+    /// One declaration may declare several things — `Widget a, b(2)` constructs
+    /// only the second — so every declarator is asked, not just the first.
     fn direct_init_type<'a>(node: Node, code: &'a str) -> Option<&'a str> {
         let type_node = node.child_by_field_name("type")?;
         if !matches!(
@@ -652,12 +658,10 @@ impl CppParser {
         ) {
             return None;
         }
-        let declarator = node.child_by_field_name("declarator")?;
-        if declarator.kind() != "init_declarator" {
-            return None;
-        }
-        let value = declarator.child_by_field_name("value")?;
-        matches!(value.kind(), "argument_list" | "initializer_list")
+        node.children_by_field_name("declarator", &mut node.walk())
+            .filter(|declarator| declarator.kind() == "init_declarator")
+            .filter_map(|declarator| declarator.child_by_field_name("value"))
+            .any(|value| matches!(value.kind(), "argument_list" | "initializer_list"))
             .then(|| last_name_segment(type_node, code))
     }
 
@@ -901,6 +905,38 @@ private:
             .iter()
             .map(|s| s.as_name().to_string())
             .collect()
+    }
+
+    /// The same shape as C's members: the name is at the end of the declarator,
+    /// and a pointer, an array or a member function pointer each put a level
+    /// between it and the declaration. Reading only the direct children kept the
+    /// plain members and quietly lost the rest.
+    #[test]
+    fn a_member_is_found_through_its_declarator_whatever_shape_it_has() {
+        let names = names_of(
+            "class Box {\n\
+             public:\n\
+             \x20   int plain;\n\
+             \x20   int *ptr;\n\
+             \x20   int arr[4];\n\
+             \x20   unsigned flag : 1;\n\
+             \x20   int a, b;\n\
+             };\n",
+        );
+
+        for member in [
+            "Box::plain",
+            "Box::ptr",
+            "Box::arr",
+            "Box::flag",
+            "Box::a",
+            "Box::b",
+        ] {
+            assert!(
+                names.iter().any(|n| n == member),
+                "missing {member} in {names:?}"
+            );
+        }
     }
 
     const NESTED: &str = r#"
@@ -1226,5 +1262,58 @@ void run() {
             "builtin initialisation is not a call: {edges:?}"
         );
         assert!(edges.contains(&("run", "helper")), "plain call: {edges:?}");
+    }
+
+    #[test]
+    fn a_name_qualified_deeper_than_the_ast_limit_does_not_end_the_process() {
+        // Generated headers qualify further than anything written by hand.
+        // Reducing a qualified name to its last segment walks the whole nest,
+        // and that walk is not covered by any caller's MAX_AST_DEPTH guard —
+        // a stack overflow aborts the daemon rather than failing one file.
+        let mut parser = CppParser::new().unwrap();
+
+        let scopes = "N::".repeat(crate::code::parsing::parser::MAX_AST_DEPTH * 40);
+        let code = format!("void run() {{ new {scopes}Leaf(); }}");
+
+        let calls = parser.find_calls_impl(&code);
+        let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
+        assert!(
+            edges.contains(&("run", "Leaf")),
+            "the last segment is still the constructed type: {edges:?}"
+        );
+    }
+
+    /// One declaration may declare several things, and only some of them are
+    /// constructed. Reading the first declarator alone makes the construction
+    /// visible or invisible depending on where it sits in the list.
+    #[test]
+    fn a_construction_counts_wherever_it_sits_in_the_declarator_list() {
+        let mut parser = CppParser::new().unwrap();
+
+        let code = r#"
+void run() {
+    Widget a, b(2);
+    Gadget x, y{3};
+    Plain u, v;
+}
+"#;
+
+        let calls = parser.find_calls_impl(code);
+        let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
+
+        assert!(
+            edges.contains(&("run", "Widget")),
+            "second declarator direct-init: {edges:?}"
+        );
+        assert!(
+            edges.contains(&("run", "Gadget")),
+            "second declarator brace-init: {edges:?}"
+        );
+        // Declaring without initialising still constructs nothing we can name a
+        // call: no initialiser, no argument list, no edge.
+        assert!(
+            !edges.iter().any(|(_, t)| *t == "Plain"),
+            "an uninitialised declaration is not a call: {edges:?}"
+        );
     }
 }
