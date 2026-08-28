@@ -273,13 +273,17 @@ impl CParser {
             if decl.kind() != "field_declaration" {
                 continue;
             }
-            for field in decl.children(&mut decl.walk()) {
-                if field.kind() != "field_identifier" {
+            // One declaration can name several members (`int a, b;`), and each
+            // name sits at the end of its own declarator rather than at the top
+            // of it — `int *p;` and `int arr[4];` wrap it a level down. A
+            // bitfield names itself directly, and reaches the same arm.
+            for field in decl.children_by_field_name("declarator", &mut decl.walk()) {
+                let Some(name) = extract_declarator_name(field, code) else {
                     continue;
-                }
+                };
                 let symbol = self.create_symbol(
                     counter.next_id(),
-                    format!("{record}.{}", &code[field.byte_range()]),
+                    format!("{record}.{name}"),
                     SymbolKind::Field,
                     file_id,
                     node_range(decl),
@@ -593,8 +597,9 @@ fn is_function_prototype(declarator: Node) -> bool {
 fn extract_declarator_name<'a>(node: Node, code: &'a str) -> Option<&'a str> {
     match node.kind() {
         // A typedef alias arrives as `type_identifier`, an object name as
-        // `identifier`. Both are the end of the declarator chain.
-        "identifier" | "type_identifier" => Some(&code[node.byte_range()]),
+        // `identifier`, a record member as `field_identifier`. All three are the
+        // end of the declarator chain.
+        "identifier" | "type_identifier" | "field_identifier" => Some(&code[node.byte_range()]),
         "init_declarator" | "pointer_declarator" | "array_declarator" | "function_declarator" => {
             node.child_by_field_name("declarator")
                 .and_then(|d| extract_declarator_name(d, code))
@@ -697,6 +702,35 @@ mod tests {
             .iter()
             .map(|s| s.as_name().to_string())
             .collect()
+    }
+
+    /// A member's name sits at the end of its declarator, not at the top of it.
+    /// `int x;` puts the two in the same place, which is why reading only the
+    /// direct children looked right — but a pointer, an array and a function
+    /// pointer each wrap the name one or more levels down, and those are most of
+    /// the members a real struct has. Reading the top level only kept `x` and
+    /// dropped the rest, leaving a struct that looked complete.
+    #[test]
+    fn a_member_is_found_through_its_declarator_whatever_shape_it_has() {
+        let names = names_of(
+            "struct Box {\n\
+             \x20   int plain;\n\
+             \x20   int *ptr;\n\
+             \x20   int arr[4];\n\
+             \x20   void (*cb)(int);\n\
+             \x20   unsigned flag : 1;\n\
+             \x20   int a, b;\n\
+             };\n",
+        );
+
+        for member in [
+            "Box.plain", "Box.ptr", "Box.arr", "Box.cb", "Box.flag", "Box.a", "Box.b",
+        ] {
+            assert!(
+                names.iter().any(|n| n == member),
+                "missing {member} in {names:?}"
+            );
+        }
     }
 
     #[test]
