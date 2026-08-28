@@ -333,11 +333,11 @@ impl CSharpParser {
         module_path: &str,
     ) -> Option<Symbol> {
         let (kind, keyword) = match node.kind() {
-            "class_declaration" => (SymbolKind::Class, "class"),
-            "record_declaration" => (SymbolKind::Class, "record"),
-            "interface_declaration" => (SymbolKind::Interface, "interface"),
-            "struct_declaration" => (SymbolKind::Struct, "struct"),
-            "enum_declaration" => (SymbolKind::Enum, "enum"),
+            "class_declaration" => (SymbolKind::Class, "class".to_string()),
+            "record_declaration" => record_kind_and_keyword(node, code),
+            "interface_declaration" => (SymbolKind::Interface, "interface".to_string()),
+            "struct_declaration" => (SymbolKind::Struct, "struct".to_string()),
+            "enum_declaration" => (SymbolKind::Enum, "enum".to_string()),
             _ => return None,
         };
 
@@ -695,6 +695,54 @@ impl CSharpParser {
 
 // ── Free helpers ────────────────────────────────────────────────────────
 
+/// What a `record_declaration` actually declares.
+///
+/// `record struct` is a value type, `record class` and a bare `record` are
+/// reference types. The grammar spells all three the same way and leaves the
+/// distinguishing keyword as an anonymous token, so it is read off the source.
+fn record_kind_and_keyword(node: Node, code: &str) -> (SymbolKind, String) {
+    let flavour = node
+        .children(&mut node.walk())
+        .filter(|c| !c.is_named())
+        .map(|c| &code[c.byte_range()])
+        .find(|text| *text == "struct" || *text == "class");
+    match flavour {
+        Some("struct") => (SymbolKind::Struct, "record struct".to_string()),
+        Some(word) => (SymbolKind::Class, format!("record {word}")),
+        None => (SymbolKind::Class, "record".to_string()),
+    }
+}
+
+/// Is this type declared inside another type, rather than in a namespace or
+/// straight in the file?
+///
+/// It decides the default access: C# gives a nested type `private` and a
+/// top-level one `internal`. A namespace body and a type body are both
+/// `declaration_list`, so the enclosing *declaration* is what is looked for,
+/// not the enclosing block.
+fn is_nested_in_a_type(node: Node) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if matches!(
+            parent.kind(),
+            "class_declaration"
+                | "record_declaration"
+                | "struct_declaration"
+                | "interface_declaration"
+        ) {
+            return true;
+        }
+        if matches!(
+            parent.kind(),
+            "namespace_declaration" | "file_scoped_namespace_declaration" | "compilation_unit"
+        ) {
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
 fn determine_csharp_visibility(node: Node, code: &str) -> Visibility {
     // An enum member cannot carry an access modifier: C# gives it the reach of
     // the enum that declares it. Looking for modifiers it is not allowed to have
@@ -732,9 +780,27 @@ fn determine_csharp_visibility(node: Node, code: &str) -> Visibility {
         (true, _, true) => Visibility::Restricted,
         (true, ..) => Visibility::Module,
         (_, true, _) => Visibility::Crate,
-        // C# default is private, and so is a bare `private`.
+        // A bare `private` is private wherever it is written.
+        (.., true) => Visibility::Private,
+        // With nothing written, the default depends on where the declaration
+        // sits: C# gives a type declared in a namespace or in the file itself
+        // the reach of its assembly, and everything else `private`.
+        _ if is_a_type_declaration(node) && !is_nested_in_a_type(node) => Visibility::Crate,
         _ => Visibility::Private,
     }
+}
+
+/// Does this node declare a type, as opposed to a member of one?
+fn is_a_type_declaration(node: Node) -> bool {
+    matches!(
+        node.kind(),
+        "class_declaration"
+            | "record_declaration"
+            | "struct_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "delegate_declaration"
+    )
 }
 
 fn extract_csharp_doc(node: &Node, code: &str) -> Option<String> {
@@ -870,6 +936,64 @@ class App {
 
         assert_eq!(level("Local"), Visibility::Module);
         assert_ne!(level("Local"), level("Other"));
+    }
+
+    /// `record struct` is a value type and `record class` a reference type.
+    /// Both are spelled as a `record_declaration`, so the node kind alone
+    /// cannot tell them apart — and calling every record a class puts a value
+    /// type in the wrong half of the index.
+    #[test]
+    fn a_record_says_whether_it_is_a_struct_or_a_class() {
+        let mut parser = CSharpParser::new().unwrap();
+        let code = "public record struct Point(int X);\n\
+                    public record class Person(string Name);\n\
+                    public record Plain(string Name);\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let of = |name: &str| {
+            let s = symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"));
+            (s.kind, s.signature.as_deref().unwrap_or("").to_string())
+        };
+
+        assert_eq!(of("Point"), (SymbolKind::Struct, "record struct Point".into()));
+        assert_eq!(
+            of("Person"),
+            (SymbolKind::Class, "record class Person".into())
+        );
+        // Without a keyword a record is a reference type, and the signature
+        // says what the source said.
+        assert_eq!(of("Plain"), (SymbolKind::Class, "record Plain".into()));
+    }
+
+    /// C# gives a type declared straight in a namespace the reach of its
+    /// assembly, not of its declaration. Only a type nested inside another
+    /// type defaults to private, and reporting the first as the second hides
+    /// every unmodified top-level type from anything outside its own file.
+    #[test]
+    fn an_unmodified_type_defaults_to_its_assembly_not_to_private() {
+        let mut parser = CSharpParser::new().unwrap();
+        let code = "namespace App {\n\
+                        class Service {\n\
+                            class Helper {}\n\
+                        }\n\
+                    }\n\
+                    class Loose {}\n";
+        let mut counter = SymbolCounter::new();
+        let symbols = parser.parse_symbols(code, FileId::new(1).unwrap(), &mut counter);
+        let level = |name: &str| {
+            symbols
+                .iter()
+                .find(|s| s.name.as_ref() == name)
+                .unwrap_or_else(|| panic!("{name} not parsed"))
+                .visibility
+        };
+
+        assert_eq!(level("Service"), Visibility::Crate, "in a namespace");
+        assert_eq!(level("Loose"), Visibility::Crate, "in the file itself");
+        assert_eq!(level("Helper"), Visibility::Private, "nested in a type");
     }
 
     /// A partial class is one type written in several places. The parser emits
