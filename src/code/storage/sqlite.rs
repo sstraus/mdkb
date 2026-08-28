@@ -962,17 +962,26 @@ fn io_as_sqlite(operation: &str, error: std::io::Error) -> rusqlite::Error {
 /// dropped, because a call the index cannot place is still better answered with
 /// every same-named symbol than with an empty list. Tier 3 is the opposite —
 /// the index CAN place the call, outside itself — so `resolved_edges` drops it.
+///
+/// The suffix arms compare with `substr` rather than `LIKE` because both of
+/// `LIKE`'s conveniences are wrong here. Its wildcards are live in the *value*
+/// being matched, and `_` is an ordinary character in half the languages
+/// indexed, so `my_store` read as a pattern also claims `myastore`. And writing
+/// PHP's separator into a `LIKE` pattern needs a backslash, which the escape
+/// clause that would fix the first problem then takes for itself. `substr(x, -n)`
+/// asks the question directly — "do these characters end it" — and a name too
+/// short to fill `n` simply fails to compare equal.
 const RESOLUTION_TIER: &str = "CASE \
      WHEN r.to_qualifier IS NOT NULL THEN ( CASE \
          WHEN s.owner_name IS NOT NULL AND ( \
              r.to_qualifier = s.owner_name \
-             OR r.to_qualifier LIKE '%::' || s.owner_name \
-             OR r.to_qualifier LIKE '%.' || s.owner_name \
-             OR r.to_qualifier LIKE '%\' || s.owner_name) THEN 1 \
+             OR substr(r.to_qualifier, -length(s.owner_name) - 2) = '::' || s.owner_name \
+             OR substr(r.to_qualifier, -length(s.owner_name) - 1) = '.' || s.owner_name \
+             OR substr(r.to_qualifier, -length(s.owner_name) - 1) = '\\' || s.owner_name) THEN 1 \
          WHEN s.module_path IS NOT NULL AND ( \
              s.module_path = r.to_qualifier \
-             OR (( s.module_path LIKE '%::' || r.to_qualifier \
-                   OR s.module_path LIKE '%.' || r.to_qualifier) \
+             OR (( substr(s.module_path, -length(r.to_qualifier) - 2) = '::' || r.to_qualifier \
+                   OR substr(s.module_path, -length(r.to_qualifier) - 1) = '.' || r.to_qualifier) \
                  AND EXISTS ( \
                      SELECT 1 FROM code_imports i WHERE i.file_id = r.file_id AND ( \
                          i.path = s.module_path \
@@ -1916,6 +1925,112 @@ mod tests {
             called_ids(&db, caller),
             Vec::<i64>::new(),
             "a qualifier narrows the candidates and must never widen them"
+        );
+    }
+
+    /// PHP writes its separator with a backslash, so `\App\Util::run` qualifies
+    /// `run` by `Util` exactly the way `App\Util::run` does in a namespace. The
+    /// backslash arm of the cascade is the one arm no test reached, which is how
+    /// it once shipped compiled down to a bare `'%'` that matched anything.
+    #[test]
+    fn a_backslash_qualifier_reaches_the_owner_it_names() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.php", "App\\Here");
+        let local = function_in(&db, "run", (here_file, "here.php"), "App\\Here", 10);
+        let (util_file, _) = file_with_function(&db, "unrelated", "util.php", "App\\Util");
+        let member = method_in(
+            &db,
+            "run",
+            "Util",
+            (util_file, "util.php"),
+            "App\\Util",
+            5,
+        );
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "run",
+            Some("\\App\\Util"),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            vec![member],
+            "expected Util::run, not the local run {local}"
+        );
+    }
+
+    /// A qualifier that merely *ends with* an owner's name did not name that
+    /// owner. `FooStore` is its own type; answering `FooStore::open` with
+    /// `Store::open` invents a call, which is the one thing the cascade exists
+    /// to prevent. Each arm must require its separator, not just the suffix.
+    #[test]
+    fn a_qualifier_that_only_ends_with_an_owner_name_is_not_that_owner() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let (store_file, _) = file_with_function(&db, "unrelated", "store.rs", "crate::store");
+        method_in(
+            &db,
+            "open",
+            "Store",
+            (store_file, "store.rs"),
+            "crate::store",
+            5,
+        );
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "open",
+            Some("FooStore"),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            Vec::<i64>::new(),
+            "FooStore is not Store, and a suffix is not a qualifier"
+        );
+    }
+
+    /// Snake_case is the majority convention in half the languages indexed here,
+    /// so an owner name carrying `_` is the common case, not the exotic one. Read
+    /// as a pattern rather than as text, `my_store` also matches `myastore` —
+    /// a different type, one character away.
+    #[test]
+    fn an_underscore_in_an_owner_name_is_a_character_not_a_wildcard() {
+        let (_dir, db) = temp_db();
+        let (here_file, caller) = file_with_function(&db, "caller", "here.rs", "crate::here");
+        let (store_file, _) = file_with_function(&db, "unrelated", "store.rs", "crate::store");
+        method_in(
+            &db,
+            "open",
+            "my_store",
+            (store_file, "store.rs"),
+            "crate::store",
+            5,
+        );
+        db.insert_relationship(
+            Some(caller),
+            "caller",
+            "open",
+            Some("crate::myastore"),
+            "Calls",
+            here_file,
+            (None, None),
+        )
+        .unwrap();
+
+        assert_eq!(
+            called_ids(&db, caller),
+            Vec::<i64>::new(),
+            "myastore is not my_store: the underscore is text, not a wildcard"
         );
     }
 
