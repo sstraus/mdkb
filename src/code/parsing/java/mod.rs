@@ -564,15 +564,24 @@ impl JavaParser {
         }
     }
 
-    /// Class named by a `this`/`super` constructor delegation.
+    /// Type named by a `this`/`super` constructor delegation.
     ///
-    /// Walks up to the enclosing `class_declaration` rather than threading class
+    /// Walks up to the enclosing type declaration rather than threading class
     /// context through the whole traversal: delegation is rare, so paying for it
     /// only where it occurs is cheaper than carrying two more parameters.
+    ///
+    /// Records and enums declare constructors as much as classes do — a record
+    /// delegating to its canonical constructor is the idiom, not a corner — so
+    /// all three spellings are walked to. Neither a record nor an enum can name
+    /// a superclass, which is why only `class_declaration` answers `super`.
     fn delegation_target<'a>(node: Node, keyword: &str, code: &'a str) -> Option<&'a str> {
         let mut current = node.parent();
         while let Some(parent) = current {
-            if parent.kind() == "class_declaration" {
+            let declares_a_type = matches!(
+                parent.kind(),
+                "class_declaration" | "record_declaration" | "enum_declaration"
+            );
+            if declares_a_type {
                 let field = if keyword == "super" {
                     "superclass"
                 } else {
@@ -1222,6 +1231,39 @@ class App extends Base {
         assert!(edges.contains(&("App", "Base")), "super(): {edges:?}");
         // Existing behaviour is untouched.
         assert!(edges.contains(&("run", "helper")), "plain call: {edges:?}");
+    }
+
+    /// A record declares constructors too, and delegating to the canonical one
+    /// is the idiom rather than the exception. An enum constant's arguments
+    /// reach its constructor the same way. Looking only for a `class_declaration`
+    /// overhead finds neither, so both forms recorded no delegation at all while
+    /// the `class` spelling of the same thing worked.
+    #[test]
+    fn a_record_or_enum_constructor_delegates_like_a_class_one() {
+        let mut parser = JavaParser::new().unwrap();
+
+        let code = r#"
+record Point(int x, int y) {
+    Point(int x) { this(x, x); }
+}
+
+enum Level {
+    LOW(0);
+    Level(int n) { this(); }
+}
+"#;
+
+        let calls = parser.find_calls_impl(code);
+        let edges: Vec<(&str, &str)> = calls.iter().map(|(c, t, _)| (*c, *t)).collect();
+
+        assert!(
+            edges.contains(&("Point", "Point")),
+            "a record's this(): {edges:?}"
+        );
+        assert!(
+            edges.contains(&("Level", "Level")),
+            "an enum's this(): {edges:?}"
+        );
     }
 
     /// Records, annotation types and everything inside an enum body fell through
