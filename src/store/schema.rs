@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 21;
+pub const SCHEMA_VERSION: i32 = 22;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -847,6 +847,34 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
             tracing::warn!(
                 "migration: deleted {purged} memory entr(ies) with an unreadable id; \
                  they broke `memory export` and could not be addressed"
+            );
+        }
+    }
+
+    // Migration from v21 to v22: date the priors that were written undated.
+    //
+    // `promote_cluster` minted every mined prior with `expires_at` NULL while
+    // the MCP writer gave the same entry type 30 days. The writer is fixed, but
+    // the rows it already wrote are permanent and every warmup still reads them.
+    //
+    // Dated from `created_at`, not from now: the TTL is the age at which a
+    // prior stops being trusted, so one mined two months ago is already past
+    // it. Scoped to `auto_extracted` — a prior a human stated is theirs to
+    // retire, not this migration's.
+    if from_version < 22 {
+        let dated = conn.execute(
+            &format!(
+                "UPDATE memory_entries SET expires_at = created_at + {} \
+                 WHERE entry_type = 'prior' \
+                   AND expires_at IS NULL \
+                   AND source_type = 'auto_extracted'",
+                crate::store::memory::PRIOR_TTL_SECS
+            ),
+            [],
+        )?;
+        if dated > 0 {
+            tracing::info!(
+                "migration: dated {dated} mined prior(s) that were written without a TTL"
             );
         }
     }
@@ -1921,6 +1949,51 @@ mod tests {
             "malformed tags_json should result in empty tags vec, got: {:?}",
             entry.tags
         );
+    }
+
+    #[test]
+    fn dating_a_mined_prior_leaves_a_stated_one_and_a_dated_one_alone() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // Three priors written before the miner carried a TTL: one mined and
+        // undated, one a human stated, one already dated by the MCP writer.
+        conn.execute_batch(
+            "INSERT INTO memory_entries
+                 (id, title, content, entry_type, tags, status, created_at, updated_at,
+                  source_type, expires_at)
+             VALUES
+                 ('prior-mined', 't', 'c', 'prior', '[]', 'active', 1000, 1000,
+                  'auto_extracted', NULL),
+                 ('prior-stated', 't', 'c', 'prior', '[]', 'active', 1000, 1000,
+                  'user_statement', NULL),
+                 ('prior-dated', 't', 'c', 'prior', '[]', 'active', 1000, 1000,
+                  'auto_extracted', 5);
+             UPDATE schema_version SET version = 21;",
+        )
+        .unwrap();
+
+        migrate_schema(&conn, 21).unwrap();
+
+        let dated_at = |id: &str| {
+            conn.query_row(
+                "SELECT expires_at FROM memory_entries WHERE id = ?1",
+                [id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            dated_at("prior-mined"),
+            Some(1000 + crate::store::memory::PRIOR_TTL_SECS),
+            "a mined prior is dated from when it was written, not from now"
+        );
+        assert_eq!(
+            dated_at("prior-stated"),
+            None,
+            "a prior a human stated is theirs to retire"
+        );
+        assert_eq!(dated_at("prior-dated"), Some(5), "an existing date stands");
     }
 
     #[test]
