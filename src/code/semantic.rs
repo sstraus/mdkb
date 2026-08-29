@@ -78,13 +78,9 @@ impl VectorStore {
     /// Uses write-to-temp + rename for atomic writes (crash-safe on Unix).
     pub fn write_all(&self, entries: &[(u32, Vec<f32>)]) -> anyhow::Result<()> {
         let count = entries.len() as u32;
-        let dim = EMBEDDING_DIM as u32;
 
         let mut buf = Vec::with_capacity(HEADER_SIZE + entries.len() * entry_size());
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&dim.to_le_bytes());
-        buf.extend_from_slice(&count.to_le_bytes());
+        push_header(&mut buf, count);
 
         for (id, embedding) in entries {
             ensure!(
@@ -107,7 +103,7 @@ impl VectorStore {
         let data = std::fs::read(&self.path)
             .with_context(|| format!("Failed to read vector store: {}", self.path.display()))?;
 
-        let count = self.entry_count_of(&data)?;
+        let count = entry_count_of(&data)?;
         let mut entries = Vec::with_capacity(count);
         let mut offset = HEADER_SIZE;
 
@@ -156,65 +152,37 @@ impl VectorStore {
     /// rejects a non-finite value and still does; the sweep is not the pass
     /// that should decide a store is corrupt, and refusing to drop orphans
     /// because of an unrelated bad entry left the store growing.
+    ///
+    /// `keep` is asked about each id exactly once. The answers are held, not
+    /// asked again for the copy: the header states how many entries follow it,
+    /// so a predicate that answered differently the second time would write a
+    /// count that disagrees with the body it precedes.
     pub fn retain(&self, keep: impl Fn(u32) -> bool) -> anyhow::Result<usize> {
         let data = std::fs::read(&self.path)
             .with_context(|| format!("Failed to read vector store: {}", self.path.display()))?;
-        let count = self.entry_count_of(&data)?;
+        let count = entry_count_of(&data)?;
         let entry_sz = entry_size();
         let id_at = |i: usize| {
             let offset = HEADER_SIZE + i * entry_sz;
             u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap())
         };
 
-        let removed = (0..count).filter(|i| !keep(id_at(*i))).count();
+        let survives: Vec<bool> = (0..count).map(|i| keep(id_at(i))).collect();
+        let kept = survives.iter().filter(|s| **s).count();
+        let removed = count - kept;
         if removed == 0 {
             return Ok(0);
         }
 
-        let kept = count - removed;
         let mut buf = Vec::with_capacity(HEADER_SIZE + kept * entry_sz);
-        buf.extend_from_slice(MAGIC);
-        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
-        buf.extend_from_slice(&(kept as u32).to_le_bytes());
-        for i in 0..count {
-            if keep(id_at(i)) {
-                let offset = HEADER_SIZE + i * entry_sz;
-                buf.extend_from_slice(&data[offset..offset + entry_sz]);
-            }
+        push_header(&mut buf, kept as u32);
+        for (i, _) in survives.iter().enumerate().filter(|(_, s)| **s) {
+            let offset = HEADER_SIZE + i * entry_sz;
+            buf.extend_from_slice(&data[offset..offset + entry_sz]);
         }
 
         atomic_write(&self.path, &buf)?;
         Ok(removed)
-    }
-
-    /// How many entries `data` holds, once its header and length agree.
-    ///
-    /// Shared by [`Self::load`] and [`Self::retain`]: a truncated or overlong
-    /// file must be refused the same way by both, or the sweep would index past
-    /// the end of a file the reader rejects.
-    fn entry_count_of(&self, data: &[u8]) -> anyhow::Result<usize> {
-        if data.len() < HEADER_SIZE {
-            bail!("Vector store file too small");
-        }
-        validate_header(&data[..HEADER_SIZE])?;
-        let count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
-        let expected_data_size = count
-            .checked_mul(entry_size())
-            .and_then(|s| s.checked_add(HEADER_SIZE))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Vector store count overflow: {count} entries * {} bytes",
-                    entry_size()
-                )
-            })?;
-        ensure!(
-            data.len() == expected_data_size,
-            "Vector store size mismatch: expected {} bytes, got {}",
-            expected_data_size,
-            data.len()
-        );
-        Ok(count)
     }
 
     /// Clear the store (reset to empty header).
@@ -249,12 +217,50 @@ fn write_empty_file(path: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut buf = Vec::with_capacity(HEADER_SIZE);
+    push_header(&mut buf, 0);
+    atomic_write(path, &buf)?;
+    Ok(())
+}
+
+/// How many entries `data` holds, once its header and length agree.
+///
+/// Shared by [`VectorStore::load`] and [`VectorStore::retain`]: a truncated or
+/// overlong file must be refused the same way by both, or the sweep would index
+/// past the end of a file the reader rejects.
+fn entry_count_of(data: &[u8]) -> anyhow::Result<usize> {
+    if data.len() < HEADER_SIZE {
+        bail!("Vector store file too small");
+    }
+    validate_header(&data[..HEADER_SIZE])?;
+    let count = u32::from_le_bytes(data[12..16].try_into().unwrap()) as usize;
+    let expected_data_size = count
+        .checked_mul(entry_size())
+        .and_then(|s| s.checked_add(HEADER_SIZE))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Vector store count overflow: {count} entries * {} bytes",
+                entry_size()
+            )
+        })?;
+    ensure!(
+        data.len() == expected_data_size,
+        "Vector store size mismatch: expected {} bytes, got {}",
+        expected_data_size,
+        data.len()
+    );
+    Ok(count)
+}
+
+/// Lay the 16-byte header for a store of `count` entries onto `buf`.
+///
+/// Three writers produce a store — a full write, an empty file, and the sweep —
+/// and all three must agree byte for byte with what [`validate_header`] accepts.
+/// They agree by sharing this.
+fn push_header(buf: &mut Vec<u8>, count: u32) {
     buf.extend_from_slice(MAGIC);
     buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
     buf.extend_from_slice(&(EMBEDDING_DIM as u32).to_le_bytes());
-    buf.extend_from_slice(&0u32.to_le_bytes()); // count = 0
-    atomic_write(path, &buf)?;
-    Ok(())
+    buf.extend_from_slice(&count.to_le_bytes());
 }
 
 /// Write data to a file atomically via write-to-temp + rename.
@@ -460,6 +466,7 @@ impl SemanticSearch {
     /// Load existing embeddings, filtering out entries matching a predicate.
     ///
     /// Returns entries where `keep(symbol_id)` returns true.
+    ///
     pub fn store_load_filtered(&self, keep: impl Fn(u32) -> bool) -> Vec<(u32, Vec<f32>)> {
         match self.store.load() {
             Ok(entries) => entries.into_iter().filter(|(id, _)| keep(*id)).collect(),
@@ -667,18 +674,92 @@ mod tests {
         assert_eq!(store.retain(|_| true).unwrap(), 0);
         assert_eq!(std::fs::read(&path).unwrap(), before, "no write was needed");
 
-        // Dropping keeps the survivors in order, with their vectors intact.
+        // Dropping keeps the survivors' bytes exactly, at their new positions.
+        // Comparing the bytes rather than the loaded floats is the point: the
+        // sweep copies byte ranges, so a range off by one entry would still
+        // load as five plausible vectors in the right order.
         assert_eq!(store.retain(|id| id % 2 == 1).unwrap(), 2);
-        let left = store.load().unwrap();
-        assert_eq!(left.iter().map(|(id, _)| *id).collect::<Vec<_>>(), [1, 3, 5]);
-        assert!((left[1].1[0] - 0.3).abs() < f32::EPSILON);
-        assert_eq!(left[1].1.len(), EMBEDDING_DIM);
+        let after = std::fs::read(&path).unwrap();
+        let entry_at = |file: &[u8], i: usize| {
+            file[HEADER_SIZE + i * entry_size()..HEADER_SIZE + (i + 1) * entry_size()].to_vec()
+        };
+        for (new_i, old_i) in [0usize, 2, 4].into_iter().enumerate() {
+            assert_eq!(
+                entry_at(&after, new_i),
+                entry_at(&before, old_i),
+                "entry {old_i} must survive unchanged at its new place {new_i}"
+            );
+        }
         assert_eq!(store.count().unwrap(), 3, "the header count follows");
+        assert_eq!(
+            after.len(),
+            HEADER_SIZE + 3 * entry_size(),
+            "and nothing trails the entries it counts"
+        );
 
-        // Dropping everything leaves a valid, empty store.
+        // Dropping everything leaves a valid, empty store, and sweeping that
+        // empty store again is a no-op rather than an error.
         assert_eq!(store.retain(|_| false).unwrap(), 3);
         assert!(store.load().unwrap().is_empty());
         assert_eq!(store.count().unwrap(), 0);
+        assert_eq!(store.retain(|_| true).unwrap(), 0);
+    }
+
+    /// The sweep addresses entries by offset, and the two offsets an off-by-one
+    /// reaches first are the ones an interior drop never moves: the first entry
+    /// and the last.
+    #[test]
+    fn retaining_drops_the_first_and_the_last_entry_as_readily_as_a_middle_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let store = VectorStore::open(&path).unwrap();
+        let entries: Vec<(u32, Vec<f32>)> = (1..=4)
+            .map(|i| (i, vec![i as f32 / 10.0; EMBEDDING_DIM]))
+            .collect();
+        let ids_left = || {
+            store
+                .load()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>()
+        };
+
+        store.write_all(&entries).unwrap();
+        assert_eq!(store.retain(|id| id != 1).unwrap(), 1);
+        assert_eq!(ids_left(), [2, 3, 4], "the first entry went");
+
+        store.write_all(&entries).unwrap();
+        assert_eq!(store.retain(|id| id != 4).unwrap(), 1);
+        assert_eq!(ids_left(), [1, 2, 3], "the last entry went");
+    }
+
+    /// `retain` walks the file by offset instead of going through `load`, so the
+    /// checks that make those offsets safe have to fire on its own path too: a
+    /// header promising more entries than the file holds must be refused, not
+    /// indexed past.
+    #[test]
+    fn retaining_refuses_a_file_whose_header_promises_more_than_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.bin");
+        let store = VectorStore::open(&path).unwrap();
+        store
+            .write_all(&[
+                (1, vec![0.5; EMBEDDING_DIM]),
+                (2, vec![0.5; EMBEDDING_DIM]),
+            ])
+            .unwrap();
+
+        // Cut the second entry away, leaving the header still claiming two.
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() - entry_size()]).unwrap();
+
+        let err = store.retain(|_| true).unwrap_err().to_string();
+        assert!(err.contains("size mismatch"), "got: {err}");
+        assert!(
+            store.load().is_err(),
+            "and the reader refuses the same file identically"
+        );
     }
 
     #[test]
