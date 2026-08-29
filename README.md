@@ -237,7 +237,7 @@ Persistent AI knowledge that survives across sessions — decisions, patterns, s
 - **Confidence scoring** — entries decay over time unless re-confirmed (0-1 score based on age, access count, source type)
 - **Duplicate detection** — near-duplicate entries are rejected before writing
 - **Revision tracking** — manual entries track up to 3 revision diffs
-- **TTL (time-to-live)** — pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Expired entries are filtered from searches and listings but remain accessible via `get(id)` with an `[EXPIRED]` marker, so they can be inspected or renewed. Omit `ttl` for permanent entries.
+- **TTL (time-to-live)** — pass `ttl` (seconds) to `memory_write` for auto-expiring entries. Expired entries are filtered from searches and listings but remain accessible via `get(id)` with an `[EXPIRED]` marker, so they can be inspected or renewed. `mdkb update` then archives them and moves their file to `memory/archive/` — archived, never deleted, so a renewal is always possible. Only entries given a TTL are ever reached: omit `ttl` and the entry is permanent, which is what `topic`, `problem` and `decision` are by default.
 - **Provenance** — `memory_write` records the authoring session and (optional) `agent`; both surface in `get(id)` and via `mdkb memory link ... --agent <name>`.
 
 Entry types: `topic` (concepts), `problem` (solutions), `decision` (architectural choices), `reminder` (time-bound — see below), `prior` (behavioral patterns — 30-day TTL default, excluded from default searches), `handoff` (session handover — no default TTL).
@@ -268,9 +268,11 @@ Create with `memory_write(id, title, content, entry_type="reminder", due_in=<sec
 
 Behavioral pattern entries written by external analyzers (e.g., HUD stop hooks). Create with `memory_write(id, title, content, entry_type="prior")` or `mdkb memory add <id> --entry-type prior`. Priors default to 30-day TTL and are excluded from all default searches — query them explicitly with `mdkb search --scope memory --entry-type prior "query"` or `search(query, scope="memory", entry_type="prior")` via MCP.
 
+A prior states what went wrong once, and that stops being true when the code it was observed on changes. The 30 days apply whether the prior was written through `memory_write` or mined from a session by the recurrence gate — one that still holds gets promoted again, one that does not is archived by the next `mdkb update`.
+
 #### Handoffs
 
-Session context transfer entries. Create with `memory_write(id, title, content, entry_type="handoff")` or `mdkb memory add <id> --entry-type handoff`. Use `--file <path>` (CLI) or `source_file` (MCP) to read content from a file — saves tokens when agents write handoffs to the filesystem. The file path is persisted as `source_path` metadata. Handoffs have no default TTL; confidence decay handles relevance naturally.
+Session context transfer entries. Create with `memory_write(id, title, content, entry_type="handoff")` or `mdkb memory add <id> --entry-type handoff`. Use `--file <path>` (CLI) or `source_file` (MCP) to read content from a file — saves tokens when agents write handoffs to the filesystem. The file path is persisted as `source_path` metadata. Handoffs have no default TTL; confidence decay handles relevance naturally. If a caller gives one an explicit `ttl`, the newest handoff is still never archived by the expiry sweep — the session it was written for can start after the TTL runs out.
 
 Source types control confidence weighting:
 
@@ -313,6 +315,10 @@ Tree-sitter parsing for **14 languages**: Rust, Go, TypeScript, JavaScript, Pyth
 - **Substring search** — find symbols by partial name (FTS5 trigram, works from 3 characters)
 - **Semantic code search** — find conceptually similar code using embeddings
 - **Persistent call graph** — function calls, callers, and transitive impact radius survive restarts
+- **Scope-resolved calls** — every symbol carries an address, and a call site keeps the qualifier it was written with, so `Store::write` and `Cache::write` are not the same edge
+- **A call the index cannot place says so** — the graph distinguishes a call resolved inside the index, one naming a module the index does not contain (`std::fs::write`), and a bare name with no candidate. None of the three is reported as "no callers"
+- **Macro invocations are their own edge kind** — `assert!` and `println!` are expansions, not calls to functions that do not exist
+- **Imports, inheritance, type usage and construction** are recorded as edges, not only definitions
 
 Hidden directories (`.git/`, `.vscode/`, etc.) are excluded by default.
 To force-index files inside a hidden directory, annotate your `.gitignore`:

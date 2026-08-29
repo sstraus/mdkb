@@ -1,5 +1,119 @@
 # Changelog
 
+## 3.8.0 (2026-08-29)
+
+Seventy-two commits, most of them in the code index. 3.7.18 was prepared but
+never tagged, so its entry below ships here too.
+
+Two things change behaviour on upgrade, both described under *Changed*: the
+schema migrates 21→22, and `mdkb update` now archives entries whose TTL has
+lapsed.
+
+### Changed
+
+- **`mdkb update` reclaims entries past their `expires_at`.** Expiry had always
+  filtered reads — an expired entry was never served to warmup, handoff, search
+  or list — but nothing reclaimed the row, so it stayed `active` and kept its
+  projected file for as long as the store lived. The only thing that archived
+  was `mdkb memory prune`, a command a human types. The sweep's scope is exactly
+  the scope of the filter that was already hiding them: `expires_at IS NOT NULL
+  AND expires_at < now`. NULL means permanent, so no `decision`, `problem` or
+  `topic` can be reached by it. Archived, not deleted — the row keeps its
+  content and the file is renamed into `memory/archive/`. The newest handoff is
+  spared whatever its age, because the session it was written for can start
+  after the TTL.
+- **A mined prior now ages out like a written one.** Written through the MCP
+  tool a prior got 30 days; mined from a session it got none, and was re-read by
+  every warmup for as long as the database lived. Both writers read one
+  constant now. Schema 21→22 dates the priors already written undated, from
+  `created_at` rather than from now, so one mined two months ago reads as
+  expired immediately. Priors a human stated are left alone.
+- **Macro invocations are `Expands` edges, not calls.** Counted as calls,
+  `assert!` and `println!` were 4 921 edges of this repository's own index
+  pointing at functions that do not exist.
+- **An unresolved call says what it is.** `CallTarget` distinguishes a call
+  placed in the index, one naming a module the index does not contain
+  (`std::fs::write`), and a bare name with no candidate. 31 503 of this
+  repository's 44 202 `Calls` edges used to answer "no callers", which reads as
+  "nothing calls this" and was wrong for nearly all of them.
+
+### Added
+
+- **Every symbol has an address, and calls resolve by scope.** Call sites keep
+  their qualifier, and `code_graph` reports how many callers arrived on a bare
+  name rather than folding them into the resolved count.
+- **Imports collected by the parsers are stored.**
+- **Construction is a call edge** in Java, C#, C++ and PHP.
+- **Inheritance and type usage** are recorded in GDScript, PHP and Lua.
+- **Wider symbol coverage across the parsers**: unions, macros, enum members,
+  namespaces and aliases in C and C++; unions, trait associated items and extern
+  declarations in Rust; records, annotation types and enum bodies in Java;
+  events, delegates, indexers, operators and local functions in C#; protocol
+  requirements, enum cases and unnamed members in Swift.
+- **`code_graph` answers the hook socket with resolved symbols**, not only prose.
+  `result.symbols` carries the same row shape as `symbols_in_file` for the
+  callers/calls/impact set, alongside the unchanged `result.text`. "No callers"
+  is `symbols: []`, never an absent field, so a client can tell an empty result
+  from a daemon too old to carry it. *(prepared as 3.7.18)*
+
+### Fixed
+
+- **An unreadable vector store is no longer read as an empty one.** The
+  incremental embedder adds what it just embedded to what it read back and
+  writes the sum as the whole store, so one unreadable store turned a one-file
+  update into a delete of every other symbol's vector.
+- **Visibility is read as each language declares it**: Rust and C as written, Go
+  unexported names at package level, Java package-private and C# file scope on
+  their own levels, Swift `package` and C# composite levels distinct, and a C#
+  top-level type defaulting to its assembly rather than to private.
+- **Doc comments are recovered** where they were being dropped: above a wrapped
+  C or C++ declaration, on a decorated TypeScript method, on a TypeScript
+  namespace, on every GDScript declaration that has one, and the way Go writes
+  one.
+- **Members are reached through their declarators** in C and C++ rather than
+  through fields the grammar does not always provide, and types declared inside
+  a C++ class body are walked.
+- **Names no longer recurse without bound.** A qualified name or receiver chain
+  deeper than the AST limit aborted the process with a stack overflow; both
+  walks are iterative now, as is the PHP type walk.
+- **Language-specific corrections**: Swift extensions no longer emit a phantom
+  type symbol and actors are not reported as classes; GDScript signals are not
+  reported as variables and dotted calls are recorded; Kotlin companion objects
+  get a symbol and extensions their receiver; PHP enum cases, promoted
+  properties, `readonly` and namespaces are recorded; Python's three underscore
+  conventions read as three, and class members are named through their class;
+  Go embedded fields are indexed under the name they are reached by, and types
+  come from the grammar rather than a hand-written list; Lua assignment targets
+  each get their own value and `local` reads as visibility; a C# record reports
+  whether it is a struct or a class, an enum member has the reach of its enum,
+  and a qualified call stores its bare member name; Java records and enums
+  delegate to their own constructors; TypeScript typed declarations get their
+  symbols and a literal stays unnamed.
+- **Stored paths are keyed from the project root**, not from the argument given
+  to the indexer.
+- **A qualifier's suffix is matched without `LIKE`'s wildcards**, so a name
+  containing `%` or `_` no longer matches more than itself.
+- **An index run reports every number it collected**, and a migration says how
+  many files it marked rather than only how many changed.
+- **The daemon publishes its IPC sockets already at 0600** and never hangs on a
+  bind failure.
+
+### Performance
+
+- **One impact hop is one query** instead of one per candidate.
+- **Embeddings are carried across a reparse** rather than regenerated, and old
+  indexes migrate to the form that allows it.
+- **The vector store is swept without materialising it.** Deciding which entries
+  to keep no longer turns every one of them into its own `Vec<f32>` first. The
+  saving is proportional to the fraction dropped; there is no wall-clock
+  difference on a 2.3 GB store, where the run is bound by reading the file.
+- **Orphaned vectors are swept** when the symbols behind them go.
+
+### Removed
+
+- Three parser capabilities nothing ever called, and `CallTarget::resolved`.
+
+
 ## 3.7.18 (2026-08-26)
 
 ### Added
