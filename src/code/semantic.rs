@@ -467,14 +467,20 @@ impl SemanticSearch {
     ///
     /// Returns entries where `keep(symbol_id)` returns true.
     ///
-    pub fn store_load_filtered(&self, keep: impl Fn(u32) -> bool) -> Vec<(u32, Vec<f32>)> {
-        match self.store.load() {
-            Ok(entries) => entries.into_iter().filter(|(id, _)| keep(*id)).collect(),
-            Err(e) => {
-                tracing::warn!("Failed to load existing embeddings: {e}");
-                Vec::new()
-            }
-        }
+    /// A read that failed is returned as a failure rather than flattened into
+    /// an empty result. The caller adds what it just embedded to what this
+    /// returns and writes the sum back as the whole store, so "unreadable" read
+    /// as "holds nothing" deletes every vector the failed read was holding.
+    pub fn store_load_filtered(
+        &self,
+        keep: impl Fn(u32) -> bool,
+    ) -> anyhow::Result<Vec<(u32, Vec<f32>)>> {
+        Ok(self
+            .store
+            .load()?
+            .into_iter()
+            .filter(|(id, _)| keep(*id))
+            .collect())
     }
 
     /// Generate embeddings for new symbols and merge with existing kept entries.
@@ -703,6 +709,30 @@ mod tests {
         assert!(store.load().unwrap().is_empty());
         assert_eq!(store.count().unwrap(), 0);
         assert_eq!(store.retain(|_| true).unwrap(), 0);
+    }
+
+    /// A store that cannot be read holds an unknown number of vectors, not zero
+    /// of them. The caller merges what this returns with what it just embedded
+    /// and writes the sum back, so answering "nothing" for "unreadable" deletes
+    /// every vector the failed read was holding.
+    #[test]
+    fn an_unreadable_store_is_not_reported_as_an_empty_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.bin");
+        let search = SemanticSearch::new(&path).unwrap();
+        search
+            .store
+            .write_all(&[(1, vec![0.5; EMBEDDING_DIM]), (2, vec![0.5; EMBEDDING_DIM])])
+            .unwrap();
+
+        // Cut the second entry away, leaving the header still claiming two.
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() - entry_size()]).unwrap();
+
+        assert!(
+            search.store_load_filtered(|_| true).is_err(),
+            "an unreadable store must be refused, not reported as holding nothing"
+        );
     }
 
     /// The sweep addresses entries by offset, and the two offsets an off-by-one

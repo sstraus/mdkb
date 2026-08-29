@@ -801,11 +801,18 @@ impl IndexFacade {
             .iter()
             .map(|s| (s.id.value(), symbol_embed_text(s)))
             .collect();
-        semantic
-            .store_load_filtered(|id| text_by_id.contains_key(&id))
-            .into_iter()
-            .filter_map(|(id, vector)| text_by_id.get(&id).map(|t| (t.clone(), vector)))
-            .collect()
+        // Nothing reusable is a valid answer here — the symbols get embedded
+        // again — so a store this cannot read costs work, not vectors.
+        match semantic.store_load_filtered(|id| text_by_id.contains_key(&id)) {
+            Ok(entries) => entries
+                .into_iter()
+                .filter_map(|(id, vector)| text_by_id.get(&id).map(|t| (t.clone(), vector)))
+                .collect(),
+            Err(e) => {
+                tracing::warn!("Failed to load reusable embeddings: {e}. Re-embedding instead.");
+                HashMap::new()
+            }
+        }
     }
 
     /// Generate embeddings only for symbols in the given files, carrying over
@@ -834,7 +841,19 @@ impl IndexFacade {
         // Load existing embeddings, filter out the ones we're regenerating,
         // then append the carried-over and the newly embedded ones.
         let changed_ids: HashSet<u32> = symbols.iter().map(|s| s.id.value()).collect();
-        let mut existing = semantic.store_load_filtered(|id| !changed_ids.contains(&id));
+        // Whatever this update writes replaces the whole store, so the vectors
+        // of every symbol it is not touching have to be read back first. If they
+        // cannot be, the update is skipped: writing without them would drop them.
+        let mut existing = match semantic.store_load_filtered(|id| !changed_ids.contains(&id)) {
+            Ok(entries) => entries,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to load existing embeddings: {e}. Skipping this update — rewriting \
+                     the store without them would delete every vector it holds."
+                );
+                return;
+            }
+        };
 
         let (carried, embed_inputs) = split_by_reuse(&symbols, reusable);
         tracing::info!(
@@ -1787,7 +1806,7 @@ pub fn world() {
         // every other symbol's real embedding.
         {
             let semantic = facade.ensure_semantic().expect("semantic (model present)");
-            let mut all = semantic.store_load_filtered(|_| true);
+            let mut all = semantic.store_load_filtered(|_| true).unwrap();
             for (id, vec) in &mut all {
                 if *id == bbb_id {
                     for value in vec.iter_mut() {
@@ -1807,7 +1826,8 @@ pub fn world() {
         let bbb_after = facade
             .ensure_semantic()
             .unwrap()
-            .store_load_filtered(|id| id == bbb_id);
+            .store_load_filtered(|id| id == bbb_id)
+            .unwrap();
         assert_eq!(bbb_after.len(), 1, "bbb embedding must still be present");
         assert!(
             bbb_after[0]
@@ -2049,6 +2069,7 @@ pub fn world() {
             .ensure_semantic()
             .unwrap()
             .store_load_filtered(|_| true)
+            .unwrap()
             .into_iter()
             .collect();
         for symbol in &symbols {
@@ -2068,6 +2089,7 @@ pub fn world() {
             .ensure_semantic()
             .unwrap()
             .store_load_filtered(|_| true)
+            .unwrap()
             .into_iter()
             .map(|(id, _)| id)
             .collect()
@@ -2121,6 +2143,7 @@ pub fn world() {
             .ensure_semantic()
             .unwrap()
             .store_load_filtered(|_| true)
+            .unwrap()
             .into_iter()
             .collect();
         assert_eq!(
