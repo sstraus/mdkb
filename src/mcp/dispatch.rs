@@ -820,14 +820,11 @@ fn write_single_memory(
     }
 
     let now = chrono::Utc::now().timestamp();
-    // Priors default to 30-day TTL if not explicitly specified.
-    const PRIOR_DEFAULT_TTL: u64 = 30 * 24 * 3600;
-    let effective_ttl = ttl.or(if entry_type == memory::EntryType::Prior {
-        Some(PRIOR_DEFAULT_TTL)
-    } else {
-        None
-    });
-    let expires_at = effective_ttl.map(|s| now + s as i64);
+    let expires_at = match (ttl, entry_type) {
+        (Some(s), _) => Some(now + s as i64),
+        (None, memory::EntryType::Prior) => Some(now + memory::PRIOR_TTL_SECS),
+        (None, _) => None,
+    };
     let due_at = due_in.map(|s| now + s as i64);
     let is_new = existing.is_none();
 

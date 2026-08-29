@@ -565,7 +565,7 @@ pub fn promote_cluster(conn: &Connection, cluster_id: &str, now: i64) -> Result<
         confirmations: 0,
         last_confirmed_at: None,
         source_type: SourceType::AutoExtracted,
-        expires_at: None,
+        expires_at: Some(now + crate::store::memory::PRIOR_TTL_SECS),
         due_at: None,
     };
     add_entry(conn, &entry)?;
@@ -1010,6 +1010,14 @@ mod tests {
         assert_eq!(entry.source_type, SourceType::AutoExtracted);
         assert!(entry.content.contains("Do not edit generated files"));
         assert!(entry.tags.contains(&"auto-mined".to_string()));
+        // A mined prior ages out like a written one: what it observed stops
+        // being true when the code it was mined from goes away, and nothing
+        // else retires it.
+        assert_eq!(
+            entry.expires_at,
+            Some(3000 + crate::store::memory::PRIOR_TTL_SECS),
+            "a mined prior carries the same TTL as a written one"
+        );
 
         let cluster = get_cluster(&conn, &cluster_id).unwrap().unwrap();
         assert_eq!(cluster.state, "promoted");

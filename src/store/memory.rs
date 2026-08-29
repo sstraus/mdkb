@@ -243,6 +243,14 @@ impl MemoryEntry {
     }
 }
 
+/// How long a prior stays before it has to earn its place again.
+///
+/// A prior states what an agent did wrong once. That stops being true when the
+/// code it was observed on changes, and nothing in the store notices — so it
+/// expires by default, whether it was written through the MCP tool or mined
+/// from a session. A prior that still holds gets promoted again.
+pub const PRIOR_TTL_SECS: i64 = 30 * 24 * 3600;
+
 /// Type of memory entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
