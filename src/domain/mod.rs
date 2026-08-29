@@ -215,6 +215,14 @@ pub struct UpdateResult {
     #[serde(default)]
     pub memory_entries_archive_skipped: usize,
 
+    /// Memory entries archived because they were past their `expires_at`.
+    ///
+    /// Separate from `memory_entries_archived`: that one reports a file the
+    /// author deleted, this one reports a TTL the author set running out. The
+    /// two answer different questions about where a store's entries went.
+    #[serde(default)]
+    pub memory_entries_expired: usize,
+
     /// Set when a `.gitignore` above the store excludes `.mdkb/` wholesale,
     /// making `.mdkb/.gitignore` inert and the entry projection untrackable.
     #[serde(default)]

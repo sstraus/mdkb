@@ -1706,6 +1706,54 @@ pub fn count_active_entries(conn: &Connection) -> Result<usize> {
     Ok(count as usize)
 }
 
+/// Archive every active entry past its `expires_at`, returning their ids.
+///
+/// Expiry has always filtered reads — an expired entry is never served — but
+/// nothing reclaimed the row, so it stayed `active` and kept its projection for
+/// as long as the store lived. Only entries someone gave a TTL are touched:
+/// `expires_at` NULL means permanent, which is every `decision`, `problem` and
+/// `topic` this store has ever written.
+///
+/// Archived, not deleted. The row keeps its content and the file moves to
+/// `memory/archive/`, so anything that turns out to still hold can come back.
+///
+/// The newest handoff is spared whatever its age. A handoff is the one entry
+/// written to be read at the start of the next session, and the next session
+/// can come after the TTL: expiring the last one leaves a returning session
+/// with no thread to pick up, which is the opposite of what it is for.
+pub fn archive_expired(conn: &Connection, now: i64) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id FROM memory_entries
+         WHERE status = 'active'
+           AND expires_at IS NOT NULL
+           AND expires_at < ?1
+           AND id IS NOT (
+               SELECT id FROM memory_entries
+               WHERE entry_type = 'handoff' AND status = 'active'
+               ORDER BY updated_at DESC LIMIT 1
+           )",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![now], |row| row.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?;
+    archive_ids(conn, &ids, now)?;
+    Ok(ids)
+}
+
+/// Flip `ids` to archived, stamping `now`.
+fn archive_ids(conn: &Connection, ids: &[String], now: i64) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE memory_entries
+         SET status = 'archived', updated_at = ?1
+         WHERE id IN (SELECT value FROM json_each(?2))",
+        params![now, serde_json::to_string(ids).unwrap_or_default()],
+    )?;
+    Ok(())
+}
+
 /// Prune entries not accessed in the given number of days.
 /// Marks entries as archived rather than deleting them.
 /// Returns the list of pruned entry IDs.
@@ -1738,15 +1786,8 @@ pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<
             })
             .collect();
 
-        if !dry_run && !ids.is_empty() {
-            conn.execute(
-                r#"
-                UPDATE memory_entries
-                SET status = 'archived', updated_at = ?1
-                WHERE id IN (SELECT value FROM json_each(?2))
-                "#,
-                params![now, serde_json::to_string(&ids).unwrap_or_default()],
-            )?;
+        if !dry_run {
+            archive_ids(conn, &ids, now)?;
         }
 
         Ok(ids)
@@ -2776,6 +2817,72 @@ mod tests {
 
         assert_eq!(count_entries(&conn).unwrap(), 3);
         assert_eq!(count_active_entries(&conn).unwrap(), 2);
+    }
+
+    /// Expiry decides what is served; this decides what is reclaimed. The two
+    /// must agree on scope, or `update` starts archiving entries the reader
+    /// still hands out.
+    #[test]
+    fn archiving_the_expired_spares_the_undated_the_unexpired_and_the_last_handoff() {
+        let conn = setup_db();
+        let now = 1_000_000;
+        let past = now - 1;
+        let future = now + 1;
+
+        let write = |id: &str, kind: EntryType, expires: Option<i64>, updated: i64| {
+            add_entry(
+                &conn,
+                &MemoryEntry {
+                    id: id.to_string(),
+                    title: id.to_string(),
+                    content: "c".to_string(),
+                    entry_type: kind,
+                    tags: vec![],
+                    status: EntryStatus::Active,
+                    created_at: 1,
+                    updated_at: updated,
+                    superseded_by: None,
+                    access_count: 0,
+                    last_accessed: None,
+                    source_path: None,
+                    confirmations: 0,
+                    last_confirmed_at: None,
+                    source_type: SourceType::AutoExtracted,
+                    expires_at: expires,
+                    due_at: None,
+                },
+            )
+            .unwrap();
+        };
+
+        write("decision-permanent", EntryType::Decision, None, 1);
+        write("prior-still-good", EntryType::Prior, Some(future), 1);
+        write("prior-expired", EntryType::Prior, Some(past), 1);
+        write("handoff-old", EntryType::Handoff, Some(past), 10);
+        write("handoff-newest", EntryType::Handoff, Some(past), 20);
+
+        let mut archived = archive_expired(&conn, now).unwrap();
+        archived.sort();
+        assert_eq!(
+            archived,
+            ["handoff-old", "prior-expired"],
+            "only entries past a TTL they were given, and never the last handoff"
+        );
+
+        let status_of = |id: &str| {
+            get_entry_without_tracking(&conn, id)
+                .unwrap()
+                .unwrap()
+                .status
+        };
+        assert_eq!(status_of("decision-permanent"), EntryStatus::Active);
+        assert_eq!(status_of("prior-still-good"), EntryStatus::Active);
+        assert_eq!(
+            status_of("handoff-newest"),
+            EntryStatus::Active,
+            "a returning session after the TTL still needs a thread to pick up"
+        );
+        assert_eq!(status_of("prior-expired"), EntryStatus::Archived);
     }
 
     #[test]

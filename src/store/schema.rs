@@ -24,29 +24,10 @@ fn legacy_prior_ids(conn: &Connection) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// Retire the markdown projection of rows a migration removed.
-///
-/// Best-effort: a schema migration must not fail because a file could not be
-/// renamed. A file left behind is reported by the drift count in `mdkb stats`
-/// and swept on a later run; a migration that aborts halfway leaves a store
-/// nobody can open.
-fn dispose_projections(conn: &Connection, ids: &[String]) {
-    if ids.is_empty() {
-        return;
-    }
-    let Some(memory_dir) = crate::store::memory_file::memory_dir_of(conn) else {
-        return;
-    };
-    for id in ids {
-        if let Err(e) = crate::store::memory_file::archive_projection(&memory_dir, id) {
-            tracing::warn!("migration: could not archive projection for {id}: {e}");
-        }
-    }
-}
-
 /// Archive every `entries/prior-<16 hex>.md` that has no row behind it.
 ///
-/// Best-effort like [`dispose_projections`], and for the same reason: a store
+/// Best-effort like [`crate::store::memory_file::dispose_projections`], and for
+/// the same reason: a store
 /// that cannot be opened is worse than a file left on disk.
 fn sweep_orphaned_legacy_priors(conn: &Connection) {
     let Some(memory_dir) = crate::store::memory_file::memory_dir_of(conn) else {
@@ -659,7 +640,7 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
             &format!("DELETE FROM memory_entries WHERE {LEGACY_PRIOR_PREDICATE}"),
             [],
         )?;
-        dispose_projections(conn, &purged);
+        crate::store::memory_file::dispose_projections(conn, &purged);
     }
 
     // Migration from v12 to v13: behavioral-prior mining tables (prior_clusters,

@@ -146,6 +146,26 @@ pub fn archive_projection(memory_dir: &std::path::Path, id: &str) -> std::io::Re
     std::fs::rename(from, archive_dir.join(format!("{id}.md")))
 }
 
+/// Retire the markdown projection of rows that were removed or archived.
+///
+/// Best-effort: neither a schema migration nor an `update` may fail because a
+/// file could not be renamed. A file left behind is reported by the drift count
+/// in `mdkb stats` and swept on a later run; a migration that aborts halfway
+/// leaves a store nobody can open.
+pub fn dispose_projections(conn: &rusqlite::Connection, ids: &[String]) {
+    if ids.is_empty() {
+        return;
+    }
+    let Some(memory_dir) = memory_dir_of(conn) else {
+        return;
+    };
+    for id in ids {
+        if let Err(e) = archive_projection(&memory_dir, id) {
+            tracing::warn!("could not archive projection for {id}: {e}");
+        }
+    }
+}
+
 /// The store's `memory/` directory, derived from an open connection.
 ///
 /// Migrations run with nothing but a `Connection` — no `Context`, no config —

@@ -284,6 +284,20 @@ pub fn handle_update_force(
         Err(e) => tracing::warn!("memory file sync failed: {e}"),
     }
 
+    // Reclaim what expiry only ever hid. An entry past its `expires_at` has
+    // been filtered out of every read since it lapsed, but stayed `active` and
+    // kept its file, so the store grew with rows nothing would serve. Runs
+    // after the sync so a projection this moves is not one the sync just
+    // reconciled. Failure is logged, never fatal — the rows keep being
+    // filtered either way.
+    match memory::archive_expired(&ctx.conn, chrono::Utc::now().timestamp()) {
+        Ok(ids) => {
+            crate::store::memory_file::dispose_projections(&ctx.conn, &ids);
+            result.memory_entries_expired = ids.len();
+        }
+        Err(e) => tracing::warn!("expired-entry sweep failed: {e}"),
+    }
+
     // Auto-embed changed documents (scoped: docs yes, claude_sessions no) so
     // hybrid search never silently degrades to BM25. Off via
     // `[search] auto_embed_docs = false`. Runs after commit; failure (e.g. cold

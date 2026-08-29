@@ -1937,6 +1937,15 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
                     result.memory_entries_archived
                 );
             }
+            // Name where the files went: an entry that lapsed is recoverable,
+            // and a count alone reads like a deletion.
+            if result.memory_entries_expired > 0 {
+                println!(
+                    "Memory entries archived (TTL lapsed): {} — files moved to \
+                     .mdkb/memory/archive/",
+                    result.memory_entries_expired
+                );
+            }
             // Conflicts and quarantines demand a human decision; a colleague
             // whose edit lost must be able to find it, so name the command that
             // retrieves the preserved version rather than only counting.
