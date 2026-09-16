@@ -237,6 +237,27 @@ write path. Behavioral-prior mining is separate and disabled by default. When
 reads a bounded transcript tail and launches the external distiller without
 holding up the host. The hook itself returns `{}` immediately.
 
+#### The distiller contract
+
+The distiller is any CLI. mdkb writes the prompt to its stdin, reads its
+stdout, and discards stderr. stdout must be one JSON object with the schema
+the prompt states; `parse_distilled` calls `serde_json::from_str` on it, so a
+fence or a prose prefix is rejected as `NotJson`. A distiller that fails is
+logged at debug and the Stop hook still reports `skipped`, so check it by
+hand when in doubt: run the configured command with a fixed prompt and read
+its stderr. Story 082 adds a doctor check, warn-level logs and real outcomes.
+
+Configure it in `~/.mdkb/daemon.toml` under `[priors]` (global base) or in a
+repo's `.mdkb/config.toml` (override). Measured 2026-09-16 with the same
+prompt:
+
+| CLI | Args | Time | Note |
+|---|---|---|---|
+| `codex` | `exec --ignore-user-config -m gpt-5.6-luna -c model_reasoning_effort="low" -s read-only --skip-git-repo-check` | 7s | Default. `--ignore-user-config` is the only working way to skip MCP startup; `-c 'mcp_servers={}'` is a silent no-op. `gpt-5.4-mini` is rejected (HTTP 400) on a ChatGPT account. |
+| `ollama` | `run gemma4:12b-mlx --think=false --hidethinking --nowordwrap --format json` | 2-5s warm | Local, no quota. `gemma4:e4b-mlx` invents trigger kinds; do not use it. |
+| `claude` | `-p --model claude-haiku-4-5-20251001 --setting-sources "" --strict-mcp-config --tools "" --no-session-persistence` | 9s | Subscription login. Wraps the JSON in a fence (rejected until story 082). Never `--bare`: it drops the login. |
+| `grok` | `--no-auto-update -p {prompt} -m grok-4.5 --tools "" --no-subagents --no-plan --deny 'mcp__*'` | 17s | Prompt only as an argument; needs the `{prompt}` placeholder from story 082. |
+
 ## Configuration
 
 All toggles live under `[hooks]` in `.mdkb/config.toml`:
