@@ -4245,8 +4245,14 @@ enum MiningOutcome {
     /// The cheap detector turned the episode down — no LLM call was made. The
     /// common case by far: most sessions teach nothing.
     Gated,
-    /// A validated prior was integrated into the store.
+    /// A validated prior was integrated, and its cluster has not yet recurred
+    /// across enough distinct sessions to be promoted.
     Distilled,
+    /// Integrated, and this observation tipped the cluster over the recurrence
+    /// gate. Distinct from `Distilled` because promotion is the only point at
+    /// which a mined prior starts being injected: a week of `distilled` with no
+    /// `promoted` says the pipeline runs and still teaches the model nothing.
+    Promoted,
     /// A well-formed answer the validator turned down. Ordinary, not a fault.
     Rejected(String),
     /// The distiller could not run, or its output could not be used at all.
@@ -4258,6 +4264,7 @@ impl MiningOutcome {
         match self {
             Self::Gated => "gated",
             Self::Distilled => "distilled",
+            Self::Promoted => "promoted",
             Self::Rejected(_) => "rejected",
             Self::Failed(_) => "failed",
         }
@@ -4265,7 +4272,7 @@ impl MiningOutcome {
 
     fn reason(&self) -> Option<&str> {
         match self {
-            Self::Gated | Self::Distilled => None,
+            Self::Gated | Self::Distilled | Self::Promoted => None,
             Self::Rejected(r) | Self::Failed(r) => Some(r),
         }
     }
@@ -4411,10 +4418,10 @@ async fn mine_episode_inner(
         }
         // `None` = the context slot was empty, so the mutation never ran.
         None => MiningOutcome::Failed("store context unavailable".to_string()),
-        // The `Some(id)` payload is the cluster's promoted memory entry, when
-        // this observation tipped it over the recurrence gate. Either way the
-        // prior was integrated, which is what `distilled` claims.
-        Some(Ok(_)) => MiningOutcome::Distilled,
+        // The payload is the cluster's promoted memory entry id, present only
+        // when this observation tipped it over the recurrence gate.
+        Some(Ok(Some(_))) => MiningOutcome::Promoted,
+        Some(Ok(None)) => MiningOutcome::Distilled,
     }
 }
 
@@ -8943,6 +8950,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Promotion is the event worth watching, so it is its own outcome.
+    ///
+    /// A mined prior does nothing until its cluster recurs across two distinct
+    /// sessions and gets promoted — that is the point at which it starts being
+    /// injected. Folding promotion into `distilled` would hide the difference
+    /// between "the pipeline works" and "the pipeline works and taught the model
+    /// something", which is the whole question `mdkb stats` is asked.
+    #[tokio::test]
+    async fn mine_episode_records_promotion_separately_from_distillation() {
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+
+        // The same lesson from two distinct sessions: the recurrence gate.
+        for session in ["sess-a", "sess-b"] {
+            mine_episode(
+                Arc::clone(&handle),
+                transcript.to_string_lossy().into_owned(),
+                session.to_string(),
+                "sh".to_string(),
+                vec![
+                    "-c".to_string(),
+                    format!("cat >/dev/null; printf '%s' '{distilled}'"),
+                ],
+            )
+            .await;
+        }
+
+        let outcomes: Vec<String> = mining_events(tmp.path())
+            .iter()
+            .map(|e| e["outcome"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec!["distilled", "promoted"],
+            "the first session integrates, the second promotes"
+        );
     }
 
     #[tokio::test]
