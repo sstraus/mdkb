@@ -45,6 +45,12 @@ pub struct PriorCluster {
     pub promoted_memory_id: Option<String>,
     pub created_at: i64,
     pub last_seen_at: i64,
+    /// The tool-error signature this lesson exists to prevent, captured from the
+    /// episode that first mined it. A session where the prior was injected and
+    /// this signature did NOT come back confirms it; one where it did refutes it.
+    /// `None` for clusters mined before the loop existed, and for clusters mined
+    /// from a user correction rather than an error.
+    pub error_signature: Option<String>,
 }
 
 /// A single observed episode feeding a cluster. Never injected directly.
@@ -113,8 +119,8 @@ pub fn upsert_cluster(conn: &Connection, c: &PriorCluster) -> Result<()> {
         "INSERT INTO prior_clusters (
             id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
             evidence_count, distinct_sessions, injected_count, confirmed_count, refuted_count,
-            state, promoted_memory_id, created_at, last_seen_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+            state, promoted_memory_id, created_at, last_seen_at, error_signature
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         ON CONFLICT(id) DO UPDATE SET
             canonical_trigger_key = excluded.canonical_trigger_key,
             trigger_kind = excluded.trigger_kind,
@@ -129,7 +135,8 @@ pub fn upsert_cluster(conn: &Connection, c: &PriorCluster) -> Result<()> {
             state = excluded.state,
             promoted_memory_id = excluded.promoted_memory_id,
             created_at = excluded.created_at,
-            last_seen_at = excluded.last_seen_at",
+            last_seen_at = excluded.last_seen_at,
+            error_signature = excluded.error_signature",
         params![
             c.id,
             c.canonical_trigger_key,
@@ -146,6 +153,7 @@ pub fn upsert_cluster(conn: &Connection, c: &PriorCluster) -> Result<()> {
             c.promoted_memory_id,
             c.created_at,
             c.last_seen_at,
+            c.error_signature,
         ],
     )?;
     Ok(())
@@ -157,7 +165,7 @@ pub fn get_cluster(conn: &Connection, id: &str) -> Result<Option<PriorCluster>> 
         .query_row(
             "SELECT id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
                     evidence_count, distinct_sessions, injected_count, confirmed_count, refuted_count,
-                    state, promoted_memory_id, created_at, last_seen_at
+                    state, promoted_memory_id, created_at, last_seen_at, error_signature
              FROM prior_clusters WHERE id = ?1",
             params![id],
             |row| {
@@ -177,6 +185,7 @@ pub fn get_cluster(conn: &Connection, id: &str) -> Result<Option<PriorCluster>> 
                     promoted_memory_id: row.get(12)?,
                     created_at: row.get(13)?,
                     last_seen_at: row.get(14)?,
+                    error_signature: row.get(15)?,
                 })
             },
         )
@@ -469,6 +478,7 @@ pub fn integrate_candidate_with_embedding(
                 promoted_memory_id: None,
                 created_at: now,
                 last_seen_at: now,
+                error_signature: None,
             },
         )?;
         if let Some(e) = embedding {
@@ -697,7 +707,7 @@ pub fn list_promoted_clusters(conn: &Connection) -> Result<Vec<PriorCluster>> {
     let mut stmt = conn.prepare(
         "SELECT id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
                 evidence_count, distinct_sessions, injected_count, confirmed_count, refuted_count,
-                state, promoted_memory_id, created_at, last_seen_at
+                state, promoted_memory_id, created_at, last_seen_at, error_signature
          FROM prior_clusters WHERE state = 'promoted'",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -717,6 +727,7 @@ pub fn list_promoted_clusters(conn: &Connection) -> Result<Vec<PriorCluster>> {
             promoted_memory_id: row.get(12)?,
             created_at: row.get(13)?,
             last_seen_at: row.get(14)?,
+            error_signature: row.get(15)?,
         })
     })?;
     let mut out = Vec::new();
@@ -781,12 +792,18 @@ fn candidate_id_for(canonical_key: &str, session: &str) -> String {
 /// semantic cluster-merge: two sessions that teach the same lesson but whose
 /// distiller emitted different triggers still converge on one cluster and can
 /// promote. Pass `None` to fall back to exact-trigger-key clustering only.
+///
+/// `error_signature` is the tool-error signature of the episode that produced
+/// this observation. It is what later sessions are checked against to decide
+/// whether an injected prior worked, so it is recorded on the cluster the first
+/// time one is seen and never overwritten afterwards.
 pub fn integrate_distilled(
     conn: &Connection,
     d: &DistilledPrior,
     session: &str,
     now: i64,
     lesson_embedding: Option<&[f32]>,
+    error_signature: Option<&str>,
 ) -> Result<Option<String>> {
     let key = canonical_trigger_key(&d.trigger_kind, &d.trigger_matcher);
     let cand = PriorCandidate {
@@ -803,17 +820,221 @@ pub fn integrate_distilled(
         created_at: now,
     };
     let cluster_id = integrate_candidate_with_embedding(conn, &cand, now, lesson_embedding)?;
+    if let Some(sig) = error_signature.map(str::trim).filter(|s| !s.is_empty()) {
+        set_cluster_error_signature(conn, &cluster_id, sig)?;
+    }
     promote_cluster(conn, &cluster_id, now)
 }
 
-/// Record that a cluster's prior was injected (telemetry for the lifecycle gate).
-pub fn record_injection(conn: &Connection, cluster_id: &str, now: i64) -> Result<()> {
+/// Record the failure a cluster exists to prevent, the first time one is seen.
+///
+/// Never overwrites: a cluster accumulates observations from several sessions
+/// and the later ones are the *same* lesson by construction, so re-writing the
+/// signature would just make it track whichever session ran last.
+fn set_cluster_error_signature(conn: &Connection, cluster_id: &str, signature: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE prior_clusters SET error_signature = ?2
+         WHERE id = ?1 AND (error_signature IS NULL OR TRIM(error_signature) = '')",
+        params![cluster_id, signature],
+    )?;
+    Ok(())
+}
+
+/// Record that a cluster's prior was injected into `session`.
+///
+/// Two writes, and both matter: the cluster counter is lifecycle telemetry, and
+/// the `prior_injections` row is the open question the next Stop hook answers —
+/// did this lesson hold? The row is inserted once per (cluster, session); a
+/// second injection in the same session keeps the first `injected_at`, because
+/// an error recurring after injection #1 refutes the prior regardless of how
+/// many times it was repeated afterwards.
+pub fn record_injection(conn: &Connection, cluster_id: &str, session: &str, now: i64) -> Result<()> {
     conn.execute(
         "UPDATE prior_clusters SET injected_count = injected_count + 1, last_seen_at = ?2
          WHERE id = ?1",
         params![cluster_id, now],
     )?;
+    conn.execute(
+        "INSERT INTO prior_injections (cluster_id, session, injected_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(cluster_id, session) DO NOTHING",
+        params![cluster_id, session, now],
+    )?;
     Ok(())
+}
+
+// ============================================================================
+// The belief loop — an injected prior is confirmed or refuted by what followed
+// ============================================================================
+
+/// Tokens of an error signature, for comparing one failure with another:
+/// lowercased alphanumeric runs, with pure numbers dropped. Line numbers, byte
+/// offsets and timing differ between two occurrences of the same failure, so
+/// keeping them would make every recurrence look like a new error.
+fn signature_tokens(signature: &str) -> std::collections::HashSet<String> {
+    signature
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() > 1 && !t.chars().all(|c| c.is_ascii_digit()))
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Minimum share of a cluster's signature tokens that must reappear in an
+/// observed error for the two to count as the same failure. Containment, not
+/// Jaccard: the observed error is often the same failure wrapped in extra
+/// context, and that extra context must not dilute the match.
+const SIGNATURE_MATCH_RATIO: f64 = 0.6;
+
+/// Whether `observed` is a recurrence of `known` — the same failure, not
+/// necessarily the same bytes.
+pub fn signatures_match(known: &str, observed: &str) -> bool {
+    let known_tokens = signature_tokens(known);
+    if known_tokens.is_empty() {
+        return false;
+    }
+    let observed_tokens = signature_tokens(observed);
+    let shared = known_tokens
+        .iter()
+        .filter(|t| observed_tokens.contains(*t))
+        .count();
+    shared as f64 / known_tokens.len() as f64 >= SIGNATURE_MATCH_RATIO
+}
+
+/// One error observed in a session, as the settling pass needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedError {
+    /// The error output signature.
+    pub signature: String,
+    /// When it happened, when the transcript said so. `None` means the record
+    /// carried no timestamp, and the error is then treated as in-scope: a
+    /// recurrence we cannot place is still a recurrence.
+    pub at: Option<i64>,
+}
+
+/// What settling one session's injections did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SettleReport {
+    pub confirmed: Vec<String>,
+    pub refuted: Vec<String>,
+}
+
+impl SettleReport {
+    /// Nothing was open to settle.
+    pub fn is_empty(&self) -> bool {
+        self.confirmed.is_empty() && self.refuted.is_empty()
+    }
+}
+
+/// Close the loop for every prior injected into `session` and not yet settled.
+///
+/// A prior is **refuted** when its own error signature recurs in the session
+/// after it was injected — it was surfaced, and the failure it warns about
+/// happened anyway. Otherwise it is **confirmed**: it was surfaced and that
+/// failure did not come back.
+///
+/// Called from the Stop hook, before the mining gate: most sessions teach
+/// nothing new and are gated out, but they still answer the question about the
+/// priors they were shown. Each (cluster, session) settles exactly once — the
+/// `prior_injections` primary key plus the `outcome IS NULL` filter — so a
+/// retried Stop hook cannot inflate either counter.
+pub fn settle_injections(
+    conn: &Connection,
+    session: &str,
+    now: i64,
+    errors: &[ObservedError],
+) -> Result<SettleReport> {
+    let mut stmt = conn.prepare(
+        "SELECT i.cluster_id, i.injected_at, c.error_signature
+         FROM prior_injections i JOIN prior_clusters c ON c.id = i.cluster_id
+         WHERE i.session = ?1 AND i.outcome IS NULL",
+    )?;
+    let open: Vec<(String, i64, Option<String>)> = stmt
+        .query_map(params![session], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+
+    let mut report = SettleReport::default();
+    for (cluster_id, injected_at, known_signature) in open {
+        // A cluster with no recorded signature (mined before this loop existed,
+        // or mined from a user correction rather than an error) has nothing to
+        // recur, so a quiet session confirms it.
+        let recurred = known_signature
+            .as_deref()
+            .map(|known| {
+                errors
+                    .iter()
+                    .filter(|e| e.at.is_none_or(|at| at >= injected_at))
+                    .any(|e| signatures_match(known, &e.signature))
+            })
+            .unwrap_or(false);
+
+        let outcome = if recurred { "refuted" } else { "confirmed" };
+        let column = if recurred {
+            "refuted_count"
+        } else {
+            "confirmed_count"
+        };
+        // Guarded by the same `outcome IS NULL` predicate as the SELECT, so two
+        // Stop hooks racing on one session settle it once between them.
+        let claimed = conn.execute(
+            "UPDATE prior_injections SET outcome = ?3, settled_at = ?4
+             WHERE cluster_id = ?1 AND session = ?2 AND outcome IS NULL",
+            params![cluster_id, session, outcome, now],
+        )?;
+        if claimed == 0 {
+            continue;
+        }
+        conn.execute(
+            &format!("UPDATE prior_clusters SET {column} = {column} + 1 WHERE id = ?1"),
+            params![cluster_id],
+        )?;
+        if recurred {
+            report.refuted.push(cluster_id);
+        } else {
+            report.confirmed.push(cluster_id);
+        }
+    }
+    Ok(report)
+}
+
+/// Apply a human's `mdkb memory confirm/refute` verdict on a promoted prior's
+/// projection to the cluster behind it. Returns the cluster id when one owns
+/// `memory_id`, `None` when the entry is an ordinary memory.
+///
+/// Without this the two halves disagreed: confirming the projection moved
+/// `memory_entries.confirmations`, which the injection score does not read,
+/// while `cluster_injection_score` kept dividing by a belief that no one could
+/// move. A person who says the lesson works is the strongest signal there is.
+pub fn apply_belief_from_memory(
+    conn: &Connection,
+    memory_id: &str,
+    delta: i32,
+) -> Result<Option<String>> {
+    if delta == 0 {
+        return Ok(None);
+    }
+    let cluster_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM prior_clusters WHERE promoted_memory_id = ?1",
+            params![memory_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(cluster_id) = cluster_id else {
+        return Ok(None);
+    };
+    let column = if delta > 0 {
+        "confirmed_count"
+    } else {
+        "refuted_count"
+    };
+    conn.execute(
+        &format!("UPDATE prior_clusters SET {column} = {column} + 1 WHERE id = ?1"),
+        params![cluster_id],
+    )?;
+    Ok(Some(cluster_id))
 }
 
 #[cfg(test)]
@@ -844,6 +1065,7 @@ mod tests {
             promoted_memory_id: None,
             created_at: 100,
             last_seen_at: 200,
+            error_signature: None,
         }
     }
 
@@ -1248,6 +1470,7 @@ mod tests {
             promoted_memory_id: None,
             created_at: 100,
             last_seen_at: 200,
+            error_signature: None,
         }
     }
 
@@ -1327,12 +1550,12 @@ mod tests {
 
         // First session: candidate stored, not yet promoted.
         assert_eq!(
-            integrate_distilled(&conn, &d, "sess-1", 1000, None).unwrap(),
+            integrate_distilled(&conn, &d, "sess-1", 1000, None, None).unwrap(),
             None,
             "one session must not promote"
         );
         // Second, distinct session: recurrence gate cleared → promoted.
-        let mem = integrate_distilled(&conn, &d, "sess-2", 2000, None)
+        let mem = integrate_distilled(&conn, &d, "sess-2", 2000, None, None)
             .unwrap()
             .expect("two distinct sessions promote");
 
@@ -1347,13 +1570,13 @@ mod tests {
         let conn = conn();
         let d = sample_distilled();
         assert_eq!(
-            integrate_distilled(&conn, &d, "sess-1", 1000, None).unwrap(),
+            integrate_distilled(&conn, &d, "sess-1", 1000, None, None).unwrap(),
             None
         );
         // Same session re-emitting the same trigger: deterministic candidate id
         // upserts, so distinct_sessions stays 1 — no self-promotion.
         assert_eq!(
-            integrate_distilled(&conn, &d, "sess-1", 1500, None).unwrap(),
+            integrate_distilled(&conn, &d, "sess-1", 1500, None, None).unwrap(),
             None,
             "one session cannot promote itself by repeating"
         );
@@ -1378,7 +1601,7 @@ mod tests {
         let d1 = sample_distilled(); // trigger {"pattern":"src/generated/**"}
         let emb1 = [1.0_f32, 0.0, 0.0];
         assert_eq!(
-            integrate_distilled(&conn, &d1, "sess-1", 1000, Some(&emb1)).unwrap(),
+            integrate_distilled(&conn, &d1, "sess-1", 1000, Some(&emb1), None).unwrap(),
             None,
             "one session must not promote"
         );
@@ -1397,7 +1620,7 @@ mod tests {
             ttl_days: Some(30),
         };
         let emb2 = [0.96_f32, 0.28, 0.0]; // cosine ~0.96 with emb1 → merges
-        let mem = integrate_distilled(&conn, &d2, "sess-2", 2000, Some(&emb2))
+        let mem = integrate_distilled(&conn, &d2, "sess-2", 2000, Some(&emb2), None)
             .unwrap()
             .expect("semantically equivalent second session promotes the merged cluster");
 
@@ -1416,7 +1639,7 @@ mod tests {
         let conn = conn();
         let d1 = sample_distilled();
         let emb1 = [1.0_f32, 0.0, 0.0];
-        integrate_distilled(&conn, &d1, "sess-1", 1000, Some(&emb1)).unwrap();
+        integrate_distilled(&conn, &d1, "sess-1", 1000, Some(&emb1), None).unwrap();
 
         // A different trigger AND an orthogonal embedding: must NOT merge.
         let d2 = DistilledPrior {
@@ -1430,7 +1653,7 @@ mod tests {
         };
         let emb2 = [0.0_f32, 1.0, 0.0]; // cosine 0.0 with emb1 → distinct
         assert_eq!(
-            integrate_distilled(&conn, &d2, "sess-2", 2000, Some(&emb2)).unwrap(),
+            integrate_distilled(&conn, &d2, "sess-2", 2000, Some(&emb2), None).unwrap(),
             None,
             "an unrelated lesson from a second session must not promote either cluster"
         );
@@ -1445,10 +1668,276 @@ mod tests {
             &promoted_cluster("clu-a", r#"{"pattern":"src/**"}"#, 2),
         )
         .unwrap();
-        record_injection(&conn, "clu-a", 999).unwrap();
-        record_injection(&conn, "clu-a", 1000).unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 999).unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(c.injected_count, 2);
         assert_eq!(c.last_seen_at, 1000);
+    }
+
+    // ========================================================================
+    // The belief loop
+    // ========================================================================
+
+    /// A cluster with a known signature, promoted and injectable.
+    fn cluster_with_signature(id: &str, signature: Option<&str>) -> PriorCluster {
+        let mut c = promoted_cluster(id, r#"{"pattern":"src/**"}"#, 2);
+        c.error_signature = signature.map(str::to_string);
+        c
+    }
+
+    fn err(signature: &str, at: Option<i64>) -> ObservedError {
+        ObservedError {
+            signature: signature.to_string(),
+            at,
+        }
+    }
+
+    #[test]
+    fn a_quiet_session_confirms_the_prior_it_was_shown() {
+        let conn = conn();
+        upsert_cluster(
+            &conn,
+            &cluster_with_signature("clu-a", Some("error[E0433]: failed to resolve `foo`")),
+        )
+        .unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
+
+        let report = settle_injections(
+            &conn,
+            "sess-1",
+            2000,
+            &[err("warning: unused variable `x`", Some(1500))],
+        )
+        .unwrap();
+
+        assert_eq!(report.confirmed, vec!["clu-a".to_string()]);
+        assert!(report.refuted.is_empty());
+        let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!(c.confirmed_count, 1);
+        assert_eq!(c.refuted_count, 0);
+    }
+
+    #[test]
+    fn the_error_coming_back_after_the_warning_refutes_it() {
+        let conn = conn();
+        upsert_cluster(
+            &conn,
+            &cluster_with_signature("clu-a", Some("error[E0433]: failed to resolve `foo`")),
+        )
+        .unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
+
+        // Same failure, different surrounding text and a different line number:
+        // a recurrence, not a byte-identical repeat.
+        let report = settle_injections(
+            &conn,
+            "sess-1",
+            2000,
+            &[err(
+                "src/lib.rs:88 error[E0433]: failed to resolve `foo` in this scope",
+                Some(1500),
+            )],
+        )
+        .unwrap();
+
+        assert_eq!(report.refuted, vec!["clu-a".to_string()]);
+        assert!(report.confirmed.is_empty());
+        let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!(c.refuted_count, 1);
+        assert_eq!(c.confirmed_count, 0);
+    }
+
+    /// The error that was already happening when the prior was injected is what
+    /// the prior is warning about, not evidence that the warning failed.
+    #[test]
+    fn an_error_before_the_injection_does_not_refute() {
+        let conn = conn();
+        upsert_cluster(
+            &conn,
+            &cluster_with_signature("clu-a", Some("error[E0433]: failed to resolve `foo`")),
+        )
+        .unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
+
+        let report = settle_injections(
+            &conn,
+            "sess-1",
+            2000,
+            &[err("error[E0433]: failed to resolve `foo`", Some(900))],
+        )
+        .unwrap();
+
+        assert_eq!(report.confirmed, vec!["clu-a".to_string()]);
+    }
+
+    /// An error the transcript did not timestamp cannot be placed before the
+    /// injection, and a recurrence we cannot place is still a recurrence.
+    #[test]
+    fn an_undated_recurrence_still_refutes() {
+        let conn = conn();
+        upsert_cluster(
+            &conn,
+            &cluster_with_signature("clu-a", Some("error[E0433]: failed to resolve `foo`")),
+        )
+        .unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
+
+        let report = settle_injections(
+            &conn,
+            "sess-1",
+            2000,
+            &[err("error[E0433]: failed to resolve `foo`", None)],
+        )
+        .unwrap();
+
+        assert_eq!(report.refuted, vec!["clu-a".to_string()]);
+    }
+
+    #[test]
+    fn settling_twice_counts_once_per_session() {
+        let conn = conn();
+        upsert_cluster(&conn, &cluster_with_signature("clu-a", Some("boom failed"))).unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 1100).unwrap();
+
+        settle_injections(&conn, "sess-1", 2000, &[]).unwrap();
+        let second = settle_injections(&conn, "sess-1", 2100, &[]).unwrap();
+
+        assert!(second.is_empty(), "a settled session has nothing left open");
+        let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!(c.confirmed_count, 1, "two injections, one session, one vote");
+        assert_eq!(c.injected_count, 2, "telemetry still counts both");
+    }
+
+    #[test]
+    fn a_second_session_votes_again() {
+        let conn = conn();
+        upsert_cluster(&conn, &cluster_with_signature("clu-a", Some("boom failed"))).unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
+        settle_injections(&conn, "sess-1", 2000, &[]).unwrap();
+        record_injection(&conn, "clu-a", "sess-2", 3000).unwrap();
+        settle_injections(&conn, "sess-2", 4000, &[]).unwrap();
+
+        let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!(c.confirmed_count, 2);
+    }
+
+    /// Clusters mined before the loop existed carry no signature. They must
+    /// still settle — as confirmed — rather than staying open forever.
+    #[test]
+    fn a_cluster_with_no_signature_settles_as_confirmed() {
+        let conn = conn();
+        upsert_cluster(&conn, &cluster_with_signature("clu-a", None)).unwrap();
+        record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
+
+        let report =
+            settle_injections(&conn, "sess-1", 2000, &[err("anything at all", Some(1500))]).unwrap();
+
+        assert_eq!(report.confirmed, vec!["clu-a".to_string()]);
+    }
+
+    #[test]
+    fn a_different_failure_is_not_a_recurrence() {
+        assert!(!signatures_match(
+            "error[E0433]: failed to resolve `foo`",
+            "error[E0599]: no method named `bar` found"
+        ));
+        assert!(signatures_match(
+            "error[E0433]: failed to resolve `foo`",
+            "at line 12: error[E0433]: failed to resolve `foo` — did you mean?"
+        ));
+    }
+
+    /// The loop is only worth building if it moves the number the injector
+    /// reads. A promoted cluster starts at 0.33 against a 0.3 threshold: three
+    /// refutations push it under, and confirmations bring it back.
+    #[test]
+    fn belief_carries_the_score_across_the_threshold_both_ways() {
+        let conn = conn();
+        upsert_cluster(&conn, &cluster_with_signature("clu-a", Some("boom failed"))).unwrap();
+        let now = 1000;
+
+        let fresh = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert!(
+            is_injectable(&fresh, now),
+            "a freshly promoted prior injects: {}",
+            cluster_injection_score(&fresh, now)
+        );
+
+        // Three sessions in which the error came back anyway.
+        for (i, session) in ["s1", "s2", "s3"].iter().enumerate() {
+            record_injection(&conn, "clu-a", session, now).unwrap();
+            settle_injections(
+                &conn,
+                session,
+                now + i as i64,
+                &[err("boom failed", Some(now))],
+            )
+            .unwrap();
+        }
+        let refuted = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!(refuted.refuted_count, 3);
+        assert!(
+            !is_injectable(&refuted, now),
+            "three refutations must stop it firing: {}",
+            cluster_injection_score(&refuted, now)
+        );
+
+        // Quiet sessions afterwards bring it back over the line.
+        for (i, session) in ["s4", "s5", "s6", "s7"].iter().enumerate() {
+            record_injection(&conn, "clu-a", session, now).unwrap();
+            settle_injections(&conn, session, now + i as i64, &[]).unwrap();
+        }
+        let recovered = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!(recovered.confirmed_count, 4);
+        assert!(
+            is_injectable(&recovered, now),
+            "confirmations must bring it back: {}",
+            cluster_injection_score(&recovered, now)
+        );
+    }
+
+    #[test]
+    fn a_human_verdict_on_the_projection_moves_the_cluster() {
+        let conn = conn();
+        // A real row: `promoted_memory_id` carries a foreign key into
+        // `memory_entries`, and the schema turns foreign keys on.
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('prior-a', 'l', 'l', 'prior', '[]', 100, 100)",
+            [],
+        )
+        .unwrap();
+        let mut c = cluster_with_signature("clu-a", Some("boom failed"));
+        c.promoted_memory_id = Some("prior-a".into());
+        upsert_cluster(&conn, &c).unwrap();
+
+        assert_eq!(
+            apply_belief_from_memory(&conn, "prior-a", 1).unwrap(),
+            Some("clu-a".to_string())
+        );
+        assert_eq!(
+            apply_belief_from_memory(&conn, "prior-a", -1).unwrap(),
+            Some("clu-a".to_string())
+        );
+        // An ordinary memory entry owns no cluster.
+        assert_eq!(apply_belief_from_memory(&conn, "some-topic", 1).unwrap(), None);
+
+        let after = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!(after.confirmed_count, 1);
+        assert_eq!(after.refuted_count, 1);
+    }
+
+    #[test]
+    fn the_first_observed_signature_is_the_one_that_sticks() {
+        let conn = conn();
+        upsert_cluster(&conn, &cluster_with_signature("clu-a", None)).unwrap();
+
+        set_cluster_error_signature(&conn, "clu-a", "first failure").unwrap();
+        set_cluster_error_signature(&conn, "clu-a", "second failure").unwrap();
+
+        let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!(c.error_signature.as_deref(), Some("first failure"));
     }
 }

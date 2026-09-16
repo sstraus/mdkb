@@ -435,6 +435,25 @@ impl std::fmt::Debug for DispatchContext {
     }
 }
 
+/// The session a hook event belongs to. Every injection is filed under this
+/// string and the Stop hook settles by it, so the two MUST read the same field:
+/// a prior injected under one key and looked for under another is never settled
+/// at all, and its belief stays frozen — the failure this loop exists to end.
+fn event_session(event: &Value) -> String {
+    event
+        .get("session_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(UNKNOWN_SESSION)
+        .to_string()
+}
+
+/// Filed against events that carry no `session_id`. Such events still settle
+/// against each other, which is the best available answer and no worse than
+/// dropping them.
+const UNKNOWN_SESSION: &str = "unknown";
+
 fn hook_session_key(handle: &RepoHandle, params: &Value) -> String {
     if let Some(session_id) = params
         .get("session_id")
@@ -3727,12 +3746,13 @@ fn expand_recall_neighbors(
 }
 
 pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> Value {
-    hook_user_prompt_submit_impl_with_dedup(handle, prompt, None).await
+    hook_user_prompt_submit_impl_with_dedup(handle, prompt, UNKNOWN_SESSION, None).await
 }
 
 async fn hook_user_prompt_submit_impl_with_dedup(
     handle: &RepoHandle,
     prompt: &str,
+    session: &str,
     dedup: Option<(&DispatchContext, String)>,
 ) -> Value {
     use crate::cli::hook_logic::prompt_wants_call_graph;
@@ -3994,7 +4014,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     }
 
     // Trigger-matched behavioral priors whose prompt pattern fires here.
-    let prior_block = prompt_prior_block(handle, prompt, dedup.as_ref()).await;
+    let prior_block = prompt_prior_block(handle, prompt, session, dedup.as_ref()).await;
 
     let nothing_found = results.is_empty() && doc_lines.is_empty() && related.is_empty();
     if nothing_found && prior_block.is_none() && !wants_cg {
@@ -4089,6 +4109,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
 async fn prompt_prior_block(
     handle: &RepoHandle,
     prompt: &str,
+    session: &str,
     dedup: Option<&(&DispatchContext, String)>,
 ) -> Option<String> {
     use crate::store::priors::{TriggerContext, match_injectable, record_injection};
@@ -4122,7 +4143,7 @@ async fn prompt_prior_block(
         let prior_id = c.id.clone();
         if let Some(Err(error)) =
             crate::core::run_guarded_write(&mut ctx_guard, "prompt prior telemetry", |ctx| {
-                record_injection(&ctx.conn, &prior_id, now)
+                record_injection(&ctx.conn, &prior_id, session, now)
             })
         {
             tracing::warn!("record prompt prior injection: {error}");
@@ -4201,6 +4222,26 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext
     // goes before the mining gate. Single-flight + best-effort.
     spawn_embedding_backfill(Arc::clone(&handle));
 
+    let transcript_path = event
+        .get("transcript_path")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let session = event_session(event);
+
+    // Settling comes first and is NOT behind the mining gate: priors are
+    // injected whenever `injection_enabled` is on, which is a different switch.
+    // Gating settlement on mining would leave every prior shown in such a repo
+    // permanently unsettled, which is the frozen belief this closes. It re-reads
+    // the transcript rather than sharing the mining read — one file read against
+    // a task that may never run, or may spend a minute in an LLM call.
+    if let Some(path) = transcript_path.clone() {
+        dctx.spawn_background(settle_session(
+            Arc::clone(&handle),
+            path,
+            session.clone(),
+        ));
+    }
+
     let cfg = &handle.config.priors;
     if !cfg.mining_enabled {
         return json!({});
@@ -4211,18 +4252,9 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext
         return json!({});
     };
     let args = cfg.distiller_args.clone();
-    let Some(transcript_path) = event
-        .get("transcript_path")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-    else {
+    let Some(transcript_path) = transcript_path else {
         return json!({});
     };
-    let session = event
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
 
     dctx.spawn_background(mine_episode(
         handle,
@@ -4232,6 +4264,65 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext
         args,
     ));
     json!({})
+}
+
+/// Answer, for every prior injected into this session, whether it held.
+///
+/// The verdict is the whole point of injecting: `cluster_injection_score`
+/// divides by a Beta belief over `confirmed_count`/`refuted_count`, and with
+/// nothing ever incrementing either, a freshly promoted prior started at 0.33
+/// against a 0.3 threshold and decayed under it in about 20 days. A prior could
+/// only ever go dark, however well it worked.
+///
+/// Best-effort like all Stop-hook work: every failure is a log line.
+async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, session: String) {
+    use crate::domain::prior_episode::parse_episode;
+    use crate::store::priors::{ObservedError, settle_injections};
+
+    let jsonl = match tokio::task::spawn_blocking(move || std::fs::read_to_string(&transcript_path))
+        .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            tracing::debug!("prior settling: read transcript failed: {e}");
+            return;
+        }
+        Err(e) => {
+            tracing::debug!("prior settling: transcript read task failed: {e}");
+            return;
+        }
+    };
+    // The same window the miner reads. A prior injected earlier than this window
+    // is settled against what the window shows, which can only ever miss a
+    // recurrence — it never invents one.
+    let episode = parse_episode(&tail_lines(&jsonl, STOP_EPISODE_WINDOW_LINES));
+    let errors: Vec<ObservedError> = episode
+        .errors
+        .iter()
+        .map(|e| ObservedError {
+            signature: e.signature.clone(),
+            at: e.at,
+        })
+        .collect();
+
+    if ensure_handle_context(&handle).await.is_err() {
+        return;
+    }
+    let now = chrono::Utc::now().timestamp();
+    let mut guard = handle.ctx.lock().await;
+    match crate::core::run_mutation(&mut guard, "prior settling", |ctx| {
+        settle_injections(&ctx.conn, &session, now, &errors)
+    }) {
+        Some(Ok(report)) if !report.is_empty() => {
+            tracing::info!(
+                "prior settling: {} confirmed, {} refuted in session {session}",
+                report.confirmed.len(),
+                report.refuted.len()
+            );
+        }
+        Some(Err(error)) => tracing::debug!("prior settling failed: {error}"),
+        _ => {}
+    }
 }
 
 /// What one prior-mining run did, as recorded in `hook-events.jsonl`.
@@ -4352,6 +4443,10 @@ async fn mine_episode_inner(
         // The cheap gate: most episodes teach nothing, no LLM call.
         return MiningOutcome::Gated;
     };
+    // The failure this lesson will exist to prevent. Recorded on the cluster so
+    // a later session can tell "the prior was shown and the error stayed away"
+    // from "the prior was shown and it happened anyway".
+    let error_signature = sig.error_signature.clone();
     let prompt = build_distill_prompt(&episode, &sig);
 
     // Spawn the external distiller off the async runtime (blocking process).
@@ -4410,6 +4505,7 @@ async fn mine_episode_inner(
             &session,
             now,
             lesson_embedding.as_deref(),
+            error_signature.as_deref(),
         )
     }) {
         Some(Err(error)) => {
@@ -4445,7 +4541,7 @@ pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Valu
     // reindex: "run the generator after editing the template" is a lesson about
     // Bash, which this hook otherwise ignores entirely.
     let prior_block = match event.get("tool_input") {
-        Some(input) => posttool_prior_block(handle, tool_name, input).await,
+        Some(input) => posttool_prior_block(handle, tool_name, input, &event_session(event)).await,
         None => None,
     };
     let mut result = match &prior_block {
@@ -4555,7 +4651,8 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
     // Trigger-matched behavioral priors are complementary to the search
     // redirect: surface any promoted prior whose trigger matches this tool call,
     // appended after the search block.
-    let prior_block = pretool_prior_block(handle, tool_name, tool_input).await;
+    let prior_block =
+        pretool_prior_block(handle, tool_name, tool_input, &event_session(event)).await;
 
     let text = match (search_block, prior_block) {
         (Some(s), Some(p)) => Some(format!("{s}\n\n{p}")),
@@ -4580,8 +4677,9 @@ async fn pretool_prior_block(
     handle: &RepoHandle,
     tool: &str,
     tool_input: &Value,
+    session: &str,
 ) -> Option<String> {
-    tool_prior_block(handle, tool, tool_input, false).await
+    tool_prior_block(handle, tool, tool_input, false, session).await
 }
 
 /// Promoted priors whose trigger matches this PostToolUse call.
@@ -4589,8 +4687,9 @@ async fn posttool_prior_block(
     handle: &RepoHandle,
     tool: &str,
     tool_input: &Value,
+    session: &str,
 ) -> Option<String> {
-    tool_prior_block(handle, tool, tool_input, true).await
+    tool_prior_block(handle, tool, tool_input, true, session).await
 }
 
 /// Promoted priors whose trigger matches a tool call, formatted as a context
@@ -4606,6 +4705,7 @@ async fn tool_prior_block(
     tool: &str,
     tool_input: &Value,
     after: bool,
+    session: &str,
 ) -> Option<String> {
     use crate::store::priors::{TriggerContext, match_injectable, record_injection};
 
@@ -4658,7 +4758,7 @@ async fn tool_prior_block(
         let prior_id = c.id.clone();
         if let Some(Err(error)) =
             crate::core::run_guarded_write(&mut ctx_guard, "tool prior telemetry", |ctx| {
-                record_injection(&ctx.conn, &prior_id, now)
+                record_injection(&ctx.conn, &prior_id, session, now)
             })
         {
             tracing::warn!("record {label} prior injection: {error}");
@@ -5056,9 +5156,15 @@ pub async fn dispatch_call(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let key = hook_session_key(&handle, &params);
+            let session = event_session(&params);
             let t0 = std::time::Instant::now();
-            let result =
-                hook_user_prompt_submit_impl_with_dedup(&handle, prompt, Some((dctx, key))).await;
+            let result = hook_user_prompt_submit_impl_with_dedup(
+                &handle,
+                prompt,
+                &session,
+                Some((dctx, key)),
+            )
+            .await;
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) {
                 "skipped"
@@ -8604,6 +8710,18 @@ mod tests {
 
     /// Seed a promoted, injectable cluster directly into the handle's store.
     async fn seed_promoted_prior(handle: &RepoHandle, kind: &str, matcher: &str, lesson: &str) {
+        seed_promoted_prior_with_signature(handle, kind, matcher, lesson, None).await;
+    }
+
+    /// As [`seed_promoted_prior`], with the failure signature the belief loop
+    /// checks recurrence against. Returns the cluster id.
+    async fn seed_promoted_prior_with_signature(
+        handle: &RepoHandle,
+        kind: &str,
+        matcher: &str,
+        lesson: &str,
+        signature: Option<&str>,
+    ) -> String {
         use crate::store::priors::{
             PriorCluster, canonical_trigger_key, cluster_id_for_key, upsert_cluster,
         };
@@ -8611,11 +8729,12 @@ mod tests {
         let guard = handle.ctx.lock().await;
         let conn = &guard.as_ref().unwrap().conn;
         let key = canonical_trigger_key(kind, matcher);
+        let cluster_id = cluster_id_for_key(&key);
         let now = chrono::Utc::now().timestamp();
         upsert_cluster(
             conn,
             &PriorCluster {
-                id: cluster_id_for_key(&key),
+                id: cluster_id.clone(),
                 canonical_trigger_key: key,
                 trigger_kind: kind.into(),
                 trigger_matcher: matcher.into(),
@@ -8630,9 +8749,11 @@ mod tests {
                 promoted_memory_id: None,
                 created_at: now,
                 last_seen_at: now, // maximally fresh
+                error_signature: signature.map(str::to_string),
             },
         )
         .unwrap();
+        cluster_id
     }
 
     #[tokio::test]
@@ -8820,6 +8941,121 @@ mod tests {
             !handle.backfill_in_flight.load(Ordering::Acquire),
             "a disabled session_start must not trigger a backfill"
         );
+    }
+
+    // ── The belief loop: an injected prior is answered at Stop ────────────────
+
+    /// A dispatch context that keeps its background tasks, so a test can wait
+    /// for the work the Stop hook detaches.
+    fn make_collecting_dctx() -> DispatchContext {
+        DispatchContext {
+            background: Some(Arc::new(StdMutex::new(Vec::new()))),
+            ..make_dctx()
+        }
+    }
+
+    async fn cluster_belief(handle: &RepoHandle, cluster_id: &str) -> (i64, i64) {
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let c = crate::store::priors::get_cluster(conn, cluster_id)
+            .unwrap()
+            .expect("cluster exists");
+        (c.confirmed_count, c.refuted_count)
+    }
+
+    /// Inject a prior on PreToolUse, then end the session, and read the verdict.
+    /// Mining stays OFF throughout: settling is gated on injection, not on
+    /// mining, and gating it on mining would leave every prior in such a repo
+    /// unsettled forever.
+    async fn inject_then_stop(transcript: &str) -> (i64, i64) {
+        let tmp = TempDir::new().unwrap();
+        let handle = Arc::new(make_handle_with(&tmp, |config| {
+            config.priors.mining_enabled = false;
+        }));
+        let cluster_id = seed_promoted_prior_with_signature(
+            &handle,
+            "pre_tool",
+            r#"{"pattern":"src/generated/**"}"#,
+            "Do not edit generated files; edit the generator instead.",
+            Some("error[E0433]: failed to resolve"),
+        )
+        .await;
+
+        let path = tmp.path().join("src/generated/api.rs");
+        let injected = hook_pre_tool_use_impl(
+            &handle,
+            &json!({
+                "tool_name": "Edit",
+                "tool_input": {"file_path": path.to_string_lossy()},
+                "session_id": "s1"
+            }),
+        )
+        .await;
+        assert_ne!(injected, json!({}), "the prior must have been injected");
+
+        let transcript_path = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript_path, transcript).unwrap();
+        let dctx = make_collecting_dctx();
+        hook_stop_impl(
+            Arc::clone(&handle),
+            &json!({
+                "transcript_path": transcript_path.to_string_lossy(),
+                "session_id": "s1"
+            }),
+            &dctx,
+        );
+        dctx.join_background().await;
+
+        cluster_belief(&handle, &cluster_id).await
+    }
+
+    #[tokio::test]
+    async fn a_session_that_did_not_trip_the_error_confirms_the_prior() {
+        let (confirmed, refuted) = inject_then_stop(MINE_BORING_TRANSCRIPT).await;
+        assert_eq!(confirmed, 1, "a quiet session is evidence the lesson held");
+        assert_eq!(refuted, 0);
+    }
+
+    #[tokio::test]
+    async fn the_warned_error_happening_anyway_refutes_the_prior() {
+        // MINE_FIX_TRANSCRIPT carries exactly the failure the seeded cluster
+        // warns about: the model was told, and hit it regardless.
+        let (confirmed, refuted) = inject_then_stop(MINE_FIX_TRANSCRIPT).await;
+        assert_eq!(refuted, 1, "the failure came back after the warning");
+        assert_eq!(confirmed, 0);
+    }
+
+    /// A prior nobody was shown has nothing to answer for. Without this, every
+    /// Stop hook would confirm every promoted prior in the store.
+    #[tokio::test]
+    async fn a_prior_that_was_never_injected_is_not_settled() {
+        let tmp = TempDir::new().unwrap();
+        let handle = Arc::new(make_handle_with(&tmp, |config| {
+            config.priors.mining_enabled = false;
+        }));
+        let cluster_id = seed_promoted_prior_with_signature(
+            &handle,
+            "pre_tool",
+            r#"{"pattern":"src/generated/**"}"#,
+            "Do not edit generated files.",
+            Some("error[E0433]: failed to resolve"),
+        )
+        .await;
+
+        let transcript_path = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript_path, MINE_BORING_TRANSCRIPT).unwrap();
+        let dctx = make_collecting_dctx();
+        hook_stop_impl(
+            Arc::clone(&handle),
+            &json!({
+                "transcript_path": transcript_path.to_string_lossy(),
+                "session_id": "s1"
+            }),
+            &dctx,
+        );
+        dctx.join_background().await;
+
+        assert_eq!(cluster_belief(&handle, &cluster_id).await, (0, 0));
     }
 
     #[tokio::test]
@@ -9212,6 +9448,7 @@ mod tests {
             &handle,
             "Edit",
             &json!({"file_path": edit_path.to_string_lossy()}),
+            "sess-inject",
         )
         .await
         .expect("promoted prior must inject on a matching PreToolUse");
@@ -9227,6 +9464,7 @@ mod tests {
             &handle,
             "Edit",
             &json!({"file_path": unrelated_path.to_string_lossy()}),
+            "sess-inject",
         )
         .await;
         assert!(
@@ -9277,6 +9515,7 @@ mod tests {
                     promoted_memory_id: None,
                     created_at: chrono::Utc::now().timestamp(),
                     last_seen_at: chrono::Utc::now().timestamp(),
+                    error_signature: None,
                 },
             )
             .unwrap();
@@ -9356,6 +9595,7 @@ mod tests {
                     promoted_memory_id: None,
                     created_at: chrono::Utc::now().timestamp(),
                     last_seen_at: chrono::Utc::now().timestamp(),
+                    error_signature: None,
                 },
             )
             .unwrap();

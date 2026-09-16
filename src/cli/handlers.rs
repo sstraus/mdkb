@@ -237,6 +237,46 @@ mod tests {
         assert_eq!(r.confirmations, 0, "refute below zero floors at 0");
     }
 
+    /// Confirming a promoted prior's projection has to move the cluster behind
+    /// it. `memory_entries.confirmations` is not what decides whether a prior
+    /// keeps firing — `cluster_injection_score` reads the cluster's belief — so
+    /// a human verdict that only touched the entry changed nothing at all.
+    #[test]
+    fn confirming_a_prior_projection_moves_the_cluster_belief() {
+        use crate::store::priors::{PriorCluster, get_cluster, upsert_cluster};
+
+        let (_t, ctx) = confirm_test_ctx();
+        upsert_cluster(
+            &ctx.conn,
+            &PriorCluster {
+                id: "clu-x".into(),
+                canonical_trigger_key: "pre_tool|{}".into(),
+                trigger_kind: "pre_tool".into(),
+                trigger_matcher: "{}".into(),
+                lesson: "Title".into(),
+                scope: "{}".into(),
+                evidence_count: 2,
+                distinct_sessions: 2,
+                injected_count: 0,
+                confirmed_count: 0,
+                refuted_count: 0,
+                state: "promoted".into(),
+                promoted_memory_id: Some("c1".into()),
+                created_at: 100,
+                last_seen_at: 100,
+                error_signature: None,
+            },
+        )
+        .expect("seed cluster");
+
+        handle_memory_confirm(&ctx, "c1", "confirmed").expect("confirm");
+        handle_memory_confirm(&ctx, "c1", "refuted").expect("refute");
+
+        let c = get_cluster(&ctx.conn, "clu-x").unwrap().expect("cluster");
+        assert_eq!(c.confirmed_count, 1);
+        assert_eq!(c.refuted_count, 1);
+    }
+
     #[test]
     fn confirm_unknown_id_errors_cleanly() {
         let (_t, ctx) = confirm_test_ctx();

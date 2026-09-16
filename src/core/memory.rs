@@ -357,6 +357,13 @@ pub fn handle_memory_show(ctx: &Context, id: &str) -> Result<Option<MemoryEntry>
 pub fn handle_memory_confirm(ctx: &Context, id: &str, outcome: &str) -> Result<ConfirmResult> {
     let delta = memory::outcome_to_delta(outcome)?;
     let message = memory::confirm_entry(&ctx.conn, id, delta)?;
+    // A promoted prior has two representations: the memory entry a person reads
+    // and the cluster the injector scores. `confirm_entry` moves only the first,
+    // and `cluster_injection_score` reads only the second — so before this, a
+    // human confirming a prior changed nothing about whether it kept firing.
+    if let Err(error) = crate::store::priors::apply_belief_from_memory(&ctx.conn, id, delta) {
+        tracing::warn!("confirm {id}: could not update the owning prior cluster: {error}");
+    }
     // Re-read the persisted count so JSON callers get the exact new value.
     let confirmations = memory::get_entry_without_tracking(&ctx.conn, id)?
         .map(|e| e.confirmations)

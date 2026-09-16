@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 23;
+pub const SCHEMA_VERSION: i32 = 24;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -315,10 +315,26 @@ CREATE TABLE IF NOT EXISTS prior_clusters (
     created_at INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL,
     embedding BLOB,                          -- lesson embedding (f32 LE) for semantic cluster-merge
+    error_signature TEXT,                    -- the failure this lesson exists to prevent (recurrence = refutation)
     FOREIGN KEY(promoted_memory_id) REFERENCES memory_entries(id) ON DELETE SET NULL
 );
 CREATE INDEX IF NOT EXISTS idx_prior_clusters_trigger ON prior_clusters(canonical_trigger_key);
 CREATE INDEX IF NOT EXISTS idx_prior_clusters_state ON prior_clusters(state);
+
+-- One row per (cluster, session) in which the prior was injected, settled at the
+-- next Stop hook into `confirmed` or `refuted`. The composite primary key is
+-- what makes "confirmed at most once per session" structural rather than a rule
+-- the settling code has to remember.
+CREATE TABLE IF NOT EXISTS prior_injections (
+    cluster_id TEXT NOT NULL,
+    session TEXT NOT NULL,
+    injected_at INTEGER NOT NULL,            -- first injection in this session
+    outcome TEXT,                            -- NULL until settled, then confirmed|refuted
+    settled_at INTEGER,
+    PRIMARY KEY (cluster_id, session),
+    FOREIGN KEY(cluster_id) REFERENCES prior_clusters(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_prior_injections_open ON prior_injections(session, outcome);
 
 -- Individual observed episodes (one per session) feeding a cluster. Never
 -- injected directly; they accumulate into a cluster which may be promoted.
@@ -889,6 +905,35 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 "migration: archived {archived} prior cluster(s) whose trigger kind has no \
                  injection point"
             );
+        }
+    }
+
+    // Migration from v23 to v24: give a cluster the error signature it exists to
+    // prevent. Without it the Stop hook cannot tell a prior that worked from one
+    // that was ignored, so `confirmed_count` and `refuted_count` stayed at 0 and
+    // every promoted prior decayed below the injection threshold in about 20
+    // days no matter how well it worked.
+    //
+    // The column is left NULL on existing rows: the signature is only knowable
+    // from the episode that mined the cluster, and that episode is gone. Those
+    // clusters settle as confirmed-on-quiet once they are injected again — the
+    // recurrence half starts working for them at their next observation.
+    //
+    // `prior_injections` needs no migration step: it is created by SCHEMA_SQL,
+    // which runs on every open.
+    if from_version < 24 && table_exists(conn, "prior_clusters") {
+        let has_signature: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('prior_clusters') WHERE name = 'error_signature'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_signature {
+            conn.execute(
+                "ALTER TABLE prior_clusters ADD COLUMN error_signature TEXT",
+                [],
+            )?;
         }
     }
 

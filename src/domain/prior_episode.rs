@@ -27,6 +27,10 @@ pub struct ToolError {
     /// First ~120 chars of the error output, whitespace-collapsed.
     pub signature: String,
     pub tool_use_id: String,
+    /// Unix seconds from the record's ISO-8601 `timestamp`, when it carried one.
+    /// The belief loop compares this with the moment a prior was injected, so
+    /// that only errors that happened *after* the warning can refute it.
+    pub at: Option<i64>,
 }
 
 /// The distilled raw episode for one transcript window.
@@ -50,8 +54,11 @@ pub struct Episode {
 #[derive(Deserialize)]
 struct Record {
     #[serde(rename = "type")]
-    record_type: String,
+    kind: String,
     message: Option<Message>,
+    /// ISO 8601, as Claude Code writes it. Absent on some records.
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -133,6 +140,14 @@ fn preview(content: &str) -> String {
     trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Unix seconds from an ISO-8601 record timestamp. An unparseable or absent
+/// stamp yields `None`, which the belief loop reads as "cannot be placed in
+/// time" rather than "happened at the epoch".
+fn record_time(raw: Option<&str>) -> Option<i64> {
+    raw.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp())
+}
+
 /// Parse a transcript window (JSONL text) into a structured [`Episode`].
 ///
 /// Mirrors the action→consequence→handling extraction: tool_use blocks in
@@ -157,13 +172,14 @@ pub fn parse_episode(jsonl: &str) -> Episode {
             Ok(r) => r,
             Err(_) => continue,
         };
+        let at = record_time(record.timestamp.as_deref());
         let Some(message) = record.message else {
             continue;
         };
         let blocks = match message.content {
             Content::Blocks(b) => b,
             Content::Text(s) => {
-                if record.record_type == "user" && !s.trim().is_empty() {
+                if record.kind == "user" && !s.trim().is_empty() {
                     user_messages.push(s);
                 }
                 continue;
@@ -172,7 +188,7 @@ pub fn parse_episode(jsonl: &str) -> Episode {
 
         for block in blocks {
             match block {
-                Block::ToolUse { id, name, input } if record.record_type == "assistant" => {
+                Block::ToolUse { id, name, input } if record.kind == "assistant" => {
                     tool_name_by_id.insert(id.clone(), name.clone());
                     tools.push(ToolUse {
                         id,
@@ -185,7 +201,7 @@ pub fn parse_episode(jsonl: &str) -> Episode {
                     tool_use_id,
                     is_error,
                     content,
-                } if record.record_type == "user" => {
+                } if record.kind == "user" => {
                     result_order.push(is_error);
                     if is_error {
                         if let Some(tool) = tool_name_by_id.get(&tool_use_id) {
@@ -193,11 +209,12 @@ pub fn parse_episode(jsonl: &str) -> Episode {
                                 tool: tool.clone(),
                                 signature: preview(&content.to_text()),
                                 tool_use_id,
+                                at,
                             });
                         }
                     }
                 }
-                Block::Text { text } if record.record_type == "user" && !text.trim().is_empty() => {
+                Block::Text { text } if record.kind == "user" && !text.trim().is_empty() => {
                     user_messages.push(text);
                 }
                 _ => {}
@@ -289,6 +306,25 @@ mod tests {
         assert_eq!(ep.errors.len(), 1);
         assert!(!ep.had_corrective_action, "no tool ran after the error");
         assert!(!ep.ended_clean, "last result was an error");
+    }
+
+    /// The belief loop needs to know WHEN an error happened: an error that
+    /// predates the prior's injection is what the prior warns about, not proof
+    /// the warning was ignored. A record without a usable stamp yields `None`,
+    /// which the loop reads as "cannot be placed", never as the epoch.
+    #[test]
+    fn an_errors_timestamp_is_carried_when_the_record_has_one() {
+        let jsonl = [
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build"}}]},"timestamp":"2026-01-09T08:43:52.235Z"}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","is_error":true,"content":"boom"}]},"timestamp":"2026-01-09T08:44:00.000Z"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","is_error":true,"content":"boom again"}]},"timestamp":"not a date"}"#,
+        ]
+        .join("\n");
+        let ep = parse_episode(&jsonl);
+        assert_eq!(ep.errors.len(), 2);
+        assert_eq!(ep.errors[0].at, Some(1767948240));
+        assert_eq!(ep.errors[1].at, None, "an unparseable stamp is not a time");
     }
 
     #[test]
