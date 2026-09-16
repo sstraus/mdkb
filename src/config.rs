@@ -499,6 +499,28 @@ pub fn raw_priors_layer(path: impl AsRef<Path>) -> Option<toml::Table> {
 /// definition of priors layering: `default < global daemon.toml < per-repo
 /// config.toml`. A type-invalid merged value degrades to defaults with a warning
 /// rather than aborting a repo open.
+/// The `[priors]` the daemon actually mines with for the repo whose config
+/// lives at `config_path`: the global `daemon.toml` layer under the per-repo
+/// override, the same merge `RepoHandle::open` performs.
+///
+/// Reading only the repo config reports "disabled" for every repo whose mining
+/// was turned on globally, which is the normal setup — so anything that reports
+/// or checks mining status has to come through here.
+pub fn effective_priors(config_path: impl AsRef<Path>) -> PriorsConfig {
+    let global = match crate::daemon::config::DaemonConfig::load_or_default(
+        &crate::daemon::config::DaemonConfig::config_path(),
+    ) {
+        Ok(c) => c.priors,
+        Err(e) => {
+            // A corrupt daemon.toml would otherwise read as "mining disabled"
+            // and send the operator looking in the wrong place.
+            tracing::warn!("daemon.toml failed to load, priors defaulted: {e}");
+            toml::Table::new()
+        }
+    };
+    merge_priors(&global, raw_priors_layer(config_path).as_ref())
+}
+
 pub fn merge_priors(global: &toml::Table, repo: Option<&toml::Table>) -> PriorsConfig {
     let mut merged = global.clone();
     if let Some(r) = repo {

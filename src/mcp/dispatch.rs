@@ -4195,7 +4195,9 @@ async fn mine_episode(
     args: Vec<String>,
 ) {
     use crate::domain::prior_detect::detect_candidate;
-    use crate::domain::prior_distill::{build_distill_prompt, parse_distilled, run_distiller_cli};
+    use crate::domain::prior_distill::{
+        build_distill_prompt, distiller_failure, parse_distilled, run_distiller_cli,
+    };
     use crate::domain::prior_episode::parse_episode;
     use crate::store::priors::integrate_distilled;
 
@@ -4219,18 +4221,30 @@ async fn mine_episode(
     let prompt = build_distill_prompt(&episode, &sig);
 
     // Spawn the external distiller off the async runtime (blocking process).
-    let raw = match tokio::task::spawn_blocking(move || run_distiller_cli(&program, &args, &prompt))
+    let logged_program = program.clone();
+    let run = match tokio::task::spawn_blocking(move || run_distiller_cli(&program, &args, &prompt))
         .await
     {
-        Ok(Ok(s)) => s,
+        Ok(Ok(run)) => run,
         Ok(Err(e)) => {
-            tracing::debug!("prior mining: distiller spawn failed: {e}");
+            // warn, not debug: a distiller that cannot be spawned is a
+            // misconfiguration the operator must see. At debug — which the
+            // daemon does not log — this stayed invisible from 2026-08-01 to
+            // 2026-09-16 while every Stop event reported success.
+            tracing::warn!("prior mining: distiller {logged_program:?} could not be spawned: {e}");
             return;
         }
         Err(_) => return,
     };
-    let distilled = match parse_distilled(&raw) {
+    let parsed = parse_distilled(&run.stdout);
+    if let Some(failure) = distiller_failure(&logged_program, &run, parsed.as_ref().err()) {
+        tracing::warn!("prior mining: {failure}");
+        return;
+    }
+    let distilled = match parsed {
         Ok(d) => d,
+        // A well-formed answer the validator turned down: most episodes teach
+        // nothing, so this is ordinary and stays at debug.
         Err(e) => {
             tracing::debug!("prior mining: distiller output rejected: {e}");
             return;
@@ -8678,6 +8692,110 @@ mod tests {
         assert_eq!(cluster.state, "candidate");
         assert_eq!(cluster.distinct_sessions, 1);
         assert!(cluster.lesson.contains("Do not edit generated files"));
+    }
+
+    /// End-to-end proof of the fence tolerance, at the level that actually
+    /// failed: `claude -p` wraps its answer in a ```json fence, mdkb rejected it
+    /// as NotJson, and mining produced nothing for six weeks. Same episode, same
+    /// lesson, only the wrapping differs — a cluster must appear.
+    #[tokio::test]
+    async fn mine_episode_accepts_a_distiller_that_fences_its_json() {
+        use crate::store::priors::{canonical_trigger_key, cluster_id_for_key, get_cluster};
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let args = vec![
+            "-c".to_string(),
+            format!("cat >/dev/null; printf 'Here you go:\\n```json\\n%s\\n```\\n' '{distilled}'"),
+        ];
+
+        mine_episode(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "sess-fenced".to_string(),
+            "sh".to_string(),
+            args,
+        )
+        .await;
+
+        ensure_handle_context(&handle).await.unwrap();
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let key = canonical_trigger_key(
+            "pre_tool",
+            r#"{"pattern":"src/generated/**","when":"editing generated code"}"#,
+        );
+        let cluster = get_cluster(conn, &cluster_id_for_key(&key))
+            .unwrap()
+            .expect("a fenced answer must still mine a candidate cluster");
+        assert_eq!(cluster.distinct_sessions, 1);
+    }
+
+    /// A distiller that takes its prompt in argv (`grok -p`) mines just as well,
+    /// and one that fails writes nothing — the failure is reported, not absorbed
+    /// into a half-built cluster.
+    #[tokio::test]
+    async fn mine_episode_honours_the_prompt_placeholder_and_persists_nothing_on_failure() {
+        use crate::store::priors::{canonical_trigger_key, cluster_id_for_key, get_cluster};
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+        let key = canonical_trigger_key(
+            "pre_tool",
+            r#"{"pattern":"src/generated/**","when":"editing generated code"}"#,
+        );
+        let cluster_id = cluster_id_for_key(&key);
+
+        // Exits non-zero with a usage message, the shape of a misconfigured CLI.
+        mine_episode(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "sess-broken".to_string(),
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "printf 'usage: distill [OPTIONS]'; exit 2".to_string(),
+            ],
+        )
+        .await;
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            assert!(
+                get_cluster(conn, &cluster_id).unwrap().is_none(),
+                "a failed distiller must leave the store untouched"
+            );
+        }
+
+        // The prompt arrives in argv: the stub echoes $1 back as the answer, so a
+        // cluster appears only if substitution happened.
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        mine_episode(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "sess-argv".to_string(),
+            "sh".to_string(),
+            vec![
+                "-c".to_string(),
+                format!("test -n \"$1\" && printf '%s' '{distilled}'"),
+                "sh".to_string(),
+                "{prompt}".to_string(),
+            ],
+        )
+        .await;
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let cluster = get_cluster(conn, &cluster_id)
+            .unwrap()
+            .expect("the prompt must reach argv and the answer must be mined");
+        assert_eq!(cluster.distinct_sessions, 1);
     }
 
     /// The full flagship loop: two independent sessions distill the same lesson,

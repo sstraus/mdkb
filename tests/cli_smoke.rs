@@ -1790,6 +1790,71 @@ fn smoke_setup_mcp_codex_dry_run() {
     assert_ok(&out, "setup mcp codex --dry-run");
 }
 
+/// `setup check` is the answer to "is the distiller actually working?", which
+/// until now could only be answered by reading the daemon log that never
+/// recorded it. It runs the configured CLI once and reports what it said.
+#[test]
+fn smoke_setup_check_reports_the_distiller_verdict() {
+    let repo = Repo::new();
+    let config = repo.root.join(".mdkb").join("config.toml");
+
+    // Nothing configured: a clear "not configured", not a failure.
+    let out = run(&["setup", "check"], &repo.root);
+    assert_ok(&out, "setup check without a distiller");
+    assert!(
+        stdout(&out).contains("not configured"),
+        "got: {}",
+        stdout(&out)
+    );
+
+    // A working distiller that fences its answer, the way `claude -p` does.
+    // The answer lives in a file: embedding JSON in the TOML arg list would
+    // need every quote escaped, and a TOML parse error reads back as
+    // "not configured" rather than as the mistake it is.
+    let answer = repo.root.join("answer.json");
+    std::fs::write(
+        &answer,
+        r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error","fix":"edited the generator"},"ttl_days":30}"#,
+    )
+    .unwrap();
+    // Only `[priors]` is read from this file by the check, and appending a
+    // second `[priors]` table to the generated default would be a duplicate-key
+    // parse error.
+    std::fs::write(
+        &config,
+        format!(
+            "[priors]\nmining_enabled = true\ndistiller_program = \"sh\"\ndistiller_args = [\"-c\", \"cat >/dev/null; printf '```json\\\\n'; cat {}; printf '\\\\n```'\"]\n",
+            answer.display()
+        ),
+    )
+    .unwrap();
+    let out = run(&["setup", "check"], &repo.root);
+    assert_ok(&out, "setup check with a working distiller");
+    assert!(
+        stdout(&out).contains("Do not edit generated files"),
+        "the lesson proves the round-trip, got: {}",
+        stdout(&out)
+    );
+
+    // A broken distiller: non-zero exit, and the reason it gave on stderr is
+    // quoted back. This is the case that was invisible for six weeks.
+    std::fs::write(
+        &config,
+        "[priors]\nmining_enabled = true\ndistiller_program = \"sh\"\ndistiller_args = [\"-c\", \"echo 'unexpected status 400 Bad Request' >&2; exit 1\"]\n",
+    )
+    .unwrap();
+    let out = run(&["setup", "check"], &repo.root);
+    assert!(
+        !out.status.success(),
+        "a broken distiller must exit non-zero so a script can act on it"
+    );
+    let combined = stdout(&out) + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        combined.contains("400 Bad Request"),
+        "the real error text must be reported, got: {combined}"
+    );
+}
+
 // ── Journal ─────────────────────────────────────────────────────────
 
 #[test]

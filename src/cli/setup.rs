@@ -440,6 +440,64 @@ pub struct HooksSetupResult {
     pub codex_hooks_flag_present: bool,
 }
 
+/// Verdict of one distiller probe run.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DistillerCheck {
+    /// Mining is off, or no `distiller_program` is set: nothing to probe.
+    NotConfigured(String),
+    /// The CLI ran and produced a prior. `lesson` is what it distilled.
+    Pass { program: String, lesson: String },
+    /// The CLI could not be run, exited non-zero, or printed no JSON object.
+    Fail { program: String, detail: String },
+}
+
+/// Run the configured distiller once against a fixed prompt and report what it
+/// said.
+///
+/// Mining is a detached background task whose failures were logged where nobody
+/// reads them; between 2026-08-01 and 2026-09-16 that hid a distiller that had
+/// been rejecting every request. The verdict here is computed by
+/// [`distiller_failure`](crate::domain::prior_distill::distiller_failure) — the
+/// same predicate the mining path uses — so this command cannot pass a distiller
+/// the daemon would then reject.
+pub fn check_distiller(root: &Path) -> DistillerCheck {
+    use crate::domain::prior_distill::{
+        build_probe_prompt, distiller_failure, parse_distilled, run_distiller_cli,
+    };
+
+    let priors = crate::config::effective_priors(root.join(".mdkb").join("config.toml"));
+    if !priors.mining_enabled {
+        return DistillerCheck::NotConfigured("mining_enabled = false".to_string());
+    }
+    let Some(program) = priors.distiller_program.clone() else {
+        return DistillerCheck::NotConfigured("no distiller_program configured".to_string());
+    };
+
+    let run = match run_distiller_cli(&program, &priors.distiller_args, &build_probe_prompt()) {
+        Ok(run) => run,
+        Err(e) => {
+            return DistillerCheck::Fail {
+                program,
+                detail: format!("could not be spawned: {e}"),
+            };
+        }
+    };
+    let parsed = parse_distilled(&run.stdout);
+    match distiller_failure(&program, &run, parsed.as_ref().err()) {
+        Some(detail) => DistillerCheck::Fail { program, detail },
+        // No failure and no prior means the model answered in schema and judged
+        // the canned episode unremarkable. The wiring is what is under test, and
+        // the wiring works.
+        None => DistillerCheck::Pass {
+            program,
+            lesson: parsed.map_or_else(
+                |reject| format!("(no prior: {reject})"),
+                |prior| prior.lesson,
+            ),
+        },
+    }
+}
+
 /// Lifecycle events emitted by `mdkb hook`.
 /// Tuple: (event_name, cli_event, optional matcher for settings.json).
 pub const HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[

@@ -1113,6 +1113,9 @@ pub enum SetupCommand {
     /// Remove mdkb registrations (MCP and/or hooks)
     #[command(subcommand)]
     Remove(SetupRemoveCommand),
+
+    /// Verify the configured integrations actually work (exits non-zero on failure)
+    Check,
 }
 
 /// MCP setup subcommands.

@@ -493,20 +493,7 @@ fn collect_mining(ctx: &Context) -> MiningStatus {
     // daemon.toml layer merged under any per-repo override — the same merge
     // `RepoHandle::open` performs. Reading only the repo config would show
     // "disabled" even when daemon.toml turned mining on.
-    let global = match crate::daemon::config::DaemonConfig::load_or_default(
-        &crate::daemon::config::DaemonConfig::config_path(),
-    ) {
-        Ok(c) => c.priors,
-        Err(e) => {
-            // A corrupt daemon.toml would otherwise silently read as "mining
-            // disabled" — surface the real cause instead of a misleading status
-            // (FAIL-1).
-            tracing::warn!("stats: daemon.toml failed to load, priors defaulted: {e}");
-            toml::Table::new()
-        }
-    };
-    let repo = crate::config::raw_priors_layer(&ctx.config_path);
-    let priors = crate::config::merge_priors(&global, repo.as_ref());
+    let priors = crate::config::effective_priors(&ctx.config_path);
 
     let candidate_count = ctx
         .conn

@@ -1576,6 +1576,26 @@ MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<n
                     }
                 }
             },
+            SetupCommand::Check => {
+                use mdkb::cli::setup::DistillerCheck;
+                match mdkb::cli::setup::check_distiller(&cwd) {
+                    DistillerCheck::NotConfigured(reason) => {
+                        println!("Prior distiller: not configured ({reason})");
+                    }
+                    DistillerCheck::Pass { program, lesson } => {
+                        println!("Prior distiller: OK ({program})");
+                        println!("  distilled: {lesson}");
+                    }
+                    // Non-zero exit: this command exists to be run from a script
+                    // or a setup checklist, and a check that reports failure on
+                    // stdout while exiting 0 is a check nobody notices.
+                    DistillerCheck::Fail { program, detail } => {
+                        eprintln!("Prior distiller: FAILED ({program})");
+                        eprintln!("  {detail}");
+                        std::process::exit(1);
+                    }
+                }
+            }
         },
         Command::Session(cmd) => match cmd {
             SessionCommand::Index {

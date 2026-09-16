@@ -169,6 +169,40 @@ EVIDENCE (untrusted):
     )
 }
 
+/// A fixed prompt for checking that a configured distiller works.
+///
+/// It is the real distill prompt over a canned episode, not a "say hello" ping:
+/// what breaks in practice is the schema round-trip — a model that refuses, an
+/// account that rejects the model, a CLI that fences its JSON — and none of that
+/// shows up unless the probe asks for exactly what mining asks for.
+pub fn build_probe_prompt() -> String {
+    let episode = Episode {
+        tools: vec![
+            crate::domain::prior_episode::ToolUse {
+                id: "probe-1".into(),
+                name: "Edit".into(),
+                file_path: Some("src/generated/schema.rs".into()),
+                command: None,
+            },
+            crate::domain::prior_episode::ToolUse {
+                id: "probe-2".into(),
+                name: "Bash".into(),
+                file_path: None,
+                command: Some("cargo build".into()),
+            },
+        ],
+        ..Default::default()
+    };
+    let signal = CandidateSignal {
+        reason: crate::domain::prior_detect::CandidateReason::ErrorFixed,
+        error_tool: Some("Bash".into()),
+        error_signature: Some("error: file src/generated/schema.rs was overwritten".into()),
+        corrective_tools: vec!["Edit".into()],
+        correction_text: Some("edit the generator template, not its output".into()),
+    };
+    build_distill_prompt(&episode, &signal)
+}
+
 // ============================================================================
 // Parse + validate (pure)
 // ============================================================================
@@ -201,11 +235,26 @@ struct RawEvidence {
     fix: String,
 }
 
+/// The JSON object inside whatever the CLI printed around it: the span from the
+/// first `{` to the last `}`.
+///
+/// The prompt demands a bare object and no agent CLI reliably obeys — `claude -p`
+/// fences it, grok with MCP loaded prefixes protocol prose, codex prints it bare.
+/// Deserialization still decides whether the span is valid, so this only widens
+/// what reaches serde, never what passes validation. Output with no braces at
+/// all stays [`DistillReject::NotJson`].
+fn json_object_slice(raw: &str) -> Option<&str> {
+    let start = raw.find('{')?;
+    let end = raw.rfind('}')?;
+    (end > start).then(|| &raw[start..=end])
+}
+
 /// Parse and strictly validate distiller output. Rejects anything that would be
 /// injection-worthless: non-reusable, fluffy/over-long lessons, non-matchable
 /// triggers, empty scope, or missing failure/fix evidence.
 pub fn parse_distilled(json: &str) -> Result<DistilledPrior, DistillReject> {
-    let raw: RawDistilled = serde_json::from_str(json).map_err(|_| DistillReject::NotJson)?;
+    let object = json_object_slice(json).ok_or(DistillReject::NotJson)?;
+    let raw: RawDistilled = serde_json::from_str(object).map_err(|_| DistillReject::NotJson)?;
 
     if !raw.is_reusable {
         return Err(DistillReject::NotReusable);
@@ -269,22 +318,141 @@ pub fn parse_distilled(json: &str) -> Result<DistilledPrior, DistillReject> {
 // CLI spawn (thin impure edge — integration-tested, not unit-tested)
 // ============================================================================
 
-/// Spawn an external agent CLI, passing the prompt on stdin, and return its
-/// stdout. `program`+`args` come from config (e.g. `claude -p`); the prompt is
-/// piped so it never lands in argv/process listings. Off the hot path.
+/// What one distiller run produced.
+///
+/// stdout alone cannot tell a crashed CLI from one that answered nothing — both
+/// are the empty string — so the exit code travels with it and the caller can
+/// say which failure it is looking at.
+#[derive(Debug, Clone)]
+pub struct DistillerRun {
+    /// Everything the CLI wrote to stdout. The answer is parsed from here only.
+    pub stdout: String,
+    /// Everything the CLI wrote to stderr. Never parsed — codex logs its
+    /// progress there — but it is where a failing CLI states its reason, so it
+    /// is kept for the failure line rather than dropped on the floor.
+    pub stderr: String,
+    /// `None` when a signal killed the process before it could exit.
+    pub exit_code: Option<i32>,
+}
+
+impl DistillerRun {
+    /// Whether the process exited 0.
+    pub fn succeeded(&self) -> bool {
+        self.exit_code == Some(0)
+    }
+
+    /// The head of stdout, for a log line that must not paste a whole answer
+    /// into the daemon log.
+    pub fn stdout_excerpt(&self, max_chars: usize) -> String {
+        excerpt(&self.stdout, max_chars)
+    }
+
+    /// What the CLI said about its own failure: stdout when it printed
+    /// something, stderr otherwise. A rejected codex model exits non-zero with
+    /// an empty stdout and the HTTP status on stderr, so reporting stdout alone
+    /// names no cause; a CLI that did answer makes its answer the evidence and
+    /// its stderr mere progress logging.
+    pub fn failure_excerpt(&self, max_chars: usize) -> String {
+        if self.stdout.trim().is_empty() {
+            return excerpt(&self.stderr, max_chars);
+        }
+        excerpt(&self.stdout, max_chars)
+    }
+}
+
+/// The first `max_chars` characters of `s`, trimmed, with an ellipsis when cut.
+fn excerpt(s: &str, max_chars: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    trimmed.chars().take(max_chars).collect::<String>() + "…"
+}
+
+/// How much distiller stdout a failure line may carry. Enough to recognise a
+/// usage message, an auth error or a fence; short of pasting a whole answer.
+pub const FAILURE_EXCERPT_CHARS: usize = 200;
+
+/// The operator-facing explanation of a run that produced no prior, or `None`
+/// when nothing is wrong with the setup.
+///
+/// The distinction is the point. A CLI that cannot start, dies on a signal,
+/// exits non-zero or prints something that is not JSON is MISCONFIGURED and the
+/// operator has to be told — logging that at debug, which the daemon does not
+/// record, is how mining stayed dead from 2026-08-01 to 2026-09-16 while every
+/// Stop event reported success. A CLI that answered properly and had its answer
+/// turned down by the validator is ORDINARY: most episodes teach nothing, so a
+/// warning there would arrive once per session and bury the other kind.
+pub fn distiller_failure(
+    program: &str,
+    run: &DistillerRun,
+    reject: Option<&DistillReject>,
+) -> Option<String> {
+    if !run.succeeded() {
+        let status = run
+            .exit_code
+            .map_or_else(|| "a signal".to_string(), |code| format!("code {code}"));
+        return Some(format!(
+            "distiller {program:?} exited with {status} and said: {:?}",
+            run.failure_excerpt(FAILURE_EXCERPT_CHARS)
+        ));
+    }
+    match reject {
+        Some(DistillReject::NotJson) => Some(format!(
+            "distiller {program:?} exited 0 but printed no JSON object; stdout was: {:?}",
+            run.stdout_excerpt(FAILURE_EXCERPT_CHARS)
+        )),
+        _ => None,
+    }
+}
+
+/// `args` with `{prompt}` replaced by the prompt, or `None` if no argument
+/// carries the placeholder.
+///
+/// `None` is the stdin contract: the prompt stays out of argv and process
+/// listings, which is the default and the safer one. Some CLIs cannot honour it
+/// — `grok -p` reads its prompt from argv and `-p -` sends a literal dash to the
+/// model — so they opt in by putting the placeholder in their args.
+fn substitute_prompt(args: &[String], prompt: &str) -> Option<Vec<String>> {
+    const PLACEHOLDER: &str = "{prompt}";
+    if !args.iter().any(|a| a.contains(PLACEHOLDER)) {
+        return None;
+    }
+    Some(
+        args.iter()
+            .map(|a| a.replace(PLACEHOLDER, prompt))
+            .collect(),
+    )
+}
+
+/// Spawn an external agent CLI and return its stdout and exit code.
+///
+/// `program`+`args` come from config (e.g. `claude -p`). The prompt goes on
+/// stdin so it never lands in argv/process listings, unless the args carry a
+/// `{prompt}` placeholder — then it is substituted there and stdin is closed,
+/// because a CLI that takes its prompt from argv may still block reading a pipe
+/// nobody writes to. Off the hot path.
 pub fn run_distiller_cli(
     program: &str,
     args: &[String],
     prompt: &str,
-) -> crate::error::Result<String> {
+) -> crate::error::Result<DistillerRun> {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
+    let argv = substitute_prompt(args, prompt);
+    let prompt_in_argv = argv.is_some();
+    let argv = argv.unwrap_or_else(|| args.to_vec());
+
     let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
+        .args(&argv)
+        .stdin(if prompt_in_argv {
+            Stdio::null()
+        } else {
+            Stdio::piped()
+        })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()?;
     if let Some(mut stdin) = child.stdin.take() {
         // A distiller that exits, or stops reading, before the whole prompt is
@@ -300,7 +468,11 @@ pub fn run_distiller_cli(
         }
     }
     let output = child.wait_with_output()?;
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    Ok(DistillerRun {
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+        exit_code: output.status.code(),
+    })
 }
 
 #[cfg(test)]
@@ -334,6 +506,49 @@ mod tests {
             parse_distilled("sorry, here is the lesson"),
             Err(DistillReject::NotJson)
         );
+    }
+
+    /// Every agent CLI wraps its answer differently and none of them can be
+    /// told not to: `claude -p` fences the object, grok with MCP loaded prefixes
+    /// protocol prose, codex prints it bare. Rejecting two of the three as
+    /// NotJson is how mining stayed dead from 2026-08-01 to 2026-09-16.
+    #[test]
+    fn accepts_the_object_however_the_cli_wrapped_it() {
+        let bare = valid_json();
+        let wrapped = [
+            format!("```json\n{bare}\n```"),
+            format!("```\n{bare}\n```"),
+            format!("Here is the distilled prior:\n{bare}"),
+            format!("{bare}\n\nLet me know if you want another one."),
+            format!("  \n{bare}\n  "),
+        ];
+        for raw in wrapped {
+            let d = parse_distilled(&raw)
+                .unwrap_or_else(|e| panic!("must parse, got {e}; input was:\n{raw}"));
+            assert_eq!(d.trigger_kind, "pre_tool");
+            assert!(d.lesson.starts_with("Do not edit"));
+        }
+    }
+
+    /// The slice is first `{` to last `}`. Output carrying no object at all is
+    /// still NotJson — the relaxation must not turn a failed distiller into a
+    /// silent success.
+    #[test]
+    fn output_with_no_json_object_is_still_not_json() {
+        for raw in [
+            "",
+            "   \n  ",
+            "I could not find a reusable lesson.",
+            "```json\n```",
+            "{ not actually json }",
+            "[{\"is_reusable\":true}]",
+        ] {
+            assert_eq!(
+                parse_distilled(raw),
+                Err(DistillReject::NotJson),
+                "input {raw:?} must stay NotJson"
+            );
+        }
     }
 
     #[test]
@@ -485,7 +700,7 @@ mod tests {
         // it as NotJson. The hook proceeds — no crash, no block.
         let out = run_distiller_cli("sh", &["-c".into(), "exit 1".into()], "prompt")
             .expect("spawn of sh must succeed even though the script exits non-zero");
-        assert_eq!(parse_distilled(&out), Err(DistillReject::NotJson));
+        assert_eq!(parse_distilled(&out.stdout), Err(DistillReject::NotJson));
     }
 
     /// A distiller that exits without ever reading stdin closes the pipe under
@@ -497,7 +712,7 @@ mod tests {
         let huge = "x".repeat(4 * 1024 * 1024);
         let out = run_distiller_cli("sh", &["-c".into(), "exit 3".into()], &huge)
             .expect("a distiller that never reads stdin is not an error");
-        assert_eq!(parse_distilled(&out), Err(DistillReject::NotJson));
+        assert_eq!(parse_distilled(&out.stdout), Err(DistillReject::NotJson));
     }
 
     #[test]
@@ -506,6 +721,177 @@ mod tests {
         // `cat` echoes stdin back, proving the round-trip does not deadlock.
         let out = run_distiller_cli("sh", &["-c".into(), "cat".into()], "hello-prompt")
             .expect("cat stub must run");
-        assert_eq!(out, "hello-prompt");
+        assert_eq!(out.stdout, "hello-prompt");
+        assert_eq!(out.exit_code, Some(0));
+    }
+
+    /// The one line that would have ended this six weeks early: codex answers a
+    /// rejected model with HTTP 400 on stderr and an empty stdout. Discarding
+    /// stderr left "exited with code 1 and said: ''", which names no cause.
+    #[test]
+    fn a_failure_with_empty_stdout_reports_stderr_instead() {
+        let run = run_distiller_cli(
+            "sh",
+            &[
+                "-c".into(),
+                "echo 'stream error: unexpected status 400 Bad Request' >&2; exit 1".into(),
+            ],
+            "p",
+        )
+        .expect("stub must spawn");
+        assert!(run.stdout.is_empty());
+        assert!(run.stderr.contains("400 Bad Request"), "{:?}", run.stderr);
+
+        let msg = distiller_failure("codex", &run, None).expect("non-zero exit is a failure");
+        assert!(
+            msg.contains("400 Bad Request"),
+            "the cause must be in the line: {msg}"
+        );
+    }
+
+    /// When the CLI did print an answer, that answer is the evidence — stderr on
+    /// a working codex run is progress logging and would only add noise.
+    #[test]
+    fn a_failure_with_stdout_reports_stdout() {
+        let run = run_distiller_cli(
+            "sh",
+            &[
+                "-c".into(),
+                "echo 'loading model'>&2; printf 'usage: distill'; exit 2".into(),
+            ],
+            "p",
+        )
+        .expect("stub must spawn");
+        let msg = distiller_failure("codex", &run, None).unwrap();
+        assert!(msg.contains("usage: distill"), "{msg}");
+        assert!(!msg.contains("loading model"), "stderr must not be in it: {msg}");
+    }
+
+    /// What the operator is told, and — just as important — what they are not
+    /// told. A misconfigured CLI must produce a line naming the exit code and
+    /// showing stdout; a working CLI that judged the episode unremarkable must
+    /// produce nothing, or the one line that matters is buried under one per
+    /// session.
+    #[test]
+    fn only_a_misconfigured_distiller_earns_a_warning() {
+        let failed = DistillerRun {
+            stdout: "usage: codex exec [OPTIONS]".into(),
+            stderr: String::new(),
+            exit_code: Some(2),
+        };
+        let msg = distiller_failure("codex", &failed, None).expect("a non-zero exit is a failure");
+        assert!(msg.contains("code 2"), "exit code must be in the line: {msg}");
+        assert!(msg.contains("usage: codex exec"), "stdout must be shown: {msg}");
+
+        let signalled = DistillerRun {
+            stdout: String::new(),
+            stderr: String::new(),
+            exit_code: None,
+        };
+        let msg = distiller_failure("codex", &signalled, None).expect("a signal is a failure");
+        assert!(msg.contains("signal"), "{msg}");
+
+        let fenced = DistillerRun {
+            stdout: "I cannot help with that.".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+        let msg = distiller_failure("claude", &fenced, Some(&DistillReject::NotJson))
+            .expect("exit 0 with no JSON is a failure");
+        assert!(msg.contains("I cannot help with that."), "{msg}");
+
+        // The validator rejecting a well-formed answer is ordinary operation.
+        let ok = DistillerRun {
+            stdout: "{...}".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+        for reject in [
+            DistillReject::NotReusable,
+            DistillReject::LessonEmpty,
+            DistillReject::TriggerNotMatchable,
+            DistillReject::ScopeEmpty,
+        ] {
+            assert_eq!(
+                distiller_failure("codex", &ok, Some(&reject)),
+                None,
+                "{reject} is a verdict, not a misconfiguration"
+            );
+        }
+        assert_eq!(distiller_failure("codex", &ok, None), None);
+    }
+
+    /// The excerpt is what keeps a whole model answer out of the daemon log.
+    #[test]
+    fn stdout_excerpt_is_bounded_and_trimmed() {
+        let run = DistillerRun {
+            stdout: format!("  \n{}\n  ", "x".repeat(500)),
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+        let excerpt = run.stdout_excerpt(200);
+        assert_eq!(excerpt.chars().count(), 201, "200 chars plus the ellipsis");
+        assert!(excerpt.ends_with('…'));
+
+        let short = DistillerRun {
+            stdout: "  brief  ".into(),
+            stderr: String::new(),
+            exit_code: Some(0),
+        };
+        assert_eq!(short.stdout_excerpt(200), "brief", "no ellipsis, no padding");
+    }
+
+    /// The caller cannot warn about a failure it cannot see. stdout alone is
+    /// ambiguous — empty stdout from a crashed CLI and empty stdout from a CLI
+    /// that answered nothing are the same string — so the exit code comes back
+    /// with it.
+    #[test]
+    fn run_distiller_cli_reports_the_exit_code() {
+        let out = run_distiller_cli("sh", &["-c".into(), "echo out; exit 7".into()], "p")
+            .expect("stub must spawn");
+        assert_eq!(out.exit_code, Some(7));
+        assert_eq!(out.stdout.trim(), "out");
+        assert!(!out.succeeded());
+    }
+
+    /// `grok -p` takes the prompt as an ARGUMENT and never reads stdin (`-p -`
+    /// sends a literal dash to the model). With `{prompt}` in the args the
+    /// prompt is substituted there and stdin is closed, so a CLI that would
+    /// block reading it cannot hang the mining task.
+    #[test]
+    fn prompt_placeholder_goes_to_argv_and_leaves_stdin_closed() {
+        let args = [
+            "-c".to_string(),
+            "cat; printf 'ARG=%s' \"$1\"".to_string(),
+            "sh".to_string(),
+            "{prompt}".to_string(),
+        ];
+        let out = run_distiller_cli("sh", &args, "hello-prompt").expect("stub must spawn");
+        assert_eq!(
+            out.stdout, "ARG=hello-prompt",
+            "the prompt must arrive in argv, and `cat` must read an empty stdin"
+        );
+    }
+
+    /// Only the placeholder argument is rewritten; an argument that merely
+    /// contains the word is left alone, and without a placeholder nothing
+    /// changes — the prompt stays on stdin, out of argv and process listings.
+    #[test]
+    fn substitution_touches_only_the_placeholder_argument() {
+        assert_eq!(
+            substitute_prompt(&["-p".into(), "{prompt}".into(), "-m".into()], "P"),
+            Some(vec!["-p".to_string(), "P".to_string(), "-m".to_string()])
+        );
+        assert_eq!(
+            substitute_prompt(&["--input={prompt}".into()], "P"),
+            Some(vec!["--input=P".to_string()]),
+            "a CLI that takes --flag=value must work too"
+        );
+        assert_eq!(
+            substitute_prompt(&["--label".into(), "prompt".into()], "P"),
+            None,
+            "a bare word is not the placeholder"
+        );
+        assert_eq!(substitute_prompt(&["-p".into()], "P"), None);
     }
 }

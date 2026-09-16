@@ -239,24 +239,43 @@ holding up the host. The hook itself returns `{}` immediately.
 
 #### The distiller contract
 
-The distiller is any CLI. mdkb writes the prompt to its stdin, reads its
-stdout, and discards stderr. stdout must be one JSON object with the schema
-the prompt states; `parse_distilled` calls `serde_json::from_str` on it, so a
-fence or a prose prefix is rejected as `NotJson`. A distiller that fails is
-logged at debug and the Stop hook still reports `skipped`, so check it by
-hand when in doubt: run the configured command with a fixed prompt and read
-its stderr. Story 082 adds a doctor check, warn-level logs and real outcomes.
+The distiller is any CLI, and the contract is three rules:
+
+- **The prompt goes on stdin**, so it never lands in argv or a process listing.
+  A CLI that reads its prompt from an argument instead opts out by putting the
+  literal `{prompt}` in `distiller_args`: it is substituted there and stdin is
+  closed, so a CLI that would block on an unwritten pipe cannot hang mining.
+- **stdout must contain one JSON object** matching the schema the prompt states.
+  Everything before the first `{` and after the last `}` is discarded, so a
+  ` ```json ` fence or a prose preamble is fine. Output with no braces at all is
+  rejected — no agent CLI reliably prints bare JSON, but none of them should be
+  able to pass off an apology as a prior either.
+- **stderr is never parsed**, because that is where codex writes its progress.
+  It is not thrown away: when a run fails with an empty stdout, stderr is what
+  the failure line quotes — a rejected model reports its HTTP status there and
+  nowhere else.
+
+A distiller that cannot be spawned, exits non-zero, or prints no JSON object is
+logged at **warn** with its exit code and the first 200 characters of what it
+said. A well-formed answer the validator turns down stays at debug: most
+episodes teach nothing, and warning about those would bury the other kind.
 
 Configure it in `~/.mdkb/daemon.toml` under `[priors]` (global base) or in a
-repo's `.mdkb/config.toml` (override). Measured 2026-09-16 with the same
-prompt:
+repo's `.mdkb/config.toml` (override), then verify it:
+
+```bash
+mdkb setup check    # runs the configured CLI once, prints the prior or the failure
+```
+
+Every option below was checked that way on 2026-09-16. Times are `setup check`
+wall-clock, so they include process start; all four returned a valid prior.
 
 | CLI | Args | Time | Note |
 |---|---|---|---|
-| `codex` | `exec --ignore-user-config -m gpt-5.6-luna -c model_reasoning_effort="low" -s read-only --skip-git-repo-check` | 7s | Default. `--ignore-user-config` is the only working way to skip MCP startup; `-c 'mcp_servers={}'` is a silent no-op. `gpt-5.4-mini` is rejected (HTTP 400) on a ChatGPT account. |
-| `ollama` | `run gemma4:12b-mlx --think=false --hidethinking --nowordwrap --format json` | 2-5s warm | Local, no quota. `gemma4:e4b-mlx` invents trigger kinds; do not use it. |
-| `claude` | `-p --model claude-haiku-4-5-20251001 --setting-sources "" --strict-mcp-config --tools "" --no-session-persistence` | 9s | Subscription login. Wraps the JSON in a fence (rejected until story 082). Never `--bare`: it drops the login. |
-| `grok` | `--no-auto-update -p {prompt} -m grok-4.5 --tools "" --no-subagents --no-plan --deny 'mcp__*'` | 17s | Prompt only as an argument; needs the `{prompt}` placeholder from story 082. |
+| `codex` | `exec --ignore-user-config -m gpt-5.6-luna -c model_reasoning_effort="low" -s read-only --skip-git-repo-check` | 8-9s | Default. `--ignore-user-config` is the only working way to skip MCP startup; `-c 'mcp_servers={}'` is a silent no-op. `gpt-5.4-mini` is rejected (HTTP 400) on a ChatGPT account. |
+| `ollama` | `run gemma4:12b-mlx --think=false --hidethinking --nowordwrap --format json` | 18s cold, 2-5s warm | Local, no quota. `gemma4:e4b-mlx` invents trigger kinds; do not use it. |
+| `claude` | `-p --model claude-haiku-4-5-20251001 --setting-sources "" --strict-mcp-config --tools "" --no-session-persistence` | 19s | Subscription login. Wraps the JSON in a fence. Never `--bare`: it drops the login. |
+| `grok` | `--no-auto-update -p {prompt} -m grok-4.5 --tools "" --no-subagents --no-plan --deny 'mcp__*'` | 33s | Reads the prompt from argv only, hence `{prompt}`. `--deny 'mcp__*'` keeps MCP protocol prose out of the answer. |
 
 ## Configuration
 
