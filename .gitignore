@@ -20,3 +20,6 @@ history/
 marketing/
 # Scratch measurements: SQL and classifier scripts for one story's numbers.
 .scratch/
+
+# cargo-mutants run output
+mutants.out/
