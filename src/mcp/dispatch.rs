@@ -532,6 +532,10 @@ impl DispatchContext {
             persistent_call_count,
             optimize_interval_calls,
             hook_dedup: Arc::new(StdMutex::new(HookDedupState::default())),
+            // The HTTP server has no caller to hand background work back to:
+            // it outlives every request, so a task parked here would never be
+            // awaited. Spawning detached is the correct behaviour there.
+            background: None,
         }
     }
 
