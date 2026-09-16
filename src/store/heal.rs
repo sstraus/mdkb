@@ -299,13 +299,13 @@ const SALVAGED_TABLES: [&str; 5] = [
 /// Copy the non-derivable tables out of a quarantined database into the fresh
 /// one via `ATTACH ... immutable=1`.
 ///
-/// `immutable=1` tells SQLite the file will not change, so it skips locking and
-/// hot-journal rollback — the only safe way to read a possibly-corrupt file. The
-/// copy is best-effort: it never fails the caller's open. A table that cannot be
+/// Opened through [`crate::domain::paths::file_uri::read_only_uri`], which carries the
+/// `immutable=1` decision and the URI spelling both readers of a quarantined
+/// file must share. The copy is best-effort: it never fails the caller's open. A table that cannot be
 /// read (its pages are the torn ones) is logged loudly with the row count that
 /// was present but lost, so a data-loss event is never silent.
 pub fn salvage_memory(fresh: &Connection, corrupt_path: &Path) -> Salvage {
-    let uri = format!("file:{}?immutable=1", corrupt_path.to_string_lossy());
+    let uri = crate::domain::paths::file_uri::read_only_uri(corrupt_path);
     if let Err(e) = fresh.execute("ATTACH DATABASE ?1 AS corrupt", params![uri]) {
         tracing::error!(
             "salvage: cannot attach quarantined {} ({e}) — memory entries and collection \
@@ -454,8 +454,8 @@ fn file_bytes(path: &Path) -> u64 {
 
 /// Describe the damage in a quarantined database.
 ///
-/// Read through `immutable=1`, the only safe way to open a file that may be
-/// torn: no locking, no hot-journal rollback, no writes.
+/// Opened through [`crate::domain::paths::file_uri::read_only_uri`], the same policy
+/// the salvage uses: no locking, no hot-journal rollback, no writes.
 fn diagnose(corrupt_path: &Path) -> Diagnosis {
     let mut diagnosis = Diagnosis {
         db_bytes: file_bytes(corrupt_path),
@@ -463,7 +463,7 @@ fn diagnose(corrupt_path: &Path) -> Diagnosis {
         ..Default::default()
     };
 
-    let uri = format!("file:{}?immutable=1", corrupt_path.to_string_lossy());
+    let uri = crate::domain::paths::file_uri::read_only_uri(corrupt_path);
     let conn = match Connection::open(&uri) {
         Ok(conn) => conn,
         Err(e) => {

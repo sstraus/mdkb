@@ -887,10 +887,12 @@ impl McpServer {
 }
 
 /// Convert a `file://` URI to a local filesystem path.
+/// The filesystem path a `file://` resource URI names.
+///
+/// Thin wrapper: the conversion itself lives in `domain::file_uri`, which owns
+/// both directions so the reader and the writer cannot disagree.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
-    let path_str = uri.strip_prefix("file://")?;
-    let path = PathBuf::from(path_str);
-    if path.is_absolute() { Some(path) } else { None }
+    crate::domain::paths::file_uri::from_uri(uri)
 }
 
 // rmcp 3 defaults to `Self::tool_router()`, a fresh router on every call;
@@ -1037,26 +1039,35 @@ pub async fn run_server(root: PathBuf, transport: TransportMode) -> crate::error
                             }
                         }
 
-                        let sessions_base =
-                            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                                .join(".claude/projects");
-                        let project_root = startup_root.to_string_lossy().to_string();
-                        match crate::core::sessions::handle_session_index(
-                            &ctx,
-                            &sessions_base,
-                            &project_root,
-                        ) {
-                            Ok(sr) if sr.added > 0 || sr.updated > 0 => {
-                                tracing::info!(
-                                    "Startup session index: {} added, {} updated",
-                                    sr.added,
-                                    sr.updated
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => {
-                                corruption_observed |= e.is_index_corrupt();
-                                tracing::warn!("Session indexing failed: {}", e);
+                        // An unresolvable home used to yield an empty string,
+                        // making this a RELATIVE path that pointed at whatever the
+                        // working directory happened to be. Skipping is the honest
+                        // outcome: there is no sessions directory to read.
+                        match crate::daemon::config::home_dir() {
+                            Err(e) => tracing::warn!(
+                                "cannot resolve the home directory ({e}); skipping session indexing"
+                            ),
+                            Ok(home) => {
+                                let sessions_base = home.join(".claude/projects");
+                                let project_root = startup_root.to_string_lossy().to_string();
+                                match crate::core::sessions::handle_session_index(
+                                    &ctx,
+                                    &sessions_base,
+                                    &project_root,
+                                ) {
+                                    Ok(sr) if sr.added > 0 || sr.updated > 0 => {
+                                        tracing::info!(
+                                            "Startup session index: {} added, {} updated",
+                                            sr.added,
+                                            sr.updated
+                                        );
+                                    }
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        corruption_observed |= e.is_index_corrupt();
+                                        tracing::warn!("Session indexing failed: {}", e);
+                                    }
+                                }
                             }
                         }
                         if let Err(error) =
@@ -4030,12 +4041,6 @@ if (require.main === module) {
             ctx_guard.is_none(),
             "ctx should remain None while reindex is active"
         );
-    }
-
-    #[test]
-    fn test_uri_to_path_valid() {
-        let path = uri_to_path("file:///Users/me/project");
-        assert_eq!(path, Some(PathBuf::from("/Users/me/project")));
     }
 
     #[test]

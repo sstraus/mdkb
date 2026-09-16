@@ -1822,6 +1822,10 @@ fn smoke_session_index_no_sessions() {
 
 // ── Daemon (non-destructive) ────────────────────────────────────────
 
+/// Unix only: the daemon has no Windows port, and `mdkb daemon status` reports
+/// "Daemon commands require Unix" there. The refusal is the correct behaviour,
+/// so the smoke test for a working daemon runs where a daemon exists.
+#[cfg(unix)]
 #[test]
 fn smoke_daemon_status() {
     let repo = Repo::new();

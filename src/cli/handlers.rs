@@ -73,6 +73,38 @@ mod tests {
         tempfile::tempdir().expect("failed to create temp dir")
     }
 
+    /// An absolute directory that exists and sits outside any project root.
+    ///
+    /// The traversal guards canonicalise before comparing, so the fixture has to
+    /// be a directory that is really there. `/etc` is a directory on Unix and
+    /// nothing on Windows, where the equivalent is the system root.
+    fn outside_dir() -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            std::path::PathBuf::from(
+                std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string()),
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from("/etc")
+        }
+    }
+
+    /// An absolute file that exists and sits outside any project root.
+    ///
+    /// Both platforms ship a hosts file, so the fixture keeps its meaning.
+    fn outside_file() -> std::path::PathBuf {
+        #[cfg(windows)]
+        {
+            outside_dir().join(r"System32\drivers\etc\hosts")
+        }
+        #[cfg(not(windows))]
+        {
+            std::path::PathBuf::from("/etc/hosts")
+        }
+    }
+
     #[cfg(any(unix, windows))]
     fn symlink_dir(target: &std::path::Path, link: &std::path::Path) {
         #[cfg(unix)]
@@ -1062,7 +1094,8 @@ mod tests {
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
-        let result = handle_collection_add(&ctx, "evil", "/etc", "**/*");
+        let outside = outside_dir();
+        let result = handle_collection_add(&ctx, "evil", &outside.to_string_lossy(), "**/*");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("escapes root"));
@@ -1076,6 +1109,7 @@ mod tests {
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
+        // Use a separate temporary directory so the target exists on either OS.
         let outside = setup_temp_dir();
         let link_path = temp.path().join("sneaky");
         symlink_dir(outside.path(), &link_path);
@@ -1637,8 +1671,12 @@ mod tests {
         handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
 
         // Try to index a file outside the project root
-        let result = handle_update_files(&ctx, temp.path(), &["/etc/hosts".to_string()])
-            .expect("should succeed overall");
+        let result = handle_update_files(
+            &ctx,
+            temp.path(),
+            &[outside_file().to_string_lossy().to_string()],
+        )
+        .expect("should succeed overall");
         assert_eq!(result.added, 0, "file outside root should not be indexed");
         assert!(
             result.errors.iter().any(|e| e.contains("path traversal")),

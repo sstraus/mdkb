@@ -45,8 +45,11 @@ pub fn model_cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FASTEMBED_CACHE_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").expect("HOME must be set to locate the model cache");
-    PathBuf::from(home).join(".cache/fastembed")
+    // `daemon::config::home_dir` owns how a home directory is resolved, per
+    // platform. Asking it keeps the spawned binary and this helper agreeing on
+    // where the cache is, which is the whole point of pointing one at the other.
+    let home = mdkb::daemon::config::home_dir().expect("locate the model cache");
+    home.join(".cache/fastembed")
 }
 
 /// A hermetic `mdkb` invocation. Callers add arguments, a working directory

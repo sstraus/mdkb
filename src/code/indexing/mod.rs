@@ -785,11 +785,8 @@ impl IndexFacade {
     fn rel_keys(paths: &[PathBuf], root: &Path) -> HashSet<String> {
         paths
             .iter()
-            .filter_map(|p| {
-                p.strip_prefix(root)
-                    .ok()
-                    .map(|r| r.to_string_lossy().to_string())
-            })
+            .filter(|p| p.starts_with(root))
+            .map(|p| crate::domain::paths::index_key::rel_key(p, root))
             .collect()
     }
 
@@ -934,10 +931,7 @@ impl IndexFacade {
 /// stage registers files — the lookup key must be built the same way everywhere
 /// or a file is silently seen as new (and, in a prune pass, as deleted).
 fn rel_key(path: &Path, root: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
+    crate::domain::paths::index_key::rel_key(path, root)
 }
 
 /// Run a code-index mutation on a long-lived facade slot, CLOSING it if the

@@ -25,6 +25,7 @@ use crate::config::Config;
 use crate::core::Context;
 use crate::core::memory_sync::sync_memory_files;
 use crate::domain::frontmatter::{ParsedDocument, parse_frontmatter};
+use crate::domain::paths::index_key;
 use crate::domain::{Collection, Document, UpdateResult};
 use crate::error::{Error, Result};
 use crate::store::evolution::RelationshipType;
@@ -498,13 +499,23 @@ fn narrower_collections(
         .collect()
 }
 
+/// The index key for `path` under `base`, or `None` when `path` sits outside it.
+///
+/// Every caller here asks the same two questions at once: is this file under the
+/// collection at all, and what is it called if so. Answering them together keeps
+/// "outside the base means no" a single decision. `index_key::rel_key` is the
+/// wrong tool for it: that one falls back to the whole path when the strip
+/// fails, which would let a file outside the collection match its glob.
+fn key_under(path: &Path, base: &Path) -> Option<String> {
+    path.strip_prefix(base).ok().map(index_key::normalize)
+}
+
 /// Whether `path` is already claimed by a collection rooted deeper than the one
 /// currently walking.
 fn claimed_by_a_narrower_collection(path: &Path, narrower: &[NarrowerCollection]) -> bool {
-    narrower.iter().any(|other| {
-        path.strip_prefix(&other.base)
-            .is_ok_and(|rel| other.matcher.is_match(rel))
-    })
+    narrower
+        .iter()
+        .any(|other| key_under(path, &other.base).is_some_and(|key| other.matcher.is_match(key)))
 }
 /// Update a single collection by scanning for file changes.
 fn update_collection(
@@ -584,17 +595,17 @@ fn update_collection(
             // Accept any file whose path relative to base_path matches the
             // collection's glob pattern and that no collection rooted deeper
             // already owns.
-            match path.strip_prefix(&base_path) {
-                Ok(rel) => glob.is_match(rel) && !claimed_by_a_narrower_collection(path, &narrower),
-                Err(_) => false,
-            }
+            key_under(path, &base_path).is_some_and(|key| glob.is_match(key))
+                && !claimed_by_a_narrower_collection(path, &narrower)
         },
     );
 
     for path in discovered {
-        let relative = match path.strip_prefix(&base_path) {
-            Ok(rel) => rel.to_string_lossy().to_string(),
-            Err(_) => continue,
+        // The stored key is the document's identity: it goes in the database,
+        // in search results and in links, so it carries the `/` spelling on
+        // every platform rather than the host separator.
+        let Some(relative) = key_under(&path, &base_path) else {
+            continue;
         };
 
         // Remove from existing set (to track deletions)
@@ -924,11 +935,7 @@ pub(crate) fn index_specified_files(
         let matched = matchers
             .iter()
             .filter_map(|(coll, matcher, canonical_base)| {
-                let relative = canonical_file
-                    .strip_prefix(canonical_base)
-                    .ok()?
-                    .to_string_lossy()
-                    .to_string();
+                let relative = key_under(&canonical_file, canonical_base)?;
 
                 matcher
                     .is_match(&relative)

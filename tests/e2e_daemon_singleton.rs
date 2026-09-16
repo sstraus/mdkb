@@ -3,6 +3,11 @@
 //! Validates that `acquire_singleton_lock` enforces one-at-a-time semantics
 //! via advisory file locking (`flock(LOCK_EX | LOCK_NB)` on Unix).
 
+// Unix only: `daemon::singleton` is `#[cfg(unix)]` because the lock is
+// `flock`. On Windows this file compiles to nothing rather than breaking
+// the whole `cargo test` build.
+#![cfg(unix)]
+
 use mdkb::daemon::singleton::{AcquireError, acquire_singleton_lock};
 use tempfile::TempDir;
 

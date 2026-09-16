@@ -163,7 +163,11 @@ pub fn canonicalize_under_cwd(base: &Path, raw: &str) -> Option<String> {
 /// Walk ancestors looking for `.mdkbignore-hooks` marker. Stops at the user's
 /// home directory (never walks above it) to avoid picking up unrelated markers.
 pub fn mdkbignore_hooks_present(start: &Path) -> bool {
-    let home: Option<PathBuf> = std::env::var_os("HOME").map(PathBuf::from);
+    // `HOME` is a POSIX convention; Windows sets `USERPROFILE` instead, so
+    // reading `HOME` directly left the stop-guard disabled there and the walk
+    // ran to the drive root, where an unrelated marker could stop it.
+    // `daemon::config::home_dir` already resolves this per platform.
+    let home: Option<PathBuf> = crate::daemon::config::home_dir().ok();
     let mut current: Option<&Path> = Some(start);
     while let Some(dir) = current {
         if dir.join(".mdkbignore-hooks").exists() {
@@ -657,6 +661,21 @@ pub fn classify_bash_search(command: &str, bin: &str) -> Option<String> {
     None
 }
 
+/// Does this shell token name the mdkb binary?
+///
+/// Compares the last path segment without its extension. Two Windows spellings
+/// were missed before: `C:\bin\mdkb.exe` split on `/` alone yields the whole
+/// string, and even `bin/mdkb.exe` kept the `.exe` the comparison did not
+/// expect. Both are ordinary ways to invoke the binary there, so the signal
+/// this feeds read as "no mdkb call" for every one of them.
+///
+/// Deliberately not `Path`: this is a token off a command line, and a command
+/// line may spell a path either way regardless of host.
+fn command_names_mdkb(token: &str) -> bool {
+    let last = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    last.strip_suffix(".exe").unwrap_or(last) == "mdkb"
+}
+
 /// Detect whether a `Bash` command invokes mdkb itself (`mdkb …`, an absolute
 /// `…/mdkb …`, or the `mdkb-bridge.js` proxy). Used as a conversion signal: a
 /// PreToolUse fire followed by an mdkb invocation means the redirect worked.
@@ -669,7 +688,7 @@ pub fn is_mdkb_invocation(command: &str) -> bool {
             tokens.remove(0);
         }
         if let Some(first) = tokens.first() {
-            if first.rsplit('/').next().unwrap_or(first) == "mdkb" {
+            if command_names_mdkb(first) {
                 return true;
             }
         }
@@ -754,6 +773,32 @@ mod tests {
     }
 
     // ── classify_grep_pattern ──────────────────────────────────────────────
+
+    /// Every ordinary way to name the binary counts, on every host. The
+    /// Windows spellings were all missed before, so the signal this feeds read
+    /// as "no mdkb call" for a session that made nothing but mdkb calls.
+    #[test]
+    fn an_mdkb_invocation_is_recognised_however_it_is_spelled() {
+        for cmd in [
+            "mdkb search x",
+            "mdkb.exe search x",
+            "/usr/local/bin/mdkb search x",
+            "bin/mdkb.exe search x",
+            r"C:in\mdkb.exe search x",
+            r"C:/bin/mdkb.exe search x",
+        ] {
+            assert!(is_mdkb_invocation(cmd), "not recognised: {cmd}");
+        }
+    }
+
+    /// The match is on the whole stem, so a differently-named tool that merely
+    /// ends in the same letters is not mistaken for mdkb.
+    #[test]
+    fn a_similar_name_is_not_mdkb() {
+        for cmd in ["notmdkb search x", "mdkbx search x", "mdkb2 search x"] {
+            assert!(!is_mdkb_invocation(cmd), "wrongly recognised: {cmd}");
+        }
+    }
 
     #[test]
     fn classify_symbol_name() {

@@ -244,6 +244,14 @@ fn the_cheatsheet_names_only_commands_that_exist() {
     // starts with it rather than a placeholder. Checked explicitly: an earlier
     // version of this test looked for a `{0} ` prefix that the output never
     // contains, so it scanned nothing and passed for the wrong reason.
+    //
+    // Matched as a PATH, never as a string. The cheatsheet prints
+    // `std::env::current_exe()` while this test holds the path cargo composed,
+    // and on Windows those are two spellings of one file: cargo joins whatever
+    // separator `CARGO_TARGET_DIR` used, while the OS reports backslashes
+    // throughout. A string compare then finds no lines and the test fails for a
+    // reason unrelated to the cheatsheet. `Path` compares by component, and on
+    // Windows both separators are separators.
     let bin = Path::new(env!("CARGO_BIN_EXE_mdkb"));
     let mut checked = 0usize;
     let mut broken = Vec::new();

@@ -385,10 +385,15 @@ fn find_mdkb_binary() -> Result<String> {
         }
     }
 
-    // Try current executable first
+    // Try current executable first.
+    //
+    // Matched on the STEM, not the file name: Windows executables carry a
+    // `.exe` extension, so `file_name()` is `mdkb.exe` there and the comparison
+    // against "mdkb" never matched. The running binary was then ignored on the
+    // one platform where it is hardest to find another way.
     if let Ok(exe) = env::current_exe() {
-        let exe_name = exe.file_name().map(|n| n.to_string_lossy().to_string());
-        if exe_name.as_deref() == Some("mdkb") {
+        let stem = exe.file_stem().map(|n| n.to_string_lossy().to_string());
+        if stem.as_deref() == Some("mdkb") {
             return Ok(exe.to_string_lossy().to_string());
         }
     }
@@ -413,7 +418,9 @@ fn find_mdkb_binary() -> Result<String> {
 
     // Check common cargo install location
     if let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf()) {
-        let cargo_bin = home.join(".cargo/bin/mdkb");
+        // `EXE_SUFFIX` is "" on Unix and ".exe" on Windows, so the file this
+        // looks for is the file cargo actually installed.
+        let cargo_bin = home.join(format!(".cargo/bin/mdkb{}", env::consts::EXE_SUFFIX));
         if cargo_bin.exists() {
             return Ok(cargo_bin.to_string_lossy().to_string());
         }
@@ -504,12 +511,7 @@ pub fn claude_settings_path(
             let dir = if let Some(p) = profile_dir {
                 p.to_path_buf()
             } else {
-                let home = env::var_os("HOME").ok_or_else(|| {
-                    Error::from(ErrorKind::Command {
-                        command: "setup hooks claude".to_string(),
-                        message: "HOME environment variable not set".to_string(),
-                    })
-                })?;
+                let home = crate::daemon::config::home_dir()?;
                 std::path::PathBuf::from(home).join(".claude")
             };
             Ok(dir.join("settings.json"))
@@ -977,12 +979,7 @@ pub fn handle_setup_hooks_claude_with_http(
 
 /// Resolve the Codex hooks file path: `$HOME/.codex/hooks.json`.
 pub fn codex_hooks_path() -> Result<std::path::PathBuf> {
-    let home = env::var_os("HOME").ok_or_else(|| {
-        Error::from(ErrorKind::Command {
-            command: "setup hooks codex".to_string(),
-            message: "HOME environment variable not set".to_string(),
-        })
-    })?;
+    let home = crate::daemon::config::home_dir()?;
     Ok(std::path::PathBuf::from(home)
         .join(".codex")
         .join("hooks.json"))
@@ -991,12 +988,10 @@ pub fn codex_hooks_path() -> Result<std::path::PathBuf> {
 /// Best-effort probe for `codex_hooks = true` in `$HOME/.codex/config.toml`.
 /// Missing file or missing flag both return `false`. Parse errors return `false`.
 fn probe_codex_hooks_flag() -> bool {
-    let Some(home) = env::var_os("HOME") else {
+    let Ok(home) = crate::daemon::config::home_dir() else {
         return false;
     };
-    let cfg = std::path::PathBuf::from(home)
-        .join(".codex")
-        .join("config.toml");
+    let cfg = home.join(".codex").join("config.toml");
     let Ok(raw) = std::fs::read_to_string(&cfg) else {
         return false;
     };
@@ -1082,12 +1077,7 @@ pub struct McpCodexSetupResult {
 
 /// Resolve the Codex CLI config.toml path: `$HOME/.codex/config.toml`.
 pub fn codex_config_path() -> Result<std::path::PathBuf> {
-    let home = env::var_os("HOME").ok_or_else(|| {
-        Error::from(ErrorKind::Command {
-            command: "setup mcp codex".to_string(),
-            message: "HOME environment variable not set".to_string(),
-        })
-    })?;
+    let home = crate::daemon::config::home_dir()?;
     Ok(std::path::PathBuf::from(home)
         .join(".codex")
         .join("config.toml"))

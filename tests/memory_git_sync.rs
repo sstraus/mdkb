@@ -660,7 +660,9 @@ fn no_shadow_reported_when_only_the_store_gitignore_applies() {
 #[test]
 fn two_clones_converge_without_a_manual_import() {
     let origin_dir = tempfile::tempdir().expect("tempdir");
-    let origin = origin_dir.path().canonicalize().unwrap();
+    // `git clone <path>` parses its argument, and rejects the verbatim `\?\`
+    // form `canonicalize` returns on Windows — reporting it as a bad hostname.
+    let origin = mdkb::domain::paths::portable::plain(&origin_dir.path().canonicalize().unwrap());
 
     // --- clone A: the repo of record ---
     handle_init(&origin).expect("init");
@@ -690,7 +692,7 @@ fn two_clones_converge_without_a_manual_import() {
 
     // --- clone B ---
     let b_dir = tempfile::tempdir().expect("tempdir");
-    let b_parent = b_dir.path().canonicalize().unwrap();
+    let b_parent = mdkb::domain::paths::portable::plain(&b_dir.path().canonicalize().unwrap());
     git(&b_parent, &["clone", origin.to_str().unwrap(), "b"]);
     let b = b_parent.join("b");
     git(&b, &["config", "user.email", "t@example.com"]);

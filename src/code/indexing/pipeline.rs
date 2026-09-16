@@ -606,8 +606,8 @@ fn stage_collect(
             continue; // shouldn't happen
         };
 
-        let file_path = parsed.path.strip_prefix(root).unwrap_or(&parsed.path);
-        let file_path_str: Box<str> = file_path.to_string_lossy().into();
+        let file_path_str: Box<str> =
+            crate::domain::paths::index_key::rel_key(&parsed.path, root).into();
 
         let mtime = hasher::file_mtime(&parsed.path).unwrap_or(0);
 

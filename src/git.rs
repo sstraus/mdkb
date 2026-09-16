@@ -312,14 +312,13 @@ fn find_store_within(start: &Path, boundary: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The user's home directory, if the environment names one. `USERPROFILE` is
-/// the Windows spelling; an empty value is treated as absent so it cannot
-/// degrade into the filesystem root.
+/// The user's home directory, if there is one.
+///
+/// Delegates to [`crate::daemon::config::home_dir`], which owns the question.
+/// This file held the second of three implementations; the reasoning that used
+/// to live in this comment now lives there, once.
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
+    crate::daemon::config::home_dir().ok()
 }
 
 /// True if `dir` holds git repositories among its immediate children — that is,

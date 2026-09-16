@@ -21,22 +21,31 @@
 //! unprivileged processes cannot write into a directory they do not own when
 //! its mode is `0700`.
 
-use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use rmcp::ServiceExt;
 use serde_json::{Value, json};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Semaphore;
-use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
 
 use crate::mcp::dispatch::{DispatchContext, dispatch_call};
-use crate::mcp::server::McpServer;
 
 use super::registry::RepoRegistry;
+
+/// What the socket server needs and the rest of this module does not.
+///
+/// Grouped under one gate rather than nine, so the platform boundary reads as a
+/// single decision instead of a property repeated per line.
+#[cfg(unix)]
+use {
+    crate::mcp::server::McpServer,
+    rmcp::ServiceExt,
+    std::os::unix::fs::PermissionsExt,
+    std::path::PathBuf,
+    tokio::io::{AsyncReadExt, AsyncWriteExt},
+    tokio::net::{UnixListener, UnixStream},
+    tokio::sync::Semaphore,
+    tokio_util::sync::CancellationToken,
+    tokio_util::task::TaskTracker,
+};
 
 /// Names of the two sockets under the daemon base directory (`~/.mdkb`).
 pub const MCP_SOCKET_NAME: &str = "daemon.sock";
@@ -50,6 +59,7 @@ pub const HOOK_SOCKET_NAME: &str = "daemon-hook.sock";
 /// connection open for a whole Claude session, so this timeout is normally
 /// reached rather than beaten. Work is drained before it, under
 /// [`WORK_DRAIN_GRACE`].
+#[cfg(unix)]
 const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Max time to wait for hook requests that are already executing.
@@ -116,6 +126,7 @@ pub(crate) async fn drain_in_flight_work(
 }
 
 /// Errors raised while serving IPC.
+#[cfg(unix)]
 #[derive(Debug, thiserror::Error)]
 pub enum IpcError {
     #[error("bind {path}: {source}")]
@@ -161,6 +172,7 @@ pub enum IpcError {
 /// The hook socket routes JSON-RPC method calls through
 /// `mcp::dispatch::dispatch_call`, resolving the target repo via
 /// `registry.get_or_open(params.root)`.
+#[cfg(unix)]
 pub async fn serve(
     base_dir: &Path,
     shutdown: CancellationToken,
@@ -250,6 +262,7 @@ pub async fn serve(
 
 /// Remove both socket files. Idempotent, and safe to call from a shutdown path
 /// that is about to end the process rather than let `serve` return.
+#[cfg(unix)]
 pub fn unlink_sockets(base_dir: &Path) {
     let _ = std::fs::remove_file(base_dir.join(MCP_SOCKET_NAME));
     let _ = std::fs::remove_file(base_dir.join(HOOK_SOCKET_NAME));
@@ -261,6 +274,7 @@ pub fn unlink_sockets(base_dir: &Path) {
 /// because `create_dir_all` honours the process umask, which may be too
 /// permissive.  Setting permissions explicitly closes the TOCTOU window: a
 /// local attacker cannot plant files in a directory they cannot write to.
+#[cfg(unix)]
 fn ensure_base_dir_0700(dir: &Path) -> Result<(), IpcError> {
     std::fs::create_dir_all(dir).map_err(|e| IpcError::Mkdir {
         path: dir.to_path_buf(),
@@ -274,6 +288,7 @@ fn ensure_base_dir_0700(dir: &Path) -> Result<(), IpcError> {
     })
 }
 
+#[cfg(unix)]
 fn remove_if_exists(path: &Path) -> Result<(), IpcError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -296,6 +311,7 @@ fn remove_if_exists(path: &Path) -> Result<(), IpcError> {
 /// goes on serving and `path` only ever appears already at `0600` — replacing a
 /// socket left behind by a previous run in the same step. The staging name
 /// carries the pid so two daemons sharing a base directory cannot collide on it.
+#[cfg(unix)]
 fn bind_socket_0600(path: &Path) -> Result<UnixListener, IpcError> {
     let mut staging = path.as_os_str().to_owned();
     staging.push(format!(".{}.tmp", std::process::id()));
@@ -323,6 +339,7 @@ fn bind_socket_0600(path: &Path) -> Result<UnixListener, IpcError> {
     Ok(listener)
 }
 
+#[cfg(unix)]
 fn chmod_0600(path: &Path) -> Result<(), IpcError> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| {
         IpcError::Chmod {
@@ -334,6 +351,7 @@ fn chmod_0600(path: &Path) -> Result<(), IpcError> {
 
 // ── MCP socket (rmcp stream) ────────────────────────────────────────────────
 
+#[cfg(unix)]
 async fn mcp_accept_loop(
     listener: UnixListener,
     shutdown: CancellationToken,
@@ -360,6 +378,7 @@ async fn mcp_accept_loop(
 /// Bind a real rmcp `McpServer` to the accepted UnixStream. The server
 /// runs in global mode and resolves repos via the shared `RepoRegistry`,
 /// so a single daemon can host any number of concurrent MCP clients.
+#[cfg(unix)]
 async fn handle_mcp_conn(stream: UnixStream, registry: Arc<RepoRegistry>) {
     let server = McpServer::global(registry);
     let service = match server.serve(stream).await {
@@ -376,13 +395,16 @@ async fn handle_mcp_conn(stream: UnixStream, registry: Arc<RepoRegistry>) {
 
 // ── Hook socket (length-prefixed JSON-RPC) ───────────────────────────────────
 
+#[cfg(unix)]
 const MAX_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Maximum number of concurrent hook connections. Each connection may allocate
 /// up to `MAX_MESSAGE_BYTES` (4 MiB) for a single message body, so this caps
 /// the worst-case RSS growth from hook traffic at ~256 MiB.
+#[cfg(unix)]
 pub const MAX_HOOK_CONNECTIONS: usize = 64;
 
+#[cfg(unix)]
 async fn hook_accept_loop(
     listener: UnixListener,
     shutdown: CancellationToken,
@@ -418,6 +440,7 @@ async fn hook_accept_loop(
     }
 }
 
+#[cfg(unix)]
 async fn handle_hook_conn(
     mut stream: UnixStream,
     registry: Arc<RepoRegistry>,
@@ -571,6 +594,20 @@ mod tests {
         Arc::new(RepoRegistry::new(config))
     }
 
+    /// A filesystem path as the body of a JSON string, without the quotes.
+    ///
+    /// These tests write request bodies as literal JSON. A Windows path carries
+    /// backslashes, and JSON reads a backslash as the start of an escape, so
+    /// interpolating the path directly produces `invalid escape` instead of the
+    /// response under test. Serializing through serde_json escapes it correctly
+    /// on every platform.
+    fn json_str(p: &std::path::Path) -> String {
+        let quoted = serde_json::to_string(&p.display().to_string()).expect("serialize path");
+        // serde_json always wraps a string in one pair of quotes, and the bodies
+        // here supply their own, so the quotes come back off.
+        quoted[1..quoted.len() - 1].to_string()
+    }
+
     fn make_dctx() -> Arc<DispatchContext> {
         Arc::new(DispatchContext {
             metrics: Arc::new(UsageMetrics::new()),
@@ -584,6 +621,7 @@ mod tests {
     // ── Security: directory and socket permissions ──────────────────────────
 
     /// `ensure_base_dir_0700` must create the directory with mode `0700`.
+    #[cfg(unix)]
     #[test]
     fn base_dir_created_with_0700() {
         let tmp = TempDir::new().unwrap();
@@ -596,6 +634,7 @@ mod tests {
 
     /// `ensure_base_dir_0700` must tighten an existing directory that has
     /// overly permissive bits (e.g. 0755 from a previous `create_dir_all`).
+    #[cfg(unix)]
     #[test]
     fn base_dir_permissions_tightened_if_too_open() {
         let tmp = TempDir::new().unwrap();
@@ -621,6 +660,7 @@ mod tests {
     /// The watcher below samples the path as fast as it can while the socket is
     /// rebound repeatedly: one bind is a couple of syscalls wide, so the window
     /// only shows up under repetition.
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_path_is_never_observable_wider_than_0600() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -664,6 +704,7 @@ mod tests {
     /// A socket bound through `bind_socket_0600` must actually serve at `path`:
     /// tightening the mode is worthless if the listener ends up answering
     /// somewhere else.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_socket_bound_at_0600_accepts_connections_at_its_path() {
         let tmp = TempDir::new().unwrap();
@@ -677,6 +718,7 @@ mod tests {
     }
 
     /// After `serve()` binds, the socket files must have mode `0600`.
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_permissions_are_0600_after_bind() {
         use tokio_util::sync::CancellationToken;
@@ -726,6 +768,7 @@ mod tests {
     /// ARCH-F1: on shutdown, serve() drains in-flight connection tasks (via the
     /// TaskTracker) and only then unlinks the sockets and returns — it does not
     /// hard-abort a connection that is mid-request.
+    #[cfg(unix)]
     #[tokio::test]
     async fn shutdown_drains_in_flight_connection() {
         let tmp = TempDir::new().unwrap();
@@ -782,6 +825,7 @@ mod tests {
     /// under the five-second grace meant for idle sockets. The CLI reported a
     /// failed mutation while the daemon finished the write anyway as its runtime
     /// dropped. The work drain must wait for the handler, not for a clock.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn shutdown_waits_for_a_request_that_outlives_the_socket_grace() {
         let gate = Arc::new(WorkGate::default());
@@ -811,6 +855,7 @@ mod tests {
     /// Unlinking must not depend on `serve` returning: the second-signal path in
     /// `main` exits the process instead of unwinding through here, and still has
     /// to leave the directory without stale sockets.
+    #[cfg(unix)]
     #[tokio::test]
     async fn unlink_sockets_clears_both_paths_and_tolerates_their_absence() {
         let tmp = TempDir::new().unwrap();
@@ -862,7 +907,7 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"no_such","params":{{"root":"{}"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let resp = dispatch_hook_message(body.as_bytes(), &make_registry(), &make_dctx()).await;
         assert!(resp.contains("-32601"), "resp: {resp}");
@@ -894,7 +939,7 @@ mod tests {
         let root = std::env::temp_dir();
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"cli.mutate","params":{{"root":"{}","command":"not_real"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let response = dispatch_hook_message(body.as_bytes(), &make_registry(), &make_dctx()).await;
         let envelope: Value = serde_json::from_str(&response).unwrap();
@@ -935,7 +980,7 @@ mod tests {
                 "repo the daemon will not serve",
                 format!(
                     r#"{{"jsonrpc":"2.0","id":1,"method":"update","params":{{"root":"{}"}}}}"#,
-                    outside_root.display()
+                    json_str(&outside_root)
                 ),
             ),
         ];
@@ -967,7 +1012,7 @@ mod tests {
         crate::cli::handlers::handle_init(&served_root).expect("init store");
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"cli.mutate","params":{{"root":"{}","command":"memory_add","id":"Bad Id","title":"T","entry_type":"topic","content":"body"}}}}"#,
-            served_root.display()
+            json_str(&served_root)
         );
         let resp = dispatch_hook_message(body.as_bytes(), &make_registry(), &make_dctx()).await;
         let envelope: Value = serde_json::from_str(&resp).unwrap();
@@ -1002,7 +1047,7 @@ mod tests {
         let dctx = make_dctx();
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":42,"method":"status","params":{{"root":"{}"}}}}"#,
-            root.display()
+            json_str(&root)
         );
 
         let resp = dispatch_hook_message(body.as_bytes(), &registry, &dctx).await;
@@ -1033,12 +1078,12 @@ mod tests {
 
         let without = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"hook.session_start","params":{{"root":"{}"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let with = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"hook.session_start","params":{{"root":"{}","cwd":"{}"}}}}"#,
-            root.display(),
-            project.display()
+            json_str(&root),
+            json_str(&project)
         );
 
         let a: Value = serde_json::from_str(
@@ -1071,7 +1116,7 @@ mod tests {
 
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"status","params":{{"root":"{}"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let hook_resp = dispatch_hook_message(body.as_bytes(), &registry, &dctx).await;
         let hook_parsed: Value = serde_json::from_str(&hook_resp).unwrap();
@@ -1097,7 +1142,7 @@ mod tests {
 
         let body = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"search","params":{{"root":"{}","query":"anything","scope":"docs"}}}}"#,
-            root.display()
+            json_str(&root)
         );
         let hook_resp = dispatch_hook_message(body.as_bytes(), &registry, &dctx).await;
         let hook_parsed: Value = serde_json::from_str(&hook_resp).unwrap();
@@ -1117,6 +1162,7 @@ mod tests {
         assert_eq!(hook_text, direct_text);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn oversized_response_closes_connection_not_corrupt_frame() {
         use tokio::net::UnixListener as HookListener;
@@ -1168,11 +1214,14 @@ mod tests {
     // This is the proof that `mdkb mcp` (a dumb byte forwarder) gives Claude
     // the exact same answer it would get talking directly to dispatch.
 
+    #[cfg(unix)]
     use rmcp::model::CallToolRequestParams;
+    #[cfg(unix)]
     use tokio::net::UnixListener as TokioUnixListener;
 
     /// Spawn `McpServer::global(registry).serve(stream)` on every accepted
     /// connection until the listener is dropped.
+    #[cfg(unix)]
     fn spawn_mcp_listener(
         listener: TokioUnixListener,
         registry: Arc<RepoRegistry>,
@@ -1190,11 +1239,13 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     fn call_params(name: &'static str, args: Value) -> CallToolRequestParams {
         CallToolRequestParams::new(name)
             .with_arguments(args.as_object().cloned().expect("arguments are an object"))
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn mcp_socket_status_equals_dispatch_call() {
         use std::time::Duration;
@@ -1245,6 +1296,7 @@ mod tests {
         server_task.abort();
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn mcp_socket_search_equals_dispatch_call() {
         use std::time::Duration;

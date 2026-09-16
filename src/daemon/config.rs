@@ -20,10 +20,37 @@ const DEFAULT_MAX_ACTIVE_REPOS: usize = 5;
 /// Returns `Ok(PathBuf)` on success. Returns an error with a clear message
 /// when the home directory cannot be resolved (e.g. HOME unset or empty),
 /// so callers fail fast instead of silently producing paths relative to CWD.
+/// The user's home directory.
+///
+/// The single owner of this question. Six other sites read `HOME` directly,
+/// which is a POSIX convention: Windows sets `USERPROFILE` and normally leaves
+/// `HOME` unset, so those sites failed there — four with a hard error, one by
+/// relocating the model cache into the working directory, and one by yielding
+/// an empty string that turned an absolute path into a relative one.
+///
+/// The order matters and each step earns its place:
+///
+/// 1. `HOME` first. It is the POSIX answer, it is what a Unix user expects to
+///    be able to override, and it is how the test suite points at a temp
+///    directory instead of the real home.
+/// 2. `USERPROFILE` next — the same variable, spelled the Windows way.
+/// 3. The platform's own API last, for a process that inherited neither.
+///
+/// An empty value counts as absent: an empty string joined onto a relative
+/// path silently degrades into the working directory, which is the failure
+/// mode this function exists to remove.
 pub fn home_dir() -> Result<PathBuf> {
-    directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .ok_or_else(|| Error::other("Cannot resolve home directory: HOME is unset or empty"))
+    let from_env = ["HOME", "USERPROFILE"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(PathBuf::from)
+        .find(|p| !p.as_os_str().is_empty());
+
+    from_env
+        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()))
+        .ok_or_else(|| {
+            Error::other("Cannot resolve home directory: HOME and USERPROFILE are unset or empty")
+        })
 }
 
 /// Daemon configuration.
@@ -297,6 +324,8 @@ whitelist_dirs = ["~/Code"]
     fn test_daemon_socket_path_default() {
         let config = DaemonConfig::default();
         let path = config.socket_path();
+        // Compare on components: the path is a real filesystem path and so
+        // carries the host separator, which the literal must not assume.
         assert!(path.ends_with(".mdkb/daemon.sock"));
     }
 
@@ -307,6 +336,8 @@ whitelist_dirs = ["~/Code"]
             ..Default::default()
         };
         let path = config.socket_path();
+        // Compare on components: the path is a real filesystem path and so
+        // carries the host separator, which the literal must not assume.
         assert!(path.ends_with("custom/mdkb.sock"));
     }
 
