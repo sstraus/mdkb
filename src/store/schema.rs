@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 22;
+pub const SCHEMA_VERSION: i32 = 23;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -310,7 +310,7 @@ CREATE TABLE IF NOT EXISTS prior_clusters (
     injected_count INTEGER NOT NULL DEFAULT 0,
     confirmed_count INTEGER NOT NULL DEFAULT 0,
     refuted_count INTEGER NOT NULL DEFAULT 0,
-    state TEXT NOT NULL DEFAULT 'candidate',  -- candidate|promoted|refuted|expired
+    state TEXT NOT NULL DEFAULT 'candidate',  -- candidate|promoted|refuted|expired|archived
     promoted_memory_id TEXT,                 -- memory_entries.id once promoted
     created_at INTEGER NOT NULL,
     last_seen_at INTEGER NOT NULL,
@@ -428,6 +428,21 @@ fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
         }
     }
     result
+}
+
+/// True when `name` is a table in this database.
+///
+/// On a real open SCHEMA_SQL runs before the migrations, so every table exists.
+/// The migration unit tests call `migrate_schema` directly on a database built
+/// at an older version, where a table added later is absent — a migration that
+/// touches one must ask first.
+fn table_exists(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        [name],
+        |_| Ok(true),
+    )
+    .unwrap_or(false)
 }
 
 fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
@@ -675,17 +690,8 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // different canonical trigger keys; the embedding lets them merge so recurrence
     // can promote). Nullable BLOB, added by explicit ALTER on existing databases.
     if from_version < 15 {
-        // On a real open SCHEMA_SQL runs first, so prior_clusters exists (created
-        // fresh WITH the column, or pre-existing WITHOUT it). Migration unit tests
-        // call migrate_schema directly with no SCHEMA_SQL, so the table may be
-        // absent — guard on its existence before ALTER.
-        let table_exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'prior_clusters'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
+        // On a real open prior_clusters exists (created fresh WITH the column, or
+        // pre-existing WITHOUT it); under the migration unit tests it may not.
         let has_embedding: bool = conn
             .query_row(
                 "SELECT 1 FROM pragma_table_info('prior_clusters') WHERE name = 'embedding'",
@@ -694,7 +700,7 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
             )
             .unwrap_or(false);
 
-        if table_exists && !has_embedding {
+        if table_exists(conn, "prior_clusters") && !has_embedding {
             conn.execute("ALTER TABLE prior_clusters ADD COLUMN embedding BLOB", [])?;
         }
     }
@@ -703,13 +709,6 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // hook traffic (which has no MCP session) can be attributed to a reserved
     // `agent='hooks'` pseudo-session instead of being dropped from call stats.
     if from_version < 16 {
-        let table_exists: bool = conn
-            .query_row(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions'",
-                [],
-                |_| Ok(true),
-            )
-            .unwrap_or(false);
         let has_agent: bool = conn
             .query_row(
                 "SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'agent'",
@@ -717,7 +716,7 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 |_| Ok(true),
             )
             .unwrap_or(false);
-        if table_exists && !has_agent {
+        if table_exists(conn, "sessions") && !has_agent {
             conn.execute("ALTER TABLE sessions ADD COLUMN agent TEXT", [])?;
         }
     }
@@ -856,6 +855,39 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
         if dated > 0 {
             tracing::info!(
                 "migration: dated {dated} mined prior(s) that were written without a TTL"
+            );
+        }
+    }
+
+    // Migration from v22 to v23: retire clusters no trigger can ever match.
+    //
+    // The distiller's validator accepted `stop` and `repo` while
+    // `store::priors::trigger_matches` handled neither, so priors mined under
+    // those kinds were stored, counted toward promotion, and then could not
+    // fire — 32 of 58 clusters, including both that had been promoted. The
+    // validator no longer emits them, which makes these rows permanently
+    // unreachable rather than merely unlucky.
+    //
+    // The lesson text is not deleted, and a promoted cluster's backing memory
+    // entry is left alone: it is a real lesson and content-based recall can
+    // still surface it. What is retired is the claim that a trigger will.
+    if from_version < 23 && table_exists(conn, "prior_clusters") {
+        let kinds = crate::domain::prior_distill::VALID_TRIGGER_KINDS
+            .iter()
+            .map(|k| format!("'{k}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let archived = conn.execute(
+            &format!(
+                "UPDATE prior_clusters SET state = 'archived' \
+                 WHERE trigger_kind NOT IN ({kinds}) AND state <> 'archived'"
+            ),
+            [],
+        )?;
+        if archived > 0 {
+            tracing::info!(
+                "migration: archived {archived} prior cluster(s) whose trigger kind has no \
+                 injection point"
             );
         }
     }
@@ -1930,6 +1962,59 @@ mod tests {
             "malformed tags_json should result in empty tags vec, got: {:?}",
             entry.tags
         );
+    }
+
+    /// Clusters mined under a kind nothing can inject are retired, and the ones
+    /// that still have an injection point are left exactly as they are.
+    ///
+    /// 32 of 58 clusters carried `stop` or `repo`, kinds the validator accepted
+    /// and the matcher never handled. They cannot become useful — the distiller
+    /// can no longer emit those kinds — so leaving them `promoted` would keep
+    /// them counted as working priors forever.
+    #[test]
+    fn archiving_retires_clusters_whose_kind_can_never_be_injected() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+
+        // `promoted_memory_id` stays NULL: it carries a foreign key into
+        // `memory_entries`, and the migration reads and writes only `state`.
+        conn.execute_batch(
+            "INSERT INTO prior_clusters
+                 (id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
+                  evidence_count, distinct_sessions, injected_count, confirmed_count,
+                  refuted_count, state, promoted_memory_id, created_at, last_seen_at)
+             VALUES
+                 ('c-stop', 'k1', 'stop', '{}', 'l', '{}', 2, 2, 0, 0, 0, 'promoted', NULL, 1, 1),
+                 ('c-repo', 'k2', 'repo', '{}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1),
+                 ('c-pre', 'k3', 'pre_tool', '{}', 'l', '{}', 2, 2, 0, 0, 0, 'promoted', NULL, 1, 1),
+                 ('c-post', 'k4', 'post_tool', '{}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1),
+                 ('c-prompt', 'k5', 'prompt', '{}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1);
+             UPDATE schema_version SET version = 22;",
+        )
+        .unwrap();
+
+        migrate_schema(&conn, 22).unwrap();
+
+        let state = |id: &str| {
+            conn.query_row("SELECT state FROM prior_clusters WHERE id = ?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(state("c-stop"), "archived", "a promoted stop cluster retires");
+        assert_eq!(
+            state("c-repo"),
+            "archived",
+            "a candidate repo cluster retires too — it can never be promoted usefully"
+        );
+        assert_eq!(state("c-pre"), "promoted", "pre_tool is untouched");
+        assert_eq!(state("c-post"), "candidate", "post_tool is untouched");
+        assert_eq!(state("c-prompt"), "candidate", "prompt is untouched");
+
+        // Archived clusters are out of the injection path by construction.
+        let promoted = crate::store::priors::list_promoted_clusters(&conn).unwrap();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].id, "c-pre");
     }
 
     #[test]

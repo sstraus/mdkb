@@ -4290,24 +4290,42 @@ fn tail_lines(s: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-pub fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
+pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
     if !handle.config.hooks.post_tool_use_enabled {
         return json!({});
     }
     let Some(tool_name) = event.get("tool_name").and_then(|v| v.as_str()) else {
         return json!({});
     };
+
+    // Priors are matched for EVERY tool, not only the ones that trigger a
+    // reindex: "run the generator after editing the template" is a lesson about
+    // Bash, which this hook otherwise ignores entirely.
+    let prior_block = match event.get("tool_input") {
+        Some(input) => posttool_prior_block(handle, tool_name, input).await,
+        None => None,
+    };
+    let mut result = match &prior_block {
+        Some(text) => json!({
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": text,
+            }
+        }),
+        None => json!({}),
+    };
+
     if !REINDEX_TOOLS.contains(&tool_name) {
-        return json!({});
+        return result;
     }
     let Some(raw_path) = event.get("tool_input").and_then(tool_input_path) else {
-        return json!({});
+        return result;
     };
     let path = if let Some(p) = canonicalize_under_cwd(&handle.root, &raw_path) {
         std::path::PathBuf::from(p)
     } else {
         tracing::warn!("hook.post_tool_use: rejected path outside root: {raw_path}");
-        return json!({});
+        return result;
     };
     if let Err(e) = handle.reindex_tx.try_send(path) {
         // Bounded logging: warn once per failure episode, not on every edit (the
@@ -4324,13 +4342,14 @@ pub fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
                  until the channel recovers."
             );
         }
-        return json!({});
+        return result;
     }
     // A prior failure episode (if any) has recovered; re-arm the one-shot warning.
     handle
         .reindex_send_warned
         .store(false, std::sync::atomic::Ordering::Relaxed);
-    json!({"queued": true})
+    result["queued"] = json!(true);
+    result
 }
 
 pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
@@ -4413,13 +4432,37 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
     }
 }
 
-/// Promoted priors whose trigger matches this PreToolUse call, formatted as a
-/// context block (and recorded as injected). `None` when injection is disabled,
-/// the memory store is unavailable, or nothing matches.
+/// Promoted priors whose trigger matches this PreToolUse call.
 async fn pretool_prior_block(
     handle: &RepoHandle,
     tool: &str,
     tool_input: &Value,
+) -> Option<String> {
+    tool_prior_block(handle, tool, tool_input, false).await
+}
+
+/// Promoted priors whose trigger matches this PostToolUse call.
+async fn posttool_prior_block(
+    handle: &RepoHandle,
+    tool: &str,
+    tool_input: &Value,
+) -> Option<String> {
+    tool_prior_block(handle, tool, tool_input, true).await
+}
+
+/// Promoted priors whose trigger matches a tool call, formatted as a context
+/// block (and recorded as injected). `None` when injection is disabled, the
+/// memory store is unavailable, or nothing matches.
+///
+/// `after` selects which half of the tool call is being answered: a `pre_tool`
+/// lesson warns before the call, a `post_tool` lesson tells the model what to do
+/// now that it has happened. Identifying the call is the same work either way,
+/// so both hooks come through here.
+async fn tool_prior_block(
+    handle: &RepoHandle,
+    tool: &str,
+    tool_input: &Value,
+    after: bool,
 ) -> Option<String> {
     use crate::store::priors::{TriggerContext, match_injectable, record_injection};
 
@@ -4439,19 +4482,28 @@ async fn pretool_prior_block(
     let command = tool_input.get("command").and_then(|v| v.as_str());
     let now = chrono::Utc::now().timestamp();
     let max = handle.config.priors.max_injected_per_hook;
+    let label = if after { "post-tool" } else { "pre-tool" };
 
-    // Read from the ALREADY-open context only — the PreToolUse hot path must
-    // never force a DB open (the same reason `code_index_hits` guards on
-    // `.exists()`). In the daemon the context is warm after SessionStart, so
-    // priors fire; a cold one-shot invocation skips them (best-effort).
+    // Read from the ALREADY-open context only — the tool hot path must never
+    // force a DB open (the same reason `code_index_hits` guards on `.exists()`).
+    // In the daemon the context is warm after SessionStart, so priors fire; a
+    // cold one-shot invocation skips them (best-effort).
     let mut ctx_guard = handle.ctx.lock().await;
 
-    let tctx = TriggerContext::PreTool {
-        tool,
-        path: path.as_deref(),
-        command,
+    let tctx = if after {
+        TriggerContext::PostTool {
+            tool,
+            path: path.as_deref(),
+            command,
+        }
+    } else {
+        TriggerContext::PreTool {
+            tool,
+            path: path.as_deref(),
+            command,
+        }
     };
-    let hits = crate::core::run_guarded_read(&mut ctx_guard, "pre-tool prior lookup", |ctx| {
+    let hits = crate::core::run_guarded_read(&mut ctx_guard, "tool prior lookup", |ctx| {
         match_injectable(&ctx.conn, &tctx, now, max)
     })?
     .ok()?;
@@ -4462,11 +4514,11 @@ async fn pretool_prior_block(
     for c in &hits {
         let prior_id = c.id.clone();
         if let Some(Err(error)) =
-            crate::core::run_guarded_write(&mut ctx_guard, "pre-tool prior telemetry", |ctx| {
+            crate::core::run_guarded_write(&mut ctx_guard, "tool prior telemetry", |ctx| {
                 record_injection(&ctx.conn, &prior_id, now)
             })
         {
-            tracing::warn!("record pre-tool prior injection: {error}");
+            tracing::warn!("record {label} prior injection: {error}");
         }
         lines.push(format!("mdkb prior: {}", c.lesson));
     }
@@ -4880,7 +4932,7 @@ pub async fn dispatch_call(
         }
         "hook.post_tool_use" => {
             let t0 = std::time::Instant::now();
-            let result = hook_post_tool_use_impl(&handle, &params);
+            let result = hook_post_tool_use_impl(&handle, &params).await;
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) {
                 "skipped"
@@ -8891,12 +8943,157 @@ mod tests {
         );
     }
 
+    /// A `post_tool` prior reaches the model it was mined for.
+    ///
+    /// Before this, `post_tool` was an accepted trigger kind with no matcher and
+    /// no injection point, so a lesson like "regenerate after touching the
+    /// template" was mined, promoted and then silently stranded. The lesson has
+    /// to arrive at PostToolUse, alongside the reindex signal rather than
+    /// instead of it.
+    #[tokio::test]
+    async fn hook_post_tool_use_injects_a_matching_post_tool_prior() {
+        use crate::store::priors::{canonical_trigger_key, cluster_id_for_key, promote_cluster};
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let file = tmp.path().join("src").join("schema.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "// generated").unwrap();
+
+        let matcher = r#"{"pattern":"src/**"}"#;
+        let key = canonical_trigger_key("post_tool", matcher);
+        let cluster_id = cluster_id_for_key(&key);
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let mut guard = handle.ctx.lock().await;
+            let ctx = guard.as_mut().unwrap();
+            crate::store::priors::upsert_cluster(
+                &ctx.conn,
+                &crate::store::priors::PriorCluster {
+                    id: cluster_id.clone(),
+                    canonical_trigger_key: key,
+                    trigger_kind: "post_tool".into(),
+                    trigger_matcher: matcher.into(),
+                    lesson: "Run the generator after editing the template.".into(),
+                    scope: r#"{"repo":"current"}"#.into(),
+                    evidence_count: 2,
+                    distinct_sessions: 2,
+                    injected_count: 0,
+                    confirmed_count: 0,
+                    refuted_count: 0,
+                    state: "candidate".into(),
+                    promoted_memory_id: None,
+                    created_at: chrono::Utc::now().timestamp(),
+                    last_seen_at: chrono::Utc::now().timestamp(),
+                },
+            )
+            .unwrap();
+            promote_cluster(&ctx.conn, &cluster_id, chrono::Utc::now().timestamp()).unwrap();
+        }
+
+        let event = json!({
+            "tool_name": "Write",
+            "tool_input": {"file_path": file.to_str().unwrap()},
+        });
+        let result = hook_post_tool_use_impl(&handle, &event).await;
+        let injected = result["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            injected.contains("Run the generator after editing the template."),
+            "a matching post_tool prior must be injected, got: {result}"
+        );
+        assert_eq!(
+            result["hookSpecificOutput"]["hookEventName"], "PostToolUse",
+            "the block must be labelled for the event it answers: {result}"
+        );
+        assert_eq!(
+            result["queued"], true,
+            "injecting a prior must not cancel the reindex the hook exists for: {result}"
+        );
+
+        // A tool call outside the glob gets the reindex and no lesson.
+        let other = tmp.path().join("notes.md");
+        std::fs::write(&other, "text").unwrap();
+        let result = hook_post_tool_use_impl(
+            &handle,
+            &json!({"tool_name": "Write", "tool_input": {"file_path": other.to_str().unwrap()}}),
+        )
+        .await;
+        assert!(
+            result.get("hookSpecificOutput").is_none(),
+            "injection is trigger-scoped, never global: {result}"
+        );
+    }
+
+    /// A lesson about a tool that never reindexes still arrives.
+    ///
+    /// `Bash` is not in `REINDEX_TOOLS`, so the hook used to return early for it.
+    /// Matching priors before that gate is what makes "run the generator after
+    /// the build" reachable — the majority of post-hoc lessons are about commands,
+    /// not file writes.
+    #[tokio::test]
+    async fn hook_post_tool_use_injects_a_prior_for_a_tool_that_never_reindexes() {
+        use crate::store::priors::{canonical_trigger_key, cluster_id_for_key, promote_cluster};
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+
+        let matcher = r#"{"pattern":"cargo build"}"#;
+        let key = canonical_trigger_key("post_tool", matcher);
+        let cluster_id = cluster_id_for_key(&key);
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let mut guard = handle.ctx.lock().await;
+            let ctx = guard.as_mut().unwrap();
+            crate::store::priors::upsert_cluster(
+                &ctx.conn,
+                &crate::store::priors::PriorCluster {
+                    id: cluster_id.clone(),
+                    canonical_trigger_key: key,
+                    trigger_kind: "post_tool".into(),
+                    trigger_matcher: matcher.into(),
+                    lesson: "Check mbx explain --last before blaming the build.".into(),
+                    scope: r#"{"repo":"current"}"#.into(),
+                    evidence_count: 2,
+                    distinct_sessions: 2,
+                    injected_count: 0,
+                    confirmed_count: 0,
+                    refuted_count: 0,
+                    state: "candidate".into(),
+                    promoted_memory_id: None,
+                    created_at: chrono::Utc::now().timestamp(),
+                    last_seen_at: chrono::Utc::now().timestamp(),
+                },
+            )
+            .unwrap();
+            promote_cluster(&ctx.conn, &cluster_id, chrono::Utc::now().timestamp()).unwrap();
+        }
+
+        let result = hook_post_tool_use_impl(
+            &handle,
+            &json!({"tool_name": "Bash", "tool_input": {"command": "cargo build --lib"}}),
+        )
+        .await;
+        let injected = result["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            injected.contains("Check mbx explain --last before blaming the build."),
+            "a post_tool prior on a non-reindex tool must still be injected, got: {result}"
+        );
+        assert!(
+            result.get("queued").is_none(),
+            "Bash queues no reindex; only the lesson is added: {result}"
+        );
+    }
+
     #[tokio::test]
     async fn hook_post_tool_use_ignores_unknown_tool() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let event = json!({"tool_name": "Bash", "tool_input": {"command": "ls"}});
-        let result = hook_post_tool_use_impl(&handle, &event);
+        let result = hook_post_tool_use_impl(&handle, &event).await;
         assert_eq!(result, json!({}));
     }
 
@@ -8912,7 +9109,7 @@ mod tests {
             "tool_name": "Write",
             "tool_input": {"file_path": file.to_str().unwrap()},
         });
-        let result = hook_post_tool_use_impl(&handle, &event);
+        let result = hook_post_tool_use_impl(&handle, &event).await;
         assert_eq!(
             result,
             json!({"queued": true}),

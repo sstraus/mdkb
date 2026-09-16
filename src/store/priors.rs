@@ -595,6 +595,15 @@ pub enum TriggerContext<'a> {
         path: Option<&'a str>,
         command: Option<&'a str>,
     },
+    /// A tool has just run. Same fields as [`TriggerContext::PreTool`]: the
+    /// difference is when the lesson is useful, not what identifies the call.
+    /// "Do not edit generated files" belongs before the edit; "run the generator
+    /// after touching the template" belongs after it.
+    PostTool {
+        tool: &'a str,
+        path: Option<&'a str>,
+        command: Option<&'a str>,
+    },
     /// The user just submitted a prompt.
     Prompt { text: &'a str },
 }
@@ -607,12 +616,42 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `pattern` identifies a tool call: the tool's name, a glob over its
+/// path, or a substring of its command. Shared by `pre_tool` and `post_tool`,
+/// which differ only in when they fire.
+fn tool_call_matches(
+    pattern: &str,
+    tool: &str,
+    path: Option<&str>,
+    command: Option<&str>,
+) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern.eq_ignore_ascii_case(tool) {
+        return true;
+    }
+    if let Some(p) = path
+        && glob_matches(pattern, p)
+    {
+        return true;
+    }
+    if let Some(c) = command
+        && c.contains(pattern)
+    {
+        return true;
+    }
+    false
+}
+
 /// Whether a promoted cluster's trigger matches the current context.
 ///
 /// The matcher reads the distiller's `{"when","pattern"}` shape. For `pre_tool`
-/// the `pattern` matches the tool name, a path glob, or a command substring; for
-/// `prompt` it (or `when`) is a case-insensitive substring of the prompt. Other
-/// kinds never match these two contexts.
+/// and `post_tool` the `pattern` matches the tool name, a path glob, or a
+/// command substring; for `prompt` it (or `when`) is a case-insensitive
+/// substring of the prompt. A kind is matched only in its own context, and a
+/// kind with no arm here never matches anything — which is why
+/// `VALID_TRIGGER_KINDS` may not contain one.
 pub fn trigger_matches(kind: &str, matcher_json: &str, ctx: &TriggerContext) -> bool {
     let v: serde_json::Value = match serde_json::from_str(matcher_json) {
         Ok(v) => v,
@@ -633,25 +672,15 @@ pub fn trigger_matches(kind: &str, matcher_json: &str, ctx: &TriggerContext) -> 
                 path,
                 command,
             },
-        ) => {
-            if pattern.is_empty() {
-                return false;
-            }
-            if pattern.eq_ignore_ascii_case(tool) {
-                return true;
-            }
-            if let Some(p) = path {
-                if glob_matches(pattern, p) {
-                    return true;
-                }
-            }
-            if let Some(c) = command {
-                if c.contains(pattern) {
-                    return true;
-                }
-            }
-            false
-        }
+        )
+        | (
+            "post_tool",
+            TriggerContext::PostTool {
+                tool,
+                path,
+                command,
+            },
+        ) => tool_call_matches(pattern, tool, *path, *command),
         ("prompt", TriggerContext::Prompt { text }) => {
             let needle = if pattern.is_empty() { when } else { pattern };
             if needle.is_empty() {
@@ -1101,6 +1130,65 @@ mod tests {
                 command: Some("cargo test --lib")
             }
         ));
+    }
+
+    /// The distiller's accepted kinds and the kinds the matcher can act on MUST
+    /// be the same set.
+    ///
+    /// They were not: the validator accepted `stop` and `repo`, `trigger_matches`
+    /// handled neither, and every cluster mined under those kinds — 32 of 58,
+    /// including both that had been promoted — sat in the store unable to fire.
+    /// A prior nothing can ever inject is worse than no prior: it consumes a
+    /// promotion, reports as working, and teaches nobody.
+    #[test]
+    fn every_accepted_trigger_kind_has_an_injection_point() {
+        // One context per kind, with a matcher that must fire in it.
+        let matchable: &[(&str, &str, TriggerContext)] = &[
+            (
+                "prompt",
+                r#"{"pattern":"ripgrep"}"#,
+                TriggerContext::Prompt {
+                    text: "use ripgrep here",
+                },
+            ),
+            (
+                "pre_tool",
+                r#"{"pattern":"src/generated/**"}"#,
+                TriggerContext::PreTool {
+                    tool: "Edit",
+                    path: Some("src/generated/api.rs"),
+                    command: None,
+                },
+            ),
+            (
+                "post_tool",
+                r#"{"pattern":"src/generated/**"}"#,
+                TriggerContext::PostTool {
+                    tool: "Edit",
+                    path: Some("src/generated/api.rs"),
+                    command: None,
+                },
+            ),
+        ];
+
+        for (kind, matcher, ctx) in matchable {
+            assert!(
+                trigger_matches(kind, matcher, ctx),
+                "{kind} is accepted by the distiller but cannot be matched"
+            );
+        }
+
+        let injectable: Vec<&str> = matchable.iter().map(|(k, _, _)| *k).collect();
+        let mut accepted = crate::domain::prior_distill::VALID_TRIGGER_KINDS.to_vec();
+        let mut expected = injectable.clone();
+        accepted.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(
+            accepted, expected,
+            "VALID_TRIGGER_KINDS must equal the kinds trigger_matches handles: \
+             accepting one more mines priors that can never fire, accepting one \
+             fewer throws away a lesson the matcher could have used"
+        );
     }
 
     #[test]
