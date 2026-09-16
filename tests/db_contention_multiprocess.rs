@@ -35,6 +35,22 @@ fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_mdkb"))
 }
 
+/// An `mdkb` child that writes the store itself.
+///
+/// Without `MDKB_NO_DAEMON` the CLI hands the write to whatever daemon happens to
+/// be running on the machine. That daemon is a different build of mdkb, so the
+/// test stopped exercising cross-process contention and started depending on the
+/// developer's installed binary: a v23 store raised "this mdkb binary understands
+/// v22" from a daemon on an older build, and every worker failed at once. The
+/// short-lived direct writer is the shape this file exists to reproduce.
+fn mdkb_child(root: &Path) -> Command {
+    let mut cmd = Command::new(bin());
+    cmd.current_dir(root)
+        .env("MDKB_NO_DAEMON", "1")
+        .stdin(Stdio::null());
+    cmd
+}
+
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -66,10 +82,8 @@ fn quarantined_files(mdkb_dir: &Path) -> Vec<String> {
 fn init_repo() -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().to_path_buf();
-    let out = Command::new(bin())
+    let out = mdkb_child(&root)
         .args(["init"])
-        .current_dir(&root)
-        .stdin(Stdio::null())
         .output()
         .expect("spawn mdkb init");
     assert!(
@@ -86,7 +100,7 @@ fn hook_writer(root: &Path, worker: usize, iters: usize) {
     for n in 0..iters {
         let id = format!("stress-{worker}-{n}");
         let body = big_body(n);
-        let add = Command::new(bin())
+        let add = mdkb_child(root)
             .args([
                 "memory",
                 "add",
@@ -102,8 +116,6 @@ fn hook_writer(root: &Path, worker: usize, iters: usize) {
                 "--on-conflict",
                 "contradicts",
             ])
-            .current_dir(root)
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -116,10 +128,8 @@ fn hook_writer(root: &Path, worker: usize, iters: usize) {
 
         // A read on this schema is a write: `get_entry` updates `access_count`,
         // the `memory_au` trigger deletes and reinserts the FTS5 row.
-        let show = Command::new(bin())
+        let show = mdkb_child(root)
             .args(["memory", "show", &id])
-            .current_dir(root)
-            .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()
@@ -131,10 +141,8 @@ fn hook_writer(root: &Path, worker: usize, iters: usize) {
         );
 
         if n.is_multiple_of(5) {
-            let del = Command::new(bin())
+            let del = mdkb_child(root)
                 .args(["memory", "rm", &id])
-                .current_dir(root)
-                .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .output()
