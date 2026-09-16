@@ -1798,6 +1798,15 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
     let repo = Repo::new();
     let config = repo.root.join(".mdkb").join("config.toml");
 
+    // `setup check` reports hook drift as well as the distiller, and unregistered
+    // hooks are a nonzero exit — correctly, they mean no event ever fires. This
+    // test is about the distiller half, so register the hooks first and leave the
+    // exit code free to say something about the distiller alone.
+    assert_ok(
+        &run(&["setup", "hooks", "claude"], &repo.root),
+        "register hooks so the check has no drift to report",
+    );
+
     // Nothing configured: a clear "not configured", not a failure.
     let out = run(&["setup", "check"], &repo.root);
     assert_ok(&out, "setup check without a distiller");

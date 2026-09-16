@@ -55,6 +55,14 @@ pub fn model_cache_dir() -> PathBuf {
 pub fn command() -> Command {
     let mut cmd = Command::new(bin());
     cmd.env("HOME", isolated_home())
+        // Isolating `HOME` stopped isolating the Claude config once `setup`
+        // learned to honour `CLAUDE_CONFIG_DIR` (cbc7ac7): a developer who sets
+        // it — `~/.claude-private` is the common case — had every `setup`
+        // command in this suite read their real profile instead of the
+        // temporary one. `setup check` then found the hooks it should not have
+        // found and exited 0 locally while CI, where the variable is unset,
+        // exited 1. Remove it so the isolated `HOME` is the only config source.
+        .env_remove("CLAUDE_CONFIG_DIR")
         .env("MDKB_NO_DAEMON", "1")
         .env("MDKB_NO_SPAWN", "1")
         .env("FASTEMBED_CACHE_DIR", model_cache_dir())
