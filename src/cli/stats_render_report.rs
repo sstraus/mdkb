@@ -324,6 +324,21 @@ fn render_hooks(out: &mut String, h: &HooksSummary) {
     if h.mining.candidate_count > 0 {
         let _ = write!(body, "\n    candidates     {}", h.mining.candidate_count);
     }
+    // "enabled" only means the switch is on. These counts are what distinguishes
+    // a distiller that works from one that is rejected on every call.
+    for o in &h.mining.outcomes_7d {
+        let _ = write!(body, "\n    {:<14} {} (7d)", o.outcome, o.count);
+        if let Some(reason) = &o.last_reason {
+            // Its own line, because the useful part of a distiller error is at
+            // the end ("...stream error: 400") and sharing the count's line left
+            // only ~40 columns before the frame cut it off.
+            let _ = write!(
+                body,
+                "\n      ↳ {}",
+                truncate(&reason.replace('\n', " "), WIDTH - 12)
+            );
+        }
+    }
 
     if !h.drift.is_clean() {
         body.push_str("\n\n  ⚠ stale hook registrations — run: mdkb setup hooks");
@@ -446,6 +461,7 @@ mod tests {
                     enabled: false,
                     reason: "mining_enabled = false".to_string(),
                     candidate_count: 0,
+                    outcomes_7d: Vec::new(),
                 },
             },
             quarantine: vec![],
@@ -697,6 +713,7 @@ mod tests {
             enabled: true,
             reason: "active (distiller: codex)".to_string(),
             candidate_count: 3,
+            outcomes_7d: Vec::new(),
         };
         let out = render(&r, false);
         assert!(out.contains("enabled"));
@@ -704,6 +721,47 @@ mod tests {
         assert!(
             out.contains("candidates"),
             "candidate count surfaced when > 0"
+        );
+    }
+
+    /// "enabled" is not an answer to "is mining working?".
+    ///
+    /// A distiller rejected on every call and a distiller that was never invoked
+    /// both render as `enabled` with zero candidates. The per-outcome counts, and
+    /// the reason behind a failure, are what tell them apart — so both have to
+    /// reach the rendered report, not just the JSON.
+    #[test]
+    fn render_hooks_shows_why_mining_produced_nothing() {
+        use crate::cli::stats_report::MiningOutcomeCount;
+
+        let mut r = fixture_report();
+        r.hooks.mining = crate::cli::stats_report::MiningStatus {
+            enabled: true,
+            reason: "active (distiller: codex)".to_string(),
+            candidate_count: 0,
+            outcomes_7d: vec![
+                MiningOutcomeCount {
+                    outcome: "gated".to_string(),
+                    count: 97,
+                    last_reason: None,
+                },
+                MiningOutcomeCount {
+                    outcome: "failed".to_string(),
+                    count: 8,
+                    last_reason: Some("codex exited 1: stream error: 400\nBad Request".to_string()),
+                },
+            ],
+        };
+        let out = render(&r, false);
+        assert!(out.contains("gated"), "outcome counts must render: {out}");
+        assert!(out.contains("97"), "the count itself must render: {out}");
+        assert!(
+            out.contains("stream error: 400"),
+            "the reason a run failed is the actionable part: {out}"
+        );
+        assert!(
+            !out.contains("400\nBad Request"),
+            "a multi-line reason must be folded onto one line: {out}"
         );
     }
 

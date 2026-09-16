@@ -390,6 +390,41 @@ pub struct DispatchContext {
     pub persistent_call_count: Arc<AtomicU64>,
     pub optimize_interval_calls: u64,
     pub hook_dedup: Arc<StdMutex<HookDedupState>>,
+    /// Where a hook parks background work so the caller can wait for it.
+    ///
+    /// `None` is the daemon: it outlives every hook by hours, so detaching is
+    /// correct and collecting handles would only leak them. `Some` is the
+    /// `MDKB_NO_DAEMON` in-process route, where the process exits the moment the
+    /// hook returns — there, a detached task is dropped before it runs, which is
+    /// why Stop-hook mining produced nothing at all on that route.
+    pub background: Option<Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>>,
+}
+
+impl DispatchContext {
+    /// Run `fut` in the background, keeping it awaitable when the caller asked
+    /// for that (see [`DispatchContext::background`]).
+    fn spawn_background(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+        let handle = tokio::spawn(fut);
+        if let Some(slot) = &self.background
+            && let Ok(mut pending) = slot.lock()
+        {
+            pending.push(handle);
+        }
+    }
+
+    /// Wait for everything [`DispatchContext::spawn_background`] collected.
+    /// A no-op on the daemon, which never collects.
+    pub async fn join_background(&self) {
+        let Some(slot) = &self.background else {
+            return;
+        };
+        loop {
+            let Some(handle) = slot.lock().ok().and_then(|mut p| p.pop()) else {
+                return;
+            };
+            let _ = handle.await;
+        }
+    }
 }
 
 impl std::fmt::Debug for DispatchContext {
@@ -3029,14 +3064,32 @@ fn log_hook_event(
     elapsed_ms: u64,
     slow_threshold_ms: u64,
 ) {
+    log_hook_event_with_reason(root, event, outcome, None, elapsed_ms, slow_threshold_ms);
+}
+
+/// [`log_hook_event`] plus the `reason` an outcome carries, omitted when there
+/// is none. An outcome without its reason is what made the mining outage
+/// unreadable: `failed` alone cannot be told from a distiller that is missing,
+/// one that refuses the request, and one that answers with prose.
+fn log_hook_event_with_reason(
+    root: std::path::PathBuf,
+    event: &str,
+    outcome: &str,
+    reason: Option<&str>,
+    elapsed_ms: u64,
+    slow_threshold_ms: u64,
+) {
     let ts = chrono::Utc::now().timestamp();
-    let mut line = serde_json::json!({
+    let mut payload = serde_json::json!({
         "ts": ts,
         "event": event,
         "outcome": outcome,
         "elapsed_ms": elapsed_ms,
-    })
-    .to_string();
+    });
+    if let Some(reason) = reason {
+        payload["reason"] = serde_json::json!(reason);
+    }
+    let mut line = payload.to_string();
     line.push('\n');
     let mdkb_dir = crate::store::namespace::store_dir(&root).unwrap_or_else(|_| root.join(".mdkb"));
     append_hook_log(&mdkb_dir.join("hook-events.jsonl"), &line);
@@ -4142,7 +4195,7 @@ const STOP_EPISODE_WINDOW_LINES: usize = 800;
 /// on, spawns an external agent CLI to distill — far too slow for the hook
 /// budget — so the actual work is detached into a background task. The hook
 /// itself only gates and enqueues.
-fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value) -> Value {
+fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext) -> Value {
     // Drain mid-session cold-model `memory_write`s in the background. Independent
     // of prior mining — must run even when mining is kill-switched off — so it
     // goes before the mining gate. Single-flight + best-effort.
@@ -4171,7 +4224,7 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value) -> Value {
         .unwrap_or("unknown")
         .to_string();
 
-    tokio::spawn(mine_episode(
+    dctx.spawn_background(mine_episode(
         handle,
         transcript_path,
         session,
@@ -4181,12 +4234,48 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value) -> Value {
     json!({})
 }
 
-/// The awaitable core of prior mining: read the transcript tail → parse the raw
-/// episode → gate on the cheap candidate detector → distill via the external CLI
-/// → validate → persist as a candidate and promote on recurrence. Best-effort:
-/// every failure degrades to a debug log and an early return (a background task
-/// must never surface errors). Kept as a standalone async fn (not inlined into
-/// the detached spawn) so it can be awaited directly in tests.
+/// What one prior-mining run did, as recorded in `hook-events.jsonl`.
+///
+/// The Stop hook returns before the distiller starts, so its own event can only
+/// ever say "I detached something". These are the four answers an operator
+/// actually needs, and the reason is part of the answer: `failed` alone cannot
+/// distinguish a distiller that is missing, one that refuses the request and one
+/// that replies with prose.
+enum MiningOutcome {
+    /// The cheap detector turned the episode down — no LLM call was made. The
+    /// common case by far: most sessions teach nothing.
+    Gated,
+    /// A validated prior was integrated into the store.
+    Distilled,
+    /// A well-formed answer the validator turned down. Ordinary, not a fault.
+    Rejected(String),
+    /// The distiller could not run, or its output could not be used at all.
+    Failed(String),
+}
+
+impl MiningOutcome {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Gated => "gated",
+            Self::Distilled => "distilled",
+            Self::Rejected(_) => "rejected",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Gated | Self::Distilled => None,
+            Self::Rejected(r) | Self::Failed(r) => Some(r),
+        }
+    }
+}
+
+/// Mine one episode and record what happened.
+///
+/// The outcome is written exactly once, here, rather than at each of the early
+/// returns inside — "one event per run" is then a property of the shape, not a
+/// rule every future `return` has to remember.
 async fn mine_episode(
     handle: Arc<RepoHandle>,
     transcript_path: String,
@@ -4194,6 +4283,43 @@ async fn mine_episode(
     program: String,
     args: Vec<String>,
 ) {
+    let root = handle.root.clone();
+    let t0 = std::time::Instant::now();
+    let outcome = mine_episode_inner(handle, transcript_path, session, program, args).await;
+    let elapsed_ms = t0.elapsed().as_millis() as u64;
+    let label = outcome.label();
+    let reason = outcome.reason().map(str::to_string);
+
+    // `u64::MAX`, not the hook latency budget: this runs detached, after the
+    // hook has already answered, and a distiller legitimately takes tens of
+    // seconds. Measuring it against the budget would file every successful run
+    // in `hook-slow.jsonl` and bury the hooks that really are over budget.
+    let _ = tokio::task::spawn_blocking(move || {
+        log_hook_event_with_reason(
+            root,
+            crate::cli::stats_report::MINING_EVENT,
+            label,
+            reason.as_deref(),
+            elapsed_ms,
+            u64::MAX,
+        );
+    })
+    .await;
+}
+
+/// The awaitable core of prior mining: read the transcript tail → parse the raw
+/// episode → gate on the cheap candidate detector → distill via the external CLI
+/// → validate → persist as a candidate and promote on recurrence. Best-effort:
+/// every failure degrades to a log line and an early return (a background task
+/// must never surface errors). Kept as a standalone async fn (not inlined into
+/// the detached spawn) so it can be awaited directly in tests.
+async fn mine_episode_inner(
+    handle: Arc<RepoHandle>,
+    transcript_path: String,
+    session: String,
+    program: String,
+    args: Vec<String>,
+) -> MiningOutcome {
     use crate::domain::prior_detect::detect_candidate;
     use crate::domain::prior_distill::{
         build_distill_prompt, distiller_failure, parse_distilled, run_distiller_cli,
@@ -4208,15 +4334,16 @@ async fn mine_episode(
         Ok(Ok(s)) => s,
         Ok(Err(e)) => {
             tracing::debug!("prior mining: read transcript failed: {e}");
-            return;
+            return MiningOutcome::Failed(format!("read transcript failed: {e}"));
         }
-        Err(_) => return,
+        Err(e) => return MiningOutcome::Failed(format!("transcript read task failed: {e}")),
     };
     let window = tail_lines(&jsonl, STOP_EPISODE_WINDOW_LINES);
 
     let episode = parse_episode(&window);
     let Some(sig) = detect_candidate(&episode) else {
-        return; // the cheap gate: most episodes teach nothing, no LLM call
+        // The cheap gate: most episodes teach nothing, no LLM call.
+        return MiningOutcome::Gated;
     };
     let prompt = build_distill_prompt(&episode, &sig);
 
@@ -4232,14 +4359,14 @@ async fn mine_episode(
             // daemon does not log — this stayed invisible from 2026-08-01 to
             // 2026-09-16 while every Stop event reported success.
             tracing::warn!("prior mining: distiller {logged_program:?} could not be spawned: {e}");
-            return;
+            return MiningOutcome::Failed(format!("distiller {logged_program:?}: {e}"));
         }
-        Err(_) => return,
+        Err(e) => return MiningOutcome::Failed(format!("distiller task failed: {e}")),
     };
     let parsed = parse_distilled(&run.stdout);
     if let Some(failure) = distiller_failure(&logged_program, &run, parsed.as_ref().err()) {
         tracing::warn!("prior mining: {failure}");
-        return;
+        return MiningOutcome::Failed(failure);
     }
     let distilled = match parsed {
         Ok(d) => d,
@@ -4247,7 +4374,7 @@ async fn mine_episode(
         // nothing, so this is ordinary and stays at debug.
         Err(e) => {
             tracing::debug!("prior mining: distiller output rejected: {e}");
-            return;
+            return MiningOutcome::Rejected(e.to_string());
         }
     };
 
@@ -4264,12 +4391,12 @@ async fn mine_episode(
     .ok()
     .flatten();
 
-    if ensure_handle_context(&handle).await.is_err() {
-        return;
+    if let Err(e) = ensure_handle_context(&handle).await {
+        return MiningOutcome::Failed(format!("open store failed: {e}"));
     }
     let now = chrono::Utc::now().timestamp();
     let mut guard = handle.ctx.lock().await;
-    if let Some(Err(error)) = crate::core::run_mutation(&mut guard, "prior mining", |ctx| {
+    match crate::core::run_mutation(&mut guard, "prior mining", |ctx| {
         integrate_distilled(
             &ctx.conn,
             &distilled,
@@ -4278,7 +4405,16 @@ async fn mine_episode(
             lesson_embedding.as_deref(),
         )
     }) {
-        tracing::debug!("prior mining: integrate_distilled failed: {error}");
+        Some(Err(error)) => {
+            tracing::debug!("prior mining: integrate_distilled failed: {error}");
+            MiningOutcome::Failed(format!("integrate failed: {error}"))
+        }
+        // `None` = the context slot was empty, so the mutation never ran.
+        None => MiningOutcome::Failed("store context unavailable".to_string()),
+        // The `Some(id)` payload is the cluster's promoted memory entry, when
+        // this observation tipped it over the recurrence gate. Either way the
+        // prior was integrated, which is what `distilled` claims.
+        Some(Ok(_)) => MiningOutcome::Distilled,
     }
 }
 
@@ -4979,7 +5115,7 @@ pub async fn dispatch_call(
         "hook.stop" => {
             let key = hook_session_key(&handle, &params);
             // Returns immediately; distillation is detached inside hook_stop_impl.
-            let result = hook_stop_impl(Arc::clone(&handle), &params);
+            let result = hook_stop_impl(Arc::clone(&handle), &params, dctx);
             dctx.reset_hook_session(&key);
             let outcome = if result == json!({}) {
                 "skipped"
@@ -5506,6 +5642,7 @@ mod tests {
             persistent_call_count: Arc::new(AtomicU64::new(0)),
             optimize_interval_calls: 200,
             hook_dedup: Arc::new(StdMutex::new(Default::default())),
+            background: None,
         }
     }
 
@@ -8626,7 +8763,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp); // mining_enabled=false by default
         let event = json!({"transcript_path": "/nonexistent", "session_id": "s1"});
-        assert_eq!(hook_stop_impl(handle, &event), json!({}));
+        assert_eq!(hook_stop_impl(handle, &event, &make_dctx()), json!({}));
     }
 
     #[tokio::test]
@@ -8636,7 +8773,7 @@ mod tests {
         assert!(!handle.backfill_in_flight.load(Ordering::Acquire));
 
         let event = json!({"transcript_path": "/nonexistent", "session_id": "s1"});
-        let out = hook_stop_impl(Arc::clone(&handle), &event);
+        let out = hook_stop_impl(Arc::clone(&handle), &event, &make_dctx());
         assert_eq!(out, json!({}), "stop still no-ops the mining path");
 
         // The drain must be scheduled regardless of the mining kill-switch: the
@@ -8685,7 +8822,7 @@ mod tests {
             config.priors.mining_enabled = true; // on, but no distiller_program → still off
         });
         let event = json!({"transcript_path": "/nonexistent", "session_id": "s1"});
-        assert_eq!(hook_stop_impl(handle, &event), json!({}));
+        assert_eq!(hook_stop_impl(handle, &event, &make_dctx()), json!({}));
     }
 
     /// A transcript where a Bash error is followed by a corrective Edit and a
@@ -8701,6 +8838,112 @@ mod tests {
         "\n",
         r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
     );
+
+    /// An episode the cheap detector turns down: no error, no user correction.
+    const MINE_BORING_TRANSCRIPT: &str = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"add a doc comment"}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"src/lib.rs"}}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+    );
+
+    /// Every `prior_mining` event written to `hook-events.jsonl` under `root`.
+    fn mining_events(root: &std::path::Path) -> Vec<Value> {
+        let dir = crate::store::namespace::store_dir(root).unwrap_or_else(|_| root.join(".mdkb"));
+        let Ok(content) = std::fs::read_to_string(dir.join("hook-events.jsonl")) else {
+            return Vec::new();
+        };
+        content
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v.get("event").and_then(Value::as_str) == Some("prior_mining"))
+            .collect()
+    }
+
+    /// Mining says what it actually did, once per run.
+    ///
+    /// `hook_stop_impl` returns `{}` before the distiller has even started, so
+    /// the `stop` event logged `outcome=skipped` on 105 of 105 Stop events while
+    /// mining was completely dead. The detached task is the only place that knows
+    /// whether the run gated, distilled, was rejected or failed, so it is the
+    /// place that has to record it — with the reason, since "failed" without the
+    /// error text is what made the six-week outage invisible.
+    #[tokio::test]
+    async fn mine_episode_records_the_outcome_it_reached() {
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let not_reusable = distilled.replace(r#""is_reusable":true"#, r#""is_reusable":false"#);
+
+        // (transcript, distiller shell script, expected outcome, a substring the
+        // reason must carry — empty when no reason belongs on that outcome).
+        let cases: Vec<(&str, String, &str, &str)> = vec![
+            (
+                MINE_BORING_TRANSCRIPT,
+                format!("cat >/dev/null; printf '%s' '{distilled}'"),
+                "gated",
+                "",
+            ),
+            (
+                MINE_FIX_TRANSCRIPT,
+                format!("cat >/dev/null; printf '%s' '{distilled}'"),
+                "distilled",
+                "",
+            ),
+            (
+                MINE_FIX_TRANSCRIPT,
+                format!("cat >/dev/null; printf '%s' '{not_reusable}'"),
+                "rejected",
+                "reusable",
+            ),
+            (
+                MINE_FIX_TRANSCRIPT,
+                "cat >/dev/null; echo 'model overloaded' >&2; exit 1".to_string(),
+                "failed",
+                "model overloaded",
+            ),
+        ];
+
+        for (transcript_body, script, expected, reason_needle) in cases {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle(&tmp);
+            let transcript = tmp.path().join("transcript.jsonl");
+            std::fs::write(&transcript, transcript_body).unwrap();
+
+            mine_episode(
+                Arc::clone(&handle),
+                transcript.to_string_lossy().into_owned(),
+                format!("sess-{expected}"),
+                "sh".to_string(),
+                vec!["-c".to_string(), script],
+            )
+            .await;
+
+            let events = mining_events(tmp.path());
+            assert_eq!(
+                events.len(),
+                1,
+                "exactly one prior_mining event per run, got {events:?} for {expected}"
+            );
+            assert_eq!(
+                events[0]["outcome"], expected,
+                "wrong outcome recorded: {:?}",
+                events[0]
+            );
+            if reason_needle.is_empty() {
+                assert!(
+                    events[0].get("reason").is_none(),
+                    "{expected} carries no reason: {:?}",
+                    events[0]
+                );
+            } else {
+                let reason = events[0]["reason"].as_str().unwrap_or_default();
+                assert!(
+                    reason.contains(reason_needle),
+                    "{expected} must quote why ({reason_needle:?}), got {reason:?}"
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn mine_episode_persists_candidate_via_fake_distiller() {

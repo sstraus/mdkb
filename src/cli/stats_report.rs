@@ -159,6 +159,24 @@ pub struct MiningStatus {
     pub reason: String,
     /// Total distilled candidates recorded so far.
     pub candidate_count: i64,
+    /// What the last 7 days of mining runs actually did, most frequent first.
+    /// `enabled` only says the switch is on; this says whether anything came of
+    /// it. Empty when nothing has been mined in the window.
+    pub outcomes_7d: Vec<MiningOutcomeCount>,
+}
+
+/// The `event` name `mine_episode` writes to `hook-events.jsonl`. Kept next to
+/// the reader so the two cannot drift; the writer is `mcp::dispatch`.
+pub const MINING_EVENT: &str = "prior_mining";
+
+/// One `outcome` value from the `prior_mining` event stream, with its count and
+/// the most recent reason recorded for it — a `failed` count is not actionable
+/// without the error text that produced it.
+#[derive(Debug, Serialize)]
+pub struct MiningOutcomeCount {
+    pub outcome: String,
+    pub count: usize,
+    pub last_reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -470,11 +488,13 @@ fn collect_sessions(ctx: &Context) -> Result<SessionsSummary> {
     })
 }
 
-fn collect_hooks(mdkb_dir: &Path, repo_root: &Path, mining: MiningStatus) -> HooksSummary {
+fn collect_hooks(mdkb_dir: &Path, repo_root: &Path, mut mining: MiningStatus) -> HooksSummary {
     let cutoff = chrono::Utc::now().timestamp() - 7 * 86_400;
 
     let slow_events_7d = count_slow_events(mdkb_dir, cutoff);
-    let events = collect_hook_event_stats(mdkb_dir, cutoff);
+    let recent = read_hook_events(mdkb_dir, cutoff);
+    let events = collect_hook_event_stats(&recent);
+    mining.outcomes_7d = collect_mining_outcomes(&recent);
     let drift = crate::cli::setup::detect_hook_drift_for_repo(repo_root, None);
 
     HooksSummary {
@@ -483,6 +503,51 @@ fn collect_hooks(mdkb_dir: &Path, repo_root: &Path, mining: MiningStatus) -> Hoo
         drift,
         mining,
     }
+}
+
+/// Every parseable `hook-events.jsonl` line at or after `since_ts`.
+fn read_hook_events(mdkb_dir: &Path, since_ts: i64) -> Vec<serde_json::Value> {
+    let Ok(content) = std::fs::read_to_string(mdkb_dir.join("hook-events.jsonl")) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|v| v.get("ts").and_then(|t| t.as_i64()).unwrap_or(0) >= since_ts)
+        .collect()
+}
+
+/// Per-outcome counts for the `prior_mining` stream, most frequent first.
+fn collect_mining_outcomes(events: &[serde_json::Value]) -> Vec<MiningOutcomeCount> {
+    let mut counts: HashMap<String, (usize, Option<String>)> = HashMap::new();
+    for v in events {
+        if v.get("event").and_then(|e| e.as_str()) != Some(MINING_EVENT) {
+            continue;
+        }
+        let outcome = v
+            .get("outcome")
+            .and_then(|o| o.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let entry = counts.entry(outcome).or_insert((0, None));
+        entry.0 += 1;
+        // Lines are appended in time order, so the last one wins: the reason an
+        // operator needs is the one from the most recent run, not the first.
+        if let Some(reason) = v.get("reason").and_then(|r| r.as_str()) {
+            entry.1 = Some(reason.to_string());
+        }
+    }
+
+    let mut out: Vec<MiningOutcomeCount> = counts
+        .into_iter()
+        .map(|(outcome, (count, last_reason))| MiningOutcomeCount {
+            outcome,
+            count,
+            last_reason,
+        })
+        .collect();
+    out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.outcome.cmp(&b.outcome)));
+    out
 }
 
 /// Behavioral-prior mining status: on only when the master switch AND a distiller
@@ -518,31 +583,26 @@ fn collect_mining(ctx: &Context) -> MiningStatus {
         enabled,
         reason,
         candidate_count,
+        outcomes_7d: Vec::new(),
     }
 }
 
-fn collect_hook_event_stats(mdkb_dir: &Path, since_ts: i64) -> Vec<HookEventStats> {
-    let path = mdkb_dir.join("hook-events.jsonl");
-    let Ok(content) = std::fs::read_to_string(&path) else {
-        return Vec::new();
-    };
-
+fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats> {
     // Per entry: (fired, converted, elapsed_ms).
     let mut buckets: HashMap<String, Vec<(bool, bool, u64)>> = HashMap::new();
 
-    for line in content.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let ts = v.get("ts").and_then(|t| t.as_i64()).unwrap_or(0);
-        if ts < since_ts {
-            continue;
-        }
+    for v in events {
         let event = v
             .get("event")
             .and_then(|e| e.as_str())
             .unwrap_or("?")
             .to_string();
+        // Mining has its own section. Its outcomes are gated/distilled/rejected/
+        // failed, none of which is "fired", so this table would report it as a
+        // hook that runs and never does anything.
+        if event == MINING_EVENT {
+            continue;
+        }
         let outcome = v
             .get("outcome")
             .and_then(|o| o.as_str())
@@ -919,10 +979,51 @@ mod tests {
                     enabled: false,
                     reason: "mining_enabled = false".to_string(),
                     candidate_count: 0,
+                    outcomes_7d: Vec::new(),
                 },
             },
             quarantine: vec![],
         }
+    }
+
+    /// `mdkb stats` answers "is mining working?", not just "is it switched on?".
+    ///
+    /// `enabled` plus `candidates` cannot tell a distiller that never runs from
+    /// one that runs and is rejected every time — for six weeks both looked
+    /// identical, and the answer was "every call returns HTTP 400". The
+    /// per-outcome counts are the difference.
+    #[test]
+    fn mining_status_reports_the_outcomes_of_the_last_seven_days() {
+        let env = Env::new();
+        let mdkb_dir = env.ctx.db_path.parent().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let event = |outcome: &str, ts: i64| {
+            format!(r#"{{"event":"prior_mining","outcome":"{outcome}","elapsed_ms":900,"ts":{ts}}}"#)
+        };
+        let lines = [
+            event("gated", now),
+            event("gated", now),
+            event("failed", now),
+            event("distilled", now),
+            event("rejected", now),
+            // Outside the 7-day window: counted nowhere.
+            event("distilled", now - 8 * 86_400),
+            // A different event stream must not leak into the mining counts.
+            format!(
+                r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":5,"ts":{now}}}"#
+            ),
+        ];
+        std::fs::write(mdkb_dir.join("hook-events.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let report = collect_report(&env.ctx).expect("collect");
+        let counts = &report.hooks.mining.outcomes_7d;
+        let of = |name: &str| counts.iter().find(|o| o.outcome == name).map(|o| o.count);
+
+        assert_eq!(of("gated"), Some(2), "counts: {counts:?}");
+        assert_eq!(of("failed"), Some(1), "counts: {counts:?}");
+        assert_eq!(of("distilled"), Some(1), "the 8-day-old run is out of window");
+        assert_eq!(of("rejected"), Some(1), "counts: {counts:?}");
+        assert_eq!(counts.len(), 4, "no foreign event leaked in: {counts:?}");
     }
 
     #[test]

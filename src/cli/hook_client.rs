@@ -388,12 +388,17 @@ async fn dispatch_in_process(method: &str, params: Value, root: &Path, emit: imp
         }
     };
     let registry = Arc::new(RepoRegistry::new(config));
+    // This process exits as soon as the hook returns, so work a hook detaches is
+    // dropped before it runs — Stop-hook mining never produced anything on this
+    // route. Collect it here and wait below.
+    let background = Arc::new(std::sync::Mutex::new(Vec::new()));
     let dctx = DispatchContext {
         metrics: Arc::new(UsageMetrics::new()),
         session_id: Arc::new(AtomicI64::new(0)),
         persistent_call_count: Arc::new(AtomicU64::new(0)),
         optimize_interval_calls: 200,
         hook_dedup: Arc::new(std::sync::Mutex::new(Default::default())),
+        background: Some(Arc::clone(&background)),
     };
 
     match registry.get_or_open(root) {
@@ -403,6 +408,9 @@ async fn dispatch_in_process(method: &str, params: Value, root: &Path, emit: imp
         },
         Err(e) => eprintln!("mdkb hook {method}: repo registry: {e}"),
     }
+    // After `emit`, so the host still gets the hook's answer at the same moment
+    // it always did; only the exit is delayed, by the distiller's own runtime.
+    dctx.join_background().await;
 }
 
 /// In-process fallback for lifecycle hooks: the raw envelope goes to stdout

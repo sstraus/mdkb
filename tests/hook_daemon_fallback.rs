@@ -301,3 +301,78 @@ fn the_generated_wiring_carries_no_dead_shell_fallback() {
         "the wiring must still invoke the hook: {line}"
     );
 }
+
+/// In-process mining finishes before the process does.
+///
+/// `hook_stop_impl` detaches distillation with `tokio::spawn` and returns `{}`
+/// immediately. That is right in the daemon, which outlives the hook by hours.
+/// On the `MDKB_NO_DAEMON` route the process exits the instant the hook returns,
+/// so the detached task was dropped before the distiller had even been spawned:
+/// mining could never produce anything on that route, and nothing said so.
+#[test]
+#[cfg(unix)]
+fn in_process_stop_waits_for_the_mining_it_started() {
+    let (_dir, root) = store();
+
+    // A transcript with an error fixed by a corrective edit — the candidate
+    // detector's ErrorFixed signal, so mining reaches the distiller.
+    let transcript = root.join("transcript.jsonl");
+    std::fs::write(
+        &transcript,
+        concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"cargo build"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"error: cannot find value `x`","is_error":true}]}}"#,
+            "\n",
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t2","name":"Edit","input":{"file_path":"src/lib.rs"}}]}}"#,
+            "\n",
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t2","content":"ok"}]}}"#,
+        ),
+    )
+    .expect("write transcript");
+
+    // The distilled answer lives in a file the stub `cat`s: inlining it would
+    // put its double quotes inside a TOML basic string and the whole config
+    // would fail to parse. `sleep 1` makes the run long enough that a dropped
+    // task could not have completed it.
+    let answer = root.join("answer.json");
+    std::fs::write(
+        &answer,
+        r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#,
+    )
+    .expect("write distiller answer");
+    let config = root.join(".mdkb/config.toml");
+    let mut toml = std::fs::read_to_string(&config).expect("read config");
+    toml.push_str(&format!(
+        "\n[priors]\nmining_enabled = true\ndistiller_program = \"sh\"\n\
+         distiller_args = [\"-c\", \"cat >/dev/null; sleep 1; cat {}\"]\n",
+        answer.display()
+    ));
+    std::fs::write(&config, toml).expect("write config");
+
+    let daemon_dir = tempfile::tempdir().expect("daemon dir");
+    let event = format!(
+        r#"{{"session_id":"s-mine","transcript_path":"{}"}}"#,
+        transcript.display()
+    );
+    let out = run_hook_with_mode(&root, "stop", &event, daemon_dir.path(), true);
+    assert!(out.status.success(), "the hook contract is exit 0");
+
+    let events = std::fs::read_to_string(root.join(".mdkb/hook-events.jsonl")).unwrap_or_default();
+    let mining: Vec<&str> = events
+        .lines()
+        .filter(|l| l.contains(r#""event":"prior_mining""#))
+        .collect();
+    assert_eq!(
+        mining.len(),
+        1,
+        "the process must not exit until the mining it started has recorded an \
+         outcome; hook-events.jsonl held {events:?}, stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        mining[0].contains(r#""outcome":"distilled""#),
+        "the awaited run must have completed, not been cut off: {}",
+        mining[0]
+    );
+}
