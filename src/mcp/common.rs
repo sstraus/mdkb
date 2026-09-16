@@ -16,7 +16,7 @@ use subtle::ConstantTimeEq;
 use tokio_util::sync::CancellationToken;
 
 use super::McpServer;
-use crate::daemon::ipc_server::WorkGate;
+use crate::daemon::hook_runtime::WorkGate;
 use crate::daemon::registry::RepoRegistry;
 use crate::mcp::dispatch::DispatchContext;
 
@@ -95,7 +95,7 @@ async fn hook_handler(
     let body = serde_json::to_vec(&request).expect("JSON-RPC request serializes");
 
     let executing = runtime.work_gate.enter().await;
-    let response = crate::daemon::ipc_server::dispatch_hook_message(
+    let response = crate::daemon::hook_runtime::dispatch_hook_message(
         &body,
         &runtime.registry,
         &runtime.dispatch,
@@ -424,7 +424,7 @@ mod tests {
                 "method": format!("hook.{method}"),
                 "params": socket_params,
             });
-            let expected = crate::daemon::ipc_server::dispatch_hook_message(
+            let expected = crate::daemon::hook_runtime::dispatch_hook_message(
                 &serde_json::to_vec(&socket_request).unwrap(),
                 &registry,
                 &dispatch,
@@ -543,9 +543,9 @@ mod tests {
         let executing = gate.enter().await;
         let drain_gate = Arc::clone(&gate);
         let drain = tokio::spawn(async move {
-            crate::daemon::ipc_server::drain_in_flight_work(
+            crate::daemon::hook_runtime::drain_in_flight_work(
                 &drain_gate,
-                crate::daemon::ipc_server::WORK_DRAIN_GRACE,
+                crate::daemon::hook_runtime::WORK_DRAIN_GRACE,
             )
             .await
         });
@@ -559,7 +559,7 @@ mod tests {
         drop(executing);
         assert_eq!(
             drain.await.unwrap(),
-            crate::daemon::ipc_server::DrainOutcome::Quiesced
+            crate::daemon::hook_runtime::DrainOutcome::Quiesced
         );
     }
 }

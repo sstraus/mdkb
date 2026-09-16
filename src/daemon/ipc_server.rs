@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rmcp::ServiceExt;
+#[cfg(test)]
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
@@ -33,9 +34,15 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::mcp::dispatch::{DispatchContext, dispatch_call};
+use crate::mcp::dispatch::DispatchContext;
+#[cfg(test)]
+use crate::mcp::dispatch::dispatch_call;
 use crate::mcp::server::McpServer;
 
+pub use super::hook_runtime::DISPATCHED_ERROR_CODE;
+pub(crate) use super::hook_runtime::{
+    DrainOutcome, WORK_DRAIN_GRACE, WorkGate, dispatch_hook_message, drain_in_flight_work,
+};
 use super::registry::RepoRegistry;
 
 /// Names of the two sockets under the daemon base directory (`~/.mdkb`).
@@ -51,69 +58,6 @@ pub const HOOK_SOCKET_NAME: &str = "daemon-hook.sock";
 /// reached rather than beaten. Work is drained before it, under
 /// [`WORK_DRAIN_GRACE`].
 const SHUTDOWN_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Max time to wait for hook requests that are already executing.
-///
-/// `mdkb update` on a large repository legitimately runs for minutes, and the
-/// CLI that asked for it budgets an hour (`cli::hook_client::MUTATION_TIMEOUT`).
-/// Draining it under [`SHUTDOWN_DRAIN_GRACE`] cut it off after five seconds and
-/// reported a failed mutation for a write the daemon then finished anyway while
-/// the runtime dropped its blocking pool — the client saw `early eof`, the index
-/// was updated. Ten minutes covers the work while staying under the caller's own
-/// deadline. An operator who will not wait sends a second signal, which exits
-/// the process outright (see `main::ShutdownSignals`) — stopping the wait alone
-/// would not, because the runtime still owns the blocking write.
-pub(crate) const WORK_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// Marks the window during which a hook request is executing.
-///
-/// Every dispatched request holds it shared; shutdown takes it exclusively,
-/// which resolves exactly when no handler is mid-flight. That distinction is the
-/// whole point: a hook connection idling between messages must not delay
-/// shutdown, and a `cli.mutate` halfway through rewriting the index must not be
-/// cut off by the grace period sized for idle sockets.
-#[derive(Debug, Default)]
-pub(crate) struct WorkGate(tokio::sync::RwLock<()>);
-
-impl WorkGate {
-    /// Hold the gate for as long as the returned guard lives.
-    pub(crate) async fn enter(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.0.read().await
-    }
-
-    /// Resolve once every holder has released it. Tokio's `RwLock` is
-    /// write-preferring, so a steady stream of new requests cannot starve this.
-    pub(crate) async fn quiesced(&self) {
-        let _exclusive = self.0.write().await;
-    }
-}
-
-/// How [`drain_in_flight_work`] stopped waiting.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DrainOutcome {
-    /// No handler is executing any more.
-    Quiesced,
-    /// The grace period elapsed with work still running.
-    TimedOut,
-}
-
-/// Wait for executing hook requests to finish, bounded by `grace`.
-///
-/// There is deliberately no in-band cancel here. Returning early would not end
-/// the process: `Runtime::drop` waits for `spawn_blocking` work that has already
-/// started, and that work — the document update inside `update_impl` — is
-/// exactly what a long drain is waiting for. An operator who will not wait is
-/// served by `main`, which exits the process outright on a second signal.
-pub(crate) async fn drain_in_flight_work(
-    gate: &WorkGate,
-    grace: std::time::Duration,
-) -> DrainOutcome {
-    tokio::select! {
-        biased;
-        () = gate.quiesced() => DrainOutcome::Quiesced,
-        () = tokio::time::sleep(grace) => DrainOutcome::TimedOut,
-    }
-}
 
 /// Errors raised while serving IPC.
 #[derive(Debug, thiserror::Error)]
@@ -462,94 +406,6 @@ async fn handle_hook_conn(
         }
         drop(executing);
     }
-}
-
-/// The only error code this server emits once a method has been dispatched.
-///
-/// Every other code is a refusal at admission — a parse failure, a missing
-/// `root`, an unknown method, a repo outside the whitelist — raised before
-/// `dispatch_call` is entered and therefore proof that nothing was executed.
-/// `cli::hook_client` keys on exactly that: a refusal lets the caller run the
-/// mutation itself, and this code does not, because a method that got as far as
-/// running may have written before it failed.
-///
-/// Pinned by `refusals_before_dispatch_never_use_the_dispatched_error_code`. Anything
-/// that widens this — a second post-dispatch code, or reusing this one for a
-/// pre-dispatch check — silently changes when the CLI is allowed to write.
-pub const DISPATCHED_ERROR_CODE: i32 = -32603;
-
-/// Parse a JSON-RPC request and route it through `dispatch_call`.
-///
-/// `params.root` is the absolute path to the target repository — required for
-/// every method except `ping`. The handle is acquired via
-/// `registry.get_or_open(root)`, which honours the daemon whitelist.
-pub(crate) async fn dispatch_hook_message(
-    body: &[u8],
-    registry: &Arc<RepoRegistry>,
-    dctx: &Arc<DispatchContext>,
-) -> String {
-    let req: Value = match serde_json::from_slice(body) {
-        Ok(v) => v,
-        Err(e) => return rpc_error(Value::Null, -32700, &format!("parse error: {e}")),
-    };
-
-    let id = req.get("id").cloned().unwrap_or(Value::Null);
-    let method = req.get("method").and_then(Value::as_str).unwrap_or("");
-    let params = req.get("params").cloned().unwrap_or(Value::Null);
-
-    if method == "ping" {
-        return json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "pong": true,
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        })
-        .to_string();
-    }
-
-    if method.is_empty() {
-        return rpc_error(id, -32600, "missing 'method'");
-    }
-
-    let Some(root) = params.get("root").and_then(Value::as_str) else {
-        return rpc_error(id, -32602, "missing 'params.root' (absolute repo path)");
-    };
-
-    // A malformed typed mutation is an admission refusal: no handler has run,
-    // so the CLI may safely use its documented in-process fallback. Validate
-    // before acquiring a repo handle and before entering dispatch_call.
-    if method == "cli.mutate"
-        && let Err(error) =
-            serde_json::from_value::<crate::core::cli_mutation::CliMutation>(params.clone())
-    {
-        return rpc_error(id, -32602, &format!("cli.mutate: invalid params: {error}"));
-    }
-
-    let handle = match registry.get_or_open(Path::new(root)) {
-        Ok(h) => h,
-        Err(e) => return rpc_error(id, -32602, &format!("repo registry: {e}")),
-    };
-
-    match dispatch_call(method, params, handle, dctx).await {
-        Ok(result) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": result,
-        })
-        .to_string(),
-        Err(err) => rpc_error(id, err.code.0, &err.message),
-    }
-}
-
-fn rpc_error(id: Value, code: i32, message: &str) -> String {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": code, "message": message}
-    })
-    .to_string()
 }
 
 #[cfg(test)]

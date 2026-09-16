@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **`search --format json` emits one JSON document.** Searching the default
+  scope printed two arrays under `## Documents` and `## Memory Entries`
+  markdown headings, so `mdkb search q --format json | jq` failed on the first
+  line and every caller fell back to parsing prose. The combined scope now
+  prints a single object with `documents` and `memory` keys. `--format csv`
+  no longer carries markdown headings either; its two tables stay told apart
+  by their header rows.
+- **`get` accepts the paths `graph` accepts and the one `search` prints.**
+  `search` displays a hit as `collection:path`, and pasting that back into
+  `get` failed, as did `stories/archive/x.md` and a path without `.md` — while
+  `graph links` resolved all of them. Both commands now share one resolver, so
+  a path is a path whichever command reads it.
+- **`graph dangling -c <collection>` scopes the report.** On a store that
+  indexes session transcripts alongside documents, the real gaps in one
+  collection were buried under another's noise. The filter applies to the
+  edge's source document.
+
 ## 3.9.0 (2026-09-14)
 
 Two questions the index could not answer before: *what does this repository say
@@ -259,7 +280,9 @@ portable unit tests.
   suite keeps Unix-socket-only writer tests on Unix while retaining portable
   singleton coverage on Windows, exercises directory aliases when Developer
   Mode permits them, and compares native paths by component so separators and
-  spaces in executable paths do not create false failures.
+  spaces in executable paths do not create false failures. HTTP/HTTPS hook
+  dispatch and in-flight work draining now live outside the Unix-socket module,
+  so the portable servers compile and run on Windows too.
 - **Every memory-writing surface uses one mutation pipeline.** CLI, MCP, batch,
   import, and hook-driven writes now share duplicate admission, embeddings,
   edges, revisions, and Markdown projection behavior.

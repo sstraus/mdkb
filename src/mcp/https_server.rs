@@ -17,7 +17,7 @@ pub async fn run_https_server(
     token: Option<&str>,
 ) -> crate::error::Result<()> {
     let cancellation_token = CancellationToken::new();
-    let work_gate = Arc::new(crate::daemon::ipc_server::WorkGate::default());
+    let work_gate = Arc::new(crate::daemon::hook_runtime::WorkGate::default());
     let router = mcp_router(
         server,
         bind,
@@ -54,11 +54,11 @@ pub async fn run_https_server(
         tracing::info!("Shutdown signal received, stopping HTTPS server...");
         cancellation_token.cancel();
         shutdown_handle.graceful_shutdown(Some(
-            crate::daemon::ipc_server::WORK_DRAIN_GRACE + std::time::Duration::from_secs(5),
+            crate::daemon::hook_runtime::WORK_DRAIN_GRACE + std::time::Duration::from_secs(5),
         ));
-        let _ = crate::daemon::ipc_server::drain_in_flight_work(
+        let _ = crate::daemon::hook_runtime::drain_in_flight_work(
             &shutdown_gate,
-            crate::daemon::ipc_server::WORK_DRAIN_GRACE,
+            crate::daemon::hook_runtime::WORK_DRAIN_GRACE,
         )
         .await;
     });
