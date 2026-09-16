@@ -4235,11 +4235,7 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext
     // the transcript rather than sharing the mining read — one file read against
     // a task that may never run, or may spend a minute in an LLM call.
     if let Some(path) = transcript_path.clone() {
-        dctx.spawn_background(settle_session(
-            Arc::clone(&handle),
-            path,
-            session.clone(),
-        ));
+        dctx.spawn_background(settle_session(Arc::clone(&handle), path, session.clone()));
     }
 
     let cfg = &handle.config.priors;

@@ -629,12 +629,7 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 /// Whether `pattern` identifies a tool call: the tool's name, a glob over its
 /// path, or a substring of its command. Shared by `pre_tool` and `post_tool`,
 /// which differ only in when they fire.
-fn tool_call_matches(
-    pattern: &str,
-    tool: &str,
-    path: Option<&str>,
-    command: Option<&str>,
-) -> bool {
+fn tool_call_matches(pattern: &str, tool: &str, path: Option<&str>, command: Option<&str>) -> bool {
     if pattern.is_empty() {
         return false;
     }
@@ -848,7 +843,12 @@ fn set_cluster_error_signature(conn: &Connection, cluster_id: &str, signature: &
 /// second injection in the same session keeps the first `injected_at`, because
 /// an error recurring after injection #1 refutes the prior regardless of how
 /// many times it was repeated afterwards.
-pub fn record_injection(conn: &Connection, cluster_id: &str, session: &str, now: i64) -> Result<()> {
+pub fn record_injection(
+    conn: &Connection,
+    cluster_id: &str,
+    session: &str,
+    now: i64,
+) -> Result<()> {
     conn.execute(
         "UPDATE prior_clusters SET injected_count = injected_count + 1, last_seen_at = ?2
          WHERE id = ?1",
@@ -1806,7 +1806,10 @@ mod tests {
 
         assert!(second.is_empty(), "a settled session has nothing left open");
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
-        assert_eq!(c.confirmed_count, 1, "two injections, one session, one vote");
+        assert_eq!(
+            c.confirmed_count, 1,
+            "two injections, one session, one vote"
+        );
         assert_eq!(c.injected_count, 2, "telemetry still counts both");
     }
 
@@ -1832,7 +1835,8 @@ mod tests {
         record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
 
         let report =
-            settle_injections(&conn, "sess-1", 2000, &[err("anything at all", Some(1500))]).unwrap();
+            settle_injections(&conn, "sess-1", 2000, &[err("anything at all", Some(1500))])
+                .unwrap();
 
         assert_eq!(report.confirmed, vec!["clu-a".to_string()]);
     }
@@ -1922,7 +1926,10 @@ mod tests {
             Some("clu-a".to_string())
         );
         // An ordinary memory entry owns no cluster.
-        assert_eq!(apply_belief_from_memory(&conn, "some-topic", 1).unwrap(), None);
+        assert_eq!(
+            apply_belief_from_memory(&conn, "some-topic", 1).unwrap(),
+            None
+        );
 
         let after = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(after.confirmed_count, 1);

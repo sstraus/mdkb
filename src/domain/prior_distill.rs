@@ -771,7 +771,10 @@ mod tests {
         .expect("stub must spawn");
         let msg = distiller_failure("codex", &run, None).unwrap();
         assert!(msg.contains("usage: distill"), "{msg}");
-        assert!(!msg.contains("loading model"), "stderr must not be in it: {msg}");
+        assert!(
+            !msg.contains("loading model"),
+            "stderr must not be in it: {msg}"
+        );
     }
 
     /// What the operator is told, and — just as important — what they are not
@@ -787,8 +790,14 @@ mod tests {
             exit_code: Some(2),
         };
         let msg = distiller_failure("codex", &failed, None).expect("a non-zero exit is a failure");
-        assert!(msg.contains("code 2"), "exit code must be in the line: {msg}");
-        assert!(msg.contains("usage: codex exec"), "stdout must be shown: {msg}");
+        assert!(
+            msg.contains("code 2"),
+            "exit code must be in the line: {msg}"
+        );
+        assert!(
+            msg.contains("usage: codex exec"),
+            "stdout must be shown: {msg}"
+        );
 
         let signalled = DistillerRun {
             stdout: String::new(),
@@ -845,7 +854,11 @@ mod tests {
             stderr: String::new(),
             exit_code: Some(0),
         };
-        assert_eq!(short.stdout_excerpt(200), "brief", "no ellipsis, no padding");
+        assert_eq!(
+            short.stdout_excerpt(200),
+            "brief",
+            "no ellipsis, no padding"
+        );
     }
 
     /// The caller cannot warn about a failure it cannot see. stdout alone is

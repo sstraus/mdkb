@@ -925,7 +925,15 @@ mod tests {
         )
         .unwrap();
         let session = conn.last_insert_rowid();
-        add_edge(&conn, project, "teams/wiz", "related", KIND_FRONTMATTER, None).unwrap();
+        add_edge(
+            &conn,
+            project,
+            "teams/wiz",
+            "related",
+            KIND_FRONTMATTER,
+            None,
+        )
+        .unwrap();
         add_edge(&conn, session, "nowhere/y", "mentions", KIND_WIKILINK, None).unwrap();
 
         assert_eq!(dangling(&conn, None).unwrap().len(), 2, "unfiltered: both");

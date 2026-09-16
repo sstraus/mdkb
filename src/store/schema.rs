@@ -2041,12 +2041,18 @@ mod tests {
         migrate_schema(&conn, 22).unwrap();
 
         let state = |id: &str| {
-            conn.query_row("SELECT state FROM prior_clusters WHERE id = ?1", [id], |r| {
-                r.get::<_, String>(0)
-            })
+            conn.query_row(
+                "SELECT state FROM prior_clusters WHERE id = ?1",
+                [id],
+                |r| r.get::<_, String>(0),
+            )
             .unwrap()
         };
-        assert_eq!(state("c-stop"), "archived", "a promoted stop cluster retires");
+        assert_eq!(
+            state("c-stop"),
+            "archived",
+            "a promoted stop cluster retires"
+        );
         assert_eq!(
             state("c-repo"),
             "archived",

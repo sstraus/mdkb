@@ -546,7 +546,11 @@ fn collect_mining_outcomes(events: &[serde_json::Value]) -> Vec<MiningOutcomeCou
             last_reason,
         })
         .collect();
-    out.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.outcome.cmp(&b.outcome)));
+    out.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.outcome.cmp(&b.outcome))
+    });
     out
 }
 
@@ -998,7 +1002,9 @@ mod tests {
         let mdkb_dir = env.ctx.db_path.parent().unwrap();
         let now = chrono::Utc::now().timestamp();
         let event = |outcome: &str, ts: i64| {
-            format!(r#"{{"event":"prior_mining","outcome":"{outcome}","elapsed_ms":900,"ts":{ts}}}"#)
+            format!(
+                r#"{{"event":"prior_mining","outcome":"{outcome}","elapsed_ms":900,"ts":{ts}}}"#
+            )
         };
         let lines = [
             event("gated", now),
@@ -1009,9 +1015,7 @@ mod tests {
             // Outside the 7-day window: counted nowhere.
             event("distilled", now - 8 * 86_400),
             // A different event stream must not leak into the mining counts.
-            format!(
-                r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":5,"ts":{now}}}"#
-            ),
+            format!(r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":5,"ts":{now}}}"#),
         ];
         std::fs::write(mdkb_dir.join("hook-events.jsonl"), lines.join("\n") + "\n").unwrap();
 
@@ -1021,7 +1025,11 @@ mod tests {
 
         assert_eq!(of("gated"), Some(2), "counts: {counts:?}");
         assert_eq!(of("failed"), Some(1), "counts: {counts:?}");
-        assert_eq!(of("distilled"), Some(1), "the 8-day-old run is out of window");
+        assert_eq!(
+            of("distilled"),
+            Some(1),
+            "the 8-day-old run is out of window"
+        );
         assert_eq!(of("rejected"), Some(1), "counts: {counts:?}");
         assert_eq!(counts.len(), 4, "no foreign event leaked in: {counts:?}");
     }

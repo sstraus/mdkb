@@ -516,8 +516,8 @@ fn user_scope_follows_claude_config_dir() {
     // SAFETY: env mutation serialized by the guard held for this test.
     unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &private) };
 
-    let result = handle_setup_hooks_claude(project.path(), "user", "", false, None)
-        .expect("setup hooks ok");
+    let result =
+        handle_setup_hooks_claude(project.path(), "user", "", false, None).expect("setup hooks ok");
 
     assert_eq!(result.settings_path, private.join("settings.json"));
     let v = read_json(&result.settings_path);
@@ -603,7 +603,10 @@ fn check_hooks_reports_the_missing_stop_entry() {
     // Setup closes the gap, and the check then passes against the same file.
     handle_setup_hooks_claude(project.path(), "user", "", false, None).expect("setup hooks ok");
     let after = check_hooks(project.path()).expect("check runs");
-    assert!(after.drift.is_clean(), "setup must clear the drift: {after:?}");
+    assert!(
+        after.drift.is_clean(),
+        "setup must clear the drift: {after:?}"
+    );
 
     // SAFETY: same guard.
     unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
