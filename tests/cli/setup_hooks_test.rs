@@ -4,8 +4,8 @@ use std::fs;
 use std::sync::MutexGuard;
 
 use mdkb::cli::setup::{
-    HOOK_EVENTS, detect_hook_drift_for_repo, handle_setup_hooks_claude,
-    handle_setup_hooks_claude_with_http,
+    HOOK_EVENTS, check_hooks, claude_settings_path, detect_hook_drift_for_repo,
+    handle_setup_hooks_claude, handle_setup_hooks_claude_with_http,
 };
 use tempfile::TempDir;
 
@@ -14,6 +14,11 @@ use super::common::env_lock;
 /// Build a fresh temp project root with $HOME pointed at a sibling dir so that
 /// `user`-scope tests don't touch the real ~/.claude. The guard serializes
 /// HOME-mutating tests across this binary.
+///
+/// `CLAUDE_CONFIG_DIR` is cleared for the same reason: it outranks $HOME in
+/// `claude_settings_path`, and a developer running the suite from a session
+/// under `CLAUDE_CONFIG_DIR=~/.claude-private` would otherwise have these tests
+/// read and write their real settings file.
 fn isolated_project() -> (MutexGuard<'static, ()>, TempDir, TempDir) {
     let guard = env_lock();
     let project = tempfile::tempdir().expect("tempdir project");
@@ -21,6 +26,7 @@ fn isolated_project() -> (MutexGuard<'static, ()>, TempDir, TempDir) {
     // SAFETY: env mutation serialized by `guard`; HOME is overwritten per test.
     unsafe {
         std::env::set_var("HOME", home.path());
+        std::env::remove_var("CLAUDE_CONFIG_DIR");
         std::env::set_var("MDKB_BINARY_OVERRIDE", env!("CARGO_BIN_EXE_mdkb"));
     }
     (guard, project, home)
@@ -497,4 +503,108 @@ fn generated_command_has_daemon_then_fallback_guard() {
             "{event_name}: matcher mismatch"
         );
     }
+}
+
+/// `CLAUDE_CONFIG_DIR` is what Claude Code itself reads to locate its config, so
+/// user-scope setup must target that directory. Before this, setup always wrote
+/// `$HOME/.claude/settings.json` while the session ran out of another dir, and
+/// every hook it registered there was dead.
+#[test]
+fn user_scope_follows_claude_config_dir() {
+    let (_guard, project, home) = isolated_project();
+    let private = home.path().join(".claude-private");
+    // SAFETY: env mutation serialized by the guard held for this test.
+    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &private) };
+
+    let result = handle_setup_hooks_claude(project.path(), "user", "", false, None)
+        .expect("setup hooks ok");
+
+    assert_eq!(result.settings_path, private.join("settings.json"));
+    let v = read_json(&result.settings_path);
+    for (event_name, ..) in HOOK_EVENTS {
+        assert_eq!(mdkb_entries(&v, event_name).len(), 1, "{event_name}");
+    }
+    assert!(
+        !home.path().join(".claude").join("settings.json").exists(),
+        "the default profile must be left untouched"
+    );
+
+    // SAFETY: same guard; restore the isolated default for later tests.
+    unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+}
+
+/// With no `CLAUDE_CONFIG_DIR`, user scope still resolves to `$HOME/.claude`.
+#[test]
+fn user_scope_falls_back_to_home_claude() {
+    let (_guard, project, home) = isolated_project();
+    let path = claude_settings_path(project.path(), "user", None).expect("path resolves");
+    assert_eq!(path, home.path().join(".claude").join("settings.json"));
+}
+
+/// An explicit `--profile-dir` outranks the environment: the flag is how a user
+/// writes hooks for a profile other than the one they are running under.
+#[test]
+fn explicit_profile_dir_outranks_claude_config_dir() {
+    let (_guard, project, home) = isolated_project();
+    let from_env = home.path().join("from-env");
+    let explicit = home.path().join("explicit");
+    // SAFETY: env mutation serialized by the guard held for this test.
+    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &from_env) };
+
+    let path =
+        claude_settings_path(project.path(), "user", Some(&explicit)).expect("path resolves");
+    assert_eq!(path, explicit.join("settings.json"));
+
+    // SAFETY: same guard.
+    unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
+}
+
+/// The shape that made this story: a config dir carrying every event except
+/// `Stop`, in the legacy untagged form. `check_hooks` must name the file it read
+/// and report `Stop` as missing — a silent pass there is why that profile never
+/// mined a prior.
+#[test]
+fn check_hooks_reports_the_missing_stop_entry() {
+    let (_guard, project, home) = isolated_project();
+    let private = home.path().join(".claude-private");
+    fs::create_dir_all(&private).unwrap();
+    // SAFETY: env mutation serialized by the guard held for this test.
+    unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", &private) };
+
+    let legacy = |event: &str| {
+        serde_json::json!({
+            "hooks": [{
+                "type": "command",
+                "command": format!("'/usr/local/bin/mdkb' hook {event}")
+            }]
+        })
+    };
+    let settings = serde_json::json!({
+        "hooks": {
+            "SessionStart": [legacy("session-start")],
+            "UserPromptSubmit": [legacy("user-prompt-submit")],
+            "PostToolUse": [legacy("post-tool-use")],
+            "PreToolUse": [legacy("pre-tool-use")]
+        }
+    });
+    fs::write(
+        private.join("settings.json"),
+        serde_json::to_string_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+
+    let check = check_hooks(project.path()).expect("check runs");
+    assert_eq!(check.user_path, private.join("settings.json"));
+    assert_eq!(check.local_path, local_settings_path(project.path()));
+    assert_eq!(check.drift.missing, vec!["Stop"]);
+    assert!(check.drift.duplicated.is_empty());
+    assert!(!check.drift.is_clean());
+
+    // Setup closes the gap, and the check then passes against the same file.
+    handle_setup_hooks_claude(project.path(), "user", "", false, None).expect("setup hooks ok");
+    let after = check_hooks(project.path()).expect("check runs");
+    assert!(after.drift.is_clean(), "setup must clear the drift: {after:?}");
+
+    // SAFETY: same guard.
+    unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") };
 }

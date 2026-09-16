@@ -548,9 +548,30 @@ pub fn hook_command_line(binary_path: &str, cli_event: &str, daemon_required: bo
     )
 }
 
+/// Claude Code profile directory in effect when the caller named none:
+/// `$CLAUDE_CONFIG_DIR` when set and non-empty, else `$HOME/.claude`.
+///
+/// Claude Code reads the same variable, so a session started with
+/// `CLAUDE_CONFIG_DIR=~/.claude-private` gets its hooks written to the file it
+/// will actually read. Before this, setup always wrote `~/.claude/settings.json`
+/// and every session under another config dir silently ran no hooks at all —
+/// `~/.claude-private` had no Stop entry, so it never mined a prior.
+pub fn claude_profile_dir() -> Result<std::path::PathBuf> {
+    if let Some(dir) = env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()) {
+        return Ok(std::path::PathBuf::from(dir));
+    }
+    let home = env::var_os("HOME").ok_or_else(|| {
+        Error::from(ErrorKind::Command {
+            command: "setup hooks claude".to_string(),
+            message: "neither CLAUDE_CONFIG_DIR nor HOME is set".to_string(),
+        })
+    })?;
+    Ok(std::path::PathBuf::from(home).join(".claude"))
+}
+
 /// Resolve the Claude Code settings path for the given scope.
 /// - `local`: `<cwd>/.claude/settings.local.json`
-/// - `user`:  `<profile_dir>/settings.json` (default profile_dir: `$HOME/.claude`)
+/// - `user`:  `<profile_dir>/settings.json` (default profile_dir: [`claude_profile_dir`])
 pub fn claude_settings_path(
     cwd: &Path,
     scope: &str,
@@ -559,16 +580,9 @@ pub fn claude_settings_path(
     match scope {
         "local" | "project" => Ok(cwd.join(".claude").join("settings.local.json")),
         "user" | "global" => {
-            let dir = if let Some(p) = profile_dir {
-                p.to_path_buf()
-            } else {
-                let home = env::var_os("HOME").ok_or_else(|| {
-                    Error::from(ErrorKind::Command {
-                        command: "setup hooks claude".to_string(),
-                        message: "HOME environment variable not set".to_string(),
-                    })
-                })?;
-                std::path::PathBuf::from(home).join(".claude")
+            let dir = match profile_dir {
+                Some(p) => p.to_path_buf(),
+                None => claude_profile_dir()?,
             };
             Ok(dir.join("settings.json"))
         }
@@ -833,6 +847,31 @@ pub fn detect_hook_drift_for_repo(cwd: &Path, profile_dir: Option<&Path>) -> Hoo
     let user = read(claude_settings_path(cwd, "user", profile_dir));
     let local = read(claude_settings_path(cwd, "local", None));
     detect_hook_drift(&[&user, &local])
+}
+
+/// Hook-registration half of `mdkb setup check`: the settings files that are
+/// live for this session, and how their mdkb registrations diverge from
+/// `HOOK_EVENTS`. `user_path` honours `CLAUDE_CONFIG_DIR`, so the check reports
+/// the file the running Claude Code actually reads.
+#[derive(Debug)]
+pub struct HookCheck {
+    /// User-scope settings file (`$CLAUDE_CONFIG_DIR/settings.json`).
+    pub user_path: PathBuf,
+    /// Project-scope settings file (`<cwd>/.claude/settings.local.json`).
+    pub local_path: PathBuf,
+    /// Events missing from both files, or registered in both (double-fire).
+    pub drift: HookDrift,
+}
+
+/// Collect the hook registrations in effect for `cwd` and compare them with the
+/// canonical set. An event counts as registered when either file carries it —
+/// Claude Code fires both scopes.
+pub fn check_hooks(cwd: &Path) -> Result<HookCheck> {
+    Ok(HookCheck {
+        user_path: claude_settings_path(cwd, "user", None)?,
+        local_path: claude_settings_path(cwd, "local", None)?,
+        drift: detect_hook_drift_for_repo(cwd, None),
+    })
 }
 
 /// Upsert mdkb hook entries into `settings` in-place, replacing any existing
