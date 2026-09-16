@@ -303,8 +303,11 @@ pub fn handle_graph_path(
     crate::store::graph::shortest_path(&ctx.conn, start, &target, max_hops)
 }
 /// References that resolve to no indexed document (full-table scan).
-pub fn handle_graph_dangling(ctx: &Context) -> Result<Vec<crate::store::graph::DanglingRef>> {
-    crate::store::graph::dangling(&ctx.conn)
+pub fn handle_graph_dangling(
+    ctx: &Context,
+    collection: Option<&str>,
+) -> Result<Vec<crate::store::graph::DanglingRef>> {
+    crate::store::graph::dangling(&ctx.conn, collection)
 }
 /// Entities ranked by degree centrality (full-table scan).
 pub fn handle_graph_hubs(

@@ -1070,7 +1070,11 @@ pub enum GraphCommand {
     },
 
     /// References pointing at no indexed document (full scan; explicit use only)
-    Dangling,
+    Dangling {
+        /// Only edges whose source document is in this collection
+        #[arg(short, long)]
+        collection: Option<String>,
+    },
 
     /// Entities ranked by degree centrality (full scan; explicit use only)
     Hubs {

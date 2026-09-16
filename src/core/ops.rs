@@ -875,6 +875,16 @@ pub fn handle_get(ctx: &Context, id_or_path: &str, lines: Option<&str>) -> Resul
         }
     }
 
+    // Last: the forms `graph` already accepts — a collection prefix
+    // (`stories/archive/x.md`), the `collection:path` form `search` prints,
+    // and a missing `.md`. `get` and `graph` must agree on what a path is.
+    if let Some(id) = crate::store::graph::resolve_entity_ref(&ctx.conn, id_or_path)? {
+        if let Some(doc) = documents::get_document(&ctx.conn, id)? {
+            let content = get_document_content(ctx, &doc, lines)?;
+            return Ok(GetResult::Document(doc, content));
+        }
+    }
+
     Err(Error::from(ErrorKind::DocumentNotFound {
         id: id_or_path.to_string(),
     }))

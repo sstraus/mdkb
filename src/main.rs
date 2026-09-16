@@ -393,12 +393,33 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         include_superseded,
                     )?;
                     let entries = handle_memory_search(&ctx, &query, limit)?;
+                    // One JSON document, not two arrays under markdown headings:
+                    // a consumer parsing stdout must never see anything else.
+                    if matches!(cli.format, OutputFormat::Json) {
+                        let out = serde_json::json!({
+                            "documents": results,
+                            "memory": entries,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&out)?);
+                        return Ok(());
+                    }
+                    // The headings label two sections for a human reader. CSV is
+                    // read by a program: a markdown heading in that stream is
+                    // noise, and the two tables stay told apart by their header
+                    // rows.
+                    let headings = !matches!(cli.format, OutputFormat::Csv);
                     if !results.is_empty() {
-                        println!("## Documents\n");
+                        if headings {
+                            println!("## Documents\n");
+                        }
                         format_search_results(&results, cli.format);
                     }
                     if !entries.is_empty() {
-                        println!("## Memory Entries\n");
+                        if headings {
+                            println!("## Memory Entries\n");
+                        } else {
+                            println!();
+                        }
                         format_memory_list(&entries, cli.format);
                     }
                     if results.is_empty() && entries.is_empty() {
@@ -1158,8 +1179,8 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     let path = handle_graph_path(&ctx, &a, &b, max_hops)?;
                     format_graph_path(path.as_deref(), cli.format);
                 }
-                GraphCommand::Dangling => {
-                    let dangling = handle_graph_dangling(&ctx)?;
+                GraphCommand::Dangling { collection } => {
+                    let dangling = handle_graph_dangling(&ctx, collection.as_deref())?;
                     format_graph_dangling(&dangling, cli.format);
                 }
                 GraphCommand::Hubs { relation, limit } => {
@@ -1268,7 +1289,8 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} search <query> --scope symbols                     # symbol definitions (fuzzy)
 {0} search <query> --scope symbols --file hook         # path substring, not a glob
 {0} search <query> --scope code                        # semantic code search
-{0} get <id>                                           # full document/memory by ID
+{0} search <query> -c <collection>                     # a collection is -c, NOT --scope
+{0} get <id|path|collection/path|collection:path|slug> # id, path (with or without .md), or memory slug
 {0} get <id> --lines 10:50                             # line range
 {0} mget <pattern>                                     # several documents at once
 
@@ -1312,7 +1334,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} graph backlinks <entity>                           # incoming edges
 {0} graph neighbors <entity> --depth 2                 # adjacent entities (undirected), each with 'via'
 {0} graph path <a> <b>                                 # shortest path between two entities
-{0} graph dangling                                     # refs resolving to no doc (full scan; explicit only)
+{0} graph dangling [-c <collection>]                   # refs resolving to no doc (full scan; explicit only)
 {0} graph hubs --relation owner --limit 20             # entities by degree centrality (full scan; explicit only)
 
 # Collections

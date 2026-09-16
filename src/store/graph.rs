@@ -244,26 +244,32 @@ pub fn resolve_ref_to_doc(conn: &Connection, reference: &str) -> Result<Option<i
     Ok(None)
 }
 
-/// Directory prefixes a collection-qualified reference may carry: the basename of
-/// each collection's configured path (collection path `./map` → prefix `map`).
-/// Stripping these lets `graph links map/people/x.md` resolve like `people/x.md`.
+/// Prefixes a collection-qualified reference may carry: the basename of each
+/// collection's configured path (collection path `./map` → prefix `map`) and
+/// the collection's name (`search` prints results as `name:path`). Stripping
+/// these lets `graph links map/people/x.md` and `get mapcoll:people/x.md`
+/// resolve like `people/x.md`.
 fn collection_prefixes(conn: &Connection) -> Vec<String> {
     let mut prefixes = Vec::new();
-    let Ok(mut stmt) = conn.prepare("SELECT path FROM collections") else {
+    let Ok(mut stmt) = conn.prepare("SELECT name, path FROM collections") else {
         return prefixes;
     };
-    let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) else {
+    let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+    else {
         return prefixes;
     };
-    for path in rows.flatten() {
+    let mut push = |name: &str| {
+        if !name.is_empty() && !prefixes.iter().any(|p| p == name) {
+            prefixes.push(name.to_string());
+        }
+    };
+    for (name, path) in rows.flatten() {
         let base = path
             .trim_start_matches("./")
             .trim_start_matches('/')
             .trim_end_matches('/');
-        let name = base.rsplit('/').next().unwrap_or(base);
-        if !name.is_empty() && !prefixes.iter().any(|p| p == name) {
-            prefixes.push(name.to_string());
-        }
+        push(base.rsplit('/').next().unwrap_or(base));
+        push(&name);
     }
     prefixes
 }
@@ -274,7 +280,10 @@ fn collection_prefixes(conn: &Connection) -> Vec<String> {
 pub fn resolvable_forms(conn: &Connection, reference: &str) -> Vec<String> {
     let mut forms = ref_forms(reference);
     for prefix in collection_prefixes(conn) {
-        if let Some(rest) = reference.strip_prefix(&format!("{prefix}/")) {
+        for sep in ['/', ':'] {
+            let Some(rest) = reference.strip_prefix(&format!("{prefix}{sep}")) else {
+                continue;
+            };
             for f in ref_forms(rest) {
                 if !forms.contains(&f) {
                     forms.push(f);
@@ -496,15 +505,21 @@ pub struct DanglingRef {
 }
 
 /// Edges pointing at a reference that resolves to no indexed document.
+/// `collection` keeps only edges whose source document is in that collection,
+/// so one collection's real gaps are not buried under another's noise.
 ///
 /// Full-table scan — an explicit gardening command only, never run inside
 /// hooks/recall. Resolution per distinct `target_ref` is cached so duplicated
 /// targets are resolved once.
-pub fn dangling(conn: &Connection) -> Result<Vec<DanglingRef>> {
-    let sql =
-        format!("SELECT {EDGE_COLUMNS} FROM edges ORDER BY target_ref, relation, source_doc_id");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], map_edge)?;
+pub fn dangling(conn: &Connection, collection: Option<&str>) -> Result<Vec<DanglingRef>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.source_doc_id, e.target_ref, e.relation, e.source_kind, e.scope, e.created_at
+         FROM edges e
+         JOIN documents d ON d.id = e.source_doc_id
+         WHERE ?1 IS NULL OR d.collection = ?1
+         ORDER BY e.target_ref, e.relation, e.source_doc_id",
+    )?;
+    let rows = stmt.query_map(params![collection], map_edge)?;
 
     let mut resolves: HashMap<String, bool> = HashMap::new();
     let mut out = Vec::new();
@@ -881,11 +896,76 @@ mod tests {
         .unwrap();
         let _ = target;
 
-        let dangling = dangling(&conn).unwrap();
+        let dangling = dangling(&conn, None).unwrap();
         assert_eq!(dangling.len(), 1, "only teams/wiz is unresolved");
         assert_eq!(dangling[0].target_ref, "teams/wiz");
         assert_eq!(dangling[0].relation, "related");
         assert_eq!(dangling[0].source, "projects/x.md");
+    }
+
+    #[test]
+    fn test_dangling_filters_by_source_collection() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('sessions', './sessions', '**/*.jsonl', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let project = insert_doc(&conn, "projects/x.md");
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('h-s', '{}', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+             VALUES ('sessions', 'a.jsonl', 'h-s', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let session = conn.last_insert_rowid();
+        add_edge(&conn, project, "teams/wiz", "related", KIND_FRONTMATTER, None).unwrap();
+        add_edge(&conn, session, "nowhere/y", "mentions", KIND_WIKILINK, None).unwrap();
+
+        assert_eq!(dangling(&conn, None).unwrap().len(), 2, "unfiltered: both");
+        let docs_only = dangling(&conn, Some("docs")).unwrap();
+        assert_eq!(docs_only.len(), 1, "the sessions edge is out of scope");
+        assert_eq!(docs_only[0].source, "projects/x.md");
+        assert!(
+            dangling(&conn, Some("nope")).unwrap().is_empty(),
+            "an unknown collection matches nothing"
+        );
+    }
+
+    #[test]
+    fn test_resolve_entity_ref_accepts_collection_name_and_search_display_form() {
+        let conn = setup_db();
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('mapcoll', './map', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let doc = insert_doc(&conn, "people/x.md");
+
+        for reference in [
+            "mapcoll/people/x.md",
+            "mapcoll:people/x.md",
+            "mapcoll:people/x",
+            "map:people/x.md",
+        ] {
+            assert_eq!(
+                resolve_entity_ref(&conn, reference).unwrap(),
+                Some(doc),
+                "{reference} must resolve: search prints name:path and users type name/path"
+            );
+        }
+        assert_eq!(
+            resolve_entity_ref(&conn, "other:people/x.md").unwrap(),
+            None,
+            "a prefix that is no collection name or path is not stripped"
+        );
     }
 
     #[test]

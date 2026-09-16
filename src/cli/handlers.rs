@@ -181,6 +181,14 @@ mod tests {
             GetResult::Document(doc, _) => assert!(doc.relative_path.ends_with("guide.md")),
             GetResult::Memory(entry) => panic!("expected a document, got {entry:?}"),
         }
+        // The forms `graph` accepts and the form `search` prints must work too:
+        // `get` and `graph` disagreeing on what a path is sent users to Python.
+        for form in ["docs/guide.md", "docs:guide.md", "guide", "docs/guide"] {
+            match handle_get(&ctx, form, None) {
+                Ok(GetResult::Document(doc, _)) => assert!(doc.relative_path.ends_with("guide.md")),
+                other => panic!("{form} must resolve to the document, got {other:?}"),
+            }
+        }
 
         assert!(
             handle_get(&ctx, "missing/thing.md", None).is_err(),

@@ -661,6 +661,21 @@ fn smoke_get_by_path() {
 }
 
 #[test]
+fn smoke_get_accepts_collection_prefixed_and_search_display_forms() {
+    let repo = Repo::new();
+    run(&["update"], &repo.root);
+    for form in ["docs/guide.md", "docs:guide.md", "guide", "docs/guide"] {
+        let out = run(&["get", form], &repo.root);
+        assert_ok(&out, &format!("get {form}"));
+        assert!(
+            stdout(&out).contains("Getting Started"),
+            "get {form} must return the document, got: {}",
+            stdout(&out)
+        );
+    }
+}
+
+#[test]
 fn smoke_get_by_id() {
     let repo = Repo::new();
     run(&["update"], &repo.root);
@@ -1362,6 +1377,17 @@ fn smoke_graph_dangling_and_hubs() {
     let dj = run(&["--format", "json", "graph", "dangling"], &repo.root);
     assert_ok(&dj, "graph dangling json");
     serde_json::from_str::<serde_json::Value>(stdout(&dj).trim()).expect("dangling json valid");
+    // -c scopes to the source document's collection.
+    let scoped = run(&["graph", "dangling", "-c", "docs"], &repo.root);
+    assert_ok(&scoped, "graph dangling -c docs");
+    assert!(stdout(&scoped).contains("teams/wiz"));
+    let other = run(&["graph", "dangling", "-c", "nope"], &repo.root);
+    assert_ok(&other, "graph dangling -c nope");
+    assert!(
+        !stdout(&other).contains("teams/wiz"),
+        "another collection must not see docs' dangling refs: {}",
+        stdout(&other)
+    );
 
     // hubs: project.md is the source of the edges → appears with out-degree.
     let hubs = run(&["graph", "hubs", "--limit", "5"], &repo.root);
@@ -1838,6 +1864,34 @@ fn smoke_format_json_search() {
     run(&["update"], &repo.root);
     let out = run(&["--format", "json", "search", "guide"], &repo.root);
     assert_ok(&out, "search --format json");
+    // The default scope used to print two arrays under markdown headings; a
+    // consumer must be able to parse stdout as one JSON document.
+    let v: serde_json::Value =
+        serde_json::from_str(stdout(&out).trim()).expect("search json must be one JSON document");
+    assert!(v["documents"].is_array(), "documents array, got: {v}");
+    assert!(v["memory"].is_array(), "memory array, got: {v}");
+    assert!(
+        !v["documents"].as_array().unwrap().is_empty(),
+        "guide.md must be found"
+    );
+}
+
+#[test]
+fn smoke_format_csv_search_has_no_markdown_headings() {
+    let repo = Repo::new();
+    run(&["update"], &repo.root);
+    let out = run(&["--format", "csv", "search", "guide"], &repo.root);
+    assert_ok(&out, "search --format csv");
+    assert!(
+        !stdout(&out).contains("## "),
+        "a markdown heading in CSV output is noise a parser chokes on: {}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("id,collection,path,title,score"),
+        "the CSV header row must still be there: {}",
+        stdout(&out)
+    );
 }
 
 #[test]
