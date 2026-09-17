@@ -45,8 +45,13 @@ pub fn model_cache_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("FASTEMBED_CACHE_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var_os("HOME").expect("HOME must be set to locate the model cache");
-    PathBuf::from(home).join(".cache/fastembed")
+    // `HOME` is a Unix convention; Windows names the same directory
+    // `USERPROFILE`, so requiring `HOME` panicked every test in this helper's
+    // suites there. Same order as `git::home_dir`.
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .expect("HOME or USERPROFILE must be set to locate the model cache");
+    PathBuf::from(home).join(".cache").join("fastembed")
 }
 
 /// A hermetic `mdkb` invocation. Callers add arguments, a working directory
@@ -55,6 +60,12 @@ pub fn model_cache_dir() -> PathBuf {
 pub fn command() -> Command {
     let mut cmd = Command::new(bin());
     cmd.env("HOME", isolated_home())
+        // `directories::BaseDirs`, which the binary uses to find its home,
+        // reads `USERPROFILE` on Windows and ignores `HOME` entirely. Setting
+        // only `HOME` would leave every spawned command reading the real
+        // profile there — the same isolation hole as `CLAUDE_CONFIG_DIR` below,
+        // on a different variable.
+        .env("USERPROFILE", isolated_home())
         // Isolating `HOME` stopped isolating the Claude config once `setup`
         // learned to honour `CLAUDE_CONFIG_DIR` (cbc7ac7): a developer who sets
         // it — `~/.claude-private` is the common case — had every `setup`
