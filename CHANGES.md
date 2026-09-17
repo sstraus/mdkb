@@ -4,6 +4,20 @@
 
 ### Fixed
 
+- **Every memory write path runs the same duplicate check.** The near-duplicate
+  gate lived inside `memory add` and the MCP write, and it only ran when the
+  caller happened to supply an embedding. Every import — a directory of files,
+  a single file restore, a JSON bundle, and the git sync — went straight to the
+  insert, so a file could restore an entry the interactive path would have
+  refused, and the same memory could sit in a store twice under two ids. The
+  check is now one function with one named threshold
+  (`NEAR_DUPLICATE_DISTANCE`), and a write that brought no vector gets one.
+  It has two arms: an identical title, which needs no model and so still works
+  on a cold store, and meaning, which catches a reworded restatement
+  (measured: cosine 0.99 refused, 0.917 not — the bar is near-verbatim). A git
+  sync never fails the whole pass on one repeated file; it reports
+  `duplicates_skipped` and leaves the file alone.
+
 - **`--entry-type` narrows memory search instead of replacing it.** Asking
   `search --scope memory --entry-type decision` dropped to a token-AND
   full-text query with no vector leg, so a paraphrase the same search recalled

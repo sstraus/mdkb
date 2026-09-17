@@ -1100,6 +1100,9 @@ pub async fn memory_write_impl(
         ttl: entry.ttl,
         due_in: entry.due_in,
         embedding: embedding.as_deref(),
+        // Already embedded off the lock above: letting `write_memory` do it
+        // would run ONNX on the runtime thread holding the context.
+        embed_when_missing: false,
         source_path: source_path.as_deref(),
         relates: &relations,
         session,
@@ -1216,6 +1219,8 @@ pub async fn memory_write_batch_impl(
                     ttl: entry.ttl,
                     due_in: entry.due_in,
                     embedding: embedding.as_deref(),
+                    // Batch-embedded off the lock above, for the same reason.
+                    embed_when_missing: false,
                     source_path: source_path.as_deref(),
                     relates: &relations,
                     session,
@@ -8236,6 +8241,7 @@ mod tests {
                 ttl: None,
                 due_in: None,
                 embedding: Some(&emb),
+                embed_when_missing: false,
                 source_path: None,
                 relates: &[],
                 session: None,
@@ -8260,6 +8266,7 @@ mod tests {
                 ttl: None,
                 due_in: None,
                 embedding: Some(&emb),
+                embed_when_missing: false,
                 source_path: None,
                 relates: &[],
                 session: None,
@@ -8290,6 +8297,7 @@ mod tests {
                 ttl: None,
                 due_in: None,
                 embedding: Some(&emb),
+                embed_when_missing: false,
                 source_path: None,
                 relates: &[],
                 session: None,

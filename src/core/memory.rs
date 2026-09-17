@@ -59,12 +59,65 @@ pub struct WriteMemoryInput<'a> {
     pub ttl: Option<u64>,
     pub due_in: Option<u64>,
     pub embedding: Option<&'a [f32]>,
+    /// Embed the text here when `embedding` is `None` and a model is warm.
+    ///
+    /// Callers that have already decided not to touch the model — a store with
+    /// `[search] auto_embed_memory = false`, which is also the hermetic switch
+    /// for tests — pass `false`, and the write then dedups on the title alone.
+    pub embed_when_missing: bool,
     pub source_path: Option<&'a str>,
     pub relates: &'a [WriteRelation],
     pub session: Option<&'a str>,
     pub agent: Option<&'a str>,
     pub on_conflict: Option<&'a str>,
     pub dry_run: bool,
+}
+
+/// One import candidate weighed against the store.
+#[derive(Debug)]
+pub struct ImportCheck {
+    /// The vector computed for the candidate, to persist after the insert.
+    /// `None` when the store does not embed on write or the model is cold.
+    pub embedding: Option<Vec<f32>>,
+    /// What the candidate repeats, when it repeats something.
+    pub duplicate: Option<memory::Duplicate>,
+}
+
+/// The duplicate check every import path runs before it inserts.
+///
+/// Imports go straight to `add_entry`, so without this a file could restore an
+/// entry that `write_memory` would have refused — the same corpus, two rules.
+/// Embedding happens here rather than after the insert because the check needs
+/// the vector; the caller persists [`ImportCheck::embedding`] afterwards.
+pub fn check_import(
+    conn: &rusqlite::Connection,
+    entry: &MemoryEntry,
+    embed: bool,
+) -> Result<ImportCheck> {
+    let embedding = embed
+        .then(|| embed_for_write(&entry.title, &entry.content))
+        .flatten();
+    let duplicate = memory::find_duplicate(conn, &entry.id, &entry.title, embedding.as_deref())?;
+    Ok(ImportCheck {
+        embedding,
+        duplicate,
+    })
+}
+
+/// Whether this store embeds memory on write. Also the hermetic switch: with
+/// it off, no write path touches the ONNX model.
+pub fn auto_embed_memory(ctx: &Context) -> bool {
+    crate::config::Config::load_or_default(&ctx.config_path)
+        .search
+        .auto_embed_memory
+}
+
+/// Embed `"{title} {content}"` with the process-wide model, or `None` when it
+/// is cold. The one place the write paths turn text into a vector.
+pub fn embed_for_write(title: &str, content: &str) -> Option<Vec<f32>> {
+    crate::llm::get_cached_service()
+        .ok()
+        .and_then(|service| service.embed_query(&format!("{title} {content}")).ok())
 }
 
 /// Create or update one memory row, including revisions, edges, provenance and
@@ -140,30 +193,21 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
     let due_at = input.due_in.map(|seconds| now + seconds as i64);
     let is_new = existing.is_none();
 
+    // A write that brought no vector still gets one, so the dedup check does
+    // not depend on which door the entry came through. The caller's own
+    // embedding wins when it has one: it was built from the same text.
+    let self_embedded = (input.embedding.is_none() && input.embed_when_missing && is_new)
+        .then(|| embed_for_write(input.title, input.content))
+        .flatten();
+    let embedding = input.embedding.or(self_embedded.as_deref());
+
     let mut contradicts_target = None;
     if is_new {
-        if let Some(embedding) = input.embedding {
-            for (rowid, distance) in
-                crate::store::vectors::memory_vector_search(conn, embedding, 3, None)?
-            {
-                if distance >= 0.32 {
-                    continue;
-                }
-                let Some(duplicate) = memory::get_entry_by_rowid(conn, rowid)? else {
-                    continue;
-                };
-                if input.on_conflict == Some("contradicts") {
-                    contradicts_target = Some(duplicate.id);
-                    break;
-                }
-                let similarity = 1.0 - (f64::from(distance) * f64::from(distance) / 2.0);
-                return Err(ErrorKind::InvalidQuery(format!(
-                    "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). Update that entry instead, or use a more distinct title/content.",
-                    duplicate.title,
-                    duplicate.id,
-                    similarity * 100.0
-                ))
-                .into());
+        if let Some(duplicate) = memory::find_duplicate(conn, input.id, input.title, embedding)? {
+            if input.on_conflict == Some("contradicts") {
+                contradicts_target = Some(duplicate.existing().id.clone());
+            } else {
+                return Err(duplicate.into());
             }
         }
     }
@@ -249,7 +293,7 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
     memory::set_provenance(&tx, input.id, input.session, input.agent)?;
     tx.commit()?;
 
-    if let Some(embedding) = input.embedding {
+    if let Some(embedding) = embedding {
         if let Some(rowid) = memory::get_rowid(conn, input.id)? {
             if let Err(error) = crate::store::vectors::store_memory_embedding(
                 conn,
@@ -297,17 +341,7 @@ pub fn handle_memory_add(
     let tags: Vec<String> = tags
         .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
         .unwrap_or_default();
-    let embedding = if dry_run
-        || !crate::config::Config::load_or_default(&ctx.config_path)
-            .search
-            .auto_embed_memory
-    {
-        None
-    } else {
-        crate::llm::get_cached_service()
-            .ok()
-            .and_then(|service| service.embed_query(&format!("{title} {content}")).ok())
-    };
+    let embed = !dry_run && auto_embed_memory(ctx);
 
     write_memory(
         &ctx.conn,
@@ -320,7 +354,8 @@ pub fn handle_memory_add(
             tags: &tags,
             ttl,
             due_in,
-            embedding: embedding.as_deref(),
+            embedding: None,
+            embed_when_missing: embed,
             source_path,
             relates,
             session: None,
@@ -555,6 +590,44 @@ pub fn handle_memory_export(
 
     Ok(result)
 }
+/// Insert one validated import batch atomically, then project each entry and
+/// persist the vector [`check_import`] already computed for it.
+///
+/// Shared by the directory and the JSON importer: they differ only in how they
+/// parse their input, and a second copy of this loop is a second place for the
+/// two to drift.
+fn insert_imported_batch(
+    ctx: &Context,
+    entries: &[(MemoryEntry, Option<Vec<f32>>)],
+    result: &mut ImportResult,
+) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let now = chrono::Utc::now().timestamp();
+    with_transaction(&ctx.conn, || {
+        for (entry, _) in entries {
+            memory::add_entry(&ctx.conn, entry)?;
+        }
+        Ok(())
+    })?;
+
+    for (entry, embedding) in entries {
+        if let Err(e) = project_entry(ctx, entry, now) {
+            tracing::warn!("Failed to save imported entry {} to disk: {e}", entry.id);
+        }
+        // Store the vector the dedup check already paid for. A cold model left
+        // it `None`, and `mdkb update`'s backfill picks the entry up later.
+        if let Some(embedding) = embedding
+            && let Err(e) = memory::store_entry_embedding(&ctx.conn, &entry.id, embedding)
+        {
+            tracing::warn!("Failed to embed imported entry {}: {e}", entry.id);
+        }
+        result.imported += 1;
+    }
+    Ok(())
+}
+
 /// Import memory entries from a directory of `.md` files with YAML frontmatter.
 pub fn handle_memory_import_dir(
     ctx: &Context,
@@ -592,7 +665,9 @@ pub fn handle_memory_import_dir(
     paths.sort();
 
     // Phase 1: read, parse, validate, and check duplicates — no DB writes.
-    let mut entries_to_insert: Vec<MemoryEntry> = Vec::new();
+    // A dry run never touches the model, so it dedups on the title alone.
+    let embed = !dry_run && auto_embed_memory(ctx);
+    let mut entries_to_insert: Vec<(MemoryEntry, Option<Vec<f32>>)> = Vec::new();
     for path in &paths {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -634,45 +709,28 @@ pub fn handle_memory_import_dir(
             continue;
         }
 
+        // Derived counters (access_count etc.) are DB-owned; fresh entry starts at 0.
+        let entry = mf.into_fresh_entry();
+        let check = check_import(&ctx.conn, &entry, embed)?;
+        if let Some(duplicate) = check.duplicate {
+            if skip_duplicates {
+                result.skipped += 1;
+            } else {
+                result.errors.push(format!("{id}: {}", duplicate.message()));
+            }
+            continue;
+        }
+
         if dry_run {
             result.imported += 1;
             continue;
         }
 
-        // Derived counters (access_count etc.) are DB-owned; fresh entry starts at 0.
-        entries_to_insert.push(mf.into_fresh_entry());
+        entries_to_insert.push((entry, check.embedding));
     }
 
     // Phase 2: insert all valid entries atomically.
-    if !entries_to_insert.is_empty() {
-        let now = chrono::Utc::now().timestamp();
-        with_transaction(&ctx.conn, || {
-            for entry in &entries_to_insert {
-                memory::add_entry(&ctx.conn, entry)?;
-            }
-            Ok(())
-        })?;
-
-        // Gated by `[search] auto_embed_memory` (default on); loaded once, not per entry.
-        let embed = crate::config::Config::load_or_default(&ctx.config_path)
-            .search
-            .auto_embed_memory;
-        for entry in &entries_to_insert {
-            if let Err(e) = project_entry(ctx, entry, now) {
-                tracing::warn!("Failed to save imported entry {} to disk: {e}", entry.id);
-            }
-            // Embed so imported entries are vector-searchable; a cold model
-            // leaves them pending for `mdkb update` backfill (never fatal).
-            if embed {
-                if let Err(e) =
-                    memory::embed_entry(&ctx.conn, &entry.id, &entry.title, &entry.content)
-                {
-                    tracing::warn!("Failed to embed imported entry {}: {e}", entry.id);
-                }
-            }
-            result.imported += 1;
-        }
-    }
+    insert_imported_batch(ctx, &entries_to_insert, &mut result)?;
 
     if !dry_run && result.imported > 0 {
         if let Err(e) = generate_memory_index(ctx) {
@@ -744,18 +802,25 @@ pub fn handle_memory_import_file(ctx: &Context, path: &Path) -> Result<()> {
     }
 
     let entry = file.into_restored_entry();
+
+    // A restore is still a write: a file that repeats an entry already here
+    // must be refused for the same reason and with the same message as
+    // `memory add` would refuse it.
+    let check = check_import(&ctx.conn, &entry, auto_embed_memory(ctx))?;
+    if let Some(duplicate) = check.duplicate {
+        return Err(duplicate.into());
+    }
+
     let now = chrono::Utc::now().timestamp();
     memory::add_entry(&ctx.conn, &entry)?;
     // Re-project so the recorded hash describes canonical bytes; otherwise the
     // next reconciliation reads a pre-v19 file back as a local edit.
     project_entry(ctx, &entry, now)?;
 
-    // Embed here when the model is warm; a cold model leaves the entry pending
-    // and `mdkb update`'s backfill picks it up with no manual step.
-    if crate::config::Config::load_or_default(&ctx.config_path)
-        .search
-        .auto_embed_memory
-        && let Err(e) = memory::embed_entry(&ctx.conn, &id, &entry.title, &entry.content)
+    // Store the vector the check already paid for; a cold model leaves the
+    // entry pending and `mdkb update`'s backfill picks it up with no manual step.
+    if let Some(embedding) = check.embedding
+        && let Err(e) = memory::store_entry_embedding(&ctx.conn, &id, &embedding)
     {
         tracing::warn!("imported entry {id}: embedding deferred to `mdkb update`: {e}");
     }
@@ -793,7 +858,9 @@ pub fn handle_memory_import(
     let now = chrono::Utc::now().timestamp();
 
     // Phase 1: parse, validate, and check duplicates — no DB writes.
-    let mut entries_to_insert: Vec<MemoryEntry> = Vec::new();
+    // A dry run never touches the model, so it dedups on the title alone.
+    let embed = !dry_run && auto_embed_memory(ctx);
+    let mut entries_to_insert: Vec<(MemoryEntry, Option<Vec<f32>>)> = Vec::new();
     for raw in &import_file.entries {
         // Parse entry_type
         let entry_type: EntryType = match raw.entry_type.parse() {
@@ -832,12 +899,7 @@ pub fn handle_memory_import(
             continue;
         }
 
-        if dry_run {
-            result.imported += 1;
-            continue;
-        }
-
-        entries_to_insert.push(MemoryEntry {
+        let entry = MemoryEntry {
             id: raw.id.clone(),
             title: raw.title.clone(),
             content: raw.content.clone(),
@@ -857,38 +919,30 @@ pub fn handle_memory_import(
             source_type,
             expires_at: None,
             due_at: None,
-        });
+        };
+
+        let check = check_import(&ctx.conn, &entry, embed)?;
+        if let Some(duplicate) = check.duplicate {
+            if skip_duplicates {
+                result.skipped += 1;
+            } else {
+                result
+                    .errors
+                    .push(format!("{}: {}", raw.id, duplicate.message()));
+            }
+            continue;
+        }
+
+        if dry_run {
+            result.imported += 1;
+            continue;
+        }
+
+        entries_to_insert.push((entry, check.embedding));
     }
 
     // Phase 2: insert all valid entries atomically.
-    if !entries_to_insert.is_empty() {
-        with_transaction(&ctx.conn, || {
-            for entry in &entries_to_insert {
-                memory::add_entry(&ctx.conn, entry)?;
-            }
-            Ok(())
-        })?;
-
-        // Gated by `[search] auto_embed_memory` (default on); loaded once, not per entry.
-        let embed = crate::config::Config::load_or_default(&ctx.config_path)
-            .search
-            .auto_embed_memory;
-        for entry in &entries_to_insert {
-            if let Err(e) = project_entry(ctx, entry, now) {
-                tracing::warn!("Failed to save imported entry {} to disk: {e}", entry.id);
-            }
-            // Embed so imported entries are vector-searchable; a cold model
-            // leaves them pending for `mdkb update` backfill (never fatal).
-            if embed {
-                if let Err(e) =
-                    memory::embed_entry(&ctx.conn, &entry.id, &entry.title, &entry.content)
-                {
-                    tracing::warn!("Failed to embed imported entry {}: {e}", entry.id);
-                }
-            }
-            result.imported += 1;
-        }
-    }
+    insert_imported_batch(ctx, &entries_to_insert, &mut result)?;
 
     if !dry_run && result.imported > 0 {
         if let Err(e) = generate_memory_index(ctx) {

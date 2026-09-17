@@ -181,6 +181,11 @@ pub struct MemorySyncSummary {
     /// merge markers, unparseable frontmatter, or an `id` disagreeing with the
     /// filename. Never imported, never used to overwrite the DB.
     pub quarantined: usize,
+    /// Files not imported because the entry they carry is already here under
+    /// another id — the same bar `memory add` and `memory import` apply. The
+    /// file is left alone rather than deleted: which of the two to keep is a
+    /// person's decision, not a sync pass's.
+    pub duplicates_skipped: usize,
     /// Set to the count when this pass imported more than
     /// [`MEMORY_SYNC_BULK_ARCHIVE_CAP`] files at once. Not a veto — see the
     /// reasoning at the check itself — but never silent either.
@@ -645,12 +650,34 @@ fn apply_sync_action(
             }
         }
         SyncAction::Import(entry) => {
+            // A file arriving from a checkout is a write like any other, and it
+            // meets the same duplicate bar. A duplicate never fails the pass:
+            // one repeated file must not stop the rest of a reconciliation.
+            let check = crate::core::memory::check_import(
+                &ctx.conn,
+                &entry,
+                crate::core::memory::auto_embed_memory(ctx),
+            )?;
+            if let Some(duplicate) = check.duplicate {
+                tracing::warn!(
+                    "memory sync: {} not imported — {}",
+                    entry.id,
+                    duplicate.message()
+                );
+                summary.duplicates_skipped += 1;
+                return Ok(());
+            }
             memory::add_entry(&ctx.conn, &entry)?;
             // Re-project rather than trust the incoming bytes: the file may have
             // been hand-written with fields in another order, and the recorded
             // hash must describe what *we* would write, or the very next pass
             // reads it back as a local edit.
             project_entry(ctx, &entry, now)?;
+            if let Some(embedding) = check.embedding
+                && let Err(e) = memory::store_entry_embedding(&ctx.conn, &entry.id, &embedding)
+            {
+                tracing::warn!("memory sync: {} embedding deferred: {e}", entry.id);
+            }
             summary.imported += 1;
         }
         SyncAction::Adopt { entry, updated_at } => {

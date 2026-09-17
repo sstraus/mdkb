@@ -2647,6 +2647,13 @@ fn print_memory_sync_warnings(s: &mdkb::core::memory_sync::MemorySyncSummary) {
             s.quarantined
         );
     }
+    if s.duplicates_skipped > 0 {
+        println!(
+            "⚠ {} file(s) not imported — the entry is already here under another id. \
+             Keep one and delete the other file.",
+            s.duplicates_skipped
+        );
+    }
     if s.archive_skipped > 0 {
         println!(
             "⚠ Archival SKIPPED — {} projected files missing at once (suspected bulk \

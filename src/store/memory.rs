@@ -6,7 +6,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{ErrorKind, Result};
+use crate::error::{Error, ErrorKind, Result};
 use crate::store::documents;
 
 /// Maximum ID length (slug format).
@@ -1064,8 +1064,23 @@ fn bm25_search_with_rowid(
     Ok(entries)
 }
 
-/// L2 distance threshold for duplicate detection (~cosine similarity > 0.85).
-const SIMILARITY_THRESHOLD: f32 = 0.55;
+/// The distance at which two entries are the same memory, and the one number
+/// every write path rejects on.
+///
+/// vec0 returns an L2 distance over unit vectors, so `cos = 1 - d²/2`: 0.32 is
+/// a cosine of about 0.95. It used to be a bare literal in `write_memory` that
+/// no import path consulted at all.
+pub const NEAR_DUPLICATE_DISTANCE: f32 = 0.32;
+
+/// How many neighbours [`find_duplicate`] inspects. The check asks "is this
+/// already here", not "what else is nearby", so a short list is enough.
+const NEAR_DUPLICATE_NEIGHBOURS: usize = 3;
+
+/// The wider band in which two entries are worth comparing but are not the same
+/// memory. Deliberately looser than [`NEAR_DUPLICATE_DISTANCE`]: anything
+/// nearer than that was already refused, so a warning at the same distance
+/// could only ever fire for a write that said `on_conflict=contradicts`.
+const SIMILAR_ENTRY_DISTANCE: f32 = 0.55;
 
 /// Weight for RRF/relevance score in confidence-weighted ranking.
 const RELEVANCE_WEIGHT: f64 = 0.7;
@@ -1075,6 +1090,118 @@ const CONFIDENCE_WEIGHT: f64 = 0.3;
 /// Combine query relevance and entry confidence into one retrieval score.
 fn final_hybrid_score(relevance_score: f64, entry: &MemoryEntry) -> f64 {
     relevance_score * RELEVANCE_WEIGHT + entry.confidence() * CONFIDENCE_WEIGHT
+}
+
+/// What a new entry would repeat, and on which evidence.
+#[derive(Debug)]
+pub enum Duplicate {
+    /// The same title, letter for letter. Needs no model, so it is the arm
+    /// that still runs on a store whose embeddings were never built.
+    Title(Box<MemoryEntry>),
+    /// The same lesson in other words, within [`NEAR_DUPLICATE_DISTANCE`].
+    Meaning {
+        entry: Box<MemoryEntry>,
+        /// Cosine, for the message. Ordinal, not a probability.
+        similarity: f64,
+    },
+}
+
+impl Duplicate {
+    /// The entry already in the store.
+    pub fn existing(&self) -> &MemoryEntry {
+        match self {
+            Duplicate::Title(entry) => entry,
+            Duplicate::Meaning { entry, .. } => entry,
+        }
+    }
+
+    /// The one rejection message, so every write path says the same thing.
+    pub fn message(&self) -> String {
+        match self {
+            Duplicate::Title(entry) => format!(
+                "Near-duplicate entry exists: \"{}\" (id: {}, identical title). Update that entry instead, or use a more distinct title/content.",
+                entry.title, entry.id
+            ),
+            Duplicate::Meaning { entry, similarity } => format!(
+                "Near-duplicate entry exists: \"{}\" (id: {}, similarity: {:.0}%). Update that entry instead, or use a more distinct title/content.",
+                entry.title,
+                entry.id,
+                similarity * 100.0
+            ),
+        }
+    }
+}
+
+impl From<Duplicate> for Error {
+    fn from(duplicate: Duplicate) -> Self {
+        ErrorKind::InvalidQuery(duplicate.message()).into()
+    }
+}
+
+/// The entry a new write would duplicate, if the store already holds one.
+///
+/// One check for every write path. `id` is the id being written, so an update
+/// never collides with itself; `embedding` is `None` when no model is warm, in
+/// which case only the title arm runs and a write still refuses to repeat a
+/// title rather than failing.
+pub fn find_duplicate(
+    conn: &Connection,
+    id: &str,
+    title: &str,
+    embedding: Option<&[f32]>,
+) -> Result<Option<Duplicate>> {
+    // The title arm first: it is one indexed comparison and it needs no model,
+    // so a cold store is not a store without dedup.
+    if let Some(existing) = find_by_exact_title(conn, title, id)? {
+        return Ok(Some(Duplicate::Title(Box::new(existing))));
+    }
+
+    let Some(embedding) = embedding else {
+        return Ok(None);
+    };
+    let neighbours = crate::store::vectors::memory_vector_search(
+        conn,
+        embedding,
+        NEAR_DUPLICATE_NEIGHBOURS,
+        None,
+    )?;
+    for (rowid, distance) in neighbours {
+        if distance >= NEAR_DUPLICATE_DISTANCE {
+            continue;
+        }
+        let Some(entry) = get_entry_by_rowid(conn, rowid)? else {
+            continue;
+        };
+        if entry.id == id {
+            continue;
+        }
+        let similarity = 1.0 - (f64::from(distance) * f64::from(distance) / 2.0);
+        return Ok(Some(Duplicate::Meaning {
+            entry: Box::new(entry),
+            similarity,
+        }));
+    }
+    Ok(None)
+}
+
+/// The active entry carrying exactly this title, ignoring `exclude_id`.
+///
+/// Retired entries are skipped on purpose: superseding an entry keeps its
+/// title, and a restore of the replacement must not collide with the row it
+/// replaced.
+fn find_by_exact_title(
+    conn: &Connection,
+    title: &str,
+    exclude_id: &str,
+) -> Result<Option<MemoryEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+         FROM memory_entries
+         WHERE title = ?1 AND id <> ?2 AND status = 'active'
+         LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map(params![title, exclude_id], row_to_entry)?;
+    rows.next().transpose().map_err(Into::into)
 }
 
 /// Find memory entries similar to the given embedding, excluding `exclude_rowid`.
@@ -1089,7 +1216,7 @@ pub fn find_similar_entries(
     let mut warnings = String::new();
     let similar = crate::store::vectors::memory_vector_search(conn, embedding, 5, None)?;
     for (sim_rowid, distance) in &similar {
-        if *sim_rowid == exclude_rowid || *distance > SIMILARITY_THRESHOLD {
+        if *sim_rowid == exclude_rowid || *distance > SIMILAR_ENTRY_DISTANCE {
             continue;
         }
         if let Some(sim_entry) = get_entry_by_rowid(conn, *sim_rowid)? {
@@ -1479,6 +1606,24 @@ pub fn get_rowid(conn: &Connection, id: &str) -> Result<Option<i64>> {
 /// [`backfill_memory_embeddings`]. Only a storage failure *after* a successful
 /// embed propagates as `Err`, so callers can log-and-continue without failing
 /// the underlying write.
+/// Persist a vector the caller already computed for `id`.
+///
+/// The import paths embed before they insert, because the dedup check needs the
+/// vector first. This stores that same vector rather than paying the model a
+/// second time through [`embed_entry`].
+pub fn store_entry_embedding(conn: &Connection, id: &str, embedding: &[f32]) -> Result<bool> {
+    let Some(rowid) = get_rowid(conn, id)? else {
+        return Ok(false);
+    };
+    crate::store::vectors::store_memory_embedding(
+        conn,
+        rowid,
+        embedding,
+        crate::llm::embeddings::MODEL_NAME,
+    )?;
+    Ok(true)
+}
+
 pub fn embed_entry(conn: &Connection, id: &str, title: &str, content: &str) -> Result<bool> {
     let Some(rowid) = get_rowid(conn, id)? else {
         return Ok(false);
@@ -4304,6 +4449,89 @@ mod tests {
             expires_at: None,
             due_at: None,
         }
+    }
+
+    /// With no model, the title arm is the whole duplicate check — and it must
+    /// still answer rather than fail open.
+    #[test]
+    fn a_write_with_no_embedder_still_refuses_an_identical_title() {
+        let conn = setup_db_with_vectors();
+        add_entry(
+            &conn,
+            &typed_entry(
+                "writer-lock",
+                "One writer, many readers",
+                "Serialise every mutation.",
+                EntryType::Decision,
+            ),
+        )
+        .unwrap();
+
+        let duplicate =
+            find_duplicate(&conn, "writer-lock-again", "One writer, many readers", None)
+                .expect("the title arm must not need a model");
+        let Some(Duplicate::Title(existing)) = duplicate else {
+            panic!("an identical title is a duplicate whatever the model says: {duplicate:?}");
+        };
+        assert_eq!(existing.id, "writer-lock");
+
+        assert!(
+            find_duplicate(&conn, "other", "A different title", None)
+                .unwrap()
+                .is_none(),
+            "a title nothing holds is not a duplicate"
+        );
+        assert!(
+            find_duplicate(&conn, "writer-lock", "One writer, many readers", None)
+                .unwrap()
+                .is_none(),
+            "an update of the entry itself is never its own duplicate"
+        );
+    }
+
+    /// The semantic arm, with hand-made vectors so it needs no model.
+    #[test]
+    fn a_neighbour_inside_the_near_duplicate_distance_is_a_duplicate() {
+        use crate::store::vectors;
+        let conn = setup_db_with_vectors();
+        add_entry(
+            &conn,
+            &typed_entry(
+                "writer-lock",
+                "One writer, many readers",
+                "Serialise every mutation.",
+                EntryType::Decision,
+            ),
+        )
+        .unwrap();
+        let rowid = get_rowid(&conn, "writer-lock").unwrap().unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "test").unwrap();
+
+        // Same vector: distance 0, well inside the bar.
+        let near = find_duplicate(
+            &conn,
+            "single-writer",
+            "Another title entirely",
+            Some(&test_embedding(0.30)),
+        )
+        .unwrap();
+        let Some(Duplicate::Meaning { entry, .. }) = near else {
+            panic!("an entry at distance 0 is a duplicate: {near:?}");
+        };
+        assert_eq!(entry.id, "writer-lock");
+
+        // Far enough away that the bar does not trip.
+        assert!(
+            find_duplicate(
+                &conn,
+                "unrelated",
+                "Another title entirely",
+                Some(&test_embedding(2.0)),
+            )
+            .unwrap()
+            .is_none(),
+            "a distant neighbour is not a duplicate"
+        );
     }
 
     /// `--entry-type` narrows the corpus; it must not switch search engines.

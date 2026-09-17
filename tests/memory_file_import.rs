@@ -104,6 +104,121 @@ fn a_second_import_of_the_same_id_is_refused_not_duplicated() {
     assert_eq!(count, 1, "never a duplicate row");
 }
 
+/// Write an entry file with a title and body of the caller's choosing.
+fn write_entry_file_with(
+    dir: &std::path::Path,
+    id: &str,
+    title: &str,
+    body: &str,
+) -> std::path::PathBuf {
+    std::fs::create_dir_all(dir).unwrap();
+    let path = dir.join(format!("{id}.md"));
+    std::fs::write(
+        &path,
+        format!(
+            "---\nid: {id}\ntitle: {title}\nentry_type: decision\n\
+             source_type: official_docs\nstatus: active\ntags: [restore]\n\
+             created_at: {CREATED}\nupdated_at: {UPDATED}\n---\n\n{body}\n"
+        ),
+    )
+    .unwrap();
+    path
+}
+
+/// An import is a write, and it meets the same duplicate bar as `memory add`.
+///
+/// The title arm is the one that survives a cold model: every import path used
+/// to go straight to `add_entry`, so a file could restore an entry the
+/// interactive path would have refused, and a store could end up holding the
+/// same memory twice under two ids.
+#[test]
+fn a_file_repeating_an_existing_title_under_a_new_id_is_refused() {
+    let (dir, root) = store();
+    let incoming = dir.path().join("incoming");
+    let first = write_entry_file_with(
+        &incoming,
+        "writer-lock",
+        "One writer, many readers",
+        "Body.",
+    );
+    let second = write_entry_file_with(
+        &incoming,
+        "writer-lock-again",
+        "One writer, many readers",
+        "A different body under the same title.",
+    );
+
+    let ctx = Context::open(&root).expect("open");
+    handle_memory_import_file(&ctx, &first).expect("first import");
+
+    let err = handle_memory_import_file(&ctx, &second).expect_err("the repeat must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("Near-duplicate entry exists") && message.contains("writer-lock"),
+        "the refusal must be the shared near-duplicate message naming the entry: {message}"
+    );
+
+    let count: i64 = ctx
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_entries WHERE title = 'One writer, many readers'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "the second file must not have landed");
+}
+
+/// The semantic arm of the same bar: different words, same lesson.
+///
+/// Needs the real model — a rewording is only detectable through the
+/// embedding, which is exactly the check every import path used to skip. The
+/// two titles differ, so the title arm cannot be what refuses this one.
+///
+/// What `NEAR_DUPLICATE_DISTANCE` (0.32, cosine ~0.95) actually catches,
+/// measured on 2026-09-17 with all-MiniLM-L6-v2: a reworded restatement of the
+/// same sentence scores cosine 0.99 and is refused, as below. A looser
+/// paraphrase — "One writer connection serialises all mutations" against
+/// "Serialise every write behind a single connection" — scores 0.917 and is
+/// NOT refused; it lands in the advisory "Similar entry exists" band instead.
+/// The bar is near-verbatim by design; do not read this test as proof that
+/// every restatement is caught.
+#[test]
+#[ignore = "requires the ONNX embedding model"]
+fn a_file_paraphrasing_an_existing_entry_is_refused() {
+    let (dir, root) = store();
+    let incoming = dir.path().join("incoming");
+    let first = write_entry_file_with(
+        &incoming,
+        "writer-lock",
+        "Serialise every write behind a single connection",
+        "All mutations go through one writer connection; readers stay concurrent.",
+    );
+    let paraphrase = write_entry_file_with(
+        &incoming,
+        "single-writer",
+        "Serialize every write behind a single connection",
+        "All mutations go through one writer connection; readers remain concurrent.",
+    );
+
+    let ctx = Context::open(&root).expect("open");
+    handle_memory_import_file(&ctx, &first).expect("first import");
+
+    let err =
+        handle_memory_import_file(&ctx, &paraphrase).expect_err("the paraphrase must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("Near-duplicate entry exists") && message.contains("writer-lock"),
+        "the refusal must be the shared near-duplicate message naming the entry: {message}"
+    );
+
+    let count: i64 = ctx
+        .conn
+        .query_row("SELECT COUNT(*) FROM memory_entries", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 1, "the paraphrase must not have landed");
+}
+
 /// A file whose frontmatter disagrees with its name is ambiguous, and guessing
 /// which one is authoritative is how a restore silently writes the wrong id.
 #[test]

@@ -512,11 +512,13 @@ mod tests {
         .expect("disable embeddings for graph-only fixture");
         let ctx = Context::open(temp.path()).expect("open should succeed");
 
-        for id in ["a", "b"] {
+        // Distinct titles: two entries sharing one letter for letter are a
+        // duplicate, and the write path refuses the second.
+        for (id, title) in [("a", "Source entry"), ("b", "Target entry")] {
             handle_memory_add(
                 &ctx,
                 id,
-                "Title",
+                title,
                 "topic",
                 None,
                 "content",
