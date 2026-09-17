@@ -15,15 +15,29 @@ const DEFAULT_PID_NAME: &str = "daemon.pid";
 /// Default maximum number of concurrently active repo handles.
 const DEFAULT_MAX_ACTIVE_REPOS: usize = 5;
 
-/// Resolve the current user's home directory via [`directories::BaseDirs`].
+/// Resolve the current user's home directory: `HOME`, then `USERPROFILE`, then
+/// [`directories::BaseDirs`].
 ///
-/// Returns `Ok(PathBuf)` on success. Returns an error with a clear message
-/// when the home directory cannot be resolved (e.g. HOME unset or empty),
-/// so callers fail fast instead of silently producing paths relative to CWD.
+/// The environment comes first because `BaseDirs` on Windows calls
+/// `SHGetKnownFolderPath(FOLDERID_Profile)` — a Win32 API that no variable can
+/// override. Everything under `~/.mdkb` was therefore unaddressable there: an
+/// operator could not point mdkb at another profile, and the test suite could
+/// not isolate itself, so every spawned command wrote into the real user
+/// profile while believing it was in a tempdir. `git::home_dir` already read
+/// the environment in this order; the two now agree.
+///
+/// An empty value counts as absent so it cannot degrade into the filesystem
+/// root. Returns an error rather than a CWD-relative path when nothing names a
+/// home, so callers fail fast.
 pub fn home_dir() -> Result<PathBuf> {
-    directories::BaseDirs::new()
-        .map(|b| b.home_dir().to_path_buf())
-        .ok_or_else(|| Error::other("Cannot resolve home directory: HOME is unset or empty"))
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()))
+        .ok_or_else(|| {
+            Error::other("Cannot resolve home directory: HOME and USERPROFILE are unset or empty")
+        })
 }
 
 /// Daemon configuration.
@@ -202,6 +216,36 @@ fn expand_tilde(path: &str) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// `nextest` gives every test its own process, so setting a variable here
+    /// cannot leak into another test.
+    ///
+    /// The point of the whole function: an operator, and this suite, must be
+    /// able to say where home is. `BaseDirs` alone answers a Win32 API that
+    /// takes no instruction.
+    #[test]
+    fn the_environment_names_home_before_the_platform_does() {
+        let tmp = TempDir::new().unwrap();
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        assert_eq!(home_dir().unwrap(), tmp.path());
+
+        // Windows spelling, honoured everywhere so the two platforms cannot
+        // drift into different resolution orders.
+        unsafe { std::env::remove_var("HOME") };
+        unsafe { std::env::set_var("USERPROFILE", tmp.path()) };
+        assert_eq!(home_dir().unwrap(), tmp.path());
+    }
+
+    /// An empty value must not resolve to the filesystem root, which is where
+    /// `PathBuf::from("")` joined with `.mdkb` would put the store.
+    #[test]
+    fn an_empty_home_is_not_a_home() {
+        unsafe { std::env::set_var("HOME", "") };
+        unsafe { std::env::set_var("USERPROFILE", "") };
+        // Falls through to the platform, which on CI does resolve — the claim
+        // is only that the empty string is never the answer.
+        assert_ne!(home_dir().ok(), Some(PathBuf::new()));
+    }
 
     #[test]
     fn test_default_daemon_config() {
