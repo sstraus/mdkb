@@ -1794,8 +1794,15 @@ mod tests {
         let ctx = Context::open(temp.path()).unwrap();
         handle_collection_add(&ctx, "docs", "docs", "**/*.md").unwrap();
 
-        // Try to index a file outside the project root
-        let result = handle_update_files(&ctx, temp.path(), &["/etc/hosts".to_string()])
+        // Try to index a file outside the project root. `/etc/hosts` is
+        // absolute on Unix but a *rooted relative* path on Windows, where it
+        // resolves inside the current drive and never escapes anything.
+        let outside = if cfg!(windows) {
+            r"C:\Windows\System32\drivers\etc\hosts"
+        } else {
+            "/etc/hosts"
+        };
+        let result = handle_update_files(&ctx, temp.path(), &[outside.to_string()])
             .expect("should succeed overall");
         assert_eq!(result.added, 0, "file outside root should not be indexed");
         assert!(

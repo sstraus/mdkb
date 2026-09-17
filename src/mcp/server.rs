@@ -887,10 +887,27 @@ impl McpServer {
 }
 
 /// Convert a `file://` URI to a local filesystem path.
+///
+/// A Windows file URI spells an absolute path as `file:///C:/project`, so what
+/// survives `strip_prefix("file://")` is `/C:/project` — which has a root but no
+/// drive, and is therefore *not* absolute to `Path`. Without dropping that
+/// leading slash the function rejected every well-formed Windows URI, and an
+/// MCP client running there could not name a root at all.
 fn uri_to_path(uri: &str) -> Option<PathBuf> {
     let path_str = uri.strip_prefix("file://")?;
+    let path_str = match path_str.strip_prefix('/') {
+        // `/C:/…` only ever means a drive-qualified path, and only on Windows.
+        Some(rest) if cfg!(windows) && has_drive_prefix(rest) => rest,
+        _ => path_str,
+    };
     let path = PathBuf::from(path_str);
     if path.is_absolute() { Some(path) } else { None }
+}
+
+/// Whether `s` starts with a `C:` style drive letter.
+fn has_drive_prefix(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!((chars.next(), chars.next()), (Some(c), Some(':')) if c.is_ascii_alphabetic())
 }
 
 // rmcp 3 defaults to `Self::tool_router()`, a fresh router on every call;
@@ -4046,6 +4063,18 @@ if (require.main === module) {
             ("file:///Users/me/project", "/Users/me/project")
         };
         assert_eq!(uri_to_path(uri), Some(PathBuf::from(expected)));
+    }
+
+    /// The drive-letter test runs everywhere, so a change to it cannot hide
+    /// behind the platform the developer happens to be on.
+    #[test]
+    fn a_drive_prefix_is_a_letter_then_a_colon() {
+        assert!(has_drive_prefix("C:/Users"));
+        assert!(has_drive_prefix("d:\\temp"));
+        assert!(!has_drive_prefix("/Users/me"));
+        assert!(!has_drive_prefix("1:/nope"));
+        assert!(!has_drive_prefix("C"));
+        assert!(!has_drive_prefix(""));
     }
 
     #[test]
