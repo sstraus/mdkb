@@ -210,7 +210,7 @@ fn an_expired_prior_stops_injecting_when_its_projection_is_archived() {
             id: "clu-generated".into(),
             canonical_trigger_key: "pre_tool|src/generated/**".into(),
             trigger_kind: "pre_tool".into(),
-            trigger_matcher: r#"{"pattern":"src/generated/**"}"#.into(),
+            trigger_matcher: r#"{"path_glob":"src/generated/**"}"#.into(),
             lesson: "Do not edit generated files; edit the generator.".into(),
             scope: r#"{"repo":"current"}"#.into(),
             evidence_count: 2,

@@ -628,75 +628,169 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `pattern` identifies a tool call: the tool's name, a glob over its
-/// path, or a substring of its command. Shared by `pre_tool` and `post_tool`,
-/// which differ only in when they fire.
-fn tool_call_matches(pattern: &str, tool: &str, path: Option<&str>, command: Option<&str>) -> bool {
-    if pattern.is_empty() {
-        return false;
-    }
-    if pattern.eq_ignore_ascii_case(tool) {
-        return true;
-    }
-    if let Some(p) = path
-        && glob_matches(pattern, p)
-    {
-        return true;
-    }
-    if let Some(c) = command
-        && c.contains(pattern)
-    {
-        return true;
-    }
-    false
+/// A trigger condition, as named selectors rather than one guessed string.
+///
+/// Every selector present must hold — they are ANDed, because "an `Edit` on a
+/// Rust file" is one condition, not two alternatives. At least one must be
+/// present; a matcher with none is rejected at distill time, and treated as
+/// never matching if one ever reaches the store.
+///
+/// This replaces a single untyped `pattern` that was tried against three
+/// different things in turn: the tool name, a path glob, then a command
+/// substring. Replayed over 5124 recorded tool calls on 2026-09-17, the 56
+/// stored tool-kind candidates produced 308 matches of which **285 came from
+/// the bare tool-name arm** — `{"pattern":"Edit"}` firing on every edit in the
+/// corpus — while **50 of the 56 patterns matched nothing at all**. One
+/// spelling, three meanings: the model could not tell which it was writing and
+/// neither could a reader.
+///
+/// Deliberately no regex selector. The pattern is untrusted model output; a
+/// backtracking regex is neither easy for a model to generate correctly nor for
+/// a person to reason about, and its failure mode is a stall, not a miss.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct TriggerMatcher {
+    /// The tool's name. Compared case-insensitively: models write `bash` and
+    /// `Bash` interchangeably and the distinction carries no meaning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// A glob over the call's repo-relative path. Case-sensitive: paths are
+    /// case-sensitive on the platforms this indexes, and `src/**` and `SRC/**`
+    /// are not the same directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_glob: Option<String>,
+    /// A literal substring of the shell command. Case-sensitive: shell tokens
+    /// (`-R` against `-r`, `Cargo.toml`) carry meaning in their case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_contains: Option<String>,
+    /// A literal substring of the user's prompt. Case-insensitive: prose
+    /// capitalisation is noise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_contains: Option<String>,
+    /// Free prose for a person reading the record. Never matched on — it exists
+    /// so the stored row explains itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<String>,
 }
 
-/// Whether a promoted cluster's trigger matches the current context.
-///
-/// The matcher reads the distiller's `{"when","pattern"}` shape. For `pre_tool`
-/// and `post_tool` the `pattern` matches the tool name, a path glob, or a
-/// command substring; for `prompt` it (or `when`) is a case-insensitive
-/// substring of the prompt. A kind is matched only in its own context, and a
-/// kind with no arm here never matches anything — which is why
-/// `VALID_TRIGGER_KINDS` may not contain one.
-pub fn trigger_matches(kind: &str, matcher_json: &str, ctx: &TriggerContext) -> bool {
-    let v: serde_json::Value = match serde_json::from_str(matcher_json) {
-        Ok(v) => v,
-        Err(_) => return false,
-    };
-    let pattern = v
-        .get("pattern")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .trim();
-    let when = v.get("when").and_then(|x| x.as_str()).unwrap_or("").trim();
+fn non_empty(s: Option<&String>) -> Option<&str> {
+    s.map(|s| s.trim()).filter(|s| !s.is_empty())
+}
 
-    match (kind, ctx) {
-        (
-            "pre_tool",
+impl TriggerMatcher {
+    /// Whether any selector is set. `when` does not count — it is prose.
+    pub fn has_selector(&self) -> bool {
+        non_empty(self.tool.as_ref()).is_some()
+            || non_empty(self.path_glob.as_ref()).is_some()
+            || non_empty(self.command_contains.as_ref()).is_some()
+            || non_empty(self.prompt_contains.as_ref()).is_some()
+    }
+
+    /// Whether every selector present holds in `ctx`.
+    ///
+    /// A selector the context cannot supply fails. `command_contains` against a
+    /// call with no command is a condition that was not met, not one that does
+    /// not apply — the alternative is a matcher that widens as the context gets
+    /// thinner, which is how the untyped matcher fired everywhere.
+    fn matches(&self, ctx: &TriggerContext) -> bool {
+        if !self.has_selector() {
+            return false;
+        }
+        let (tool, path, command, prompt) = match ctx {
             TriggerContext::PreTool {
                 tool,
                 path,
                 command,
-            },
-        )
-        | (
-            "post_tool",
-            TriggerContext::PostTool {
+            }
+            | TriggerContext::PostTool {
                 tool,
                 path,
                 command,
-            },
-        ) => tool_call_matches(pattern, tool, *path, *command),
-        ("prompt", TriggerContext::Prompt { text }) => {
-            let needle = if pattern.is_empty() { when } else { pattern };
-            if needle.is_empty() {
-                return false;
-            }
-            text.to_lowercase().contains(&needle.to_lowercase())
+            } => (Some(*tool), *path, *command, None),
+            TriggerContext::Prompt { text } => (None, None, None, Some(*text)),
+        };
+
+        if let Some(want) = non_empty(self.tool.as_ref())
+            && !tool.is_some_and(|t| t.eq_ignore_ascii_case(want))
+        {
+            return false;
         }
-        _ => false,
+        if let Some(want) = non_empty(self.path_glob.as_ref())
+            && !path.is_some_and(|p| glob_matches(want, p))
+        {
+            return false;
+        }
+        if let Some(want) = non_empty(self.command_contains.as_ref())
+            && !command.is_some_and(|c| c.contains(want))
+        {
+            return false;
+        }
+        if let Some(want) = non_empty(self.prompt_contains.as_ref())
+            && !prompt.is_some_and(|p| p.to_lowercase().contains(&want.to_lowercase()))
+        {
+            return false;
+        }
+        true
     }
+}
+
+/// Whether a promoted cluster's trigger matches the current context.
+///
+/// A kind is matched only in its own context, and a kind with no arm here never
+/// matches anything — which is why `VALID_TRIGGER_KINDS` may not contain one.
+///
+/// A stored matcher in the pre-D4 `{"when","pattern"}` shape never matches.
+/// That is the decision, not an oversight: `pattern` meant three different
+/// things depending on which of three attempts happened to hit, so there is no
+/// safe reading to migrate it to. The plan (D4) requires such a cluster to be
+/// re-expressed by hand or archived, never reinterpreted automatically — see
+/// [`archive_untyped_matchers`], which retires them so they cannot sit in the
+/// store reporting as live while matching nothing.
+pub fn trigger_matches(kind: &str, matcher_json: &str, ctx: &TriggerContext) -> bool {
+    let Ok(matcher) = serde_json::from_str::<TriggerMatcher>(matcher_json) else {
+        return false;
+    };
+    let kind_fits = matches!(
+        (kind, ctx),
+        ("pre_tool", TriggerContext::PreTool { .. })
+            | ("post_tool", TriggerContext::PostTool { .. })
+            | ("prompt", TriggerContext::Prompt { .. })
+    );
+    kind_fits && matcher.matches(ctx)
+}
+
+/// Retire every cluster whose matcher predates the typed shape.
+///
+/// Returns the ids retired. These rows cannot fire — `trigger_matches` refuses
+/// the untyped shape by design — so leaving them `candidate` or `promoted`
+/// would let them accumulate evidence, occupy a promotion and report as working
+/// while teaching nobody. Archiving states the truth; the evidence text stays on
+/// the row for anyone re-expressing the lesson by hand.
+pub fn archive_untyped_matchers(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, trigger_matcher FROM prior_clusters
+          WHERE state IN ('candidate', 'promoted')",
+    )?;
+    let rows: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    let stale: Vec<String> = rows
+        .into_iter()
+        .filter(|(_, m)| {
+            serde_json::from_str::<TriggerMatcher>(m)
+                .map(|t| !t.has_selector())
+                .unwrap_or(true)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    for id in &stale {
+        conn.execute(
+            "UPDATE prior_clusters SET state = 'archived' WHERE id = ?1",
+            params![id],
+        )?;
+    }
+    Ok(stale)
 }
 
 /// Promoted clusters whose memory entry is still alive.
@@ -1415,9 +1509,188 @@ mod tests {
 
     // --- Phase 7: trigger matching + injection selection ---
 
+    fn edit(path: &str) -> TriggerContext<'_> {
+        TriggerContext::PreTool {
+            tool: "Edit",
+            path: Some(path),
+            command: None,
+        }
+    }
+
+    fn bash(command: &str) -> TriggerContext<'_> {
+        TriggerContext::PreTool {
+            tool: "Bash",
+            path: None,
+            command: Some(command),
+        }
+    }
+
+    /// Two selectors are one condition, not two chances to fire.
+    ///
+    /// The plan's worked example (D4): `{"tool":"Edit","path_glob":"**/*.rs"}`
+    /// is about editing Rust, so a Bash command that merely names a Rust file
+    /// is not it. The untyped matcher fired on both — it tried the tool name,
+    /// then the path, then the command, and stopped at the first that hit.
+    #[test]
+    fn a_tool_and_a_path_are_anded_not_tried_in_turn() {
+        let matcher = r#"{"tool":"Edit","path_glob":"**/*.rs"}"#;
+
+        assert!(trigger_matches(
+            "pre_tool",
+            matcher,
+            &edit("src/store/priors.rs")
+        ));
+
+        // Right tool, wrong path.
+        assert!(!trigger_matches("pre_tool", matcher, &edit("README.md")));
+        // Right path, wrong tool — and this is the one the old matcher got
+        // wrong: a shell command touching a Rust file is not an edit of it.
+        assert!(!trigger_matches(
+            "pre_tool",
+            matcher,
+            &TriggerContext::PreTool {
+                tool: "Bash",
+                path: Some("src/store/priors.rs"),
+                command: Some("wc -l src/store/priors.rs"),
+            }
+        ));
+    }
+
+    /// A selector the context cannot answer fails; it does not fall away.
+    ///
+    /// An `Edit` carries no command, so `command_contains` against one is a
+    /// condition that was not met. Treating it as "not applicable" would make
+    /// the matcher widen as the context got thinner, which is exactly how a
+    /// narrow-looking pattern ended up firing everywhere.
+    #[test]
+    fn a_selector_the_context_cannot_supply_fails_rather_than_widening() {
+        let matcher = r#"{"tool":"Edit","command_contains":"cargo"}"#;
+        assert!(!trigger_matches("pre_tool", matcher, &edit("src/main.rs")));
+
+        // And a matcher with nothing to match on never fires, whatever prose
+        // sits beside it.
+        assert!(!trigger_matches(
+            "pre_tool",
+            r#"{"when":"before editing anything at all"}"#,
+            &edit("src/main.rs")
+        ));
+        assert!(!trigger_matches("pre_tool", "{}", &edit("src/main.rs")));
+    }
+
+    /// Case sensitivity is a property of each selector, and each has a reason.
+    #[test]
+    fn each_selector_defines_its_own_case_sensitivity() {
+        // Tool: insensitive. Models write `bash` and `Bash` interchangeably.
+        assert!(trigger_matches(
+            "pre_tool",
+            r#"{"tool":"bash"}"#,
+            &bash("ls")
+        ));
+
+        // Command: sensitive. `-R` and `-r` are different flags.
+        assert!(trigger_matches(
+            "pre_tool",
+            r#"{"command_contains":"cargo test"}"#,
+            &bash("cargo test --lib")
+        ));
+        assert!(!trigger_matches(
+            "pre_tool",
+            r#"{"command_contains":"Cargo Test"}"#,
+            &bash("cargo test --lib")
+        ));
+
+        // Path: sensitive. `src/` and `SRC/` are not the same directory.
+        assert!(!trigger_matches(
+            "pre_tool",
+            r#"{"path_glob":"SRC/**"}"#,
+            &edit("src/main.rs")
+        ));
+
+        // Prompt: insensitive. Prose capitalisation is noise.
+        assert!(trigger_matches(
+            "prompt",
+            r#"{"prompt_contains":"RIPGREP"}"#,
+            &TriggerContext::Prompt {
+                text: "use ripgrep here"
+            }
+        ));
+    }
+
+    /// No selector is a regex, and the store must not accidentally behave like
+    /// one.
+    ///
+    /// The pattern is untrusted model output. `a|b` is three literal
+    /// characters, not an alternation — a model that means two alternatives has
+    /// to write two priors, which is also the only shape a person can read off
+    /// the row. Nine of the stored candidates carry `|` in their pattern; none
+    /// of them ever meant a literal pipe.
+    #[test]
+    fn alternation_is_literal_text_not_a_regex() {
+        let matcher = r#"{"command_contains":"git reset --soft|--mixed"}"#;
+        assert!(!trigger_matches(
+            "pre_tool",
+            matcher,
+            &bash("git reset --soft HEAD~1")
+        ));
+        assert!(trigger_matches(
+            "pre_tool",
+            matcher,
+            &bash("git reset --soft|--mixed")
+        ));
+    }
+
+    /// A matcher in the pre-D4 shape never fires, and does not sit in the store
+    /// pretending to.
+    #[test]
+    fn the_untyped_shape_never_matches_and_is_archived_rather_than_reinterpreted() {
+        // `*| grep*` is the live cluster the review found: written as a glob,
+        // matched as a literal substring, so it only ever fired on a command
+        // that contained the asterisks.
+        let untyped = r#"{"pattern":"*| grep*","when":"before shell commands"}"#;
+        assert!(!trigger_matches(
+            "pre_tool",
+            untyped,
+            &bash("ls | grep foo")
+        ));
+
+        let conn = conn();
+        upsert_cluster(&conn, &promoted_cluster("clu-untyped", untyped, 5)).unwrap();
+        let mut typed = promoted_cluster("clu-typed", r#"{"command_contains":"| grep"}"#, 5);
+        typed.id = "clu-typed".into();
+        upsert_cluster(&conn, &typed).unwrap();
+
+        let retired = archive_untyped_matchers(&conn).unwrap();
+        assert_eq!(retired, vec!["clu-untyped".to_string()]);
+
+        let state = |id: &str| -> String {
+            conn.query_row(
+                "SELECT state FROM prior_clusters WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(state("clu-untyped"), "archived");
+        assert_eq!(
+            state("clu-typed"),
+            "promoted",
+            "a typed cluster must survive the sweep untouched"
+        );
+
+        // The evidence stays readable for whoever re-expresses the lesson.
+        let kept: String = conn
+            .query_row(
+                "SELECT trigger_matcher FROM prior_clusters WHERE id = 'clu-untyped'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, untyped);
+    }
+
     #[test]
     fn pre_tool_trigger_matches_path_glob_tool_and_command() {
-        let matcher = r#"{"when":"editing generated code","pattern":"src/generated/**"}"#;
+        let matcher = r#"{"when":"editing generated code","path_glob":"src/generated/**"}"#;
         let ctx = TriggerContext::PreTool {
             tool: "Edit",
             path: Some("src/generated/api.rs"),
@@ -1434,7 +1707,7 @@ mod tests {
         assert!(!trigger_matches("pre_tool", matcher, &ctx_miss));
 
         // Tool-name pattern.
-        let tool_matcher = r#"{"pattern":"Bash"}"#;
+        let tool_matcher = r#"{"tool":"Bash"}"#;
         assert!(trigger_matches(
             "pre_tool",
             tool_matcher,
@@ -1446,7 +1719,7 @@ mod tests {
         ));
 
         // Command-substring pattern.
-        let cmd_matcher = r#"{"pattern":"cargo test"}"#;
+        let cmd_matcher = r#"{"command_contains":"cargo test"}"#;
         assert!(trigger_matches(
             "pre_tool",
             cmd_matcher,
@@ -1472,14 +1745,14 @@ mod tests {
         let matchable: &[(&str, &str, TriggerContext)] = &[
             (
                 "prompt",
-                r#"{"pattern":"ripgrep"}"#,
+                r#"{"prompt_contains":"ripgrep"}"#,
                 TriggerContext::Prompt {
                     text: "use ripgrep here",
                 },
             ),
             (
                 "pre_tool",
-                r#"{"pattern":"src/generated/**"}"#,
+                r#"{"path_glob":"src/generated/**"}"#,
                 TriggerContext::PreTool {
                     tool: "Edit",
                     path: Some("src/generated/api.rs"),
@@ -1488,7 +1761,7 @@ mod tests {
             ),
             (
                 "post_tool",
-                r#"{"pattern":"src/generated/**"}"#,
+                r#"{"path_glob":"src/generated/**"}"#,
                 TriggerContext::PostTool {
                     tool: "Edit",
                     path: Some("src/generated/api.rs"),
@@ -1519,7 +1792,7 @@ mod tests {
 
     #[test]
     fn prompt_trigger_matches_case_insensitive_substring() {
-        let matcher = r#"{"when":"asks about ripgrep","pattern":"ripgrep"}"#;
+        let matcher = r#"{"when":"asks about ripgrep","prompt_contains":"ripgrep"}"#;
         assert!(trigger_matches(
             "prompt",
             matcher,
@@ -1546,13 +1819,13 @@ mod tests {
         // prompt-kind trigger against a pre_tool context: no match.
         assert!(!trigger_matches(
             "prompt",
-            r#"{"pattern":"src/generated/**"}"#,
+            r#"{"path_glob":"src/generated/**"}"#,
             &ctx
         ));
         // Unparseable matcher: no match (must not surface a prior everywhere).
         assert!(!trigger_matches("pre_tool", "not json", &ctx));
         // Invalid glob: no match.
-        assert!(!trigger_matches("pre_tool", r#"{"pattern":"["}"#, &ctx));
+        assert!(!trigger_matches("pre_tool", r#"{"path_glob":"["}"#, &ctx));
     }
 
     fn promoted_cluster(id: &str, matcher: &str, sessions: i64) -> PriorCluster {
@@ -1603,17 +1876,17 @@ mod tests {
         // Promoted + matching trigger.
         seed_with_projection(
             &conn,
-            promoted_cluster("clu-a", r#"{"pattern":"src/generated/**"}"#, 2),
+            promoted_cluster("clu-a", r#"{"path_glob":"src/generated/**"}"#, 2),
             None,
         );
         // Promoted but non-matching trigger.
         seed_with_projection(
             &conn,
-            promoted_cluster("clu-b", r#"{"pattern":"docs/**"}"#, 2),
+            promoted_cluster("clu-b", r#"{"path_glob":"docs/**"}"#, 2),
             None,
         );
         // Matching trigger but only a candidate (never injectable).
-        let mut cand = promoted_cluster("clu-c", r#"{"pattern":"src/generated/**"}"#, 2);
+        let mut cand = promoted_cluster("clu-c", r#"{"path_glob":"src/generated/**"}"#, 2);
         cand.state = "candidate".into();
         upsert_cluster(&conn, &cand).unwrap();
 
@@ -1634,12 +1907,12 @@ mod tests {
         // Two matching promoted priors; the one seen in more sessions scores higher.
         seed_with_projection(
             &conn,
-            promoted_cluster("clu-lo", r#"{"pattern":"src/generated/**"}"#, 2),
+            promoted_cluster("clu-lo", r#"{"path_glob":"src/generated/**"}"#, 2),
             None,
         );
         seed_with_projection(
             &conn,
-            promoted_cluster("clu-hi", r#"{"pattern":"src/**"}"#, 8),
+            promoted_cluster("clu-hi", r#"{"path_glob":"src/**"}"#, 8),
             None,
         );
 
@@ -1666,7 +1939,7 @@ mod tests {
         let lapsed_at = 1_000;
         let now = lapsed_at + 1;
 
-        let matcher = r#"{"pattern":"src/**"}"#;
+        let matcher = r#"{"path_glob":"src/**"}"#;
         seed_with_projection(&conn, promoted_cluster("clu-live", matcher, 2), None);
         seed_with_projection(
             &conn,
@@ -1718,7 +1991,7 @@ mod tests {
     fn sample_distilled() -> DistilledPrior {
         DistilledPrior {
             trigger_kind: "pre_tool".into(),
-            trigger_matcher: r#"{"pattern":"src/generated/**"}"#.into(),
+            trigger_matcher: r#"{"path_glob":"src/generated/**"}"#.into(),
             lesson: "Do not edit generated files; edit the generator instead.".into(),
             scope: r#"{"repo":"current","languages":["rust"]}"#.into(),
             evidence_failure: "Direct edit was overwritten by regeneration.".into(),
@@ -1782,7 +2055,7 @@ mod tests {
         let conn = conn();
 
         // Session 1: the distiller emits a pre_tool trigger for the lesson.
-        let d1 = sample_distilled(); // trigger {"pattern":"src/generated/**"}
+        let d1 = sample_distilled(); // trigger {"path_glob":"src/generated/**"}
         let emb1 = [1.0_f32, 0.0, 0.0];
         assert_eq!(
             integrate_distilled(&conn, &d1, "sess-1", 1000, Some(&emb1), None).unwrap(),
@@ -1795,7 +2068,7 @@ mod tests {
         // near-identical lesson embedding must merge it into cluster 1.
         let d2 = DistilledPrior {
             trigger_kind: "post_tool".into(),
-            trigger_matcher: r#"{"pattern":"src/generated/*","when":"after editing generated"}"#
+            trigger_matcher: r#"{"path_glob":"src/generated/*","when":"after editing generated"}"#
                 .into(),
             lesson: "Regenerate generated sources; never hand-edit auto-generated files.".into(),
             scope: r#"{"repo":"current"}"#.into(),
@@ -1828,7 +2101,7 @@ mod tests {
         // A different trigger AND an orthogonal embedding: must NOT merge.
         let d2 = DistilledPrior {
             trigger_kind: "prompt".into(),
-            trigger_matcher: r#"{"pattern":"deploy"}"#.into(),
+            trigger_matcher: r#"{"prompt_contains":"deploy"}"#.into(),
             lesson: "Always run the smoke test before deploying to production.".into(),
             scope: r#"{"repo":"current"}"#.into(),
             evidence_failure: "Broken deploy reached prod.".into(),
@@ -1849,7 +2122,7 @@ mod tests {
         let conn = conn();
         upsert_cluster(
             &conn,
-            &promoted_cluster("clu-a", r#"{"pattern":"src/**"}"#, 2),
+            &promoted_cluster("clu-a", r#"{"path_glob":"src/**"}"#, 2),
         )
         .unwrap();
         let seen_before = get_cluster(&conn, "clu-a").unwrap().unwrap().last_seen_at;
@@ -1869,7 +2142,7 @@ mod tests {
 
     /// A cluster with a known signature, promoted and injectable.
     fn cluster_with_signature(id: &str, signature: Option<&str>) -> PriorCluster {
-        let mut c = promoted_cluster(id, r#"{"pattern":"src/**"}"#, 2);
+        let mut c = promoted_cluster(id, r#"{"path_glob":"src/**"}"#, 2);
         c.error_signature = signature.map(str::to_string);
         c
     }

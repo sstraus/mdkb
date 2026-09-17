@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 25;
+pub const SCHEMA_VERSION: i32 = 26;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -955,6 +955,34 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 "ALTER TABLE memory_entries ADD COLUMN last_refuted_at INTEGER",
                 [],
             )?;
+        }
+    }
+
+    // Migration from v25 to v26: retire clusters whose trigger is the pre-D4
+    // untyped `pattern`.
+    //
+    // One string was tried against three things in turn — the tool name, a path
+    // glob, then a command substring — and the first hit won. Replayed over
+    // 5124 recorded tool calls on 2026-09-17, the 56 stored tool-kind
+    // candidates produced 308 matches of which 285 came from the bare tool-name
+    // arm, while 50 of the 56 patterns matched nothing at all. The one cluster
+    // that matched for a real reason, `*| grep*`, hit 7 of 4802 commands: it
+    // was written as a glob and matched as a substring, so it only fired on a
+    // command containing the asterisks. Written properly as
+    // `{"command_contains":"| grep"}` the same lesson matches 1201.
+    //
+    // These rows are archived, never rewritten. There is no safe reading to
+    // migrate to — that is the whole defect — so the plan (D4) requires a human
+    // to re-express the lesson after reading its evidence. The evidence and the
+    // old matcher stay on the row for exactly that.
+    if from_version < 26 && table_exists(conn, "prior_clusters") {
+        let retired = crate::store::priors::archive_untyped_matchers(conn)?;
+        if !retired.is_empty() {
+            tracing::info!(
+                "migration: archived {} prior cluster(s) whose trigger used the untyped \
+                 `pattern`; re-express the lesson with a named selector to revive it",
+                retired.len()
+            );
         }
     }
 
@@ -2058,9 +2086,9 @@ mod tests {
              VALUES
                  ('c-stop', 'k1', 'stop', '{}', 'l', '{}', 2, 2, 0, 0, 0, 'promoted', 'm-stop', 1, 1),
                  ('c-repo', 'k2', 'repo', '{}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1),
-                 ('c-pre', 'k3', 'pre_tool', '{}', 'l', '{}', 2, 2, 0, 0, 0, 'promoted', 'm-pre', 1, 1),
-                 ('c-post', 'k4', 'post_tool', '{}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1),
-                 ('c-prompt', 'k5', 'prompt', '{}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1);
+                 ('c-pre', 'k3', 'pre_tool', '{\"tool\":\"Edit\"}', 'l', '{}', 2, 2, 0, 0, 0, 'promoted', 'm-pre', 1, 1),
+                 ('c-post', 'k4', 'post_tool', '{\"tool\":\"Bash\"}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1),
+                 ('c-prompt', 'k5', 'prompt', '{\"prompt_contains\":\"deploy\"}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1);
              UPDATE schema_version SET version = 22;",
         )
         .unwrap();

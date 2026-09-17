@@ -1931,7 +1931,7 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
     let answer = repo.root.join("answer.json");
     std::fs::write(
         &answer,
-        r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error","fix":"edited the generator"},"ttl_days":30}"#,
+        r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","tool":"Edit","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error","fix":"edited the generator"},"ttl_days":30}"#,
     )
     .unwrap();
     // Only `[priors]` is read from this file by the check, and appending a

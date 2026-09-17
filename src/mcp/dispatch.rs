@@ -9220,7 +9220,7 @@ mod tests {
         seed_promoted_prior(
             &handle,
             "pre_tool",
-            r#"{"pattern":"src/generated/**"}"#,
+            r#"{"path_glob":"src/generated/**"}"#,
             "Do not edit generated files; edit the generator instead.",
         )
         .await;
@@ -9246,7 +9246,7 @@ mod tests {
         seed_promoted_prior(
             &handle,
             "pre_tool",
-            r#"{"pattern":"src/generated/**"}"#,
+            r#"{"path_glob":"src/generated/**"}"#,
             "Do not edit generated files.",
         )
         .await;
@@ -9270,7 +9270,7 @@ mod tests {
         seed_promoted_prior(
             &handle,
             "pre_tool",
-            r#"{"pattern":"src/generated/**"}"#,
+            r#"{"path_glob":"src/generated/**"}"#,
             "Do not edit generated files.",
         )
         .await;
@@ -9291,7 +9291,7 @@ mod tests {
         seed_promoted_prior(
             &handle,
             "prompt",
-            r#"{"pattern":"ripgrep"}"#,
+            r#"{"prompt_contains":"ripgrep"}"#,
             "Prefer ripgrep over grep for repository search.",
         )
         .await;
@@ -9313,7 +9313,7 @@ mod tests {
         seed_promoted_prior(
             &handle,
             "prompt",
-            r#"{"pattern":"ripgrep"}"#,
+            r#"{"prompt_contains":"ripgrep"}"#,
             "Prefer ripgrep over grep for repository search.",
         )
         .await;
@@ -9446,7 +9446,7 @@ mod tests {
         let cluster_id = seed_promoted_prior_with_signature(
             &handle,
             "pre_tool",
-            r#"{"pattern":"src/generated/**"}"#,
+            r#"{"path_glob":"src/generated/**"}"#,
             "Do not edit generated files; edit the generator instead.",
             Some("error[E0433]: failed to resolve"),
         )
@@ -9527,7 +9527,7 @@ mod tests {
         let cluster_id = seed_promoted_prior_with_signature(
             &handle,
             "pre_tool",
-            r#"{"pattern":"src/generated/**"}"#,
+            r#"{"path_glob":"src/generated/**"}"#,
             "Do not edit generated files.",
             Some("error[E0433]: failed to resolve"),
         )
@@ -9605,7 +9605,7 @@ mod tests {
     /// error text is what made the six-week outage invisible.
     #[tokio::test]
     async fn mine_episode_records_the_outcome_it_reached() {
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
         let not_reusable = distilled.replace(r#""is_reusable":true"#, r#""is_reusable":false"#);
 
         // (transcript, distiller shell script, expected outcome, a substring the
@@ -9688,7 +9688,7 @@ mod tests {
     /// something", which is the whole question `mdkb stats` is asked.
     #[tokio::test]
     async fn mine_episode_records_promotion_separately_from_distillation() {
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
 
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
@@ -9733,7 +9733,7 @@ mod tests {
 
         // Fake distiller: consume stdin (the prompt), emit a valid distilled prior.
         // JSON uses only double quotes so it survives single-quote shell wrapping.
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
         let program = "sh".to_string();
         let args = vec![
             "-c".to_string(),
@@ -9755,7 +9755,7 @@ mod tests {
         let conn = &guard.as_ref().unwrap().conn;
         let key = canonical_trigger_key(
             "pre_tool",
-            r#"{"pattern":"src/generated/**","when":"editing generated code"}"#,
+            r#"{"path_glob":"src/generated/**","when":"editing generated code"}"#,
         );
         let cluster = get_cluster(conn, &cluster_id_for_key(&key))
             .unwrap()
@@ -9778,7 +9778,7 @@ mod tests {
         let transcript = tmp.path().join("transcript.jsonl");
         std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
 
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
         let args = vec![
             "-c".to_string(),
             format!("cat >/dev/null; printf 'Here you go:\\n```json\\n%s\\n```\\n' '{distilled}'"),
@@ -9798,7 +9798,7 @@ mod tests {
         let conn = &guard.as_ref().unwrap().conn;
         let key = canonical_trigger_key(
             "pre_tool",
-            r#"{"pattern":"src/generated/**","when":"editing generated code"}"#,
+            r#"{"path_glob":"src/generated/**","when":"editing generated code"}"#,
         );
         let cluster = get_cluster(conn, &cluster_id_for_key(&key))
             .unwrap()
@@ -9819,7 +9819,7 @@ mod tests {
         std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
         let key = canonical_trigger_key(
             "pre_tool",
-            r#"{"pattern":"src/generated/**","when":"editing generated code"}"#,
+            r#"{"path_glob":"src/generated/**","when":"editing generated code"}"#,
         );
         let cluster_id = cluster_id_for_key(&key);
 
@@ -9847,7 +9847,7 @@ mod tests {
 
         // The prompt arrives in argv: the stub echoes $1 back as the answer, so a
         // cluster appears only if substitution happened.
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
         mine_episode(
             Arc::clone(&handle),
             transcript.to_string_lossy().into_owned(),
@@ -9890,7 +9890,7 @@ mod tests {
         // whose glob targets generated files. Identical output both sessions → one
         // trigger key → one cluster whose distinct_sessions climbs to the promotion
         // gate (PROMOTION_MIN_SESSIONS = 2).
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template instead.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template instead.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
         let program = "sh".to_string();
         let args = vec![
             "-c".to_string(),
@@ -9912,7 +9912,7 @@ mod tests {
         // minted a backing memory id.
         let key = canonical_trigger_key(
             "pre_tool",
-            r#"{"pattern":"src/generated/**","when":"editing generated code"}"#,
+            r#"{"path_glob":"src/generated/**","when":"editing generated code"}"#,
         );
         let cluster_id = cluster_id_for_key(&key);
         {
@@ -9981,7 +9981,7 @@ mod tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "// generated").unwrap();
 
-        let matcher = r#"{"pattern":"src/**"}"#;
+        let matcher = r#"{"path_glob":"src/**"}"#;
         let key = canonical_trigger_key("post_tool", matcher);
         let cluster_id = cluster_id_for_key(&key);
         ensure_handle_context(&handle).await.unwrap();
@@ -10061,7 +10061,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
 
-        let matcher = r#"{"pattern":"cargo build"}"#;
+        let matcher = r#"{"command_contains":"cargo build"}"#;
         let key = canonical_trigger_key("post_tool", matcher);
         let cluster_id = cluster_id_for_key(&key);
         ensure_handle_context(&handle).await.unwrap();

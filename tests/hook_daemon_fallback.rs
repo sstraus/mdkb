@@ -338,7 +338,7 @@ fn in_process_stop_waits_for_the_mining_it_started() {
     let answer = root.join("answer.json");
     std::fs::write(
         &answer,
-        r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","pattern":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#,
+        r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#,
     )
     .expect("write distiller answer");
     let config = root.join(".mdkb/config.toml");

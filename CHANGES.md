@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### Changed
+
+- **A prior's trigger is named selectors, not one guessed string.** The matcher
+  took a single `pattern` and tried it against three different things in turn —
+  the tool name, a path glob, then a command substring — stopping at whichever
+  hit first. One spelling, three meanings: the distiller prompt could not say
+  which was wanted and a reader of the stored row could not tell which had been
+  written. Replayed over 5124 recorded tool calls, the 56 stored tool-kind
+  candidates produced 308 matches of which **285 came from the bare tool-name
+  arm** (`{"pattern":"Edit"}` firing on every edit), while **50 of the 56
+  patterns matched nothing at all**. The one that matched for a real reason,
+  `*| grep*`, hit 7 of 4802 commands — written as a glob, matched as a
+  substring, so it only fired on a command containing the asterisks. The same
+  lesson as `{"command_contains":"| grep"}` matches 1201.
+
+  The trigger is now `tool`, `path_glob`, `command_contains` and
+  `prompt_contains`: at least one required, all present ones ANDed, each with a
+  documented case sensitivity, and a selector the context cannot supply fails
+  rather than falling away. No regex — the pattern is untrusted model output,
+  and `a|b` is three literal characters. `parse_distilled` refuses the old
+  untyped shape with an error naming the replacement, and the distill prompt
+  documents exactly this schema.
+
+  Schema v26 **archives** existing clusters whose trigger is the untyped shape
+  rather than reinterpreting them: there is no safe reading to migrate to, which
+  is the defect itself. Their evidence and old matcher stay on the row, so the
+  lesson can be re-expressed by hand with a named selector.
+
 ### Fixed
 
 - **A change the watcher dropped can no longer sit unrecovered.** The watcher
