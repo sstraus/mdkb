@@ -1198,7 +1198,7 @@ pub fn find_duplicate(
         if entry.id == id {
             continue;
         }
-        let similarity = 1.0 - (f64::from(distance) * f64::from(distance) / 2.0);
+        let similarity = crate::store::hybrid::cosine_from_distance(distance);
         return Ok(Some(Duplicate::Meaning {
             entry: Box::new(entry),
             similarity,
@@ -1244,7 +1244,7 @@ pub fn find_similar_entries(
         }
         if let Some(sim_entry) = get_entry_by_rowid(conn, *sim_rowid)? {
             if sim_entry.id != exclude_id {
-                let similarity = 1.0 - (f64::from(*distance) * f64::from(*distance) / 2.0);
+                let similarity = crate::store::hybrid::cosine_from_distance(*distance);
                 warnings.push_str(&format!(
                     "\nSimilar entry exists: {} (similarity: {:.2}). Consider updating it instead.",
                     sim_entry.id, similarity

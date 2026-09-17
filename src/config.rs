@@ -177,6 +177,20 @@ impl Default for SearchMemoryConfig {
 /// the choice still follows the rule, so a fixture change reopens it.
 pub const MIN_RECALL_COSINE_DEFAULT: f32 = 0.40;
 
+/// Default cosine floor for recall on a prompt that carries no sigil, read off
+/// the same curve.
+///
+/// The rule above stops discriminating at 0.40: every floor from there up
+/// admits none of the 40 negatives, so precision cannot choose between them.
+/// The second rule, for the case nobody asked for, is the cheapest margin above
+/// it — the floor where the recall curve flattens before falling again.
+/// Measured: 0.40→0.45 costs 0.139 recall@5, 0.45→0.50 costs 0.027, 0.50→0.55
+/// costs 0.111. 0.50 is that plateau.
+///
+/// Both floors are asserted against the fixture by
+/// `eval::fixture::tests::print_the_precision_recall_curve_over_tau`.
+pub const RECALL_AUTO_MIN_COSINE_DEFAULT: f32 = 0.50;
+
 /// Memory index settings (Phase 6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -636,7 +650,56 @@ pub struct HooksConfig {
     /// unless you explicitly ask. The leading `*` is stripped before recall so it
     /// never reaches FTS or the model (and stopwords are already dropped from the
     /// recall query). Set `false` for the always-on behavior.
+    ///
+    /// With it `false` the sigil does not stop meaning anything: it selects the
+    /// lower floor (`search.memory.min_recall_cosine`) instead of enabling the
+    /// feature, and a prompt without it is admitted at
+    /// [`recall_auto_min_cosine`](Self::recall_auto_min_cosine).
+    ///
+    /// **Still `true`, deliberately.** This repo's `.mdkb/hook-events.jsonl`
+    /// holds 1716 UserPromptSubmit calls over 72 days (2026-07-07 to
+    /// 2026-09-17) of which 8 injected — 0.47%. Flipping this turns those 1708
+    /// silent prompts into retrieval attempts, and nothing measured so far says
+    /// what fraction of them would inject something worth the turn. The fixture
+    /// cannot answer it either: every floor from 0.40 up scores precision 1.000
+    /// on it, so it cannot rank them. Turn on [`user_prompt_submit_shadow`],
+    /// let it run a week, then decide on that data.
+    ///
+    /// [`user_prompt_submit_shadow`]: Self::user_prompt_submit_shadow
     pub user_prompt_submit_require_sigil: bool,
+
+    /// Cosine floor for recall on a prompt that carries no sigil.
+    ///
+    /// Two floors, because the two cases are not the same request. A sigil is
+    /// somebody asking, and a mediocre answer to a question costs them one
+    /// glance; an automatic injection is charged on a turn nobody asked to
+    /// enrich, and a wrong entry there is paid on every turn after it. So the
+    /// automatic floor is the stricter one.
+    ///
+    /// Read off the same curve as [`MIN_RECALL_COSINE_DEFAULT`], which cannot
+    /// separate the two on precision — every floor at or above 0.40 admits none
+    /// of the 40 labelled negatives. What the curve does show is where recall
+    /// stops paying for strictness: 0.40→0.45 costs 0.139 recall@5, 0.45→0.50
+    /// costs 0.027, and 0.50→0.55 costs 0.111 again. 0.50 is that plateau — the
+    /// cheapest extra margin on the measured curve.
+    ///
+    /// Unused while the sigil is required except in shadow mode, which is what
+    /// will decide whether it is right.
+    pub recall_auto_min_cosine: f32,
+
+    /// Run recall on the prompts the sigil gate currently skips, record what
+    /// *would* have been injected, and inject nothing.
+    ///
+    /// The only way to answer "what happens if the sigil stops being required"
+    /// without answering it in production. Each skipped prompt appends a
+    /// `recall_shadow` row to `.mdkb/hook-events.jsonl`: how many entries
+    /// cleared each floor, the top cosine, whether the session had already seen
+    /// them, and the latency.
+    ///
+    /// Off by default: it makes every prompt pay an embedding and a hybrid
+    /// search for an answer that is thrown away. Turn it on for a week when you
+    /// want the data.
+    pub user_prompt_submit_shadow: bool,
 }
 
 impl Default for HooksConfig {
@@ -656,6 +719,8 @@ impl Default for HooksConfig {
             code_hits_in_pretooluse: true,
             doc_graph_in_recall: true,
             user_prompt_submit_require_sigil: true,
+            recall_auto_min_cosine: RECALL_AUTO_MIN_COSINE_DEFAULT,
+            user_prompt_submit_shadow: false,
         }
     }
 }

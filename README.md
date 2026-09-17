@@ -214,10 +214,50 @@ Session start includes a compact power-feature reminder and points to
 `mdkb cheatsheet`. Per-prompt recall is quiet by default: prefix a prompt with
 `*` to inject matching memory, documents, and graph hints. MDKB removes the
 asterisk before search and before telemetry; it is an activation signal, not
-part of the query. Without it, the prompt passes through unchanged. To make
-recall always-on, set `user_prompt_submit_require_sigil = false` under `[hooks]` in
-`.mdkb/config.toml`. Session warmup and the other enabled hooks do not require
-the sigil.
+part of the query. Without it, the prompt passes through unchanged. Session
+warmup and the other enabled hooks do not require the sigil.
+
+#### The two recall floors
+
+The sigil selects a **threshold**, not a feature. Both settings run the same
+retrieval over the same text; they differ in what a candidate has to score to be
+injected, because an injection nobody asked for is charged on every turn after
+it while a miss on a sigil prompt costs one search.
+
+| `[hooks]` / `[search.memory]` key | Default | What it gates |
+| --- | --- | --- |
+| `search.memory.min_recall_cosine` | `0.40` | The floor for a `*`-prefixed prompt. Lowest floor admitting no labelled negative on the eval fixture. |
+| `hooks.recall_auto_min_cosine` | `0.50` | The floor for a prompt with no sigil. The recall plateau above `0.40` — see [docs/retrieval-eval.md](docs/retrieval-eval.md). |
+| `hooks.user_prompt_submit_require_sigil` | `true` | When `true`, a prompt without `*` retrieves nothing at all. Set `false` for always-on recall at the `0.50` floor. |
+| `hooks.user_prompt_submit_shadow` | `false` | Runs the always-on path on the skipped prompts, records the result, injects nothing. |
+
+**`require_sigil` is still `true`, and the way to change that is to measure
+first.** This repo logged 1716 UserPromptSubmit calls over 72 days and injected
+on 8 of them (0.47%); flipping the default turns the other 1708 into retrieval
+attempts, and the eval fixture cannot say how many of those are worth the turn —
+it scores precision 1.000 at every floor from 0.40 up, so it cannot rank them.
+
+Set `user_prompt_submit_shadow = true`, leave it for a week, then read
+`.mdkb/hook-events.jsonl`. Shadow rows carry `"outcome": "shadow"` and a
+`shadow` object:
+
+```json
+{"ts":1789659256,"event":"user_prompt_submit","outcome":"shadow","elapsed_ms":41,
+ "shadow":{"session":"…","entries":["writer-recovery-protocol"],"docs":1,
+           "related":0,"top_cosine":0.62,"floor":0.5}}
+```
+
+The counters to decide on, all four together — no one of them is the release
+criterion on its own:
+
+- **injection rate** — shadow rows with a non-empty `entries`/`docs`/`related`, over all `user_prompt_submit` rows. How noisy always-on would be.
+- **precision** — read the `entries` ids and judge them. This is why the row names entries instead of counting them, and why fixture precision cannot stand in.
+- **repetition rate** — the same entry id recurring across rows of one `session`. An entry injected on every turn is worse than one never injected.
+- **P95 `elapsed_ms`** — shadow runs the full retrieval, so its latency is the real cost of the always-on path.
+
+Shadow mode deliberately does **not** touch the per-session dedup map or the
+behavioural-prior injection counters: writing to either would change what a
+later real injection does and corrupt the counters above.
 
 SessionStart keeps discovery compact and operational:
 

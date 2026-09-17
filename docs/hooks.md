@@ -119,10 +119,17 @@ sigil, for example `* how does writer recovery work?`. The asterisk is explicit
 consent to search the current repository's context. Without it, the prompt
 passes through unchanged. The handler strips the sigil before search and
 telemetry, then removes stopwords and sub-3-character fragments,
-then ranks memory through hybrid BM25 and local-vector retrieval. The configured
-floor applies to the final relevance-plus-confidence score, not confidence
-alone. Matching documents reuse the same query embedding, avoiding a second
-ONNX inference pass.
+then ranks memory through hybrid BM25 and local-vector retrieval. Matching
+documents reuse the same query embedding, avoiding a second ONNX inference pass.
+
+The sigil selects a **cosine floor**, not a feature: a sigil prompt is admitted
+at `search.memory.min_recall_cosine` (0.40) and — once
+`user_prompt_submit_require_sigil` is `false` — a plain one at
+`hooks.recall_auto_min_cosine` (0.50), because an injection nobody asked for is
+charged on every turn after it. The floor is absolute, measured against the
+query embedding; a strong lexical match (an identifier, a rare phrase) is the
+second admission arm. Confidence orders results and never admits them. When
+nothing clears the floor, nothing is injected.
 
 Output (when matches are found):
 
@@ -291,6 +298,17 @@ post_tool_use_enabled = true
 # Keep normal prompts untouched unless they begin with `*`.
 user_prompt_submit_require_sigil = true
 
+# The cosine floor for a prompt that carries no sigil. A `*`-prefixed
+# prompt uses the lower `search.memory.min_recall_cosine` (0.40): the
+# sigil selects a threshold, it does not switch recall on. Unused while
+# require_sigil is true, except in shadow mode.
+recall_auto_min_cosine = 0.50
+
+# Run the always-on path on the prompts the sigil gate skips, record
+# what it would have injected in .mdkb/hook-events.jsonl, inject
+# nothing. Turn on for a week before flipping require_sigil.
+user_prompt_submit_shadow = false
+
 # Warmup is bounded by both entry count and tokens.
 warmup_limit = 10
 warmup_token_budget = 300
@@ -303,13 +321,10 @@ recall_limit = 5
 # the same hybrid engine as `mdkb search --scope docs`. 0 = memory only.
 recall_docs_limit = 3
 
-# Latency budget in milliseconds. If a hook exceeds this,
-# the overrun is appended to .mdkb/hook-slow.jsonl and the
-# output may be truncated with a notice.
+# Latency budget in milliseconds. A run over budget is copied to
+# .mdkb/hook-slow.jsonl. Nothing is truncated: the value decides
+# what gets flagged, not what gets emitted.
 latency_budget_ms = 200
-
-# Minimum hybrid score for a recall result to be injected.
-min_recall_score = 0.3
 
 # Require daemon delivery instead of using the in-process fallback.
 daemon_required = false
@@ -402,11 +417,39 @@ directory.
 ### Recall is empty
 
 - Recall requires a leading `*` by default. Use `* your prompt`, or set
-  `user_prompt_submit_require_sigil = false` for always-on recall.
+  `user_prompt_submit_require_sigil = false` for always-on recall at the
+  stricter `recall_auto_min_cosine` floor.
 - Hybrid recall requires at least one indexed memory entry. Run `mdkb memory
   list` and confirm the DB is populated.
 - Conversational prompts with only stopwords (e.g. "what is this?")
   produce no tokens and are skipped by design.
+- Nothing cleared the floor. That is the gate working, not a failure: recall is
+  absolute, so a store with no answer injects nothing rather than its best
+  guess. `mdkb search --scope memory "<prompt>"` shows what was there.
+
+### Shadow mode
+
+`user_prompt_submit_shadow = true` runs the always-on path on the prompts the
+sigil gate skips, records what it *would* have injected, and injects nothing.
+It exists so the `require_sigil` default is flipped on a week of measurement
+rather than on the eval fixture, which scores precision 1.000 at every floor
+from 0.40 up and so cannot rank them.
+
+```json
+{"ts":…,"event":"user_prompt_submit","outcome":"shadow","elapsed_ms":41,
+ "shadow":{"session":"…","entries":["writer-recovery-protocol"],"docs":1,
+           "related":0,"top_cosine":0.62,"floor":0.5}}
+```
+
+`entries` names the memory ids rather than counting them, because the release
+criterion is precision and a count cannot be judged after the fact. No prompt
+text is recorded, as in every other row. The release criteria are all four
+together — injection rate, precision, repetition rate and P95 `elapsed_ms` —
+and the README's two-floor section says how to read each off these rows.
+
+Shadow mode does not touch the per-session dedup map or the behavioural-prior
+injection counters: a write to either would change what a later real injection
+does, which would corrupt the counters it is there to produce.
 
 ### Slow hooks
 

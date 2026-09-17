@@ -3219,18 +3219,49 @@ fn log_hook_event_with_phases(
         event,
         outcome,
         None,
-        phases.as_json(),
+        phases.as_json().map(|value| ("phases", value)),
         elapsed_ms,
         slow_threshold_ms,
     );
 }
 
+/// [`log_hook_event`] plus the shadow-recall row: what the automatic floor
+/// would have injected into a prompt the sigil gate left alone.
+///
+/// The counters the sigil default has to be decided on — injection rate,
+/// precision, repetition, P95 latency — cannot be read off the existing rows,
+/// which only say `skipped` 1708 times in a row. This is the row that can
+/// answer them, and it exists so the flip is decided on a week of measurement
+/// rather than on the fixture, which scores precision 1.000 at every floor
+/// from 0.40 up and so cannot rank them.
+fn log_hook_event_with_shadow(
+    root: std::path::PathBuf,
+    event: &str,
+    shadow: &ShadowRecall,
+    elapsed_ms: u64,
+    slow_threshold_ms: u64,
+) {
+    log_hook_event_full(
+        root,
+        event,
+        "shadow",
+        None,
+        Some(("shadow", shadow.as_json())),
+        elapsed_ms,
+        slow_threshold_ms,
+    );
+}
+
+/// `extra` is the one field an event type adds to the common row, named by its
+/// caller: `("phases", …)` for SessionStart, `("shadow", …)` for a shadow-mode
+/// UserPromptSubmit. Naming it at the call site keeps a reader of the log able
+/// to tell which event a field belongs to.
 fn log_hook_event_full(
     root: std::path::PathBuf,
     event: &str,
     outcome: &str,
     reason: Option<&str>,
-    phases: Option<serde_json::Value>,
+    extra: Option<(&'static str, serde_json::Value)>,
     elapsed_ms: u64,
     slow_threshold_ms: u64,
 ) {
@@ -3244,8 +3275,8 @@ fn log_hook_event_full(
     if let Some(reason) = reason {
         payload["reason"] = serde_json::json!(reason);
     }
-    if let Some(phases) = phases {
-        payload["phases"] = phases;
+    if let Some((field, value)) = extra {
+        payload[field] = value;
     }
     let mut line = payload.to_string();
     line.push('\n');
@@ -3984,8 +4015,90 @@ fn expand_recall_neighbors(
     Ok(out)
 }
 
+/// What a prompt gets from recall.
+///
+/// Recall is the same work in all three live arms — the same query, the same
+/// two legs, the same store. Only the floor it runs at and what happens to the
+/// result differ, which is the point: the sigil selects a threshold, it does not
+/// switch a feature on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallMode {
+    /// The prompt carried the sigil. Somebody asked, so the lower floor
+    /// (`search.memory.min_recall_cosine`) applies.
+    Sigil,
+    /// No sigil and none required. The stricter floor
+    /// (`hooks.recall_auto_min_cosine`) applies: this turn was not asked to be
+    /// enriched, so a wrong entry is charged on every turn after it while a
+    /// missing one costs one search.
+    Automatic,
+    /// No sigil, the sigil is required, and `hooks.user_prompt_submit_shadow`
+    /// is on: run exactly what [`RecallMode::Automatic`] would run, record what
+    /// it found, inject nothing.
+    Shadow,
+    /// No sigil, the sigil is required, shadow off. Nothing runs.
+    Off,
+}
+
+impl RecallMode {
+    /// The cosine floor this mode retrieves at, given the sigil floor
+    /// (`search.memory.min_recall_cosine`) the store is configured with.
+    fn floor(self, cfg: &crate::config::HooksConfig, sigil_floor: f32) -> f32 {
+        match self {
+            RecallMode::Sigil => sigil_floor,
+            _ => cfg.recall_auto_min_cosine,
+        }
+    }
+}
+
+/// Pick the mode for `prompt` and return it with the sigil stripped.
+///
+/// The `*` (and the whitespace after it) never reaches FTS, the embedder or the
+/// model in any arm. That is what makes the two floors comparable: a sigil
+/// prompt and the same prompt without it retrieve against the same text and
+/// differ only in what they are required to score.
+fn recall_mode<'p>(cfg: &crate::config::HooksConfig, prompt: &'p str) -> (RecallMode, &'p str) {
+    match prompt.trim_start().strip_prefix('*') {
+        Some(rest) => (RecallMode::Sigil, rest.trim_start()),
+        None if !cfg.user_prompt_submit_require_sigil => (RecallMode::Automatic, prompt),
+        None if cfg.user_prompt_submit_shadow => (RecallMode::Shadow, prompt),
+        None => (RecallMode::Off, prompt),
+    }
+}
+
+/// One shadow-mode observation: what the automatic floor would have injected
+/// into a prompt that was in fact left alone.
+///
+/// Entry ids rather than a count, because the release criterion is precision
+/// and a count cannot be judged after the fact — somebody has to read which
+/// entries would have landed. No prompt text, in line with every other row in
+/// `hook-events.jsonl`.
+#[derive(Debug)]
+pub struct ShadowRecall {
+    session: String,
+    entries: Vec<String>,
+    docs: usize,
+    related: usize,
+    top_cosine: Option<f64>,
+    floor: f32,
+}
+
+impl ShadowRecall {
+    fn as_json(&self) -> Value {
+        json!({
+            "session": self.session,
+            "entries": self.entries,
+            "docs": self.docs,
+            "related": self.related,
+            "top_cosine": self.top_cosine,
+            "floor": self.floor,
+        })
+    }
+}
+
 pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> Value {
-    hook_user_prompt_submit_impl_with_dedup(handle, prompt, UNKNOWN_SESSION, None).await
+    let mut shadow = None;
+    hook_user_prompt_submit_impl_with_dedup(handle, prompt, UNKNOWN_SESSION, None, &mut shadow)
+        .await
 }
 
 async fn hook_user_prompt_submit_impl_with_dedup(
@@ -3993,6 +4106,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     prompt: &str,
     session: &str,
     dedup: Option<(&DispatchContext, String)>,
+    shadow: &mut Option<ShadowRecall>,
 ) -> Value {
     use crate::cli::hook_logic::prompt_wants_call_graph;
 
@@ -4010,16 +4124,23 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         return json!({});
     }
 
-    // Opt-in sigil: when enabled, only prompts starting with `*` get injection.
-    // Strip the `*` (and following whitespace) so it never reaches FTS, the
-    // embedder, or the model; a prompt without it is left untouched.
-    let prompt = if cfg.user_prompt_submit_require_sigil {
-        match prompt.trim_start().strip_prefix('*') {
-            Some(rest) => rest.trim_start(),
-            None => return json!({}),
-        }
+    let (mode, prompt) = recall_mode(cfg, prompt);
+    if mode == RecallMode::Off {
+        return json!({});
+    }
+    // Two floors, one knob each way round: the sigil lowers the bar because
+    // somebody asked, the automatic path raises it because nobody did.
+    let mut search_cfg = handle.config.search.memory.clone();
+    search_cfg.min_recall_cosine = mode.floor(cfg, search_cfg.min_recall_cosine);
+    // Shadow mode observes; it must not leave a trace that changes what a later
+    // real injection does. The dedup map is per-session state — marking an
+    // entry seen here would silence it on the sigil prompt that follows — so
+    // shadow runs with it detached, and the prior leg (which writes injection
+    // telemetry) is skipped outright below.
+    let dedup = if mode == RecallMode::Shadow {
+        None
     } else {
-        prompt
+        dedup
     };
 
     let prompt_repeat = dedup
@@ -4044,6 +4165,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
 
     let mut results: Vec<memory::MemoryEntry> = Vec::new();
     let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
+    let mut top_cosine: Option<f64> = None;
     if let Some(ref q) = fts_query {
         if ensure_handle_context(handle).await.is_err() {
             return json!({});
@@ -4068,7 +4190,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
                 query_embedding.as_deref(),
                 limit,
                 None,
-                &handle.config.search.memory,
+                &search_cfg,
             )
         });
         let mut scored_results = match search {
@@ -4164,6 +4286,14 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             e.entry_type != crate::store::memory::EntryType::Prior
                 || e.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
         });
+        // The best absolute score in the result, read before `injectable` drops
+        // it. `score` cannot stand in: it is max-normalized, so the top hit is
+        // 1.0 for every prompt including the ones nothing in the store answers.
+        top_cosine = scored_results
+            .iter()
+            .filter_map(|e| e.distance)
+            .map(crate::store::hybrid::cosine_from_distance)
+            .max_by(f64::total_cmp);
         results = injectable(scored_results);
 
         // Global rank: float high-confidence priors to the top WITHOUT
@@ -4255,6 +4385,24 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     if let Some((dctx, key)) = &dedup {
         dctx.retain_new_hook_related_lines(key, &mut doc_lines);
         dctx.retain_new_hook_related_lines(key, &mut related);
+    }
+
+    // Shadow mode stops here: everything above is read-only, so the row records
+    // a full retrieval — and the dispatcher's stopwatch measures the real cost
+    // of the automatic path, which is one of the release criteria. The prior
+    // leg below is not read-only (`record_injection`), and a prior fires on a
+    // named trigger rather than on a threshold, so it is not what this question
+    // is about.
+    if mode == RecallMode::Shadow {
+        *shadow = Some(ShadowRecall {
+            session: session.to_string(),
+            entries: results.iter().map(|e| e.id.clone()).collect(),
+            docs: doc_lines.len(),
+            related: related.len(),
+            top_cosine,
+            floor: search_cfg.min_recall_cosine,
+        });
+        return json!({});
     }
 
     // Trigger-matched behavioral priors whose prompt pattern fires here.
@@ -5434,11 +5582,13 @@ pub async fn dispatch_call(
             let key = hook_session_key(&handle, &params);
             let session = event_session(&params);
             let t0 = std::time::Instant::now();
+            let mut shadow = None;
             let result = hook_user_prompt_submit_impl_with_dedup(
                 &handle,
                 prompt,
                 &session,
                 Some((dctx, key)),
+                &mut shadow,
             )
             .await;
             let ms = t0.elapsed().as_millis() as u64;
@@ -5449,8 +5599,11 @@ pub async fn dispatch_call(
             };
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
-            tokio::task::spawn_blocking(move || {
-                log_hook_event(root, "user_prompt_submit", outcome, ms, budget);
+            tokio::task::spawn_blocking(move || match shadow {
+                Some(shadow) => {
+                    log_hook_event_with_shadow(root, "user_prompt_submit", &shadow, ms, budget);
+                }
+                None => log_hook_event(root, "user_prompt_submit", outcome, ms, budget),
             });
             record_hook_call(&handle, tool_name).await;
             Ok(result)
@@ -6515,6 +6668,10 @@ mod tests {
                 config.hooks.user_prompt_submit_require_sigil = false;
                 config.hooks.recall_docs_limit = 0;
                 config.hooks.recall_limit = 5;
+                // Both floors: with the sigil not required this prompt takes
+                // the automatic path, and pinning only one of the two would
+                // leave the other deciding the outcome.
+                config.hooks.recall_auto_min_cosine = floor;
                 config.search.memory.min_recall_cosine = floor;
             });
             // Shares exactly one ordinary word with the prompt ("budget"), so
@@ -6883,6 +7040,155 @@ mod tests {
         assert!(
             body.contains("sigil-mem"),
             "sigil-prefixed prompt should surface recall: {body}"
+        );
+    }
+
+    /// The sigil is a threshold selector, not an on/off switch: with it no
+    /// longer required, a prompt that carries one still means something
+    /// different from one that does not, and the `*` is stripped either way.
+    #[test]
+    fn the_sigil_selects_a_floor_rather_than_switching_recall_on() {
+        let mut cfg = crate::config::HooksConfig {
+            user_prompt_submit_require_sigil: true,
+            user_prompt_submit_shadow: false,
+            ..crate::config::HooksConfig::default()
+        };
+
+        assert_eq!(
+            recall_mode(&cfg, "* where is the parser"),
+            (RecallMode::Sigil, "where is the parser"),
+        );
+        assert_eq!(
+            recall_mode(&cfg, "where is the parser").0,
+            RecallMode::Off,
+            "with the sigil required and shadow off, a plain prompt runs nothing"
+        );
+
+        cfg.user_prompt_submit_shadow = true;
+        assert_eq!(
+            recall_mode(&cfg, "where is the parser").0,
+            RecallMode::Shadow,
+            "shadow mode observes exactly the prompts the gate skips"
+        );
+
+        cfg.user_prompt_submit_require_sigil = false;
+        assert_eq!(
+            recall_mode(&cfg, "where is the parser").0,
+            RecallMode::Automatic,
+        );
+        assert_eq!(
+            recall_mode(&cfg, "  *   where is the parser"),
+            (RecallMode::Sigil, "where is the parser"),
+            "the sigil still selects the lower floor, and still never reaches the query"
+        );
+    }
+
+    /// Criterion: two thresholds, the automatic one the higher. The floor is
+    /// picked by the mode, so a change to either constant cannot silently
+    /// invert them.
+    #[test]
+    // The floors are propagated, never computed: exact equality is the claim.
+    #[allow(clippy::float_cmp)]
+    fn the_automatic_floor_is_the_stricter_of_the_two() {
+        let cfg = crate::config::HooksConfig::default();
+        let sigil_floor = crate::config::SearchMemoryConfig::default().min_recall_cosine;
+
+        let automatic = RecallMode::Automatic.floor(&cfg, sigil_floor);
+        let shadow = RecallMode::Shadow.floor(&cfg, sigil_floor);
+        let sigil = RecallMode::Sigil.floor(&cfg, sigil_floor);
+
+        assert_eq!(sigil, sigil_floor);
+        assert_eq!(automatic, cfg.recall_auto_min_cosine);
+        assert_eq!(
+            shadow, automatic,
+            "shadow must retrieve at the floor it is measuring, or it measures nothing"
+        );
+        assert!(
+            automatic > sigil,
+            "an injection nobody asked for must clear a higher bar than one that was asked for: \
+             automatic {automatic}, sigil {sigil}"
+        );
+    }
+
+    /// Shadow mode answers "what would flipping the default do" without
+    /// flipping it: the prompt is returned untouched, and the row names the
+    /// entries that would have landed in it.
+    #[tokio::test]
+    // `row.floor` is the configured value copied through, not a computation.
+    #[allow(clippy::float_cmp)]
+    async fn shadow_mode_records_the_injection_it_does_not_make() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+            config.hooks.user_prompt_submit_shadow = true;
+        });
+        seed_memory_entry(&handle, "shadow-mem").await;
+
+        let mut shadow = None;
+        let out = hook_user_prompt_submit_impl_with_dedup(
+            &handle,
+            "what do we know about the recall_gate_fixture topic content",
+            UNKNOWN_SESSION,
+            None,
+            &mut shadow,
+        )
+        .await;
+
+        assert_eq!(out, json!({}), "shadow mode must inject nothing: {out}");
+        let row = shadow.expect("shadow row missing for a skipped prompt");
+        assert!(
+            row.entries.iter().any(|id| id == "shadow-mem"),
+            "the row must name what would have been injected: {:?}",
+            row.entries
+        );
+        assert_eq!(
+            row.floor, handle.config.hooks.recall_auto_min_cosine,
+            "the row must say which floor produced it"
+        );
+    }
+
+    /// Shadow mode must not spend the session's dedup budget: an entry it
+    /// observed is still new to the sigil prompt that follows it.
+    #[tokio::test]
+    async fn a_shadow_run_does_not_silence_the_real_injection_after_it() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+            config.hooks.user_prompt_submit_shadow = true;
+        });
+        seed_memory_entry(&handle, "dedup-mem").await;
+        let dctx = make_dctx();
+        let key = "session-under-test".to_string();
+        const PROMPT: &str = "what do we know about the recall_gate_fixture topic content";
+
+        let mut shadow = None;
+        let observed = hook_user_prompt_submit_impl_with_dedup(
+            &handle,
+            PROMPT,
+            UNKNOWN_SESSION,
+            Some((&dctx, key.clone())),
+            &mut shadow,
+        )
+        .await;
+        assert_eq!(observed, json!({}));
+        assert!(
+            shadow.is_some(),
+            "the plain prompt should have been shadowed"
+        );
+
+        let mut ignored = None;
+        let injected = hook_user_prompt_submit_impl_with_dedup(
+            &handle,
+            &format!("* {PROMPT}"),
+            UNKNOWN_SESSION,
+            Some((&dctx, key)),
+            &mut ignored,
+        )
+        .await;
+        let body = additional_context(&injected);
+        assert!(
+            body.contains("dedup-mem"),
+            "the shadow run consumed the entry the sigil prompt needed: {body}"
         );
     }
 

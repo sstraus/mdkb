@@ -151,17 +151,25 @@ of what memory entries exist — encouraging MCP tool use for deeper lookup.
 2. Check wrap-up markers (`/clear`, `/compact`, `/exit`, `/quit`, `/wrapup`) → skip
 3. Check `.mdkbignore-hooks` and `.mdkb/` → skip if absent
 4. Read `[hooks]` config → skip if `user_prompt_submit_enabled = false`
-5. Require and strip the leading `*` when
-   `user_prompt_submit_require_sigil = true` (the default)
+5. Pick the recall mode and strip the leading `*`: **sigil** (retrieves at
+   `search.memory.min_recall_cosine`), **automatic** (no sigil, none required —
+   retrieves at the stricter `hooks.recall_auto_min_cosine`), **shadow** (no
+   sigil, one required, `user_prompt_submit_shadow = true` — retrieves at the
+   automatic floor and injects nothing), or **off**
 6. Build an FTS query: tokenize prompt, strip stopwords (EN+IT), drop tokens < 3
    chars, join with OR, quote each token
 7. Embed the raw prompt off the async lock and call
-   `search_entries_hybrid_fts` → BM25/vector fusion plus confidence; discard
-   entries below `min_recall_score` using the final hybrid score
+   `search_entries_hybrid_fts` → BM25/vector fusion; admit on cosine ≥ the
+   mode's floor **or** a strong lexical match, confidence ordering only
 8. Call `hybrid_search_fts` → matching documents, reusing the same OR query and
    embedding (no second inference pass, no lock held across ONNX)
 9. Expand active one-hop memory relations, flag stale dependencies, resolve
    named document neighbors, and suppress repeated results within the session
+9a. **Shadow mode stops here**: append a `"outcome": "shadow"` row naming the
+   entry ids, the doc and neighbor counts, the top cosine and the floor, then
+   return `{}`. Everything above is read-only; the prior leg below writes
+   injection telemetry, so it is skipped, and the dedup map is detached for the
+   whole run
 10. Build markdown: `## mdkb: relevant context` (memory), then
    `## mdkb: matching docs` (search hits), then `## mdkb: related docs`
    (graph neighbors). A doc reachable both ways is emitted once, as a graph
@@ -178,8 +186,9 @@ proactive recall — the assistant doesn't need to decide to search.
 
 The separation between relevance and durability matters: topic/problem/decision
 confidence does not decay merely because the entry is old, while reminder,
-prior, and handoff confidence still reflects time. Prompt admission is then
-based on query relevance plus confidence, not age alone.
+prior, and handoff confidence still reflects time. Admission itself is absolute
+and confidence plays no part in it — an entry is injected on cosine or on a
+strong lexical match; confidence only orders what was already admitted.
 
 ### PreToolUse
 
@@ -254,8 +263,9 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `recall_limit` | usize | `5` | Max hybrid memory results in UserPromptSubmit |
 | `recall_docs_limit` | usize | `3` | Max matching documents in UserPromptSubmit; `0` = memory only |
 | `latency_budget_ms` | u64 | `200` | Overrun threshold; logs to `hook-slow.jsonl` |
-| `min_recall_score` | f64 | `0.3` | Floor on the final hybrid relevance-plus-confidence score |
 | `user_prompt_submit_require_sigil` | bool | `true` | Require a leading `*` before prompt recall |
+| `recall_auto_min_cosine` | f32 | `0.50` | Cosine floor for a prompt with no sigil; a sigil prompt uses `search.memory.min_recall_cosine` (`0.40`) |
+| `user_prompt_submit_shadow` | bool | `false` | Run the always-on path on skipped prompts, record it, inject nothing |
 | `daemon_required` | bool | `false` | Disable the in-process command-hook fallback |
 | `code_hits_in_pretooluse` | bool | `true` | Return indexed definition hits before suggesting a command |
 | `doc_graph_in_recall` | bool | `true` | Add bounded one-hop document neighbors to recall |

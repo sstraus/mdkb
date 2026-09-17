@@ -83,12 +83,30 @@ Read the numbers with the corpus size in mind: 12 memories and k = 5 means the t
 | 0.35 | 0.722 | 0.839 | 26 | 5 |
 | **0.40** | **0.583** | **1.000** | **21** | **0** |
 | 0.45 | 0.444 | 1.000 | 16 | 0 |
+| **0.50** | **0.417** | **1.000** | **15** | **0** |
+| 0.55 | 0.306 | 1.000 | 11 | 0 |
 | 0.60 | 0.278 | 1.000 | 10 | 0 |
 | 0.90 | 0.028 | 1.000 | 1 | 0 |
 
 The rule is the lowest floor that admits no labelled negative, which is 0.40. F1 would peak flat across 0.30-0.35 instead, and 0.35 is the better trade if a miss and a false positive cost the same. On this path they do not: recall is injected into a prompt nobody asked to enrich, so a wrong entry is charged on every turn of the conversation while a missing one costs one explicit search. The test asserts the rule, not the number, so changing the fixture reopens the choice rather than silently invalidating it.
 
-The price is 15 of 36 held-out queries no longer retrieving their memory, several of them well-formed questions (`which entry should a bounded cache drop when it is full`). Recovering them needs a second, lower threshold for queries the user asked for explicitly — a sigil-prefixed prompt or a `search` call — which is a separate piece of work, not a reason to lower this one.
+The price is 15 of 36 held-out queries no longer retrieving their memory, several of them well-formed questions (`which entry should a bounded cache drop when it is full`). Recovering them needs a floor below 0.40, which this curve prices at 5 false positives per 5 recovered hits (tau 0.35) — a one-for-one trade, and still an open question rather than a settled one. It is not what the second floor below does.
+
+### Where 0.50 comes from
+
+`config::RECALL_AUTO_MIN_COSINE_DEFAULT` is the floor for a prompt that carries **no** sigil — see the two-floor table in the README. Precision cannot choose it: every floor from 0.40 up admits none of the 40 negatives, so they all score 1.000 and the curve has nothing left to say about correctness above 0.40.
+
+The rule is the recall curve instead — the **plateau**, the floor whose step costs less recall@5 than the step before it and the step after it:
+
+| step | recall@5 lost |
+|---|---|
+| 0.40 → 0.45 | 0.139 |
+| **0.45 → 0.50** | **0.027** |
+| 0.50 → 0.55 | 0.111 |
+
+0.50 is the cheapest extra margin the curve offers: it buys a stricter gate for a prompt nobody asked to enrich at roughly a fifth of what either neighbouring step costs. `print_the_precision_recall_curve_over_tau` asserts that property, not the number, so a fixture change reopens this choice the same way it reopens 0.40.
+
+This is a *calibration* rather than a *decision*: it says which floor is cheapest, not whether always-on recall is worth having. That is what `hooks.user_prompt_submit_shadow` is for — the fixture cannot rank floors above 0.40, so the sigil default stays `true` until a week of shadow rows says otherwise.
 
 Floors, enforced by tests and by CI:
 

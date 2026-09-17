@@ -428,16 +428,47 @@ mod tests {
             "MIN_RECALL_COSINE_DEFAULT is {chosen}, but the lowest floor that \
              admits no labelled negative is {lowest_clean}"
         );
-        let at_chosen = curve
-            .iter()
-            .find(|(tau, _)| (*tau - chosen).abs() < 0.001)
-            .map(|(_, r)| r)
-            .expect("the chosen floor is a point on the curve");
+        let at = |tau: f32| {
+            curve
+                .iter()
+                .find(|(t, _)| (*t - tau).abs() < 0.001)
+                .map(|(_, r)| r)
+                .unwrap_or_else(|| panic!("{tau} is not a point on the curve"))
+        };
+        let at_chosen = at(chosen);
         assert_eq!(at_chosen.precision, Some(1.0));
         assert!(
             at_chosen.recall_at_k >= 0.58,
             "recall@5 at the chosen floor fell to {}",
             at_chosen.recall_at_k
+        );
+
+        // `RECALL_AUTO_MIN_COSINE_DEFAULT` is the floor for a prompt nobody
+        // asked to enrich, and precision cannot choose it: every floor from
+        // `chosen` up admits no negative, so they all score 1.000. Its rule is
+        // the recall curve instead — the plateau, the floor whose step costs
+        // less recall than the step before it and the step after it. That is
+        // the cheapest extra margin on offer, and it is what makes the second
+        // constant derived rather than picked.
+        let auto = crate::config::RECALL_AUTO_MIN_COSINE_DEFAULT;
+        assert!(
+            auto > chosen,
+            "the automatic floor {auto} must be stricter than the sigil floor {chosen}"
+        );
+        assert_eq!(
+            at(auto).precision,
+            Some(1.0),
+            "the automatic floor must admit no labelled negative either"
+        );
+        let loss = |tau: f32| at(tau - 0.05).recall_at_k - at(tau).recall_at_k;
+        let (before, here, after) = (loss(auto - 0.05), loss(auto), loss(auto + 0.05));
+        assert!(
+            here < before && here < after,
+            "RECALL_AUTO_MIN_COSINE_DEFAULT is {auto}, but that is not the plateau: \
+             recall@5 loss is {before:.3} into {:.2}, {here:.3} into {auto:.2}, \
+             {after:.3} into {:.2}",
+            auto - 0.05,
+            auto + 0.05
         );
     }
 

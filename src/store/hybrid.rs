@@ -103,6 +103,17 @@ pub fn distance_bound(min_cosine: f32) -> f32 {
     (2.0 * (1.0 - min_cosine)).max(0.0).sqrt()
 }
 
+/// The cosine a vec0 distance stands for — the inverse of [`distance_bound`],
+/// by the same `cos = 1 − d²/2` identity.
+///
+/// Comparing a threshold against a bound is enough to *filter*; reporting what
+/// a result actually scored needs the number itself, so telemetry and the
+/// duplicate detector convert per row.
+pub fn cosine_from_distance(distance: f32) -> f64 {
+    let d = f64::from(distance);
+    1.0 - (d * d / 2.0)
+}
+
 /// Whether a candidate is relevant in **absolute** terms — the injection gate.
 ///
 /// Two independent arms, because the two legs of retrieval fail on different

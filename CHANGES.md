@@ -2,6 +2,42 @@
 
 ## Unreleased
 
+### Added
+
+- **A second recall floor, and a shadow mode to decide the first one on.** The
+  `*` sigil switched per-prompt recall on and off, which made "should it be on
+  by default" a question with no middle answer. It now selects a **threshold**:
+  a sigil prompt is admitted at `search.memory.min_recall_cosine` (0.40), and a
+  prompt without one — once `user_prompt_submit_require_sigil` is `false` — at
+  the stricter `hooks.recall_auto_min_cosine` (0.50). Same retrieval, same
+  query, same store; only what a candidate must score to be injected differs,
+  because an injection nobody asked for is charged on every turn after it while
+  a miss on a sigil prompt costs one search. Nothing clears the floor, nothing
+  is injected.
+
+  0.50 is read off the same precision-recall curve as 0.40, by a second rule.
+  Precision cannot pick it: every floor from 0.40 up admits none of the 40
+  labelled negatives, so they all score 1.000. The rule is the recall plateau —
+  0.40→0.45 costs 0.139 recall@5, 0.45→0.50 costs 0.027, 0.50→0.55 costs 0.111,
+  so 0.50 is the cheapest extra margin the curve offers. The eval test asserts
+  that property rather than the number, so a fixture change reopens it.
+
+  **`user_prompt_submit_require_sigil` is unchanged at `true`.** This repo
+  logged 1716 UserPromptSubmit calls over 72 days and injected on 8 of them
+  (0.47%); flipping the default turns the other 1708 into retrieval attempts,
+  and the fixture cannot say how many are worth the turn. So
+  `hooks.user_prompt_submit_shadow` (default `false`) runs the always-on path
+  on exactly those skipped prompts, records what it *would* have injected in
+  `.mdkb/hook-events.jsonl`, and injects nothing. Turn it on for a week and
+  decide on four counters together — injection rate, precision (the row names
+  the entry ids, because a count cannot be judged after the fact), repetition
+  rate, and P95 latency — not on fixture precision alone. The README names each
+  and says how to read it.
+
+  Shadow mode does not write to the per-session dedup map or the
+  behavioural-prior injection counters. Either write would change what a later
+  real injection does, and so would corrupt the counters it exists to produce.
+
 ### Changed
 
 - **An accepted duplication cluster stays accepted when its membership
