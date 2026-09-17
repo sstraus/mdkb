@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- **`code impact` no longer walks through a call it could not place.** An
+  arrival at tier 7 means the caller wrote this name and no rule could say it
+  meant this symbol. The walk expanded it anyway, so everything behind a bare
+  name match was reported as impacted — for a common name, most of the index.
+  Reported and expandable are now two states: every arrival is reported, only
+  placed ones are walked through, and a symbol first reached ambiguously is
+  still expanded if a placed call reaches it later (with the budget of the path
+  that qualified it, not of the one that named it). The answer splits into the
+  actionable radius and an ambiguous frontier, and carries a coverage note
+  saying how many arrivals the walk stopped at — a truncated radius used to
+  read as exhaustive. `mdkb code impact --format json` is one document with
+  `targets`, `ambiguous` and `stopped_arrivals`.
+
 - **A behavioural prior stops being injected when its lesson is gone or
   contradicted.** The 30-day TTL lives on the memory entry, never on the
   cluster, and the injection path read `prior_clusters` alone: a prior whose

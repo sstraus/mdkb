@@ -1495,6 +1495,71 @@ fn smoke_code_lifecycle() {
     assert_ok(&out, "code impact");
 }
 
+/// An impact radius answers two questions, and one list merges them.
+///
+/// A caller reached through a call no rule could place is in the list because
+/// it wrote *a* symbol of this name — nothing says it wrote this one. The walk
+/// will not continue through such an arrival, so the radius is short by
+/// whatever that symbol calls, and a single undifferentiated list reads as both
+/// certain and complete when it is neither.
+#[test]
+fn smoke_code_impact_separates_the_ambiguous_frontier_and_says_where_it_stopped() {
+    let repo = Repo::new();
+    // `direct` calls `target` from the same file, which places the call.
+    // `edge` calls it from another file with no import, which places nothing —
+    // so `behind_edge`, which only `edge` reaches, must not be reported.
+    std::fs::write(
+        repo.root.join("src/lib.rs"),
+        "pub fn target() {}\npub fn direct() { target(); }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.root.join("src/ambiguous.rs"),
+        "pub fn edge() { target(); }\npub fn behind_edge() { edge(); }\n",
+    )
+    .unwrap();
+
+    assert_ok(&run(&["code", "init"], &repo.root), "code init");
+    assert_ok(&run(&["code", "index", "src/"], &repo.root), "code index");
+
+    let out = run(&["code", "impact", "target", "--depth", "2"], &repo.root);
+    assert_ok(&out, "code impact");
+    let text = stdout(&out);
+
+    let radius = text.find("Impact radius").expect("the actionable list");
+    let frontier = text.find("Ambiguous frontier").expect("the ambiguous list");
+    assert!(
+        radius < text.find("direct").expect("direct is impacted") && frontier > radius,
+        "the placed caller belongs to the actionable list, which comes first: {text}"
+    );
+    assert!(
+        text[frontier..].contains("edge"),
+        "the unplaced caller belongs under the frontier heading: {text}"
+    );
+    assert!(
+        !text.contains("behind_edge"),
+        "nothing behind an unplaced arrival may be reported as impacted: {text}"
+    );
+    assert!(
+        text.contains("the walk stopped at 1 of these"),
+        "the coverage note must say the radius is short, or it reads as complete: {text}"
+    );
+
+    // One JSON document, so `| jq` works on the whole answer.
+    let out = run(
+        &[
+            "code", "impact", "target", "--depth", "2", "--format", "json",
+        ],
+        &repo.root,
+    );
+    assert_ok(&out, "code impact --format json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&stdout(&out)).expect("one JSON document, not two");
+    assert_eq!(parsed["stopped_arrivals"], 1);
+    assert_eq!(parsed["targets"].as_array().map(Vec::len), Some(1));
+    assert_eq!(parsed["ambiguous"].as_array().map(Vec::len), Some(1));
+}
+
 #[test]
 fn smoke_code_find_caps_output_and_reports_total() {
     let repo = Repo::new();

@@ -3456,6 +3456,21 @@ if (require.main === module) {
                 "Should report impact or no impact: {}",
                 text
             );
+            // `validate` is called from `process_data` in the same file, which
+            // places the call, and from `hook.js`, which nothing places. The two
+            // arrivals answer different questions and the prose has to say so —
+            // a merged list reads as certain, and a walk that stopped at the
+            // ambiguous one reads as complete.
+            assert!(
+                text.contains("Ambiguous frontier"),
+                "the unplaced arrivals must be listed apart: {text}"
+            );
+            assert!(
+                text.contains("they are listed apart")
+                    && text.contains("The walk stopped at 2 of them"),
+                "the header must point at the second list and say where the walk \
+                 stopped: {text}"
+            );
         }
 
         #[tokio::test]

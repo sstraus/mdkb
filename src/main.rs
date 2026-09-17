@@ -1476,10 +1476,8 @@ MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<n
                 format_unplaced_arrivals(unplaced, &target, cli.format);
             }
             CodeCommand::Impact { name, depth } => {
-                let (source, impacted, unplaced) =
-                    mdkb::cli::handlers::handle_code_impact(&cwd, &name, depth)?;
-                format_code_graph("Impact radius", &source, &impacted, cli.format);
-                format_unplaced_arrivals(unplaced, &source, cli.format);
+                let (source, report) = mdkb::cli::handlers::handle_code_impact(&cwd, &name, depth)?;
+                format_code_impact(&source, &report, cli.format);
             }
             CodeCommand::Info => {
                 let info = mdkb::cli::handlers::handle_code_info(&cwd)?;
@@ -4066,6 +4064,72 @@ fn format_unplaced_arrivals(
         "  {unplaced} of these arrived through an unqualified call and may belong to another `{}`",
         target.name,
     );
+}
+
+/// Print an impact radius as two lists and a coverage note.
+///
+/// One list would merge two different answers: what a placed call reaches, and
+/// what merely shares a name with the target. The walk does not continue
+/// through the second kind, so the radius is short by their subtrees — and a
+/// list that does not say so reads as exhaustive.
+///
+/// One JSON document, not two: `mdkb code impact --format json | jq` has to
+/// work, which it cannot if the two lists are printed as separate documents.
+fn format_code_impact(
+    source: &mdkb::code::symbol::Symbol,
+    report: &mdkb::core::code::ImpactReport,
+    format: OutputFormat,
+) {
+    match format {
+        OutputFormat::Json => {
+            let output = serde_json::json!({
+                "source": source,
+                "relationship": "Impact radius",
+                "targets": report.impacted,
+                "ambiguous": report.ambiguous,
+                "stopped_arrivals": report.stopped_arrivals,
+            });
+            println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("source,relationship,target,target_kind,file,line");
+            for (label, group) in [
+                ("Impact radius", &report.impacted),
+                ("Ambiguous frontier", &report.ambiguous),
+            ] {
+                for t in group {
+                    println!(
+                        "{},{},{},{},{},{}",
+                        source.name, label, t.name, t.kind, t.file_path, t.range.start_line,
+                    );
+                }
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            format_code_graph("Impact radius", source, &report.impacted, format);
+            if report.ambiguous.is_empty() {
+                return;
+            }
+            println!(
+                "Ambiguous frontier for {} — reached by an unqualified call, so each may \
+                 belong to another `{}`:",
+                source.name, source.name,
+            );
+            for t in &report.ambiguous {
+                println!(
+                    "  - {} {} ({}:{})",
+                    t.kind, t.name, t.file_path, t.range.start_line,
+                );
+            }
+            if report.stopped_arrivals > 0 {
+                println!(
+                    "  the walk stopped at {} of these, so the radius is short by whatever \
+                     they call",
+                    report.stopped_arrivals,
+                );
+            }
+        }
+    }
 }
 
 fn format_code_info(info: &mdkb::cli::handlers::CodeInfoResult, format: OutputFormat) {

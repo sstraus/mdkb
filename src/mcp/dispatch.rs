@@ -2753,26 +2753,22 @@ pub async fn code_graph_impl(
 
     let symbol = resolve_symbol(facade, &params.name, params.symbol_id)?;
 
-    // One entry per hit, `None` when `impact` returns an id the index no longer
-    // holds. Keeping the id alongside preserves that row in the prose instead of
-    // silently shortening the list.
-    // How many entries got here on the strength of a bare name alone. Counted
-    // during the walk because the tier is what the walk returns; reporting it is
+    // How many entries got here on the strength of a bare name alone, and — for
+    // `impact` — how many of those the walk refused to continue through.
+    // Counted here because the tier is what the walk returns; reporting it is
     // the useful statement on this side, where every edge is resolved by
     // construction and a `CallTarget` would say `Resolved` every time.
     let mut unplaced_arrivals = 0usize;
+    let mut stopped_arrivals = 0usize;
     let mut call_evidence = Vec::new();
-    let hits: Vec<(
-        crate::code::types::SymbolId,
-        Option<crate::code::symbol::Symbol>,
-    )> = match params.direction.as_str() {
+    let hits: Vec<crate::code::symbol::Symbol> = match params.direction.as_str() {
         "calls" => {
             let (calls, _) = crate::core::code::classify_calls(facade, symbol.id);
             calls
                 .into_iter()
                 .map(|call| {
                     call_evidence.push((call.tier, call.is_unique));
-                    (call.symbol.id, Some(call.symbol))
+                    call.symbol
                 })
                 .collect()
         }
@@ -2781,17 +2777,24 @@ pub async fn code_graph_impl(
             .into_iter()
             .map(|(s, tier)| {
                 unplaced_arrivals += usize::from(tier == crate::code::storage::TIER_UNPLACED);
-                (s.id, Some(s))
+                s
             })
             .collect(),
-        "impact" => facade
-            .get_impact_by_tier(symbol.id, params.max_depth)
-            .into_iter()
-            .map(|(sid, tier)| {
-                unplaced_arrivals += usize::from(tier == crate::code::storage::TIER_UNPLACED);
-                (sid, facade.get_symbol(sid))
-            })
-            .collect(),
+        "impact" => {
+            let radius = facade.get_impact_by_tier(symbol.id, params.max_depth);
+            stopped_arrivals = radius.stopped_arrivals;
+            // The ambiguous arrivals go last, under their own heading: the two
+            // groups answer different questions and a single list merges them.
+            let mut reached = radius.reached;
+            reached.sort_by_key(|(_, tier)| *tier == crate::code::storage::TIER_UNPLACED);
+            reached
+                .into_iter()
+                .map(|(s, tier)| {
+                    unplaced_arrivals += usize::from(tier == crate::code::storage::TIER_UNPLACED);
+                    s
+                })
+                .collect()
+        }
         _ => {
             return Err(mcp_error(format!(
                 "Invalid direction: '{}'. Valid: calls, callers, impact.",
@@ -2800,9 +2803,7 @@ pub async fn code_graph_impl(
         }
     };
 
-    // Unresolved ids carry no location, so they cannot appear in `symbols`.
-    let symbols: Vec<crate::code::symbol::Symbol> =
-        hits.iter().filter_map(|(_, s)| s.clone()).collect();
+    let symbols = hits.clone();
 
     // What the call graph could not place, for the `calls` direction only —
     // it is the direction that has targets at all. Without this an answer of
@@ -2856,29 +2857,33 @@ pub async fn code_graph_impl(
             "Impact radius for {} ({:?}): {} symbol(s) within {} hop(s).{}\n\n",
             symbol.name,
             symbol.kind,
-            hits.len(),
+            hits.len() - unplaced_arrivals,
             params.max_depth,
-            unplaced_suffix_arrivals(unplaced_arrivals, &symbol.name)
+            impact_coverage_note(unplaced_arrivals, stopped_arrivals, &symbol.name)
         ),
     };
-    for (index, (sid, sym)) in hits.iter().enumerate() {
-        match sym {
-            Some(s) => {
-                text.push_str(&format_symbol(s));
-                if let Some((tier, is_unique)) = call_evidence.get(index) {
-                    text.push_str(&format!(
-                        "    Resolution: tier {tier}, {}\n",
-                        if *is_unique {
-                            "unique"
-                        } else {
-                            "candidate list"
-                        }
-                    ));
-                }
-                text.push('\n');
-            }
-            None => text.push_str(&format!("  sym#{} (not found in index)\n", sid.value())),
+    // Where the placed arrivals end and the ambiguous frontier begins. Only
+    // `impact` sorts its hits this way; the other directions never split.
+    let frontier_starts_at = hits.len() - unplaced_arrivals;
+    for (index, sym) in hits.iter().enumerate() {
+        if params.direction == "impact" && index == frontier_starts_at {
+            text.push_str(
+                "Ambiguous frontier — reached by an unqualified call, so the walk stopped \
+                 here rather than report what they call:\n\n",
+            );
         }
+        text.push_str(&format_symbol(sym));
+        if let Some((tier, is_unique)) = call_evidence.get(index) {
+            text.push_str(&format!(
+                "    Resolution: tier {tier}, {}\n",
+                if *is_unique {
+                    "unique"
+                } else {
+                    "candidate list"
+                }
+            ));
+        }
+        text.push('\n');
     }
 
     Ok(CodeGraphOutput { text, symbols })
@@ -2892,6 +2897,30 @@ fn unplaced_suffix_arrivals(unplaced: usize, name: &str) -> String {
         return String::new();
     }
     format!(" {unplaced} arrived through an unqualified call and may belong to another `{name}`.")
+}
+
+/// How far an impact radius goes, and where it stopped.
+///
+/// Two separate facts, and the second is the one a list cannot show. How many
+/// entries are here on a name alone says how much of the list to distrust; how
+/// many of those the walk refused to continue through says the list is short by
+/// their subtrees. Without the second, a truncated radius reads as exhaustive
+/// and a real caller two hops out is never mentioned at all.
+fn impact_coverage_note(ambiguous: usize, stopped: usize, name: &str) -> String {
+    if ambiguous == 0 {
+        return String::new();
+    }
+    let mut note = format!(
+        " {ambiguous} more arrived through an unqualified call and may belong to another \
+         `{name}`; they are listed apart."
+    );
+    if stopped > 0 {
+        note.push_str(&format!(
+            " The walk stopped at {stopped} of them, so the radius is short by whatever \
+             those call."
+        ));
+    }
+    note
 }
 
 /// The calls of `symbol_id` that no rule placed on an indexed symbol.

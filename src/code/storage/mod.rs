@@ -4,7 +4,7 @@ pub mod repair;
 pub mod schema;
 
 mod sqlite;
-pub use sqlite::{CallSite, CodeDb, NameMatch, TIER_UNPLACED};
+pub use sqlite::{CallSite, CodeDb, ImpactRadius, NameMatch, TIER_UNPLACED};
 
 /// The resolver's own tier cascade, for the duplication pass.
 ///

@@ -672,24 +672,30 @@ impl IndexFacade {
     /// within `max_depth` hops via call relationships.
     pub fn get_impact_radius(&self, start: SymbolId, max_depth: usize) -> Vec<SymbolId> {
         self.get_impact_by_tier(start, max_depth)
+            .reached
             .into_iter()
-            .map(|(id, _)| id)
+            .map(|(symbol, _)| symbol.id)
             .collect()
     }
 
     /// The impact radius with the nearest resolution tier each symbol was
-    /// reached by.
-    pub fn get_impact_by_tier(&self, start: SymbolId, max_depth: usize) -> Vec<(SymbolId, i64)> {
-        self.db
+    /// reached by, and how many ambiguous arrivals the walk refused to follow.
+    pub fn get_impact_by_tier(
+        &self,
+        start: SymbolId,
+        max_depth: usize,
+    ) -> crate::code::storage::ImpactRadius {
+        let mut radius = self
+            .db
             .get_impact_by_tier(i64::from(start.value()), max_depth as u32)
             .unwrap_or_else(|e| {
                 tracing::error!("DB error in get_impact_by_tier({start:?}): {e}");
-                Vec::new()
-            })
-            .into_iter()
-            .map(|(symbol, tier)| (symbol.id, tier))
-            .filter(|&(id, _)| id != start)
-            .collect()
+                crate::code::storage::ImpactRadius::default()
+            });
+        // A cycle reaches the starting symbol again; it is the question, not an
+        // answer.
+        radius.reached.retain(|(symbol, _)| symbol.id != start);
+        radius
     }
 
     // -----------------------------------------------------------------------

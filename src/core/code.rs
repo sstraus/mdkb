@@ -385,37 +385,52 @@ pub fn handle_code_callers(
     let callers = by_tier.into_iter().map(|(caller, _)| caller).collect();
     Ok((symbol, callers, unplaced))
 }
+/// An impact answer, split by what the walk can stand behind.
+#[derive(Debug, Default)]
+pub struct ImpactReport {
+    /// Reached through calls a rule placed. These are the symbols to act on.
+    pub impacted: Vec<crate::code::symbol::Symbol>,
+    /// Reached only by a bare name match, and so never walked through. They
+    /// are in the list because one of them may be the real caller; they are
+    /// apart from it because most of them are not.
+    pub ambiguous: Vec<crate::code::symbol::Symbol>,
+    /// How many of the ambiguous ones the walk stopped at while depth
+    /// remained. The radius is short by whatever they call.
+    pub stopped_arrivals: usize,
+}
+
 /// Handle `mdkb code impact` - impact analysis from a symbol.
 ///
-/// Reports the same unplaced count as [`handle_code_callers`], over the whole
-/// radius: a symbol no rule placed any better than the name it wrote is in the
-/// list on the strength of that name alone.
+/// Splits the radius the way [`handle_code_callers`] counts it, for the same
+/// reason: a symbol no rule placed any better than the name it wrote is in the
+/// list on the strength of that name alone. Over a traversal it matters more —
+/// the walk refuses to continue through such an arrival, so the answer is
+/// incomplete in a way only [`ImpactReport::stopped_arrivals`] records.
 pub fn handle_code_impact(
     root: &Path,
     name: &str,
     depth: usize,
-) -> Result<(
-    crate::code::symbol::Symbol,
-    Vec<crate::code::symbol::Symbol>,
-    usize,
-)> {
+) -> Result<(crate::code::symbol::Symbol, ImpactReport)> {
     let facade = open_code_read_only(root)?;
 
     let symbol = facade
         .get_symbol_by_name(name)
         .ok_or_else(|| Error::other(format!("Symbol '{}' not found", name)))?;
 
-    let by_tier = facade.get_impact_by_tier(symbol.id, depth);
-    let unplaced = by_tier
-        .iter()
-        .filter(|(_, tier)| *tier == crate::code::storage::TIER_UNPLACED)
-        .count();
-    let impacted: Vec<_> = by_tier
-        .iter()
-        .filter_map(|&(id, _)| facade.get_symbol(id))
-        .collect();
+    let radius = facade.get_impact_by_tier(symbol.id, depth);
+    let (ambiguous, impacted): (Vec<_>, Vec<_>) = radius
+        .reached
+        .into_iter()
+        .partition(|(_, tier)| *tier == crate::code::storage::TIER_UNPLACED);
 
-    Ok((symbol, impacted, unplaced))
+    Ok((
+        symbol,
+        ImpactReport {
+            impacted: impacted.into_iter().map(|(s, _)| s).collect(),
+            ambiguous: ambiguous.into_iter().map(|(s, _)| s).collect(),
+            stopped_arrivals: radius.stopped_arrivals,
+        },
+    ))
 }
 /// Handle `mdkb code info` - show index statistics.
 pub fn handle_code_info(root: &Path) -> Result<CodeInfoResult> {

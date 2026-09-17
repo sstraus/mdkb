@@ -871,43 +871,113 @@ impl CodeDb {
     ) -> rusqlite::Result<Vec<Symbol>> {
         Ok(self
             .get_impact_by_tier(symbol_id, max_depth)?
+            .reached
             .into_iter()
             .map(|(symbol, _)| symbol)
             .collect())
     }
 
-    /// The impact radius with the nearest tier each symbol was reached by.
+    /// The impact radius: every symbol the walk reached, and what it refused to
+    /// walk through.
     ///
-    /// A symbol reached again by a nearer rule keeps the nearer tier, so
-    /// [`TIER_UNPLACED`] survives only for symbols that no walk placed any
-    /// better than "wrote this name somewhere".
+    /// **Reported and expanded are two states, not one.** An arrival at
+    /// [`TIER_UNPLACED`] is a bare name match — the caller wrote this name and
+    /// no rule could say it meant this symbol. Reporting it is right: the
+    /// reader can judge it. Walking through it is not: every symbol behind it
+    /// would be reported as impacted on the strength of a name, and one hot
+    /// name drags in a subtree that has nothing to do with the change.
+    ///
+    /// So an unplaced arrival is recorded and never expanded. A symbol first
+    /// reached that way is still expanded later if a placed call reaches it —
+    /// otherwise the rule would under-traverse, dropping a real path because an
+    /// ambiguous one happened to arrive first. Each symbol is queued at most
+    /// once, on its first expandable arrival, and carries the depth of the path
+    /// that queued it: a late qualifying arrival gets no extra budget.
+    ///
+    /// The tier reported per symbol is the nearest arrival — the last edge,
+    /// never the path. A symbol reached through a chain is not more or less
+    /// certain than its last edge says, and no per-hop confidence is invented:
+    /// the tiers are ordinal categories, not probabilities.
     pub fn get_impact_by_tier(
         &self,
         symbol_id: i64,
         max_depth: u32,
-    ) -> rusqlite::Result<Vec<(Symbol, i64)>> {
-        let mut seen: HashMap<i64, (Symbol, i64)> = HashMap::new();
-        let mut frontier = vec![symbol_id];
+    ) -> rusqlite::Result<ImpactRadius> {
+        /// One symbol the walk reached, and how.
+        struct Visit {
+            symbol: Symbol,
+            /// The nearest tier any arrival reached it by.
+            best_arrival_tier: i64,
+            /// Whether it was ever queued for expansion. Once true it never
+            /// queues again, so no symbol is walked twice however many
+            /// arrivals reach it.
+            queued_expandable: bool,
+            /// Whether an unplaced arrival reached it while depth remained —
+            /// the walk could have gone on and chose not to.
+            stopped_with_budget: bool,
+        }
 
-        // `max_depth` counts hops beyond the direct callers, which are depth 0.
-        // A hop is one query for the whole frontier, not one per symbol in it.
-        for _ in 0..=max_depth {
-            let mut next = Vec::new();
-            for (caller, tier) in self.callers_of_any(&frontier)? {
+        let mut visits: HashMap<i64, Visit> = HashMap::new();
+        // The depth of a queued item is the hop that expands it. The start is
+        // hop 0, whose arrivals are the direct callers; `max_depth` counts hops
+        // beyond those.
+        let mut queue: std::collections::VecDeque<(i64, u32)> =
+            std::collections::VecDeque::from([(symbol_id, 0)]);
+
+        while let Some(&(_, depth)) = queue.front() {
+            // Every item queued at this depth is asked about in one query, not
+            // one per symbol: the cascade needs a window function over every
+            // `Calls` edge of the name, and that runs once per statement.
+            let mut hop = Vec::new();
+            while let Some(&(id, item_depth)) = queue.front() {
+                if item_depth != depth {
+                    break;
+                }
+                hop.push(id);
+                queue.pop_front();
+            }
+
+            // Arrivals from this hop land one deeper, which has to be within
+            // budget for any of them to be walked further.
+            let room_to_expand = depth < max_depth;
+            for (caller, tier) in self.callers_of_any(&hop)? {
                 let caller_id = i64::from(caller.id.value());
-                if let Some((_, best)) = seen.get_mut(&caller_id) {
-                    *best = (*best).min(tier);
+                let expandable = tier != TIER_UNPLACED;
+                let visit = visits.entry(caller_id).or_insert_with(|| Visit {
+                    symbol: caller,
+                    best_arrival_tier: tier,
+                    queued_expandable: false,
+                    stopped_with_budget: false,
+                });
+                visit.best_arrival_tier = visit.best_arrival_tier.min(tier);
+                if !room_to_expand {
+                    continue;
+                }
+                if expandable {
+                    // The first expandable arrival is the only one that queues.
+                    // A tier that merely improves changes the report, not the
+                    // traversal.
+                    if !visit.queued_expandable {
+                        visit.queued_expandable = true;
+                        queue.push_back((caller_id, depth + 1));
+                    }
                 } else {
-                    seen.insert(caller_id, (caller, tier));
-                    next.push(caller_id);
+                    visit.stopped_with_budget = true;
                 }
             }
-            if next.is_empty() {
-                break;
-            }
-            frontier = next;
         }
-        Ok(seen.into_values().collect())
+
+        let stopped_arrivals = visits
+            .values()
+            .filter(|v| v.stopped_with_budget && !v.queued_expandable)
+            .count();
+        Ok(ImpactRadius {
+            reached: visits
+                .into_values()
+                .map(|v| (v.symbol, v.best_arrival_tier))
+                .collect(),
+            stopped_arrivals,
+        })
     }
 
     /// Begin a transaction for batch operations.
@@ -1140,6 +1210,21 @@ struct CandidateEdge {
     qualifier: Option<String>,
     receiver_type: Option<String>,
     candidates: Vec<(i64, i64)>,
+}
+
+/// What an impact walk reached, and what it would not walk through.
+///
+/// [`ImpactRadius::stopped_arrivals`] is the honest half of the answer: a
+/// radius that stopped at ambiguous arrivals is short by whatever those symbols
+/// call, and a reader who is not told so reads the list as complete.
+#[derive(Debug, Default)]
+pub struct ImpactRadius {
+    /// Every symbol reached, once, with the nearest tier an arrival reached it
+    /// by — the last edge, not the confidence of the path.
+    pub reached: Vec<(Symbol, i64)>,
+    /// Symbols an unplaced arrival reached while depth remained, and that no
+    /// placed call ever reached. The walk stopped at each of them.
+    pub stopped_arrivals: usize,
 }
 
 /// The tier that says "the target is named, and it is not in this index".
@@ -3140,7 +3225,7 @@ mod tests {
         )
         .unwrap();
 
-        let by_tier = db.get_impact_by_tier(root, 1).unwrap();
+        let by_tier = db.get_impact_by_tier(root, 1).unwrap().reached;
         let tier_of = |name: &str| {
             by_tier
                 .iter()
@@ -3154,6 +3239,172 @@ mod tests {
         // One entry, and the nearer of the two tiers it was reached by.
         assert_eq!(tier_of("shared"), vec![4], "nearest tier wins, once");
         assert_eq!(by_tier.len(), 3, "no symbol is reported twice");
+    }
+
+    /// Insert a callable symbol, returning its id.
+    fn impact_symbol(db: &CodeDb, name: &str, (file, path): (i64, &str), module: &str) -> i64 {
+        db.insert_symbol(
+            name,
+            "Function",
+            file,
+            path,
+            10,
+            None,
+            None,
+            None,
+            0,
+            None,
+            None,
+            Some(module),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// Insert a `Calls` edge attributed to `file`, which is what the cascade
+    /// reads: a target in that same file is tier 4, and a target sharing the
+    /// caller's module path is tier 6.
+    fn impact_call(db: &CodeDb, from: i64, from_name: &str, to: &str, file: i64) {
+        db.insert_relationship(
+            Some(from),
+            from_name,
+            to,
+            &CallSite::default(),
+            "Calls",
+            file,
+            (None, None),
+        )
+        .unwrap();
+    }
+
+    /// The walk reports an unplaced arrival and refuses to walk through it —
+    /// without dropping a symbol a placed call also reaches.
+    ///
+    /// An arrival at [`TIER_UNPLACED`] means the caller wrote this name and no
+    /// rule could say it meant this symbol. Expanding it reports that symbol's
+    /// whole subtree as impacted on the strength of a name, which for a hot
+    /// name is most of the index. The opposite mistake is as bad: refusing to
+    /// expand a symbol *ever* because an ambiguous arrival reached it first
+    /// drops real paths, so `X` below — unplaced from `root`, placed from `P` —
+    /// must still be walked.
+    #[test]
+    fn an_unplaced_arrival_is_reported_but_never_walked_through() {
+        let (_dir, db) = temp_db();
+        let root_file = (insert_test_file(&db), "test.rs");
+        let u_file = (
+            db.insert_file("u.rs", "u.rs", "hash-u", Some("Rust"), None, None)
+                .unwrap(),
+            "u.rs",
+        );
+        let x_file = (
+            db.insert_file("x.rs", "x.rs", "hash-x", Some("Rust"), None, None)
+                .unwrap(),
+            "x.rs",
+        );
+
+        let root = impact_symbol(&db, "root", root_file, "crate::root");
+        let placed = impact_symbol(&db, "P", root_file, "crate::api");
+        let ambiguous = impact_symbol(&db, "U", u_file, "crate::u");
+        let behind = impact_symbol(&db, "E", u_file, "crate::u");
+        let both_ways = impact_symbol(&db, "X", x_file, "crate::api");
+        let deep = impact_symbol(&db, "D", x_file, "crate::x");
+
+        impact_call(&db, placed, "P", "root", root_file.0); // tier 4: same file
+        impact_call(&db, ambiguous, "U", "root", u_file.0); // tier 7: unplaced
+        impact_call(&db, behind, "E", "U", u_file.0); // placed, but only behind U
+        impact_call(&db, both_ways, "X", "root", x_file.0); // tier 7: the same symbol
+        impact_call(&db, both_ways, "X", "P", x_file.0); // tier 6: shared module path
+        impact_call(&db, deep, "D", "X", x_file.0); // tier 4: same file
+
+        let radius = db.get_impact_by_tier(root, 2).unwrap();
+        let mut names: Vec<&str> = radius.reached.iter().map(|(s, _)| s.as_name()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["D", "P", "U", "X"],
+            "E is behind an unplaced arrival and must not be reported; every other \
+             symbol appears exactly once"
+        );
+
+        let tier_of = |name: &str| {
+            radius
+                .reached
+                .iter()
+                .find(|(s, _)| s.as_name() == name)
+                .map(|(_, tier)| *tier)
+                .expect("reported")
+        };
+        assert_eq!(tier_of("U"), TIER_UNPLACED, "U arrived on a name alone");
+        assert_eq!(
+            tier_of("X"),
+            6,
+            "X is stored at the tier that placed it, not at the unplaced arrival \
+             it also had"
+        );
+        assert_eq!(
+            radius.stopped_arrivals, 1,
+            "only U stopped the walk — X was reached again by a placed call, so \
+             nothing was left unexplored behind it"
+        );
+    }
+
+    /// A symbol that qualifies late is expanded from the path that qualified
+    /// it, not from the one that first named it.
+    ///
+    /// `S` arrives unplaced among the direct callers and again, placed, one hop
+    /// further out. It must be walked — otherwise the rule under-traverses —
+    /// but with the budget of the second path. Crediting it the depth of its
+    /// first arrival would buy it a hop it never earned, and `W`, three placed
+    /// hops from `root` with `max_depth` 2, would appear.
+    #[test]
+    fn a_late_qualifying_arrival_gets_no_extra_traversal_budget() {
+        let (_dir, db) = temp_db();
+        let root_file = (insert_test_file(&db), "test.rs");
+        let s_file = (
+            db.insert_file("s.rs", "s.rs", "hash-s", Some("Rust"), None, None)
+                .unwrap(),
+            "s.rs",
+        );
+
+        let root = impact_symbol(&db, "root", root_file, "crate::root");
+        // `A` shares `S`'s module path, which is what places the call from `S`.
+        let alias = impact_symbol(&db, "A", root_file, "crate::s");
+        let late = impact_symbol(&db, "S", s_file, "crate::s");
+        let above_late = impact_symbol(&db, "T", s_file, "crate::s");
+        let beyond = impact_symbol(&db, "W", s_file, "crate::s");
+
+        impact_call(&db, alias, "A", "root", root_file.0); // tier 4
+        impact_call(&db, late, "S", "root", s_file.0); // tier 7: unplaced
+        impact_call(&db, late, "S", "A", s_file.0); // tier 6: placed, one hop out
+        impact_call(&db, above_late, "T", "S", s_file.0); // tier 4
+        impact_call(&db, beyond, "W", "T", s_file.0); // tier 4
+
+        let radius = db.get_impact_by_tier(root, 2).unwrap();
+        let mut names: Vec<&str> = radius.reached.iter().map(|(s, _)| s.as_name()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["A", "S", "T"],
+            "S is walked (no under-traversal) and T is reached, but W is a hop \
+             past the budget of the path that qualified S"
+        );
+
+        let s_tier = radius
+            .reached
+            .iter()
+            .find(|(sym, _)| sym.as_name() == "S")
+            .map(|(_, tier)| *tier)
+            .expect("S is reported");
+        assert_eq!(
+            s_tier, 6,
+            "the nearest arrival wins — and improving the tier of a symbol \
+             already queued changes the report, never the traversal"
+        );
+        assert_eq!(
+            radius.stopped_arrivals, 0,
+            "nothing was left unexplored: the one unplaced arrival was later \
+             reached by a placed call"
+        );
     }
 
     #[test]
