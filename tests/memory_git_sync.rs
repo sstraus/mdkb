@@ -26,7 +26,7 @@ struct Env {
 impl Env {
     fn new() -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().canonicalize().expect("canonicalize");
+        let root = canonical(dir.path());
         handle_init(&root).expect("init");
         let ctx = Context::open(&root).expect("open");
         Self {
@@ -122,6 +122,20 @@ fn frontmatter_keys(text: &str) -> Vec<String> {
         .take_while(|l| *l != "---")
         .filter_map(|l| l.split_once(':').map(|(k, _)| k.trim().to_string()))
         .collect()
+}
+
+/// `canonicalize`, minus the Windows extended-length prefix.
+///
+/// `std::fs::canonicalize` returns `\\?\C:\Users\…` on Windows, and `git` reads
+/// a leading `\\` as the start of a UNC share: `git clone \\?\C:\…` answers
+/// "hostname contains invalid characters". The prefix only ever precedes an
+/// already-absolute path, so dropping it changes nothing else.
+fn canonical(path: &Path) -> PathBuf {
+    let canonical = path.canonicalize().expect("canonicalize");
+    match canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(stripped) => PathBuf::from(stripped),
+        None => canonical,
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -662,7 +676,7 @@ fn no_shadow_reported_when_only_the_store_gitignore_applies() {
 #[test]
 fn two_clones_converge_without_a_manual_import() {
     let origin_dir = tempfile::tempdir().expect("tempdir");
-    let origin = origin_dir.path().canonicalize().unwrap();
+    let origin = canonical(origin_dir.path());
 
     // --- clone A: the repo of record ---
     handle_init(&origin).expect("init");
@@ -692,7 +706,7 @@ fn two_clones_converge_without_a_manual_import() {
 
     // --- clone B ---
     let b_dir = tempfile::tempdir().expect("tempdir");
-    let b_parent = b_dir.path().canonicalize().unwrap();
+    let b_parent = canonical(b_dir.path());
     git(&b_parent, &["clone", origin.to_str().unwrap(), "b"]);
     let b = b_parent.join("b");
     git(&b, &["config", "user.email", "t@example.com"]);
