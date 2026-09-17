@@ -1796,6 +1796,43 @@ fn smoke_setup_mcp_codex_dry_run() {
     assert_ok(&out, "setup mcp codex --dry-run");
 }
 
+/// A `[priors]` block whose distiller prints `answer` and exits 0.
+///
+/// Paths go in TOML *literal* strings (single quotes), which process no
+/// escapes: a Windows path in a basic string makes `\U`, `\A` and friends
+/// invalid escapes, and the resulting parse error reads back as "not
+/// configured" — indistinguishable from a distiller that was never set up.
+///
+/// The payload is a file rather than an inline shell string so that neither
+/// arm has to quote JSON through a shell twice. `parse_distilled` accepts a
+/// bare object — `json_object_slice` exists because codex prints it unfenced —
+/// so `type`/`cat` alone is a valid distiller answer.
+fn priors_printing(answer: &std::path::Path) -> String {
+    let (program, args) = if cfg!(windows) {
+        ("cmd", format!("['/c', 'type {}']", answer.display()))
+    } else {
+        (
+            "sh",
+            format!("['-c', 'cat >/dev/null; cat {}']", answer.display()),
+        )
+    };
+    format!(
+        "[priors]\nmining_enabled = true\ndistiller_program = '{program}'\ndistiller_args = {args}\n"
+    )
+}
+
+/// A `[priors]` block whose distiller writes `message` to stderr and exits 1.
+fn priors_failing(message: &str) -> String {
+    let (program, args) = if cfg!(windows) {
+        ("cmd", format!("['/c', 'echo {message} 1>&2 & exit 1']"))
+    } else {
+        ("sh", format!("['-c', 'echo {message} >&2; exit 1']"))
+    };
+    format!(
+        "[priors]\nmining_enabled = true\ndistiller_program = '{program}'\ndistiller_args = {args}\n"
+    )
+}
+
 /// `setup check` is the answer to "is the distiller actually working?", which
 /// until now could only be answered by reading the daemon log that never
 /// recorded it. It runs the configured CLI once and reports what it said.
@@ -1835,14 +1872,8 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
     // Only `[priors]` is read from this file by the check, and appending a
     // second `[priors]` table to the generated default would be a duplicate-key
     // parse error.
-    std::fs::write(
-        &config,
-        format!(
-            "[priors]\nmining_enabled = true\ndistiller_program = \"sh\"\ndistiller_args = [\"-c\", \"cat >/dev/null; printf '```json\\\\n'; cat {}; printf '\\\\n```'\"]\n",
-            answer.display()
-        ),
-    )
-    .unwrap();
+    //
+    std::fs::write(&config, priors_printing(&answer)).unwrap();
     let out = run(&["setup", "check"], &repo.root);
     assert_ok(&out, "setup check with a working distiller");
     assert!(
@@ -1853,11 +1884,7 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
 
     // A broken distiller: non-zero exit, and the reason it gave on stderr is
     // quoted back. This is the case that was invisible for six weeks.
-    std::fs::write(
-        &config,
-        "[priors]\nmining_enabled = true\ndistiller_program = \"sh\"\ndistiller_args = [\"-c\", \"echo 'unexpected status 400 Bad Request' >&2; exit 1\"]\n",
-    )
-    .unwrap();
+    std::fs::write(&config, priors_failing("unexpected status 400 Bad Request")).unwrap();
     let out = run(&["setup", "check"], &repo.root);
     assert!(
         !out.status.success(),
@@ -1873,11 +1900,9 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
     // field of the schema is required, so this does not deserialize and the
     // check reports it rather than staying quiet: a model pointed at the wrong
     // endpoint, or given the wrong system prompt, must not look healthy.
-    std::fs::write(
-        &config,
-        "[priors]\nmining_enabled = true\ndistiller_program = \"sh\"\ndistiller_args = [\"-c\", \"cat >/dev/null; echo '{\\\"answer\\\":\\\"nothing useful here\\\"}'\"]\n",
-    )
-    .unwrap();
+    let wrong_shape = repo.root.join("wrong-shape.json");
+    std::fs::write(&wrong_shape, r#"{"answer":"nothing useful here"}"#).unwrap();
+    std::fs::write(&config, priors_printing(&wrong_shape)).unwrap();
     let out = run(&["setup", "check"], &repo.root);
     let combined = stdout(&out) + &String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1948,8 +1973,19 @@ fn smoke_session_index_no_sessions() {
 fn smoke_daemon_status() {
     let repo = Repo::new();
     let out = run(&["daemon", "status"], &repo.root);
-    // daemon status always exits 0 per contract
-    assert_ok(&out, "daemon status");
+    if cfg!(unix) {
+        // daemon status always exits 0 per contract
+        assert_ok(&out, "daemon status");
+    } else {
+        // There is no daemon off Unix — `ipc_server`, `spawn` and `singleton`
+        // are all `#[cfg(unix)]`. Asserting the refusal rather than skipping
+        // the test keeps the command's behaviour pinned on both platforms.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && stderr.contains("require Unix"),
+            "daemon status must refuse clearly off Unix, got: {stderr}"
+        );
+    }
 }
 
 // ── Output format variants ──────────────────────────────────────────
