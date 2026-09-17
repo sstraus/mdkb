@@ -296,6 +296,42 @@ const SALVAGED_TABLES: [&str; 5] = [
     "prior_clusters",
 ];
 
+/// A SQLite URI naming `path`, with `immutable=1`.
+///
+/// Not a `format!`, because three characters in a path change what the URI
+/// means. SQLite parses everything after the first `?` as query parameters and
+/// everything after `#` as a fragment, and in URI mode it wants `/` separators.
+/// A Windows temp directory reaches this function as
+/// `\\?\C:\Users\…\index.sqlite.corrupt-…`: the `?` of the extended-length
+/// prefix ended the path after two characters and turned the rest of the drive
+/// path into nonsense parameters, so `ATTACH` failed and the heal reported
+/// "salvaged 0 memory entries" while the entries were sitting in the file.
+/// Silent data loss on exactly the path whose job is to prevent it.
+fn immutable_uri(path: &Path) -> String {
+    let mut encoded = String::from("file:");
+    // `\\?\` only ever prefixes an already-absolute Windows path, and SQLite
+    // does not want it.
+    let raw = path.to_string_lossy();
+    let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+    // A drive-qualified path becomes `file:///C:/…`; a Unix path already starts
+    // with `/`, which `file:` accepts as-is.
+    if raw.as_bytes().get(1) == Some(&b':') {
+        encoded.push_str("///");
+    }
+    for ch in raw.chars() {
+        match ch {
+            '?' => encoded.push_str("%3f"),
+            '#' => encoded.push_str("%23"),
+            // Only on Windows: `\` is an ordinary character in a Unix file name
+            // and rewriting it would name a different file.
+            '\\' if cfg!(windows) => encoded.push('/'),
+            other => encoded.push(other),
+        }
+    }
+    encoded.push_str("?immutable=1");
+    encoded
+}
+
 /// Copy the non-derivable tables out of a quarantined database into the fresh
 /// one via `ATTACH ... immutable=1`.
 ///
@@ -305,7 +341,7 @@ const SALVAGED_TABLES: [&str; 5] = [
 /// read (its pages are the torn ones) is logged loudly with the row count that
 /// was present but lost, so a data-loss event is never silent.
 pub fn salvage_memory(fresh: &Connection, corrupt_path: &Path) -> Salvage {
-    let uri = format!("file:{}?immutable=1", corrupt_path.to_string_lossy());
+    let uri = immutable_uri(corrupt_path);
     if let Err(e) = fresh.execute("ATTACH DATABASE ?1 AS corrupt", params![uri]) {
         tracing::error!(
             "salvage: cannot attach quarantined {} ({e}) — memory entries and collection \
@@ -463,7 +499,7 @@ fn diagnose(corrupt_path: &Path) -> Diagnosis {
         ..Default::default()
     };
 
-    let uri = format!("file:{}?immutable=1", corrupt_path.to_string_lossy());
+    let uri = immutable_uri(corrupt_path);
     let conn = match Connection::open(&uri) {
         Ok(conn) => conn,
         Err(e) => {
@@ -1039,6 +1075,48 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// These run on every platform on purpose. The bug they pin only *fires* on
+    /// Windows, and a `#[cfg(windows)]` test would have been written by someone
+    /// who already knew to look — which is precisely what did not happen.
+    #[test]
+    fn a_question_mark_in_a_path_cannot_end_the_uri() {
+        // `?` opens SQLite's query string, so a literal one must be encoded or
+        // everything after it stops naming the file. This is the `\\?\` prefix
+        // case reduced to its essence.
+        let uri = immutable_uri(Path::new("/tmp/od?d/index.sqlite"));
+        assert_eq!(uri, "file:/tmp/od%3fd/index.sqlite?immutable=1");
+        assert_eq!(
+            uri.matches("?immutable=1").count(),
+            1,
+            "exactly one query string"
+        );
+    }
+
+    #[test]
+    fn a_hash_in_a_path_cannot_start_a_fragment() {
+        assert_eq!(
+            immutable_uri(Path::new("/tmp/v#2/index.sqlite")),
+            "file:/tmp/v%232/index.sqlite?immutable=1"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_path_is_left_alone() {
+        assert_eq!(
+            immutable_uri(Path::new("/tmp/mdkb/index.sqlite")),
+            "file:/tmp/mdkb/index.sqlite?immutable=1"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_extended_length_windows_path_names_the_file_it_points_at() {
+        assert_eq!(
+            immutable_uri(Path::new(r"\\?\C:\Users\me\.mdkb\index.sqlite")),
+            "file:///C:/Users/me/.mdkb/index.sqlite?immutable=1"
+        );
     }
 
     #[test]
