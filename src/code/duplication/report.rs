@@ -135,6 +135,21 @@ impl Bucket {
 pub struct Cluster {
     pub members: Vec<DupCandidate>,
     pub evidence: Evidence,
+    /// Set when this cluster was accepted once and has gained a member since.
+    /// `None` is the ordinary case: never accepted, or unchanged since.
+    pub accepted: Option<AcceptedSnapshot>,
+}
+
+/// What somebody reviewed when they accepted a cluster.
+///
+/// Kept on the resurfaced cluster so the report can say what is new rather than
+/// showing the whole finding again as if nobody had ever looked at it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedSnapshot {
+    /// The ignore entry that accepted it.
+    pub entry_id: String,
+    /// The member keys that were reviewed — see [`member_key`].
+    pub members: BTreeSet<String>,
 }
 
 /// How wide a symbol reaches, largest first.
@@ -202,14 +217,31 @@ impl Cluster {
         total - kept
     }
 
-    /// Identity that survives a reparse.
-    ///
-    /// Built from the sorted `(module_path, name)` pairs and nothing else. Not
-    /// ids, which `split_by_reuse` reassigns; not line numbers, which move when
-    /// anything above the symbol is edited. Sorted so that the order the
-    /// members happened to come back in cannot change the answer.
+    /// Identity that survives a reparse. See [`cluster_hash`].
     pub fn cluster_hash(&self) -> String {
         cluster_hash(&self.members)
+    }
+
+    /// The identity as the report prints it — see [`short_hash`].
+    pub fn short_hash(&self) -> String {
+        short_hash(&self.cluster_hash())
+    }
+
+    /// The members as the ignore-list compares them.
+    pub fn member_keys(&self) -> BTreeSet<String> {
+        self.members.iter().map(member_key).collect()
+    }
+
+    /// The members that were not in the accepted snapshot — everything a
+    /// reviewer has not seen. Empty when the cluster was never accepted.
+    pub fn added_members(&self) -> Vec<&DupCandidate> {
+        let Some(accepted) = &self.accepted else {
+            return Vec::new();
+        };
+        self.members
+            .iter()
+            .filter(|m| !accepted.members.contains(&member_key(m)))
+            .collect()
     }
 
     /// See [`Evidence::bucket`].
@@ -218,21 +250,60 @@ impl Cluster {
     }
 }
 
-/// See [`Cluster::cluster_hash`].
+/// Hex characters of the identity the report and the ignore-list id print.
+///
+/// Twelve, not the whole 64: a reader retypes this, and the display prefix only
+/// has to be unambiguous inside one report. The stored identity is never
+/// truncated — [`cluster_hash`] returns all of it, and matching never looks at
+/// the prefix.
+pub const SHORT_HASH_LEN: usize = 12;
+
+/// How one member is identified, for the cluster hash and for the ignore-list.
+///
+/// Six fields, unit-separated: repo-relative path, language, qualified path,
+/// kind, name and signature. The pair `(module_path, name)` this used to be was
+/// two ways wrong — two overloads share it, and it names a different symbol the
+/// moment the file is renamed under an unchanged module path — and being wrong
+/// here is not a cosmetic problem: the ignore-list compares these, so a key
+/// that collides silently suppresses somebody else's finding.
+///
+/// A unit separator cannot occur in a path, an identifier or a module path, so
+/// `("a::b", "c")` cannot collide with `("a", "b::c")`.
+///
+/// Not the line numbers, which move when anything above the symbol is edited,
+/// and not the id, which `split_by_reuse` reassigns on every reparse.
+pub fn member_key(c: &DupCandidate) -> String {
+    [
+        c.file_path.as_str(),
+        c.language.as_deref().unwrap_or(""),
+        c.module_path.as_deref().unwrap_or(""),
+        c.kind.as_str(),
+        c.name.as_str(),
+        c.signature.as_deref().unwrap_or(""),
+    ]
+    .join("\u{1f}")
+}
+
+/// Identity of a cluster: SHA-256 over its sorted member keys, in full.
+///
+/// All 64 hex characters, 256 bits. The first eight used to be stored, and 32
+/// bits is a coin flip at a few tens of thousands of clusters — a collision
+/// there makes one accepted cluster suppress an unrelated finding, silently.
+/// The short form exists for printing only ([`short_hash`]).
+///
+/// Sorted, so the order the members came back in cannot change the answer.
 pub fn cluster_hash(members: &[DupCandidate]) -> String {
-    // Unit separator between the fields and record separator between members:
-    // neither can occur in an identifier or a module path, so ("a::b", "c")
-    // cannot collide with ("a", "b::c").
-    let mut keys: Vec<String> = members
-        .iter()
-        .map(|c| format!("{}\u{1f}{}", c.module_path.as_deref().unwrap_or(""), c.name))
-        .collect();
+    let mut keys: Vec<String> = members.iter().map(member_key).collect();
     keys.sort_unstable();
     let mut hasher = Sha256::new();
+    // Record separator between members, unit separator inside them.
     hasher.update(keys.join("\u{1e}").as_bytes());
-    // First 8 hex characters: enough to name a cluster in a report and in an
-    // ignore-list entry, short enough for a human to retype.
-    format!("{:x}", hasher.finalize())[..8].to_string()
+    format!("{:x}", hasher.finalize())
+}
+
+/// The first [`SHORT_HASH_LEN`] characters of an identity, for display.
+pub fn short_hash(hash: &str) -> String {
+    hash.chars().take(SHORT_HASH_LEN).collect()
 }
 
 /// Order clusters worst-first.
@@ -366,6 +437,11 @@ fn cluster_json(cluster: &Cluster) -> serde_json::Value {
             "similarity": similarity,
         }),
     };
+    let added: BTreeSet<String> = cluster
+        .added_members()
+        .into_iter()
+        .map(member_key)
+        .collect();
     let members: Vec<serde_json::Value> = cluster
         .members
         .iter()
@@ -379,11 +455,18 @@ fn cluster_json(cluster: &Cluster) -> serde_json::Value {
                 "line_end": m.line_end + 1,
                 "name": m.name,
                 "module": m.module_path,
+                // True only on a cluster that grew after being accepted: the
+                // member nobody has reviewed yet.
+                "new": added.contains(&member_key(m)),
             })
         })
         .collect();
     serde_json::json!({
+        // The full identity, never the display prefix: a consumer that stores
+        // this and compares it later must not be handed a truncation.
         "hash": cluster.cluster_hash(),
+        "short_hash": cluster.short_hash(),
+        "accepted_entry": cluster.accepted.as_ref().map(|a| a.entry_id.clone()),
         "name": cluster.members.first().map(|c| c.name.as_str()),
         "copies": cluster.members.len(),
         "module_spread": cluster.module_spread(),
@@ -466,10 +549,20 @@ fn render_cluster(
         .members
         .first()
         .map_or("(empty)", |c| c.name.as_str());
-    out.push_str(&format!(
-        "## {n}. `{name}` — {}\n\n",
-        cluster.cluster_hash()
-    ));
+    out.push_str(&format!("## {n}. `{name}` — {}\n\n", cluster.short_hash()));
+    if let Some(accepted) = &cluster.accepted {
+        out.push_str(&format!(
+            "**Changed since accepted** (`{}`): {} new member{}. The rest was \
+             reviewed and stays accepted.\n\n",
+            accepted.entry_id,
+            cluster.added_members().len(),
+            if cluster.added_members().len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+        ));
+    }
     out.push_str(&format!(
         "{} copies across {} module{} · {} · {} duplicated lines · {}\n\n",
         cluster.members.len(),
@@ -484,10 +577,22 @@ fn render_cluster(
         cluster.evidence.describe(),
     ));
 
+    let added: BTreeSet<String> = cluster
+        .added_members()
+        .into_iter()
+        .map(member_key)
+        .collect();
     for member in &cluster.members {
+        // Only the new members are marked: a reader who accepted this cluster
+        // once has to look at what they have not seen, not at all of it again.
+        let marker = if added.contains(&member_key(member)) {
+            "**NEW** "
+        } else {
+            ""
+        };
         // Display is 1-based; the stored rows are 0-based tree-sitter rows.
         out.push_str(&format!(
-            "- `{}:{}-{}` — {}\n",
+            "- {marker}`{}:{}-{}` — {}\n",
             member.file_path,
             member.line_start + 1,
             member.line_end + 1,
@@ -544,6 +649,25 @@ fn fence_tag(path: &str) -> &'static str {
 // it was accepted, is searchable like any other decision, and can be superseded
 // when the reason stops holding. No new schema — the store already models all
 // of it.
+//
+// MIGRATION. Entries written before the membership was recorded carry an id
+// derived from the old eight-character digest over `(module_path, name)` pairs.
+// That digest cannot be un-hashed, so there is nothing to convert: the
+// membership it stood for is not recoverable from it, and neither is the new
+// identity. Such an entry is left exactly as it is and keeps matching by id
+// prefix — which, since the member key changed, means it matches nothing, and
+// its cluster is reported again. Re-running `mdkb dup` and accepting it once
+// more writes the membership down and is the whole migration. Nothing here
+// rewrites an existing ignore entry: the rationale on it is a human's, and a
+// pass that edited it would be editing something it cannot re-derive.
+
+/// The fence that holds the reviewed membership inside an ignore entry.
+///
+/// A fenced block rather than a new column: the entry is a `decision` like any
+/// other, projected to disk and read by people, and the membership has to
+/// survive that round trip. `text` and not `json` so the projected markdown
+/// does not invite a renderer to reformat it.
+const MEMBERS_FENCE: &str = "```text dup-members";
 
 /// The tag every ignore entry carries.
 pub const IGNORE_TAG: &str = "dup-ignore";
@@ -551,11 +675,19 @@ pub const IGNORE_TAG: &str = "dup-ignore";
 /// The memory id for an accepted cluster.
 ///
 /// Namespaced rather than the bare hash: a memory store holds ids a human
-/// chose, and an eight-character hex string is exactly the kind of id somebody
-/// else might pick. The prefix also makes the whole list greppable.
+/// chose, and a hex string is exactly the kind of id somebody else might pick.
+/// The prefix also makes the whole list greppable.
+///
+/// Takes the short form, because this is the string a reader retypes. It is a
+/// handle, not the identity: matching compares membership (see
+/// [`is_ignored`]), so a shortened id can never be what decides whether a
+/// finding is suppressed.
 pub fn ignore_entry_id(cluster_hash: &str) -> String {
-    format!("dup-ignore-{cluster_hash}")
+    format!("{IGNORE_ID_PREFIX}{}", short_hash(cluster_hash))
 }
+
+/// The namespace every ignore entry's id starts with.
+pub const IGNORE_ID_PREFIX: &str = "dup-ignore-";
 
 /// Record a cluster as accepted duplication.
 ///
@@ -583,7 +715,20 @@ pub fn ignore_cluster(
         let _ = writeln!(acc, "- `{}:{}`", m.file_path, m.line_start + 1);
         acc
     });
-    let content = format!("{rationale}\n\nCluster `{hash}`:\n\n{locations}");
+    // The membership is written down, not just the digest, because the digest
+    // cannot be un-hashed: a cluster that gains a member gets a different one,
+    // and an ignore keyed on it would silently stop matching. The reviewed set
+    // is what the decision was actually about.
+    let members = cluster
+        .member_keys()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = format!(
+        "{rationale}\n\nCluster `{hash}`:\n\n{locations}\n\
+         Reviewed membership — a cluster is still accepted while its members are \
+         a subset of this list.\n\n{MEMBERS_FENCE}\n{members}\n```\n"
+    );
 
     crate::core::memory::handle_memory_add(
         ctx,
@@ -604,39 +749,160 @@ pub fn ignore_cluster(
     Ok(id)
 }
 
-/// Whether an accepted-duplication decision is currently standing.
+/// Parse the reviewed membership out of an ignore entry's content.
 ///
-/// [`resolve_active`](crate::store::memory_graph::resolve_active)
-/// is the store's own answer to "is this entry still in force", so a superseded
-/// *or* expired entry stops filtering and the cluster comes back — which is the
-/// point of keeping this in the memory store rather than a text file. The
-/// untracked form because an audit is a read: it runs over every cluster, must
-/// work on a read-only connection, and must not inflate the access counts that
-/// rank memory search.
-///
-/// The entry type and tag are checked too. An unrelated entry that happens to
-/// hold this id must not silently delete a finding: suppression fails open
-/// here for the same reason it does in the call-graph pass.
-pub fn is_ignored(conn: &rusqlite::Connection, cluster_hash: &str) -> crate::error::Result<bool> {
-    let id = ignore_entry_id(cluster_hash);
-    let Some(entry) = crate::store::memory_graph::resolve_active(conn, &id)? else {
-        return Ok(false);
-    };
-    Ok(
-        entry.entry_type == crate::store::memory::EntryType::Decision
-            && entry.tags.iter().any(|t| t == IGNORE_TAG),
+/// `None` when there is no fenced block — an entry somebody wrote by hand, or
+/// one written before the membership was recorded. Those keep the old
+/// behaviour: the id is the whole decision (see [`Accepted::members`]).
+fn parse_members(content: &str) -> Option<BTreeSet<String>> {
+    let rest = content.split_once(MEMBERS_FENCE)?.1;
+    let block = rest.split_once("\n```")?.0;
+    Some(
+        block
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
     )
 }
 
-/// Drop the clusters somebody already accepted.
+/// One standing accepted-duplication decision.
+#[derive(Debug, Clone)]
+pub struct Accepted {
+    pub entry_id: String,
+    /// The reviewed membership, or `None` for an entry that recorded none — a
+    /// hand-written one, or one from before the membership was stored. Such an
+    /// entry can only match by id, exactly as it did before.
+    pub members: Option<BTreeSet<String>>,
+}
+
+/// Every accepted-duplication decision currently standing.
+///
+/// [`resolve_active`](crate::store::memory_graph::resolve_active) is the store's
+/// own answer to "is this entry still in force", so a superseded *or* expired
+/// entry stops filtering and the cluster comes back — which is the point of
+/// keeping this in the memory store rather than a text file. The untracked form
+/// because an audit is a read: it runs over every cluster, must work on a
+/// read-only connection, and must not inflate the access counts that rank
+/// memory search.
+///
+/// The entry type and tag are checked too. An unrelated entry that happens to
+/// carry this id prefix must not silently delete a finding: suppression fails
+/// open here for the same reason it does in the call-graph pass.
+pub fn accepted_clusters(conn: &rusqlite::Connection) -> crate::error::Result<Vec<Accepted>> {
+    let ids = crate::store::memory::list_entry_ids_with_prefix(conn, IGNORE_ID_PREFIX)?;
+    let mut out = Vec::new();
+    for id in ids {
+        let Some(entry) = crate::store::memory_graph::resolve_active(conn, &id)? else {
+            continue;
+        };
+        if entry.entry_type != crate::store::memory::EntryType::Decision
+            || !entry.tags.iter().any(|t| t == IGNORE_TAG)
+        {
+            continue;
+        }
+        out.push(Accepted {
+            members: parse_members(&entry.content),
+            entry_id: entry.id,
+        });
+    }
+    Ok(out)
+}
+
+/// What the ignore-list says about one cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verdict {
+    /// Nobody accepted it; report it as a finding.
+    Report,
+    /// Accepted, and it has gained nothing since; suppress it.
+    Accepted,
+    /// Accepted once, and it has grown since. Report it, carrying what was
+    /// reviewed so only the new members have to be looked at.
+    Changed(AcceptedSnapshot),
+}
+
+/// Match one cluster against the standing decisions.
+///
+/// Subset, not equality. A cluster is still the thing somebody accepted as long
+/// as every member of it was in what they reviewed: losing a member, or a
+/// cluster splitting into two halves, changes nothing about the decision — both
+/// halves were accepted. Gaining one does: nobody has looked at the new copy,
+/// and the whole point of an ignore-list is that a human decided, so it
+/// resurfaces rather than inheriting an acceptance it was never part of.
+///
+/// Equality was never a real option: it is what the digest already gave, and it
+/// is exactly why a removal used to make a finding reappear as new.
+pub fn verdict(accepted: &[Accepted], cluster: &Cluster) -> Verdict {
+    let keys = cluster.member_keys();
+    let hash = cluster.cluster_hash();
+    let mut grown: Option<&Accepted> = None;
+    let mut by_prefix = 0usize;
+    for entry in accepted {
+        let Some(members) = &entry.members else {
+            // No recorded membership: it can only speak for the cluster its id
+            // was derived from, and the id holds a prefix of that identity. Any
+            // prefix is accepted — 12 characters is what the report prints, but
+            // somebody who copied more, or fewer, meant the same cluster.
+            let typed = entry
+                .entry_id
+                .strip_prefix(IGNORE_ID_PREFIX)
+                .unwrap_or_default();
+            if !typed.is_empty() && hash.starts_with(typed) {
+                by_prefix += 1;
+            }
+            continue;
+        };
+        if keys.is_subset(members) {
+            return Verdict::Accepted;
+        }
+        // A strict superset means the reviewed cluster grew. Keep looking —
+        // another entry may cover it outright — but remember the best match.
+        if members.is_subset(&keys) && !members.is_empty() {
+            let better =
+                grown.is_none_or(|g| g.members.as_ref().is_none_or(|m| m.len() < members.len()));
+            if better {
+                grown = Some(entry);
+            }
+        }
+    }
+    // Exactly one snapshot-less entry named this cluster. Two means the
+    // prefixes somebody typed are ambiguous, and suppression fails open: a
+    // false positive costs the reader one line, a false suppression deletes a
+    // finding with nothing saying it happened.
+    if by_prefix == 1 {
+        return Verdict::Accepted;
+    }
+    match grown {
+        Some(entry) => Verdict::Changed(AcceptedSnapshot {
+            entry_id: entry.entry_id.clone(),
+            members: entry.members.clone().unwrap_or_default(),
+        }),
+        None => Verdict::Report,
+    }
+}
+
+/// Whether a cluster is currently suppressed by the ignore-list.
+pub fn is_ignored(conn: &rusqlite::Connection, cluster: &Cluster) -> crate::error::Result<bool> {
+    Ok(verdict(&accepted_clusters(conn)?, cluster) == Verdict::Accepted)
+}
+
+/// Drop the clusters somebody already accepted, and mark the ones that have
+/// grown since they were accepted so the report can say what is new.
 pub fn filter_ignored(
     conn: &rusqlite::Connection,
     clusters: Vec<Cluster>,
 ) -> crate::error::Result<Vec<Cluster>> {
+    let accepted = accepted_clusters(conn)?;
     let mut kept = Vec::with_capacity(clusters.len());
-    for cluster in clusters {
-        if !is_ignored(conn, &cluster.cluster_hash())? {
-            kept.push(cluster);
+    for mut cluster in clusters {
+        match verdict(&accepted, &cluster) {
+            Verdict::Accepted => {}
+            Verdict::Report => kept.push(cluster),
+            Verdict::Changed(snapshot) => {
+                cluster.accepted = Some(snapshot);
+                kept.push(cluster);
+            }
         }
     }
     Ok(kept)
@@ -676,6 +942,9 @@ mod tests {
             name: name.to_string(),
             file_path: file.to_string(),
             module_path: module.map(str::to_string),
+            kind: "Function".to_string(),
+            language: Some("rust".to_string()),
+            signature: None,
             owner_name: None,
             visibility,
             line_start: 10,
@@ -687,6 +956,7 @@ mod tests {
         Cluster {
             members,
             evidence: Evidence::Semantic { similarity: 0.8 },
+            accepted: None,
         }
     }
 
@@ -873,8 +1143,14 @@ mod tests {
         assert_ne!(cluster_hash(&a), cluster_hash(&b));
     }
 
+    /// The whole digest is kept; only the printed form is short.
+    ///
+    /// Eight hex characters used to be stored, and 32 bits collide at a few
+    /// tens of thousands of clusters — a collision there makes one accepted
+    /// cluster suppress an unrelated finding with nothing in the output saying
+    /// so.
     #[test]
-    fn the_hash_is_eight_hex_characters() {
+    fn the_identity_is_stored_whole_and_only_displayed_short() {
         let hash = cluster_hash(&[member(
             1,
             "a",
@@ -884,8 +1160,16 @@ mod tests {
             10,
         )]);
 
-        assert_eq!(hash.len(), 8);
+        assert_eq!(hash.len(), 64, "256 bits, not a truncation");
         assert!(hash.chars().all(|c| c.is_ascii_hexdigit()), "{hash}");
+
+        let short = short_hash(&hash);
+        assert_eq!(short.len(), SHORT_HASH_LEN);
+        assert!(
+            (12..=16).contains(&SHORT_HASH_LEN),
+            "a display prefix short enough to retype and long enough to be unambiguous"
+        );
+        assert!(hash.starts_with(&short), "the short form is a prefix of it");
     }
 
     #[test]
@@ -917,13 +1201,13 @@ mod tests {
             member(1, "parse", "src/a.rs", Some("alpha"), Visibility::Public, 3),
             member(2, "parse", "src/b.rs", Some("beta"), Visibility::Public, 3),
         ]);
-        let hash = c.cluster_hash();
+        let short = c.short_hash();
 
         let out = render(&[c], 6, &mut |_| {
             Some("fn parse() {\n    todo!()\n}\n".into())
         });
 
-        assert!(out.contains(&hash), "the cluster hash:\n{out}");
+        assert!(out.contains(&short), "the cluster hash:\n{out}");
         // 1-based display over 0-based storage: line_start 10 renders as 11.
         assert!(out.contains("`src/a.rs:11-13`"), "file:line:\n{out}");
         assert!(out.contains("`src/b.rs:11-13`"), "both members:\n{out}");
@@ -941,6 +1225,7 @@ mod tests {
                 member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
             ],
             evidence: Evidence::Structural { hamming: 4 },
+            accepted: None,
         };
 
         let out = render(&[c], 6, &mut |_| None);
@@ -1006,6 +1291,7 @@ mod tests {
                 member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 3),
             ],
             evidence: Evidence::Structural { hamming: 0 },
+            accepted: None,
         };
         let at_the_cut = Cluster {
             members: vec![
@@ -1013,6 +1299,7 @@ mod tests {
                 member(4, "d", "src/d.rs", Some("delta"), Visibility::Private, 3),
             ],
             evidence: Evidence::Structural { hamming: 6 },
+            accepted: None,
         };
 
         let out = render_json(&[near, at_the_cut], 6);
@@ -1074,6 +1361,7 @@ mod tests {
                 member(3, "parse", "src/c.rs", Some("gamma"), Visibility::Public, 3),
             ],
             evidence: Evidence::Structural { hamming: 2 },
+            accepted: None,
         };
         let hash = c.cluster_hash();
 
@@ -1242,6 +1530,7 @@ mod tests {
                     member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 10),
                 ],
                 evidence: Evidence::Structural { hamming: 0 },
+                accepted: None,
             },
             Cluster {
                 members: vec![
@@ -1249,6 +1538,7 @@ mod tests {
                     member(4, "d", "src/d.rs", Some("delta"), Visibility::Public, 8),
                 ],
                 evidence: Evidence::Structural { hamming: 6 },
+                accepted: None,
             },
             cluster(vec![
                 member(5, "e", "src/e.rs", Some("epsilon"), Visibility::Public, 10),
@@ -1289,6 +1579,7 @@ mod tests {
                     member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 10),
                 ],
                 evidence: Evidence::Structural { hamming: 0 },
+                accepted: None,
             },
             Cluster {
                 members: vec![
@@ -1296,6 +1587,7 @@ mod tests {
                     member(4, "d", "src/d.rs", Some("delta"), Visibility::Public, 8),
                 ],
                 evidence: Evidence::Structural { hamming: 6 },
+                accepted: None,
             },
         ];
 
@@ -1324,6 +1616,7 @@ mod tests {
                 member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 8),
             ],
             evidence: Evidence::Structural { hamming: 4 },
+            accepted: None,
         }];
 
         let prose = render(&clusters, 4, &mut |_| None);
@@ -1364,6 +1657,7 @@ mod tests {
                 ),
             ],
             evidence: Evidence::Structural { hamming: 0 },
+            accepted: None,
         };
         let noisy = Cluster {
             members: (0..12)
@@ -1381,6 +1675,7 @@ mod tests {
                 })
                 .collect(),
             evidence: Evidence::Structural { hamming: 6 },
+            accepted: None,
         };
         assert!(
             noisy.module_spread() > trustworthy.module_spread(),
@@ -1443,6 +1738,229 @@ mod tests {
         ])
     }
 
+    /// Accept `cluster`, recording its membership the way [`ignore_cluster`]
+    /// does. Written through `add_entry` rather than through the store's own
+    /// entry point so the test needs no `Context`; the round trip through the
+    /// real writer is covered by
+    /// `an_accepted_cluster_is_written_as_a_tagged_decision_that_says_why`.
+    fn accept(conn: &Connection, cluster: &Cluster) -> String {
+        let id = ignore_entry_id(&cluster.cluster_hash());
+        let members: Vec<String> = cluster.member_keys().into_iter().collect();
+        let mut entry = decision(&id, vec![IGNORE_TAG.to_string()], EntryType::Decision);
+        entry.content = format!(
+            "Two adapters, deliberately not shared.\n\n{MEMBERS_FENCE}\n{}\n```\n",
+            members.join("\n")
+        );
+        add_entry(conn, &entry).unwrap();
+        id
+    }
+
+    /// Losing a member must not undo the decision.
+    ///
+    /// The digest was taken over the whole membership, so deleting one copy
+    /// produced a different one, the ignore stopped matching, and the finding
+    /// somebody had already dismissed came back as new. Subset matching is the
+    /// fix: the two copies that are left are still copies they accepted.
+    #[test]
+    fn a_member_that_went_away_leaves_the_decision_standing() {
+        let conn = memory_db();
+        let reviewed = cluster(vec![
+            member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+            member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 10),
+            member(3, "c", "src/c.rs", Some("gamma"), Visibility::Public, 10),
+        ]);
+        accept(&conn, &reviewed);
+
+        let mut shrunk = reviewed.clone();
+        shrunk.members.pop();
+        assert_ne!(
+            shrunk.cluster_hash(),
+            reviewed.cluster_hash(),
+            "the fixture is only meaningful if the digest did change"
+        );
+
+        assert!(is_ignored(&conn, &shrunk).unwrap());
+        assert!(filter_ignored(&conn, vec![shrunk]).unwrap().is_empty());
+    }
+
+    /// A cluster that split into halves is still the cluster that was accepted.
+    #[test]
+    fn a_split_leaves_both_halves_accepted() {
+        let conn = memory_db();
+        let reviewed = cluster(vec![
+            member(1, "a", "src/a.rs", Some("alpha"), Visibility::Public, 10),
+            member(2, "b", "src/b.rs", Some("beta"), Visibility::Public, 10),
+            member(3, "c", "src/c.rs", Some("gamma"), Visibility::Public, 10),
+            member(4, "d", "src/d.rs", Some("delta"), Visibility::Public, 10),
+        ]);
+        accept(&conn, &reviewed);
+
+        let left = cluster(reviewed.members[..2].to_vec());
+        let right = cluster(reviewed.members[2..].to_vec());
+
+        assert!(
+            filter_ignored(&conn, vec![left, right]).unwrap().is_empty(),
+            "both halves were reviewed, so both stay accepted"
+        );
+    }
+
+    /// Gaining a member brings the cluster back, and says what is new.
+    ///
+    /// Nobody has looked at the new copy. Inheriting an acceptance it was never
+    /// part of is the failure mode an ignore-list exists to prevent — but
+    /// showing the whole finding again wastes the review that did happen, so
+    /// the report carries what was accepted and marks only the addition.
+    #[test]
+    fn a_member_that_appeared_brings_the_cluster_back_labelled_changed() {
+        let conn = memory_db();
+        let reviewed = ignored_cluster();
+        let id = accept(&conn, &reviewed);
+
+        let mut grown = reviewed.clone();
+        grown.members.push(member(
+            3,
+            "c",
+            "src/c.rs",
+            Some("gamma"),
+            Visibility::Public,
+            10,
+        ));
+
+        assert!(!is_ignored(&conn, &grown).unwrap());
+        let kept = filter_ignored(&conn, vec![grown]).unwrap();
+        assert_eq!(kept.len(), 1, "it has to resurface");
+        let back = &kept[0];
+        let snapshot = back.accepted.as_ref().expect("labelled as changed");
+        assert_eq!(snapshot.entry_id, id);
+        assert_eq!(
+            back.added_members()
+                .iter()
+                .map(|m| m.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c"],
+            "only the member nobody reviewed"
+        );
+
+        let out = render(kept.as_slice(), 6, &mut |_| None);
+        assert!(out.contains("**Changed since accepted**"), "{out}");
+        assert!(out.contains(&format!("`{id}`")), "{out}");
+        assert!(out.contains("**NEW** `src/c.rs:"), "the addition:\n{out}");
+        assert!(
+            !out.contains("**NEW** `src/a.rs:"),
+            "an already-reviewed member must not be marked:\n{out}"
+        );
+    }
+
+    /// An entry with no recorded membership keeps working as it always did.
+    ///
+    /// Somebody may have written one by hand, and every entry written before
+    /// the membership was stored is of that shape. It can only speak for the
+    /// cluster its id came from, which is exactly the old behaviour.
+    #[test]
+    fn an_entry_without_a_recorded_membership_still_matches_by_id() {
+        let conn = memory_db();
+        let c = ignored_cluster();
+        add_entry(
+            &conn,
+            &decision(
+                &ignore_entry_id(&c.cluster_hash()),
+                vec![IGNORE_TAG.to_string()],
+                EntryType::Decision,
+            ),
+        )
+        .unwrap();
+
+        assert!(is_ignored(&conn, &c).unwrap());
+        // ...and for nothing else. A snapshot-less entry must not start
+        // suppressing clusters it was never about.
+        let other = cluster(vec![member(
+            9,
+            "z",
+            "src/z.rs",
+            Some("zeta"),
+            Visibility::Public,
+            10,
+        )]);
+        assert!(!is_ignored(&conn, &other).unwrap());
+    }
+
+    /// A prefix of the identity is accepted; an ambiguous one is not.
+    ///
+    /// The report prints twelve characters and that is what a reader retypes,
+    /// but somebody who copied ten, or all sixty-four, meant the same cluster.
+    /// Two entries whose prefixes both fit is a question the code cannot
+    /// answer, so it declines to suppress — a lost finding is silent, an extra
+    /// one is a line.
+    #[test]
+    fn an_unambiguous_prefix_is_accepted_and_an_ambiguous_one_is_not() {
+        let c = ignored_cluster();
+        let hash = c.cluster_hash();
+        let untyped = |p: &str| Accepted {
+            entry_id: format!("{IGNORE_ID_PREFIX}{p}"),
+            members: None,
+        };
+
+        for len in [8, 12, 16, 64] {
+            let prefix: String = hash.chars().take(len).collect();
+            assert_eq!(
+                verdict(&[untyped(&prefix)], &c),
+                Verdict::Accepted,
+                "a {len}-character prefix names one cluster"
+            );
+        }
+
+        // Two prefixes of the same hash: the shorter cannot be told from the
+        // longer, so neither decides.
+        let ten: String = hash.chars().take(10).collect();
+        let twelve: String = hash.chars().take(12).collect();
+        assert_eq!(
+            verdict(&[untyped(&ten), untyped(&twelve)], &c),
+            Verdict::Report,
+            "ambiguous, so it fails open"
+        );
+
+        // A prefix of something else names nothing here.
+        assert_eq!(verdict(&[untyped("ffffffffffff")], &c), Verdict::Report);
+        assert_eq!(
+            verdict(&[untyped("")], &c),
+            Verdict::Report,
+            "an empty prefix matches every cluster and must match none"
+        );
+    }
+
+    /// The member key separates what `(module_path, name)` could not.
+    ///
+    /// Two overloads share a module and a name; a file rename keeps both while
+    /// moving the symbol somewhere else entirely. Either collision means one
+    /// accepted cluster silently suppresses a different finding.
+    #[test]
+    fn the_member_key_separates_overloads_and_follows_a_rename() {
+        let base = member(
+            1,
+            "parse",
+            "src/a.rs",
+            Some("alpha"),
+            Visibility::Public,
+            10,
+        );
+
+        let mut overload = base.clone();
+        overload.signature = Some("fn parse(s: &str) -> u32".to_string());
+        assert_ne!(member_key(&base), member_key(&overload), "overloads");
+
+        let mut renamed = base.clone();
+        renamed.file_path = "src/b.rs".to_string();
+        assert_ne!(member_key(&base), member_key(&renamed), "a renamed file");
+
+        let mut other_language = base.clone();
+        other_language.language = Some("python".to_string());
+        assert_ne!(member_key(&base), member_key(&other_language), "language");
+
+        let mut method = base.clone();
+        method.kind = "Method".to_string();
+        assert_ne!(member_key(&base), member_key(&method), "kind");
+    }
+
     #[test]
     fn an_active_decision_filters_the_cluster_out_of_the_report() {
         let conn = memory_db();
@@ -1457,7 +1975,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(is_ignored(&conn, &c.cluster_hash()).unwrap());
+        assert!(is_ignored(&conn, &c).unwrap());
         assert!(filter_ignored(&conn, vec![c]).unwrap().is_empty());
     }
 
@@ -1500,7 +2018,7 @@ mod tests {
             EntryStatus::Superseded,
             "the edge flipped the status"
         );
-        assert!(!is_ignored(&conn, &c.cluster_hash()).unwrap());
+        assert!(!is_ignored(&conn, &c).unwrap());
         assert_eq!(filter_ignored(&conn, vec![c]).unwrap().len(), 1);
     }
 
@@ -1530,14 +2048,14 @@ mod tests {
             &decision(&id, vec!["unrelated".into()], EntryType::Decision),
         )
         .unwrap();
-        assert!(!is_ignored(&conn, &c.cluster_hash()).unwrap(), "wrong tag");
+        assert!(!is_ignored(&conn, &c).unwrap(), "wrong tag");
 
         crate::store::memory::update_entry(
             &conn,
             &decision(&id, vec![IGNORE_TAG.to_string()], EntryType::Topic),
         )
         .unwrap();
-        assert!(!is_ignored(&conn, &c.cluster_hash()).unwrap(), "wrong type");
+        assert!(!is_ignored(&conn, &c).unwrap(), "wrong type");
     }
 
     /// The id follows the cluster, not the ids or lines inside it — so an
@@ -1546,8 +2064,12 @@ mod tests {
     fn the_ignore_id_is_namespaced_and_follows_the_cluster_hash() {
         let c = ignored_cluster();
 
-        assert_eq!(ignore_entry_id("a1b2c3d4"), "dup-ignore-a1b2c3d4");
-        assert!(ignore_entry_id(&c.cluster_hash()).ends_with(&c.cluster_hash()));
+        assert_eq!(
+            ignore_entry_id("a1b2c3d4e5f60000ff"),
+            "dup-ignore-a1b2c3d4e5f6",
+            "the id carries the printable prefix, which is what a reader retypes"
+        );
+        assert!(ignore_entry_id(&c.cluster_hash()).ends_with(&c.short_hash()));
         assert_ne!(
             ignore_entry_id(&c.cluster_hash()),
             c.cluster_hash(),
@@ -1596,8 +2118,15 @@ mod tests {
             "where:\n{}",
             entry.content
         );
-        // And what it wrote is what the filter reads.
-        assert!(is_ignored(&ctx.conn, &c.cluster_hash()).unwrap());
+        // And what it wrote is what the filter reads — including the
+        // membership, which is the half a hand-edited entry can lose.
+        assert_eq!(
+            parse_members(&entry.content),
+            Some(c.member_keys()),
+            "the block the writer emits must be the block the matcher parses:\n{}",
+            entry.content
+        );
+        assert!(is_ignored(&ctx.conn, &c).unwrap());
     }
 
     /// The ignore-list adds no schema and writes no SQL of its own.

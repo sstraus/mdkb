@@ -962,6 +962,30 @@ pub fn list_entries(
     list_entries_sorted(conn, limit, MemorySortOrder::Popular, status_filter)
 }
 
+/// Every entry id under a namespace prefix, in id order.
+///
+/// Ids only: the caller resolves each one through
+/// [`resolve_active`](crate::store::memory_graph::resolve_active), which is the
+/// store's own answer to whether an entry still stands, and loading the bodies
+/// here would mean answering that question twice in two different ways.
+///
+/// `prefix` is matched literally — `_` and `%` are escaped, so a namespace that
+/// contains either cannot widen the match to entries nobody asked for.
+pub fn list_entry_ids_with_prefix(conn: &Connection, prefix: &str) -> Result<Vec<String>> {
+    let escaped = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let mut stmt =
+        conn.prepare("SELECT id FROM memory_entries WHERE id LIKE ?1 ESCAPE '\\' ORDER BY id")?;
+    let rows = stmt.query_map(params![format!("{escaped}%")], |r| r.get::<_, String>(0))?;
+    let mut ids = Vec::new();
+    for row in rows {
+        ids.push(row?);
+    }
+    Ok(ids)
+}
+
 /// List all entries including expired ones. Used by the export handler.
 pub fn list_entries_all(conn: &Connection) -> Result<Vec<MemoryEntry>> {
     let mut stmt = conn.prepare(

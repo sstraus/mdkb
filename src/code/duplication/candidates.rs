@@ -32,6 +32,16 @@ pub struct DupCandidate {
     pub name: String,
     pub file_path: String,
     pub module_path: Option<String>,
+    /// `Function` or `Method`, as stored. Part of the member key: a free
+    /// function and a method of the same name are not the same symbol.
+    pub kind: String,
+    /// The file's language, `None` when the indexer could not name one. Part of
+    /// the member key, so a Rust `parse` and a Python `parse` at the same
+    /// relative path cannot be read as the same member.
+    pub language: Option<String>,
+    /// The signature as stored, `None` when the parser produced none. Part of
+    /// the member key: it is the only field that separates two overloads.
+    pub signature: Option<String>,
     /// The class or trait this is a member of, `None` for a free function.
     pub owner_name: Option<String>,
     /// How far the symbol reaches. Ranking uses it: duplicated `pub` API is
@@ -61,13 +71,18 @@ impl DupCandidate {
 /// until something has parsed the body. Filtering here is what keeps the parse
 /// from touching every file in the repository — see [`files_of`].
 pub fn candidates(conn: &Connection, min_lines: u32) -> rusqlite::Result<Vec<DupCandidate>> {
+    // LEFT JOIN, not JOIN: a symbol whose file row is missing still has to be
+    // reported. Losing a finding because a join failed is the one outcome this
+    // pass must never produce.
     let mut stmt = conn.prepare(
-        "SELECT id, name, file_path, module_path, owner_name, visibility, line_start, line_end \
-         FROM code_symbols \
-         WHERE kind IN ('Function', 'Method') \
-           AND line_end IS NOT NULL \
-           AND line_end - line_start + 1 >= ?1 \
-         ORDER BY file_path, line_start",
+        "SELECT s.id, s.name, s.file_path, s.module_path, s.owner_name, s.visibility, \
+                s.line_start, s.line_end, s.kind, s.signature, f.language \
+         FROM code_symbols s \
+         LEFT JOIN code_files f ON f.id = s.file_id \
+         WHERE s.kind IN ('Function', 'Method') \
+           AND s.line_end IS NOT NULL \
+           AND s.line_end - s.line_start + 1 >= ?1 \
+         ORDER BY s.file_path, s.line_start",
     )?;
     let rows = stmt.query_map(params![min_lines], |row| {
         Ok(DupCandidate {
@@ -79,6 +94,9 @@ pub fn candidates(conn: &Connection, min_lines: u32) -> rusqlite::Result<Vec<Dup
             visibility: visibility_from_i64(row.get(5)?),
             line_start: row.get(6)?,
             line_end: row.get(7)?,
+            kind: row.get(8)?,
+            signature: row.get(9)?,
+            language: row.get(10)?,
         })
     })?;
     rows.collect()

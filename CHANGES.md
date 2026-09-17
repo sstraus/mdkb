@@ -4,6 +4,35 @@
 
 ### Changed
 
+- **An accepted duplication cluster stays accepted when its membership
+  changes.** The ignore-list was keyed on a digest of the whole membership, so
+  deleting one copy produced a different key, the decision stopped matching, and
+  a finding somebody had already dismissed came back as new. The entry now
+  records the membership that was reviewed, and a cluster is accepted while its
+  members are a **subset** of that: a removal keeps the decision, and a cluster
+  splitting in two leaves both halves accepted. Gaining a member resurfaces it —
+  nobody looked at the new copy — but labelled `Changed since accepted`, with
+  only the new members marked `**NEW**`, so the review that did happen is not
+  repeated.
+
+  The member key was `(module_path, name)`, which two overloads share and which
+  names a different symbol after a file rename. It is now the repo-relative
+  path, the language, the qualified path, the kind, the name and the signature.
+  A collision here is not cosmetic: it silently suppresses somebody else's
+  finding.
+
+  The stored identity goes from 8 hex characters to the full 64. 32 bits is a
+  coin flip across a few tens of thousands of clusters. Reports print a 12-hex
+  prefix, the JSON surface carries both, and any unambiguous prefix is accepted
+  as an id — two prefixes that both fit suppress nothing, because a lost finding
+  is silent and an extra one is a line.
+
+  **No existing ignore entry is rewritten.** The old digest cannot be un-hashed,
+  so the membership it stood for is not recoverable and there is nothing to
+  convert. An old entry is left alone, its cluster is reported again, and
+  accepting it once more from a fresh `mdkb dup` run writes the membership down.
+  That re-run is the whole migration.
+
 - **A SessionStart telemetry row says where the time went.** The row carried
   `elapsed_ms` and nothing else, so a hook averaging 476 ms against a 200 ms
   budget — 66% of 1372 recorded runs over budget — named no phase, and

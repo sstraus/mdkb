@@ -202,6 +202,7 @@ fn structural_cluster(group: &[usize], scan: &Scan) -> Cluster {
     Cluster {
         members: scan.members(group),
         evidence: Evidence::Structural { hamming: widest },
+        accepted: None,
     }
 }
 
@@ -273,6 +274,7 @@ fn semantic_clusters(
             evidence: Evidence::Semantic {
                 similarity: group_similarity(&group, &pairs),
             },
+            accepted: None,
         })
         .collect())
 }
