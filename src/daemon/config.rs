@@ -30,14 +30,33 @@ const DEFAULT_MAX_ACTIVE_REPOS: usize = 5;
 /// root. Returns an error rather than a CWD-relative path when nothing names a
 /// home, so callers fail fast.
 pub fn home_dir() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
+    named_home(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+    )
+    .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()))
+    .ok_or_else(|| {
+        Error::other("Cannot resolve home directory: HOME and USERPROFILE are unset or empty")
+    })
+}
+
+/// The home directory the environment names, if either variable names one.
+///
+/// Split out from [`home_dir`] so the precedence can be tested without
+/// `set_var`: `cargo test` runs tests as threads of one process, so mutating
+/// the environment in a test corrupts whichever sibling reads it next. This
+/// function is pure, and the platform fallback is the only untested line left.
+/// An empty value is skipped rather than accepted, so `HOME=""` falls through
+/// to `USERPROFILE` instead of resolving to the filesystem root.
+fn named_home(
+    home: Option<&std::ffi::OsStr>,
+    user_profile: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    [home, user_profile]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.is_empty())
         .map(PathBuf::from)
-        .filter(|p| !p.as_os_str().is_empty())
-        .or_else(|| directories::BaseDirs::new().map(|b| b.home_dir().to_path_buf()))
-        .ok_or_else(|| {
-            Error::other("Cannot resolve home directory: HOME and USERPROFILE are unset or empty")
-        })
 }
 
 /// Daemon configuration.
@@ -217,34 +236,46 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// `nextest` gives every test its own process, so setting a variable here
-    /// cannot leak into another test.
-    ///
     /// The point of the whole function: an operator, and this suite, must be
     /// able to say where home is. `BaseDirs` alone answers a Win32 API that
     /// takes no instruction.
+    ///
+    /// Tested through `named_home` rather than by setting the variables:
+    /// `cargo test` runs tests as threads of ONE process, so a `set_var` here
+    /// reaches whichever sibling reads the environment next. An earlier draft
+    /// of this test did exactly that and broke two unrelated config tests.
     #[test]
     fn the_environment_names_home_before_the_platform_does() {
-        let tmp = TempDir::new().unwrap();
-        unsafe { std::env::set_var("HOME", tmp.path()) };
-        assert_eq!(home_dir().unwrap(), tmp.path());
+        let home = std::ffi::OsStr::new("/home/me");
+        let profile = std::ffi::OsStr::new("C:/Users/me");
 
-        // Windows spelling, honoured everywhere so the two platforms cannot
-        // drift into different resolution orders.
-        unsafe { std::env::remove_var("HOME") };
-        unsafe { std::env::set_var("USERPROFILE", tmp.path()) };
-        assert_eq!(home_dir().unwrap(), tmp.path());
+        assert_eq!(
+            named_home(Some(home), Some(profile)),
+            Some(PathBuf::from("/home/me")),
+            "HOME wins when both are named"
+        );
+        assert_eq!(
+            named_home(None, Some(profile)),
+            Some(PathBuf::from("C:/Users/me")),
+            "the Windows spelling is honoured everywhere, so the platforms \
+             cannot drift into different resolution orders"
+        );
+        assert_eq!(named_home(None, None), None, "nothing named, nothing found");
     }
 
     /// An empty value must not resolve to the filesystem root, which is where
     /// `PathBuf::from("")` joined with `.mdkb` would put the store.
     #[test]
-    fn an_empty_home_is_not_a_home() {
-        unsafe { std::env::set_var("HOME", "") };
-        unsafe { std::env::set_var("USERPROFILE", "") };
-        // Falls through to the platform, which on CI does resolve — the claim
-        // is only that the empty string is never the answer.
-        assert_ne!(home_dir().ok(), Some(PathBuf::new()));
+    fn an_empty_value_is_not_a_home() {
+        let empty = std::ffi::OsStr::new("");
+        let profile = std::ffi::OsStr::new("C:/Users/me");
+
+        assert_eq!(named_home(Some(empty), Some(empty)), None);
+        assert_eq!(
+            named_home(Some(empty), Some(profile)),
+            Some(PathBuf::from("C:/Users/me")),
+            "an empty HOME falls through rather than winning"
+        );
     }
 
     #[test]
