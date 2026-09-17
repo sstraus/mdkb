@@ -597,7 +597,20 @@ pub struct HooksConfig {
     /// inject memory only.
     pub recall_docs_limit: usize,
 
-    /// Latency budget in milliseconds; hook truncates output if exceeded.
+    /// Overrun threshold in milliseconds. A hook that runs longer than this has
+    /// its telemetry row copied to `.mdkb/hook-slow.jsonl`, alongside the
+    /// `hook-events.jsonl` row every run writes.
+    ///
+    /// It does NOT cap anything. The doc here used to say the hook truncates
+    /// its output when the budget is exceeded, and no code ever did that — a
+    /// reader who trusted it would set the value expecting shorter injections
+    /// and get the same output, silently. Truncating on a stopwatch would also
+    /// be the wrong knob: the output size is already bounded by `warmup_limit`
+    /// and `warmup_token_budget`, and cutting a block mid-way once a machine
+    /// happens to be busy makes the injection non-deterministic.
+    ///
+    /// Use `warmup_limit` / `warmup_token_budget` to bound the output, and this
+    /// to decide what counts as slow enough to look at.
     pub latency_budget_ms: u64,
 
     /// Minimum confidence for a warmup entry to be injected. `0.0` (default)

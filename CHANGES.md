@@ -4,6 +4,29 @@
 
 ### Changed
 
+- **A SessionStart telemetry row says where the time went.** The row carried
+  `elapsed_ms` and nothing else, so a hook averaging 476 ms against a 200 ms
+  budget — 66% of 1372 recorded runs over budget — named no phase, and
+  answering from outside meant reprofiling against the store that produced it.
+  Rows now carry a `phases` object splitting the total across `context`,
+  `warmup`, `handoff`, `stale_deps` and `code_check`, in the order they run and
+  summing to the whole.
+
+  The split settles it: **measured 2026-09-17 on a 615-document store, the
+  first SessionStart against a daemon that has not opened the repo costs 494 ms
+  — 360 ms `warmup`, 132 ms `context` — and every run after it costs 1 ms
+  (P50 1, P95 1 over 20 runs).** The budget is exceeded by first-touch cost,
+  not by the hook's work, so an average over recorded runs mostly measures how
+  often the daemon was cold.
+
+  `latency_budget_ms` documented itself as truncating hook output when
+  exceeded. It never did — it only decides which rows are copied to
+  `hook-slow.jsonl`. The doc comment and both hook documents now say so.
+  Truncating on a stopwatch stays rejected rather than implemented: the output
+  is already bounded by `warmup_limit` and `warmup_token_budget`, and cutting a
+  block mid-way because a machine was busy makes the injection
+  non-deterministic.
+
 - **Candidates that carry the same lesson are one cluster.** Clustering keyed on
   the trigger first and the lesson second, so it counted spellings rather than
   lessons. The distiller is non-deterministic: one rule comes back as six

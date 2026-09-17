@@ -127,8 +127,10 @@ stage, so a downstream `| grep` filter is not incorrectly replaced.
 5. Call `get_warmup_index(conn, warmup_limit)` → returns formatted memory
    entry summaries (id, type, title, tags)
 6. Build markdown block: `## mdkb memory warmup\n\n- [type] id: title #tags\n...`
-7. If elapsed > `latency_budget_ms`, log to `hook-slow.jsonl` and append
-   truncation notice
+7. Write the telemetry row, with the per-phase split (`context`, `warmup`,
+   `handoff`, `stale_deps`, `code_check`); if elapsed > `latency_budget_ms`,
+   copy it to `hook-slow.jsonl`. Nothing is truncated — the output is bounded
+   by `warmup_limit` and `warmup_token_budget`, not by the clock
 
 **Output example:**
 ```

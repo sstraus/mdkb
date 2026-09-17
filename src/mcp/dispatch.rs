@@ -3164,7 +3164,15 @@ fn log_hook_event(
     elapsed_ms: u64,
     slow_threshold_ms: u64,
 ) {
-    log_hook_event_with_reason(root, event, outcome, None, elapsed_ms, slow_threshold_ms);
+    log_hook_event_full(
+        root,
+        event,
+        outcome,
+        None,
+        None,
+        elapsed_ms,
+        slow_threshold_ms,
+    );
 }
 
 /// [`log_hook_event`] plus the `reason` an outcome carries, omitted when there
@@ -3179,6 +3187,53 @@ fn log_hook_event_with_reason(
     elapsed_ms: u64,
     slow_threshold_ms: u64,
 ) {
+    log_hook_event_full(
+        root,
+        event,
+        outcome,
+        reason,
+        None,
+        elapsed_ms,
+        slow_threshold_ms,
+    );
+}
+
+/// [`log_hook_event`] plus the per-phase split of `elapsed_ms`.
+///
+/// `elapsed_ms` alone says a hook was slow and nothing about where the time
+/// went: SessionStart averaged 476 ms against a 200 ms budget for as long as
+/// the telemetry existed, and no row ever said which of its five phases was
+/// responsible. Answering that from the outside means re-running the hook under
+/// a profiler on a store that reproduces the problem — the store is the input,
+/// so it usually does not.
+fn log_hook_event_with_phases(
+    root: std::path::PathBuf,
+    event: &str,
+    outcome: &str,
+    phases: &PhaseTimings,
+    elapsed_ms: u64,
+    slow_threshold_ms: u64,
+) {
+    log_hook_event_full(
+        root,
+        event,
+        outcome,
+        None,
+        phases.as_json(),
+        elapsed_ms,
+        slow_threshold_ms,
+    );
+}
+
+fn log_hook_event_full(
+    root: std::path::PathBuf,
+    event: &str,
+    outcome: &str,
+    reason: Option<&str>,
+    phases: Option<serde_json::Value>,
+    elapsed_ms: u64,
+    slow_threshold_ms: u64,
+) {
     let ts = chrono::Utc::now().timestamp();
     let mut payload = serde_json::json!({
         "ts": ts,
@@ -3188,6 +3243,9 @@ fn log_hook_event_with_reason(
     });
     if let Some(reason) = reason {
         payload["reason"] = serde_json::json!(reason);
+    }
+    if let Some(phases) = phases {
+        payload["phases"] = phases;
     }
     let mut line = payload.to_string();
     line.push('\n');
@@ -3595,6 +3653,55 @@ fn format_projection_drift_banner(ctx: &crate::core::Context) -> crate::Result<O
     )))
 }
 
+/// The wall-clock split of one hook run, phase by phase, in the order they ran.
+///
+/// Sequential by construction: [`mark`](PhaseTimings::mark) closes the segment
+/// that opened when the previous one did. That is the real shape of
+/// SessionStart — nothing in it runs concurrently — and it is the reason the
+/// phases add up to the total the dispatcher measures. Independent stopwatches
+/// would not add up, and a split that does not account for the whole is exactly
+/// how an unattributed 476 ms average survives.
+///
+/// Phases are recorded as they complete, so a run that returns early carries
+/// only the phases it reached. That is the honest record: the missing names say
+/// where it stopped.
+#[derive(Debug)]
+pub struct PhaseTimings {
+    last: std::time::Instant,
+    phases: Vec<(&'static str, u64)>,
+}
+
+impl PhaseTimings {
+    fn new() -> Self {
+        Self {
+            last: std::time::Instant::now(),
+            phases: Vec::new(),
+        }
+    }
+
+    /// Close the running segment and name it.
+    fn mark(&mut self, phase: &'static str) {
+        let now = std::time::Instant::now();
+        self.phases
+            .push((phase, now.duration_since(self.last).as_millis() as u64));
+        self.last = now;
+    }
+
+    /// The split as a JSON object, or `None` when nothing was marked — a hook
+    /// with no phases must not write an empty object into every row.
+    fn as_json(&self) -> Option<Value> {
+        if self.phases.is_empty() {
+            return None;
+        }
+        Some(Value::Object(
+            self.phases
+                .iter()
+                .map(|(name, ms)| ((*name).to_string(), json!(ms)))
+                .collect(),
+        ))
+    }
+}
+
 /// `session_cwd` is the validated session working directory (see
 /// [`hook_session_cwd`]) — the only signal that says which project inside a
 /// multi-project store this session belongs to. `None` means unscoped: every
@@ -3602,6 +3709,27 @@ fn format_projection_drift_banner(ctx: &crate::core::Context) -> crate::Result<O
 pub async fn hook_session_start_impl(
     handle: &Arc<RepoHandle>,
     session_cwd: Option<&std::path::Path>,
+) -> Value {
+    hook_session_start_timed(handle, session_cwd).await.0
+}
+
+/// [`hook_session_start_impl`] and the per-phase split of the time it took.
+///
+/// Split off rather than folded into the one function because only the
+/// dispatcher, which writes the telemetry row, has any use for the timings.
+pub async fn hook_session_start_timed(
+    handle: &Arc<RepoHandle>,
+    session_cwd: Option<&std::path::Path>,
+) -> (Value, PhaseTimings) {
+    let mut phases = PhaseTimings::new();
+    let out = hook_session_start_inner(handle, session_cwd, &mut phases).await;
+    (out, phases)
+}
+
+async fn hook_session_start_inner(
+    handle: &Arc<RepoHandle>,
+    session_cwd: Option<&std::path::Path>,
+    phases: &mut PhaseTimings,
 ) -> Value {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
@@ -3613,6 +3741,10 @@ pub async fn hook_session_start_impl(
     if ensure_handle_context(handle).await.is_err() {
         return json!({});
     }
+    // First open of the store in this process: it can carry a schema migration
+    // and the sqlite-vec load, neither of which the warmup query should be
+    // blamed for.
+    phases.mark("context");
     let limit = cfg.warmup_limit.max(1);
     let mut ctx_guard = handle.ctx.lock().await;
     let startup_data =
@@ -3649,6 +3781,9 @@ pub async fn hook_session_start_impl(
             None => return json!({}),
         };
     drop(ctx_guard);
+    // Ranked warmup pool, document count, collection list and the projection
+    // drift count — four queries under one lock.
+    phases.mark("warmup");
 
     let scope = project_scope_token(&handle.root, session_cwd, &collection_names);
 
@@ -3680,6 +3815,7 @@ pub async fn hook_session_start_impl(
             None => return json!({}),
         }
     };
+    phases.mark("handoff");
     let (handoff_body, entries) = strip_handoffs(entries, anchor.as_ref());
 
     // Rank: confidence floor (off at 0.0), project affinity first when a scope
@@ -3712,6 +3848,8 @@ pub async fn hook_session_start_impl(
             None => {}
         }
     }
+    // Ranking plus the one graph query that marks a stale dependency.
+    phases.mark("stale_deps");
     lines.extend(ranked.iter().map(|e| {
         let prefix = if stale_ids.contains(&e.id) {
             "[STALE-DEP] "
@@ -3792,6 +3930,10 @@ pub async fn hook_session_start_impl(
             }
         }
     }
+
+    // Rendering the body plus the second database this hook opens — `code.sqlite`,
+    // read-only, for its last scan timestamp.
+    phases.mark("code_check");
 
     json!({
         "hookSpecificOutput": {
@@ -5269,7 +5411,7 @@ pub async fn dispatch_call(
             dctx.reset_hook_session(&key);
             let t0 = std::time::Instant::now();
             let session_cwd = hook_session_cwd(&params, &handle.root);
-            let result = hook_session_start_impl(&handle, session_cwd.as_deref()).await;
+            let (result, phases) = hook_session_start_timed(&handle, session_cwd.as_deref()).await;
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) {
                 "skipped"
@@ -5279,7 +5421,7 @@ pub async fn dispatch_call(
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || {
-                log_hook_event(root, "session_start", outcome, ms, budget);
+                log_hook_event_with_phases(root, "session_start", outcome, &phases, ms, budget);
             });
             record_hook_call(&handle, tool_name).await;
             Ok(result)

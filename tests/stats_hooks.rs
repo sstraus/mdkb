@@ -122,6 +122,55 @@ fn hook_dispatch_records_call_under_hooks_pseudo_session() {
     assert!(hooks_call_count(&conn, "session_start") >= 2);
 }
 
+/// `elapsed_ms` says a hook was slow; only the split says what to fix.
+///
+/// SessionStart ran at a 476 ms average against a 200 ms budget with no row
+/// ever naming the phase responsible, and the phases are the five places it
+/// touches the disk — nothing about the total distinguishes a slow schema
+/// migration from a slow warmup query.
+#[test]
+fn session_start_telemetry_carries_the_per_phase_split() {
+    let tmp = seed_repo();
+    run_hook(tmp.path(), "session-start", "");
+
+    let text = std::fs::read_to_string(tmp.path().join(".mdkb/hook-events.jsonl"))
+        .expect("every hook run writes a telemetry row");
+    let row = text
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("each row is one JSON object"))
+        .find(|r| r["event"] == "session_start")
+        .expect("a session_start row");
+
+    let phases = row
+        .get("phases")
+        .and_then(serde_json::Value::as_object)
+        .expect("the row must carry the per-phase split, not just the total");
+    for name in ["context", "warmup", "handoff", "stale_deps", "code_check"] {
+        assert!(
+            phases.contains_key(name),
+            "phase `{name}` is missing from {phases:?}"
+        );
+    }
+
+    // The split has to account for the whole run. A partial one is worse than
+    // none: it names the slowest of the phases it happens to cover and hides
+    // that the time went somewhere else entirely.
+    let sum: u64 = phases
+        .values()
+        .map(|v| v.as_u64().expect("a phase is a whole number of ms"))
+        .sum();
+    let total = row["elapsed_ms"].as_u64().expect("elapsed_ms");
+    assert!(
+        sum <= total,
+        "the phases ({sum} ms) cannot exceed the total ({total} ms)"
+    );
+    assert!(
+        total - sum <= 10,
+        "{} ms of the {total} ms total is unattributed",
+        total - sum
+    );
+}
+
 #[test]
 fn query_events_off_by_default_records_nothing() {
     let tmp = seed_repo();
