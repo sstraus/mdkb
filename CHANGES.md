@@ -235,6 +235,97 @@
   collection were buried under another's noise. The filter applies to the
   edge's source document.
 
+The eleven entries below landed in `ec6381d`, which carried no changelog of its
+own. They are recorded here after the fact, from the stories and re-verified
+against the code.
+
+- **Recall is gated on an absolute score, not a relative one.** Fusion scores
+  are max-normalized, so the best match to any prompt scored 1.0 and the floor
+  could not reject it — a question the store had no answer to still injected
+  the store's best guess. Admission is now a cosine floor measured against the
+  query embedding (`search.memory.min_recall_cosine`, 0.40) **or** a strong
+  lexical match — an identifier, an exact phrase, several rare terms — because
+  embeddings are weak on identifiers and BM25 set membership is not evidence
+  when the query is OR-expanded. Confidence left the admission decision
+  entirely and orders results only: a well-confirmed unrelated entry is still
+  unrelated. 0.40 is read off a precision-recall curve over 36 held-out queries
+  and 40 labelled in-domain negatives, by the rule "the lowest floor admitting
+  no negative"; the test asserts the rule, so a fixture change reopens the
+  number. Cost recorded honestly: hybrid recall@5 fell from 1.000 to 0.583.
+  `mdkb eval recall` gained `--min-precision`, because lowering the gate
+  *raises* recall and a recall floor alone cannot catch its removal.
+
+- **One memory search on every surface.** The CLI ran a token-AND full-text
+  query with no vector leg while the MCP tool and the recall hook ran hybrid,
+  so the same question answered differently depending on where it was asked.
+  All three now build the same OR-expanded expression
+  (`store::search::build_recall_query`) and call the same engine
+  (`search_entries_recall` → `search_entries_hybrid_fts`) with the same
+  absolute floor; the token-AND variant is deleted. The CLI gained the vector
+  leg it never had. OR-expansion is only safe because admission became
+  absolute: the expression generates candidates, it does not decide relevance.
+
+- **The vector leg of document search honours `--collection`.** The BM25 leg
+  filtered by collection and the vector leg did not, so a scoped search
+  returned documents from outside its scope whenever the semantic half found
+  them. Both legs feed one aggregation that is now filtered once, after
+  aggregation.
+
+- **Following an edge is not a read.** Recall's one-hop expansion and
+  `memory link` went through a resolver that bumped `access_count` and stamped
+  `last_accessed`, so a machine walking the graph inflated the popularity
+  ranking that decides what SessionStart warms up. There is one resolver now
+  and it never tracks; the tracking variant is deleted rather than left in the
+  codebase as a trap.
+
+- **A refutation writes `corrections` and is weighted heavier than a
+  confirmation.** `memory confirm --outcome refuted` had no column to write to,
+  so the staleness graph could not see it. `corrections` and `last_refuted_at`
+  are now first-class, belief is `(1+c)/(2+c+3r)` — twenty confirmations and
+  one authoritative refutation used to still score 0.913 — and an entry whose
+  last signal was a refutation is **disputed**: never injected unasked until it
+  is reconfirmed or replaced, while an explicit `search` still returns it. A
+  refutation never touches `last_confirmed_at`. Disputed is derived, not a new
+  status: `status` is projected to the git-tracked markdown, and a machine-local
+  refutation must not rewrite a tracked file.
+
+- **`memory rm` and `prune` are atomic with the disk archive.** Both flipped
+  the row and left the file, and the next git sync read the file and revived
+  the entry — a delete that undid itself one sync later. Both paths go through
+  one `archive_then_remove`.
+
+- **Redaction covers home paths and usernames.** Evidence sent to the distiller
+  carried `/Users/<name>` and `C:\Users\<name>` verbatim. Only the user segment
+  is rewritten (`~`, `%USERPROFILE%`), so `/etc/hosts` and an already-tilde
+  path are untouched.
+
+- **The distiller prompt derives the trigger kinds from the schema.** The
+  prompt listed them as a literal, so adding a kind to `VALID_TRIGGER_KINDS`
+  left the model being asked for the old set. It interpolates the constant now,
+  closing the third side of a triangle already pinned between the constant and
+  the matcher. `setup check` covers a schema-blind model.
+
+- **`coupling` says which edge kind suppresses a pair.** The module doc listed
+  four kinds; the code has only ever suppressed on `Calls` at tiers 1–2. A pair
+  connected only by, say, `Implements` is reported, and the doc now says so
+  with the reason — a trait and its impl make no claim to change together.
+  Widening `resolved_edges` stays out of scope until a co-change pair connected
+  by another kind is measured as a false positive.
+
+- **`code_graph` discloses that receiver-type inference is Rust-only.** A
+  TypeScript method call resolves on its written name, which reads identically
+  to a fully inferred Rust answer. The note is emitted only when the weakness is
+  actually present — a non-Rust file with an unresolved or bare-name arrival —
+  because a non-Rust symbol whose calls all placed at tiers 1–2 is as
+  trustworthy as a Rust one, and every MCP token is charged on every turn.
+
+- **`code_index_hits` ordering is deterministic and says what it hid.** Six
+  definitions of one name came back in whatever order SQLite produced, and the
+  block silently kept the first five — so the same query gave a different answer
+  between runs, and `find_symbol_by_name` took `.next()` off the same unordered
+  result. The order is in the shared SQL constant, by `(file_path, line_start)`,
+  so every caller gets it, and the block states how many definitions it hid.
+
 ## 3.9.0 (2026-09-14)
 
 Two questions the index could not answer before: *what does this repository say
