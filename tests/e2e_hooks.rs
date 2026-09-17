@@ -40,7 +40,11 @@ fn run_hook_with_home(
         .current_dir(cwd)
         .env("MDKB_NO_DAEMON", "1");
     if let Some(home) = home {
-        cmd.env("HOME", home);
+        // `directories::BaseDirs`, which the binary uses to find `~/.mdkb`,
+        // reads `USERPROFILE` on Windows and ignores `HOME`. Setting only
+        // `HOME` left the malformed `daemon.toml` in a directory the binary
+        // never looked at, so the test asserted a fault it had not injected.
+        cmd.env("HOME", home).env("USERPROFILE", home);
     }
     let mut child = cmd
         .stdin(Stdio::piped())
