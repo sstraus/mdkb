@@ -4374,10 +4374,17 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
         settle_injections(&ctx.conn, &session, now, &errors)
     }) {
         Some(Ok(report)) if !report.is_empty() => {
+            // All four outcomes are logged, not just the two that move a
+            // counter: a run that settles nothing but `unobservable` is the
+            // signal that the distiller is not writing error signatures, and
+            // reporting only confirmed/refuted would show it as silence.
             tracing::info!(
-                "prior settling: {} confirmed, {} refuted in session {session}",
+                "prior settling: {} confirmed, {} refuted, {} unobservable, \
+                 {} without opportunity in session {session}",
                 report.confirmed.len(),
-                report.refuted.len()
+                report.refuted.len(),
+                report.unobservable.len(),
+                report.no_opportunity.len()
             );
         }
         Some(Err(error)) => tracing::debug!("prior settling failed: {error}"),
