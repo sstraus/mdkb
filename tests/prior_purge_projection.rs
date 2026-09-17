@@ -175,3 +175,98 @@ fn the_sweep_leaves_live_entries_and_ordinary_files_alone() {
         "the colleague's entry must still import normally"
     );
 }
+
+/// The other way a projection outlives the lesson: the 30-day TTL on a prior.
+///
+/// Story 093-bb13: the TTL lives on the memory entry, never on the cluster, and
+/// `list_promoted_clusters` read `prior_clusters` alone. So `mdkb update` would
+/// archive a lapsed prior and move its file to `memory/archive/`, and the hooks
+/// would go on injecting the lesson — pointing the reader at an entry that no
+/// `mdkb memory` command would serve any more.
+#[test]
+fn an_expired_prior_stops_injecting_when_its_projection_is_archived() {
+    use mdkb::store::priors::{PriorCluster, TriggerContext, match_injectable};
+
+    const MEMORY_ID: &str = "prior-abcdef0123456789";
+    let (_dir, root) = store();
+    let ctx = Context::open(&root).expect("open");
+    let now = chrono::Utc::now().timestamp();
+
+    // A promoted prior exactly as `integrate_distilled` leaves one: a memory
+    // entry carrying the lesson, and a cluster carrying the trigger.
+    ctx.conn
+        .execute(
+            "INSERT INTO memory_entries
+                 (id, title, content, entry_type, tags, status, created_at, updated_at,
+                  source_type, expires_at)
+             VALUES (?1, 'Do not edit generated files', 'Edit the generator instead.',
+                     'prior', '[]', 'active', 1700000000, 1700000000, 'auto_extracted', ?2)",
+            rusqlite::params![MEMORY_ID, now + 86_400],
+        )
+        .expect("seed the lesson");
+    mdkb::store::priors::upsert_cluster(
+        &ctx.conn,
+        &PriorCluster {
+            id: "clu-generated".into(),
+            canonical_trigger_key: "pre_tool|src/generated/**".into(),
+            trigger_kind: "pre_tool".into(),
+            trigger_matcher: r#"{"pattern":"src/generated/**"}"#.into(),
+            lesson: "Do not edit generated files; edit the generator.".into(),
+            scope: r#"{"repo":"current"}"#.into(),
+            evidence_count: 2,
+            distinct_sessions: 2,
+            injected_count: 0,
+            confirmed_count: 0,
+            refuted_count: 0,
+            state: "promoted".into(),
+            promoted_memory_id: Some(MEMORY_ID.into()),
+            created_at: now,
+            last_seen_at: now,
+            error_signature: None,
+        },
+    )
+    .expect("seed the cluster");
+    mdkb::cli::handlers::sync_memory_files(&ctx).expect("project");
+
+    let trigger = TriggerContext::PreTool {
+        tool: "Edit",
+        path: Some("src/generated/api.rs"),
+        command: None,
+    };
+    assert_eq!(
+        match_injectable(&ctx.conn, &trigger, now, 5)
+            .expect("match")
+            .len(),
+        1,
+        "a live prior injects — this is the before half of the story"
+    );
+    assert!(
+        entries(&root).join(format!("{MEMORY_ID}.md")).exists(),
+        "and its lesson is on disk where a reader can find it"
+    );
+
+    // The TTL lapses. Nothing else about the cluster changes.
+    ctx.conn
+        .execute(
+            "UPDATE memory_entries SET expires_at = ?2 WHERE id = ?1",
+            rusqlite::params![MEMORY_ID, now - 1],
+        )
+        .expect("lapse the TTL");
+
+    let result = handle_update(&ctx, &root).expect("update");
+    assert_eq!(
+        result.memory_entries_expired, 1,
+        "the sweep must claim the lapsed prior"
+    );
+    assert!(
+        !entries(&root).join(format!("{MEMORY_ID}.md")).exists()
+            && archive(&root).join(format!("{MEMORY_ID}.md")).exists(),
+        "its projection moves to the archive, as for any expired entry"
+    );
+    assert!(
+        match_injectable(&ctx.conn, &trigger, now, 5)
+            .expect("match")
+            .is_empty(),
+        "and the injection stops with it — a lesson nothing holds is not a lesson"
+    );
+}

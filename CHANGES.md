@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- **A behavioural prior stops being injected when its lesson is gone or
+  contradicted.** The 30-day TTL lives on the memory entry, never on the
+  cluster, and the injection path read `prior_clusters` alone: a prior whose
+  entry had lapsed, been archived or been deleted kept firing a lesson that no
+  `mdkb memory` command would serve any more — the reader could not even look
+  it up. The promoted list now joins the entry and applies the same liveness
+  rule as every other read, so an expired prior leaves the injection path the
+  moment `mdkb update` archives it, and comes back if the entry does.
+  Separately, the `refuted` state the schema always named and nothing ever
+  wrote is now written: after at least three settlements, a cluster the errors
+  contradict more often than a person confirms is demoted out of injection, and
+  a human verdict on the projection is what brings it back.
+
 - **Every memory write path runs the same duplicate check.** The near-duplicate
   gate lived inside `memory add` and the MCP write, and it only ran when the
   caller happened to supply an embedding. Every import — a directory of files,

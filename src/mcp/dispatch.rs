@@ -4394,6 +4394,14 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
                 report.unobservable.len(),
                 report.unrefuted.len()
             );
+            // A demotion retires a lesson. Named, not counted: this is the one
+            // line that explains why a prior stopped appearing.
+            if !report.demoted.is_empty() {
+                tracing::info!(
+                    "prior settling: demoted {} out of injection",
+                    report.demoted.join(", ")
+                );
+            }
         }
         Some(Err(error)) => tracing::debug!("prior settling failed: {error}"),
         _ => {}
@@ -9140,6 +9148,17 @@ mod tests {
         let key = canonical_trigger_key(kind, matcher);
         let cluster_id = cluster_id_for_key(&key);
         let now = chrono::Utc::now().timestamp();
+        // The lesson the cluster projects has to exist: story 093 made the
+        // injection path join `memory_entries`, so a cluster with nothing to
+        // show is not injectable however promoted it looks.
+        let memory_id = format!("prior-{cluster_id}");
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_entries
+                 (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES (?1, ?2, ?2, 'prior', '[]', ?3, ?3)",
+            rusqlite::params![&memory_id, lesson, now],
+        )
+        .unwrap();
         upsert_cluster(
             conn,
             &PriorCluster {
@@ -9155,7 +9174,7 @@ mod tests {
                 confirmed_count: 0,
                 refuted_count: 0,
                 state: "promoted".into(),
-                promoted_memory_id: None,
+                promoted_memory_id: Some(memory_id),
                 created_at: now,
                 last_seen_at: now, // maximally fresh
                 error_signature: signature.map(str::to_string),

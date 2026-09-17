@@ -1110,8 +1110,7 @@ impl Duplicate {
     /// The entry already in the store.
     pub fn existing(&self) -> &MemoryEntry {
         match self {
-            Duplicate::Title(entry) => entry,
-            Duplicate::Meaning { entry, .. } => entry,
+            Duplicate::Title(entry) | Duplicate::Meaning { entry, .. } => entry,
         }
     }
 

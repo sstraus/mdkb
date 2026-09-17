@@ -2042,17 +2042,23 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_schema(&conn).unwrap();
 
-        // `promoted_memory_id` stays NULL: it carries a foreign key into
-        // `memory_entries`, and the migration reads and writes only `state`.
+        // The two promoted clusters project into real, live memory entries:
+        // `list_promoted_clusters` joins on `promoted_memory_id`, so a cluster
+        // with nothing to show is filtered out before `state` is ever read, and
+        // the assertion below would pass for the wrong reason. The migration
+        // itself reads and writes only `state`.
         conn.execute_batch(
-            "INSERT INTO prior_clusters
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('m-stop', 'stop lesson', 'l', 'prior', '[]', 1, 1),
+                    ('m-pre', 'pre lesson', 'l', 'prior', '[]', 1, 1);
+             INSERT INTO prior_clusters
                  (id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
                   evidence_count, distinct_sessions, injected_count, confirmed_count,
                   refuted_count, state, promoted_memory_id, created_at, last_seen_at)
              VALUES
-                 ('c-stop', 'k1', 'stop', '{}', 'l', '{}', 2, 2, 0, 0, 0, 'promoted', NULL, 1, 1),
+                 ('c-stop', 'k1', 'stop', '{}', 'l', '{}', 2, 2, 0, 0, 0, 'promoted', 'm-stop', 1, 1),
                  ('c-repo', 'k2', 'repo', '{}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1),
-                 ('c-pre', 'k3', 'pre_tool', '{}', 'l', '{}', 2, 2, 0, 0, 0, 'promoted', NULL, 1, 1),
+                 ('c-pre', 'k3', 'pre_tool', '{}', 'l', '{}', 2, 2, 0, 0, 0, 'promoted', 'm-pre', 1, 1),
                  ('c-post', 'k4', 'post_tool', '{}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1),
                  ('c-prompt', 'k5', 'prompt', '{}', 'l', '{}', 1, 1, 0, 0, 0, 'candidate', NULL, 1, 1);
              UPDATE schema_version SET version = 22;",
@@ -2084,7 +2090,7 @@ mod tests {
         assert_eq!(state("c-prompt"), "candidate", "prompt is untouched");
 
         // Archived clusters are out of the injection path by construction.
-        let promoted = crate::store::priors::list_promoted_clusters(&conn).unwrap();
+        let promoted = crate::store::priors::list_promoted_clusters(&conn, 1).unwrap();
         assert_eq!(promoted.len(), 1);
         assert_eq!(promoted[0].id, "c-pre");
     }

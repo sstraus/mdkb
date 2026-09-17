@@ -699,15 +699,28 @@ pub fn trigger_matches(kind: &str, matcher_json: &str, ctx: &TriggerContext) -> 
     }
 }
 
-/// All clusters currently in the `promoted` state.
-pub fn list_promoted_clusters(conn: &Connection) -> Result<Vec<PriorCluster>> {
+/// Promoted clusters whose memory entry is still alive.
+///
+/// A promoted cluster is only half the record: the lesson a person reads is the
+/// memory entry it was promoted into, and priors carry a TTL. Once that entry
+/// expires or is retired, the cluster went on injecting a lesson the store no
+/// longer holds — the projection was gone and the injection was not.
+///
+/// The `JOIN` is deliberately inner. `promoted_memory_id` is
+/// `ON DELETE SET NULL`, so a deleted entry leaves the cluster pointing at
+/// nothing, and a cluster with no lesson to show is not injectable either.
+pub fn list_promoted_clusters(conn: &Connection, now: i64) -> Result<Vec<PriorCluster>> {
     let mut stmt = conn.prepare(
-        "SELECT id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
-                evidence_count, distinct_sessions, injected_count, confirmed_count, refuted_count,
-                state, promoted_memory_id, created_at, last_seen_at, error_signature
-         FROM prior_clusters WHERE state = 'promoted'",
+        "SELECT c.id, c.canonical_trigger_key, c.trigger_kind, c.trigger_matcher, c.lesson, c.scope,
+                c.evidence_count, c.distinct_sessions, c.injected_count, c.confirmed_count, c.refuted_count,
+                c.state, c.promoted_memory_id, c.created_at, c.last_seen_at, c.error_signature
+         FROM prior_clusters c
+         JOIN memory_entries m ON m.id = c.promoted_memory_id
+         WHERE c.state = 'promoted'
+           AND m.status = 'active'
+           AND (m.expires_at IS NULL OR m.expires_at > ?1)",
     )?;
-    let rows = stmt.query_map([], |row| {
+    let rows = stmt.query_map(params![now], |row| {
         Ok(PriorCluster {
             id: row.get(0)?,
             canonical_trigger_key: row.get(1)?,
@@ -746,7 +759,7 @@ pub fn match_injectable(
     if max == 0 {
         return Ok(Vec::new());
     }
-    let mut matched: Vec<PriorCluster> = list_promoted_clusters(conn)?
+    let mut matched: Vec<PriorCluster> = list_promoted_clusters(conn, now)?
         .into_iter()
         .filter(|c| {
             is_injectable(c, now) && trigger_matches(&c.trigger_kind, &c.trigger_matcher, ctx)
@@ -932,6 +945,9 @@ pub struct SettleReport {
     /// Observable, and the failure did not come back — which is not the same as
     /// the prior having worked. See [`settle_injections`].
     pub unrefuted: Vec<String>,
+    /// Clusters this pass moved from `promoted` to `refuted`, so they stop
+    /// being injected. A subset of [`SettleReport::refuted`].
+    pub demoted: Vec<String>,
 }
 
 impl SettleReport {
@@ -940,6 +956,13 @@ impl SettleReport {
         self.refuted.is_empty() && self.unobservable.is_empty() && self.unrefuted.is_empty()
     }
 }
+
+/// How many settlements a cluster needs before the refuted-versus-confirmed
+/// balance is allowed to demote it.
+///
+/// One recurrence is a session, not a verdict: the failure may have had another
+/// cause, or the prior may have been shown too late to help.
+const MIN_SETTLEMENTS_BEFORE_REFUTED: i64 = 3;
 
 /// Close the loop for every prior injected into `session` and not yet settled.
 ///
@@ -1037,6 +1060,22 @@ pub fn settle_injections(
                 "UPDATE prior_clusters SET refuted_count = refuted_count + 1 WHERE id = ?1",
                 params![cluster_id],
             )?;
+            // A lesson the evidence keeps contradicting stops being shown. The
+            // predicate is evaluated in the same statement that writes the
+            // state, so two Stop hooks racing cannot demote on a stale count.
+            // `state = 'promoted'` also makes the demotion idempotent.
+            let demoted = conn.execute(
+                "UPDATE prior_clusters
+                    SET state = 'refuted'
+                  WHERE id = ?1
+                    AND state = 'promoted'
+                    AND refuted_count > confirmed_count
+                    AND confirmed_count + refuted_count >= ?2",
+                params![cluster_id, MIN_SETTLEMENTS_BEFORE_REFUTED],
+            )?;
+            if demoted > 0 {
+                report.demoted.push(cluster_id.clone());
+            }
         }
         match outcome {
             "refuted" => report.refuted.push(cluster_id),
@@ -1082,6 +1121,23 @@ pub fn apply_belief_from_memory(
         &format!("UPDATE prior_clusters SET {column} = {column} + 1 WHERE id = ?1"),
         params![cluster_id],
     )?;
+    if delta > 0 {
+        // The other half of the demotion in `settle_injections`. A person
+        // vouching for the lesson is the only thing that undoes it: without
+        // this, `refuted` would be a one-way door that no verdict could
+        // reopen, and story 092's recovery path would be dead. Same shape as
+        // the demotion — the predicate is evaluated in the statement that
+        // writes the state, so a racing settle cannot reinstate on a stale
+        // count.
+        conn.execute(
+            "UPDATE prior_clusters
+                SET state = 'promoted'
+              WHERE id = ?1
+                AND state = 'refuted'
+                AND confirmed_count > refuted_count",
+            params![cluster_id],
+        )?;
+    }
     Ok(Some(cluster_id))
 }
 
@@ -1513,8 +1569,8 @@ mod tests {
             confirmed_count: 0,
             refuted_count: 0,
             state: "promoted".into(),
-            // No FK row needed: the injection path reads the cluster's lesson
-            // directly, not the promoted memory entry.
+            // Linked by `with_live_projection` in the tests that need the
+            // injection path; left unset in the ones that only move counters.
             promoted_memory_id: None,
             created_at: 100,
             last_seen_at: 200,
@@ -1522,22 +1578,40 @@ mod tests {
         }
     }
 
+    /// Give a cluster the live memory entry it projects into, and insert it.
+    ///
+    /// `list_promoted_clusters` joins on `promoted_memory_id`, so a promoted
+    /// cluster with nothing to show never reaches the injection path. A fixture
+    /// that skips the entry proves nothing about injection.
+    fn seed_with_projection(conn: &Connection, mut c: PriorCluster, expires_at: Option<i64>) {
+        let memory_id = format!("prior-{}", c.id);
+        conn.execute(
+            "INSERT INTO memory_entries
+                 (id, title, content, entry_type, tags, created_at, updated_at, expires_at)
+             VALUES (?1, ?1, ?2, 'prior', '[]', 100, 100, ?3)",
+            params![&memory_id, &c.lesson, expires_at],
+        )
+        .unwrap();
+        c.promoted_memory_id = Some(memory_id);
+        upsert_cluster(conn, &c).unwrap();
+    }
+
     #[test]
     fn match_injectable_returns_only_trigger_matched_promoted_priors() {
         let conn = conn();
         let now = 200;
         // Promoted + matching trigger.
-        upsert_cluster(
+        seed_with_projection(
             &conn,
-            &promoted_cluster("clu-a", r#"{"pattern":"src/generated/**"}"#, 2),
-        )
-        .unwrap();
+            promoted_cluster("clu-a", r#"{"pattern":"src/generated/**"}"#, 2),
+            None,
+        );
         // Promoted but non-matching trigger.
-        upsert_cluster(
+        seed_with_projection(
             &conn,
-            &promoted_cluster("clu-b", r#"{"pattern":"docs/**"}"#, 2),
-        )
-        .unwrap();
+            promoted_cluster("clu-b", r#"{"pattern":"docs/**"}"#, 2),
+            None,
+        );
         // Matching trigger but only a candidate (never injectable).
         let mut cand = promoted_cluster("clu-c", r#"{"pattern":"src/generated/**"}"#, 2);
         cand.state = "candidate".into();
@@ -1558,16 +1632,16 @@ mod tests {
         let conn = conn();
         let now = 200;
         // Two matching promoted priors; the one seen in more sessions scores higher.
-        upsert_cluster(
+        seed_with_projection(
             &conn,
-            &promoted_cluster("clu-lo", r#"{"pattern":"src/generated/**"}"#, 2),
-        )
-        .unwrap();
-        upsert_cluster(
+            promoted_cluster("clu-lo", r#"{"pattern":"src/generated/**"}"#, 2),
+            None,
+        );
+        seed_with_projection(
             &conn,
-            &promoted_cluster("clu-hi", r#"{"pattern":"src/**"}"#, 8),
-        )
-        .unwrap();
+            promoted_cluster("clu-hi", r#"{"pattern":"src/**"}"#, 8),
+            None,
+        );
 
         let ctx = TriggerContext::PreTool {
             tool: "Edit",
@@ -1577,6 +1651,68 @@ mod tests {
         let hits = match_injectable(&conn, &ctx, now, 1).unwrap();
         assert_eq!(hits.len(), 1, "cap honored");
         assert_eq!(hits[0].id, "clu-hi", "higher-recurrence prior ranks first");
+    }
+
+    /// A cluster is promoted only for as long as the lesson it projects exists.
+    ///
+    /// The 30-day TTL lives on the memory entry, never on the cluster, and this
+    /// list used to read `prior_clusters` alone. So a prior whose entry had
+    /// lapsed, been retired, or been deleted kept firing a lesson that no
+    /// `mdkb memory` command would serve any more — the reader could not even
+    /// look it up.
+    #[test]
+    fn a_prior_whose_lesson_is_gone_is_no_longer_promoted() {
+        let conn = conn();
+        let lapsed_at = 1_000;
+        let now = lapsed_at + 1;
+
+        let matcher = r#"{"pattern":"src/**"}"#;
+        seed_with_projection(&conn, promoted_cluster("clu-live", matcher, 2), None);
+        seed_with_projection(
+            &conn,
+            promoted_cluster("clu-lapsed", matcher, 2),
+            Some(lapsed_at),
+        );
+        // Retired by hand rather than by the clock: equally gone.
+        seed_with_projection(&conn, promoted_cluster("clu-retired", matcher, 2), None);
+        conn.execute(
+            "UPDATE memory_entries SET status = 'archived' WHERE id = 'prior-clu-retired'",
+            [],
+        )
+        .unwrap();
+        // The entry was deleted: `ON DELETE SET NULL` left the cluster promoted
+        // and pointing at nothing.
+        upsert_cluster(&conn, &promoted_cluster("clu-orphan", matcher, 2)).unwrap();
+
+        let ids: Vec<String> = list_promoted_clusters(&conn, now)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["clu-live".to_string()],
+            "only the prior whose lesson the store still holds stays promoted"
+        );
+
+        // Nothing else needed changing: the injection path reads this list.
+        let ctx = TriggerContext::PreTool {
+            tool: "Edit",
+            path: Some("src/generated/api.rs"),
+            command: None,
+        };
+        let hits = match_injectable(&conn, &ctx, now, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "clu-live");
+
+        // And the lapsed one comes back the moment its entry does — the cluster
+        // was never edited, so this is reversible by fixing the entry alone.
+        conn.execute(
+            "UPDATE memory_entries SET expires_at = ?1 WHERE id = 'prior-clu-lapsed'",
+            params![now + 86_400],
+        )
+        .unwrap();
+        assert_eq!(list_promoted_clusters(&conn, now).unwrap().len(), 2);
     }
 
     fn sample_distilled() -> DistilledPrior {
@@ -2084,6 +2220,10 @@ mod tests {
         }
         let refuted = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(refuted.refuted_count, 3);
+        assert_eq!(
+            refuted.state, "refuted",
+            "story 093: the score falling is also a state change now"
+        );
         assert!(
             !is_injectable(&refuted, now),
             "three refutations must stop it firing: {}",
@@ -2105,10 +2245,80 @@ mod tests {
         }
         let recovered = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(recovered.confirmed_count, 4);
+        assert_eq!(
+            recovered.state, "promoted",
+            "the verdict has to reopen the state too, or the score can never \
+             matter again"
+        );
         assert!(
             is_injectable(&recovered, now),
             "confirmations must bring it back: {}",
             cluster_injection_score(&recovered, now)
+        );
+    }
+
+    /// The state the schema always named and nothing ever wrote.
+    ///
+    /// `cluster_injection_score` already sank under the threshold on repeated
+    /// refutation, but the cluster stayed `promoted` for ever: every hook paid
+    /// to load it and score it, and one confirmation put it straight back on
+    /// screen. Three settlements is the bar — below that, a single unlucky
+    /// session would retire a lesson that works.
+    #[test]
+    fn a_lesson_the_errors_keep_contradicting_is_demoted_and_stops_injecting() {
+        let conn = conn();
+        let now = 1_000;
+        let ctx = TriggerContext::PreTool {
+            tool: "Edit",
+            path: Some("src/generated/api.rs"),
+            command: None,
+        };
+        seed_with_projection(
+            &conn,
+            cluster_with_signature("clu-a", Some("boom failed")),
+            None,
+        );
+        assert_eq!(
+            match_injectable(&conn, &ctx, now, 5).unwrap().len(),
+            1,
+            "a freshly promoted prior injects"
+        );
+
+        // The error the lesson exists to prevent comes back twice. Two is not
+        // enough: the cluster is still shown.
+        for session in ["s1", "s2"] {
+            record_injection(&conn, "clu-a", session, now).unwrap();
+            let report =
+                settle_injections(&conn, session, now, &[err("boom failed", Some(now))]).unwrap();
+            assert!(
+                report.demoted.is_empty(),
+                "two settlements must not demote: {report:?}"
+            );
+        }
+        assert_eq!(
+            get_cluster(&conn, "clu-a").unwrap().unwrap().state,
+            "promoted"
+        );
+
+        // The third crosses the bar, and the pass says so.
+        record_injection(&conn, "clu-a", "s3", now).unwrap();
+        let report = settle_injections(&conn, "s3", now, &[err("boom failed", Some(now))]).unwrap();
+        assert_eq!(report.demoted, vec!["clu-a".to_string()]);
+        assert_eq!(
+            get_cluster(&conn, "clu-a").unwrap().unwrap().state,
+            "refuted"
+        );
+        assert!(
+            match_injectable(&conn, &ctx, now, 5).unwrap().is_empty(),
+            "a refuted lesson must stop being shown"
+        );
+
+        // Idempotent: a fourth refutation reports no second demotion.
+        record_injection(&conn, "clu-a", "s4", now).unwrap();
+        let again = settle_injections(&conn, "s4", now, &[err("boom failed", Some(now))]).unwrap();
+        assert!(
+            again.demoted.is_empty(),
+            "the demotion happens once, not on every later refutation"
         );
     }
 
