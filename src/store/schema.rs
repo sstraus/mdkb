@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 26;
+pub const SCHEMA_VERSION: i32 = 27;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -982,6 +982,34 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 "migration: archived {} prior cluster(s) whose trigger used the untyped \
                  `pattern`; re-express the lesson with a named selector to revive it",
                 retired.len()
+            );
+        }
+    }
+
+    // Migration from v26 to v27: regroup the candidates already on disk under
+    // the clustering rule they were not written under.
+    //
+    // Clustering used to key on the trigger first and fall back to the lesson;
+    // it now does the opposite, because a prior IS its lesson and recurrence is
+    // what promotion counts. A store built under the old rule holds one lesson
+    // split across as many clusters as it had trigger spellings — measured on
+    // the live store 2026-09-17, 11 candidates carrying one budget-limit rule
+    // sat in 9 clusters, so not one of them reached `PROMOTION_MIN_SESSIONS`.
+    // The episodes that produced them are gone, so the new rule is worth
+    // nothing unless it is applied to the rows that are left.
+    //
+    // Clusters left holding nothing are logged, never deleted: a promoted one
+    // still owns a live memory entry.
+    if from_version < 27 && table_exists(conn, "prior_candidates") {
+        let now = chrono::Utc::now().timestamp();
+        let report = crate::store::priors::recluster(conn, now)?;
+        if report.moved > 0 {
+            tracing::info!(
+                "migration: regrouped {} prior candidate(s) by lesson; {} cluster(s) left empty, \
+                 {} now clear the recurrence gate",
+                report.moved,
+                report.emptied.len(),
+                report.newly_promotable.len(),
             );
         }
     }

@@ -4,6 +4,36 @@
 
 ### Changed
 
+- **Candidates that carry the same lesson are one cluster.** Clustering keyed on
+  the trigger first and the lesson second, so it counted spellings rather than
+  lessons. The distiller is non-deterministic: one rule comes back as six
+  different triggers, lands in six clusters, and not one of them reaches the two
+  distinct sessions that gate promotion — the rule is observed six times and
+  promoted never, while a weak trigger promotes because its key happened to
+  repeat. On the live store, 11 candidates carrying one budget-limit lesson sat
+  in 9 clusters. Clustering now compares the lesson embedding first and falls
+  back to the trigger key only when there is no embedding.
+
+  The merge threshold moves from 0.85 to **0.70**, and 0.85 was a guess that the
+  data refuted: on 69 real clusters it merged nothing at all, and the six budget
+  candidates — the exact case it existed to catch — have a real pairwise cosine
+  of min 0.427 / median 0.691 / max 0.794, so 0 of their 36 pairs reached it. A
+  sweep over the same store puts the first threshold that collapses them at
+  0.70, with **no** group mixing that lesson with a foreign one at any value
+  down to 0.60, so 0.70 keeps a 0.10 margin.
+
+  Matching is also against a group's nearest member rather than its first: a
+  lesson's paraphrases spread out, no single point is close to all of them, and
+  seed-only matching still left the budget candidates in 4 groups at 0.70. A
+  candidate that reaches two groups folds them together, so the result does not
+  depend on the order rows come off disk.
+
+  Schema v27 re-runs the clustering over the candidates already stored — the
+  episodes that produced them are gone, so re-mining is not available. Replayed
+  against a copy of a real store the pass takes 69 clusters to 38 and the budget
+  lesson from 9 groups to 1, moving 39 candidates. Clusters left empty are
+  reported, not deleted: a promoted one still owns a live memory entry.
+
 - **A prior's trigger is named selectors, not one guessed string.** The matcher
   took a single `pattern` and tried it against three different things in turn —
   the tool name, a path glob, then a command substring — stopping at whichever

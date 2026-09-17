@@ -361,9 +361,33 @@ fn find_cluster_by_key(conn: &Connection, canonical_key: &str) -> Result<Option<
 /// treated as the same behavioral prior and merged. The distiller is
 /// non-deterministic, so equivalent lessons land on different canonical trigger
 /// keys; without semantic merge a recurring lesson would never accumulate the
-/// ≥2 distinct sessions that gate promotion. 0.85 is high enough to keep
-/// genuinely distinct lessons apart.
-const PRIOR_MERGE_SIMILARITY: f32 = 0.85;
+/// ≥2 distinct sessions that gate promotion.
+///
+/// **0.85 was measured and rejected.** It was a guess, and on the real store it
+/// merged nothing: 69 clusters, 2346 pairs, and every cluster stayed alone. The
+/// six "check the budget, then switch to the fallback editing path" candidates —
+/// plainly one lesson, and the case this threshold exists to catch — had a real
+/// pairwise cosine of min 0.427 / median 0.691 / **max 0.794**, so 0 of their 36
+/// pairs reached 0.85. all-MiniLM-L6-v2 does not put two paraphrases of a
+/// one-sentence instruction that high.
+///
+/// Sweep over the same 69 clusters, transitive grouping, 2026-09-17:
+///
+/// ```text
+/// t=0.85  69 groups   budget lands in 9 groups   budget mixed with non-budget: 0
+/// t=0.80  61 groups   budget lands in 9 groups   budget mixed with non-budget: 0
+/// t=0.75  47 groups   budget lands in 4 groups   budget mixed with non-budget: 0
+/// t=0.70  38 groups   budget lands in 1 group    budget mixed with non-budget: 0
+/// t=0.60  28 groups                              budget mixed with non-budget: 0
+/// ```
+///
+/// 0.70 is the first value that collapses the budget lesson, and it is still
+/// below the point where anything foreign joins it — the cross-merge count is 0
+/// all the way down to 0.60, so 0.70 keeps a 0.10 margin. Its other groups were
+/// read by hand and are one lesson each: 11 "check the state before issuing a
+/// transition", 5 "scope is settled, act or stop", 3 "verify the reindex before
+/// deleting the quarantined file".
+const PRIOR_MERGE_SIMILARITY: f32 = 0.70;
 
 /// Encode an embedding as little-endian f32 bytes for BLOB storage.
 fn encode_embedding(embedding: &[f32]) -> Vec<u8> {
@@ -402,8 +426,11 @@ fn find_cluster_by_embedding(
     threshold: f32,
 ) -> Result<Option<String>> {
     let mut stmt = conn.prepare(
+        // `archived` belongs in this list as much as the other two: a cluster
+        // retired because its trigger can never fire must not quietly absorb
+        // the evidence of a lesson that still can.
         "SELECT id, embedding FROM prior_clusters
-         WHERE embedding IS NOT NULL AND state NOT IN ('refuted', 'expired')",
+         WHERE embedding IS NOT NULL AND state NOT IN ('refuted', 'expired', 'archived')",
     )?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
@@ -449,15 +476,28 @@ pub fn integrate_candidate_with_embedding(
 ) -> Result<String> {
     let key = canonical_trigger_key(&cand.trigger_kind, &cand.trigger_matcher);
 
-    let cluster_id = if let Some(existing) = find_cluster_by_key(conn, &key)? {
-        existing.id
-    } else if let Some(sim_id) = match embedding {
+    // The lesson decides, and the trigger key is only the fallback.
+    //
+    // A prior IS its lesson; the trigger is how it gets surfaced. Two sessions
+    // that learned the same rule under different triggers are one recurrence,
+    // and recurrence is what `PROMOTION_MIN_SESSIONS` counts. Keying on the
+    // trigger first counted spellings instead: measured on the live store
+    // 2026-09-17, 11 candidates carrying one budget-limit rule sat in 9
+    // separate clusters, so none of them ever reached two distinct sessions
+    // while a weak `*| grep*` pattern promoted because its key happened to
+    // repeat.
+    //
+    // A candidate with no embedding still falls through to the key, so mining
+    // on a machine without the embedding model degrades to the old behaviour
+    // rather than failing.
+    let by_lesson = match embedding {
         Some(e) => find_cluster_by_embedding(conn, e, PRIOR_MERGE_SIMILARITY)?,
         None => None,
-    } {
-        // Semantically equivalent to an existing cluster under a different
-        // trigger key — merge into it rather than fragmenting the evidence.
+    };
+    let cluster_id = if let Some(sim_id) = by_lesson {
         sim_id
+    } else if let Some(existing) = find_cluster_by_key(conn, &key)? {
+        existing.id
     } else {
         let id = cluster_id_for_key(&key);
         upsert_cluster(
@@ -508,6 +548,217 @@ pub fn integrate_candidate_with_embedding(
     upsert_cluster(conn, &cluster)?;
 
     Ok(cluster_id)
+}
+
+/// What one [`recluster`] pass did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ReclusterReport {
+    /// Candidates whose `cluster_id` changed.
+    pub moved: usize,
+    /// Clusters that ended the pass holding no candidates at all.
+    pub emptied: Vec<String>,
+    /// Clusters that cleared the recurrence gate only because the pass merged
+    /// their evidence back together.
+    pub newly_promotable: Vec<String>,
+}
+
+/// Re-run clustering over every stored candidate under the current rules.
+///
+/// Needed because the rules changed under the data: clustering used to key on
+/// the trigger first, so a store built under it holds one lesson split across
+/// as many clusters as it had trigger spellings, none of them with enough
+/// distinct sessions to promote. Re-mining is not an option — the episodes are
+/// gone — so the fix has to work from the candidates already on disk.
+///
+/// The grouping is done in memory rather than by re-running
+/// [`integrate_candidate_with_embedding`] per candidate, and it has to be: that
+/// function compares against the clusters currently in the table, and a
+/// candidate's own cluster is always its own nearest neighbour, so every
+/// candidate would land straight back where it started. Here the groups are
+/// built from nothing, in creation order, and only then written down.
+///
+/// The oldest candidate in a group keeps its cluster, so the surviving row
+/// carries the earliest history — its belief counters, its error signature and,
+/// if it has one, its promoted memory entry. Clusters left empty are reported,
+/// not deleted: a promoted one still owns a live memory entry, and deciding
+/// what becomes of that is not this function's call.
+///
+/// The lesson embedding is read off the candidate's current cluster, so the
+/// pass needs no model. A candidate whose cluster has none groups by trigger
+/// key alone, exactly as mining does without an embedding.
+///
+/// Idempotent: a second pass over the result regroups it the same way and moves
+/// nothing.
+pub fn recluster(conn: &Connection, now: i64) -> Result<ReclusterReport> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.cluster_id, k.embedding
+           FROM prior_candidates c
+           LEFT JOIN prior_clusters k ON k.id = c.cluster_id
+          ORDER BY c.created_at, c.id",
+    )?;
+    let rows: Vec<(String, Option<String>, Option<Vec<u8>>)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    /// A group as it is being built: the seed candidate is the oldest one in it
+    /// and decides the surviving cluster, while `embeddings` and `keys` carry
+    /// every member's, because a group is matched against as a whole.
+    struct Group {
+        seed: PriorCandidate,
+        seed_cluster: Option<String>,
+        embeddings: Vec<Vec<f32>>,
+        keys: Vec<String>,
+        members: Vec<PriorCandidate>,
+    }
+
+    impl Group {
+        /// The best cosine between `e` and any member — single-link, not a
+        /// distance to the seed.
+        ///
+        /// Measured on the live store, 2026-09-17: matching the seed alone left
+        /// the six budget candidates in 4 groups at 0.70 and still 2 at 0.60,
+        /// because the seed is one point and a lesson's paraphrases spread out
+        /// around it (real pairwise cosine min 0.427 / max 0.794). Against the
+        /// whole group they fall into 1 at 0.70.
+        fn similarity(&self, e: &[f32]) -> Option<f32> {
+            self.embeddings
+                .iter()
+                .map(|m| cosine_similarity(e, m))
+                .max_by(f32::total_cmp)
+        }
+
+        fn absorb(&mut self, other: Group) {
+            self.embeddings.extend(other.embeddings);
+            self.keys.extend(other.keys);
+            self.members.extend(other.members);
+        }
+    }
+
+    let before: Vec<String> = rows.iter().filter_map(|(_, c, _)| c.clone()).collect();
+    let mut groups: Vec<Group> = Vec::new();
+
+    for (cand_id, old_cluster, blob) in &rows {
+        let Some(cand) = get_candidate(conn, cand_id)? else {
+            continue;
+        };
+        let embedding = blob.as_ref().map(|b| decode_embedding(b));
+        let key = canonical_trigger_key(&cand.trigger_kind, &cand.trigger_matcher);
+
+        // Lesson first, trigger key second — the same order mining uses.
+        let mut hits: Vec<usize> = embedding
+            .as_ref()
+            .map(|e| {
+                groups
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, g)| g.similarity(e).is_some_and(|s| s >= PRIOR_MERGE_SIMILARITY))
+                    .map(|(i, _)| i)
+                    .collect()
+            })
+            .unwrap_or_default();
+        if hits.is_empty() {
+            hits.extend(groups.iter().position(|g| g.keys.contains(&key)));
+        }
+
+        let Some(&survivor) = hits.first() else {
+            groups.push(Group {
+                seed_cluster: old_cluster.clone(),
+                embeddings: embedding.into_iter().collect(),
+                keys: vec![key],
+                members: vec![cand.clone()],
+                seed: cand,
+            });
+            continue;
+        };
+
+        // `hits` is ascending, so the survivor is the group with the oldest
+        // seed. A candidate that reaches two groups proves those two carry one
+        // lesson as well, so they are folded together rather than the candidate
+        // being assigned to the nearest of them: without that, a lesson whose
+        // paraphrases arrive in an unlucky order stays split forever.
+        groups[survivor].members.push(cand);
+        if let Some(e) = embedding {
+            groups[survivor].embeddings.push(e);
+        }
+        groups[survivor].keys.push(key);
+        for &i in hits[1..].iter().rev() {
+            let absorbed = groups.remove(i);
+            groups[survivor].absorb(absorbed);
+        }
+    }
+
+    let mut report = ReclusterReport::default();
+    for group in &groups {
+        // `keys` and `embeddings` are in insertion order, so the first of each
+        // is the seed's — the identity the surviving cluster keeps.
+        let seed_key = &group.keys[0];
+        let cluster_id = match &group.seed_cluster {
+            Some(id) if get_cluster(conn, id)?.is_some() => id.clone(),
+            _ => {
+                let id = cluster_id_for_key(seed_key);
+                upsert_cluster(
+                    conn,
+                    &PriorCluster {
+                        id: id.clone(),
+                        canonical_trigger_key: seed_key.clone(),
+                        trigger_kind: group.seed.trigger_kind.clone(),
+                        trigger_matcher: group.seed.trigger_matcher.clone(),
+                        lesson: group.seed.lesson.clone(),
+                        scope: group.seed.scope.clone(),
+                        evidence_count: 0,
+                        distinct_sessions: 0,
+                        injected_count: 0,
+                        confirmed_count: 0,
+                        refuted_count: 0,
+                        state: "candidate".into(),
+                        promoted_memory_id: None,
+                        created_at: now,
+                        last_seen_at: now,
+                        error_signature: None,
+                    },
+                )?;
+                if let Some(e) = group.embeddings.first() {
+                    set_cluster_embedding(conn, &id, e)?;
+                }
+                id
+            }
+        };
+
+        for member in &group.members {
+            let already = member.cluster_id.as_deref() == Some(cluster_id.as_str());
+            if !already {
+                report.moved += 1;
+            }
+            let mut linked = member.clone();
+            linked.cluster_id = Some(cluster_id.clone());
+            upsert_candidate(conn, &linked)?;
+        }
+
+        let members = list_candidates_for_cluster(conn, &cluster_id)?;
+        let mut cluster = get_cluster(conn, &cluster_id)?.expect("cluster resolved above");
+        cluster.evidence_count = members.len() as i64;
+        cluster.distinct_sessions = members
+            .iter()
+            .filter_map(|c| c.source_session.as_deref())
+            .collect::<std::collections::HashSet<_>>()
+            .len() as i64;
+        cluster.last_seen_at = now;
+        upsert_cluster(conn, &cluster)?;
+        if should_promote(&cluster) {
+            report.newly_promotable.push(cluster_id);
+        }
+    }
+
+    for id in before
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if list_candidates_for_cluster(conn, &id)?.is_empty() {
+            report.emptied.push(id);
+        }
+    }
+    Ok(report)
 }
 
 /// Whether a cluster has recurred across enough distinct sessions to promote.
@@ -1505,6 +1756,304 @@ mod tests {
     fn promoting_a_missing_cluster_is_none() {
         let conn = conn();
         assert_eq!(promote_cluster(&conn, "clu-nope", 3000).unwrap(), None);
+    }
+
+    // --- Phase 6b: clustering keys on the lesson, not the trigger ---
+
+    /// A candidate carrying `lesson`, triggered by a Bash command substring.
+    ///
+    /// Each gets its own command, so every one of them has a different
+    /// `canonical_trigger_key` — which is the whole point: under the old rules
+    /// that alone kept them apart.
+    fn budget_candidate(n: usize, session: &str, lesson: &str) -> PriorCandidate {
+        PriorCandidate {
+            id: format!("cand-budget-{n}"),
+            cluster_id: None,
+            state: "candidate".into(),
+            trigger_kind: "pre_tool".into(),
+            trigger_matcher: format!(r#"{{"command_contains":"step-{n}"}}"#),
+            lesson: lesson.into(),
+            scope: r#"{"repo":"current"}"#.into(),
+            evidence_failure: Some("hit the budget limit".into()),
+            evidence_fix: Some("switched to the shell fallback".into()),
+            source_session: Some(session.into()),
+            created_at: 1000 + n as i64,
+        }
+    }
+
+    /// Two spellings of one lesson are one cluster, whatever their triggers.
+    ///
+    /// Trigger-first clustering counted spellings rather than lessons: on the
+    /// live store 11 candidates carrying one budget-limit rule sat in 9
+    /// clusters, so not one of them reached `PROMOTION_MIN_SESSIONS` and the
+    /// rule was never promoted, while a weak `*| grep*` pattern promoted
+    /// because its key happened to repeat.
+    #[test]
+    fn one_lesson_under_two_triggers_is_one_cluster() {
+        let conn = conn();
+        // Cosine 0.9986 — comfortably over PRIOR_MERGE_SIMILARITY.
+        let near = [1.0_f32, 0.05, 0.0];
+        let same = [1.0_f32, 0.0, 0.0];
+
+        let a = integrate_candidate_with_embedding(
+            &conn,
+            &budget_candidate(1, "sess-1", "Check the tool budget before edit-heavy work."),
+            1000,
+            Some(&same),
+        )
+        .unwrap();
+        let b = integrate_candidate_with_embedding(
+            &conn,
+            &budget_candidate(
+                2,
+                "sess-2",
+                "Check the budget before starting a long edit run.",
+            ),
+            2000,
+            Some(&near),
+        )
+        .unwrap();
+        assert_eq!(a, b, "one lesson must not fragment across two trigger keys");
+
+        // And the merged evidence is what clears the recurrence gate.
+        let cluster = get_cluster(&conn, &a).unwrap().unwrap();
+        assert_eq!(cluster.distinct_sessions, 2);
+        assert!(
+            should_promote(&cluster),
+            "merging the evidence is only worth anything if it promotes"
+        );
+
+        // An unrelated lesson still gets its own cluster: the merge is on
+        // meaning, not on everything.
+        let mut other = budget_candidate(3, "sess-3", "Never force-push to a shared branch.");
+        other.id = "cand-other".into();
+        let c = integrate_candidate_with_embedding(&conn, &other, 3000, Some(&[0.0, 0.0, 1.0]))
+            .unwrap();
+        assert_ne!(
+            c, a,
+            "an orthogonal lesson must not be swept into the merge"
+        );
+    }
+
+    /// Without an embedding the trigger key still decides.
+    ///
+    /// Mining on a machine with no embedding model has to keep working; it
+    /// degrades to the old behaviour rather than putting every lesson in one
+    /// bucket or in none.
+    #[test]
+    fn clustering_falls_back_to_the_trigger_key_when_there_is_no_embedding() {
+        let conn = conn();
+        let a =
+            integrate_candidate_with_embedding(&conn, &budget_candidate(1, "s1", "L"), 1000, None)
+                .unwrap();
+        let b =
+            integrate_candidate_with_embedding(&conn, &budget_candidate(2, "s2", "L"), 2000, None)
+                .unwrap();
+        assert_ne!(a, b, "different trigger keys, no embedding: two clusters");
+
+        let mut same_trigger = budget_candidate(1, "s3", "L");
+        same_trigger.id = "cand-same-trigger".into();
+        let c = integrate_candidate_with_embedding(&conn, &same_trigger, 3000, None).unwrap();
+        assert_eq!(c, a, "the same trigger key still merges");
+    }
+
+    /// Six lesson embeddings with the geometry measured on the live store.
+    ///
+    /// The real budget candidates are not a tight ball: their pairwise cosine
+    /// runs min 0.427 / median 0.691 / max 0.794, so not one of the 36 pairs
+    /// reaches the 0.85 this code used to merge at. The fixture reproduces that
+    /// as a chain — each spelling close to the one before it, the two ends far
+    /// apart — because that is the shape that makes the case hard: no single
+    /// point is near every other, which is why a group is matched by its
+    /// nearest member and not by its seed.
+    ///
+    /// `STEP` is the measured maximum, so the closest pair here is exactly the
+    /// closest pair on disk and every other pair is further apart than its real
+    /// counterpart. The fixture is harder than the data it stands for.
+    fn budget_embeddings() -> Vec<Vec<f32>> {
+        const STEP: f32 = 0.794;
+        let mut out = vec![vec![1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0]];
+        for n in 1..6 {
+            let mut v: Vec<f32> = out[n - 1].iter().map(|x| x * STEP).collect();
+            // The previous vector is zero in dimension `n`, so this stays a
+            // unit vector and the cosine to it is exactly `STEP`.
+            v[n] = (1.0 - STEP * STEP).sqrt();
+            out.push(v);
+        }
+        out
+    }
+
+    /// Write a candidate into a cluster of its own, keyed on its trigger — the
+    /// shape the old trigger-first rule left on disk.
+    fn seed_own_cluster(conn: &Connection, cand: &PriorCandidate, embedding: &[f32]) {
+        let key = canonical_trigger_key(&cand.trigger_kind, &cand.trigger_matcher);
+        let id = cluster_id_for_key(&key);
+        upsert_cluster(
+            conn,
+            &PriorCluster {
+                id: id.clone(),
+                canonical_trigger_key: key,
+                trigger_kind: cand.trigger_kind.clone(),
+                trigger_matcher: cand.trigger_matcher.clone(),
+                lesson: cand.lesson.clone(),
+                scope: cand.scope.clone(),
+                evidence_count: 1,
+                distinct_sessions: 1,
+                injected_count: 0,
+                confirmed_count: 0,
+                refuted_count: 0,
+                state: "candidate".into(),
+                promoted_memory_id: None,
+                created_at: 1000,
+                last_seen_at: 1000,
+                error_signature: None,
+            },
+        )
+        .unwrap();
+        set_cluster_embedding(conn, &id, embedding).unwrap();
+        let mut linked = cand.clone();
+        linked.cluster_id = Some(id);
+        upsert_candidate(conn, &linked).unwrap();
+    }
+
+    /// The store already on disk is repaired, not just new mining.
+    ///
+    /// The episodes that produced these candidates are gone, so the rule change
+    /// is worth nothing unless it can be applied to the rows that are left.
+    #[test]
+    fn reclustering_collapses_a_lesson_that_was_split_across_six_triggers() {
+        let conn = conn();
+        let lesson = "Check the tool budget before edit-heavy work.";
+        let embeddings = budget_embeddings();
+
+        // The fixture is only worth anything if it is as far apart as the real
+        // candidates were: no pair may reach the threshold this code used to
+        // merge at, or the test would pass without the change it guards.
+        let mut pairs: Vec<f32> = Vec::new();
+        for i in 0..embeddings.len() {
+            for j in i + 1..embeddings.len() {
+                pairs.push(cosine_similarity(&embeddings[i], &embeddings[j]));
+            }
+        }
+        let max = pairs.iter().copied().fold(f32::MIN, f32::max);
+        assert_eq!(pairs.len(), 15);
+        assert!(
+            max < 0.85,
+            "no pair may reach the old 0.85 threshold, closest is {max}"
+        );
+        assert!(
+            (max - 0.794).abs() < 0.001,
+            "the closest pair must be the measured 0.794, got {max}"
+        );
+
+        // Build the store the OLD way: trigger key first, so six spellings of
+        // one lesson become six clusters and none of them can promote.
+        for n in 1..=6 {
+            let cand = budget_candidate(n, &format!("sess-{n}"), lesson);
+            seed_own_cluster(&conn, &cand, &embeddings[n - 1]);
+        }
+
+        let distinct_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT cluster_id) FROM prior_candidates",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct_before, 6, "the fixture must start fragmented");
+
+        let report = recluster(&conn, 9000).unwrap();
+
+        let distinct_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT cluster_id) FROM prior_candidates",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            distinct_after, 1,
+            "six spellings of one lesson must end as one cluster"
+        );
+        assert_eq!(report.moved, 5);
+        assert_eq!(
+            report.emptied.len(),
+            5,
+            "five clusters are left holding nothing"
+        );
+
+        // The point of the merge: six sessions of evidence in one place, which
+        // is what promotion reads.
+        let surviving: String = conn
+            .query_row(
+                "SELECT DISTINCT cluster_id FROM prior_candidates",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cluster = get_cluster(&conn, &surviving).unwrap().unwrap();
+        assert_eq!(cluster.evidence_count, 6);
+        assert_eq!(cluster.distinct_sessions, 6);
+        assert_eq!(report.newly_promotable, vec![surviving]);
+
+        // Idempotent: the pass is safe to re-run, and does not keep shuffling.
+        let again = recluster(&conn, 9100).unwrap();
+        assert_eq!(again.moved, 0, "a second pass must move nothing");
+    }
+
+    /// A candidate that reaches two groups proves the two are one lesson.
+    ///
+    /// Arrival order decides what the pass sees first, and a lesson must not
+    /// stay split because the spelling that bridges its two halves happened to
+    /// be recorded last. Assigning the bridge to the nearer half would leave
+    /// the other stranded with no path to it, and the result would depend on
+    /// the order rows came off disk.
+    #[test]
+    fn a_candidate_reaching_two_groups_folds_them_together() {
+        let conn = conn();
+        let lesson = "Check the tool budget before edit-heavy work.";
+        let e = budget_embeddings();
+        // 1 and 3 are 0.63 apart — under the threshold, so two groups. 2 sits
+        // at 0.794 from both, and arrives last.
+        assert!(cosine_similarity(&e[0], &e[2]) < PRIOR_MERGE_SIMILARITY);
+        assert!(cosine_similarity(&e[0], &e[1]) >= PRIOR_MERGE_SIMILARITY);
+        assert!(cosine_similarity(&e[1], &e[2]) >= PRIOR_MERGE_SIMILARITY);
+
+        for (n, emb, at) in [(1, &e[0], 1000), (3, &e[2], 2000), (2, &e[1], 3000)] {
+            let mut cand = budget_candidate(n, &format!("sess-{n}"), lesson);
+            cand.created_at = at;
+            seed_own_cluster(&conn, &cand, emb);
+        }
+
+        let report = recluster(&conn, 9000).unwrap();
+
+        let distinct: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT cluster_id) FROM prior_candidates",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(distinct, 1, "the bridge must fold both halves into one");
+        // The oldest candidate keeps its cluster, so the survivor is the one
+        // seeded from candidate 1 — not the nearer of the two halves.
+        let surviving: String = conn
+            .query_row(
+                "SELECT DISTINCT cluster_id FROM prior_candidates",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let first = budget_candidate(1, "sess-1", lesson);
+        assert_eq!(
+            surviving,
+            cluster_id_for_key(&canonical_trigger_key(
+                &first.trigger_kind,
+                &first.trigger_matcher
+            ))
+        );
+        assert_eq!(report.moved, 2);
+        assert_eq!(report.emptied.len(), 2);
     }
 
     // --- Phase 7: trigger matching + injection selection ---
