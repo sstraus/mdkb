@@ -323,7 +323,7 @@ mod tests {
         .join("\n");
         let ep = parse_episode(&jsonl);
         assert_eq!(ep.errors.len(), 2);
-        assert_eq!(ep.errors[0].at, Some(1767948240));
+        assert_eq!(ep.errors[0].at, Some(1_767_948_240));
         assert_eq!(ep.errors[1].at, None, "an unparseable stamp is not a time");
     }
 

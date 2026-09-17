@@ -4374,17 +4374,16 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
         settle_injections(&ctx.conn, &session, now, &errors)
     }) {
         Some(Ok(report)) if !report.is_empty() => {
-            // All four outcomes are logged, not just the two that move a
+            // All three outcomes are logged, not just the one that moves a
             // counter: a run that settles nothing but `unobservable` is the
             // signal that the distiller is not writing error signatures, and
-            // reporting only confirmed/refuted would show it as silence.
+            // reporting only refutations would show it as silence.
             tracing::info!(
-                "prior settling: {} confirmed, {} refuted, {} unobservable, \
-                 {} without opportunity in session {session}",
-                report.confirmed.len(),
+                "prior settling: {} refuted, {} unobservable, {} unrefuted \
+                 in session {session}",
                 report.refuted.len(),
                 report.unobservable.len(),
-                report.no_opportunity.len()
+                report.unrefuted.len()
             );
         }
         Some(Err(error)) => tracing::debug!("prior settling failed: {error}"),
@@ -9359,11 +9358,25 @@ mod tests {
         (c.confirmed_count, c.refuted_count)
     }
 
-    /// Inject a prior on PreToolUse, then end the session, and read the verdict.
+    /// The outcome written on the injection row, or `None` while it is open.
+    async fn injection_outcome(handle: &RepoHandle, cluster_id: &str) -> Option<String> {
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        conn.query_row(
+            "SELECT outcome FROM prior_injections WHERE cluster_id = ?1 AND session = 's1'",
+            rusqlite::params![cluster_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Inject a prior on PreToolUse, then end the session, and read the verdict:
+    /// the cluster's two counters plus the outcome on the injection row, which
+    /// is where a settlement that moves no counter is recorded.
     /// Mining stays OFF throughout: settling is gated on injection, not on
     /// mining, and gating it on mining would leave every prior in such a repo
     /// unsettled forever.
-    async fn inject_then_stop(transcript: &str) -> (i64, i64) {
+    async fn inject_then_stop(transcript: &str) -> (i64, i64, Option<String>) {
         let tmp = TempDir::new().unwrap();
         let handle = Arc::new(make_handle_with(&tmp, |config| {
             config.priors.mining_enabled = false;
@@ -9402,23 +9415,43 @@ mod tests {
         );
         dctx.join_background().await;
 
-        cluster_belief(&handle, &cluster_id).await
+        let (confirmed, refuted) = cluster_belief(&handle, &cluster_id).await;
+        (
+            confirmed,
+            refuted,
+            injection_outcome(&handle, &cluster_id).await,
+        )
     }
 
+    /// Story 092, criterion 6, end to end. This is the `pre_tool` case, the one
+    /// where the operation provably ran — and it still earns nothing, because
+    /// PreToolUse returns `additionalContext` and never a deny. The Edit was
+    /// already committed when the prior appeared, so a quiet session shows the
+    /// lesson being ignored without consequence, not the lesson working. The row
+    /// closes as `unrefuted` so the next Stop hook does not ask again.
     #[tokio::test]
-    async fn a_session_that_did_not_trip_the_error_confirms_the_prior() {
-        let (confirmed, refuted) = inject_then_stop(MINE_BORING_TRANSCRIPT).await;
-        assert_eq!(confirmed, 1, "a quiet session is evidence the lesson held");
+    async fn a_session_that_did_not_trip_the_error_does_not_confirm_the_prior() {
+        let (confirmed, refuted, outcome) = inject_then_stop(MINE_BORING_TRANSCRIPT).await;
+        assert_eq!(
+            confirmed, 0,
+            "a quiet session is not evidence the lesson held"
+        );
         assert_eq!(refuted, 0);
+        assert_eq!(
+            outcome.as_deref(),
+            Some("unrefuted"),
+            "settled, not reopened"
+        );
     }
 
     #[tokio::test]
     async fn the_warned_error_happening_anyway_refutes_the_prior() {
         // MINE_FIX_TRANSCRIPT carries exactly the failure the seeded cluster
         // warns about: the model was told, and hit it regardless.
-        let (confirmed, refuted) = inject_then_stop(MINE_FIX_TRANSCRIPT).await;
+        let (confirmed, refuted, outcome) = inject_then_stop(MINE_FIX_TRANSCRIPT).await;
         assert_eq!(refuted, 1, "the failure came back after the warning");
         assert_eq!(confirmed, 0);
+        assert_eq!(outcome.as_deref(), Some("refuted"));
     }
 
     /// A prior nobody was shown has nothing to answer for. Without this, every

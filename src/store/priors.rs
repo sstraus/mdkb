@@ -651,17 +651,6 @@ fn tool_call_matches(pattern: &str, tool: &str, path: Option<&str>, command: Opt
     false
 }
 
-/// Trigger kinds whose injection is itself proof that the warned-about
-/// operation ran.
-///
-/// [`match_injectable`] evaluates the matcher against a live [`TriggerContext`],
-/// so a `pre_tool` or `post_tool` injection only happens when a real tool call
-/// carried the matching command or path. A `prompt` injection fires on the
-/// prompt text, and `repo`/`stop` fire on the session itself; none of the three
-/// says an operation followed, and no stored table can be asked afterwards
-/// because tool arguments are never persisted.
-const OPPORTUNITY_PROVING_KINDS: [&str; 2] = ["pre_tool", "post_tool"];
-
 /// Whether a promoted cluster's trigger matches the current context.
 ///
 /// The matcher reads the distiller's `{"when","pattern"}` shape. For `pre_tool`
@@ -931,64 +920,67 @@ pub struct ObservedError {
 
 /// What settling one session's injections did.
 ///
-/// Four outcomes, and only the first two are evidence. Splitting them is the
-/// point: a settlement that moves no counter still has to be recorded, or the
-/// next Stop hook reopens the same question forever.
+/// Three outcomes, and only the first is evidence. Splitting the other two is
+/// the point: a settlement that moves no counter still has to be recorded, or
+/// the next Stop hook reopens the same question forever.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct SettleReport {
-    /// Observable, the opportunity existed, and the failure did not come back.
-    pub confirmed: Vec<String>,
     /// The failure the prior warns about happened after it was shown.
     pub refuted: Vec<String>,
     /// The cluster has no error signature, so nothing could have been observed.
     pub unobservable: Vec<String>,
-    /// Observable, but nothing recorded says the warned-about operation ran.
-    pub no_opportunity: Vec<String>,
+    /// Observable, and the failure did not come back — which is not the same as
+    /// the prior having worked. See [`settle_injections`].
+    pub unrefuted: Vec<String>,
 }
 
 impl SettleReport {
     /// Nothing was open to settle.
     pub fn is_empty(&self) -> bool {
-        self.confirmed.is_empty()
-            && self.refuted.is_empty()
-            && self.unobservable.is_empty()
-            && self.no_opportunity.is_empty()
+        self.refuted.is_empty() && self.unobservable.is_empty() && self.unrefuted.is_empty()
     }
 }
 
 /// Close the loop for every prior injected into `session` and not yet settled.
 ///
-/// Four outcomes, of which only two are evidence:
+/// Three outcomes, of which exactly one is evidence:
 ///
 /// * **refuted** — the prior's own error signature recurred after it was
 ///   injected. It was surfaced, and the failure it warns about happened anyway.
-/// * **confirmed** — the signature existed, the warned-about operation
-///   demonstrably ran, and the failure did not come back.
 /// * **unobservable** — the cluster has no error signature. A prior mined from
 ///   a user correction has nothing that can recur, so no session can be
 ///   evidence about it. 61 of the 66 clusters in the live store are here.
-/// * **no_opportunity** — the signature existed and did not recur, but nothing
-///   recorded says the operation ever ran.
+/// * **unrefuted** — the signature existed and did not recur.
 ///
-/// The opportunity question is what separates the last two from `confirmed`,
-/// and it is **not** answerable after the fact: `call_log` records a tool name
-/// and a timestamp, never the arguments [`tool_call_matches`] needs to decide
-/// whether a call could have exercised the prior. It *is* answerable at
-/// injection time, and the answer is already recorded as `trigger_kind`:
-/// `pre_tool` and `post_tool` injections happen because the matcher fired on a
-/// live tool call, so the operation provably ran. A `prompt`, `repo` or `stop`
-/// injection proves only that the session started or the prompt matched.
+/// **A session never confirms a prior.** Only a person does, through
+/// [`apply_belief_from_memory`]. The tempting automated rule — "the operation
+/// ran and the failure did not follow, so the lesson worked" — is not weak
+/// evidence but inverted evidence, for a reason the hook shape makes plain: the
+/// PreToolUse hook returns `additionalContext` and never a deny, so the command
+/// is already committed when the prior is shown. An injection therefore means
+/// the warned-about operation ran *with the lesson not applied to it*. The
+/// heeded case — the agent rewrites the command, the matcher stops firing —
+/// produces no injection at all and so leaves no row to settle. An automated
+/// `confirmed` would be fed exclusively by the un-heeded case, and would rise
+/// fastest on the priors whose failure is least deterministic.
+///
+/// The matcher makes that concrete: [`tool_call_matches`] accepts a bare tool
+/// name, which the distiller prompt offers as a pattern form, so a cluster with
+/// `pattern: "Bash"` fires on every shell call. Under an automated positive
+/// rule it would bank a confirmation in every session that ran any command
+/// without reproducing the signature.
 ///
 /// Before this split, a missing signature mapped through `unwrap_or(false)` to
 /// "did not recur" and therefore to `confirmed`: every injection of a
 /// correction-mined prior was a free confirmation, and the belief term rose on
-/// silence.
+/// silence. A prior that is never re-mined, never refuted and never confirmed by
+/// a person now decays out of injection range, which is the intended TTL.
 ///
 /// Called from the Stop hook, before the mining gate: most sessions teach
 /// nothing new and are gated out, but they still answer the question about the
 /// priors they were shown. Each (cluster, session) settles exactly once — the
 /// `prior_injections` primary key plus the `outcome IS NULL` filter — so a
-/// retried Stop hook cannot inflate either counter.
+/// retried Stop hook cannot inflate the counter.
 pub fn settle_injections(
     conn: &Connection,
     session: &str,
@@ -996,19 +988,19 @@ pub fn settle_injections(
     errors: &[ObservedError],
 ) -> Result<SettleReport> {
     let mut stmt = conn.prepare(
-        "SELECT i.cluster_id, i.injected_at, c.error_signature, c.trigger_kind
+        "SELECT i.cluster_id, i.injected_at, c.error_signature
          FROM prior_injections i JOIN prior_clusters c ON c.id = i.cluster_id
          WHERE i.session = ?1 AND i.outcome IS NULL",
     )?;
-    let open: Vec<(String, i64, Option<String>, String)> = stmt
+    let open: Vec<(String, i64, Option<String>)> = stmt
         .query_map(params![session], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     drop(stmt);
 
     let mut report = SettleReport::default();
-    for (cluster_id, injected_at, known_signature, trigger_kind) in open {
+    for (cluster_id, injected_at, known_signature) in open {
         // A blank signature is the same absence as a missing one: it matches
         // nothing, so nothing about it can be observed.
         let signature = known_signature
@@ -1023,13 +1015,7 @@ pub fn settle_injections(
                     .iter()
                     .filter(|e| e.at.is_none_or(|at| at >= injected_at))
                     .any(|e| signatures_match(known, &e.signature));
-                if recurred {
-                    "refuted"
-                } else if OPPORTUNITY_PROVING_KINDS.contains(&trigger_kind.as_str()) {
-                    "confirmed"
-                } else {
-                    "no_opportunity"
-                }
+                if recurred { "refuted" } else { "unrefuted" }
             }
         };
 
@@ -1043,24 +1029,19 @@ pub fn settle_injections(
         if claimed == 0 {
             continue;
         }
-        // Only an evidential outcome moves a counter. The other two are
-        // recorded on the injection row and nowhere else.
-        let column = match outcome {
-            "refuted" => Some("refuted_count"),
-            "confirmed" => Some("confirmed_count"),
-            _ => None,
-        };
-        if let Some(column) = column {
+        // Only a refutation moves a counter. The other two are recorded on the
+        // injection row and nowhere else. `confirmed_count` still exists and is
+        // still read by the belief term — only a person writes it now.
+        if outcome == "refuted" {
             conn.execute(
-                &format!("UPDATE prior_clusters SET {column} = {column} + 1 WHERE id = ?1"),
+                "UPDATE prior_clusters SET refuted_count = refuted_count + 1 WHERE id = ?1",
                 params![cluster_id],
             )?;
         }
         match outcome {
             "refuted" => report.refuted.push(cluster_id),
-            "confirmed" => report.confirmed.push(cluster_id),
             "unobservable" => report.unobservable.push(cluster_id),
-            _ => report.no_opportunity.push(cluster_id),
+            _ => report.unrefuted.push(cluster_id),
         }
     }
     Ok(report)
@@ -1764,8 +1745,13 @@ mod tests {
         }
     }
 
+    /// Story 092, criterion 6. A different error is not the prior's error, so
+    /// the session did not refute it — and that is all the session says. The
+    /// PreToolUse hook cannot deny the call, so the prior was shown *after* the
+    /// operation was committed: a quiet session is the un-heeded case, never
+    /// proof the lesson worked. Only a person confirms.
     #[test]
-    fn a_quiet_session_confirms_the_prior_it_was_shown() {
+    fn a_quiet_session_does_not_confirm_the_prior_it_was_shown() {
         let conn = conn();
         upsert_cluster(
             &conn,
@@ -1782,10 +1768,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.confirmed, vec!["clu-a".to_string()]);
+        assert_eq!(report.unrefuted, vec!["clu-a".to_string()]);
         assert!(report.refuted.is_empty());
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
-        assert_eq!(c.confirmed_count, 1);
+        assert_eq!(c.confirmed_count, 0, "no session moves this counter");
         assert_eq!(c.refuted_count, 0);
     }
 
@@ -1813,7 +1799,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.refuted, vec!["clu-a".to_string()]);
-        assert!(report.confirmed.is_empty());
+        assert!(report.unrefuted.is_empty());
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(c.refuted_count, 1);
         assert_eq!(c.confirmed_count, 0);
@@ -1839,7 +1825,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(report.confirmed, vec!["clu-a".to_string()]);
+        assert_eq!(report.unrefuted, vec!["clu-a".to_string()]);
+        assert!(report.refuted.is_empty());
     }
 
     /// An error the transcript did not timestamp cannot be placed before the
@@ -1878,7 +1865,6 @@ mod tests {
         let report = settle_injections(&conn, "sess-1", 2000, &[]).unwrap();
 
         assert_eq!(report.unobservable, vec!["clu-a".to_string()]);
-        assert!(report.confirmed.is_empty(), "silence is not a confirmation");
         assert!(report.refuted.is_empty());
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(c.confirmed_count, 0, "neither counter moves");
@@ -1909,27 +1895,33 @@ mod tests {
     /// matched, which says nothing about whether the operation it warns about
     /// ever ran. Nothing recorded can answer that — `call_log` keeps tool names
     /// and timestamps, never arguments — so the session is not evidence either
-    /// way.
+    /// way. The `pre_tool` case settles the same way for a different reason:
+    /// the operation provably ran, and ran *unchanged*, because the hook cannot
+    /// deny it.
     #[test]
-    fn a_prompt_injection_that_saw_no_recurrence_settles_no_opportunity() {
+    fn no_recurrence_settles_unrefuted_whatever_the_trigger_kind() {
         let conn = conn();
-        let mut c = cluster_with_signature("clu-a", Some("error[E0433]: failed to resolve"));
-        c.trigger_kind = "prompt".into();
-        c.canonical_trigger_key = "prompt|{pattern:src/**}".into();
-        upsert_cluster(&conn, &c).unwrap();
-        record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
+        for (id, kind, key) in [
+            ("clu-prompt", "prompt", "prompt|{pattern:src/**}"),
+            ("clu-pre", "pre_tool", "pre_tool|{pattern:Bash}"),
+        ] {
+            let mut c = cluster_with_signature(id, Some("error[E0433]: failed to resolve"));
+            c.trigger_kind = kind.into();
+            c.canonical_trigger_key = key.into();
+            upsert_cluster(&conn, &c).unwrap();
+            record_injection(&conn, id, "sess-1", 1000).unwrap();
+        }
 
         let report = settle_injections(&conn, "sess-1", 2000, &[]).unwrap();
 
-        assert_eq!(report.no_opportunity, vec!["clu-a".to_string()]);
-        assert!(report.confirmed.is_empty());
-        assert_eq!(
-            get_cluster(&conn, "clu-a")
-                .unwrap()
-                .unwrap()
-                .confirmed_count,
-            0
-        );
+        let mut unrefuted = report.unrefuted.clone();
+        unrefuted.sort();
+        assert_eq!(unrefuted, vec!["clu-pre", "clu-prompt"]);
+        for id in ["clu-prompt", "clu-pre"] {
+            let c = get_cluster(&conn, id).unwrap().unwrap();
+            assert_eq!(c.confirmed_count, 0, "{id} banked a confirmation");
+            assert_eq!(c.refuted_count, 0);
+        }
     }
 
     /// A recurrence refutes whatever the kind: the failure is observed, not
@@ -1978,6 +1970,9 @@ mod tests {
         assert_eq!(after.injected_count, 1, "the injection is still counted");
     }
 
+    /// Both this test and the next one used to count confirmations, which no
+    /// session can produce any more. The claim they make is about the *ballot*,
+    /// not the verdict, so a refutation carries it unchanged.
     #[test]
     fn settling_twice_counts_once_per_session() {
         let conn = conn();
@@ -1985,15 +1980,13 @@ mod tests {
         record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
         record_injection(&conn, "clu-a", "sess-1", 1100).unwrap();
 
-        settle_injections(&conn, "sess-1", 2000, &[]).unwrap();
-        let second = settle_injections(&conn, "sess-1", 2100, &[]).unwrap();
+        let errors = [err("boom failed", Some(1500))];
+        settle_injections(&conn, "sess-1", 2000, &errors).unwrap();
+        let second = settle_injections(&conn, "sess-1", 2100, &errors).unwrap();
 
         assert!(second.is_empty(), "a settled session has nothing left open");
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
-        assert_eq!(
-            c.confirmed_count, 1,
-            "two injections, one session, one vote"
-        );
+        assert_eq!(c.refuted_count, 1, "two injections, one session, one vote");
         assert_eq!(c.injected_count, 2, "telemetry still counts both");
     }
 
@@ -2001,13 +1994,14 @@ mod tests {
     fn a_second_session_votes_again() {
         let conn = conn();
         upsert_cluster(&conn, &cluster_with_signature("clu-a", Some("boom failed"))).unwrap();
+        let errors = [err("boom failed", None)];
         record_injection(&conn, "clu-a", "sess-1", 1000).unwrap();
-        settle_injections(&conn, "sess-1", 2000, &[]).unwrap();
+        settle_injections(&conn, "sess-1", 2000, &errors).unwrap();
         record_injection(&conn, "clu-a", "sess-2", 3000).unwrap();
-        settle_injections(&conn, "sess-2", 4000, &[]).unwrap();
+        settle_injections(&conn, "sess-2", 4000, &errors).unwrap();
 
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
-        assert_eq!(c.confirmed_count, 2);
+        assert_eq!(c.refuted_count, 2);
     }
 
     /// Clusters mined before the loop existed carry no signature. They must
@@ -2028,8 +2022,9 @@ mod tests {
                 .unwrap();
 
         assert_eq!(report.unobservable, vec!["clu-a".to_string()]);
-        assert!(report.confirmed.is_empty());
         assert!(report.refuted.is_empty());
+        let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!((c.confirmed_count, c.refuted_count), (0, 0));
 
         // Settled means settled: a second Stop hook finds nothing open.
         let again = settle_injections(&conn, "sess-1", 2100, &[]).unwrap();
@@ -2051,10 +2046,22 @@ mod tests {
     /// The loop is only worth building if it moves the number the injector
     /// reads. A promoted cluster starts at 0.33 against a 0.3 threshold: three
     /// refutations push it under, and confirmations bring it back.
+    ///
+    /// Story 092 changed who may push it back up. Quiet sessions no longer can —
+    /// they are the un-heeded case — so the recovery half now runs through the
+    /// human verdict, which is the only thing that raises belief.
     #[test]
     fn belief_carries_the_score_across_the_threshold_both_ways() {
         let conn = conn();
-        upsert_cluster(&conn, &cluster_with_signature("clu-a", Some("boom failed"))).unwrap();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('prior-a', 'l', 'l', 'prior', '[]', 100, 100)",
+            [],
+        )
+        .unwrap();
+        let mut seed = cluster_with_signature("clu-a", Some("boom failed"));
+        seed.promoted_memory_id = Some("prior-a".into());
+        upsert_cluster(&conn, &seed).unwrap();
         let now = 1000;
 
         let fresh = get_cluster(&conn, "clu-a").unwrap().unwrap();
@@ -2083,10 +2090,18 @@ mod tests {
             cluster_injection_score(&refuted, now)
         );
 
-        // Quiet sessions afterwards bring it back over the line.
+        // Quiet sessions afterwards change nothing: silence is not a recovery.
         for (i, session) in ["s4", "s5", "s6", "s7"].iter().enumerate() {
             record_injection(&conn, "clu-a", session, now).unwrap();
             settle_injections(&conn, session, now + i as i64, &[]).unwrap();
+        }
+        let still_out = get_cluster(&conn, "clu-a").unwrap().unwrap();
+        assert_eq!(still_out.confirmed_count, 0, "no session confirms");
+        assert!(!is_injectable(&still_out, now), "silence is not a recovery");
+
+        // Four human confirmations bring it back over the line.
+        for _ in 0..4 {
+            apply_belief_from_memory(&conn, "prior-a", 1).unwrap();
         }
         let recovered = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(recovered.confirmed_count, 4);
