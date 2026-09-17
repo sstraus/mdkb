@@ -3,6 +3,12 @@
 //! Validates that `acquire_singleton_lock` enforces one-at-a-time semantics
 //! via advisory file locking (`flock(LOCK_EX | LOCK_NB)` on Unix).
 
+// `daemon::singleton` is `#[cfg(unix)]`, like `ipc_server` and `spawn`: the
+// whole daemon is a Unix-socket design. Without this gate the file does not
+// compile on Windows, which is what broke the `Test Windows` job — the import
+// resolves to nothing there. Every other daemon E2E file already carries it.
+#![cfg(unix)]
+
 use mdkb::daemon::singleton::{AcquireError, acquire_singleton_lock};
 use tempfile::TempDir;
 
