@@ -4,6 +4,26 @@
 
 ### Fixed
 
+- **A change the watcher dropped can no longer sit unrecovered.** The watcher
+  drops events when its 100-slot channel fills and sets a flag that schedules a
+  full rescan — measured on 2026-09-17, a 500-file burst produced 793 failed
+  `try_send` calls, and the rescan did cover every file. But the flag was only
+  read in the flush arm, which runs only when a batch, a doc update or a memory
+  sync is already pending. A burst whose delivered events all route nowhere —
+  the shape of a `cargo build`: hundreds of artifacts, not one of them a source
+  file — left the loop blocked with the flag set and nothing scheduled to read
+  it, so an edit dropped in that same burst stayed out of the index until some
+  later routed change happened to arrive. The flag is now read on every
+  delivered event, and a drop alone is enough to arm the flush. Separately, the
+  recovery rescan used to do nothing at all, and say nothing, when a corrupt
+  database had closed the index connection — the flag that scheduled it was
+  already spent, so that gap was permanent. It reopens the index first.
+
+  Related, and worth knowing before diagnosing this again: `code.sqlite` is in
+  WAL mode, so under a daemon that holds the connection open its mtime sits at
+  the last checkpoint. `ls -l` on it can read days old over a perfectly current
+  index. `mdkb stats` reports the real state.
+
 - **`code impact` no longer walks through a call it could not place.** An
   arrival at tier 7 means the caller wrote this name and no rule could say it
   meant this symbol. The walk expanded it anyway, so everything behind a bare

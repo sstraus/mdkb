@@ -67,7 +67,13 @@ const MAX_INDEXABLE_FILE_BYTES: u64 = 1024 * 1024;
 // ---------------------------------------------------------------------------
 
 /// Configuration for the indexing pipeline.
-#[derive(Debug)]
+///
+/// `Clone` because the watcher keeps one master copy for the lifetime of the
+/// repo and hands a copy to every facade it opens — the first one and each
+/// reopen after corruption closed the slot. A reopened facade that indexed
+/// under different rules than the original would quietly change what is in the
+/// index, which is worse than not reopening at all.
+#[derive(Debug, Clone)]
 pub struct PipelineConfig {
     pub channel_size: usize,
     pub batch_size: usize,

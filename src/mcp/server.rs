@@ -1402,6 +1402,15 @@ pub async fn run_file_watcher_inner(
         .collect();
     // Build exclude matcher for code changes (node_modules, dist, target, etc.)
     let code_excludes = build_code_excludes(&root, &code_ignore_patterns);
+    // The settings every facade this watcher opens must carry — the bootstrap
+    // below and every later reopen after corruption closed the slot. One value,
+    // so a reopened facade can never index under different rules than the
+    // original one did.
+    let pipeline_config = crate::code::indexing::pipeline::PipelineConfig {
+        ignore_patterns: code_ignore_patterns.clone(),
+        respect_gitignore,
+        ..Default::default()
+    };
 
     // The memory projection this watcher reconciles: `memory/entries/` of the
     // store `ctx` opened, which in a namespace is `.mdkb/namespaces/<name>/`.
@@ -1449,22 +1458,7 @@ pub async fn run_file_watcher_inner(
         };
         if needs_bootstrap {
             let mut idx_guard = code_index.lock().await;
-            if idx_guard.is_none() {
-                let index_path = root.join(".mdkb/code.sqlite");
-                match IndexFacade::open_or_create(&index_path) {
-                    Ok(facade) => {
-                        let pipeline_config = crate::code::indexing::pipeline::PipelineConfig {
-                            ignore_patterns: code_ignore_patterns.clone(),
-                            respect_gitignore,
-                            ..Default::default()
-                        };
-                        *idx_guard = Some(facade.with_config(pipeline_config));
-                    }
-                    Err(e) => {
-                        tracing::error!("Watcher bootstrap: failed to open code index: {e}");
-                    }
-                }
-            }
+            ensure_code_facade(&mut idx_guard, &root, &pipeline_config);
             if let Some(facade) = idx_guard.as_mut() {
                 if facade.file_count() == 0 {
                     match facade.index_directory(&root) {
@@ -1493,6 +1487,16 @@ pub async fn run_file_watcher_inner(
     let mut code_batch: Vec<PathBuf> = Vec::new();
     let mut needs_doc_update = false;
     let mut needs_memory_sync = MemorySyncRequest::Idle;
+    // The watcher dropped events under backpressure, so the batch is an
+    // incomplete view of what changed and only a full rescan can close the gap.
+    //
+    // Latched here instead of being read straight off the watcher in the flush
+    // arm, because that arm only runs when something else is already pending. A
+    // burst whose every *delivered* event routes nowhere — a `cargo build`
+    // filling the channel with `target/**` while one source edit is dropped —
+    // leaves the batch empty, and the drop that came with it would never be
+    // looked at. The index would stay stale until the daemon restarted.
+    let mut needs_rescan = false;
 
     loop {
         // Helper: receive from the optional injected-path channel, or block forever if absent.
@@ -1507,95 +1511,102 @@ pub async fn run_file_watcher_inner(
             };
         }
 
-        if code_batch.is_empty() && !needs_doc_update && !needs_memory_sync.is_pending() {
-            // No pending work — block until next event from either source.
-            tokio::select! {
-                change = watcher.recv() => {
-                    let Some(change) = change else {
-                        tracing::error!(
-                            "Watcher: FSEvents stream closed; file-change watching stopped \
-                             for this repo (restart the daemon to restore it)."
-                        );
-                        break;
-                    };
-                    tracing::debug!("File change detected: {:?}", change.path);
-                    let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
-                    if routes.code { code_batch.push(change.path.clone()); }
-                    if routes.doc { needs_doc_update = true; }
-                    if routes.memory { needs_memory_sync.note(change.path.clone()); }
-                    if !routes.any() {
-                        tracing::debug!("Ignoring unrouted change: {:?}", change.path);
-                    }
+        let pending = !code_batch.is_empty()
+            || needs_doc_update
+            || needs_memory_sync.is_pending()
+            || needs_rescan;
+
+        tokio::select! {
+            change = watcher.recv() => {
+                let Some(change) = change else {
+                    tracing::error!(
+                        "Watcher: FSEvents stream closed; file-change watching stopped \
+                         for this repo (restart the daemon to restore it)."
+                    );
+                    break;
+                };
+                // Polled on every delivered event, not only when a flush is due.
+                // A drop can only happen with the channel full, so an event
+                // always follows one and carries the news out of the watcher.
+                needs_rescan |= watcher.take_missed_events();
+                tracing::debug!("File change detected: {:?}", change.path);
+                let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
+                if routes.code { code_batch.push(change.path.clone()); }
+                if routes.doc { needs_doc_update = true; }
+                if routes.memory { needs_memory_sync.note(change.path.clone()); }
+                if !routes.any() {
+                    tracing::debug!("Ignoring unrouted change: {:?}", change.path);
                 }
-                path = recv_injected!() => {
-                    if let Some(p) = path {
-                        // Directory = post-heal full-rebuild signal; file = code reindex.
-                        if p.is_dir() {
-                            full_rebuild_from_heal(&ctx, &code_index, &root).await;
-                        } else {
-                            code_batch.push(p);
-                        }
+            }
+            path = recv_injected!() => {
+                if let Some(p) = path {
+                    // A directory is the post-heal full-rebuild signal (the repo
+                    // root); a file is a targeted code reindex.
+                    if p.is_dir() {
+                        full_rebuild_from_heal(&ctx, &code_index, &root, &pipeline_config).await;
+                    } else {
+                        code_batch.push(p);
                     }
                 }
             }
-        } else {
-            // Pending batch — accumulate more events or flush after idle timeout.
-            tokio::select! {
-                change = watcher.recv() => {
-                    if let Some(change) = change {
-                        tracing::debug!("File change detected: {:?}", change.path);
-                        let routes = classify_change(&change.path, &collection_paths, &code_excludes, &memory_entries_dir);
-                        if routes.code { code_batch.push(change.path.clone()); }
-                        if routes.doc { needs_doc_update = true; }
-                        if routes.memory { needs_memory_sync.note(change.path.clone()); }
-                        if !routes.any() {
-                            tracing::debug!("Ignoring unrouted change: {:?}", change.path);
-                        }
-                    } else {
-                        tracing::error!(
-                            "Watcher: FSEvents stream closed; file-change watching stopped \
-                             for this repo (restart the daemon to restore it)."
-                        );
-                        break;
+            // Armed only while work is pending: with nothing to flush the loop
+            // blocks on the two event sources rather than waking on a timer.
+            () = tokio::time::sleep(std::time::Duration::from_millis(batch_idle_ms)), if pending => {
+                if needs_rescan {
+                    needs_rescan = false;
+                    tracing::warn!(
+                        "Watcher: recovering dropped change events with a full rescan"
+                    );
+                    code_batch.clear();
+                    // Gated, unlike the incremental flush: that one is a no-op on
+                    // a closed slot, but the rescan REOPENS the slot, and opening
+                    // `code.sqlite` for a repo that turned code indexing off would
+                    // create the index the config says must not exist.
+                    if code_enabled {
+                        full_code_rescan(&code_index, &root, &pipeline_config).await;
                     }
+                    needs_doc_update = true;
+                    needs_memory_sync = MemorySyncRequest::Full;
+                } else {
+                    flush_code_batch(&code_index, &root, &mut code_batch).await;
                 }
-                path = recv_injected!() => {
-                    if let Some(p) = path {
-                        // A directory is the post-heal full-rebuild signal (the repo
-                        // root); a file is a targeted code reindex.
-                        if p.is_dir() {
-                            full_rebuild_from_heal(&ctx, &code_index, &root).await;
-                        } else {
-                            code_batch.push(p);
-                        }
-                    }
-                }
-                () = tokio::time::sleep(std::time::Duration::from_millis(batch_idle_ms)) => {
-                    if watcher.take_missed_events() {
-                        // The watcher dropped events under backpressure; the batch
-                        // is an incomplete view, so rescan everything instead.
-                        tracing::warn!(
-                            "Watcher: recovering dropped change events with a full rescan"
-                        );
-                        code_batch.clear();
-                        full_code_rescan(&code_index, &root).await;
-                        needs_doc_update = true;
-                        needs_memory_sync = MemorySyncRequest::Full;
-                    } else {
-                        flush_code_batch(&code_index, &root, &mut code_batch).await;
-                    }
-                    // Order matters: `handle_update` already runs the memory
-                    // reconciliation, so a pending doc update subsumes a pending
-                    // memory sync. Flushing docs first lets the memory flush see
-                    // the flag cleared and skip a redundant second pass.
-                    flush_doc_update(&ctx, &root, &mut needs_doc_update, &mut needs_memory_sync).await;
-                    flush_memory_sync(&ctx, &mut needs_memory_sync).await;
-                }
+                // Order matters: `handle_update` already runs the memory
+                // reconciliation, so a pending doc update subsumes a pending
+                // memory sync. Flushing docs first lets the memory flush see
+                // the flag cleared and skip a redundant second pass.
+                flush_doc_update(&ctx, &root, &mut needs_doc_update, &mut needs_memory_sync).await;
+                flush_memory_sync(&ctx, &mut needs_memory_sync).await;
             }
         }
     }
 
     Ok(())
+}
+
+/// Open the code-index facade into `slot` if it is closed, and report whether
+/// the slot holds one afterwards.
+///
+/// The slot is `None` before the first open and again after
+/// [`crate::code::indexing::run_code_mutation`] closed a corrupt database. Every
+/// path that must not silently do nothing has to come through here first.
+fn ensure_code_facade(
+    slot: &mut Option<IndexFacade>,
+    root: &Path,
+    config: &crate::code::indexing::pipeline::PipelineConfig,
+) -> bool {
+    if slot.is_some() {
+        return true;
+    }
+    match IndexFacade::open_or_create(root.join(".mdkb/code.sqlite")) {
+        Ok(facade) => {
+            *slot = Some(facade.with_config(config.clone()));
+            true
+        }
+        Err(e) => {
+            tracing::error!("Watcher: failed to open code index: {e}");
+            false
+        }
+    }
 }
 
 /// Flush accumulated code changes as a single incremental reindex.
@@ -1635,8 +1646,17 @@ async fn flush_code_batch(
 /// Full code rescan (content-hash diff over all files), used to recover after
 /// the watcher dropped change events under backpressure — the specific dropped
 /// paths are unknown, so `update` re-checks everything.
-async fn full_code_rescan(code_index: &Arc<Mutex<Option<IndexFacade>>>, root: &Path) {
+async fn full_code_rescan(
+    code_index: &Arc<Mutex<Option<IndexFacade>>>,
+    root: &Path,
+    config: &crate::code::indexing::pipeline::PipelineConfig,
+) {
     let mut idx_guard = code_index.lock().await;
+    // Reopen first. This runs after a corrupt database closed the slot, which is
+    // exactly when a recovery rescan matters most: without this the mutation
+    // returns `None`, the rescan is skipped without a word, and the drop that
+    // scheduled it has already been consumed — the index stays stale for good.
+    ensure_code_facade(&mut idx_guard, root, config);
     let outcome = crate::code::indexing::run_code_mutation(
         &mut idx_guard,
         "watcher recovery rescan",
@@ -1666,6 +1686,7 @@ async fn full_rebuild_from_heal(
     ctx: &Arc<Mutex<Option<Context>>>,
     code_index: &Arc<Mutex<Option<IndexFacade>>>,
     root: &Path,
+    config: &crate::code::indexing::pipeline::PipelineConfig,
 ) {
     tracing::warn!("post-heal: rebuilding docs + sessions + code from source");
     // A quarantine rebuilds `memory_entries` empty, so the projection on disk is
@@ -1675,7 +1696,7 @@ async fn full_rebuild_from_heal(
     let mut needs_memory = MemorySyncRequest::Full;
     flush_doc_update(ctx, root, &mut needs_docs, &mut needs_memory).await;
     flush_memory_sync(ctx, &mut needs_memory).await;
-    full_code_rescan(code_index, root).await;
+    full_code_rescan(code_index, root, config).await;
 
     match crate::daemon::config::home_dir() {
         Err(e) => tracing::warn!("post-heal session reindex skipped: {e}"),
@@ -3470,6 +3491,42 @@ if (require.main === module) {
                     && text.contains("The walk stopped at 2 of them"),
                 "the header must point at the second list and say where the walk \
                  stopped: {text}"
+            );
+        }
+
+        /// The recovery rescan reopens a facade that corruption closed.
+        ///
+        /// `run_code_mutation` closes the slot when SQLite reports a torn file,
+        /// and every later mutation on a closed slot returns `None` — it does
+        /// nothing and says nothing. That is survivable for the incremental
+        /// flush, whose paths arrive again on the next edit. It is not
+        /// survivable for the rescan: the dropped-events flag that scheduled it
+        /// has already been consumed, so a skipped rescan is a gap nothing will
+        /// ever schedule again. Reopening first is what makes the recovery a
+        /// recovery.
+        #[tokio::test]
+        async fn a_recovery_rescan_reopens_an_index_that_corruption_closed() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path().to_path_buf();
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            std::fs::write(root.join("src/after.rs"), "pub fn after_the_close() {}\n").unwrap();
+
+            // The state `run_code_mutation` leaves behind after it quarantines.
+            let code_index: Arc<Mutex<Option<IndexFacade>>> = Arc::new(Mutex::new(None));
+            let config = crate::code::indexing::pipeline::PipelineConfig {
+                respect_gitignore: false,
+                ..Default::default()
+            };
+
+            full_code_rescan(&code_index, &root, &config).await;
+
+            let guard = code_index.lock().await;
+            let facade = guard
+                .as_ref()
+                .expect("the rescan must reopen the slot, not skip because it is closed");
+            assert!(
+                facade.get_symbol_by_name("after_the_close").is_some(),
+                "the reopened index must hold what changed while it was closed"
             );
         }
 

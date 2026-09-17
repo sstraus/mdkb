@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+#[path = "common/cli.rs"]
+mod cli;
+
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 
@@ -641,6 +644,328 @@ async fn documents_are_watched_with_code_indexing_disabled() {
         },
     )
     .await;
+
+    watcher.abort();
+}
+
+/// A burst larger than the event channel must not leave the index short.
+///
+/// Story 101-58b1. The review found `code.sqlite` two days stale under a
+/// running daemon, with `File watcher channel full` in the log. The channel
+/// holds 100 events; a burst larger than that drops the excess at `try_send`
+/// and sets a flag the consumer turns into a full rescan.
+///
+/// Measured here on 2026-09-17 with 500 files written in one go: the debouncer
+/// delivers them as one batch, `try_send` fails for the tail, and the flag is
+/// set. What the index ends up holding is the whole point — a recovery that
+/// runs is worth nothing if it recovers a subset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_burst_larger_than_the_channel_still_indexes_every_file() {
+    let _serial = WATCHER_TESTS.lock().await;
+    let tmp = canonical_tempdir();
+    let root = tmp.path().to_path_buf();
+
+    let ctx = Context::init(&root).expect("Context::init");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("seed.rs"), "pub fn seed() {}\n").unwrap();
+
+    let ctx_arc: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(Some(ctx)));
+    let code_index: Arc<Mutex<Option<IndexFacade>>> = Arc::new(Mutex::new(None));
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let watcher = {
+        let (root, ctx, code, ready) = (
+            root.clone(),
+            Arc::clone(&ctx_arc),
+            Arc::clone(&code_index),
+            Arc::clone(&ready),
+        );
+        tokio::spawn(async move {
+            let _ = run_file_watcher_inner(
+                root,
+                ctx,
+                code,
+                true,
+                vec![],
+                true,
+                50,
+                200,
+                Some(ready),
+                None,
+            )
+            .await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), ready.notified())
+        .await
+        .expect("watcher ready");
+
+    // Freshness as it is visible on disk — the symptom the review reported.
+    //
+    // NOT `code.sqlite` alone, and that is the finding: the index runs in WAL
+    // mode (`PRAGMA journal_mode` = wal, checked 2026-09-17), so a write lands
+    // in `code.sqlite-wal` and the main file's mtime only moves at a
+    // checkpoint. A daemon holds the connection open for days, so `ls -l
+    // code.sqlite` can read two days old over an index that is perfectly
+    // current — which is exactly what the review saw. The honest freshness
+    // signal is the newest of the whole file set.
+    let db_mtime = || {
+        ["code.sqlite", "code.sqlite-wal", "code.sqlite-shm"]
+            .iter()
+            .filter_map(|name| {
+                std::fs::metadata(root.join(".mdkb").join(name))
+                    .and_then(|m| m.modified())
+                    .ok()
+            })
+            .max()
+    };
+    let mtime_before = db_mtime();
+
+    // 500 files at once: five times the channel, written as fast as the
+    // filesystem takes them.
+    const BURST: usize = 500;
+    let burst = || {
+        for n in 0..BURST {
+            std::fs::write(
+                src.join(format!("burst{n}.rs")),
+                format!("pub fn burst{n}() -> usize {{ {n} }}\n"),
+            )
+            .unwrap();
+        }
+    };
+    burst();
+
+    // Every file, not most of them. A recovery that covers a subset is the
+    // same stale index with a reassuring log line.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        let indexed = {
+            let guard = code_index.lock().await;
+            guard.as_ref().map_or(0, |facade| {
+                (0..BURST)
+                    .filter(|n| facade.get_symbol_by_name(&format!("burst{n}")).is_some())
+                    .count()
+            })
+        };
+        if indexed == BURST {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "only {indexed} of {BURST} burst files reached the code index"
+        );
+        // Re-issue: the same reason `wait_for` nudges — FSEvents arms its
+        // stream after `ready` returns.
+        burst();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    let mtime_after = db_mtime().expect("the code index must exist on disk after the burst");
+    assert!(
+        mtime_before.is_none_or(|before| mtime_after > before),
+        "the code index holds the burst but nothing on disk moved \
+         ({mtime_before:?} -> {mtime_after:?})"
+    );
+
+    watcher.abort();
+}
+
+/// `mdkb stats` reports a fresh code index after an editing session.
+///
+/// The burst test proves the recovery path; this proves the ordinary one, in
+/// the shape the report was actually made in — a few edits seconds apart, each
+/// its own flush, no drops involved. And it asks the question the way a person
+/// does: not by opening the database, but by running `mdkb stats` and reading
+/// the number back.
+///
+/// The `indexed` timestamp on that panel is the one to trust. `ls -l
+/// code.sqlite` is not: the index is in WAL mode, so under a daemon that keeps
+/// the connection open the file's mtime sits at the last checkpoint and can
+/// read days old over a current index.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_reports_a_fresh_code_index_after_an_editing_session() {
+    let _serial = WATCHER_TESTS.lock().await;
+    let tmp = canonical_tempdir();
+    let root = tmp.path().to_path_buf();
+
+    let ctx = Context::init(&root).expect("Context::init");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("lib.rs"), "pub fn already_here() {}\n").unwrap();
+
+    let ctx_arc: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(Some(ctx)));
+    let code_index: Arc<Mutex<Option<IndexFacade>>> = Arc::new(Mutex::new(None));
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let watcher = {
+        let (root, ctx, code, ready) = (
+            root.clone(),
+            Arc::clone(&ctx_arc),
+            Arc::clone(&code_index),
+            Arc::clone(&ready),
+        );
+        tokio::spawn(async move {
+            let _ = run_file_watcher_inner(
+                root,
+                ctx,
+                code,
+                true,
+                vec![],
+                true,
+                50,
+                200,
+                Some(ready),
+                None,
+            )
+            .await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), ready.notified())
+        .await
+        .expect("watcher ready");
+
+    // An editing session: one file at a time, with a pause between, the way
+    // someone works. Nothing here overruns the channel.
+    const EDITS: [&str; 3] = ["parse_header", "parse_body", "parse_footer"];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    for (n, name) in EDITS.iter().enumerate() {
+        loop {
+            std::fs::write(
+                src.join(format!("edit{n}.rs")),
+                format!("pub fn {name}() -> bool {{ true }}\n"),
+            )
+            .unwrap();
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let seen = {
+                let guard = code_index.lock().await;
+                guard
+                    .as_ref()
+                    .is_some_and(|facade| facade.get_symbol_by_name(name).is_some())
+            };
+            if seen {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "edit {n} ({name}) never reached the code index"
+            );
+        }
+    }
+
+    // Release the writer so the spawned process reads a settled database, then
+    // ask the same question a person asks.
+    watcher.abort();
+    {
+        let mut guard = code_index.lock().await;
+        *guard = None;
+    }
+
+    let out = cli::run(&["stats"], &root);
+    assert!(
+        out.status.success(),
+        "mdkb stats failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    for name in EDITS {
+        let found = cli::run(&["code", "find", name], &root);
+        assert!(
+            String::from_utf8_lossy(&found.stdout).contains(name),
+            "`mdkb code find {name}` does not see the edit that `mdkb stats` \
+             reported an index for:\n{text}"
+        );
+    }
+    assert!(
+        text.contains("Code Index") && !text.contains("(not indexed)"),
+        "stats must report an indexed code index after an editing session:\n{text}"
+    );
+}
+
+/// A drop is acted on even when not one delivered event routes anywhere.
+///
+/// The recovery reads the watcher's dropped-events flag, and that read used to
+/// live in the flush arm — which only runs when a batch, a doc update or a
+/// memory sync is already pending. So a burst whose delivered events all route
+/// nowhere (the shape of a `cargo build`: hundreds of artifacts, not one of
+/// them a source file) left the loop blocked on `recv` with the flag set and
+/// nothing scheduled to read it. The source edit that was dropped in the same
+/// burst stayed out of the index until the next routed change happened to
+/// arrive — which, for someone who asked mdkb a question instead of typing,
+/// is the stale answer the review reported.
+///
+/// Files with no known language are used rather than excluded ones so the test
+/// states the routing fact directly: `classify_change` sends these nowhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drop_is_recovered_even_when_every_delivered_event_routes_nowhere() {
+    let _serial = WATCHER_TESTS.lock().await;
+    let tmp = canonical_tempdir();
+    let root = tmp.path().to_path_buf();
+
+    let ctx = Context::init(&root).expect("Context::init");
+    let src = root.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("seed.rs"), "pub fn seed() {}\n").unwrap();
+    let junk = root.join("build-output");
+    std::fs::create_dir_all(&junk).unwrap();
+
+    let ctx_arc: Arc<Mutex<Option<Context>>> = Arc::new(Mutex::new(Some(ctx)));
+    let code_index: Arc<Mutex<Option<IndexFacade>>> = Arc::new(Mutex::new(None));
+    let ready = Arc::new(tokio::sync::Notify::new());
+    let watcher = {
+        let (root, ctx, code, ready) = (
+            root.clone(),
+            Arc::clone(&ctx_arc),
+            Arc::clone(&code_index),
+            Arc::clone(&ready),
+        );
+        tokio::spawn(async move {
+            let _ = run_file_watcher_inner(
+                root,
+                ctx,
+                code,
+                true,
+                vec![],
+                true,
+                50,
+                200,
+                Some(ready),
+                None,
+            )
+            .await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(20), ready.notified())
+        .await
+        .expect("watcher ready");
+
+    // Let the bootstrap reindex settle so the baseline counts only what the
+    // burst causes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let code_before = CODE_REINDEX_COUNT.load(Ordering::Relaxed);
+
+    // Six times the channel, so the tail is certain to be dropped: measured
+    // 2026-09-17, a 500-file burst produced 793 failed `try_send` calls.
+    const BURST: usize = 600;
+    let burst = || {
+        for n in 0..BURST {
+            std::fs::write(junk.join(format!("artifact{n}.o")), format!("{n}\n")).unwrap();
+        }
+    };
+    burst();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        if CODE_REINDEX_COUNT.load(Ordering::Relaxed) > code_before {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the watcher dropped events during a burst that routed nowhere and never \
+             scheduled the recovery rescan (CODE_REINDEX_COUNT stuck at {code_before})"
+        );
+        // Same nudge as the burst test: FSEvents arms its stream lazily.
+        burst();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
 
     watcher.abort();
 }
