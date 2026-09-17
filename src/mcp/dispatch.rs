@@ -1384,6 +1384,7 @@ pub async fn search_impl(
                     &params.query,
                     query_embedding.as_deref(),
                     limit,
+                    None,
                     &handle.config.search.memory,
                 )
             })
@@ -1421,6 +1422,7 @@ pub async fn search_impl(
                         &params.query,
                         query_embedding.as_deref(),
                         limit,
+                        None,
                         &handle.config.search.memory,
                     )?;
                     Ok((docs, memories))
@@ -1677,6 +1679,7 @@ pub async fn cross_repo_search_impl(
                                 &query,
                                 query_embedding.as_deref(),
                                 limit,
+                                None,
                                 &memory_cfg,
                             )
                         },
@@ -3888,6 +3891,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
                 prompt,
                 query_embedding.as_deref(),
                 limit,
+                None,
                 &handle.config.search.memory,
             )
         });

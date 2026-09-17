@@ -984,42 +984,6 @@ pub fn search_entries(conn: &Connection, query: &str, limit: usize) -> Result<Ve
     search_entries_fts(conn, &fts_query, limit)
 }
 
-/// FTS search filtered to a single entry_type. No default exclusions applied.
-pub fn search_entries_by_type(
-    conn: &Connection,
-    query: &str,
-    entry_type: &str,
-    limit: usize,
-) -> Result<Vec<MemoryEntry>> {
-    let fts_query = crate::store::search::escape_fts5_query(query);
-    if crate::store::search::fts_query_is_empty(&fts_query) {
-        return Ok(Vec::new());
-    }
-    let now = Utc::now().timestamp();
-    let mut stmt = conn.prepare(
-        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.last_refuted_at, m.source_type, m.expires_at, m.due_at
-         FROM memory_entries m
-         JOIN memory_fts f ON m.rowid = f.rowid
-         WHERE memory_fts MATCH ?1
-         AND m.entry_type = ?4
-         AND (m.expires_at IS NULL OR m.expires_at > ?3)
-         ORDER BY bm25(memory_fts)
-         LIMIT ?2"
-    )?;
-
-    let rows = stmt.query_map(
-        params![fts_query, limit as i64, now, entry_type],
-        row_to_entry,
-    )?;
-
-    let mut entries = Vec::new();
-    for row in rows {
-        entries.push(row?);
-    }
-
-    Ok(entries)
-}
-
 /// Search memory entries using a pre-built FTS5 query expression.
 ///
 /// Callers are responsible for producing a valid FTS5 query (including OR /
@@ -1066,16 +1030,20 @@ fn bm25_search_with_rowid(
     conn: &Connection,
     fts_query: &str,
     limit: usize,
+    entry_type: Option<&str>,
 ) -> Result<Vec<(i64, MemoryEntry)>> {
     if crate::store::search::fts_query_is_empty(fts_query) {
         return Ok(Vec::new());
     }
     let now = Utc::now().timestamp();
+    // `?4 IS NULL` makes the filter a no-op for an untyped search, so both
+    // shapes share one prepared statement and one cache slot.
     let mut stmt = conn.prepare(
         "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.last_refuted_at, m.source_type, m.expires_at, m.due_at
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
+         AND (?4 IS NULL OR m.entry_type = ?4)
          AND (m.expires_at IS NULL OR m.expires_at > ?3)
          AND NOT (m.entry_type = 'reminder' AND (m.due_at IS NULL OR m.due_at > ?3))
          -- priors are surfaced (gated by confidence in the hook); list/stats paths still exclude them
@@ -1083,7 +1051,7 @@ fn bm25_search_with_rowid(
          LIMIT ?2"
     )?;
 
-    let rows = stmt.query_map(params![fts_query, limit as i64, now], |row| {
+    let rows = stmt.query_map(params![fts_query, limit as i64, now, entry_type], |row| {
         let rowid: i64 = row.get(0)?;
         let entry = row_to_entry_offset(row, 1)?;
         Ok((rowid, entry))
@@ -1119,7 +1087,7 @@ pub fn find_similar_entries(
     exclude_id: &str,
 ) -> Result<String> {
     let mut warnings = String::new();
-    let similar = crate::store::vectors::memory_vector_search(conn, embedding, 5)?;
+    let similar = crate::store::vectors::memory_vector_search(conn, embedding, 5, None)?;
     for (sim_rowid, distance) in &similar {
         if *sim_rowid == exclude_rowid || *distance > SIMILARITY_THRESHOLD {
             continue;
@@ -1216,11 +1184,16 @@ pub fn access_recency_score(
 /// `query` is treated as raw text and escaped into a token-AND FTS5 expression.
 /// For pre-built FTS queries (e.g. recall's OR-expression) use
 /// [`search_entries_hybrid_fts`].
+///
+/// `entry_type` restricts both legs to one `EntryType`. It is a filter on the
+/// corpus, not a second ranking: a typed query and the same query untyped rank
+/// the entries of that type identically.
 pub fn search_entries_recall(
     conn: &Connection,
     query_text: &str,
     query_embedding: Option<&[f32]>,
     limit: usize,
+    entry_type: Option<&str>,
     cfg: &crate::config::SearchMemoryConfig,
 ) -> Result<Vec<ScoredMemoryEntry>> {
     let Some(fts_query) = crate::store::search::build_recall_query(query_text) else {
@@ -1228,7 +1201,15 @@ pub fn search_entries_recall(
         // against the embedding of a function word.
         return Ok(Vec::new());
     };
-    search_entries_hybrid_fts(conn, &fts_query, query_text, query_embedding, limit, cfg)
+    search_entries_hybrid_fts(
+        conn,
+        &fts_query,
+        query_text,
+        query_embedding,
+        limit,
+        entry_type,
+        cfg,
+    )
 }
 
 /// Hybrid search variant accepting a pre-built FTS5 query expression.
@@ -1248,12 +1229,17 @@ pub fn search_entries_recall(
 /// Every candidate passes the absolute relevance gate
 /// (`cfg.min_recall_cosine`) before any normalization — see
 /// [`crate::store::hybrid::admits`].
+///
+/// `entry_type` is applied inside both legs, never to the fused set: a
+/// post-filter would let entries of other types consume the per-leg caps and
+/// return fewer matches than exist.
 pub fn search_entries_hybrid_fts(
     conn: &Connection,
     fts_query: &str,
     query_text: &str,
     query_embedding: Option<&[f32]>,
     limit: usize,
+    entry_type: Option<&str>,
     cfg: &crate::config::SearchMemoryConfig,
 ) -> Result<Vec<ScoredMemoryEntry>> {
     let access_recency_weight = cfg.access_recency_weight;
@@ -1268,7 +1254,7 @@ pub fn search_entries_hybrid_fts(
     }
 
     // BM25 search (get more for fusion)
-    let bm25_results = bm25_search_with_rowid(conn, fts_query, limit * 2)?;
+    let bm25_results = bm25_search_with_rowid(conn, fts_query, limit * 2, entry_type)?;
 
     // The absolute relevance gate, expressed once as a distance bound. `None`
     // when the floor is disabled, which restores the pre-gate behavior of
@@ -1336,7 +1322,8 @@ pub fn search_entries_hybrid_fts(
     };
 
     // Vector search
-    let vector_results = vectors::memory_vector_search(conn, query_embedding, limit * 2)?;
+    let vector_results =
+        vectors::memory_vector_search(conn, query_embedding, limit * 2, entry_type)?;
 
     // If no vector results, fall back to BM25-only
     if vector_results.is_empty() {
@@ -2327,15 +2314,15 @@ mod tests {
                 "search_entries({text:?}) must match nothing"
             );
             assert!(
-                search_entries_by_type(&conn, text, "topic", 5)
+                search_entries_recall(&conn, text, None, 5, Some("topic"), &ungated(0.0))
                     .unwrap_or_else(|e| panic!(
-                        "search_entries_by_type({text:?}) must not error: {e}"
+                        "typed search_entries_recall({text:?}) must not error: {e}"
                     ))
                     .is_empty(),
-                "search_entries_by_type({text:?}) must match nothing"
+                "typed search_entries_recall({text:?}) must match nothing"
             );
             assert!(
-                search_entries_recall(&conn, text, None, 5, &ungated(0.0))
+                search_entries_recall(&conn, text, None, 5, None, &ungated(0.0))
                     .unwrap_or_else(|e| panic!(
                         "search_entries_recall({text:?}) must not error: {e}"
                     ))
@@ -4283,13 +4270,104 @@ mod tests {
         add_entry(&conn, &entry).unwrap();
 
         // Search without embedding — should fall back to BM25
-        let results = search_entries_recall(&conn, "OAuth PKCE", None, 10, &ungated(0.2)).unwrap();
+        let results =
+            search_entries_recall(&conn, "OAuth PKCE", None, 10, None, &ungated(0.2)).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "test-entry");
         assert!(
             (results[0].score - 0.8275).abs() < 0.001,
             "final score should combine rank-1 relevance and confidence: {}",
             results[0].score
+        );
+    }
+
+    /// Build one active entry with only the fields a search test cares about.
+    fn typed_entry(id: &str, title: &str, content: &str, entry_type: EntryType) -> MemoryEntry {
+        MemoryEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+            content: content.to_string(),
+            entry_type,
+            tags: vec![],
+            status: EntryStatus::Active,
+            created_at: 1000,
+            updated_at: 1000,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            corrections: 0,
+            last_confirmed_at: None,
+            last_refuted_at: None,
+            source_type: SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        }
+    }
+
+    /// `--entry-type` narrows the corpus; it must not switch search engines.
+    ///
+    /// The CLI used to answer a typed query with token-AND BM25 and no vector
+    /// leg, so a paraphrase the untyped search recalled perfectly returned
+    /// nothing as soon as the flag was added. The entry below shares no word
+    /// with the query: only the vector leg can find it, and it must be found
+    /// both ways.
+    #[test]
+    fn the_entry_type_filter_narrows_the_corpus_without_changing_the_engine() {
+        let conn = setup_db_with_vectors();
+        use crate::store::vectors;
+
+        let wanted = typed_entry(
+            "sqlite-writer-lock",
+            "One writer, many readers",
+            "Serialise every mutation behind a single connection.",
+            EntryType::Decision,
+        );
+        add_entry(&conn, &wanted).unwrap();
+        let wanted_rowid = get_rowid(&conn, "sqlite-writer-lock").unwrap().unwrap();
+        vectors::store_memory_embedding(&conn, wanted_rowid, &test_embedding(0.30), "test")
+            .unwrap();
+
+        // Nearer to the query than the wanted entry, and of another type.
+        let decoy = typed_entry(
+            "parser-stack-depth",
+            "Deep syntax trees overflow the stack",
+            "Recursion depth grows with nesting in generated files.",
+            EntryType::Problem,
+        );
+        add_entry(&conn, &decoy).unwrap();
+        let decoy_rowid = get_rowid(&conn, "parser-stack-depth").unwrap().unwrap();
+        vectors::store_memory_embedding(&conn, decoy_rowid, &test_embedding(0.10), "test").unwrap();
+
+        // A paraphrase: no token of it appears in either entry, so the BM25
+        // leg contributes nothing and the answer comes from the vector leg.
+        let paraphrase = "concurrent database mutation strategy";
+        let query = test_embedding(0.11);
+
+        let untyped =
+            search_entries_recall(&conn, paraphrase, Some(&query), 10, None, &ungated(0.0))
+                .unwrap();
+        let untyped_ids: Vec<&str> = untyped.iter().map(|r| r.id.as_str()).collect();
+        assert!(
+            untyped_ids.contains(&"sqlite-writer-lock"),
+            "the untyped paraphrase must recall the decision, got {untyped_ids:?}"
+        );
+
+        let typed = search_entries_recall(
+            &conn,
+            paraphrase,
+            Some(&query),
+            10,
+            Some("decision"),
+            &ungated(0.0),
+        )
+        .unwrap();
+        let typed_ids: Vec<&str> = typed.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            typed_ids,
+            vec!["sqlite-writer-lock"],
+            "the typed paraphrase must return the same entry and drop the other type"
         );
     }
 
@@ -4385,6 +4463,7 @@ mod tests {
             "token expiration",
             Some(&query_emb),
             10,
+            None,
             &ungated(0.2),
         )
         .unwrap();
@@ -4441,6 +4520,7 @@ mod tests {
             "searchable entry",
             Some(&query_emb),
             3,
+            None,
             &ungated(0.2),
         )
         .unwrap();
@@ -5322,7 +5402,7 @@ mod tests {
         // Weight = 0 → ordering is BM25 ties; both present, order not guaranteed
         // but we only care that the boost changes ranking when enabled.
         let with_boost =
-            search_entries_recall(&conn, "popular topic", None, 10, &ungated(0.5)).unwrap();
+            search_entries_recall(&conn, "popular topic", None, 10, None, &ungated(0.5)).unwrap();
         assert_eq!(with_boost.len(), 2);
         assert_eq!(
             with_boost[0].id, "hot",
@@ -5364,12 +5444,12 @@ mod tests {
             add_entry(&conn, &entry).unwrap();
         }
 
-        let run_a = search_entries_recall(&conn, "deterministic", None, 10, &ungated(0.3))
+        let run_a = search_entries_recall(&conn, "deterministic", None, 10, None, &ungated(0.3))
             .unwrap()
             .into_iter()
             .map(|e| e.entry.id)
             .collect::<Vec<_>>();
-        let run_b = search_entries_recall(&conn, "deterministic", None, 10, &ungated(0.3))
+        let run_b = search_entries_recall(&conn, "deterministic", None, 10, None, &ungated(0.3))
             .unwrap()
             .into_iter()
             .map(|e| e.entry.id)

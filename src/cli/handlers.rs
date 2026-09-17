@@ -269,7 +269,7 @@ mod tests {
         .expect("add");
         handle_memory_confirm(&ctx, "d1", "refuted").expect("refute");
 
-        let hits = handle_memory_search(&ctx, "retry_backoff_ceiling", 5).expect("search");
+        let hits = handle_memory_search(&ctx, "retry_backoff_ceiling", 5, None).expect("search");
         assert!(
             hits.iter().any(|e| e.id == "d1"),
             "an explicit search must still find a refuted entry, got {:?}",

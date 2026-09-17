@@ -4,6 +4,14 @@
 
 ### Fixed
 
+- **`--entry-type` narrows memory search instead of replacing it.** Asking
+  `search --scope memory --entry-type decision` dropped to a token-AND
+  full-text query with no vector leg, so a paraphrase the same search recalled
+  perfectly without the flag returned nothing with it. The filter now runs
+  inside both legs of the one hybrid search, and it applies to the memory half
+  of an unscoped search too, where it used to be discarded in silence.
+  Not-yet-due reminders are hidden from a typed search, as they already were
+  from every other search and listing.
 - **`search --format json` emits one JSON document.** Searching the default
   scope printed two arrays under `## Documents` and `## Memory Entries`
   markdown headings, so `mdkb search q --format json | jq` failed on the first

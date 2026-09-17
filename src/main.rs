@@ -391,19 +391,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     format_search_results(&results, cli.format);
                 }
                 Some("memory") => {
-                    let entries = if let Some(ref et) = entry_type {
-                        // DEFERRED (2026-09-16) — the fourth memory-search
-                        // semantics. Story 084 unified the CLI, the MCP tool
-                        // and the hook on OR-expanded hybrid plus the absolute
-                        // floor; this branch is still token-AND FTS, so adding
-                        // `--entry-type` changes what the same query finds.
-                        // Unifying it needs an entry_type filter threaded
-                        // through `search_entries_hybrid_fts`, which is its own
-                        // piece of work.
-                        mdkb::store::memory::search_entries_by_type(&ctx.conn, &query, et, limit)?
-                    } else {
-                        handle_memory_search(&ctx, &query, limit)?
-                    };
+                    let entries = handle_memory_search(&ctx, &query, limit, entry_type.as_deref())?;
                     format_memory_list(&entries, cli.format);
                 }
                 None => {
@@ -415,7 +403,10 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         collection.as_deref(),
                         include_superseded,
                     )?;
-                    let entries = handle_memory_search(&ctx, &query, limit)?;
+                    // `--entry-type` narrows the memory half here too: the flag
+                    // describes the memory corpus, not the scope it was asked
+                    // for, and it used to be dropped silently without `--scope`.
+                    let entries = handle_memory_search(&ctx, &query, limit, entry_type.as_deref())?;
                     // One JSON document, not two arrays under markdown headings:
                     // a consumer parsing stdout must never see anything else.
                     if matches!(cli.format, OutputFormat::Json) {
@@ -1028,7 +1019,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     format_memory_list(&entries, cli.format);
                 }
                 MemoryCommand::Search { query, limit } => {
-                    let entries = handle_memory_search(&ctx, &query, limit)?;
+                    let entries = handle_memory_search(&ctx, &query, limit, None)?;
                     format_memory_list(&entries, cli.format);
                 }
                 MemoryCommand::Warmup { limit } => {

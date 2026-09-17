@@ -144,7 +144,7 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
     if is_new {
         if let Some(embedding) = input.embedding {
             for (rowid, distance) in
-                crate::store::vectors::memory_vector_search(conn, embedding, 3)?
+                crate::store::vectors::memory_vector_search(conn, embedding, 3, None)?
             {
                 if distance >= 0.32 {
                     continue;
@@ -435,7 +435,15 @@ pub fn handle_memory_list(
 /// The embedding is best-effort, exactly as `handle_hybrid_search` treats it:
 /// no model means no vector leg and no semantic admission arm, so recall
 /// degrades to strong lexical matches rather than to an error.
-pub fn handle_memory_search(ctx: &Context, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
+///
+/// `entry_type` narrows the corpus both legs draw from. It does not switch
+/// engines: the typed and untyped answers agree on every entry of that type.
+pub fn handle_memory_search(
+    ctx: &Context,
+    query: &str,
+    limit: usize,
+    entry_type: Option<&str>,
+) -> Result<Vec<MemoryEntry>> {
     let query_embedding = match crate::llm::get_cached_service().and_then(|s| s.embed_query(query))
     {
         Ok(v) => Some(v),
@@ -450,6 +458,7 @@ pub fn handle_memory_search(ctx: &Context, query: &str, limit: usize) -> Result<
         query,
         query_embedding.as_deref(),
         limit,
+        entry_type,
         &cfg.search.memory,
     )?;
     Ok(scored.into_iter().map(|result| result.entry).collect())

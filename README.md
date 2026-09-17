@@ -306,7 +306,7 @@ validation and write admission remain authoritative.
 |-------|-----------------|
 | _(omit)_ | Docs + memory combined (default) |
 | `docs` | Hybrid BM25 + semantic over markdown documents |
-| `memory` | Hybrid BM25 + semantic over memory entries, identical on every surface — the CLI, the MCP tool and the recall hook build the same OR-expanded query and apply the same absolute relevance floor. Adding `--entry-type` on the CLI still selects a full-text-only path |
+| `memory` | Hybrid BM25 + semantic over memory entries, identical on every surface — the CLI, the MCP tool and the recall hook build the same OR-expanded query and apply the same absolute relevance floor. `--entry-type` narrows the corpus both legs draw from; it does not select a different engine |
 | `symbols` | Exact symbol lookup by name, filterable by `kind` and `file` |
 | `code` | Semantic code search across indexed symbols |
 | `duplicates` | Clusters of near-identical bodies. `since="<ref>"` narrows the report to clusters your change touched |

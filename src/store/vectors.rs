@@ -616,20 +616,75 @@ pub fn memory_vector_search(
     conn: &Connection,
     query_embedding: &[f32],
     limit: usize,
+    entry_type: Option<&str>,
 ) -> Result<Vec<(i64, f32)>> {
     let embedding_bytes = query_embedding.as_bytes();
+
+    // A typed search over-fetches, because the filter below runs after the KNN
+    // and would otherwise return fewer than `limit` rows whenever the nearest
+    // neighbours carry another type.
+    let fetch_limit = if entry_type.is_some() {
+        limit.saturating_mul(5)
+    } else {
+        limit
+    };
 
     let mut stmt = conn.prepare(
         "SELECT memory_rowid, distance FROM vec_memory WHERE embedding MATCH ?1 ORDER BY distance LIMIT ?2",
     )?;
 
-    let results: std::result::Result<Vec<_>, _> = stmt
-        .query_map(params![embedding_bytes, limit as i64], |row| {
+    let mut results: Vec<(i64, f32)> = stmt
+        .query_map(params![embedding_bytes, fetch_limit as i64], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f32>(1)?))
         })?
-        .collect();
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    Ok(results?)
+    // The BM25 leg filters on `m.entry_type`; this leg must agree, or a typed
+    // query draws its whole semantic pool from every type and discards it.
+    //
+    // DEFERRED (2026-09-17) — post-filtering over a KNN result narrows what a
+    // typed search returns but cannot guarantee completeness: if the nearest
+    // `fetch_limit` entries all carry another type, a farther in-type match is
+    // still invisible. A complete answer needs `entry_type` inside the vector
+    // index (a vec0 metadata column). Not justified until a typed search is
+    // measured coming back short.
+    if let Some(entry_type) = entry_type {
+        retain_memory_rows_of_type(conn, &mut results, entry_type);
+    }
+    results.truncate(limit);
+
+    Ok(results)
+}
+
+/// Drop the KNN hits whose memory row carries another `entry_type`.
+///
+/// A failure leaves the candidate set untouched and warns: an unfiltered
+/// vector leg still meets the BM25 leg's own filter downstream, whereas an
+/// empty one silently answers "nothing found".
+fn retain_memory_rows_of_type(
+    conn: &Connection,
+    candidates: &mut Vec<(i64, f32)>,
+    entry_type: &str,
+) {
+    let placeholders: String = candidates
+        .iter()
+        .map(|(rowid, _)| rowid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT rowid FROM memory_entries WHERE rowid IN ({placeholders}) AND entry_type = ?1"
+    );
+    let kept: std::collections::HashSet<i64> = match conn.prepare(&sql).and_then(|mut stmt| {
+        stmt.query_map(params![entry_type], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()
+    }) {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!("entry_type filter for the memory vector leg failed: {e}");
+            return;
+        }
+    };
+    candidates.retain(|(rowid, _)| kept.contains(rowid));
 }
 
 /// Delete embedding for a memory entry.
@@ -1023,7 +1078,7 @@ mod tests {
 
         // Search with query close to auth topics
         let query = test_embedding(0.11);
-        let results = memory_vector_search(&conn, &query, 3).unwrap();
+        let results = memory_vector_search(&conn, &query, 3, None).unwrap();
 
         assert_eq!(results.len(), 3);
         // Auth entries should be closest
@@ -1049,7 +1104,7 @@ mod tests {
         assert!(deleted);
 
         // Search should return empty
-        let results = memory_vector_search(&conn, &test_embedding(0.1), 10).unwrap();
+        let results = memory_vector_search(&conn, &test_embedding(0.1), 10, None).unwrap();
         assert!(results.is_empty());
 
         // Deleting again should return false
@@ -1066,7 +1121,7 @@ mod tests {
 
         // Search should find entry once, with updated embedding
         let query = test_embedding(0.89);
-        let results = memory_vector_search(&conn, &query, 10).unwrap();
+        let results = memory_vector_search(&conn, &query, 10, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].0, rowid);
     }

@@ -112,8 +112,16 @@ impl Retrieval<'_> {
         } else {
             fts_query
         };
-        memory::search_entries_hybrid_fts(conn, fts, text, embedding.as_deref(), k, self.memory_cfg)
-            .map(|results| results.into_iter().map(|result| result.entry).collect())
+        memory::search_entries_hybrid_fts(
+            conn,
+            fts,
+            text,
+            embedding.as_deref(),
+            k,
+            None,
+            self.memory_cfg,
+        )
+        .map(|results| results.into_iter().map(|result| result.entry).collect())
     }
 }
 
