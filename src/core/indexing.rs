@@ -503,7 +503,7 @@ fn narrower_collections(
 fn claimed_by_a_narrower_collection(path: &Path, narrower: &[NarrowerCollection]) -> bool {
     narrower.iter().any(|other| {
         path.strip_prefix(&other.base)
-            .is_ok_and(|rel| other.matcher.is_match(rel))
+            .is_ok_and(|rel| other.matcher.is_match(crate::domain::rel_key(rel)))
     })
 }
 /// Update a single collection by scanning for file changes.
@@ -585,7 +585,10 @@ fn update_collection(
             // collection's glob pattern and that no collection rooted deeper
             // already owns.
             match path.strip_prefix(&base_path) {
-                Ok(rel) => glob.is_match(rel) && !claimed_by_a_narrower_collection(path, &narrower),
+                Ok(rel) => {
+                    glob.is_match(crate::domain::rel_key(rel))
+                        && !claimed_by_a_narrower_collection(path, &narrower)
+                }
                 Err(_) => false,
             }
         },
@@ -593,7 +596,7 @@ fn update_collection(
 
     for path in discovered {
         let relative = match path.strip_prefix(&base_path) {
-            Ok(rel) => rel.to_string_lossy().to_string(),
+            Ok(rel) => crate::domain::rel_key(rel),
             Err(_) => continue,
         };
 
@@ -924,11 +927,8 @@ pub(crate) fn index_specified_files(
         let matched = matchers
             .iter()
             .filter_map(|(coll, matcher, canonical_base)| {
-                let relative = canonical_file
-                    .strip_prefix(canonical_base)
-                    .ok()?
-                    .to_string_lossy()
-                    .to_string();
+                let relative =
+                    crate::domain::rel_key(canonical_file.strip_prefix(canonical_base).ok()?);
 
                 matcher
                     .is_match(&relative)

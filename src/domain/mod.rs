@@ -13,6 +13,29 @@ pub mod sessions;
 
 use serde::{Deserialize, Serialize};
 
+/// The canonical string form of a path relative to an index root: always
+/// `/`-separated, on every platform.
+///
+/// The store keys documents and symbols by this string, and everything that
+/// reads those keys speaks `/` — collection glob patterns, `mdkb graph` entity
+/// references, the code index's module addresses, the `file:` arguments users
+/// type. `Path::to_string_lossy` yields the *native* separator, so on Windows
+/// the same file was written as `src\lib.rs` and looked up as `src/lib.rs`.
+/// Ten tests in the `Test Windows` job said so the first time that job got far
+/// enough to run them; before that it failed to compile and the defect was
+/// invisible.
+///
+/// On Unix this is the identity, because `\` is a legal character in a file
+/// name there and rewriting it would corrupt the key.
+pub fn rel_key(relative: &std::path::Path) -> String {
+    let key = relative.to_string_lossy();
+    if cfg!(windows) {
+        key.replace('\\', "/")
+    } else {
+        key.into_owned()
+    }
+}
+
 /// How a collection was created.
 pub const COLLECTION_SOURCE_MANUAL: &str = "manual";
 /// Collection was auto-detected via directory conventions.
@@ -269,5 +292,32 @@ impl UpdateResult {
     /// report an honest doc-collection total, not just the per-run delta.
     pub fn docs_indexed(&self) -> usize {
         self.added + self.updated + self.unchanged
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rel_key;
+    use std::path::{Path, PathBuf};
+
+    /// The whole point: one key spelling for a nested file, everywhere.
+    #[test]
+    fn a_nested_path_is_always_slash_separated() {
+        let nested: PathBuf = ["src", "code", "indexing", "mod.rs"].iter().collect();
+        assert_eq!(rel_key(&nested), "src/code/indexing/mod.rs");
+    }
+
+    #[test]
+    fn a_top_level_file_is_unchanged() {
+        assert_eq!(rel_key(Path::new("README.md")), "README.md");
+    }
+
+    /// On Unix a backslash is an ordinary character in a file name, so
+    /// rewriting it would invent a key no file answers to. The platform check
+    /// in `rel_key` exists for this case and nothing else.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_unix_file_name_survives() {
+        assert_eq!(rel_key(Path::new(r"weird\name.md")), r"weird\name.md");
     }
 }

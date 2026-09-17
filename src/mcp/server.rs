@@ -4034,10 +4034,18 @@ if (require.main === module) {
         );
     }
 
+    /// "Absolute" is what the host OS says it is. A Windows client sends
+    /// `file:///C:/…`, and `/Users/me/project` is *not* absolute there — which
+    /// is why this test asserted `None` on Windows until the fixture learned to
+    /// speak the platform.
     #[test]
     fn test_uri_to_path_valid() {
-        let path = uri_to_path("file:///Users/me/project");
-        assert_eq!(path, Some(PathBuf::from("/Users/me/project")));
+        let (uri, expected) = if cfg!(windows) {
+            ("file:///C:/Users/me/project", "C:/Users/me/project")
+        } else {
+            ("file:///Users/me/project", "/Users/me/project")
+        };
+        assert_eq!(uri_to_path(uri), Some(PathBuf::from(expected)));
     }
 
     #[test]

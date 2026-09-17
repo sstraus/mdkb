@@ -1216,7 +1216,11 @@ mod tests {
         handle_init(temp.path()).unwrap();
         let ctx = Context::open(temp.path()).unwrap();
 
-        let result = handle_collection_add(&ctx, "evil", "/etc", "**/*");
+        // `/etc` is absolute on Unix and a *rooted relative* path on Windows,
+        // where it stays inside the root and is correctly not rejected. The
+        // claim is about absolute paths, so each platform needs its own.
+        let outside = if cfg!(windows) { r"C:\Windows" } else { "/etc" };
+        let result = handle_collection_add(&ctx, "evil", outside, "**/*");
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(msg.contains("escapes root"));

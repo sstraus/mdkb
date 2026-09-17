@@ -4783,9 +4783,11 @@ async fn tool_prior_block(
         .get("file_path")
         .and_then(|v| v.as_str())
         .map(|p| {
+            // The distilled trigger pattern is a `/`-separated glob, so the
+            // path it is matched against must be one too.
             std::path::Path::new(p)
                 .strip_prefix(&handle.root)
-                .map(|r| r.to_string_lossy().into_owned())
+                .map(crate::domain::rel_key)
                 .unwrap_or_else(|_| p.to_string())
         });
     let command = tool_input.get("command").and_then(|v| v.as_str());

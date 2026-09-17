@@ -607,7 +607,9 @@ fn stage_collect(
         };
 
         let file_path = parsed.path.strip_prefix(root).unwrap_or(&parsed.path);
-        let file_path_str: Box<str> = file_path.to_string_lossy().into();
+        // `/`-separated on every platform: `module_path` reads this back with
+        // `strip_prefix("src/")`, and the graph addresses symbols by it.
+        let file_path_str: Box<str> = crate::domain::rel_key(file_path).into();
 
         let mtime = hasher::file_mtime(&parsed.path).unwrap_or(0);
 
