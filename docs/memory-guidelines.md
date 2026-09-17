@@ -227,11 +227,18 @@ memory_write(
   300-token budget and a confidence floor. Due reminders and the newest handoff
   have dedicated slots instead of competing with durable knowledge.
 - **Search** (`search(query, scope="memory")`): Hybrid BM25+vector search for
-  specific entries. Hook recall applies `min_recall_score` to the final hybrid
-  relevance-plus-confidence score.
+  specific entries. Every surface runs the same engine; admission is decided
+  absolutely, before ranking, by `search.memory.min_recall_cosine` plus a strong
+  lexical match (story 083), so confidence only orders what was admitted.
 - **Confidence**: Topics, problems, and decisions do not decay with age; their
   truth changes through TTL, supersession, or refutation. Reminders, priors, and
   handoffs are lifecycle records, so their confidence does decay over time.
+- **Refutation**: `memory confirm <id> --outcome refuted` counts against the
+  entry three times as heavily as a confirmation counts for it, and it does not
+  cancel a confirmation that really happened. Until the entry is reconfirmed it
+  is not injected at all — not in warmup, not in recall — however high its
+  confidence still is. An explicit `search` still returns it, because the point
+  of recording a dispute is that the next reader sees it.
 - **Relations**: Active one-hop memory neighbors can expand recall, while a
   superseded or net-refuted dependency marks the entry `[STALE-DEP]` without
   mutating stored confidence.

@@ -1,72 +1,389 @@
 {
   "_authoring_rule": "Queries are written from memory of the TOPIC, never from the document. Each memory gets three held-out queries: a question a user would type, a paraphrase in different vocabulary, and a half-remembered fragment. A query must not share any run of four consecutive words with the title or content of a memory it expects; fixture::tests::held_out_queries_share_no_4gram_with_their_target enforces this (words are lowercased and split on every non-alphanumeric character). When a mode scores everything, make the queries harder. Never make the metric looser.",
+  "_negatives_rule": "A negative is an in-domain query: it shares vocabulary with at least one memory but not one of the twelve memories answers it. The correct retrieval for a negative is the empty set, so a negative that returns any entry at all is a false positive. Negatives obey the same no-4gram rule as the queries, which is what keeps them from being unlabelled positives; fixture::tests::negatives_are_in_domain_and_answered_by_no_memory enforces both halves. These 40 labelled negatives are the set the cosine floor tau is calibrated against - raising tau removes false positives and eventually removes hits, and the curve is printed by recall::tests::print_the_precision_recall_curve_over_tau.",
   "_comment": "Synthetic recall/judge fixture. Seeds a fresh store; independent of the live repo. Keep expected_ids referencing existing memory ids.",
   "memories": [
-    { "id": "oauth-pkce", "title": "OAuth2 PKCE flow", "content": "authorization code exchange with PKCE code_verifier and code_challenge for public clients", "tags": ["auth", "security"] },
-    { "id": "jwt-rotation", "title": "JWT signing key rotation", "content": "rotate asymmetric signing keys with a kid header and overlapping validity windows", "tags": ["auth", "security"] },
-    { "id": "http-retry", "title": "HTTP retry with backoff", "content": "exponential backoff with jitter and a retry budget for idempotent requests", "tags": ["net", "resilience"] },
-    { "id": "circuit-breaker", "title": "Circuit breaker pattern", "content": "open the circuit after a failure threshold, half-open probe before closing again", "tags": ["net", "resilience"] },
-    { "id": "lru-cache", "title": "LRU cache eviction", "content": "least recently used eviction policy backed by a doubly linked list and a hash map", "tags": ["perf", "cache"] },
-    { "id": "bloom-filter", "title": "Bloom filter membership", "content": "probabilistic set membership with false positives but no false negatives using k hash functions", "tags": ["perf", "datastructure"] },
-    { "id": "pg-index", "title": "Postgres partial index", "content": "create a partial index with a where clause to shrink index size for selective queries", "tags": ["db", "postgres"] },
-    { "id": "pg-vacuum", "title": "Postgres autovacuum tuning", "content": "tune autovacuum scale factor and cost delay to reclaim dead tuples on hot tables", "tags": ["db", "postgres"] },
-    { "id": "idempotency-key", "title": "Idempotency keys for payments", "content": "store an idempotency key per payment request to make retries safe and avoid double charge", "tags": ["payments", "resilience"] },
-    { "id": "saga-pattern", "title": "Saga distributed transaction", "content": "coordinate long-lived transactions with compensating actions instead of two phase commit", "tags": ["distributed", "transaction"] },
-    { "id": "rate-limit", "title": "Token bucket rate limiting", "content": "token bucket refills at a fixed rate and requests consume tokens to smooth bursts", "tags": ["net", "throttling"] },
-    { "id": "grpc-stream", "title": "gRPC bidirectional streaming", "content": "bidirectional streaming lets client and server send message sequences over one connection", "tags": ["net", "grpc"] }
+    {
+      "id": "oauth-pkce",
+      "title": "OAuth2 PKCE flow",
+      "content": "authorization code exchange with PKCE code_verifier and code_challenge for public clients",
+      "tags": [
+        "auth",
+        "security"
+      ]
+    },
+    {
+      "id": "jwt-rotation",
+      "title": "JWT signing key rotation",
+      "content": "rotate asymmetric signing keys with a kid header and overlapping validity windows",
+      "tags": [
+        "auth",
+        "security"
+      ]
+    },
+    {
+      "id": "http-retry",
+      "title": "HTTP retry with backoff",
+      "content": "exponential backoff with jitter and a retry budget for idempotent requests",
+      "tags": [
+        "net",
+        "resilience"
+      ]
+    },
+    {
+      "id": "circuit-breaker",
+      "title": "Circuit breaker pattern",
+      "content": "open the circuit after a failure threshold, half-open probe before closing again",
+      "tags": [
+        "net",
+        "resilience"
+      ]
+    },
+    {
+      "id": "lru-cache",
+      "title": "LRU cache eviction",
+      "content": "least recently used eviction policy backed by a doubly linked list and a hash map",
+      "tags": [
+        "perf",
+        "cache"
+      ]
+    },
+    {
+      "id": "bloom-filter",
+      "title": "Bloom filter membership",
+      "content": "probabilistic set membership with false positives but no false negatives using k hash functions",
+      "tags": [
+        "perf",
+        "datastructure"
+      ]
+    },
+    {
+      "id": "pg-index",
+      "title": "Postgres partial index",
+      "content": "create a partial index with a where clause to shrink index size for selective queries",
+      "tags": [
+        "db",
+        "postgres"
+      ]
+    },
+    {
+      "id": "pg-vacuum",
+      "title": "Postgres autovacuum tuning",
+      "content": "tune autovacuum scale factor and cost delay to reclaim dead tuples on hot tables",
+      "tags": [
+        "db",
+        "postgres"
+      ]
+    },
+    {
+      "id": "idempotency-key",
+      "title": "Idempotency keys for payments",
+      "content": "store an idempotency key per payment request to make retries safe and avoid double charge",
+      "tags": [
+        "payments",
+        "resilience"
+      ]
+    },
+    {
+      "id": "saga-pattern",
+      "title": "Saga distributed transaction",
+      "content": "coordinate long-lived transactions with compensating actions instead of two phase commit",
+      "tags": [
+        "distributed",
+        "transaction"
+      ]
+    },
+    {
+      "id": "rate-limit",
+      "title": "Token bucket rate limiting",
+      "content": "token bucket refills at a fixed rate and requests consume tokens to smooth bursts",
+      "tags": [
+        "net",
+        "throttling"
+      ]
+    },
+    {
+      "id": "grpc-stream",
+      "title": "gRPC bidirectional streaming",
+      "content": "bidirectional streaming lets client and server send message sequences over one connection",
+      "tags": [
+        "net",
+        "grpc"
+      ]
+    }
   ],
   "recall": [
-    { "query": "how does a mobile app do oauth login safely without a client secret", "expected_ids": ["oauth-pkce"] },
-    { "query": "proof key for code exchange in the authorization grant", "expected_ids": ["oauth-pkce"] },
-    { "query": "pkce verifier thing", "expected_ids": ["oauth-pkce"] },
-
-    { "query": "how do we swap the key that signs our tokens without logging everyone out", "expected_ids": ["jwt-rotation"] },
-    { "query": "publishing a new public key while the old one is still accepted for a while", "expected_ids": ["jwt-rotation"] },
-    { "query": "kid claim jwt keys", "expected_ids": ["jwt-rotation"] },
-
-    { "query": "what should a client do when a request fails with a 503", "expected_ids": ["http-retry"] },
-    { "query": "wait longer between each attempt and add randomness so clients do not stampede", "expected_ids": ["http-retry"] },
-    { "query": "retry jitter", "expected_ids": ["http-retry"] },
-
-    { "query": "how to stop hammering a downstream service that keeps timing out", "expected_ids": ["circuit-breaker"] },
-    { "query": "trip after too many errors, then let one request through to test if it recovered", "expected_ids": ["circuit-breaker"] },
-    { "query": "breaker half open state", "expected_ids": ["circuit-breaker"] },
-
-    { "query": "which entry should a bounded cache drop when it is full", "expected_ids": ["lru-cache"] },
-    { "query": "evict the item nobody has touched for the longest time, O(1) with a linked list plus map", "expected_ids": ["lru-cache"] },
-    { "query": "lru", "expected_ids": ["lru-cache"] },
-
-    { "query": "is there a compact way to check if a key is definitely not in a set", "expected_ids": ["bloom-filter"] },
-    { "query": "bit array that can say maybe present or surely absent", "expected_ids": ["bloom-filter"] },
-    { "query": "bloom false positive rate", "expected_ids": ["bloom-filter"] },
-
-    { "query": "how do I index only the rows that match a condition in postgresql", "expected_ids": ["pg-index"] },
-    { "query": "smaller btree that covers a subset of the table filtered by a predicate", "expected_ids": ["pg-index"] },
-    { "query": "index where clause pg", "expected_ids": ["pg-index"] },
-
-    { "query": "why does my postgres table keep bloating even though rows are deleted", "expected_ids": ["pg-vacuum"] },
-    { "query": "make the background cleanup run more aggressively on frequently updated tables", "expected_ids": ["pg-vacuum"] },
-    { "query": "vacuum dead rows", "expected_ids": ["pg-vacuum"] },
-
-    { "query": "how do we make sure a customer is never billed twice when the network drops", "expected_ids": ["idempotency-key"] },
-    { "query": "client generated unique token so a repeated checkout call is a no-op", "expected_ids": ["idempotency-key"] },
-    { "query": "idempotent payment retry", "expected_ids": ["idempotency-key"] },
-
-    { "query": "how to keep data consistent across microservices without a distributed lock", "expected_ids": ["saga-pattern"] },
-    { "query": "a sequence of local transactions each with an undo step if a later one fails", "expected_ids": ["saga-pattern"] },
-    { "query": "saga compensation", "expected_ids": ["saga-pattern"] },
-
-    { "query": "how can an api allow short bursts but cap the average request rate", "expected_ids": ["rate-limit"] },
-    { "query": "throttling algorithm where capacity refills steadily and each call spends one unit", "expected_ids": ["rate-limit"] },
-    { "query": "rate limiter bucket", "expected_ids": ["rate-limit"] },
-
-    { "query": "can both sides of an rpc keep sending messages to each other at the same time", "expected_ids": ["grpc-stream"] },
-    { "query": "full duplex protobuf calls on a single http2 channel", "expected_ids": ["grpc-stream"] },
-    { "query": "grpc stream both ways", "expected_ids": ["grpc-stream"] }
+    {
+      "query": "how does a mobile app do oauth login safely without a client secret",
+      "expected_ids": [
+        "oauth-pkce"
+      ]
+    },
+    {
+      "query": "proof key for code exchange in the authorization grant",
+      "expected_ids": [
+        "oauth-pkce"
+      ]
+    },
+    {
+      "query": "pkce verifier thing",
+      "expected_ids": [
+        "oauth-pkce"
+      ]
+    },
+    {
+      "query": "how do we swap the key that signs our tokens without logging everyone out",
+      "expected_ids": [
+        "jwt-rotation"
+      ]
+    },
+    {
+      "query": "publishing a new public key while the old one is still accepted for a while",
+      "expected_ids": [
+        "jwt-rotation"
+      ]
+    },
+    {
+      "query": "kid claim jwt keys",
+      "expected_ids": [
+        "jwt-rotation"
+      ]
+    },
+    {
+      "query": "what should a client do when a request fails with a 503",
+      "expected_ids": [
+        "http-retry"
+      ]
+    },
+    {
+      "query": "wait longer between each attempt and add randomness so clients do not stampede",
+      "expected_ids": [
+        "http-retry"
+      ]
+    },
+    {
+      "query": "retry jitter",
+      "expected_ids": [
+        "http-retry"
+      ]
+    },
+    {
+      "query": "how to stop hammering a downstream service that keeps timing out",
+      "expected_ids": [
+        "circuit-breaker"
+      ]
+    },
+    {
+      "query": "trip after too many errors, then let one request through to test if it recovered",
+      "expected_ids": [
+        "circuit-breaker"
+      ]
+    },
+    {
+      "query": "breaker half open state",
+      "expected_ids": [
+        "circuit-breaker"
+      ]
+    },
+    {
+      "query": "which entry should a bounded cache drop when it is full",
+      "expected_ids": [
+        "lru-cache"
+      ]
+    },
+    {
+      "query": "evict the item nobody has touched for the longest time, O(1) with a linked list plus map",
+      "expected_ids": [
+        "lru-cache"
+      ]
+    },
+    {
+      "query": "lru",
+      "expected_ids": [
+        "lru-cache"
+      ]
+    },
+    {
+      "query": "is there a compact way to check if a key is definitely not in a set",
+      "expected_ids": [
+        "bloom-filter"
+      ]
+    },
+    {
+      "query": "bit array that can say maybe present or surely absent",
+      "expected_ids": [
+        "bloom-filter"
+      ]
+    },
+    {
+      "query": "bloom false positive rate",
+      "expected_ids": [
+        "bloom-filter"
+      ]
+    },
+    {
+      "query": "how do I index only the rows that match a condition in postgresql",
+      "expected_ids": [
+        "pg-index"
+      ]
+    },
+    {
+      "query": "smaller btree that covers a subset of the table filtered by a predicate",
+      "expected_ids": [
+        "pg-index"
+      ]
+    },
+    {
+      "query": "index where clause pg",
+      "expected_ids": [
+        "pg-index"
+      ]
+    },
+    {
+      "query": "why does my postgres table keep bloating even though rows are deleted",
+      "expected_ids": [
+        "pg-vacuum"
+      ]
+    },
+    {
+      "query": "make the background cleanup run more aggressively on frequently updated tables",
+      "expected_ids": [
+        "pg-vacuum"
+      ]
+    },
+    {
+      "query": "vacuum dead rows",
+      "expected_ids": [
+        "pg-vacuum"
+      ]
+    },
+    {
+      "query": "how do we make sure a customer is never billed twice when the network drops",
+      "expected_ids": [
+        "idempotency-key"
+      ]
+    },
+    {
+      "query": "client generated unique token so a repeated checkout call is a no-op",
+      "expected_ids": [
+        "idempotency-key"
+      ]
+    },
+    {
+      "query": "idempotent payment retry",
+      "expected_ids": [
+        "idempotency-key"
+      ]
+    },
+    {
+      "query": "how to keep data consistent across microservices without a distributed lock",
+      "expected_ids": [
+        "saga-pattern"
+      ]
+    },
+    {
+      "query": "a sequence of local transactions each with an undo step if a later one fails",
+      "expected_ids": [
+        "saga-pattern"
+      ]
+    },
+    {
+      "query": "saga compensation",
+      "expected_ids": [
+        "saga-pattern"
+      ]
+    },
+    {
+      "query": "how can an api allow short bursts but cap the average request rate",
+      "expected_ids": [
+        "rate-limit"
+      ]
+    },
+    {
+      "query": "throttling algorithm where capacity refills steadily and each call spends one unit",
+      "expected_ids": [
+        "rate-limit"
+      ]
+    },
+    {
+      "query": "rate limiter bucket",
+      "expected_ids": [
+        "rate-limit"
+      ]
+    },
+    {
+      "query": "can both sides of an rpc keep sending messages to each other at the same time",
+      "expected_ids": [
+        "grpc-stream"
+      ]
+    },
+    {
+      "query": "full duplex protobuf calls on a single http2 channel",
+      "expected_ids": [
+        "grpc-stream"
+      ]
+    },
+    {
+      "query": "grpc stream both ways",
+      "expected_ids": [
+        "grpc-stream"
+      ]
+    }
+  ],
+  "negatives": [
+    "which signing algorithm should we pick for saml assertions, rsa or ecdsa",
+    "which audience claim belongs in a machine to machine access token",
+    "where should a single page app keep its refresh token",
+    "does mutual tls remove the need for a bearer token between internal services",
+    "how long should a session cookie stay valid after the user closes the tab",
+    "what naming convention do we use for authorization scopes on admin endpoints",
+    "how do I set a tcp keepalive interval on a linux socket",
+    "what connection timeout does the sidecar proxy apply to upstream calls",
+    "how many worker threads should the http server pool run",
+    "which status code should a deprecated endpoint return",
+    "how do I trace a request across three services with one correlation id",
+    "what is the maximum header size our gateway accepts",
+    "how do I stop a redis key from ever expiring",
+    "what memcached slab size fits an eight kilobyte value",
+    "does the cpu cache line size change how I order struct fields",
+    "which serialization format should we store cached list values in",
+    "how do I invalidate a cdn edge cache for one path",
+    "how do I build a consistent hash ring for shard placement",
+    "which hash function detects bit rot in cold object storage",
+    "how do I estimate the number of distinct users in a streaming pipeline",
+    "how do I add a generated column to an existing postgres table",
+    "what lock does alter table set not null acquire",
+    "how do I ship logical replication changes from hot tables into kafka",
+    "which extension gives postgres trigram text search",
+    "how do I move a database to a bigger instance without closing open client connections",
+    "how do I read the cost estimate explain analyze prints for a nested loop join",
+    "how do we process a chargeback dispute webhook for a settled payment",
+    "what rounding rule applies when we charge an invoice denominated in yen",
+    "how do I reconcile a settlement report against the payment ledger",
+    "which pci scope applies if we never store card numbers",
+    "how do we coordinate a leader election with etcd leases",
+    "what does serializable snapshot isolation prevent for concurrent transactions",
+    "how do we version an event schema we store in an outbox table",
+    "how do I guarantee message ordering across kafka partitions",
+    "how do I shape bandwidth for one tenant at the load balancer",
+    "which nginx directive caps concurrent client connections",
+    "how do we bill a customer for overage above the plan rate",
+    "how do I enable http3 on the public edge",
+    "which protobuf field numbers are reserved and must not be used",
+    "how do I generate a typescript client from an openapi document"
   ],
   "judge": [
-    { "question": "How do public clients secure the OAuth2 code exchange?", "expected_answer": "code exchange with PKCE" },
-    { "question": "How are retries made safe for payments?", "expected_answer": "idempotency key" },
-    { "question": "What eviction policy does the cache use?", "expected_answer": "least recently used" }
+    {
+      "question": "How do public clients secure the OAuth2 code exchange?",
+      "expected_answer": "code exchange with PKCE"
+    },
+    {
+      "question": "How are retries made safe for payments?",
+      "expected_answer": "idempotency key"
+    },
+    {
+      "question": "What eviction policy does the cache use?",
+      "expected_answer": "least recently used"
+    }
   ]
 }

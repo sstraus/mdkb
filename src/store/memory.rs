@@ -199,8 +199,18 @@ pub struct MemoryEntry {
     pub source_path: Option<String>,
     #[serde(default)]
     pub confirmations: u32,
+    /// Times this entry was reported wrong. Weighs three times as much as a
+    /// confirmation in the belief term: being wrong once is stronger evidence
+    /// than being right once.
+    #[serde(default)]
+    pub corrections: u32,
     #[serde(default)]
     pub last_confirmed_at: Option<i64>,
+    /// Unix timestamp of the last refutation. Deliberately separate from
+    /// `last_confirmed_at`, which is the decay reference: a refutation must not
+    /// refresh an entry's decay clock.
+    #[serde(default)]
+    pub last_refuted_at: Option<i64>,
     #[serde(default)]
     pub source_type: SourceType,
     /// Unix timestamp when this entry expires. `None` = permanent.
@@ -219,6 +229,16 @@ pub struct MemoryEntry {
 pub struct ScoredMemoryEntry {
     pub entry: MemoryEntry,
     pub score: f64,
+    /// Raw vec0 distance to the query embedding, `None` when this entry came
+    /// from the BM25 leg only or no embedding was supplied.
+    ///
+    /// Carried rather than folded into `score` because it is the only
+    /// **absolute** measure in the result: `score` is max-normalized and
+    /// mixes confidence, so it cannot answer "is this relevant at all".
+    pub distance: Option<f32>,
+    /// Whether the query matched this entry lexically hard enough to stand on
+    /// its own — see [`crate::store::hybrid::strong_lexical_match`].
+    pub strong_lexical: bool,
 }
 
 impl std::ops::Deref for ScoredMemoryEntry {
@@ -240,8 +260,10 @@ impl MemoryEntry {
 
     /// Calculate confidence at a specific timestamp (for testing).
     pub fn confidence_at(&self, now: i64) -> f64 {
-        // Belief: sigmoid over confirmations. 0 confirms = 0.5, 10 = 0.91, 50 = 0.98.
-        let belief = (1.0 + f64::from(self.confirmations)) / (2.0 + f64::from(self.confirmations));
+        // Belief: sigmoid over confirmations, with a refutation counted three
+        // times heavier. 0/0 = 0.5, 10/0 = 0.91, 0/1 = 0.2, 3/1 = 0.5.
+        let belief = (1.0 + f64::from(self.confirmations))
+            / (2.0 + f64::from(self.confirmations) + 3.0 * f64::from(self.corrections));
 
         // Durable knowledge stays valid until it is explicitly superseded or
         // refuted. Lifecycle records decay from their last verification.
@@ -263,6 +285,30 @@ impl MemoryEntry {
         };
 
         (belief * decay * source_mult).max(CONFIDENCE_FLOOR)
+    }
+
+    /// Whether the last thing that happened to this entry was a refutation.
+    ///
+    /// Derived, not stored, and deliberately not an [`EntryStatus`] variant:
+    /// `status` is projected to the git-tracked markdown, while `confirmations`
+    /// and the two timestamps are machine-local and never projected. A status
+    /// flag would rewrite a tracked file to record a local refutation.
+    ///
+    /// A disputed entry is suppressed from automatic injection however high its
+    /// score is, so the score is never the only safety mechanism. Reconfirming
+    /// it clears the dispute, because the confirmation is then the later stamp.
+    ///
+    /// Both stamps are 1-second resolution, so a confirmation and a refutation
+    /// in the same second are genuinely unordered. The tie goes to the
+    /// confirmation, because the contract above is that reconfirming clears the
+    /// dispute: reading a tie as a live refutation would make an entry refuted
+    /// and immediately reconfirmed — someone undoing their own mistake —
+    /// silently unsurfaceable, with nothing in the output to say why.
+    pub fn is_disputed(&self) -> bool {
+        match (self.last_refuted_at, self.corrections) {
+            (Some(refuted), c) if c > 0 => self.last_confirmed_at.is_none_or(|ok| refuted > ok),
+            _ => false,
+        }
     }
 }
 
@@ -448,7 +494,7 @@ pub fn list_entries_sorted(
 
     let sql = if status_filter.is_some() {
         format!(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
             FROM memory_entries WHERE status = ?1
             AND (expires_at IS NULL OR expires_at > ?2)
             AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?2))
@@ -456,7 +502,7 @@ pub fn list_entries_sorted(
         )
     } else {
         format!(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
             FROM memory_entries WHERE (expires_at IS NULL OR expires_at > ?1)
             AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?1))
             AND entry_type != 'prior' {order_clause} LIMIT ?2"
@@ -484,8 +530,8 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
     let tags_json = serde_json::to_string(&entry.tags)?;
 
     conn.execute(
-        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             entry.id,
             entry.title,
@@ -499,7 +545,9 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
             entry.last_accessed,
             entry.source_path,
             entry.confirmations,
+            entry.corrections,
             entry.last_confirmed_at,
+            entry.last_refuted_at,
             entry.source_type.to_string(),
             entry.expires_at,
             entry.due_at,
@@ -545,8 +593,11 @@ pub fn get_provenance(conn: &Connection, id: &str) -> Result<(Option<String>, Op
     Ok(row.unwrap_or((None, None)))
 }
 
-/// Map a confirmation outcome string to a Bayesian delta.
-/// `"confirmed"` → +1, `"refuted"` → -1 (floor 0). Any other value errors.
+/// Map a confirmation outcome string to a signed confidence signal.
+/// `"confirmed"` → +1, `"refuted"` → -1. Any other value errors. The sign is
+/// what carries the meaning: [`confirm_entry`] reads a positive delta as a
+/// verification and a negative one as a refutation, and the two are recorded in
+/// different columns.
 /// Shared by the MCP `memory_confirm` tool and the CLI `memory confirm` command.
 pub fn outcome_to_delta(outcome: &str) -> Result<i32> {
     match outcome {
@@ -559,15 +610,25 @@ pub fn outcome_to_delta(outcome: &str) -> Result<i32> {
     }
 }
 
-/// Apply a confidence signal of `delta` confirmations to a memory entry.
+/// Apply a confidence signal of `delta` to a memory entry.
 ///
-/// A positive delta is a fresh verification: it raises the counter and moves
-/// `last_confirmed_at` to now, which restarts the decay clock. A negative
-/// delta only lowers the counter (floor 0) and leaves the clock alone — a
-/// refutation is not evidence the entry was just checked and found good, so
-/// it must never make the entry more confident. A zero delta changes nothing.
-/// Auto-restores archived entries to active on a positive delta (strong
-/// relevance signal). Returns error if entry is superseded.
+/// A positive delta is a fresh verification: it raises `confirmations` and moves
+/// `last_confirmed_at` to now, which restarts the decay clock.
+///
+/// A negative delta is a refutation, and it is **not** the inverse of a
+/// confirmation. It raises `corrections` and stamps `last_refuted_at`; it leaves
+/// `confirmations` and `last_confirmed_at` untouched. Two reasons:
+///
+/// * cancelling a confirmation loses the fact that the entry was reported
+///   wrong. `corrections` is what [`crate::store::memory_graph`] reads to find
+///   stale dependencies and what the warmup filter reads to exclude an entry, so
+///   a refutation that never writes it is a signal thrown away;
+/// * `last_confirmed_at` is the decay reference. Moving it on a refutation would
+///   make being told the entry is wrong *refresh* its decay clock.
+///
+/// A zero delta changes nothing. Auto-restores archived entries to active on a
+/// positive delta (strong relevance signal). Returns error if entry is
+/// superseded.
 pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> {
     let entry = get_entry_without_tracking(conn, id)?
         .ok_or_else(|| ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")))?;
@@ -586,25 +647,32 @@ pub fn confirm_entry(conn: &Connection, id: &str, delta: i32) -> Result<String> 
         entry.status.to_string()
     };
 
-    // `confirmations` and `last_confirmed_at` are machine-local and never
-    // projected, so they must not move `updated_at`: that would rewrite the
-    // git-tracked file to record a counter git deliberately does not carry.
-    // `status` IS projected, so a restore from archived does move it.
+    // The four counter columns are machine-local and never projected, so they
+    // must not move `updated_at`: that would rewrite the git-tracked file to
+    // record a counter git deliberately does not carry. `status` IS projected,
+    // so a restore from archived does move it.
     let status_changed = new_status != entry.status.to_string();
     conn.execute(
-        "UPDATE memory_entries SET confirmations = MAX(0, CAST(confirmations AS INTEGER) + ?1), \
-         last_confirmed_at = CASE WHEN ?1 > 0 THEN ?2 ELSE last_confirmed_at END, status = ?3, \
+        "UPDATE memory_entries SET \
+         confirmations = CASE WHEN ?1 > 0 THEN COALESCE(confirmations, 0) + ?1 \
+                              ELSE COALESCE(confirmations, 0) END, \
+         corrections = CASE WHEN ?1 < 0 THEN COALESCE(corrections, 0) - ?1 \
+                            ELSE COALESCE(corrections, 0) END, \
+         last_confirmed_at = CASE WHEN ?1 > 0 THEN ?2 ELSE last_confirmed_at END, \
+         last_refuted_at = CASE WHEN ?1 < 0 THEN ?2 ELSE last_refuted_at END, \
+         status = ?3, \
          updated_at = CASE WHEN ?5 THEN ?2 ELSE updated_at END WHERE id = ?4",
         params![delta, now, new_status, id, status_changed],
     )?;
 
-    let new_count = (i64::from(entry.confirmations) + i64::from(delta)).max(0) as u32;
     if entry.status == EntryStatus::Archived && delta > 0 {
         Ok(format!("Confirmed and restored to active: {id}"))
     } else if delta >= 0 {
-        Ok(format!("Confirmed: {id} ({new_count} confirmations)"))
+        let count = i64::from(entry.confirmations) + i64::from(delta.max(0));
+        Ok(format!("Confirmed: {id} ({count} confirmations)"))
     } else {
-        Ok(format!("Refuted: {id} ({new_count} confirmations)"))
+        let count = i64::from(entry.corrections) - i64::from(delta);
+        Ok(format!("Refuted: {id} ({count} corrections)"))
     }
 }
 
@@ -868,7 +936,7 @@ pub fn get_entry(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
 /// Get a memory entry by ID without incrementing access count.
 pub fn get_entry_without_tracking(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
         FROM memory_entries WHERE id = ?1"
     )?;
 
@@ -899,7 +967,7 @@ pub fn list_entries_all(conn: &Connection) -> Result<Vec<MemoryEntry>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, content, entry_type, tags, status, created_at, updated_at,
                 superseded_by, access_count, last_accessed, source_path, confirmations,
-                last_confirmed_at, source_type, expires_at, due_at
+                corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
          FROM memory_entries ORDER BY id",
     )?;
     let rows = stmt.query_map([], row_to_entry)?;
@@ -929,7 +997,7 @@ pub fn search_entries_by_type(
     }
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at, m.due_at
+        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.last_refuted_at, m.source_type, m.expires_at, m.due_at
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -968,7 +1036,7 @@ pub fn search_entries_fts(
     }
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at, m.due_at
+        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.last_refuted_at, m.source_type, m.expires_at, m.due_at
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -1004,7 +1072,7 @@ fn bm25_search_with_rowid(
     }
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
-        "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.last_confirmed_at, m.source_type, m.expires_at, m.due_at
+        "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.last_refuted_at, m.source_type, m.expires_at, m.due_at
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -1073,7 +1141,7 @@ pub fn find_similar_entries(
 pub fn get_entry_by_rowid(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
     let entry = conn
         .query_row(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
             FROM memory_entries WHERE rowid = ?1",
             params![rowid],
             row_to_entry,
@@ -1089,7 +1157,7 @@ fn get_entries_by_rowids(conn: &Connection, rowids: &[i64]) -> Result<HashMap<i6
     }
     let placeholders: Vec<String> = (1..=rowids.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
-        "SELECT rowid, id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
+        "SELECT rowid, id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
         FROM memory_entries WHERE rowid IN ({})",
         placeholders.join(", ")
     );
@@ -1148,39 +1216,48 @@ pub fn access_recency_score(
 /// `query` is treated as raw text and escaped into a token-AND FTS5 expression.
 /// For pre-built FTS queries (e.g. recall's OR-expression) use
 /// [`search_entries_hybrid_fts`].
-pub fn search_entries_hybrid(
+pub fn search_entries_recall(
     conn: &Connection,
-    query: &str,
+    query_text: &str,
     query_embedding: Option<&[f32]>,
     limit: usize,
-    access_recency_weight: f64,
-    recency_half_life_secs: i64,
+    cfg: &crate::config::SearchMemoryConfig,
 ) -> Result<Vec<ScoredMemoryEntry>> {
-    let fts_query = crate::store::search::escape_fts5_query(query);
-    search_entries_hybrid_fts(
-        conn,
-        &fts_query,
-        query_embedding,
-        limit,
-        access_recency_weight,
-        recency_half_life_secs,
-    )
+    let Some(fts_query) = crate::store::search::build_recall_query(query_text) else {
+        // Nothing but stopwords: the vector leg alone would rank the corpus
+        // against the embedding of a function word.
+        return Ok(Vec::new());
+    };
+    search_entries_hybrid_fts(conn, &fts_query, query_text, query_embedding, limit, cfg)
 }
 
 /// Hybrid search variant accepting a pre-built FTS5 query expression.
 ///
-/// Same fusion/ranking as [`search_entries_hybrid`] but skips the default
-/// token-AND escaping, so callers can pass OR-expressions (recall) or other
-/// FTS5 operators. The embedding is the caller's responsibility and may be
-/// derived from the original prompt text rather than the FTS expression.
+/// Same fusion/ranking as [`search_entries_recall`], for the one caller that
+/// already holds the expression: the `UserPromptSubmit` hook builds it once
+/// with [`crate::store::search::build_recall_query`] and feeds it to both the
+/// memory and the documents leg. The embedding is the caller's responsibility
+/// and may be derived from the original prompt text rather than the FTS
+/// expression.
+///
+/// `query_text` is that original text. It is what the embedding was built
+/// from, and the lexical admission arm needs it unsplit: the FTS expression
+/// has already been tokenized, which turns `code_verifier` into two ordinary
+/// words and destroys the property that makes an identifier evidence.
+///
+/// Every candidate passes the absolute relevance gate
+/// (`cfg.min_recall_cosine`) before any normalization — see
+/// [`crate::store::hybrid::admits`].
 pub fn search_entries_hybrid_fts(
     conn: &Connection,
     fts_query: &str,
+    query_text: &str,
     query_embedding: Option<&[f32]>,
     limit: usize,
-    access_recency_weight: f64,
-    recency_half_life_secs: i64,
+    cfg: &crate::config::SearchMemoryConfig,
 ) -> Result<Vec<ScoredMemoryEntry>> {
+    let access_recency_weight = cfg.access_recency_weight;
+    let recency_half_life_secs = cfg.recency_half_life_secs;
     use crate::store::{hybrid, vectors};
 
     // An empty expression is not a query, so neither leg runs: the vector leg
@@ -1193,15 +1270,38 @@ pub fn search_entries_hybrid_fts(
     // BM25 search (get more for fusion)
     let bm25_results = bm25_search_with_rowid(conn, fts_query, limit * 2)?;
 
+    // The absolute relevance gate, expressed once as a distance bound. `None`
+    // when the floor is disabled, which restores the pre-gate behavior of
+    // returning every scored candidate.
+    let bound =
+        (cfg.min_recall_cosine > 0.0).then(|| hybrid::distance_bound(cfg.min_recall_cosine));
+
+    // Lexical evidence is a property of (query, entry), independent of which
+    // leg found the entry, so it is computed from the candidate's own text.
+    let strong_lexical = |entry: &MemoryEntry| {
+        hybrid::strong_lexical_match(query_text, &format!("{}\n{}", entry.title, entry.content))
+    };
+
     // BM25-only fallback: preserve BM25 order but stable-sort by the
     // access-recency signal so frequently/recently used entries float up
     // (mirrors the third RRF signal in the fused path below). With no vector
     // leg, reciprocal BM25 rank supplies the relevance component.
     let bm25_fallback = |results: Vec<(i64, MemoryEntry)>| -> Vec<ScoredMemoryEntry> {
-        let mut entries: Vec<MemoryEntry> = results.into_iter().map(|(_, e)| e).collect();
+        // No vector leg means no distance, so the semantic arm of the gate has
+        // nothing to say and only a strong lexical match is admitted. This is
+        // the deliberate strict case: recall OR-expands the prompt, so keeping
+        // the whole BM25 set here would inject on one shared common word.
+        let mut entries: Vec<(MemoryEntry, bool)> = results
+            .into_iter()
+            .map(|(_, entry)| {
+                let lexical = strong_lexical(&entry);
+                (entry, lexical)
+            })
+            .filter(|(_, lexical)| bound.is_none() || *lexical)
+            .collect();
         if access_recency_weight > 0.0 {
             let now = Utc::now().timestamp();
-            entries.sort_by(|a, b| {
+            entries.sort_by(|(a, _), (b, _)| {
                 let sa = access_recency_score(
                     a.access_count,
                     a.last_accessed,
@@ -1221,8 +1321,10 @@ pub fn search_entries_hybrid_fts(
             .into_iter()
             .take(limit)
             .enumerate()
-            .map(|(rank, entry)| ScoredMemoryEntry {
+            .map(|(rank, (entry, lexical))| ScoredMemoryEntry {
                 score: final_hybrid_score(1.0 / (rank + 1) as f64, &entry),
+                distance: None,
+                strong_lexical: lexical,
                 entry,
             })
             .collect()
@@ -1272,6 +1374,35 @@ pub fn search_entries_hybrid_fts(
         .collect();
     let vector_entries = get_entries_by_rowids(conn, &vector_only_rowids)?;
 
+    // ── Absolute admission ───────────────────────────────────────────────────
+    // Before `normalize_scores`, and before the access-recency bonus, because
+    // both are query-relative: after normalization the best candidate scores
+    // 1.0 whatever the query was, and `final_hybrid_score` then adds
+    // confidence, so a well-confirmed entry about something else clears any
+    // floor. The distances are already in `vector_results` — this costs no
+    // extra SQL on the UserPromptSubmit path.
+    let distances: HashMap<i64, f32> = vector_results.iter().copied().collect();
+    let mut evidence: HashMap<i64, (Option<f32>, bool)> = HashMap::new();
+    for (rowid, _) in &fused {
+        let Some(entry) = entry_map.get(rowid).or_else(|| vector_entries.get(rowid)) else {
+            continue;
+        };
+        evidence.insert(
+            *rowid,
+            (distances.get(rowid).copied(), strong_lexical(entry)),
+        );
+    }
+    if let Some(bound) = bound {
+        fused.retain(|(rowid, _)| {
+            evidence
+                .get(rowid)
+                .is_some_and(|(distance, lexical)| hybrid::admits(*lexical, *distance, bound))
+        });
+        if fused.is_empty() {
+            return Ok(Vec::new());
+        }
+    }
+
     // Third RRF signal: access-count × recency (get-path only). Rank every
     // candidate rowid by its access_recency_score descending, then fold the
     // reciprocal-rank contribution back into `fused`. Entries with zero signal
@@ -1310,7 +1441,7 @@ pub fn search_entries_hybrid_fts(
 
     // Resolve fused results to MemoryEntry
     // Apply confidence-weighted re-ranking: final = rrf_norm * 0.7 + confidence * 0.3
-    let mut scored_results: Vec<(MemoryEntry, f64)> = Vec::new();
+    let mut scored_results: Vec<(MemoryEntry, f64, Option<f32>, bool)> = Vec::new();
     for (rowid, rrf_score) in fused {
         let entry = if let Some(e) = entry_map.remove(&rowid) {
             e
@@ -1320,7 +1451,8 @@ pub fn search_entries_hybrid_fts(
             continue;
         };
         let final_score = final_hybrid_score(rrf_score, &entry);
-        scored_results.push((entry, final_score));
+        let (distance, lexical) = evidence.get(&rowid).copied().unwrap_or((None, false));
+        scored_results.push((entry, final_score, distance, lexical));
     }
 
     // Re-sort by final score descending
@@ -1329,7 +1461,14 @@ pub fn search_entries_hybrid_fts(
     Ok(scored_results
         .into_iter()
         .take(limit)
-        .map(|(entry, score)| ScoredMemoryEntry { entry, score })
+        .map(
+            |(entry, score, distance, strong_lexical)| ScoredMemoryEntry {
+                entry,
+                score,
+                distance,
+                strong_lexical,
+            },
+        )
         .collect())
 }
 
@@ -1442,15 +1581,15 @@ pub struct ProjectionRow {
 /// Reads here must not be tracked — reconciliation is not a use of the memory.
 pub fn list_projection_state(conn: &Connection) -> Result<Vec<ProjectionRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at, projected_at, projected_hash
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, projected_at, projected_hash
          FROM memory_entries ORDER BY id",
     )?;
     let rows = stmt
         .query_map([], |r| {
             Ok(ProjectionRow {
                 entry: row_to_entry(r)?,
-                projected_at: r.get(17)?,
-                projected_hash: r.get(18)?,
+                projected_at: r.get(19)?,
+                projected_hash: r.get(20)?,
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
@@ -1706,7 +1845,7 @@ pub fn newest_handoff_for_scope(
 ) -> Result<Option<MemoryEntry>> {
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
          FROM memory_entries
          WHERE status = 'active'
            AND entry_type = 'handoff'
@@ -1746,7 +1885,7 @@ pub fn get_warmup_entries(
     // says is wrong (net-refuted) is not taught as if it were right.
     let eligible = EntryType::sql_list(|t| t.is_durable() || *t == EntryType::Prior);
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, last_confirmed_at, source_type, expires_at, due_at
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
          FROM memory_entries
          WHERE status = 'active'
          AND entry_type IN ({eligible})
@@ -1856,7 +1995,7 @@ fn archive_ids(conn: &Connection, ids: &[String], now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Archive what the store no longer needs: every entry past its `expires_at`,
+/// Which entries the store no longer needs: every entry past its `expires_at`,
 /// plus lifecycle entries (reminder, prior, handoff) older than `days` that
 /// nothing has read since.
 ///
@@ -1871,51 +2010,59 @@ fn archive_ids(conn: &Connection, ids: &[String], now: i64) -> Result<()> {
 /// (the same rule as `archive_expired`), and a reminder not yet past its
 /// `due_at` has simply not happened yet.
 ///
-/// Archives rather than deletes. With `dry_run` nothing is written and the
-/// returned ids are exactly what a real run would archive.
-pub fn prune_entries(conn: &Connection, days: u32, dry_run: bool) -> Result<Vec<String>> {
+/// Selection only: nothing is written, so the caller decides when — and in
+/// which order — the rows change. [`handle_memory_prune`] needs that, because
+/// the markdown projection of every id must reach `archive/` *before* the row
+/// leaves the active set; a row archived while its file stays in `entries/` is
+/// revived by the next `sync_memory_files` pass.
+///
+/// [`handle_memory_prune`]: crate::core::memory::handle_memory_prune
+pub fn prunable_entry_ids(conn: &Connection, days: u32) -> Result<Vec<String>> {
     let now = Utc::now().timestamp();
     let cutoff = now - (i64::from(days) * 24 * 60 * 60);
 
-    documents::with_savepoint(conn, "prune_entries", || {
-        let lifecycle = EntryType::sql_list(|t| !t.is_durable());
-        let mut stmt = conn.prepare(&format!(
-            r#"
-            SELECT id FROM memory_entries
-            WHERE status = 'active'
-            AND (
-                (expires_at IS NOT NULL AND expires_at < ?2)
-                OR (
-                    entry_type IN ({lifecycle})
-                    AND COALESCE(last_accessed, created_at) < ?1
-                    AND (due_at IS NULL OR due_at < ?1)
-                    AND id IS NOT (
-                        SELECT id FROM memory_entries
-                        WHERE entry_type = 'handoff' AND status = 'active'
-                        ORDER BY updated_at DESC LIMIT 1
-                    )
+    let lifecycle = EntryType::sql_list(|t| !t.is_durable());
+    let mut stmt = conn.prepare(&format!(
+        r#"
+        SELECT id FROM memory_entries
+        WHERE status = 'active'
+        AND (
+            (expires_at IS NOT NULL AND expires_at < ?2)
+            OR (
+                entry_type IN ({lifecycle})
+                AND COALESCE(last_accessed, created_at) < ?1
+                AND (due_at IS NULL OR due_at < ?1)
+                AND id IS NOT (
+                    SELECT id FROM memory_entries
+                    WHERE entry_type = 'handoff' AND status = 'active'
+                    ORDER BY updated_at DESC LIMIT 1
                 )
             )
-            "#
-        ))?;
+        )
+        "#
+    ))?;
 
-        let ids: Vec<String> = stmt
-            .query_map(params![cutoff, now], |row| row.get(0))?
-            .filter_map(|r| match r {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::warn!("Failed to read prunable entry ID: {e}");
-                    None
-                }
-            })
-            .collect();
+    let ids: Vec<String> = stmt
+        .query_map(params![cutoff, now], |row| row.get(0))?
+        .filter_map(|r| match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!("Failed to read prunable entry ID: {e}");
+                None
+            }
+        })
+        .collect();
 
-        if !dry_run {
-            archive_ids(conn, &ids, now)?;
-        }
+    Ok(ids)
+}
 
-        Ok(ids)
-    })
+/// Retire `ids`: flip them to archived in one statement.
+///
+/// The write half of a prune, split from [`prunable_entry_ids`] so that the
+/// disk archive can run in between. Archives rather than deletes.
+pub fn archive_entries(conn: &Connection, ids: &[String]) -> Result<()> {
+    let now = Utc::now().timestamp();
+    documents::with_savepoint(conn, "archive_entries", || archive_ids(conn, ids, now))
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
@@ -1931,7 +2078,7 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
     });
     let entry_type_str: String = row.get(off + 3)?;
     let status_str: String = row.get(off + 5)?;
-    let source_type_str: String = row.get::<_, Option<String>>(off + 14)?.unwrap_or_default();
+    let source_type_str: String = row.get::<_, Option<String>>(off + 16)?.unwrap_or_default();
 
     Ok(MemoryEntry {
         id: row.get(off)?,
@@ -1956,7 +2103,9 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
         last_accessed: row.get(off + 10)?,
         source_path: row.get(off + 11)?,
         confirmations: row.get::<_, Option<i64>>(off + 12)?.unwrap_or(0) as u32,
-        last_confirmed_at: row.get(off + 13)?,
+        corrections: row.get::<_, Option<i64>>(off + 13)?.unwrap_or(0) as u32,
+        last_confirmed_at: row.get(off + 14)?,
+        last_refuted_at: row.get(off + 15)?,
         source_type: source_type_str.parse().unwrap_or_else(|_| {
             tracing::warn!(
                 "Unknown source_type '{}', defaulting to UserStatement",
@@ -1964,8 +2113,8 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
             );
             SourceType::UserStatement
         }),
-        expires_at: row.get(off + 15)?,
-        due_at: row.get(off + 16)?,
+        expires_at: row.get(off + 17)?,
+        due_at: row.get(off + 18)?,
     })
 }
 
@@ -2112,7 +2261,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2153,7 +2304,9 @@ mod tests {
                 last_accessed: None,
                 source_path: None,
                 confirmations: 0,
+                corrections: 0,
                 last_confirmed_at: None,
+                last_refuted_at: None,
                 source_type: SourceType::UserStatement,
                 expires_at: None,
                 due_at: None,
@@ -2182,12 +2335,12 @@ mod tests {
                 "search_entries_by_type({text:?}) must match nothing"
             );
             assert!(
-                search_entries_hybrid(&conn, text, None, 5, 0.0, 0)
+                search_entries_recall(&conn, text, None, 5, &ungated(0.0))
                     .unwrap_or_else(|e| panic!(
-                        "search_entries_hybrid({text:?}) must not error: {e}"
+                        "search_entries_recall({text:?}) must not error: {e}"
                     ))
                     .is_empty(),
-                "search_entries_hybrid({text:?}) must match nothing"
+                "search_entries_recall({text:?}) must match nothing"
             );
         }
     }
@@ -2235,7 +2388,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2331,7 +2486,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: Some(due),
@@ -2374,7 +2531,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at,
@@ -2479,7 +2638,9 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2596,7 +2757,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: Some(expires),
             due_at: None,
@@ -2638,7 +2801,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2659,7 +2824,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: Some(now - 3600), // Expired 1 hour ago
             due_at: None,
@@ -2734,7 +2901,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2772,7 +2941,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2815,7 +2986,9 @@ mod tests {
                 last_accessed: None,
                 source_path: None,
                 confirmations: 0,
+                corrections: 0,
                 last_confirmed_at: None,
+                last_refuted_at: None,
                 source_type: SourceType::UserStatement,
                 expires_at: None,
                 due_at: None,
@@ -2849,7 +3022,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2869,7 +3044,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2902,7 +3079,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2934,7 +3113,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -2981,7 +3162,9 @@ mod tests {
                 last_accessed: None,
                 source_path: None,
                 confirmations: 0,
+                corrections: 0,
                 last_confirmed_at: None,
+                last_refuted_at: None,
                 source_type: SourceType::UserStatement,
                 expires_at: None,
                 due_at: None,
@@ -3020,7 +3203,9 @@ mod tests {
                     last_accessed: None,
                     source_path: None,
                     confirmations: 0,
+                    corrections: 0,
                     last_confirmed_at: None,
+                    last_refuted_at: None,
                     source_type: SourceType::AutoExtracted,
                     expires_at: expires,
                     due_at: None,
@@ -3079,7 +3264,9 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3087,7 +3274,7 @@ mod tests {
         add_entry(&conn, &entry).unwrap();
 
         // Prune with 30 days - should find nothing
-        let pruned = prune_entries(&conn, 30, false).unwrap();
+        let pruned = prune(&conn, 30);
         assert!(pruned.is_empty());
 
         // Entry should still be active
@@ -3119,7 +3306,9 @@ mod tests {
             last_accessed: Some(old_time),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3127,7 +3316,7 @@ mod tests {
         add_entry(&conn, &entry).unwrap();
 
         // Prune with 30 days - should find the entry
-        let pruned = prune_entries(&conn, 30, false).unwrap();
+        let pruned = prune(&conn, 30);
         assert_eq!(pruned.len(), 1);
         assert_eq!(pruned[0], "stale");
 
@@ -3158,7 +3347,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3166,7 +3357,7 @@ mod tests {
         add_entry(&conn, &entry).unwrap();
 
         // Prune with 30 days - should find the entry
-        let pruned = prune_entries(&conn, 30, false).unwrap();
+        let pruned = prune(&conn, 30);
         assert_eq!(pruned.len(), 1);
         assert_eq!(pruned[0], "never-used");
     }
@@ -3192,7 +3383,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3200,7 +3393,7 @@ mod tests {
         add_entry(&conn, &entry).unwrap();
 
         // Dry run - should report but not change
-        let pruned = prune_entries(&conn, 30, true).unwrap();
+        let pruned = prunable_entry_ids(&conn, 30).unwrap();
         assert_eq!(pruned.len(), 1);
         assert_eq!(pruned[0], "stale-dry");
 
@@ -3232,7 +3425,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3240,7 +3435,7 @@ mod tests {
         add_entry(&conn, &entry).unwrap();
 
         // Prune - should find nothing (already archived)
-        let pruned = prune_entries(&conn, 30, false).unwrap();
+        let pruned = prune(&conn, 30);
         assert!(pruned.is_empty());
     }
 
@@ -3267,7 +3462,9 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3289,7 +3486,9 @@ mod tests {
             last_accessed: Some(old_time),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3305,10 +3504,19 @@ mod tests {
         assert_eq!(pool_ids(&conn).len(), 2);
 
         // Prune
-        prune_entries(&conn, 30, false).unwrap();
+        prune(&conn, 30);
 
         // After prune: only recent in warmup
         assert_eq!(pool_ids(&conn), vec!["recent".to_string()]);
+    }
+
+    /// Both halves of a prune back to back, for the tests that only care about
+    /// the outcome. Production puts the disk archive between them — see
+    /// `core::memory_sync::archive_then_remove` for why the order matters.
+    fn prune(conn: &Connection, days: u32) -> Vec<String> {
+        let ids = prunable_entry_ids(conn, days).unwrap();
+        archive_entries(conn, &ids).unwrap();
+        ids
     }
 
     /// Seed one active entry with only the fields prune reasons about.
@@ -3337,7 +3545,9 @@ mod tests {
                 last_accessed,
                 source_path: None,
                 confirmations: 0,
+                corrections: 0,
                 last_confirmed_at: None,
+                last_refuted_at: None,
                 source_type: SourceType::UserStatement,
                 expires_at,
                 due_at,
@@ -3393,7 +3603,7 @@ mod tests {
             None,
         );
 
-        let pruned = prune_entries(&conn, 90, false).unwrap();
+        let pruned = prune(&conn, 90);
         assert_eq!(
             pruned,
             vec!["topic-with-ttl".to_string()],
@@ -3478,7 +3688,7 @@ mod tests {
             None,
         );
 
-        let mut pruned = prune_entries(&conn, 90, false).unwrap();
+        let mut pruned = prune(&conn, 90);
         pruned.sort();
         assert_eq!(
             pruned,
@@ -3510,7 +3720,7 @@ mod tests {
             None,
         );
 
-        let mut preview = prune_entries(&conn, 90, true).unwrap();
+        let mut preview = prunable_entry_ids(&conn, 90).unwrap();
         preview.sort();
         assert_eq!(count_entries(&conn).unwrap(), 3);
         for id in ["topic-old", "prior-old", "decision-expired"] {
@@ -3524,7 +3734,7 @@ mod tests {
             );
         }
 
-        let mut real = prune_entries(&conn, 90, false).unwrap();
+        let mut real = prune(&conn, 90);
         real.sort();
         assert_eq!(preview, real, "the preview and the real run must agree");
         assert_eq!(
@@ -3588,7 +3798,9 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: Some(now - 60), // Expired 1 minute ago
             due_at: None,
@@ -3609,7 +3821,9 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3619,7 +3833,7 @@ mod tests {
         add_entry(&conn, &active).unwrap();
 
         // Prune with 30-day cutoff — expired should be pruned even though recently created
-        let pruned = prune_entries(&conn, 30, false).unwrap();
+        let pruned = prune(&conn, 30);
         assert!(
             pruned.contains(&"ttl-expired".to_string()),
             "expired TTL entry should be pruned"
@@ -3660,14 +3874,16 @@ mod tests {
             last_accessed: Some(old_time),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
         };
         add_entry(&conn, &stale).unwrap();
 
-        let pruned = prune_entries(&conn, 30, false).unwrap();
+        let pruned = prune(&conn, 30);
         assert_eq!(pruned, vec!["stale-toctou"]);
 
         // Insert a new entry with an old timestamp AFTER prune ran.
@@ -3686,7 +3902,9 @@ mod tests {
             last_accessed: Some(old_time),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3723,7 +3941,9 @@ mod tests {
             last_accessed: Some(now - 200),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3742,7 +3962,9 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3784,7 +4006,9 @@ mod tests {
             last_accessed: Some(now - 1000),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3803,7 +4027,9 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3845,7 +4071,9 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -3864,7 +4092,9 @@ mod tests {
             last_accessed: Some(now - 500),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -4005,6 +4235,20 @@ mod tests {
         conn
     }
 
+    /// Production weights with the relevance gate **off**, for the tests whose
+    /// subject is fusion, ranking or determinism rather than admission.
+    ///
+    /// `test_embedding` is not a unit vector, so a cosine floor over it would
+    /// measure nothing: `cos = 1 - d²/2` only holds for unit vectors. The gate
+    /// has its own tests, which build normalized ones.
+    fn ungated(access_recency_weight: f64) -> crate::config::SearchMemoryConfig {
+        crate::config::SearchMemoryConfig {
+            access_recency_weight,
+            recency_half_life_secs: 2_592_000,
+            min_recall_cosine: 0.0,
+        }
+    }
+
     fn test_embedding(seed: f32) -> Vec<f32> {
         (0..crate::store::vectors::EMBEDDING_DIM)
             .map(|i| seed + i as f32 * 0.001)
@@ -4029,7 +4273,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -4037,7 +4283,7 @@ mod tests {
         add_entry(&conn, &entry).unwrap();
 
         // Search without embedding — should fall back to BM25
-        let results = search_entries_hybrid(&conn, "OAuth PKCE", None, 10, 0.2, 2_592_000).unwrap();
+        let results = search_entries_recall(&conn, "OAuth PKCE", None, 10, &ungated(0.2)).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "test-entry");
         assert!(
@@ -4067,7 +4313,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -4091,7 +4339,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -4116,7 +4366,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -4128,13 +4380,12 @@ mod tests {
         // Query: "token expiration" — BM25 matches jwt-refresh, vector matches auth-basic+jwt-refresh
         // Query embedding close to auth entries
         let query_emb = test_embedding(0.105);
-        let results = search_entries_hybrid(
+        let results = search_entries_recall(
             &conn,
             "token expiration",
             Some(&query_emb),
             10,
-            0.2,
-            2_592_000,
+            &ungated(0.2),
         )
         .unwrap();
 
@@ -4171,7 +4422,9 @@ mod tests {
                 last_accessed: None,
                 source_path: None,
                 confirmations: 0,
+                corrections: 0,
                 last_confirmed_at: None,
+                last_refuted_at: None,
                 source_type: SourceType::UserStatement,
                 expires_at: None,
                 due_at: None,
@@ -4183,13 +4436,12 @@ mod tests {
         }
 
         let query_emb = test_embedding(0.5);
-        let results = search_entries_hybrid(
+        let results = search_entries_recall(
             &conn,
             "searchable entry",
             Some(&query_emb),
             3,
-            0.2,
-            2_592_000,
+            &ungated(0.2),
         )
         .unwrap();
         assert_eq!(results.len(), 3, "Should respect limit of 3");
@@ -4212,7 +4464,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -4249,7 +4503,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations,
+            corrections: 0,
             last_confirmed_at: last_confirmed,
+            last_refuted_at: None,
             source_type: source,
             expires_at: None,
             due_at: None,
@@ -4692,9 +4948,15 @@ mod tests {
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
         assert_eq!(updated.confirmations, 0);
+        assert_eq!(updated.corrections, 1, "the refutation must be recorded");
         assert_eq!(
             updated.last_confirmed_at, None,
             "refute must not move the decay clock"
+        );
+        assert!(
+            updated.last_refuted_at.is_some_and(|t| t >= now),
+            "refute must stamp last_refuted_at, got {:?}",
+            updated.last_refuted_at
         );
         let after = updated.confidence_at(now);
         assert!(
@@ -4703,10 +4965,17 @@ mod tests {
         );
     }
 
-    /// With confirmations to lose, refuting drops the counter and leaves the
-    /// decay clock where the last real verification put it.
+    /// A refutation is not the inverse of a confirmation.
+    ///
+    /// This used to assert that refuting *decremented* `confirmations`, which
+    /// threw the signal away twice over: the fact that the entry was reported
+    /// wrong was gone, and `corrections` — the column `memory_graph` and the
+    /// warmup filter both read — stayed at zero, so every consumer of it was
+    /// dead code. Story 087 changed it: the confirmation history is left alone
+    /// and the refutation is recorded on its own, weighing three times as much.
+    /// The decay clock still must not move, which is the part unchanged here.
     #[test]
-    fn test_refute_drops_confirmations_and_keeps_decay_clock() {
+    fn test_refute_records_a_correction_and_keeps_decay_clock() {
         let conn = setup_db();
         let now = Utc::now().timestamp();
         let stale = now - 60 * 86400;
@@ -4723,12 +4992,33 @@ mod tests {
         confirm_entry(&conn, "test", -1).unwrap();
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
-        assert_eq!(updated.confirmations, 2);
+        assert_eq!(
+            updated.confirmations, 3,
+            "a refutation must not erase a confirmation"
+        );
+        assert_eq!(updated.corrections, 1);
         assert_eq!(updated.last_confirmed_at, Some(stale));
+        assert!(updated.last_refuted_at.is_some_and(|t| t >= now));
+        assert!(
+            updated.is_disputed(),
+            "the last signal was a refutation, so the entry is disputed"
+        );
         let after = updated.confidence_at(now);
         assert!(
-            after <= before,
-            "refute raised confidence: {before} -> {after}"
+            after < before,
+            "refute must lower confidence: {before} -> {after}"
+        );
+
+        // Reconfirming clears the dispute — the confirmation is the later stamp.
+        confirm_entry(&conn, "test", 1).unwrap();
+        let reconfirmed = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
+        assert_eq!(
+            reconfirmed.corrections, 1,
+            "the history is kept, not erased"
+        );
+        assert!(
+            !reconfirmed.is_disputed(),
+            "a reconfirmed entry is no longer disputed"
         );
     }
 
@@ -4751,7 +5041,9 @@ mod tests {
 
         let updated = get_entry_without_tracking(&conn, "test").unwrap().unwrap();
         assert_eq!(updated.confirmations, 2);
+        assert_eq!(updated.corrections, 0);
         assert_eq!(updated.last_confirmed_at, Some(stale));
+        assert_eq!(updated.last_refuted_at, None);
     }
 
     #[test]
@@ -4946,7 +5238,9 @@ mod tests {
             last_accessed: Some(1000),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -4994,7 +5288,9 @@ mod tests {
             last_accessed: Some(now - 60),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -5013,7 +5309,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -5024,7 +5322,7 @@ mod tests {
         // Weight = 0 → ordering is BM25 ties; both present, order not guaranteed
         // but we only care that the boost changes ranking when enabled.
         let with_boost =
-            search_entries_hybrid(&conn, "popular topic", None, 10, 0.5, 2_592_000).unwrap();
+            search_entries_recall(&conn, "popular topic", None, 10, &ungated(0.5)).unwrap();
         assert_eq!(with_boost.len(), 2);
         assert_eq!(
             with_boost[0].id, "hot",
@@ -5056,7 +5354,9 @@ mod tests {
                 last_accessed: if i == 0 { None } else { Some(now - 30) },
                 source_path: None,
                 confirmations: 0,
+                corrections: 0,
                 last_confirmed_at: None,
+                last_refuted_at: None,
                 source_type: SourceType::UserStatement,
                 expires_at: None,
                 due_at: None,
@@ -5064,12 +5364,12 @@ mod tests {
             add_entry(&conn, &entry).unwrap();
         }
 
-        let run_a = search_entries_hybrid(&conn, "deterministic", None, 10, 0.3, 2_592_000)
+        let run_a = search_entries_recall(&conn, "deterministic", None, 10, &ungated(0.3))
             .unwrap()
             .into_iter()
             .map(|e| e.entry.id)
             .collect::<Vec<_>>();
-        let run_b = search_entries_hybrid(&conn, "deterministic", None, 10, 0.3, 2_592_000)
+        let run_b = search_entries_recall(&conn, "deterministic", None, 10, &ungated(0.3))
             .unwrap()
             .into_iter()
             .map(|e| e.entry.id)
@@ -5112,7 +5412,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,

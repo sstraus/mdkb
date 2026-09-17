@@ -606,7 +606,7 @@ pub fn ignore_cluster(
 
 /// Whether an accepted-duplication decision is currently standing.
 ///
-/// [`resolve_active_untracked`](crate::store::memory_graph::resolve_active_untracked)
+/// [`resolve_active`](crate::store::memory_graph::resolve_active)
 /// is the store's own answer to "is this entry still in force", so a superseded
 /// *or* expired entry stops filtering and the cluster comes back — which is the
 /// point of keeping this in the memory store rather than a text file. The
@@ -619,7 +619,7 @@ pub fn ignore_cluster(
 /// here for the same reason it does in the call-graph pass.
 pub fn is_ignored(conn: &rusqlite::Connection, cluster_hash: &str) -> crate::error::Result<bool> {
     let id = ignore_entry_id(cluster_hash);
-    let Some(entry) = crate::store::memory_graph::resolve_active_untracked(conn, &id)? else {
+    let Some(entry) = crate::store::memory_graph::resolve_active(conn, &id)? else {
         return Ok(false);
     };
     Ok(
@@ -1427,7 +1427,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,

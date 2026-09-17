@@ -55,14 +55,21 @@ use rmcp::ServiceExt;
 fn print_eval_recall(runs: &[mdkb::eval::ModeRun<mdkb::eval::recall::RecallReport>]) {
     for run in runs {
         match &run.report {
+            // `n/a` rather than a number when the fixture labelled no
+            // negatives: `hits / hits` is not a measurement.
             Some(r) => println!(
-                "{:<10} recall@{}: {:.3}  MRR: {:.3}  (n={}, misses={})",
+                "{:<10} recall@{}: {:.3}  MRR: {:.3}  precision: {}  \
+                 (n={}, misses={}, negatives={}, false positives={})",
                 run.mode.as_str(),
                 r.k,
                 r.recall_at_k,
                 r.mrr,
+                r.precision
+                    .map_or_else(|| "n/a".to_string(), |p| format!("{p:.3}")),
                 r.n,
-                r.misses.len()
+                r.misses.len(),
+                r.n_negatives,
+                r.false_positives.len()
             ),
             None => println!(
                 "{:<10} skipped: {}",
@@ -76,6 +83,14 @@ fn print_eval_recall(runs: &[mdkb::eval::ModeRun<mdkb::eval::recall::RecallRepor
             if !r.misses.is_empty() {
                 println!("\nmissed ({}):", run.mode.as_str());
                 for q in &r.misses {
+                    println!("  {q}");
+                }
+            }
+            // The other half of the picture: a query with no answer that got
+            // one anyway. A precision drop has to name its queries too.
+            if !r.false_positives.is_empty() {
+                println!("\nadmitted a negative ({}):", run.mode.as_str());
+                for q in &r.false_positives {
                     println!("  {q}");
                 }
             }
@@ -377,6 +392,14 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 }
                 Some("memory") => {
                     let entries = if let Some(ref et) = entry_type {
+                        // DEFERRED (2026-09-16) — the fourth memory-search
+                        // semantics. Story 084 unified the CLI, the MCP tool
+                        // and the hook on OR-expanded hybrid plus the absolute
+                        // floor; this branch is still token-AND FTS, so adding
+                        // `--entry-type` changes what the same query finds.
+                        // Unifying it needs an entry_type filter threaded
+                        // through `search_entries_hybrid_fts`, which is its own
+                        // piece of work.
                         mdkb::store::memory::search_entries_by_type(&ctx.conn, &query, et, limit)?
                     } else {
                         handle_memory_search(&ctx, &query, limit)?
@@ -805,6 +828,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 mode,
                 download,
                 min_recall,
+                min_precision,
             } => {
                 let modes = parse_eval_modes(&mode);
                 let runs = handle_eval_recall(&EvalOptions {
@@ -827,6 +851,32 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     if !below.is_empty() {
                         return Err(mdkb::Error::other(format!(
                             "recall@{k} below {floor}: {}",
+                            below.join(", ")
+                        )));
+                    }
+                }
+                if let Some(floor) = min_precision {
+                    // A mode with no measured precision (the fixture labelled
+                    // no negatives) cannot clear a precision floor: asking for
+                    // one against an unlabelled fixture is the error.
+                    let below: Vec<String> = runs
+                        .iter()
+                        .filter_map(|run| run.report.as_ref())
+                        .filter(|r| r.precision.is_none_or(|p| p < floor))
+                        .map(|r| {
+                            format!(
+                                "{} {}",
+                                r.mode.as_str(),
+                                r.precision.map_or_else(
+                                    || "unmeasured".to_string(),
+                                    |p| format!("{p:.3}")
+                                )
+                            )
+                        })
+                        .collect();
+                    if !below.is_empty() {
+                        return Err(mdkb::Error::other(format!(
+                            "precision below {floor}: {}",
                             below.join(", ")
                         )));
                     }

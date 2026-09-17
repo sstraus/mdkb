@@ -137,6 +137,21 @@ pub struct SearchMemoryConfig {
 
     /// Half-life for recency decay in seconds (default ~30 days).
     pub recency_half_life_secs: i64,
+
+    /// Absolute cosine floor a memory entry must clear to be returned at all.
+    ///
+    /// The relevance gate. Fusion scores are max-normalized, so the best match
+    /// to any prompt scores 1.0 and no relative floor can reject it; this one
+    /// is measured against the query embedding itself. An entry passes on
+    /// cosine ≥ this value, or on a strong lexical match (an identifier, a
+    /// phrase, or several rare terms — `store::hybrid::strong_lexical_match`).
+    /// Confidence is not part of the decision.
+    ///
+    /// Calibrated on `assets/eval/memory-recall.json`: see
+    /// `eval::fixture::tests::print_the_precision_recall_curve_over_tau`. `0.0`
+    /// keeps every semantically scored candidate, restoring the pre-gate
+    /// behavior.
+    pub min_recall_cosine: f32,
 }
 
 impl Default for SearchMemoryConfig {
@@ -144,9 +159,23 @@ impl Default for SearchMemoryConfig {
         Self {
             access_recency_weight: 0.2,
             recency_half_life_secs: 30 * 24 * 60 * 60,
+            min_recall_cosine: MIN_RECALL_COSINE_DEFAULT,
         }
     }
 }
+
+/// Default cosine floor for memory recall, read off the precision-recall curve
+/// in `docs/retrieval-eval.md` rather than picked by hand.
+///
+/// The rule: the lowest floor at which no labelled in-domain negative is
+/// admitted. Measured over 36 held-out queries and 40 negatives in hybrid
+/// mode, that is 0.40 — precision 1.000 at recall@5 0.583. 0.35 buys 5 more
+/// hits and costs 5 false positives, a one-for-one trade this path cannot
+/// take: recall is injected into a prompt nobody asked to enrich, so a wrong
+/// entry is charged on every turn while a missing one costs one search.
+/// `eval::fixture::tests::print_the_precision_recall_curve_over_tau` asserts
+/// the choice still follows the rule, so a fixture change reopens it.
+pub const MIN_RECALL_COSINE_DEFAULT: f32 = 0.40;
 
 /// Memory index settings (Phase 6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -571,9 +600,6 @@ pub struct HooksConfig {
     /// Latency budget in milliseconds; hook truncates output if exceeded.
     pub latency_budget_ms: u64,
 
-    /// Minimum final hybrid score for a recall result to be injected.
-    pub min_recall_score: f64,
-
     /// Minimum confidence for a warmup entry to be injected. `0.0` (default)
     /// disables the floor — every access-ranked entry is eligible.
     pub warmup_min_confidence: f64,
@@ -612,7 +638,6 @@ impl Default for HooksConfig {
             recall_limit: 5,
             recall_docs_limit: 3,
             latency_budget_ms: 200,
-            min_recall_score: 0.3,
             warmup_min_confidence: 0.25,
             daemon_required: false,
             code_hits_in_pretooluse: true,

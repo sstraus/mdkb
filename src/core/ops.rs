@@ -36,8 +36,9 @@ use walkdir::WalkDir;
 pub fn handle_embed(ctx: &Context, collection: Option<&str>) -> Result<EmbedResult> {
     let mut result = EmbedResult::default();
 
-    // Use cached service to avoid reloading
-    let service = crate::llm::get_cached_service()?;
+    // The one command whose job is to produce embeddings, so it is the one
+    // allowed to fetch the weights (see `llm::get_cached_service`).
+    let service = crate::llm::get_or_download_service()?;
 
     // Load config once (chunking + session-embed policy)
     let config = crate::config::Config::load_or_default(&ctx.config_path);
@@ -200,11 +201,14 @@ pub fn handle_eval_recall(
 ) -> Result<Vec<crate::eval::ModeRun<crate::eval::recall::RecallReport>>> {
     let fx = load_eval_fixture(opts.fixture)?;
     let cases = fx.recall_cases();
+    let negatives = fx.negative_queries();
     crate::eval::run_modes(
         &fx,
         opts.modes,
         crate::eval::load_embedder(opts.download),
-        |conn, retrieval| crate::eval::recall::run_recall(conn, retrieval, &cases, opts.k),
+        |conn, retrieval| {
+            crate::eval::recall::run_recall(conn, retrieval, &cases, &negatives, opts.k)
+        },
     )
 }
 /// Handle `mdkb eval judge` — seed a real store from the fixture and score

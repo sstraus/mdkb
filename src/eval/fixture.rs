@@ -48,6 +48,11 @@ pub struct Fixture {
     pub memories: Vec<FixtureMemory>,
     #[serde(default)]
     pub recall: Vec<FixtureRecall>,
+    /// In-domain queries no memory answers. See `_negatives_rule` in the JSON:
+    /// they carry the corpus vocabulary but not its answers, so the correct
+    /// retrieval is the empty set and anything returned is a false positive.
+    #[serde(default)]
+    pub negatives: Vec<String>,
     #[serde(default)]
     pub judge: Vec<FixtureJudge>,
 }
@@ -105,7 +110,9 @@ impl Fixture {
                     last_accessed: None,
                     source_path: None,
                     confirmations: 0,
+                    corrections: 0,
                     last_confirmed_at: None,
+                    last_refuted_at: None,
                     source_type: SourceType::UserStatement,
                     expires_at: None,
                     due_at: None,
@@ -139,6 +146,10 @@ impl Fixture {
                 expected_ids: r.expected_ids.clone(),
             })
             .collect()
+    }
+
+    pub fn negative_queries(&self) -> Vec<String> {
+        self.negatives.clone()
     }
 
     pub fn judge_cases(&self) -> Vec<JudgeCase> {
@@ -282,6 +293,56 @@ mod tests {
         assert_eq!(seeded as usize, fx.memories.len());
     }
 
+    /// The `_negatives_rule` stated in the fixture file, both halves.
+    ///
+    /// In-domain: a negative has to carry the corpus vocabulary, or it is an
+    /// easy negative that any floor rejects and tells the calibration nothing.
+    /// Unanswered: it has to obey the same no-4gram rule as the queries, or it
+    /// is a positive nobody labelled and the false positive it scores is the
+    /// fixture's fault, not the retriever's.
+    #[test]
+    fn negatives_are_in_domain_and_answered_by_no_memory() {
+        let fx = committed_fixture();
+        assert!(
+            (30..=50).contains(&fx.negatives.len()),
+            "the tau calibration wants 30 to 50 negatives, found {}",
+            fx.negatives.len()
+        );
+        let mut corpus_words: HashSet<String> = HashSet::new();
+        let mut corpus_grams: HashSet<Vec<String>> = HashSet::new();
+        for m in &fx.memories {
+            for field in [&m.title, &m.content] {
+                corpus_words.extend(words(field));
+                corpus_grams.extend(four_grams(field));
+            }
+        }
+        for q in &fx.negatives {
+            let in_domain = words(q).into_iter().any(|w| {
+                corpus_words.contains(&w) && !crate::store::search::STOPWORDS.contains(&w.as_str())
+            });
+            assert!(
+                in_domain,
+                "negative {q:?} shares no content word with any memory, so it is \
+                 not in-domain"
+            );
+            let grams = four_grams(q);
+            let leaked: Vec<_> = grams.intersection(&corpus_grams).collect();
+            assert!(
+                leaked.is_empty(),
+                "negative {q:?} copies {leaked:?} from a memory, so it is an \
+                 unlabelled positive"
+            );
+        }
+        // A negative must not also be listed as a query with an answer.
+        let asked: HashSet<&str> = fx.recall.iter().map(|c| c.query.as_str()).collect();
+        for q in &fx.negatives {
+            assert!(
+                !asked.contains(q.as_str()),
+                "{q:?} is both positive and negative"
+            );
+        }
+    }
+
     /// Run the committed fixture in `mode` through a real store.
     fn baseline(mode: Mode) -> crate::eval::recall::RecallReport {
         let fx = committed_fixture();
@@ -299,51 +360,164 @@ mod tests {
             embedder: embedder.as_deref(),
             memory_cfg: &cfg,
         };
-        run_recall(&store.ctx.conn, &retrieval, &fx.recall_cases(), 5).unwrap()
+        run_recall(
+            &store.ctx.conn,
+            &retrieval,
+            &fx.recall_cases(),
+            &fx.negative_queries(),
+            5,
+        )
+        .unwrap()
+    }
+
+    /// The precision-recall curve over the cosine floor.
+    ///
+    /// This is the measurement `config::MIN_RECALL_COSINE_DEFAULT` comes from:
+    /// 36 held-out queries with an answer against 40 in-domain negatives with
+    /// none, in the production hybrid mode, at every floor from 0.00 to 0.90.
+    /// Re-run it (`--ignored`) after any change to the fixture, the fusion
+    /// weights or the lexical admission arm, and record the table in
+    /// `docs/retrieval-eval.md`.
+    #[test]
+    #[ignore = "requires ONNX model download"]
+    fn print_the_precision_recall_curve_over_tau() {
+        let fx = committed_fixture();
+        let store = fx.open_store().unwrap();
+        let svc = crate::llm::get_cached_service().expect("model");
+        fx.embed(&store.ctx.conn).unwrap();
+        let cases = fx.recall_cases();
+        let negatives = fx.negative_queries();
+
+        println!("  tau  recall@5  precision  hits  false positives");
+        let mut curve = Vec::new();
+        for step in 0..=18 {
+            let tau = step as f32 * 0.05;
+            let cfg = SearchMemoryConfig {
+                min_recall_cosine: tau,
+                ..SearchMemoryConfig::default()
+            };
+            let retrieval = Retrieval {
+                mode: Mode::Hybrid,
+                embedder: Some(svc.as_ref()),
+                memory_cfg: &cfg,
+            };
+            let r = run_recall(&store.ctx.conn, &retrieval, &cases, &negatives, 5).unwrap();
+            println!(
+                " {tau:.2}     {:.3}      {:.3}    {:>2}  {}",
+                r.recall_at_k,
+                r.precision.expect("negatives are labelled"),
+                r.n - r.misses.len(),
+                r.false_positives.len()
+            );
+            curve.push((tau, r));
+        }
+
+        // The rule `MIN_RECALL_COSINE_DEFAULT` was chosen by: the lowest floor
+        // on this curve that admits no labelled negative. Asserting the rule
+        // rather than the number is what keeps the constant derived — change
+        // the fixture and this fails until the constant is re-read off it.
+        let chosen = crate::config::MIN_RECALL_COSINE_DEFAULT;
+        let clean = |r: &crate::eval::recall::RecallReport| r.false_positives.is_empty();
+        let lowest_clean = curve
+            .iter()
+            .find(|(_, r)| clean(r))
+            .map(|(tau, _)| *tau)
+            .expect("some floor on the curve admits no negative");
+        assert!(
+            (lowest_clean - chosen).abs() < 0.001,
+            "MIN_RECALL_COSINE_DEFAULT is {chosen}, but the lowest floor that \
+             admits no labelled negative is {lowest_clean}"
+        );
+        let at_chosen = curve
+            .iter()
+            .find(|(tau, _)| (*tau - chosen).abs() < 0.001)
+            .map(|(_, r)| r)
+            .expect("the chosen floor is a point on the curve");
+        assert_eq!(at_chosen.precision, Some(1.0));
+        assert!(
+            at_chosen.recall_at_k >= 0.58,
+            "recall@5 at the chosen floor fell to {}",
+            at_chosen.recall_at_k
+        );
     }
 
     /// Floors sit just under the numbers recorded in docs/retrieval-eval.md.
     /// A drop below one means retrieval regressed (or the fixture changed and
     /// the doc must be updated with it).
+    /// BM25 alone surfaces one entry of 36 on this fixture, and nothing at all
+    /// for the 40 negatives. That is the point of the floor.
+    ///
+    /// A BM25-only run supplies no embedding, so the distance arm of
+    /// `hybrid::admits` is unavailable and a strong lexical match is the only
+    /// way in. Every query and every negative reaches the BM25 result set —
+    /// the expression is OR-expanded and the negatives are in-domain by
+    /// construction — so this is the direct measurement of the story's
+    /// constraint: membership in that set is not evidence.
+    ///
+    /// The one hit, `proof key for code exchange in the authorization grant`,
+    /// shares two rare terms (`authorization`, `exchange`) with the oauth
+    /// entry, which is the rare-term arm firing on real evidence. It used to
+    /// score 0.167 (6 of 36) by ranking whatever BM25 returned.
     #[test]
     fn committed_fixture_bm25_baseline_holds() {
         let r = baseline(Mode::Bm25);
         assert_eq!(r.n, 36);
-        assert!(
-            r.recall_at_k >= 0.16,
-            "bm25 recall@5 dropped to {} (misses: {:?})",
-            r.recall_at_k,
-            r.misses
+        assert_eq!(r.n_negatives, 40);
+        // Counted on the miss list, not on the float: the exact statement is
+        // "35 of 36 queries were rejected", and `recall_at_k` is a type that
+        // should not be compared for equality.
+        assert_eq!(
+            r.misses.len(),
+            35,
+            "without an embedding only a strong lexical match may be admitted, \
+             yet {} of {} queries got through (recall@5 {:.3})",
+            r.n - r.misses.len(),
+            r.n,
+            r.recall_at_k
         );
-        // Held-out queries: token-AND BM25 must NOT get everything. If it does,
-        // the queries have leaked document wording.
-        assert!(
-            !r.misses.is_empty(),
-            "bm25 missed nothing; the held-out queries are not held out"
+        assert_eq!(
+            r.false_positives,
+            Vec::<String>::new(),
+            "every negative is in the OR-expanded BM25 result set; membership \
+             there must not admit it"
         );
     }
 
+    /// Both model modes are floored at recall AND at precision.
+    ///
+    /// Recall alone stopped being a sufficient guard when the absolute cosine
+    /// floor went in: removing the floor raises recall to 1.000 and would
+    /// sail past a recall floor while putting back the behavior story 083
+    /// exists to remove. The pair has to hold together — 0.583 recall@5 at
+    /// precision 1.000 over the 40 labelled negatives, the operating point
+    /// `MIN_RECALL_COSINE_DEFAULT` was read off (`docs/retrieval-eval.md`).
     #[test]
     #[ignore = "requires ONNX model download"]
     fn committed_fixture_embedding_baseline_holds() {
-        let r = baseline(Mode::Embedding);
-        assert!(
-            r.recall_at_k >= 0.9,
-            "embedding recall@5 dropped to {} (misses: {:?})",
-            r.recall_at_k,
-            r.misses
-        );
+        assert_baseline(Mode::Embedding);
     }
 
     #[test]
     #[ignore = "requires ONNX model download"]
     fn committed_fixture_hybrid_baseline_holds() {
-        let r = baseline(Mode::Hybrid);
+        assert_baseline(Mode::Hybrid);
+    }
+
+    fn assert_baseline(mode: Mode) {
+        let r = baseline(mode);
         assert!(
-            r.recall_at_k >= 0.9,
-            "hybrid recall@5 dropped to {} (misses: {:?})",
+            r.recall_at_k >= 0.58,
+            "{} recall@5 dropped to {} (misses: {:?})",
+            mode.as_str(),
             r.recall_at_k,
             r.misses
+        );
+        assert_eq!(
+            r.precision,
+            Some(1.0),
+            "{} admitted a labelled negative: {:?}",
+            mode.as_str(),
+            r.false_positives
         );
     }
 }

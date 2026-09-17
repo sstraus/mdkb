@@ -34,6 +34,67 @@ pub fn escape_fts5_query_or(query: &str) -> String {
     quote_fts5_terms(query).join(" OR ")
 }
 
+/// Common English/Italian stopwords stripped before FTS matching.
+pub const STOPWORDS: &[&str] = &[
+    "a", "an", "and", "or", "but", "the", "of", "to", "in", "on", "at", "by", "for", "with", "as",
+    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "can", "shall", "we", "you", "i", "he",
+    "she", "it", "they", "them", "us", "my", "your", "our", "their", "this", "that", "these",
+    "those", "how", "what", "why", "when", "where", "who", "which", "so", "if", "then", "than",
+    "about", "into", "from", "up", "down", "out", "over", "under", "not", "no", "yes", "il", "la",
+    "le", "lo", "gli", "un", "uno", "una", "di", "da", "del", "della", "che", "e", "o", "ma", "se",
+    "ci", "si", "mi", "ti", "per", "con", "su", "come", "quando", "perche", "cosa", "dove", "chi",
+    "quale", "non", "sono", "era", "stato",
+];
+
+/// The content words of `text`: lowercased, alphanumeric, at least three
+/// characters, stopwords dropped.
+///
+/// One tokenizer for both arms of retrieval. The FTS recall query
+/// ([`build_recall_query`]) and the lexical admission
+/// test ([`crate::store::hybrid::strong_lexical_match`]) have to agree on what
+/// a word is: a gate that judged terms the query never searched for would
+/// admit on evidence the retrieval never used.
+pub fn content_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter_map(|tok| {
+            let t = tok.to_lowercase();
+            if t.len() < 3 || STOPWORDS.contains(&t.as_str()) {
+                return None;
+            }
+            Some(t)
+        })
+        .collect()
+}
+
+/// Build an FTS5 expression from natural-language text: the content words,
+/// quoted, joined with `OR`. `None` when the text carries no content word.
+///
+/// This is the one memory-search expression. Every surface uses it — the
+/// `UserPromptSubmit` hook, `mdkb search --scope memory`, and the MCP `search`
+/// tool with `scope: memory` — because a paraphrase has to retrieve the same
+/// entry whoever asks. Token-AND ([`escape_fts5_query`]) returns nothing as
+/// soon as one query word is absent from the entry, which is why the eval
+/// scored 0.167 on paraphrases with it.
+///
+/// `OR` is only safe because admission is decided afterwards, absolutely, by
+/// [`crate::store::hybrid::admits`]: this expression generates candidates, it
+/// does not decide relevance. Widening it without that gate is how an
+/// unrelated prompt used to inject its best BM25 hit.
+pub fn build_recall_query(text: &str) -> Option<String> {
+    let tokens = content_tokens(text);
+    if tokens.is_empty() {
+        return None;
+    }
+    Some(
+        tokens
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+    )
+}
+
 /// True when an escaped FTS5 expression carries no term to match.
 ///
 /// `escape_fts5_query` splits on whitespace, so an empty or whitespace-only

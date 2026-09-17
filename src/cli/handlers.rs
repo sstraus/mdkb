@@ -230,11 +230,57 @@ mod tests {
         assert_eq!(r2.confirmations, 2, "double confirm accumulates");
     }
 
+    /// A refuted outcome is reported on its own counter. Before story 087 it
+    /// decremented `confirmations`, so refuting an entry with none reported
+    /// "0 confirmations" — indistinguishable from doing nothing at all.
     #[test]
-    fn confirm_refuted_floors_at_zero() {
+    fn confirm_refuted_reports_a_correction_not_a_lost_confirmation() {
         let (_t, ctx) = confirm_test_ctx();
+        handle_memory_confirm(&ctx, "c1", "confirmed").expect("confirm");
         let r = handle_memory_confirm(&ctx, "c1", "refuted").expect("refute");
-        assert_eq!(r.confirmations, 0, "refute below zero floors at 0");
+        assert_eq!(r.confirmations, 1, "the confirmation history stands");
+        assert_eq!(r.corrections, 1, "the refutation is what moved");
+        assert!(r.message.contains("1 corrections"), "{}", r.message);
+    }
+
+    /// Suppression applies to unasked injection only. A refutation is a fact
+    /// about the entry, not a reason to hide it from someone who went looking:
+    /// the whole point of recording it is that the next reader sees the dispute
+    /// instead of re-deriving it.
+    #[test]
+    fn a_refuted_entry_is_still_returned_by_an_explicit_search() {
+        let (_t, ctx) = confirm_test_ctx();
+        handle_memory_add(
+            &ctx,
+            "d1",
+            "Disputed entry",
+            "topic",
+            None,
+            "The retry_backoff_ceiling is forty seconds.",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+        )
+        .expect("add");
+        handle_memory_confirm(&ctx, "d1", "refuted").expect("refute");
+
+        let hits = handle_memory_search(&ctx, "retry_backoff_ceiling", 5).expect("search");
+        assert!(
+            hits.iter().any(|e| e.id == "d1"),
+            "an explicit search must still find a refuted entry, got {:?}",
+            hits.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        assert!(
+            hits.iter()
+                .find(|e| e.id == "d1")
+                .is_some_and(|e| e.is_disputed()),
+            "and it must carry the dispute, so the caller can see it"
+        );
     }
 
     /// Confirming a promoted prior's projection has to move the cluster behind
@@ -573,6 +619,66 @@ mod tests {
 
         let (_, agent) = memory::get_provenance(&ctx.conn, "a").expect("provenance read");
         assert_eq!(agent.as_deref(), Some("scout"));
+    }
+
+    #[test]
+    fn test_memory_link_does_not_count_as_a_read() {
+        // Linking two entries is a structural edit, not a recall. Counting the
+        // existence check as a read would move `access_count`, which ranks
+        // memory search through `access_recency_score`.
+        let temp = setup_temp_dir();
+        handle_init(temp.path()).expect("init should succeed");
+        let ctx = Context::open(temp.path()).expect("open should succeed");
+
+        // Distinct bodies: `write_memory` rejects near-duplicates, and this
+        // test is about the access counters, not about dedup.
+        handle_memory_add(
+            &ctx,
+            "src",
+            "Connection pool sizing",
+            "topic",
+            None,
+            "The pool caps at twenty simultaneous connections.",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+        )
+        .expect("add src should succeed");
+        handle_memory_add(
+            &ctx,
+            "dst",
+            "Retry backoff policy",
+            "topic",
+            None,
+            "Exponential backoff with jitter guards the retry loop.",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+        )
+        .expect("add dst should succeed");
+
+        handle_memory_link(&ctx, "src", "relates_to", "dst", false, None)
+            .expect("link should succeed");
+
+        for id in ["src", "dst"] {
+            let entry = crate::store::memory::get_entry_without_tracking(&ctx.conn, id)
+                .expect("read should succeed")
+                .expect("entry exists");
+            assert_eq!(
+                entry.access_count, 0,
+                "memory link must not increment access_count on {id}"
+            );
+        }
     }
 
     #[test]

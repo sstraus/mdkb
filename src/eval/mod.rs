@@ -44,7 +44,12 @@ pub fn load_embedder(download: bool) -> std::result::Result<Arc<EmbeddingService
             crate::llm::embeddings::model_cache_path().display()
         ));
     }
-    crate::llm::get_cached_service().map_err(|e| format!("embedding model unavailable: {e}"))
+    if download {
+        crate::llm::get_or_download_service()
+    } else {
+        crate::llm::get_cached_service()
+    }
+    .map_err(|e| format!("embedding model unavailable: {e}"))
 }
 
 /// Seed a real store from `fixture` and run `eval` once per requested mode.
@@ -107,7 +112,15 @@ mod tests {
             &fx,
             &Mode::ALL,
             Err("test: no model".to_string()),
-            |conn, retrieval| recall::run_recall(conn, retrieval, &fx.recall_cases(), 5),
+            |conn, retrieval| {
+                recall::run_recall(
+                    conn,
+                    retrieval,
+                    &fx.recall_cases(),
+                    &fx.negative_queries(),
+                    5,
+                )
+            },
         )
         .unwrap();
         assert_eq!(runs.len(), 3);
@@ -173,7 +186,9 @@ pub(crate) mod testkit {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,

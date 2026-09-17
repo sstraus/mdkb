@@ -83,7 +83,10 @@ fn guard_trigger_exists(root: &Path) -> bool {
 
 fn run_search(root: &Path, home: &Path, extra_env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new(BIN);
-    cmd.args(["search", "findable", "--scope", "memory"])
+    // The whole content, not one word of it: memory search admits on the
+    // absolute relevance floor OR a strong lexical match, and no model runs
+    // here, so a three-word run of the entry's own text is what gets in.
+    cmd.args(["search", "findable after migration", "--scope", "memory"])
         .current_dir(root)
         .env("HOME", home);
     for (k, v) in extra_env {

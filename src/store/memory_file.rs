@@ -82,7 +82,11 @@ impl MemoryFile {
             last_accessed: meta.last_accessed,
             source_path: meta.source_path,
             confirmations: meta.confirmations.unwrap_or(0),
+            // A refutation is machine-local and is not projected, so a file can
+            // never state one and reading one back is always "never refuted".
+            corrections: 0,
             last_confirmed_at: meta.last_confirmed_at,
+            last_refuted_at: None,
             source_type: meta.source_type,
             expires_at: meta.expires_at,
             due_at: meta.due_at,
@@ -413,7 +417,9 @@ mod tests {
             last_accessed: Some(1_700_000_200),
             source_path: Some("docs/auth.md".to_string()),
             confirmations: 1,
+            corrections: 0,
             last_confirmed_at: Some(1_700_000_150),
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,

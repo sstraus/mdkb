@@ -89,11 +89,126 @@ pub fn lost_in_middle_reorder<T>(items: &mut Vec<T>) {
     items.extend(back);
 }
 
+/// The vec0 distance that corresponds to a cosine floor.
+///
+/// vec0 returns an **L2 distance** over unit vectors, not a cosine: for unit
+/// `a` and `b`, `d² = 2(1 − cos)`, so `cos = 1 − d²/2` — the conversion
+/// `find_similar_entries` already does — and a cosine floor τ is the bound
+/// `d ≤ √(2(1−τ))`. Converting the threshold once beats converting every row.
+///
+/// τ ≥ 1 yields 0.0 (only an identical vector passes) and τ ≤ −1 yields 2.0
+/// (every vector passes), so an out-of-range configuration degrades to one of
+/// the two honest extremes instead of producing NaN.
+pub fn distance_bound(min_cosine: f32) -> f32 {
+    (2.0 * (1.0 - min_cosine)).max(0.0).sqrt()
+}
+
+/// Whether a candidate is relevant in **absolute** terms — the injection gate.
+///
+/// Two independent arms, because the two legs of retrieval fail on different
+/// queries:
+///
+/// * **Semantic.** The embedding says the entry is about the same thing,
+///   measured against a fixed bound rather than against this query's own best
+///   result. `normalize_scores` divides by the maximum, so the top hit scores
+///   1.0 for every prompt: a relative floor admits the best match to a
+///   question nothing in the store answers.
+/// * **Lexical.** Embeddings are weak on identifiers, so a search for
+///   `CONFIDENCE_FLOOR` must still reach its entry even when the prose around
+///   it embeds nowhere near the query. Membership in the BM25 result set is
+///   *not* this arm: recall OR-expands the prompt, so a single common word
+///   would open the gate for everything. See [`strong_lexical_match`].
+///
+/// Confidence is deliberately absent. A well-confirmed entry about something
+/// else is still about something else; confidence orders what was admitted.
+pub fn admits(strong_lexical: bool, distance: Option<f32>, bound: f32) -> bool {
+    strong_lexical || distance.is_some_and(|d| d <= bound)
+}
+
+/// Distinct rare query terms an entry must contain to pass on term overlap
+/// alone. One is a coincidence — "retry" appears in a question about retries
+/// and in an entry about retrying a different thing.
+const STRONG_LEXICAL_RARE_TERMS: usize = 2;
+
+/// Length at which a content word is treated as rare enough to be evidence.
+///
+/// A document-frequency count would be the principled measure, and it is
+/// exactly what this cannot afford: `df` needs another FTS query on the
+/// UserPromptSubmit path. Length is the proxy — "idempotency" and "vacuum"
+/// discriminate, "cache" and "value" do not — chosen because it needs no
+/// index lookup at all.
+const RARE_TERM_LEN: usize = 7;
+
+/// Consecutive content words that count as a quoted phrase.
+const STRONG_LEXICAL_PHRASE_LEN: usize = 3;
+
+/// True when `query` matches `entry_text` strongly enough to be admitted with
+/// no help from the embedding. Any one of three arms is enough:
+///
+/// 1. an identifier the query wrote out (`code_verifier`, `Store::write`,
+///    `min_recall_cosine`) appears verbatim in the entry;
+/// 2. three consecutive content words of the query appear, in order, in the
+///    entry — a phrase, not a bag of words;
+/// 3. at least [`STRONG_LEXICAL_RARE_TERMS`] distinct rare terms are shared.
+pub fn strong_lexical_match(query: &str, entry_text: &str) -> bool {
+    use crate::store::search::content_tokens;
+
+    let haystack = entry_text.to_lowercase();
+    if identifier_candidates(query).any(|ident| haystack.contains(&ident)) {
+        return true;
+    }
+
+    let q = content_tokens(query);
+    let e = content_tokens(entry_text);
+
+    if q.len() >= STRONG_LEXICAL_PHRASE_LEN
+        && e.len() >= STRONG_LEXICAL_PHRASE_LEN
+        && q.windows(STRONG_LEXICAL_PHRASE_LEN)
+            .any(|phrase| e.windows(STRONG_LEXICAL_PHRASE_LEN).any(|w| w == phrase))
+    {
+        return true;
+    }
+
+    let entry_terms: std::collections::HashSet<&str> = e.iter().map(String::as_str).collect();
+    let shared: std::collections::HashSet<&str> = q
+        .iter()
+        .filter(|t| t.len() >= RARE_TERM_LEN && entry_terms.contains(t.as_str()))
+        .map(String::as_str)
+        .collect();
+    shared.len() >= STRONG_LEXICAL_RARE_TERMS
+}
+
+/// The words of `query` that look like code rather than prose, lowercased.
+///
+/// Split on whitespace, not on punctuation: `content_tokens` would turn
+/// `code_verifier` into two ordinary words and lose exactly the property that
+/// makes it evidence. A token qualifies when it carries an underscore, a path
+/// or member separator, an internal capital, or a digit.
+fn identifier_candidates(query: &str) -> impl Iterator<Item = String> + '_ {
+    query
+        .split_whitespace()
+        .map(|tok| tok.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+        .filter(|tok| {
+            let camel_case =
+                tok.chars().any(char::is_lowercase) && tok.chars().skip(1).any(char::is_uppercase);
+            tok.len() >= 3
+                && (tok.contains('_')
+                    || tok.contains("::")
+                    || tok.contains('.')
+                    || tok.chars().any(char::is_numeric)
+                    || camel_case)
+        })
+        .map(str::to_lowercase)
+}
+
 /// Normalize scores to [0, 1] range using max-normalization.
 ///
 /// Divides all scores by the maximum observed score, preserving relative
 /// differences between entries. This avoids the min-max problem where
 /// single-source results get their differences artificially amplified.
+///
+/// Query-relative by construction: the top result is always 1.0. Admission
+/// must therefore happen before this runs — see [`admits`].
 pub fn normalize_scores(scores: &mut [(i64, f64)]) {
     if scores.is_empty() {
         return;

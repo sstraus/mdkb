@@ -144,7 +144,9 @@ fn seed_project_with_memory(id: &str, title: &str, content: &str, tags: &[&str])
         last_accessed: Some(now),
         source_path: None,
         confirmations: 1,
+        corrections: 0,
         last_confirmed_at: Some(now),
+        last_refuted_at: None,
         source_type: SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -352,7 +354,9 @@ fn seed_two_entries_with_access_counts(
         last_accessed: Some(now - 30 * 86400),
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -373,7 +377,9 @@ fn seed_two_entries_with_access_counts(
         last_accessed: Some(now - 3600),
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -387,9 +393,12 @@ fn seed_two_entries_with_access_counts(
 
 #[test]
 fn user_prompt_submit_access_recency_reranks_higher_access_first() {
-    // Both entries share a unique keyword so both will match FTS.
+    // Both entries share a unique keyword so both will match FTS. It is an
+    // identifier, not a word: with no embedding service under test, the
+    // absolute recall floor admits only a strong lexical match, and an
+    // identifier the prompt writes out is the arm that fires.
     // The high-access entry should float to the top after re-ranking.
-    let keyword = "cacherefreshpolicy";
+    let keyword = "cache_refresh_policy";
     let low_id = "cache-low-access";
     let high_id = "cache-high-access";
 
@@ -608,7 +617,9 @@ fn user_prompt_submit_dedups_neighbor_against_memory_id() {
         last_accessed: Some(now),
         source_path: None,
         confirmations: 1,
+        corrections: 0,
         last_confirmed_at: Some(now),
+        last_refuted_at: None,
         source_type: SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -651,7 +662,9 @@ fn topic_entry(id: &str, title: &str, content: &str) -> MemoryEntry {
         last_accessed: Some(now),
         source_path: None,
         confirmations: 1,
+        corrections: 0,
         last_confirmed_at: Some(now),
+        last_refuted_at: None,
         source_type: SourceType::UserStatement,
         expires_at: None,
         due_at: None,

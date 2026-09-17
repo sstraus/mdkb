@@ -45,7 +45,9 @@ pub fn hybrid_search_fts(
     let bm25_results = search::search_fts(&ctx.conn, fts_query, &bm25_query)?;
 
     let vector_results = match query_embedding {
-        Some(embedding) => vectors::chunk_vector_search(&ctx.conn, embedding, limit * 2)?,
+        Some(embedding) => {
+            vectors::chunk_vector_search(&ctx.conn, embedding, limit * 2, collection)?
+        }
         None => Vec::new(),
     };
 

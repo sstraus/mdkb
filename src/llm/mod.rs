@@ -16,10 +16,43 @@ use std::sync::{Arc, Mutex};
 /// reloading on every request for long-running processes like the MCP server.
 static CACHED_SERVICE: Mutex<Option<Arc<EmbeddingService>>> = Mutex::new(None);
 
-/// Get or initialize the cached embedding service.
+/// The cached embedding service, or an error when the weights are not on disk.
+///
+/// **Never downloads.** Every caller here is a query or a write that embeds as
+/// a side effect, and all of them already treat an error as "carry on without a
+/// vector" — hybrid search falls back to BM25, `embed_entry_by_rowid` leaves the
+/// row pending. A download in any of them instead blocks the caller on a 90 MB
+/// fetch with no way to say no.
+///
+/// Measured 2026-09-16: `mdkb search --scope memory` gained the vector leg
+/// (story 084), and six integration tests that spawn the binary under an
+/// isolated `HOME` stopped failing and started hanging indefinitely inside
+/// `TextEmbedding::try_new`, waiting on the network. The same command on a
+/// developer machine without the model would have done the same thing, inside a
+/// hook, unasked.
+///
+/// Commands whose *purpose* is to build embeddings call
+/// [`get_or_download_service`] instead.
 ///
 /// Returns a shared reference via `Arc`. Thread-safe.
 pub fn get_cached_service() -> crate::error::Result<Arc<EmbeddingService>> {
+    if CACHED_SERVICE.lock().is_ok_and(|g| g.is_none()) && !embeddings::model_is_cached() {
+        return Err(crate::error::Error::other(format!(
+            "embedding model not cached at {} — run `mdkb embed` to fetch it",
+            embeddings::model_cache_path().display()
+        )));
+    }
+    get_or_download_service()
+}
+
+/// Get or initialize the cached embedding service, downloading the weights when
+/// they are absent.
+///
+/// Only for commands the user ran *to* build embeddings — `mdkb embed`, and an
+/// eval invoked with `--download`. Everything else uses [`get_cached_service`].
+///
+/// Returns a shared reference via `Arc`. Thread-safe.
+pub fn get_or_download_service() -> crate::error::Result<Arc<EmbeddingService>> {
     let guard = CACHED_SERVICE
         .lock()
         .map_err(|_| crate::error::Error::other("Embedding service cache lock poisoned"))?;

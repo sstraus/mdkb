@@ -48,7 +48,9 @@ fn seed(
         last_accessed: None,
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -285,5 +287,68 @@ fn an_empty_handoff_body_is_not_injected_but_is_still_dropped() {
     assert!(
         rest.iter().all(|e| e.entry_type != EntryType::Handoff),
         "the handoff still leaves the compact list"
+    );
+}
+
+/// Story 087, criterion 8. The pool query has carried `AND corrections <=
+/// confirmations` all along, and it excluded nothing: no production path wrote
+/// `corrections`, so the clause was unreachable. It is now reachable through
+/// `confirm_entry`, which is the only thing that made it a filter.
+///
+/// Two layers, because one is not enough. The SQL clause catches the net-refuted
+/// entry; the ranker catches the one whose confirmation count still outweighs
+/// its refutation — `AND corrections <= confirmations` admits 20c/1r, and an
+/// entry someone has just said is wrong must not be taught at session start
+/// because it used to be right.
+#[test]
+fn a_refuted_entry_is_not_warmed_up() {
+    let c = conn();
+    seed(&c, "holds", EntryType::Topic, &[], 5, 1);
+    seed(&c, "net-refuted", EntryType::Topic, &[], 90, 1);
+    seed(
+        &c,
+        "well-confirmed-then-refuted",
+        EntryType::Topic,
+        &[],
+        99,
+        1,
+    );
+
+    // The hottest two entries in the store, by a wide margin, so nothing but the
+    // refutation can be what keeps them out.
+    for _ in 0..20 {
+        mdkb::store::memory::confirm_entry(&c, "well-confirmed-then-refuted", 1).expect("confirm");
+    }
+    // Backdate the confirmation so the refutation below is unambiguously the
+    // later signal. Both stamps are 1-second resolution and this test writes
+    // both within the same second; the ordering is the fixture, not the subject.
+    c.execute(
+        "UPDATE memory_entries SET last_confirmed_at = last_confirmed_at - 86400
+         WHERE id = 'well-confirmed-then-refuted'",
+        [],
+    )
+    .expect("backdate");
+    mdkb::store::memory::confirm_entry(&c, "net-refuted", -1).expect("refute");
+    mdkb::store::memory::confirm_entry(&c, "well-confirmed-then-refuted", -1).expect("refute");
+
+    let (_due, pool) = get_warmup_entries(&c, 10).expect("warmup");
+    let ids: Vec<&str> = pool.iter().map(|e| e.id.as_str()).collect();
+    assert!(
+        !ids.contains(&"net-refuted"),
+        "the pool query must drop a net-refuted entry; got {ids:?}"
+    );
+    assert!(
+        ids.contains(&"well-confirmed-then-refuted"),
+        "control: 20 confirmations against 1 refutation clears the SQL clause, \
+         which is why the ranker has to decide it; got {ids:?}"
+    );
+
+    let ranked =
+        mdkb::mcp::dispatch::rank_warmup_entries_for_test(pool, 10, 0.0, 2_000_000_000, None);
+    let ranked_ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+    assert_eq!(
+        ranked_ids,
+        vec!["holds"],
+        "only the entry nobody has refuted may be warmed up"
     );
 }

@@ -2,10 +2,12 @@
 //!
 //! Every query goes through the production memory search
 //! (`store::memory::search_entries_hybrid_fts`: BM25 leg, vector leg, RRF
-//! fusion, access-recency signal, confidence re-rank) with the production
-//! `[search.memory]` weights. The only knob is [`Mode`], which decides which
-//! legs get input. This is the yardstick every retrieval change is measured
-//! against — a change that drops recall@k is a regression, not a win.
+//! fusion, access-recency signal, absolute admission, confidence re-rank) with
+//! the production `[search.memory]` weights AND the production FTS expression,
+//! so the CLI, the MCP tool and the hook are all measured at once. The only
+//! knob is [`Mode`], which decides which legs get input. This is the yardstick
+//! every retrieval change is measured against — a change that drops recall@k
+//! or precision is a regression, not a win.
 
 use crate::config::SearchMemoryConfig;
 use crate::error::{Error, Result};
@@ -110,15 +112,8 @@ impl Retrieval<'_> {
         } else {
             fts_query
         };
-        memory::search_entries_hybrid_fts(
-            conn,
-            fts,
-            embedding.as_deref(),
-            k,
-            self.memory_cfg.access_recency_weight,
-            self.memory_cfg.recency_half_life_secs,
-        )
-        .map(|results| results.into_iter().map(|result| result.entry).collect())
+        memory::search_entries_hybrid_fts(conn, fts, text, embedding.as_deref(), k, self.memory_cfg)
+            .map(|results| results.into_iter().map(|result| result.entry).collect())
     }
 }
 
@@ -136,32 +131,62 @@ pub struct RecallReport {
     pub mode: Mode,
     pub recall_at_k: f64,
     pub mrr: f64,
+    /// Share of the queries that retrieved something which were supposed to:
+    /// `hits / (hits + false_positives)`. Recall alone cannot judge the
+    /// absolute relevance floor — a floor of zero scores perfect recall by
+    /// answering every query, including the ones with no answer.
+    ///
+    /// `None` when the fixture labelled no negatives, and also when nothing
+    /// was retrieved for any query at all. In the first case the formula
+    /// reduces to `hits / hits` and a flat 1.000 would read as a measurement
+    /// of a floor that was never tested; in the second there is nothing to be
+    /// precise about, and a floor that answers no query is silent rather than
+    /// accurate.
+    pub precision: Option<f64>,
     pub n: usize,
+    /// How many labelled negatives were scored. Zero means precision was
+    /// measured against positives only and carries no information.
+    pub n_negatives: usize,
     pub k: usize,
     /// The queries whose expected id did not appear in the top-k, so a drop in
     /// `recall_at_k` names the cases that caused it.
     pub misses: Vec<String>,
+    /// The labelled negatives that retrieved an entry anyway, so a drop in
+    /// `precision` names the queries that caused it.
+    pub false_positives: Vec<String>,
 }
 
-/// Compute recall@k and MRR over `cases`.
+/// Compute recall@k, MRR and precision over `cases` and `negatives`.
 ///
 /// A case is a hit if any of its `expected_ids` appears in the top-k retrieved
 /// entries; MRR credits the reciprocal rank of the first such hit. An empty
 /// case set yields zeroed metrics (never a divide-by-zero).
 ///
-/// Each query is escaped token-AND, as the `search` tool escapes a memory
-/// query: this measures what an agent gets when it searches for a memory.
+/// `negatives` are in-domain queries no stored entry answers, so the correct
+/// retrieval for one is the empty set and anything it returns is a false
+/// positive. They are what makes the absolute relevance floor measurable:
+/// without them, dropping the floor to zero looks like a pure win.
+///
+/// Each query is OR-expanded with [`crate::store::search::build_recall_query`],
+/// the one expression every memory surface now builds: the CLI
+/// `search --scope memory`, the MCP `search` tool with `scope: memory` and the
+/// `UserPromptSubmit` hook. The number this reports is therefore what an agent
+/// gets, whichever door it came through.
 pub fn run_recall(
     conn: &Connection,
     retrieval: &Retrieval<'_>,
     cases: &[EvalCase],
+    negatives: &[String],
     k: usize,
 ) -> Result<RecallReport> {
     let mut hits = 0usize;
     let mut reciprocal_rank = 0f64;
     let mut misses = Vec::new();
     for case in cases {
-        let fts = crate::store::search::escape_fts5_query(&case.query);
+        let Some(fts) = crate::store::search::build_recall_query(&case.query) else {
+            misses.push(case.query.clone());
+            continue;
+        };
         let results = retrieval.search(conn, &fts, &case.query, k)?;
         match results
             .iter()
@@ -175,15 +200,28 @@ pub fn run_recall(
             None => misses.push(case.query.clone()),
         }
     }
+    let mut false_positives = Vec::new();
+    for query in negatives {
+        let Some(fts) = crate::store::search::build_recall_query(query) else {
+            continue;
+        };
+        if !retrieval.search(conn, &fts, query, k)?.is_empty() {
+            false_positives.push(query.clone());
+        }
+    }
     let n = cases.len();
     let denom = n.max(1) as f64;
+    let admitted = hits + false_positives.len();
     Ok(RecallReport {
         mode: retrieval.mode,
         recall_at_k: hits as f64 / denom,
         mrr: reciprocal_rank / denom,
+        precision: (!negatives.is_empty() && admitted > 0).then(|| hits as f64 / admitted as f64),
         n,
+        n_negatives: negatives.len(),
         k,
         misses,
+        false_positives,
     })
 }
 
@@ -218,9 +256,11 @@ mod tests {
         );
 
         let cases = vec![
-            // Clear hit: "pkce" and "exchange" tokens live only in the oauth entry.
+            // Clear hit: the three tokens run consecutively in the oauth entry,
+            // which is what the absolute recall gate wants from a BM25-only run
+            // (no embedding → no distance → strong lexical is the only arm).
             EvalCase {
-                query: "pkce exchange".into(),
+                query: "authorization code exchange".into(),
                 expected_ids: vec!["oauth".into()],
             },
             // Clear miss: neither token is present in any entry.
@@ -231,7 +271,7 @@ mod tests {
         ];
 
         let cfg = SearchMemoryConfig::default();
-        let r = run_recall(&conn, &Retrieval::bm25(&cfg), &cases, 5).unwrap();
+        let r = run_recall(&conn, &Retrieval::bm25(&cfg), &cases, &[], 5).unwrap();
         assert_eq!(r.mode, Mode::Bm25);
         assert_eq!(r.n, 2);
         assert_eq!(r.k, 5);
@@ -248,22 +288,76 @@ mod tests {
         );
         // The report names the query that failed, not just the count.
         assert_eq!(r.misses, vec!["kubernetes helm".to_string()]);
+        // No labelled negatives were scored, so precision carries no signal
+        // and says so with `None` rather than a flattering 1.000.
+        assert_eq!(r.n_negatives, 0);
+        assert_eq!(r.precision, None);
+    }
+
+    /// Precision is the metric the absolute relevance floor is tuned against,
+    /// and it has to move when recall does not. Both queries here retrieve,
+    /// one of them is labelled as having no answer: recall stays perfect and
+    /// precision halves.
+    #[test]
+    fn a_negative_that_retrieves_an_entry_costs_precision_not_recall() {
+        let conn = setup_db();
+        add(
+            &conn,
+            "oauth",
+            "OAuth2 PKCE flow",
+            "authorization code exchange with PKCE",
+            &["auth"],
+        );
+        add(
+            &conn,
+            "cache",
+            "LRU cache eviction",
+            "least recently used eviction policy",
+            &["perf"],
+        );
+
+        let cases = vec![EvalCase {
+            query: "authorization code exchange".into(),
+            expected_ids: vec!["oauth".into()],
+        }];
+        // Quotes the cache entry's own words, so the floor admits it — but it
+        // is labelled as a query no entry should answer.
+        let negatives = vec!["least recently used eviction".to_string()];
+
+        let cfg = SearchMemoryConfig::default();
+        let r = run_recall(&conn, &Retrieval::bm25(&cfg), &cases, &negatives, 5).unwrap();
+        assert!(r.misses.is_empty(), "the positive case is a hit");
+        assert!(
+            (r.mrr - 1.0).abs() < 1e-9,
+            "the hit is at rank 1 → MRR 1.0, got {}",
+            r.mrr
+        );
+        assert_eq!(r.n_negatives, 1);
+        assert_eq!(r.false_positives, negatives);
+        assert_eq!(
+            r.precision,
+            Some(0.5),
+            "one hit against one false positive → 0.5"
+        );
     }
 
     #[test]
     fn empty_cases_do_not_divide_by_zero() {
         let conn = setup_db();
         let cfg = SearchMemoryConfig::default();
-        let r = run_recall(&conn, &Retrieval::bm25(&cfg), &[], 5).unwrap();
+        let r = run_recall(&conn, &Retrieval::bm25(&cfg), &[], &[], 5).unwrap();
         assert_eq!(
             r,
             RecallReport {
                 mode: Mode::Bm25,
                 recall_at_k: 0.0,
                 mrr: 0.0,
+                precision: None,
                 n: 0,
+                n_negatives: 0,
                 k: 5,
                 misses: vec![],
+                false_positives: vec![],
             }
         );
     }

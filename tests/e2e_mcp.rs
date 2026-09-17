@@ -1340,7 +1340,12 @@ fn test_memory_complete_workflow() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+        source_path: None,
+        confirmations: 0,
+        corrections: 0,
+        last_confirmed_at: None,
+        last_refuted_at: None,
+        source_type: memory::SourceType::UserStatement,
         expires_at: None,
         due_at: None,
     };
@@ -1357,7 +1362,12 @@ fn test_memory_complete_workflow() {
         superseded_by: None,
         access_count: 0,
         last_accessed: None,
-            source_path: None, confirmations: 0, last_confirmed_at: None, source_type: memory::SourceType::UserStatement,
+        source_path: None,
+        confirmations: 0,
+        corrections: 0,
+        last_confirmed_at: None,
+        last_refuted_at: None,
+        source_type: memory::SourceType::UserStatement,
         expires_at: None,
         due_at: None,
     };
@@ -1439,7 +1449,7 @@ fn test_memory_complete_workflow() {
     );
 
     // 8. Test prune (nothing should be pruned since entries are recent)
-    let pruned = memory::prune_entries(&env.ctx.conn, 30, true).expect("Failed to prune");
+    let pruned = memory::prunable_entry_ids(&env.ctx.conn, 30).expect("Failed to prune");
     assert!(pruned.is_empty(), "Recent entries should not be pruned");
 }
 
@@ -1471,7 +1481,9 @@ fn test_memory_stats_integration() {
         last_accessed: None,
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -1533,7 +1545,9 @@ fn test_memory_index_persistence() {
             last_accessed: if i > 0 { Some(now) } else { None },
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: memory::SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -1598,7 +1612,9 @@ fn test_memory_condense_finds_related() {
         last_accessed: None,
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -1619,7 +1635,9 @@ fn test_memory_condense_finds_related() {
         last_accessed: None,
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -1640,7 +1658,9 @@ fn test_memory_condense_finds_related() {
         last_accessed: None,
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -1661,7 +1681,9 @@ fn test_memory_condense_finds_related() {
         last_accessed: None,
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -1715,7 +1737,9 @@ fn test_memory_condense_dry_run() {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: memory::SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -1777,7 +1801,9 @@ fn test_memory_condense_creates_merged_entry() {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: memory::SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -1999,7 +2025,7 @@ fn test_experiment_cancel() {
 }
 
 #[tokio::test]
-async fn test_memory_confirm_increments_and_refutes_floor_at_zero() {
+async fn test_memory_confirm_counts_confirmations_and_refutations_separately() {
     use mdkb::mcp::server::McpServer;
     use mdkb::mcp::tools::MemoryConfirmParams;
     use rmcp::handler::server::wrapper::Parameters;
@@ -2021,7 +2047,9 @@ async fn test_memory_confirm_increments_and_refutes_floor_at_zero() {
         last_accessed: None,
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -2053,7 +2081,10 @@ async fn test_memory_confirm_increments_and_refutes_floor_at_zero() {
         "last_confirmed_at must be set"
     );
 
-    // 5x refuted when confirmations=3 → floor at 0, never negative.
+    // 5x refuted when confirmations=3. Story 087: these land on `corrections`
+    // and leave the three confirmations standing, so the entry records both
+    // "verified three times" and "reported wrong five times" — which is what
+    // actually happened — instead of collapsing to "zero confirmations".
     for _ in 0..5 {
         server
             .memory_confirm(Parameters(MemoryConfirmParams {
@@ -2069,9 +2100,22 @@ async fn test_memory_confirm_increments_and_refutes_floor_at_zero() {
         .expect("get after refute")
         .expect("entry present");
     assert_eq!(
-        after_refute.confirmations, 0,
-        "refute must floor confirmations at 0, got {}",
+        after_refute.confirmations, 3,
+        "refuting must not erase a confirmation, got {}",
         after_refute.confirmations
+    );
+    assert_eq!(
+        after_refute.corrections, 5,
+        "every refutation must be counted, got {}",
+        after_refute.corrections
+    );
+    assert_eq!(
+        after_refute.last_confirmed_at, after_confirm.last_confirmed_at,
+        "the decay reference must not move on a refutation"
+    );
+    assert!(
+        after_refute.last_refuted_at.is_some(),
+        "last_refuted_at must be stamped"
     );
 }
 
@@ -2103,7 +2147,9 @@ async fn test_memory_search_repeated_get_ranks_above_untouched() {
         last_accessed: None,
         source_path: None,
         confirmations: 0,
+        corrections: 0,
         last_confirmed_at: None,
+        last_refuted_at: None,
         source_type: memory::SourceType::UserStatement,
         expires_at: None,
         due_at: None,
@@ -2142,10 +2188,13 @@ async fn test_memory_search_repeated_get_ranks_above_untouched() {
     assert_eq!(a_after_get.access_count, 3, "get must bump A");
     assert_eq!(b_after_get.access_count, 0, "B must stay untouched");
 
-    // Search via the MCP layer with scope="memory".
+    // Search via the MCP layer with scope="memory". The query quotes three
+    // consecutive words of the entries: with no embedding service under test,
+    // the absolute recall floor admits only a strong lexical match, and two
+    // shared words are not one.
     let search_result = server
         .search(Parameters(SearchParams {
-            query: "ranking signal".to_string(),
+            query: "identical ranking signal".to_string(),
             root: None,
             limit: 10,
             collection: None,

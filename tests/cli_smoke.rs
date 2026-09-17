@@ -880,7 +880,9 @@ fn smoke_memory_lifecycle() {
     let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("confirm json");
     assert_eq!(v["confirmations"], 2, "two confirms → count 2");
 
-    // refuted below zero floors at 0 rather than going negative.
+    // Six refutations accumulate on their own counter and never touch the two
+    // confirmations: a refutation records that the entry was reported wrong,
+    // it does not cancel a verification that really happened.
     for _ in 0..5 {
         let out = run(
             &[
@@ -906,9 +908,13 @@ fn smoke_memory_lifecycle() {
         ],
         &repo.root,
     );
-    assert_ok(&out, "memory confirm refuted floor");
+    assert_ok(&out, "memory confirm refuted");
     let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("confirm json");
-    assert_eq!(v["confirmations"], 0, "confirmations floor at 0");
+    assert_eq!(
+        v["confirmations"], 2,
+        "refuting must not erase a confirmation"
+    );
+    assert_eq!(v["corrections"], 6, "every refutation is counted");
 
     // Unknown id is a clean non-zero error, not a panic.
     let out = run(
@@ -1861,6 +1867,22 @@ fn smoke_setup_check_reports_the_distiller_verdict() {
     assert!(
         combined.contains("400 Bad Request"),
         "the real error text must be reported, got: {combined}"
+    );
+
+    // A model that exits 0 with well-formed JSON of the WRONG SHAPE. Every
+    // field of the schema is required, so this does not deserialize and the
+    // check reports it rather than staying quiet: a model pointed at the wrong
+    // endpoint, or given the wrong system prompt, must not look healthy.
+    std::fs::write(
+        &config,
+        "[priors]\nmining_enabled = true\ndistiller_program = \"sh\"\ndistiller_args = [\"-c\", \"cat >/dev/null; echo '{\\\"answer\\\":\\\"nothing useful here\\\"}'\"]\n",
+    )
+    .unwrap();
+    let out = run(&["setup", "check"], &repo.root);
+    let combined = stdout(&out) + &String::from_utf8_lossy(&out.stderr);
+    assert!(
+        combined.contains("FAILED") && combined.contains("nothing useful here"),
+        "a schema-blind model must be reported with its own output, got: {combined}"
     );
 }
 

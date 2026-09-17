@@ -100,17 +100,38 @@ pub(crate) fn project_after_write(ctx: &Context, id: &str, now: i64) {
     }
 }
 
-/// Retire the projection of an entry the store just deleted and refresh the
-/// warmup index. The file moves to `memory/archive/`: left in `entries/`, the
-/// next reconciliation would find a file with no row and import it, and the
-/// deleted entry would come back. Best-effort, like [`project_after_write`].
-pub(crate) fn archive_after_delete(ctx: &Context, id: &str) {
-    if let Err(e) = archive_entry_on_disk(ctx, id) {
-        tracing::warn!("Failed to archive entry {id} on disk: {e}");
+/// Retire the projections of `ids`, then let `remove` take their rows out of
+/// the active set. The one disposal order for every path that retires an entry.
+///
+/// The order is the whole invariant, and it used to run the other way round.
+/// A file left in `entries/` with no active row behind it is not litter: the
+/// next [`sync_memory_files`] pass imports it (no row) or revives it (an
+/// archived row), so the retired entry comes back. Deleting the row first and
+/// archiving the file best-effort therefore made a failed rename into a
+/// resurrection.
+///
+/// Archiving first inverts which way a failure can go. The worst case becomes
+/// a file in `archive/` whose row is still active — drift that `mdkb stats`
+/// reports and the next projection repairs — and `remove` never runs, so the
+/// error the caller returns is true: nothing was retired. `archive_projection`
+/// treats a missing file as success, so a retry of the whole operation is safe.
+///
+/// The warmup index is refreshed last, best-effort: it is derived data, and
+/// failing the call after the rows are gone would report a retirement that did
+/// happen as one that did not.
+pub(crate) fn archive_then_remove<T>(
+    ctx: &Context,
+    ids: &[String],
+    remove: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    for id in ids {
+        archive_entry_on_disk(ctx, id)?;
     }
+    let removed = remove()?;
     if let Err(e) = generate_memory_index(ctx) {
         tracing::warn!("Failed to regenerate memory index: {e}");
     }
+    Ok(removed)
 }
 
 /// True when every changed file under `entries/` holds exactly the bytes the
@@ -814,7 +835,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,

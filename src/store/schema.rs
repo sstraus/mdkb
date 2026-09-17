@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 24;
+pub const SCHEMA_VERSION: i32 = 25;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     confirmations INTEGER DEFAULT 0,  -- Positive confidence signals
     corrections INTEGER DEFAULT 0,    -- Negative confidence signals
     last_confirmed_at INTEGER,        -- Timestamp of last confirmation
+    last_refuted_at INTEGER,          -- Timestamp of last refutation; never moves last_confirmed_at
     source_type TEXT DEFAULT 'user_statement',  -- official_docs, user_statement, inference
     expires_at INTEGER,                        -- Unix timestamp; NULL = permanent
     due_at INTEGER,                            -- Unix timestamp; surfaces reminders at/after this time
@@ -932,6 +933,26 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
         if !has_signature {
             conn.execute(
                 "ALTER TABLE prior_clusters ADD COLUMN error_signature TEXT",
+                [],
+            )?;
+        }
+    }
+
+    // Migration from v24 to v25: record WHEN an entry was last refuted. The
+    // `corrections` count alone cannot tell a refutation that was answered by a
+    // later confirmation from one still standing, and `last_confirmed_at` must
+    // not be reused for it because it is the decay reference.
+    if from_version < 25 && table_exists(conn, "memory_entries") {
+        let has_refuted: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'last_refuted_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_refuted {
+            conn.execute(
+                "ALTER TABLE memory_entries ADD COLUMN last_refuted_at INTEGER",
                 [],
             )?;
         }
@@ -2728,6 +2749,50 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// Story 087: a store written before v25 has no `last_refuted_at`, and every
+    /// memory read now selects it. Without the migration the first query on an
+    /// existing store fails with "no such column", so this is the one test that
+    /// stands between the feature and a broken upgrade.
+    #[test]
+    fn a_v24_store_gains_last_refuted_at() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at, confirmations, corrections)
+             VALUES ('pre-v25', 'Older than the column', 'Body', 'topic', '[]', 1000, 1000, 2, 1)",
+            [],
+        )
+        .unwrap();
+
+        // Simulate the v24 store: the column simply is not there.
+        conn.execute_batch(
+            "ALTER TABLE memory_entries DROP COLUMN last_refuted_at;
+             UPDATE schema_version SET version = 24;",
+        )
+        .unwrap();
+        assert!(
+            crate::store::memory::get_entry_without_tracking(&conn, "pre-v25").is_err(),
+            "control: without the column, reading an entry must fail"
+        );
+
+        init_schema(&conn).expect("v24→v25 migration failed");
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+
+        let entry = crate::store::memory::get_entry_without_tracking(&conn, "pre-v25")
+            .expect("read after migration")
+            .expect("the row must survive");
+        assert_eq!(entry.confirmations, 2, "existing counters are untouched");
+        assert_eq!(entry.corrections, 1);
+        assert_eq!(
+            entry.last_refuted_at, None,
+            "a store that never recorded a refutation date has none to invent"
+        );
+        assert!(
+            !entry.is_disputed(),
+            "and without a date, an old correction count cannot suppress injection"
+        );
     }
 
     #[test]

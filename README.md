@@ -31,6 +31,10 @@ use and then runs on-device.
   session warmup, provide opt-in prompt recall with a leading `*` by default,
   redirect code searches to indexed symbols, and reindex after edits. Always-on
   prompt recall is configurable.
+- **It learns from its own sessions** — an opt-in Stop hook distils the
+  episode that just ended into a behavioral prior, promotes lessons that recur
+  across sessions, injects them where their trigger fires, and settles each
+  injection as confirmed or refuted at the next Stop.
 - **Code intelligence is structural** — tree-sitter indexes 14 languages and
   persists symbols and call relationships, so callers, callees, and transitive
   impact do not require repeated multi-file grep.
@@ -62,52 +66,68 @@ the primary requirement.
 
 ## What it does
 
-- **Hybrid retrieval** — BM25 + local semantic vectors over documents and
-  memory, with result fusion and filters.
-- **Two knowledge graphs** — frontmatter/wikilink relations for project docs,
-  plus typed relations between memories and documents.
-- **Code intelligence** — tree-sitter parsing for 14 languages, symbol and
-  semantic code search, callers, callees, and transitive impact.
-- **Persistent memory** — `topic`, `problem`, `decision`, `reminder`, `prior`,
-  and `handoff` entries with duplicate detection and revision history.
-- **Lifecycle hooks** — session warmup, controlled prompt recall, code-search
-  guidance, and post-edit reindexing for Claude Code and Codex.
-- **Git-reviewable memory** — bidirectional synchronization between the local
-  store and `.mdkb/memory/entries/*.md` without projecting local usage churn.
-- **Unified diagnostics** — `mdkb stats` reports index health, collections,
-  memory, code, sessions, and hooks; `mdkb surface` maps MCP tools to CLI
-  commands.
-- **Self-maintaining indexes** — automatic watching, differential reindexing,
-  integrity checks, repair, and database maintenance.
+Five capabilities, each with its own section below.
 
-## Recent improvements
+### 1. Recall that reaches the agent without a tool call
 
-- **Content-aware prompt recall** now ranks memory with the same hybrid
-  BM25-plus-vector score used by search. The injection floor applies to that
-  final relevance score rather than to age-derived confidence, so old but
-  relevant engineering decisions survive while weak lexical matches stay out.
-- **One memory mutation path** serves CLI, MCP, batch writes, imports, and hook
-  workflows. Duplicate checks, embeddings, typed edges, revisions, and the
-  Git-reviewable Markdown projection therefore stay consistent regardless of
-  which surface wrote the entry.
-- **Typed receiver resolution** records both the written qualifier and the
-  inferred receiver type of method calls. The graph can distinguish calls such
-  as `store.write()` and `cache.write()` even when the member name is identical;
-  coupling analysis now trusts the same resolved-edge cascade instead of raw
-  name equality.
-- **Native HTTP/HTTPS hooks** share the exact Unix-hook dispatcher at
-  `POST /hook/{method}`. Claude Code can install supported HTTP handlers with
-  `--http-url`; authentication, repository selection, work draining, and error
-  envelopes are identical across transports.
-- **Safer network MCP** uses rmcp 3.3, bearer authentication, constant-time
-  token comparison, and an allow-list for `Host` headers to block DNS rebinding.
-- **Agent-readable tool metadata** labels all 12 MCP tools as read-only or
-  mutating, destructive or safe, idempotent or not, and open-world or local.
-  Clients can plan and ask for approval from declared behavior rather than
-  guessing from a tool name.
-- **Cleaner operations** remove dead configuration knobs, reject unknown config
-  with its dotted path, drain in-flight work on shutdown, and keep detached
-  daemon stderr in `~/.mdkb/logs/daemon.log`.
+Lifecycle hooks for Claude Code and Codex inject context at the moments it is
+useful: a ranked **session warmup** with the latest handoff and due reminders at
+SessionStart; **prompt recall** that ranks memory and documents against the
+prompt with the same hybrid BM25-plus-vector score as search, expands one hop
+through typed memory edges, and flags entries whose supporting memory was
+superseded; **code-index hits** that replace a `grep` for a definition with the
+real `file:line`; and **post-edit reindexing** so the index follows the edit.
+The same dispatcher serves command hooks, a Unix socket, and native HTTP. See
+[Hooks](#hooks-optional-recommended) and [docs/hooks.md](docs/hooks.md).
+
+### 2. Memory that ages by evidence, not by the calendar
+
+`topic`, `problem` and `decision` entries stay valid until superseded, refuted
+or expired; `reminder`, `prior` and `handoff` entries decay. Every entry carries
+provenance, a source-authority weight, a Bayesian confirmation signal
+(`memory_confirm`), up to three revision diffs, and typed edges (`supports`,
+`contradicts`, `supersedes`, `derived_from`, `relates_to`). Near-duplicates are
+rejected at write time, or linked as a contradiction on request. Durable
+entries are projected to `.mdkb/memory/entries/*.md` for review in Git; local
+usage counters never are. See [Memory](#memory).
+
+### 3. A self-learning loop over the agent's own sessions
+
+At Stop, mdkb reads the episode that just ended, detects an error that was
+fixed or a user correction, and asks a configured local or remote CLI
+(`codex`, `claude`, `ollama`, `grok`) to distil one falsifiable lesson with a
+machine-matchable trigger. Lessons that recur across sessions are promoted to
+**priors** and injected exactly where their trigger fires: before a tool call,
+after one, or on a matching prompt. Each injection is settled at the next Stop
+as confirmed or refuted, and `mdkb stats` shows what mining did. Off by
+default. See [Priors](#priors).
+
+### 4. Structural code intelligence, with audits built on it
+
+tree-sitter indexes 14 languages into persistent symbols and typed edges
+(`Calls`, `Uses`, `Implements`, `Expands`, `Defines`). Calls are resolved
+through a tiered cascade that keeps the written qualifier and the inferred
+receiver type, so `store.write()` and `cache.write()` are different edges and
+an unresolved call says so instead of inventing one. Two audits read the same
+index: `mdkb dup` reports what the repository says twice, bucketed by how
+trustworthy each finding is, and `mdkb coupling` reports files that change
+together in Git with no confidently resolved `Calls` edge between them. See
+[Code Intelligence](#code-intelligence).
+
+### 5. Retrieval you can measure
+
+`mdkb eval` scores memory search against a held-out fixture and fails CI below
+a floor; `mdkb stats` reports hook activation, hit rate, latency and mining
+outcomes; the opt-in developer telemetry profile records recall quality without
+storing prompt text. Numbers in this README and in `CHANGES.md` come from those
+commands, run on this repository. See [Retrieval eval](#retrieval-eval),
+[Stats](#stats) and [Developer Telemetry Profile](#developer-telemetry-profile).
+
+Also included: two knowledge graphs (frontmatter and wikilink relations for
+docs, typed relations for memory), 12 annotated MCP tools with a CLI twin for
+each (`mdkb surface`), self-maintaining indexes with integrity checks and
+repair, and store namespaces so a consumer's test suite cannot pollute its own
+memory.
 
 See [CHANGES.md](CHANGES.md) for release history.
 
@@ -271,7 +291,7 @@ full in-process server, sharing one daemon for file watching and indexing.
 | `update` | Differential reindex of all collections and source code |
 | `memory_write` | Create or update a memory entry (supports `ttl`, `due_in` for reminders, near-duplicate rejection) |
 | `memory_write_batch` | Create or update multiple memory entries at once (max 20) |
-| `memory_confirm` | Atomic Bayesian signal — `outcome="confirmed"` / `"refuted"` bumps `confirmations` and `last_confirmed_at` without rewriting content |
+| `memory_confirm` | Atomic Bayesian signal without rewriting content — `outcome="confirmed"` bumps `confirmations` and `last_confirmed_at`; `"refuted"` bumps `corrections`, stamps `last_refuted_at`, and stops the entry being injected unasked until it is reconfirmed |
 | `memory_delete` | Delete a memory entry |
 | `memory_list` | List memory entries sorted by recency, popularity, or creation date |
 | `usage` | Session and lifetime token ledger (per-tool call counts, token totals, truncation stats) |
@@ -286,7 +306,7 @@ validation and write admission remain authoritative.
 |-------|-----------------|
 | _(omit)_ | Docs + memory combined (default) |
 | `docs` | Hybrid BM25 + semantic over markdown documents |
-| `memory` | Full-text over memory entries |
+| `memory` | Hybrid BM25 + semantic over memory entries, identical on every surface — the CLI, the MCP tool and the recall hook build the same OR-expanded query and apply the same absolute relevance floor. Adding `--entry-type` on the CLI still selects a full-text-only path |
 | `symbols` | Exact symbol lookup by name, filterable by `kind` and `file` |
 | `code` | Semantic code search across indexed symbols |
 | `duplicates` | Clusters of near-identical bodies. `since="<ref>"` narrows the report to clusters your change touched |
@@ -330,9 +350,38 @@ Create with `memory_write(id, title, content, entry_type="reminder", due_in=<sec
 
 #### Priors
 
-Behavioral pattern entries written by external analyzers (e.g., HUD stop hooks). Create with `memory_write(id, title, content, entry_type="prior")` or `mdkb memory add <id> --entry-type prior`. Priors default to 30-day TTL and are excluded from all default searches — query them explicitly with `mdkb search --scope memory --entry-type prior "query"` or `search(query, scope="memory", entry_type="prior")` via MCP.
+A prior is a behavioral lesson mined from the agent's own sessions: *do not edit
+generated files, change the generator*. mdkb mines, promotes, injects and
+settles them itself; the loop is off until a distiller is configured.
 
-A prior states what went wrong once, and that stops being true when the code it was observed on changes. The 30 days apply whether the prior was written through `memory_write` or mined from a session by the recurrence gate — one that still holds gets promoted again, one that does not is archived by the next `mdkb update`.
+1. **Mine.** At Stop, with `[priors] mining_enabled = true` and a
+   `distiller_program`, the hook reads the tail of the transcript, looks for an
+   error that was fixed or a user correction, and sends tool names, the
+   redacted error signature and the correction to the configured CLI. The CLI
+   must answer with one JSON object: a falsifiable lesson (160 characters, no
+   hedging), a trigger kind (`prompt`, `pre_tool`, `post_tool`) with a
+   machine-matchable pattern, a scope, and the failure/fix evidence. Anything
+   else is rejected. `mdkb setup check` runs the configured CLI once and prints
+   the prior or the failure; four tested configurations are in
+   [docs/hooks.md](docs/hooks.md).
+2. **Cluster and promote.** Candidates with the same trigger, or a lesson within
+   0.85 cosine of an existing cluster, merge. A cluster seen in two distinct
+   sessions is promoted to a `prior` memory entry with a 30-day TTL.
+3. **Inject.** A promoted prior is injected only where its trigger fires: a
+   `pre_tool` lesson before the matching tool call, a `post_tool` lesson after
+   it, a `prompt` lesson when the prompt contains its pattern. At most one per
+   hook by default (`max_injected_per_hook`). Priors also take one reserved slot
+   in the session warmup when their confidence clears 0.7.
+4. **Settle.** At the next Stop, every prior injected in the session is marked
+   confirmed if its error signature did not recur, refuted if it did.
+   `mdkb memory confirm <id> --outcome confirmed|refuted` records a human
+   verdict on the same counters. The belief score gates future injection.
+
+`mdkb stats` shows mining outcomes for the last seven days (gated, distilled,
+promoted, rejected, failed, with the last reason). Priors are excluded from
+default searches and listings; query them with `--entry-type prior`. A prior
+can also be written by hand with `entry_type="prior"`, and receives the same
+30-day TTL.
 
 #### Handoffs
 
@@ -347,31 +396,6 @@ Source types control confidence weighting:
 | `auto_extracted` | 0.70 | Automated knowledge capture |
 | `inference` | 0.65 | AI-inferred knowledge |
 
-## Sessions
-
-mdkb indexes Claude Code session JSONL files from `~/.claude/projects` to track token usage and tool call statistics per session.
-
-### CLI
-
-```bash
-# Index sessions for the current project
-mdkb session index
-
-# Custom sessions directory or project root
-mdkb session index --sessions-path /path/to/sessions --project-root /path/to/project
-```
-
-Session data feeds the `mdkb stats` dashboard (session totals, top tools by call count and tokens) and the `usage` MCP tool.
-
-### MCP: `usage` tool
-
-Returns per-tool call counts, total tokens, and averages:
-
-```
-usage(session_only=true)   # current session (default)
-usage(session_only=false)  # lifetime aggregates across all sessions
-```
-
 ## Code Intelligence
 
 Tree-sitter parsing for **14 languages**: Rust, Go, TypeScript, JavaScript, Python, Java, Kotlin, C, C++, C#, PHP, Swift, Lua, and GDScript.
@@ -383,7 +407,11 @@ Tree-sitter parsing for **14 languages**: Rust, Go, TypeScript, JavaScript, Pyth
 - **Receiver-type inference** — Rust method receivers are reduced through local
   bindings, parameters, constructors, `Self`, and return values before the call
   cascade resolves the target. Ambiguous bare-name matches remain candidates,
-  not invented edges.
+  not invented edges. **This pass is Rust-only.** In the other 13 languages a
+  method call carries no receiver type, so it resolves on its written name
+  alone — the unplaced tier, or no candidate at all. `code_graph` says so in
+  the answer instead of letting a TypeScript result read as authoritative as a
+  Rust one.
 - **A call the index cannot place says so** — the graph distinguishes a call resolved inside the index, one naming a module the index does not contain (`std::fs::write`), and a bare name with no candidate. None of the three is reported as "no callers"
 - **Macro invocations are their own edge kind** — `assert!` and `println!` are expansions, not calls to functions that do not exist
 - **Imports, inheritance, type usage and construction** are recorded as edges, not only definitions
@@ -401,6 +429,45 @@ Generate semantic embeddings (downloads ~30MB ONNX model on first run):
 ```bash
 mdkb embed
 ```
+
+### Audits: duplication and hidden coupling
+
+Two audits read the same index. `dup` reports what the repository says twice;
+`coupling` reports files that change together in git history with no confidently
+resolved `Calls` edge between them. It uses the same callable-kind and
+resolution-tier cascade as the call graph, so a coincidental bare name cannot
+hide coupling. `Calls` at tiers 1–2 is the only edge that suppresses a pair: a
+pair joined solely by `Uses`, `Implements`, `Expands` or `Defines` is still
+reported, because those kinds say the two files are related, not that they must
+change together.
+
+```bash
+mdkb dup                          # sweep the repository
+mdkb dup --file src/code/parsing  # scope the candidates
+mdkb dup --since HEAD             # review mode: only clusters your change touched
+mdkb dup --semantic               # add the embedding pass (minutes, not seconds)
+mdkb coupling                     # 5+ shared commits over the last year
+mdkb coupling --since 6.months --min-cochanges 3
+mdkb dup --format json               # findings with their distance, for bucketing
+```
+
+`dup` runs two passes. The structural one compares fingerprints, needs no
+model, and finishes in seconds. The semantic one embeds every body and is
+**off by default**: measured on this repository it took 817 s of an 818 s run
+to add 69 of 767 clusters. Turn it on for a single run with `--semantic` or
+any `--threshold` override, or standing with `semantic = true` under
+`[code.duplication]` in `.mdkb/config.toml`. Over MCP, passing `threshold` to
+`search(scope="duplicates")` is the opt-in. A model that will not load
+degrades the run to the structural pass rather than failing it.
+
+Read `dup` knowing where its signal is: the report says so itself. After the
+headline, a bucket table breaks the clusters down by structural distance
+(`0`, `1-3`, `4`, `5`, `at cut`) and the semantic pass (`cosine`) — the
+clusters at 0–3 bits are the trustworthy core, the ones at the cut are mostly
+false positives. Clusters are ranked bucket-first, so a trustworthy finding
+outranks a noisy one regardless of how far it spreads. `--format json` carries
+the same `buckets` summary alongside `evidence.hamming` per cluster. See
+`CHANGES.md` for the measured distribution.
 
 ## CLI Reference
 
@@ -477,39 +544,6 @@ can still be unhelpful, especially when the prompt language differs from the
 indexed corpus. The current profile proves activation, performance, result
 shape, and repeated use; it does not infer helpfulness without explicit user
 feedback.
-
-Two audits read the same index. `dup` reports what the repository says twice;
-`coupling` reports files that change together in git history with no confidently
-resolved edge between them. It uses the same callable-kind and resolution-tier
-cascade as the call graph, so a coincidental bare name cannot hide coupling.
-
-```bash
-mdkb dup                          # sweep the repository
-mdkb dup --file src/code/parsing  # scope the candidates
-mdkb dup --since HEAD             # review mode: only clusters your change touched
-mdkb dup --semantic               # add the embedding pass (minutes, not seconds)
-mdkb coupling                     # 5+ shared commits over the last year
-mdkb coupling --since 6.months --min-cochanges 3
-mdkb dup --format json               # findings with their distance, for bucketing
-```
-
-`dup` runs two passes. The structural one compares fingerprints, needs no
-model, and finishes in seconds. The semantic one embeds every body and is
-**off by default**: measured on this repository it took 817 s of an 818 s run
-to add 69 of 767 clusters. Turn it on for a single run with `--semantic` or
-any `--threshold` override, or standing with `semantic = true` under
-`[code.duplication]` in `.mdkb/config.toml`. Over MCP, passing `threshold` to
-`search(scope="duplicates")` is the opt-in. A model that will not load
-degrades the run to the structural pass rather than failing it.
-
-Read `dup` knowing where its signal is: the report says so itself. After the
-headline, a bucket table breaks the clusters down by structural distance
-(`0`, `1-3`, `4`, `5`, `at cut`) and the semantic pass (`cosine`) — the
-clusters at 0–3 bits are the trustworthy core, the ones at the cut are mostly
-false positives. Clusters are ranked bucket-first, so a trustworthy finding
-outranks a noisy one regardless of how far it spreads. `--format json` carries
-the same `buckets` summary alongside `evidence.hamming` per cluster. See
-`CHANGES.md` for the measured distribution.
 
 ### Knowledge Graph
 
@@ -625,6 +659,19 @@ mdkb stats --no-color
 ```
 
 The report is stacked: header (repo, version, db size, last update) → index health → collections → memory (by entry type, reminders DUE / upcoming 7d) → code (by language, top files by tokens) → sessions (totals, top tools) → hooks (invocations, hit rate, latency, prior mining, registration drift). Output auto-detects whether stdout is a TTY; the JSON format is stable for scripting.
+
+#### Sessions
+
+The sessions row comes from Claude Code session JSONL files under
+`~/.claude/projects`, indexed per project for token usage and tool-call counts:
+
+```bash
+mdkb session index
+mdkb session index --sessions-path /path/to/sessions --project-root /path/to/project
+```
+
+The same data backs the `usage` MCP tool: `usage(session_only=true)` for the
+current session, `usage(session_only=false)` for lifetime aggregates.
 
 ## Configuration
 

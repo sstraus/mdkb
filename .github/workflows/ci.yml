@@ -48,10 +48,14 @@ jobs:
         run: cargo run --all-features --quiet -- eval recall --mode embedding --download
 
       - name: Retrieval eval
+        # No bm25 floor: the absolute recall gate leaves that mode at 0 on this
+        # fixture by design, and `committed_fixture_bm25_baseline_holds` pins
+        # the exact 0 in the always-running unit suite above. A `--min-recall 0`
+        # here would be an assertion that cannot fail.
         run: |
-          cargo run --all-features --quiet -- eval recall --mode bm25 --min-recall 0.16
-          cargo run --all-features --quiet -- eval recall --mode hybrid --min-recall 0.9
-          cargo run --all-features --quiet -- eval recall --mode embedding
+          cargo run --all-features --quiet -- eval recall --mode bm25
+          cargo run --all-features --quiet -- eval recall --mode hybrid --min-recall 0.58 --min-precision 1.0
+          cargo run --all-features --quiet -- eval recall --mode embedding --min-recall 0.58 --min-precision 1.0
           cargo run --all-features --quiet -- eval judge
 
   test-windows:

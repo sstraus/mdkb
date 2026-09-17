@@ -151,13 +151,16 @@ mod tests {
 
         let cases = vec![
             // Retrieved oauth context supports the expected answer → Correct.
+            // Both questions quote a consecutive run of the entry's own words:
+            // BM25-only retrieval has no distance, so the absolute recall gate
+            // admits on a strong lexical match or not at all.
             JudgeCase {
-                question: "pkce exchange".into(),
+                question: "authorization code exchange".into(),
                 expected_answer: "code exchange".into(),
             },
             // Retrieved cache context does not support this answer → Incorrect.
             JudgeCase {
-                question: "cache eviction".into(),
+                question: "least recently used eviction".into(),
                 expected_answer: "quantum entanglement".into(),
             },
         ];

@@ -421,8 +421,15 @@ fn read_commands_leave_no_write_trace_on_the_store() {
         );
     }
 
+    // `HOME` is a fresh tempdir, so the embedding weights are not on disk.
+    // `scope=code` is purely semantic — it has no lexical arm to fall back to —
+    // and `get_cached_service` no longer downloads on a query path, so the
+    // command reports "embedding model not cached" instead of searching. That
+    // is the honest answer: an empty result set here would say "no matches"
+    // about a search that never ran. Every other row still succeeds, which is
+    // what keeps this row from hiding a real read-only regression.
     for (args, succeeds) in [
-        (vec!["search", "missing", "--scope", "code"], true),
+        (vec!["search", "missing", "--scope", "code"], false),
         (vec!["search", "missing", "--scope", "symbols"], true),
         (vec!["code", "search", "missing"], true),
         (vec!["code", "find", "missing"], true),

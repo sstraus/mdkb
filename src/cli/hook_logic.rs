@@ -36,53 +36,6 @@ pub fn prompt_is_wrapup(prompt: &str) -> bool {
         .any(|m| trimmed.starts_with(m) || trimmed.eq_ignore_ascii_case(m.trim_start_matches('/')))
 }
 
-// ── FTS recall query ──────────────────────────────────────────────────────────
-
-/// Common English/Italian stopwords stripped before FTS matching.
-const STOPWORDS: &[&str] = &[
-    "a", "an", "and", "or", "but", "the", "of", "to", "in", "on", "at", "by", "for", "with", "as",
-    "is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did",
-    "will", "would", "could", "should", "may", "might", "can", "shall", "we", "you", "i", "he",
-    "she", "it", "they", "them", "us", "my", "your", "our", "their", "this", "that", "these",
-    "those", "how", "what", "why", "when", "where", "who", "which", "so", "if", "then", "than",
-    "about", "into", "from", "up", "down", "out", "over", "under", "not", "no", "yes", "il", "la",
-    "le", "lo", "gli", "un", "uno", "una", "di", "da", "del", "della", "che", "e", "o", "ma", "se",
-    "ci", "si", "mi", "ti", "per", "con", "su", "come", "quando", "perche", "cosa", "dove", "chi",
-    "quale", "non", "sono", "era", "stato",
-];
-
-/// Build an FTS5 query string from a natural-language prompt by stripping
-/// stopwords and keeping alphanumeric tokens ≥ 3 chars. Returns None when
-/// the filtered query would be empty or too narrow to produce useful recall.
-pub fn build_recall_query(prompt: &str) -> Option<String> {
-    let tokens: Vec<String> = prompt
-        .split(|c: char| !c.is_alphanumeric())
-        .filter_map(|tok| {
-            let t = tok.to_lowercase();
-            if t.len() < 3 {
-                return None;
-            }
-            if STOPWORDS.contains(&t.as_str()) {
-                return None;
-            }
-            Some(t)
-        })
-        .collect();
-
-    if tokens.is_empty() {
-        return None;
-    }
-
-    // Join with OR so a conversational prompt matches on any keyword.
-    // Wrap each token in quotes to neutralize FTS operators inside.
-    let query = tokens
-        .iter()
-        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
-        .collect::<Vec<_>>()
-        .join(" OR ");
-    Some(query)
-}
-
 // ── Path utilities ────────────────────────────────────────────────────────────
 
 /// Tool names whose output may modify on-disk files we want to reindex.

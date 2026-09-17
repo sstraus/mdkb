@@ -656,6 +656,11 @@ pub enum EvalCommand {
         /// Exit 1 when any mode that ran scores recall@k below this
         #[arg(long)]
         min_recall: Option<f64>,
+        /// Exit 1 when any mode that ran scores precision below this. Guards
+        /// the absolute relevance floor: lowering it raises recall, so a
+        /// recall floor alone cannot catch its removal.
+        #[arg(long)]
+        min_precision: Option<f64>,
     },
 
     /// Answer-support accuracy over a fixture (deterministic SubstringJudge)

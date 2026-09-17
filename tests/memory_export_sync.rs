@@ -4,7 +4,7 @@
 
 use std::path::PathBuf;
 
-use mdkb::cli::handlers::{handle_init, handle_update, sync_memory_files};
+use mdkb::cli::handlers::{handle_init, handle_memory_rm, handle_update, sync_memory_files};
 use mdkb::core::Context;
 use mdkb::store::memory::{self, EntryStatus, EntryType, MemoryEntry, SourceType};
 use tempfile::TempDir;
@@ -47,7 +47,9 @@ impl Env {
                 last_accessed: None,
                 source_path: None,
                 confirmations: 0,
+                corrections: 0,
                 last_confirmed_at: None,
+                last_refuted_at: None,
                 source_type: SourceType::UserStatement,
                 expires_at: None,
                 due_at: None,
@@ -226,4 +228,86 @@ fn update_runs_sync_and_reports_counts() {
     assert_eq!(r.memory_files_projected, 1);
     assert!(env.entries_dir().join("via-update.md").exists());
     assert_eq!(env.file_count() as i64, env.active_count());
+}
+
+/// Story 088: the resurrection this ordering exists to prevent.
+///
+/// `memory rm` used to delete the row first and archive the markdown file
+/// afterwards, best-effort. A file left in `entries/` with no row behind it is
+/// imported by the next reconciliation, so a failed rename brought the deleted
+/// entry back.
+#[test]
+fn memory_rm_then_sync_does_not_resurrect_the_entry() {
+    let env = Env::new();
+    env.add_db_only("gone");
+    env.add_db_only("kept");
+    sync_memory_files(&env.ctx).expect("initial sync");
+    assert!(env.entries_dir().join("gone.md").exists());
+
+    assert!(handle_memory_rm(&env.ctx, "gone").expect("rm"));
+    assert_eq!(env.status_of("gone"), None, "the row is gone");
+    assert!(
+        !env.entries_dir().join("gone.md").exists(),
+        "the projection left entries/ in the same operation"
+    );
+    assert!(
+        env.root.join(".mdkb/memory/archive/gone.md").exists(),
+        "and it was archived, not destroyed"
+    );
+
+    let s = sync_memory_files(&env.ctx).expect("resync");
+    assert_eq!(env.status_of("gone"), None, "sync did not import it back");
+    assert_eq!(s.imported, 0, "nothing on disk claimed to be a new entry");
+    assert_eq!(
+        env.status_of("kept").as_deref(),
+        Some("active"),
+        "the untouched entry is unaffected"
+    );
+}
+
+/// Story 088: archive first means a failure cannot retire anything.
+///
+/// The archive directory is replaced by a regular file, so the `create_dir_all`
+/// inside `archive_projection` fails. `rm` must report that error with the row
+/// untouched — the alternative is a deleted entry whose file is still on disk.
+#[test]
+fn a_failing_archive_leaves_the_row_in_place() {
+    let env = Env::new();
+    env.add_db_only("stubborn");
+    sync_memory_files(&env.ctx).expect("initial sync");
+
+    let archive = env.root.join(".mdkb/memory/archive");
+    if archive.exists() {
+        std::fs::remove_dir_all(&archive).expect("clear archive dir");
+    }
+    std::fs::write(&archive, b"not a directory").expect("occupy the archive path");
+
+    let err = handle_memory_rm(&env.ctx, "stubborn").expect_err("archive cannot succeed");
+    assert_eq!(
+        env.status_of("stubborn").as_deref(),
+        Some("active"),
+        "the row survives a failed archive: {err}"
+    );
+    assert!(
+        env.entries_dir().join("stubborn.md").exists(),
+        "and so does its projection, so a retry has something to archive"
+    );
+
+    // The retry, once the path is a directory again, is the whole point of
+    // failing loudly here.
+    std::fs::remove_file(&archive).expect("free the archive path");
+    assert!(handle_memory_rm(&env.ctx, "stubborn").expect("retry"));
+    assert_eq!(env.status_of("stubborn"), None);
+}
+
+/// An `rm` of an id the store never had must not touch a stray file: that file
+/// belongs to no row, and deciding its fate is `sync`'s job, not `rm`'s.
+#[test]
+fn removing_an_unknown_id_is_a_no_op() {
+    let env = Env::new();
+    let stray = env.entries_dir().join("not-a-row.md");
+    std::fs::write(&stray, "---\nid: not-a-row\n---\nbody").expect("write stray");
+
+    assert!(!handle_memory_rm(&env.ctx, "not-a-row").expect("rm"));
+    assert!(stray.exists(), "the stray file is left for sync to judge");
 }

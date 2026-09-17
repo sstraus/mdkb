@@ -399,6 +399,7 @@ pub fn chunk_vector_search(
     conn: &Connection,
     query_embedding: &[f32],
     limit: usize,
+    collection: Option<&str>,
 ) -> Result<Vec<(i64, f32)>> {
     let embedding_bytes = query_embedding.as_bytes();
     let fetch_limit = limit * 5;
@@ -427,6 +428,25 @@ pub fn chunk_vector_search(
         return Ok(Vec::new());
     }
 
+    // The BM25 leg filters on `d.collection`; this leg must agree or a scoped
+    // query draws its whole pool from the corpus and the caller discards it
+    // after the cap. Filtering both legs once, here, keeps the two SQL shapes
+    // above unchanged.
+    //
+    // DEFERRED (2026-09-16) — this is post-filtering over a KNN result, so it
+    // narrows what a scoped search returns but cannot guarantee completeness:
+    // if the nearest `fetch_limit` chunks all sit outside the collection, a
+    // farther in-collection match is still invisible. A complete answer needs
+    // the collection inside the vector index (a vec0 metadata column) or an
+    // iterative widening loop. Neither is justified until a scoped search is
+    // measured coming back short.
+    if let Some(collection) = collection {
+        retain_documents_in_collection(conn, &mut best_per_doc, collection);
+        if best_per_doc.is_empty() {
+            return Ok(Vec::new());
+        }
+    }
+
     let mut results: Vec<(i64, f32)> = best_per_doc.into_iter().collect();
     results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(limit);
@@ -447,6 +467,36 @@ pub fn delete_chunk_embeddings(conn: &Connection, document_id: i64) -> Result<()
 }
 
 /// Search vec_chunks, returning (document_id, distance) aggregated by best chunk per doc.
+/// Drop every document id that is not in `collection`.
+///
+/// One query for the whole candidate set: the ids come from a vector scan that
+/// has no collection predicate of its own, so this is where both legs of
+/// [`chunk_vector_search`] agree with the BM25 leg. A query failure leaves the
+/// candidates untouched rather than silently emptying a scoped search.
+fn retain_documents_in_collection(
+    conn: &Connection,
+    candidates: &mut std::collections::HashMap<i64, f32>,
+    collection: &str,
+) {
+    let placeholders: String = candidates
+        .keys()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("SELECT id FROM documents WHERE id IN ({placeholders}) AND collection = ?1");
+    let kept: std::collections::HashSet<i64> = match conn.prepare(&sql).and_then(|mut stmt| {
+        stmt.query_map(params![collection], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<i64>>>()
+    }) {
+        Ok(ids) => ids.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!("collection filter for the vector leg failed: {e}");
+            return;
+        }
+    };
+    candidates.retain(|id, _| kept.contains(id));
+}
+
 fn search_vec_chunks_by_doc(
     conn: &Connection,
     embedding_bytes: &[u8],
@@ -664,6 +714,60 @@ mod tests {
 
         assert_eq!(retrieved.len(), EMBEDDING_DIM);
         assert!((retrieved[0] - 0.1).abs() < 0.001);
+    }
+
+    /// Seed one collection with one embedded document, returning its id.
+    fn seed_doc(conn: &Connection, collection: &str, path: &str, hash: &str, seed: f32) -> i64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES (?1, '.', '*.md', 0, 0)",
+            params![collection],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES (?1, 'body', 0)",
+            params![hash],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+             VALUES (?1, ?2, ?3, 0, 0)",
+            params![collection, path, hash],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        store_embedding(conn, id, &test_embedding(seed), "test").unwrap();
+        id
+    }
+
+    #[test]
+    fn chunk_vector_search_scoped_to_a_collection_excludes_other_collections() {
+        // The BM25 leg of `hybrid_search_fts` filters on `d.collection`; the
+        // vector leg must too. Otherwise a scoped query whose wording does not
+        // overlap the text lexically draws its whole candidate pool from the
+        // corpus, every out-of-collection candidate is discarded after the cap,
+        // and the search answers "nothing found" while a match exists.
+        let conn = setup_db();
+        let wanted = seed_doc(&conn, "docs", "wanted.md", "h-wanted", 0.30);
+        // Nearer to the query than the wanted document, and in another collection.
+        let _decoy = seed_doc(&conn, "notes", "decoy.md", "h-decoy", 0.10);
+
+        let query = test_embedding(0.10);
+
+        // Unscoped: the nearer decoy leads.
+        let all = chunk_vector_search(&conn, &query, 10, None).unwrap();
+        assert!(
+            all.len() == 2,
+            "unscoped search sees both documents, got {all:?}"
+        );
+
+        // Scoped: only the wanted document, even though it is the farther one.
+        let scoped = chunk_vector_search(&conn, &query, 10, Some("docs")).unwrap();
+        assert_eq!(
+            scoped.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![wanted],
+            "a scoped vector search must return only documents in that collection"
+        );
     }
 
     #[test]
@@ -1096,7 +1200,7 @@ mod tests {
 
         // Search near auth section (0.5) — should find doc 1 via chunk, doc 2 via whole-doc
         let query = test_embedding(0.49);
-        let results = chunk_vector_search(&conn, &query, 10).unwrap();
+        let results = chunk_vector_search(&conn, &query, 10, None).unwrap();
 
         assert!(
             results.len() >= 2,
@@ -1147,7 +1251,7 @@ mod tests {
         store_chunk_embeddings(&conn, 1, &chunks, &embeddings, "test").unwrap();
 
         let query = test_embedding(0.15);
-        let results = chunk_vector_search(&conn, &query, 10).unwrap();
+        let results = chunk_vector_search(&conn, &query, 10, None).unwrap();
 
         // Should return doc 1 only once (aggregated from 3 chunks)
         assert_eq!(results.len(), 1);
@@ -1181,7 +1285,7 @@ mod tests {
         assert!(!has_chunk_embeddings(&conn, 1).unwrap());
 
         // Chunk vector search should fall back to doc-level (which was also stored)
-        let results = chunk_vector_search(&conn, &test_embedding(0.1), 10).unwrap();
+        let results = chunk_vector_search(&conn, &test_embedding(0.1), 10, None).unwrap();
         // Doc-level embedding was stored by store_chunk_embeddings, still exists
         assert!(results.len() <= 1);
     }
@@ -1194,7 +1298,7 @@ mod tests {
         // Only whole-doc embedding, no chunks
         store_embedding(&conn, 1, &test_embedding(0.5), "test").unwrap();
 
-        let results = chunk_vector_search(&conn, &test_embedding(0.49), 10).unwrap();
+        let results = chunk_vector_search(&conn, &test_embedding(0.49), 10, None).unwrap();
         assert_eq!(results.len(), 1, "Should fall back to doc-level search");
         assert_eq!(results[0].0, 1);
     }

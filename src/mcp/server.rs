@@ -759,7 +759,7 @@ impl McpServer {
 
     /// Record a Bayesian confirmation signal for a memory entry.
     #[tool(
-        description = "Record outcome=\"confirmed\"|\"refuted\" against a memory entry. Atomic: increments or decrements confirmations (floor 0) and advances last_confirmed_at.",
+        description = "Record outcome=\"confirmed\"|\"refuted\" against a memory entry. Atomic: confirmed raises confirmations and advances last_confirmed_at; refuted raises corrections, stamps last_refuted_at and suppresses the entry from automatic injection until it is reconfirmed.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3024,7 +3024,9 @@ mod tests {
                     last_accessed: None,
                     source_path: None,
                     confirmations: 0,
+                    corrections: 0,
                     last_confirmed_at: None,
+                    last_refuted_at: None,
                     source_type: memory::SourceType::UserStatement,
                     expires_at: None,
                     due_at: None,

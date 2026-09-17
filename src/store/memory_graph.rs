@@ -263,22 +263,16 @@ pub fn incoming(
 /// Resolve a memory `target_ref` to a live entry, or `None` when it does not
 /// exist yet (dangling) or is no longer injectable (superseded / expired).
 ///
-/// Used by recall expansion (Step 5) so only active neighbors surface; also
-/// proves a dangling edge resolves once its target entry is created.
-pub fn resolve_active(conn: &Connection, target_ref: &str) -> Result<Option<MemoryEntry>> {
-    Ok(live(memory::get_entry(conn, target_ref)?))
-}
-
-/// The same resolution without counting the lookup as a use.
+/// Used by recall expansion so only active neighbors surface, and by the
+/// duplication ignore-list to check an entry still stands; also proves a
+/// dangling edge resolves once its target entry is created.
 ///
-/// A machine checking whether an entry still stands — the duplication
-/// ignore-list does it once per cluster per audit — is not a recall. Counting
-/// it would both inflate the recency signal that ranks memory search and
-/// require a writable connection for what is a read.
-pub fn resolve_active_untracked(
-    conn: &Connection,
-    target_ref: &str,
-) -> Result<Option<MemoryEntry>> {
+/// Resolution NEVER counts as a use. A machine following an edge is not the
+/// agent reading the entry: counting it would feed `access_recency_score` —
+/// the third RRF signal — from the injection itself, so an entry would rank
+/// higher because it was injected, with no new evidence. It would also require
+/// a writable connection for what is a read.
+pub fn resolve_active(conn: &Connection, target_ref: &str) -> Result<Option<MemoryEntry>> {
     Ok(live(memory::get_entry_without_tracking(conn, target_ref)?))
 }
 
@@ -412,7 +406,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -719,6 +715,40 @@ mod tests {
         )
         .unwrap();
         assert!(has_stale_dependency(&conn, "child").unwrap());
+    }
+
+    /// Story 087, criterion 7. The test above hand-writes `corrections` with
+    /// SQL, which is how this whole subsystem could pass its tests while being
+    /// unreachable: nothing in production wrote that column, so no dependent was
+    /// ever reported stale. This one goes through the production writer.
+    #[test]
+    fn refuting_an_entry_makes_its_dependents_stale() {
+        let conn = setup_db();
+        insert_memory(&conn, "child");
+        insert_memory(&conn, "base");
+        add_edge(
+            &conn,
+            "child",
+            "base",
+            TargetKind::Memory,
+            MemoryRelation::DerivedFrom,
+        )
+        .unwrap();
+        assert!(
+            !has_stale_dependency(&conn, "child").unwrap(),
+            "control: a live base is not a stale dependency"
+        );
+
+        crate::store::memory::confirm_entry(&conn, "base", -1).unwrap();
+
+        assert!(
+            has_stale_dependency(&conn, "child").unwrap(),
+            "a refuted base must make its dependents stale"
+        );
+        assert_eq!(
+            stale_dependency_ids(&conn, &["child"]).unwrap(),
+            std::collections::HashSet::from(["child".to_string()])
+        );
     }
 
     #[test]

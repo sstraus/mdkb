@@ -491,6 +491,7 @@ struct Row {
     confirmations: i64,
     corrections: i64,
     last_confirmed_at: Option<i64>,
+    last_refuted_at: Option<i64>,
     source_type: String,
     /// `expires_at - created_at`.
     expires_in: Option<i64>,
@@ -525,6 +526,7 @@ fn row(repo: &Repo, id: &str) -> Row {
         i64,
         i64,
         Option<i64>,
+        Option<i64>,
         String,
         Option<i64>,
         Option<i64>,
@@ -537,8 +539,9 @@ fn row(repo: &Repo, id: &str) -> Row {
         .query_row(
             "SELECT id, title, content, entry_type, tags, status, created_at, updated_at,
                     superseded_by, access_count, last_accessed, source_path, confirmations,
-                    corrections, last_confirmed_at, source_type, expires_at, due_at,
-                    created_session, created_agent, projected_at, projected_hash
+                    corrections, last_confirmed_at, last_refuted_at, source_type,
+                    expires_at, due_at, created_session, created_agent,
+                    projected_at, projected_hash
              FROM memory_entries WHERE id = ?1",
             [id],
             |r| {
@@ -565,6 +568,7 @@ fn row(repo: &Repo, id: &str) -> Row {
                     r.get(19)?,
                     r.get(20)?,
                     r.get(21)?,
+                    r.get(22)?,
                 ))
             },
         )
@@ -623,12 +627,13 @@ fn row(repo: &Repo, id: &str) -> Row {
         confirmations: s.12,
         corrections: s.13,
         last_confirmed_at: s.14,
-        source_type: s.15,
-        expires_in: s.16.map(|t| t - created_at),
-        due_in: s.17.map(|t| t - created_at),
-        created_session: s.18,
-        created_agent: s.19,
-        projection_recorded: s.20.is_some() && s.21.is_some(),
+        last_refuted_at: s.15,
+        source_type: s.16,
+        expires_in: s.17.map(|t| t - created_at),
+        due_in: s.18.map(|t| t - created_at),
+        created_session: s.19,
+        created_agent: s.20,
+        projection_recorded: s.21.is_some() && s.22.is_some(),
         edges,
         embedded: embedded > 0,
         revisions,
@@ -1004,16 +1009,20 @@ fn search_repo() -> Repo {
     .expect("write faq");
     run(&["update"], &repo.root);
 
+    // The identifier carries the memory half of the parity check: the MCP
+    // surface gates recall on an absolute cosine floor OR a strong lexical
+    // match, and this fixture runs without an embedding service, so a query
+    // for one ordinary word would be admitted on neither arm.
     for (id, title, content) in [
         (
             "mem-one",
             "Parity note one",
-            "the fixture word appears here",
+            "the parity_fixture_word appears here",
         ),
         (
             "mem-two",
             "Parity note two",
-            "the fixture word appears here as well",
+            "the parity_fixture_word appears here as well",
         ),
     ] {
         run(
@@ -1055,14 +1064,81 @@ async fn both_surfaces_return_the_same_documents() {
     );
 }
 
+/// A paraphrase has to retrieve the same entry on all three doors.
+///
+/// Story 084. Three engines used to answer this one question: the CLI went
+/// through plain token-AND FTS, the MCP tool through token-AND plus the vector
+/// leg, the hook through OR-expansion plus the vector leg. Token-AND returns
+/// nothing as soon as one query word is absent from the entry, so this query —
+/// which names the entry's identifier and then three words no entry contains —
+/// used to be two empty results and one hit.
+///
+/// No embedding is needed to see the difference, which is why this runs
+/// everywhere: with no model all three degrade to the same strong-lexical
+/// admission, and the identifier is the evidence that admits.
+#[tokio::test]
+async fn all_three_surfaces_answer_the_same_paraphrase() {
+    const QUERY: &str = "does parity_fixture_word survive a paraphrase";
+    let repo = search_repo();
+
+    let cli = text(&run(&["search", QUERY, "--scope", "memory"], &repo.root));
+    let cli_ids = bracketed_ids(&cli);
+    assert_eq!(
+        cli_ids.len(),
+        2,
+        "the CLI must not be token-AND any more:\n{cli}"
+    );
+
+    let (mcp, count) = mcp_search(&repo, "memory", QUERY).await;
+    assert_eq!(count, cli_ids.len(), "MCP said:\n{mcp}");
+    assert_eq!(
+        bracketed_ids(&mcp),
+        cli_ids,
+        "the same entries in the same order\nCLI:\n{cli}\nMCP:\n{mcp}"
+    );
+
+    // The third door. The `*` sigil rather than a config patch: recall
+    // injection is gated behind it by default and this test has no business
+    // changing that default.
+    let hook = user_prompt_submit(&repo.root, &format!("* {QUERY}"));
+    for id in &cli_ids {
+        assert!(
+            hook.contains(id),
+            "the hook must recall {id} for the same paraphrase:\n{hook}"
+        );
+    }
+}
+
+/// Run the `UserPromptSubmit` hook over this repository and return its stdout.
+fn user_prompt_submit(cwd: &Path, prompt: &str) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+    let event = serde_json::json!({ "prompt": prompt }).to_string();
+    let mut child = cli::command()
+        .args(["hook", "user-prompt-submit"])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .spawn()
+        .expect("spawn mdkb hook user-prompt-submit");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(event.as_bytes())
+        .expect("write hook event");
+    let out = child.wait_with_output().expect("wait for hook");
+    assert!(out.status.success(), "the hook must always exit 0");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 #[tokio::test]
 async fn both_surfaces_return_the_same_memory_entries() {
     let repo = search_repo();
     let cli = text(&run(
-        &["search", "fixture", "--scope", "memory"],
+        &["search", "parity_fixture_word", "--scope", "memory"],
         &repo.root,
     ));
-    let (mcp, count) = mcp_search(&repo, "memory", "fixture").await;
+    let (mcp, count) = mcp_search(&repo, "memory", "parity_fixture_word").await;
 
     let cli_ids = bracketed_ids(&cli);
     assert_eq!(

@@ -19,9 +19,8 @@ use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
 
 use crate::cli::hook_logic::{
-    REINDEX_TOOLS, build_recall_query, canonicalize_under_cwd, classify_bash_search,
-    classify_definition_search, classify_grep_pattern, is_mdkb_invocation, prompt_is_wrapup,
-    tool_input_path,
+    REINDEX_TOOLS, canonicalize_under_cwd, classify_bash_search, classify_definition_search,
+    classify_grep_pattern, is_mdkb_invocation, prompt_is_wrapup, tool_input_path,
 };
 use crate::code::indexing::IndexFacade;
 use crate::core::Context;
@@ -933,14 +932,11 @@ pub async fn memory_delete_impl(
 
     let mut ctx_guard = handle.ctx.lock().await;
     let deleted = run_handle_memory_mutation(&mut ctx_guard, "memory delete", |ctx| {
-        let deleted = memory::delete_entry(&ctx.conn, id)
-            .map_err(|e| mcp_store_error("Failed to delete memory entry", e))?;
-        if deleted {
-            // Same door as `mdkb memory rm`: a file left in `entries/` would be
-            // re-imported by the next reconciliation.
-            crate::core::memory_sync::archive_after_delete(ctx, id);
-        }
-        Ok(deleted)
+        // Literally the same door as `mdkb memory rm`, not a copy of it: the
+        // archive-then-delete order that keeps a retired entry from being
+        // re-imported must not exist twice.
+        crate::core::memory::handle_memory_rm(ctx, id)
+            .map_err(|e| mcp_store_error("Failed to delete memory entry", e))
     })?;
 
     Ok(if deleted {
@@ -951,7 +947,8 @@ pub async fn memory_delete_impl(
 }
 
 /// `memory_confirm` — record a Bayesian confirmation signal against an entry.
-/// `outcome` must be "confirmed" (+1) or "refuted" (-1, floor 0).
+/// `outcome` must be "confirmed" (raises `confirmations`) or "refuted" (raises
+/// `corrections` and suppresses automatic injection).
 pub async fn memory_confirm_impl(
     handle: &RepoHandle,
     id: &str,
@@ -1382,13 +1379,12 @@ pub async fn search_impl(
             let query_embedding = embed_query_off_lock(&params.query).await;
             let mut ctx_guard = handle.ctx.lock().await;
             let entries = crate::core::run_guarded_read(&mut ctx_guard, "memory search", |ctx| {
-                memory::search_entries_hybrid(
+                memory::search_entries_recall(
                     &ctx.conn,
                     &params.query,
                     query_embedding.as_deref(),
                     limit,
-                    handle.config.search.memory.access_recency_weight,
-                    handle.config.search.memory.recency_half_life_secs,
+                    &handle.config.search.memory,
                 )
             })
             .ok_or_else(|| mcp_error("Database not initialized"))?
@@ -1420,13 +1416,12 @@ pub async fn search_impl(
                         params.collection.as_deref(),
                         params.include_superseded,
                     )?;
-                    let memories = memory::search_entries_hybrid(
+                    let memories = memory::search_entries_recall(
                         &ctx.conn,
                         &params.query,
                         query_embedding.as_deref(),
                         limit,
-                        handle.config.search.memory.access_recency_weight,
-                        handle.config.search.memory.recency_half_life_secs,
+                        &handle.config.search.memory,
                     )?;
                     Ok((docs, memories))
                 })
@@ -1618,8 +1613,7 @@ pub async fn cross_repo_search_impl(
         let collection = params.collection.clone();
         let include_superseded = params.include_superseded;
         let min_confidence = params.min_confidence;
-        let recency_weight = handle.config.search.memory.access_recency_weight;
-        let recency_half_life = handle.config.search.memory.recency_half_life_secs;
+        let memory_cfg = handle.config.search.memory.clone();
 
         async move {
             if let Err(e) = ensure_handle_context(&handle).await {
@@ -1678,13 +1672,12 @@ pub async fn cross_repo_search_impl(
                         &mut ctx_guard,
                         "cross-repo memory search",
                         |ctx| {
-                            memory::search_entries_hybrid(
+                            memory::search_entries_recall(
                                 &ctx.conn,
                                 &query,
                                 query_embedding.as_deref(),
                                 limit,
-                                recency_weight,
-                                recency_half_life,
+                                &memory_cfg,
                             )
                         },
                     );
@@ -2817,10 +2810,11 @@ pub async fn code_graph_impl(
     if hits.is_empty() {
         let text = match params.direction.as_str() {
             "calls" => format!(
-                "{} ({:?}) calls no indexed function.{}",
+                "{} ({:?}) calls no indexed function.{}{}",
                 symbol.name,
                 symbol.kind,
-                unplaced_suffix(&unplaced)
+                unplaced_suffix(&unplaced),
+                receiver_inference_note(&symbol.file_path, &unplaced, &call_evidence)
             ),
             "callers" => format!(
                 "{} ({:?}) has no indexed callers.",
@@ -2836,11 +2830,12 @@ pub async fn code_graph_impl(
 
     let mut text = match params.direction.as_str() {
         "calls" => format!(
-            "{} ({:?}) calls {} indexed function(s).{}\n\n",
+            "{} ({:?}) calls {} indexed function(s).{}{}\n\n",
             symbol.name,
             symbol.kind,
             hits.len(),
-            unplaced_suffix(&unplaced)
+            unplaced_suffix(&unplaced),
+            receiver_inference_note(&symbol.file_path, &unplaced, &call_evidence)
         ),
         "callers" => format!(
             "{} ({:?}) is called by {} function(s).{}\n\n",
@@ -2924,6 +2919,51 @@ fn unplaced_suffix(unplaced: &crate::core::code::UnplacedCalls) -> String {
     } else {
         format!(" Also calls {}.", parts.join(", "))
     }
+}
+
+/// Why a non-Rust `calls` answer is weaker than a Rust one, empty when the
+/// distinction cannot bite.
+///
+/// Call-site receiver-type inference exists for Rust only:
+/// `src/code/parsing/rust/parser.rs` is the sole producer of
+/// `Call::receiver_type`, and every other parser leaves it `None`. So for the
+/// other 13 indexed languages a method call carries no receiver type, and the
+/// cascade has nothing to place it with beyond the written name — which is the
+/// unplaced tier, or no candidate at all. Without this sentence a TypeScript
+/// answer reads as authoritative as a Rust one.
+///
+/// Emitted only when the weakness is actually present: a non-Rust symbol whose
+/// calls all resolved at a near tier through a written qualifier is as
+/// trustworthy as a Rust one, and the note would be noise.
+fn receiver_inference_note(
+    file_path: &str,
+    unplaced: &crate::core::code::UnplacedCalls,
+    tiers: &[(i64, bool)],
+) -> String {
+    use crate::code::parsing::language::Language;
+
+    // Extension only, never `Language::from_path`: that one falls back to
+    // reading the file for a shebang, and this runs on an MCP hot path.
+    let language = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(Language::from_extension);
+    if language == Some(Language::Rust) {
+        return String::new();
+    }
+
+    let by_name_only = !unplaced.unknown.is_empty()
+        || tiers
+            .iter()
+            .any(|(tier, _)| *tier == crate::code::storage::TIER_UNPLACED);
+    if !by_name_only {
+        return String::new();
+    }
+
+    " Receiver-type inference runs for Rust only, so a method call in this file \
+     resolves on its written name alone: confirm the receiver's type in the \
+     source before trusting a match."
+        .to_string()
 }
 
 /// `usage` — token economy audit. Reads session + lifetime stats and returns
@@ -3164,20 +3204,29 @@ fn entry_in_scope(entry: &crate::store::memory::MemoryEntry, token: &str) -> boo
 /// the recall gate and the warmup reserved-prior slot both key off.
 const PRIOR_CONFIDENCE_GATE: f64 = 0.7;
 
-/// Apply the UserPromptSubmit recall floor to final retrieval scores.
+/// Drop the scores now that nothing else decides admission.
 ///
-/// Confidence remains a ranking component, but the injection decision must
-/// reflect relevance and confidence together. A non-positive floor disables
-/// filtering, matching the configuration's established no-floor behavior.
-fn apply_min_recall_score(
-    entries: Vec<memory::ScoredMemoryEntry>,
-    min_recall_score: f64,
-) -> Vec<memory::MemoryEntry> {
-    let floor = (min_recall_score > 0.0).then_some(min_recall_score);
+/// There used to be a `min_recall_score` floor here, over
+/// `rrf_norm * 0.7 + confidence * 0.3`. It could not do the job it was named
+/// for: `rrf_norm` is max-normalized, so the best candidate for any prompt
+/// scores 1.0 and the sum clears any sane floor — and the confidence term let
+/// a well-confirmed entry about something else buy its way in. The gate is now
+/// absolute and lives in `search_entries_hybrid_fts`
+/// (`search.memory.min_recall_cosine`), before normalization. Confidence is
+/// back to what it is good for: ordering what was admitted.
+///
+/// One thing is still decided here: a disputed entry — one whose last signal was
+/// a refutation — is never injected, whatever it scored. Confidence alone cannot
+/// do that job, because an entry confirmed twenty times and refuted once still
+/// scores 0.84. The score measures how well an entry is believed; being told it
+/// is wrong is a different fact, and unasked injection is the one surface where
+/// it has to win. The entry stays searchable: an explicit `memory search` still
+/// returns it, so a refutation hides nothing from someone who asks.
+fn injectable(entries: Vec<memory::ScoredMemoryEntry>) -> Vec<memory::MemoryEntry> {
     entries
         .into_iter()
-        .filter(|result| floor.is_none_or(|score| result.score >= score))
         .map(|result| result.entry)
+        .filter(|entry| !entry.is_disputed())
         .collect()
 }
 
@@ -3212,6 +3261,12 @@ fn rank_warmup_entries(
     if min_confidence > 0.0 {
         entries.retain(|e| e.confidence_at(now) >= min_confidence);
     }
+
+    // Same rule as the recall path (see `injectable`): an entry whose last
+    // signal was a refutation is not warmed up. The pool query already drops
+    // net-refuted entries in SQL; this catches the ones a high confirmation
+    // count still carries, where the score would happily inject them.
+    entries.retain(|e| !e.is_disputed());
 
     // Project affinity is a BIAS, never a filter: an out-of-scope entry is
     // demoted below every in-scope one but still emitted while budget remains,
@@ -3713,7 +3768,8 @@ pub async fn hook_session_start_impl(
 /// neighbors reachable by an outgoing edge, formatted `- [id] title (via relation)`.
 /// Capped at `EXPAND_RECALL_SEEDS` seeds and `EXPAND_RECALL_NEIGHBORS` neighbors
 /// total; already-recalled ids are skipped and superseded/expired/dangling targets
-/// are excluded via `resolve_active` — bounded work on the recall hot path.
+/// are excluded via `resolve_active`, which does not count as a read — bounded
+/// work on the recall hot path.
 /// `seeds` and `max_neighbors` are the configurable caps (`GraphConfig`); edges
 /// arrive `created_at DESC` from [`memory_graph::outgoing`], so candidates are
 /// ordered by recency before the cap truncates.
@@ -3792,7 +3848,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         .map(|(dctx, key)| dctx.remember_hook_prompt(key, &prompt_fingerprint(prompt)))
         .unwrap_or(false);
     let wants_cg = prompt_wants_call_graph(prompt);
-    let fts_query = build_recall_query(prompt);
+    let fts_query = crate::store::search::build_recall_query(prompt);
     // DEFERRED (2026-06-30) — memory→memory 1-hop expansion. Memories aren't in
     // the graph (edges.source_doc_id FKs documents.id; memory ids are TEXT slugs
     // with no documents row), so a memory_edges table + post-recall expansion is
@@ -3826,10 +3882,13 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             memory::search_entries_hybrid_fts(
                 &ctx.conn,
                 q,
+                // The raw prompt, not `q`: `q` is the OR-expanded FTS
+                // expression, and the lexical admission arm needs the words
+                // as written. It is also what `query_embedding` embedded.
+                prompt,
                 query_embedding.as_deref(),
                 limit,
-                handle.config.search.memory.access_recency_weight,
-                handle.config.search.memory.recency_half_life_secs,
+                &handle.config.search.memory,
             )
         });
         let mut scored_results = match search {
@@ -3848,9 +3907,10 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             let mut eligible_scores = scored_results
                 .iter()
                 .filter(|entry| {
-                    entry.score >= cfg.min_recall_score
-                        && (entry.entry_type != crate::store::memory::EntryType::Prior
-                            || entry.confidence_at(telemetry_now) >= PRIOR_CONFIDENCE_GATE)
+                    // Admission already happened in the store, so the only
+                    // filter left is the prior-confidence gate applied below.
+                    entry.entry_type != crate::store::memory::EntryType::Prior
+                        || entry.confidence_at(telemetry_now) >= PRIOR_CONFIDENCE_GATE
                 })
                 .map(|entry| entry.score);
             let top_score = eligible_scores.next();
@@ -3924,7 +3984,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             e.entry_type != crate::store::memory::EntryType::Prior
                 || e.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
         });
-        results = apply_min_recall_score(scored_results, cfg.min_recall_score);
+        results = injectable(scored_results);
 
         // Global rank: float high-confidence priors to the top WITHOUT
         // scrambling the rest (stable sort on a boolean key preserves the
@@ -4790,13 +4850,28 @@ async fn code_index_hits(handle: &RepoHandle, symbol: &str, limit: usize) -> Opt
         }
     };
     let facade = idx_guard.as_ref()?;
-    let mut symbols = facade.find_symbols_by_name(symbol);
+    let symbols = facade.find_symbols_by_name(symbol);
     if symbols.is_empty() {
         return None;
     }
-    symbols.truncate(limit);
+    Some(render_code_index_hits(symbol, &symbols, limit))
+}
+
+/// Render the PreToolUse code-index block for `symbols`, showing at most
+/// `limit` of them.
+///
+/// `find_symbols_by_name` returns rows ordered by `(file_path, line_start)`, so
+/// the prefix shown here is the first definitions in the repository rather than
+/// whichever rows SQLite happened to return. When the list is cut, the block
+/// says so: a hook that silently showed 5 of 12 definitions taught the agent
+/// that there were 5.
+fn render_code_index_hits(
+    symbol: &str,
+    symbols: &[crate::code::symbol::Symbol],
+    limit: usize,
+) -> String {
     let mut block = format!("mdkb code index — `{symbol}` defined at:\n");
-    for s in &symbols {
+    for s in symbols.iter().take(limit) {
         // Stored ranges are 0-based (tree-sitter rows); display 1-based lines.
         block.push_str(&format!(
             "- {}:{} ({})\n",
@@ -4805,8 +4880,13 @@ async fn code_index_hits(handle: &RepoHandle, symbol: &str, limit: usize) -> Opt
             s.kind
         ));
     }
+    if let Some(hidden) = symbols.len().checked_sub(limit).filter(|n| *n > 0) {
+        block.push_str(&format!(
+            "… and {hidden} more definition(s) of this name.\n"
+        ));
+    }
     block.push_str("Read the definition directly instead of grepping.\n");
-    Some(block)
+    block
 }
 
 /// Attribute a completed hook invocation to the reserved `hooks` pseudo-session
@@ -5589,7 +5669,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type,
             expires_at: None,
             due_at: None,
@@ -5959,7 +6041,11 @@ mod tests {
         let entry = crate::store::memory::MemoryEntry {
             id: id.to_string(),
             title: format!("Title for {id}"),
-            content: "Some content about the topic.".to_string(),
+            // The identifier is load-bearing, not decoration: memory recall
+            // is gated absolutely, and with no embedding service under test
+            // the only arm that can admit an entry is a strong lexical match.
+            // Every prompt that expects this entry names `recall_gate_fixture`.
+            content: "Some content about the topic: the recall_gate_fixture knob.".to_string(),
             entry_type: crate::store::memory::EntryType::Topic,
             tags: vec!["alpha".to_string()],
             status: crate::store::memory::EntryStatus::Active,
@@ -5970,7 +6056,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: crate::store::memory::SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -5997,7 +6085,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: crate::store::memory::SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -6009,12 +6099,112 @@ mod tests {
         crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed stale handoff");
     }
 
+    /// Story 087, criterion 6. The table was written down before the code.
+    ///
+    /// Four confirmation histories, with the confidence each produces and
+    /// whether the entry may be injected unasked. `Topic` is durable so decay
+    /// is 1.0, and `OfficialDocs` has authority 1.0, so confidence here IS the
+    /// belief term — the numbers are the formula, not an artefact of the fixture.
+    ///
+    /// | history        | c  | r | belief = (1+c)/(2+c+3r) | last signal | injectable |
+    /// |----------------|----|---|-------------------------|-------------|------------|
+    /// | 0c/1r          |  0 | 1 | 1/5  = 0.2000           | refuted     | no         |
+    /// | 3c/1r          |  3 | 1 | 4/8  = 0.5000           | refuted     | no         |
+    /// | 20c/1r recent  | 20 | 1 | 21/25 = 0.8400          | refuted     | no         |
+    /// | 1r then 2c     |  2 | 1 | 3/7  = 0.4286           | confirmed   | YES        |
+    ///
+    /// Row 3 is the one that matters: 0.84 clears every threshold in the
+    /// system, including the prior gate at 0.7, and it is still not injected.
+    /// Row 4 is its mirror: the lowest confidence of the four, and the only one
+    /// admitted, because the last thing anyone said about it is that it holds.
+    /// Together they are the claim — the score is never the safety mechanism.
     #[test]
-    fn min_recall_score_filters_final_score_not_confidence() {
+    fn a_refuted_entry_is_not_injected_however_well_confirmed_it_is() {
         let now = chrono::Utc::now().timestamp();
-        let low_confidence_entry = crate::store::memory::MemoryEntry {
-            id: "above-gate".to_string(),
-            title: "Above gate".to_string(),
+        let history =
+            |id: &str, confirmations: u32, corrections: u32, confirmed_ago: Option<i64>| {
+                crate::store::memory::MemoryEntry {
+                    id: id.to_string(),
+                    title: id.to_string(),
+                    content: "Refutation table fixture".to_string(),
+                    entry_type: crate::store::memory::EntryType::Topic,
+                    tags: vec![],
+                    status: crate::store::memory::EntryStatus::Active,
+                    created_at: now - 10 * 86_400,
+                    updated_at: now - 10 * 86_400,
+                    superseded_by: None,
+                    access_count: 0,
+                    last_accessed: None,
+                    source_path: None,
+                    confirmations,
+                    corrections,
+                    last_confirmed_at: confirmed_ago.map(|ago| now - ago),
+                    last_refuted_at: (corrections > 0).then_some(now - 3600),
+                    source_type: crate::store::memory::SourceType::OfficialDocs,
+                    expires_at: None,
+                    due_at: None,
+                }
+            };
+
+        // (entry, expected confidence, expected injection eligibility)
+        let table = [
+            (history("zero-c-one-r", 0, 1, None), 0.2000, false),
+            (history("three-c-one-r", 3, 1, Some(7200)), 0.5000, false),
+            (history("twenty-c-one-r", 20, 1, Some(7200)), 0.8400, false),
+            (history("one-r-then-two-c", 2, 1, Some(1800)), 0.4286, true),
+        ];
+
+        for (entry, expected_confidence, _) in &table {
+            let got = entry.confidence_at(now);
+            assert!(
+                (got - expected_confidence).abs() < 0.001,
+                "{}: confidence should be {expected_confidence}, got {got}",
+                entry.id
+            );
+        }
+
+        // The one row that clears the prior gate is still refuted. Without the
+        // suppression its score alone would carry it into the prompt.
+        assert!(
+            table[2].0.confidence_at(now) >= PRIOR_CONFIDENCE_GATE,
+            "control: the 20c/1r row must out-score every threshold in the system"
+        );
+
+        let scored = table
+            .iter()
+            .map(|(entry, _, _)| memory::ScoredMemoryEntry {
+                entry: entry.clone(),
+                score: entry.confidence_at(now),
+                distance: Some(0.4),
+                strong_lexical: true,
+            })
+            .collect();
+        let injected: Vec<String> = injectable(scored).into_iter().map(|e| e.id).collect();
+
+        let expected: Vec<String> = table
+            .iter()
+            .filter(|(_, _, eligible)| *eligible)
+            .map(|(entry, _, _)| entry.id.clone())
+            .collect();
+        assert_eq!(
+            injected, expected,
+            "only the reconfirmed entry may be injected unasked"
+        );
+    }
+
+    /// Story 083 replaced the `min_recall_score` floor this test used to
+    /// assert. That floor ran over `rrf_norm * 0.7 + confidence * 0.3` after
+    /// max-normalization, so it could not reject an irrelevant entry — the
+    /// best match to any prompt normalizes to 1.0 — and it *could* reject a
+    /// relevant one for being unconfirmed. The subject under test is now the
+    /// absolute gate, and what is asserted here is the half that belongs to
+    /// this layer: confidence has left the admission decision entirely.
+    #[test]
+    fn confidence_does_not_decide_injection() {
+        let now = chrono::Utc::now().timestamp();
+        let stale = crate::store::memory::MemoryEntry {
+            id: "stale-but-relevant".to_string(),
+            title: "Stale but relevant".to_string(),
             content: "Recall gate test entry".to_string(),
             entry_type: crate::store::memory::EntryType::Handoff,
             tags: vec![],
@@ -6026,73 +6216,131 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: crate::store::memory::SourceType::UserStatement,
             expires_at: None,
             due_at: None,
         };
         assert!(
-            low_confidence_entry.confidence() < 0.07,
+            stale.confidence() < 0.07,
             "control: entry confidence should be about 0.06"
         );
-        let below_gate_entry = crate::store::memory::MemoryEntry {
-            id: "below-gate".to_string(),
-            ..low_confidence_entry.clone()
+        let fresh = crate::store::memory::MemoryEntry {
+            id: "fresh".to_string(),
+            created_at: now,
+            updated_at: now,
+            ..stale.clone()
         };
-        let injected = apply_min_recall_score(
-            vec![
-                memory::ScoredMemoryEntry {
-                    entry: low_confidence_entry,
-                    score: 0.31,
-                },
-                memory::ScoredMemoryEntry {
-                    entry: below_gate_entry,
-                    score: 0.29,
-                },
-            ],
-            0.3,
+        assert!(
+            fresh.confidence() > stale.confidence(),
+            "control: the two entries must differ in confidence"
         );
+
+        // Both were admitted by the store, one with a far lower final score.
+        // Nothing here may re-filter them: the gate already ran, absolutely.
+        let injected = injectable(vec![
+            memory::ScoredMemoryEntry {
+                entry: stale,
+                score: 0.29,
+                distance: Some(0.4),
+                strong_lexical: false,
+            },
+            memory::ScoredMemoryEntry {
+                entry: fresh,
+                score: 0.83,
+                distance: Some(0.4),
+                strong_lexical: false,
+            },
+        ]);
 
         assert_eq!(
             injected
                 .iter()
                 .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["above-gate"],
-            "the above-gate result must be injected even with 0.06 confidence"
+            vec!["stale-but-relevant", "fresh"],
+            "a 0.06-confidence entry the store admitted is still injected"
         );
     }
 
+    /// The gate's end-to-end consequence on the hook path, in the
+    /// configuration the tests run in: no embedding service, so no distance,
+    /// so the semantic arm cannot speak and only a strong lexical match is
+    /// admitted. A prompt that merely shares OR-expanded common words with an
+    /// entry injects nothing — that is the whole point.
     #[tokio::test]
-    async fn min_recall_score_injects_only_the_above_score_result() {
+    async fn without_an_embedding_only_a_strong_lexical_match_is_injected() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle_with(&tmp, |config| {
             config.hooks.user_prompt_submit_require_sigil = false;
             config.hooks.recall_docs_limit = 0;
             config.hooks.recall_limit = 2;
-            config.hooks.min_recall_score = 0.5;
         });
-        // The repeated matching terms make this the top BM25 fallback result:
-        // final score ≈ 0.7 * 1.0 + 0.3 * 0.06, above the 0.5 gate.
+        // Shares the identifier `recall_gate_target` with the prompt: admitted
+        // on the lexical arm, which exists because embeddings are weak here.
         seed_stale_handoff_entry(
             &handle,
-            "above-score",
-            "recallgate target recallgate target recallgate target recallgate target",
+            "identifier-match",
+            "the recall_gate_target knob is read once per prompt",
         )
         .await;
-        // Rank two gets reciprocal-rank relevance 0.5, so its final score is
-        // ≈ 0.7 * 0.5 + 0.3 * 0.06, below the same gate.
-        seed_stale_handoff_entry(&handle, "below-score", "recallgate target").await;
+        // Shares only the ordinary word "knob": in the BM25 result set, and
+        // rejected anyway.
+        seed_stale_handoff_entry(&handle, "common-word-only", "another knob entirely").await;
 
-        let output = hook_user_prompt_submit_impl(&handle, "recallgate target").await;
+        let output = hook_user_prompt_submit_impl(&handle, "who reads recall_gate_target").await;
         let context = additional_context(&output);
         assert!(
-            context.contains("above-score"),
-            "the high final-score result should be injected: {context}"
+            context.contains("identifier-match"),
+            "an identifier the prompt wrote out is strong evidence: {context}"
         );
         assert!(
-            !context.contains("below-score"),
-            "the low final-score result must not be injected: {context}"
+            !context.contains("common-word-only"),
+            "one shared common word must not open the gate: {context}"
+        );
+    }
+
+    /// The sentence story 083 exists for: a prompt about something we store
+    /// nothing on gets nothing, not the best of a bad set.
+    ///
+    /// The second half is what makes it a real test. The same prompt with the
+    /// floor at 0.0 does inject the entry, so the BM25 leg demonstrably found
+    /// it and the floor is what rejected it — not an empty result set that
+    /// would have been empty anyway.
+    #[tokio::test]
+    async fn a_prompt_unrelated_to_every_entry_injects_nothing() {
+        const PROMPT: &str = "how large should the quarterly travel budget for the team be";
+
+        async fn recall_with_floor(floor: f32) -> String {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle_with(&tmp, |config| {
+                config.hooks.user_prompt_submit_require_sigil = false;
+                config.hooks.recall_docs_limit = 0;
+                config.hooks.recall_limit = 5;
+                config.search.memory.min_recall_cosine = floor;
+            });
+            // Shares exactly one ordinary word with the prompt ("budget"), so
+            // the OR-expanded recall query matches it on the BM25 leg.
+            seed_stale_handoff_entry(
+                &handle,
+                "shares-one-word",
+                "requests retry with an exponential backoff budget",
+            )
+            .await;
+            let output = hook_user_prompt_submit_impl(&handle, PROMPT).await;
+            serde_json::to_string(&output).unwrap()
+        }
+
+        let gated = recall_with_floor(crate::config::MIN_RECALL_COSINE_DEFAULT).await;
+        assert_eq!(gated, "{}", "an unrelated prompt must inject nothing");
+
+        let ungated = recall_with_floor(0.0).await;
+        assert!(
+            ungated.contains("shares-one-word"),
+            "the BM25 leg must have found the entry for the gate to be what \
+             rejected it, yet with no floor nothing was injected either: {ungated}"
         );
     }
 
@@ -6175,7 +6423,11 @@ mod tests {
         )
         .await;
 
-        let out = hook_user_prompt_submit_impl(&handle, "what about the topic content").await;
+        let out = hook_user_prompt_submit_impl(
+            &handle,
+            "what about the recall_gate_fixture topic content",
+        )
+        .await;
         let body = additional_context(&out);
         assert!(
             body.contains("topic-mem"),
@@ -6246,7 +6498,7 @@ mod tests {
         seed_memory_entry(&handle, "dedup-topic").await;
 
         let params = json!({
-            "prompt": "what do we know about the topic content",
+            "prompt": "what do we know about the recall_gate_fixture topic content",
             "session_id": "s1"
         });
         let first = dispatch_call(
@@ -6279,7 +6531,7 @@ mod tests {
             let result = dispatch_call(
                 "hook.user_prompt_submit",
                 json!({
-                    "prompt": "what do we know about the topic content",
+                    "prompt": "what do we know about the recall_gate_fixture topic content",
                     "session_id": session_id
                 }),
                 Arc::clone(&handle),
@@ -6302,7 +6554,7 @@ mod tests {
         seed_memory_entry(&handle, "clear-topic").await;
 
         let params = json!({
-            "prompt": "what do we know about the topic content",
+            "prompt": "what do we know about the recall_gate_fixture topic content",
             "session_id": "s1"
         });
         let first = dispatch_call(
@@ -6386,8 +6638,11 @@ mod tests {
         seed_memory_entry(&primary, "child-mem").await;
 
         // Prompt terms match the seeded entries' content ("...about the topic.").
-        let out =
-            hook_user_prompt_submit_impl(&primary, "what do we know about the topic content").await;
+        let out = hook_user_prompt_submit_impl(
+            &primary,
+            "what do we know about the recall_gate_fixture topic content",
+        )
+        .await;
         let body = out
             .pointer("/hookSpecificOutput/additionalContext")
             .and_then(Value::as_str)
@@ -6411,8 +6666,11 @@ mod tests {
         seed_memory_entry(&handle, "sigil-mem").await;
 
         // Same recall-worthy prompt WITHOUT the sigil: no injection at all.
-        let plain =
-            hook_user_prompt_submit_impl(&handle, "what do we know about the topic content").await;
+        let plain = hook_user_prompt_submit_impl(
+            &handle,
+            "what do we know about the recall_gate_fixture topic content",
+        )
+        .await;
         assert_eq!(
             plain,
             json!({}),
@@ -6420,9 +6678,11 @@ mod tests {
         );
 
         // WITH the `*` sigil: recall fires and the sigil never leaks into output.
-        let opted =
-            hook_user_prompt_submit_impl(&handle, "* what do we know about the topic content")
-                .await;
+        let opted = hook_user_prompt_submit_impl(
+            &handle,
+            "* what do we know about the recall_gate_fixture topic content",
+        )
+        .await;
         let body = additional_context(&opted);
         assert!(
             body.contains("sigil-mem"),
@@ -6451,7 +6711,9 @@ mod tests {
             last_accessed: None,
             source_path: None,
             confirmations,
+            corrections: 0,
             last_confirmed_at: Some(now),
+            last_refuted_at: None,
             source_type: crate::store::memory::SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -6612,6 +6874,127 @@ mod tests {
             assert_eq!(out.len(), 3, "must expand exactly the 3 capped neighbors");
         }
         best
+    }
+
+    #[test]
+    fn code_index_hits_block_states_what_it_hid() {
+        use crate::code::symbol::{Symbol, Visibility};
+        use crate::code::types::{FileId, Range, SymbolId, SymbolKind};
+
+        let sym = |path: &str, line: u32| Symbol {
+            id: SymbolId::new(1).unwrap(),
+            name: "handler".into(),
+            kind: SymbolKind::Function,
+            file_id: FileId::new(1).unwrap(),
+            range: Range::new(line, 0, line, 1),
+            file_path: path.into(),
+            signature: None,
+            doc_comment: None,
+            module_path: None,
+            visibility: Visibility::Public,
+            scope_context: None,
+        };
+        let six: Vec<Symbol> = (0..6).map(|i| sym("a.rs", i * 10)).collect();
+
+        // Truncated: the block must say so. A hook that silently showed 5 of 6
+        // taught the agent that there were 5.
+        let block = render_code_index_hits("handler", &six, 5);
+        assert_eq!(block.matches("- a.rs:").count(), 5);
+        assert!(block.contains("and 1 more"), "{block}");
+
+        // Not truncated: no claim about hidden definitions.
+        let block = render_code_index_hits("handler", &six[..3], 5);
+        assert_eq!(block.matches("- a.rs:").count(), 3);
+        assert!(!block.contains("more definition"), "{block}");
+
+        // 0-based tree-sitter rows are displayed 1-based.
+        assert!(block.contains("- a.rs:1 "), "{block}");
+    }
+
+    #[test]
+    fn a_non_rust_call_answer_discloses_that_receiver_inference_is_rust_only() {
+        use crate::code::storage::TIER_UNPLACED;
+        use crate::core::code::UnplacedCalls;
+
+        let unknown = UnplacedCalls {
+            external: Vec::new(),
+            unknown: vec!["fetch".to_string()],
+        };
+        let none = UnplacedCalls::default();
+
+        // A TypeScript method call whose receiver nothing inferred: the reader
+        // is about to trust a name match, so say what placed it.
+        let note = receiver_inference_note("src/api/client.ts", &unknown, &[]);
+        assert!(note.contains("Rust only"), "{note}");
+        assert!(note.contains("written name alone"), "{note}");
+
+        // Same file, but the call did resolve — on the bare name, at the
+        // unplaced tier. Equally in need of the disclosure.
+        assert!(
+            !receiver_inference_note("src/api/client.ts", &none, &[(TIER_UNPLACED, false)])
+                .is_empty()
+        );
+
+        // Rust: inference ran. An unplaced call there means it ran and failed,
+        // which `unplaced_suffix` already reports.
+        assert!(
+            receiver_inference_note("src/store/vectors.rs", &unknown, &[(TIER_UNPLACED, false)])
+                .is_empty()
+        );
+
+        // Non-Rust, but every call landed at a near tier through a written
+        // qualifier: as trustworthy as Rust, so the note would be noise.
+        assert!(receiver_inference_note("src/api/client.ts", &none, &[(1, true)]).is_empty());
+    }
+
+    #[test]
+    fn expand_recall_neighbors_does_not_count_as_a_read() {
+        // Expansion is the machine following an edge, not the agent reading the
+        // entry. Counting it would feed `access_recency_score` — the third RRF
+        // signal — from the injection itself: an entry would become more likely
+        // to be injected because it was injected, with no new evidence.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        for i in 0..2 {
+            conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
+                 VALUES (?1, ?2, 'body', 'topic', 1, 1)",
+                rusqlite::params![format!("n{i}"), format!("Title {i}")],
+            )
+            .unwrap();
+        }
+        memory_graph::add_edge(
+            &conn,
+            "n0",
+            "n1",
+            TargetKind::Memory,
+            MemoryRelation::Supports,
+        )
+        .unwrap();
+        // Read the seed WITHOUT tracking so the assertion below measures only
+        // what expansion did.
+        let seeds = vec![
+            memory::get_entry_without_tracking(&conn, "n0")
+                .unwrap()
+                .unwrap(),
+        ];
+
+        assert_eq!(
+            expand_recall_neighbors(&conn, &seeds, 2, 3).unwrap().len(),
+            1
+        );
+
+        let neighbor = memory::get_entry_without_tracking(&conn, "n1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            neighbor.access_count, 0,
+            "expansion must not increment the neighbor's access_count"
+        );
+        assert!(
+            neighbor.last_accessed.is_none(),
+            "expansion must not stamp last_accessed"
+        );
     }
 
     #[test]
@@ -6829,7 +7212,9 @@ mod tests {
                 last_accessed: Some(now),
                 source_path: None,
                 confirmations: 0,
+                corrections: 0,
                 last_confirmed_at: None,
+                last_refuted_at: None,
                 source_type: crate::store::memory::SourceType::UserStatement,
                 expires_at: None,
                 due_at: None,
@@ -6888,7 +7273,9 @@ mod tests {
             last_accessed: Some(ts),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: crate::store::memory::SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -7068,7 +7455,9 @@ mod tests {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: crate::store::memory::SourceType::UserStatement,
             expires_at: None,
             due_at: None,

@@ -11,8 +11,7 @@ use std::path::Path;
 use crate::core::Context;
 use crate::core::indexing::with_transaction;
 use crate::core::memory_sync::{
-    archive_after_delete, archive_entry_on_disk, generate_memory_index, project_after_write,
-    project_entry,
+    archive_then_remove, generate_memory_index, project_after_write, project_entry,
 };
 use crate::error::{Error, ErrorKind, Result};
 use crate::store::memory::{self, EntryStatus, EntryType, MemoryEntry};
@@ -221,7 +220,9 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
             last_accessed: None,
             source_path: input.source_path.map(str::to_string),
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: source_type.unwrap_or_default(),
             expires_at,
             due_at,
@@ -364,14 +365,15 @@ pub fn handle_memory_confirm(ctx: &Context, id: &str, outcome: &str) -> Result<C
     if let Err(error) = crate::store::priors::apply_belief_from_memory(&ctx.conn, id, delta) {
         tracing::warn!("confirm {id}: could not update the owning prior cluster: {error}");
     }
-    // Re-read the persisted count so JSON callers get the exact new value.
-    let confirmations = memory::get_entry_without_tracking(&ctx.conn, id)?
-        .map(|e| e.confirmations)
-        .unwrap_or(0);
+    // Re-read the persisted counts so JSON callers get the exact new values.
+    let counters = memory::get_entry_without_tracking(&ctx.conn, id)?
+        .map(|e| (e.confirmations, e.corrections))
+        .unwrap_or((0, 0));
     Ok(ConfirmResult {
         id: id.to_string(),
         outcome: outcome.to_string(),
-        confirmations,
+        confirmations: counters.0,
+        corrections: counters.1,
         message,
     })
 }
@@ -390,7 +392,9 @@ pub fn handle_memory_link(
     let rel = MemoryRelation::from_str(relation)
         .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
 
-    if memory::get_entry(&ctx.conn, id)?.is_none() {
+    // An existence check is not a read of the entry: `memory link` must not
+    // move the access counters that rank memory search.
+    if memory::get_entry_without_tracking(&ctx.conn, id)?.is_none() {
         return Err(ErrorKind::InvalidQuery(format!("Memory entry not found: {id}")).into());
     }
 
@@ -423,37 +427,62 @@ pub fn handle_memory_list(
     memory::list_entries(&ctx.conn, limit, status_filter)
 }
 /// Handle `mdkb memory search` command.
+/// The same engine the MCP `search` tool and the `UserPromptSubmit` hook use:
+/// OR-expanded FTS plus the vector leg, fused, then admitted by the absolute
+/// relevance floor. It used to be plain token-AND FTS, which meant a
+/// paraphrase the hook recalled perfectly returned nothing on the CLI.
+///
+/// The embedding is best-effort, exactly as `handle_hybrid_search` treats it:
+/// no model means no vector leg and no semantic admission arm, so recall
+/// degrades to strong lexical matches rather than to an error.
 pub fn handle_memory_search(ctx: &Context, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
-    memory::search_entries(&ctx.conn, query, limit)
+    let query_embedding = match crate::llm::get_cached_service().and_then(|s| s.embed_query(query))
+    {
+        Ok(v) => Some(v),
+        Err(e) => {
+            tracing::debug!("Memory search falling back to BM25-only: {e}");
+            None
+        }
+    };
+    let cfg = crate::config::Config::load_or_default(&ctx.config_path);
+    let scored = memory::search_entries_recall(
+        &ctx.conn,
+        query,
+        query_embedding.as_deref(),
+        limit,
+        &cfg.search.memory,
+    )?;
+    Ok(scored.into_iter().map(|result| result.entry).collect())
 }
 /// Handle `mdkb memory warmup` command.
 pub fn handle_memory_warmup(ctx: &Context, limit: usize) -> Result<Vec<String>> {
     memory::get_warmup_index(&ctx.conn, limit)
 }
 /// Handle `mdkb memory rm` command.
+///
+/// Existence is checked without tracking first, so that a `rm` of an unknown
+/// id stays a no-op instead of retiring a stray file that has no row.
 pub fn handle_memory_rm(ctx: &Context, id: &str) -> Result<bool> {
-    let deleted = memory::delete_entry(&ctx.conn, id)?;
-    if deleted {
-        archive_after_delete(ctx, id);
+    if memory::get_entry_without_tracking(&ctx.conn, id)?.is_none() {
+        return Ok(false);
     }
-    Ok(deleted)
+    archive_then_remove(ctx, std::slice::from_ref(&id.to_string()), || {
+        memory::delete_entry(&ctx.conn, id)
+    })
 }
 /// Handle `mdkb memory prune` command.
 /// Archives expired entries and lifecycle entries unread for `days`; durable
-/// types are never archived for age (see `memory::prune_entries`).
+/// types are never archived for age (see `memory::prunable_entry_ids`).
+///
+/// The selection and the write are separate store calls because the disk
+/// archive has to run between them — see [`archive_then_remove`]. The ids are
+/// read once, so no entry can cross the expiry boundary between the two.
 pub fn handle_memory_prune(ctx: &Context, days: u32, dry_run: bool) -> Result<Vec<String>> {
-    let pruned = memory::prune_entries(&ctx.conn, days, dry_run)?;
-    if !dry_run && !pruned.is_empty() {
-        // Archive entries from disk and regenerate index
-        for id in &pruned {
-            if let Err(e) = archive_entry_on_disk(ctx, id) {
-                tracing::warn!("Failed to archive entry {id} on disk: {e}");
-            }
-        }
-        if let Err(e) = generate_memory_index(ctx) {
-            tracing::warn!("Failed to regenerate memory index: {e}");
-        }
+    let pruned = memory::prunable_entry_ids(&ctx.conn, days)?;
+    if dry_run || pruned.is_empty() {
+        return Ok(pruned);
     }
+    archive_then_remove(ctx, &pruned, || memory::archive_entries(&ctx.conn, &pruned))?;
     Ok(pruned)
 }
 /// Export all memory entries to `<dir>/<id>.md` files with YAML frontmatter.
@@ -813,7 +842,9 @@ pub fn handle_memory_import(
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type,
             expires_at: None,
             due_at: None,
@@ -921,7 +952,9 @@ pub fn handle_memory_condense(
                 last_accessed: None,
                 source_path: None,
                 confirmations: 0,
+                corrections: 0,
                 last_confirmed_at: None,
+                last_refuted_at: None,
                 source_type: memory::SourceType::AutoExtracted,
                 expires_at: None,
                 due_at: None,
@@ -963,6 +996,10 @@ pub struct ConfirmResult {
     pub outcome: String,
     /// Confirmation count after applying the signal.
     pub confirmations: u32,
+    /// Refutation count after applying the signal. A refuted outcome raises
+    /// this and leaves `confirmations` alone, so a caller that reads only the
+    /// confirmation count would see a refutation as a no-op.
+    pub corrections: u32,
     pub message: String,
 }
 /// Result of a memory export operation.

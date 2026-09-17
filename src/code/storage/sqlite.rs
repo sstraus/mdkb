@@ -1213,9 +1213,13 @@ const SYMBOL_SELECT_BY_ID: &str = "SELECT id, name, kind, file_id, file_path, li
      line_end, col_end, visibility, signature, doc_comment, module_path, scope_context \
      FROM code_symbols WHERE id = ?1";
 
+/// Ordered, because two callers take a prefix of the result and neither can
+/// defend an arbitrary one: `code_index_hits` shows the first `limit` and
+/// `find_symbol_by_name` takes `.next()`. Without ORDER BY, which definition a
+/// hook quotes depends on SQLite's row order.
 const SYMBOL_SELECT_BY_NAME: &str = "SELECT id, name, kind, file_id, file_path, line_start, col_start, \
      line_end, col_end, visibility, signature, doc_comment, module_path, scope_context \
-     FROM code_symbols WHERE name = ?1";
+     FROM code_symbols WHERE name = ?1 ORDER BY file_path, line_start";
 
 /// Wrap a substring in a LIKE pattern, escaping the LIKE metacharacters so a
 /// `%` or `_` in user input matches literally.
@@ -1679,6 +1683,41 @@ mod tests {
     fn test_get_symbol_not_found() {
         let (_dir, db) = temp_db();
         assert!(db.get_symbol(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn find_symbols_by_name_is_ordered_by_file_then_line() {
+        // Two callers take a PREFIX of this result: the PreToolUse code-index
+        // block shows the first few, and `find_symbol_by_name` takes the first
+        // one. Without a deterministic order, which definition a hook quotes
+        // depends on SQLite's row order — which is how a hook came to quote the
+        // wrong line numbers.
+        let (_dir, db) = temp_db();
+        let file_id = insert_test_file(&db);
+        // Inserted out of order on purpose.
+        for (path, line) in [("z.rs", 5), ("a.rs", 90), ("a.rs", 12)] {
+            db.insert_symbol(
+                "handler", "Function", file_id, path, line, None, None, None, 0, None, None, None,
+                None,
+            )
+            .unwrap();
+        }
+
+        let got: Vec<(String, u32)> = db
+            .find_symbols_by_name("handler")
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.file_path.to_string(), s.range.start_line))
+            .collect();
+
+        assert_eq!(
+            got,
+            vec![
+                ("a.rs".to_string(), 12),
+                ("a.rs".to_string(), 90),
+                ("z.rs".to_string(), 5),
+            ]
+        );
     }
 
     #[test]

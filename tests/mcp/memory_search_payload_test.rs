@@ -49,7 +49,9 @@ async fn memory_search_payload_exposes_confidence_and_counters() {
             last_accessed: Some(now),
             source_path: None,
             confirmations: 3,
+            corrections: 0,
             last_confirmed_at: Some(confirmed_at),
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -123,7 +125,9 @@ async fn memory_search_payload_marks_never_confirmed_entries() {
             last_accessed: None,
             source_path: None,
             confirmations: 0,
+            corrections: 0,
             last_confirmed_at: None,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -182,7 +186,11 @@ fn seed_three_priors(root: &std::path::Path) {
         let entry = MemoryEntry {
             id: id.to_string(),
             title: format!("Prior {id}"),
-            content: "Bayesian prior about oauth flow details.".to_string(),
+            // The identifier is load-bearing: memory recall is gated on an
+            // absolute cosine floor OR a strong lexical match, and no
+            // embedding service runs under test, so only the lexical arm can
+            // admit these entries. Every query below names it.
+            content: "Bayesian prior about oauth_flow_details.".to_string(),
             entry_type: EntryType::Decision,
             tags: vec!["oauth".to_string()],
             status: EntryStatus::Active,
@@ -193,7 +201,9 @@ fn seed_three_priors(root: &std::path::Path) {
             last_accessed: None,
             source_path: None,
             confirmations,
+            corrections: 0,
             last_confirmed_at: last_confirmed,
+            last_refuted_at: None,
             source_type: SourceType::UserStatement,
             expires_at: None,
             due_at: None,
@@ -232,7 +242,7 @@ async fn min_confidence_filters_low_confidence_priors() {
     let server = McpServer::new(root);
 
     // Strict filter: only medium + high clear 0.70.
-    let text = search_memory(&server, "oauth prior", Some(0.70)).await;
+    let text = search_memory(&server, "oauth_flow_details prior", Some(0.70)).await;
 
     assert!(
         !text.contains("low-prior"),
@@ -258,7 +268,7 @@ async fn min_confidence_omitted_preserves_current_behavior() {
     let server = McpServer::new(root);
 
     // No filter → all three entries surface.
-    let text = search_memory(&server, "oauth prior", None).await;
+    let text = search_memory(&server, "oauth_flow_details prior", None).await;
 
     for id in ["low-prior", "medium-prior", "high-prior"] {
         assert!(
@@ -278,7 +288,7 @@ async fn min_confidence_zero_keeps_all_entries() {
     let server = McpServer::new(root);
 
     // 0.0 is an explicit no-op — same as omitted.
-    let text = search_memory(&server, "oauth prior", Some(0.0)).await;
+    let text = search_memory(&server, "oauth_flow_details prior", Some(0.0)).await;
 
     for id in ["low-prior", "medium-prior", "high-prior"] {
         assert!(

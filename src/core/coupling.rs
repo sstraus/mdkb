@@ -6,7 +6,17 @@
 //! static analysis can see: an implicit contract, a config duplicated in two
 //! places, a test that knows the implementation, two hand-synced copies of one
 //! rule. Reported here as the file pairs that co-change often enough to be a
-//! pattern, and that no `Calls`/`Uses`/`Expands`/`Implements` edge connects.
+//! pattern, and that no confidently resolved `Calls` edge connects.
+//!
+//! `Calls` is the only edge kind that suppresses a pair, and only at tiers 1–2:
+//! [`resolved_edges`] filters on `r.kind = 'Calls'` and
+//! [`connected_file_pairs`] keeps `nearest <= MAX_SUPPRESSING_TIER`. A pair
+//! joined solely by `Uses`, `Implements`, `Expands` or `Defines` is therefore
+//! still reported, even when that edge resolves at tier 1. Widening the kind
+//! set is out of scope here: no co-change pair connected by one of those kinds
+//! has been measured as a false positive, and each kind carries a different
+//! claim about the two files — `Implements` between a trait and its impl says
+//! nothing about whether the two must change together.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -630,6 +640,53 @@ mod tests {
         .unwrap();
 
         assert_eq!(report.pairs(), 1, "a tier-7 name match is not a connection");
+    }
+
+    /// Pins the documented kind filter: `Calls` is the only suppressing kind.
+    /// The edge below is shaped exactly like the one
+    /// `files_that_cochange_and_have_a_graph_edge_are_not_reported` uses — the
+    /// qualifier matches the target's `owner_name`, so it resolves at tier 1 —
+    /// and differs only in its kind. It still does not hide the pair.
+    #[test]
+    fn a_pair_connected_only_by_an_implements_edge_is_still_reported() {
+        let root = tempfile::tempdir().unwrap();
+        init_repo(root.path());
+        cochange_n_times(root.path(), &["src/a.rs", "src/b.rs"], 5);
+        code_index(root.path(), &["src/a.rs", "src/b.rs"], None);
+        let code = Connection::open(root.path().join(".mdkb/code.sqlite")).unwrap();
+        code.execute(
+            "INSERT INTO code_symbols \
+             (id, name, kind, file_id, file_path, visibility, line_start, line_end, owner_name) \
+             VALUES (100, 'Impl', 'Struct', 1, 'src/a.rs', 0, 0, 3, NULL), \
+                    (101, 'method', 'Function', 2, 'src/b.rs', 0, 0, 3, 'Target')",
+            [],
+        )
+        .unwrap();
+        code.execute(
+            "INSERT INTO code_relationships \
+             (from_symbol_id, from_name, to_name, kind, file_id, to_qualifier) \
+             VALUES (100, 'Impl', 'method', 'Implements', 1, 'Target')",
+            [],
+        )
+        .unwrap();
+        drop(code);
+
+        let report = handle_coupling(
+            root.path(),
+            &CouplingOverrides {
+                min_cochanges: Some(5),
+                since: Some("5 years ago".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.pairs(),
+            1,
+            "only Calls suppresses a pair; Implements does not: {}",
+            report.markdown
+        );
     }
 
     #[test]
