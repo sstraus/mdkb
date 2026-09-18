@@ -220,7 +220,7 @@ impl Context {
         // are exactly such a pair. Canonicalizing here makes the identity a
         // property of the store rather than of whatever spelling the caller
         // happened to hold.
-        let mdkb_dir = mdkb_dir.canonicalize().map_err(|e| {
+        let mdkb_dir = crate::domain::canonicalize_plain(&mdkb_dir).map_err(|e| {
             Error::other(format!(
                 "cannot canonicalize {}: {e} — refusing to open, because locks \
                  keyed on a non-canonical path silently corrupt the index",
@@ -386,7 +386,7 @@ impl Context {
             }
             .into());
         }
-        let mdkb_dir = mdkb_dir.canonicalize().map_err(|e| {
+        let mdkb_dir = crate::domain::canonicalize_plain(&mdkb_dir).map_err(|e| {
             Error::other(format!("cannot canonicalize {}: {e}", mdkb_dir.display()))
         })?;
         let config_path = mdkb_dir.join("config.toml");
@@ -474,7 +474,7 @@ impl Context {
         // Auto-init can be entered concurrently by several hook/MCP processes.
         // Derive every sidecar from the canonical store identity and serialize
         // config + virtual-table creation exactly like `open` does.
-        let mdkb_dir = mdkb_dir.canonicalize().map_err(|e| {
+        let mdkb_dir = crate::domain::canonicalize_plain(&mdkb_dir).map_err(|e| {
             Error::other(format!(
                 "cannot canonicalize {} during initialization: {e}",
                 mdkb_dir.display()

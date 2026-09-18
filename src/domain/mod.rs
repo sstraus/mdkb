@@ -13,6 +13,35 @@ pub mod sessions;
 
 use serde::{Deserialize, Serialize};
 
+/// `Path::canonicalize`, minus the Windows extended-length prefix.
+///
+/// `std::fs::canonicalize` returns the verbatim form `\\?\C:\Users\…` on
+/// Windows. It names the same file, but it does not compare, concatenate or
+/// hand off like the path everybody else is holding, and the failures are
+/// silent every time:
+///
+/// - `Path::strip_prefix` between a verbatim path and a plain one returns
+///   `None`, so `memory_sync` read every committed deletion as unexplained loss
+///   and never detected a `.gitignore` shadowing the store — it gave up before
+///   running git at all.
+/// - SQLite read the `?` as the end of a URI and `ATTACH` failed, so a heal
+///   reported "salvaged 0 memory entries" over a file that still held them
+///   (`store::heal::immutable_uri`).
+/// - `git clone \\?\C:\…` answers "hostname contains invalid characters",
+///   because git reads the leading `\\` as the start of a UNC share.
+///
+/// Canonicalizing is still right — it is what makes the store's identity a
+/// property of the file rather than of the caller's spelling. Only the prefix
+/// has to go, and dropping it loses nothing: it only ever precedes an
+/// already-absolute path. On Unix this is `canonicalize` unchanged.
+pub fn canonicalize_plain(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    let canonical = path.canonicalize()?;
+    match canonical.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+        Some(stripped) => Ok(std::path::PathBuf::from(stripped)),
+        None => Ok(canonical),
+    }
+}
+
 /// The canonical string form of a path relative to an index root: always
 /// `/`-separated, on every platform.
 ///

@@ -150,22 +150,38 @@
 
 ### Fixed
 
-- **Memory git-sync asks git the right question on Windows.** `gitignore_shadow`
-  and `committed_deletions` built their pathspec with `Path::strip_prefix`,
-  which yields the *native* separator. Git reads a `\` in a pathspec as a glob
-  escape, so `.mdkb\memory\entries` matched nothing and both calls answered
-  with silence rather than an error: `check-ignore` reported every store
-  unshadowed, and `ls-tree`/`log` came back empty, which demoted every committed
-  deletion to "suspect" and capped it. A colleague's `git rm` of twelve entries
-  archived none of them, and a parent `.gitignore` excluding `.mdkb/` wholesale
-  was never reported — the two failure modes the code exists to prevent, on the
-  one platform where nobody had seen it run. Both arguments now go through
-  `domain::rel_key`, the single owner of that rule, added when ten index-key
-  tests failed on the same mismatch. Git's own output is always `/`-separated,
-  so the parsing side is untouched, and Unix is unaffected because `rel_key` is
-  the identity there — `\` is a legal character in a Unix filename and
-  rewriting it would corrupt the key. *(Surfaced by the `Test Windows` job the
-  first time it reached these tests — see below.)*
+- **The store's own paths stop being two different spellings on Windows.**
+  `Context::open` canonicalizes the store directory, deliberately: locks are
+  keyed on that path as a string, and two spellings of one directory give two
+  lock domains over a single database. On Windows `std::fs::canonicalize`
+  returns the extended-length form `\\?\C:\Users\…`, so every path derived from
+  it — `memory_dir()`, `db_path` — carried the prefix while `ctx.root()`, which
+  is stored as the caller passed it, did not.
+
+  `Path::strip_prefix` between those two returns `None`, and both callers in
+  memory git-sync treat that as "git cannot answer". So on Windows
+  `committed_deletions` reported no committed history and `gitignore_shadow`
+  reported no shadowing — **without running git at all**. A colleague's
+  committed `git rm` of twelve entries read as unexplained loss and the
+  deletion cap archived none of them, and a parent `.gitignore` excluding
+  `.mdkb/` wholesale was never reported. Both are the failure the code exists
+  to prevent, and both were silent, because a `None` here is indistinguishable
+  from "not a git repository".
+
+  `domain::canonicalize_plain` now does the canonicalizing and drops the
+  prefix, at all three `Context` open paths. The identity guarantee is
+  unchanged — one deterministic spelling per store — and the prefix loses
+  nothing, because it only ever precedes an already-absolute path. Unix is
+  untouched. This is the third time this prefix has cost something here: it
+  also made SQLite's `ATTACH` fail during a heal, which reported "salvaged 0
+  memory entries" over a file that still held them, and it made `git clone`
+  answer "hostname contains invalid characters". The rule has one owner now.
+
+  *(Found by running the suite on a Windows host. Worth recording that the
+  first diagnosis — git treating `\` in a pathspec as a glob escape — was
+  reasoned out from the source and was wrong; git for Windows accepts either
+  separator. Only instrumenting the real machine showed git was never being
+  invoked.)*
 
 - **The `Test Windows` job runs the suite instead of stopping at a compile
   error.** `tests/e2e_daemon_singleton.rs` imported `mdkb::daemon::singleton`
