@@ -150,6 +150,40 @@
 
 ### Fixed
 
+- **Memory git-sync asks git the right question on Windows.** `gitignore_shadow`
+  and `committed_deletions` built their pathspec with `Path::strip_prefix`,
+  which yields the *native* separator. Git reads a `\` in a pathspec as a glob
+  escape, so `.mdkb\memory\entries` matched nothing and both calls answered
+  with silence rather than an error: `check-ignore` reported every store
+  unshadowed, and `ls-tree`/`log` came back empty, which demoted every committed
+  deletion to "suspect" and capped it. A colleague's `git rm` of twelve entries
+  archived none of them, and a parent `.gitignore` excluding `.mdkb/` wholesale
+  was never reported — the two failure modes the code exists to prevent, on the
+  one platform where nobody had seen it run. Both arguments now go through
+  `domain::rel_key`, the single owner of that rule, added when ten index-key
+  tests failed on the same mismatch. Git's own output is always `/`-separated,
+  so the parsing side is untouched, and Unix is unaffected because `rel_key` is
+  the identity there — `\` is a legal character in a Unix filename and
+  rewriting it would corrupt the key. *(Surfaced by the `Test Windows` job the
+  first time it reached these tests — see below.)*
+
+- **The `Test Windows` job runs the suite instead of stopping at a compile
+  error.** `tests/e2e_daemon_singleton.rs` imported `mdkb::daemon::singleton`
+  unconditionally, but `daemon::singleton`, `ipc_server` and `spawn` are all
+  `#[cfg(unix)]` — the daemon is a Unix-socket design end to end. On Windows the
+  import resolved to nothing and the job stopped there, before running a single
+  test, which is why every Windows defect below it was invisible rather than
+  failing. The file now carries `#![cfg(unix)]`, as four sibling daemon E2E
+  files already did; no coverage is lost, because the code under test does not
+  exist on Windows. Separately, `two_clones_converge_without_a_manual_import`
+  passed `git clone` a path straight from `std::fs::canonicalize`, which on
+  Windows is the extended-length form `\\?\C:\Users\…`; git reads the leading
+  `\\` as the start of a UNC share and answered "hostname contains invalid
+  characters". The suite strips that prefix now. With both gone the job compiles
+  and runs 1926 unit tests, and it immediately found the git-sync pathspec
+  defect above. *(Diagnosed by Steve Muchow (@smuchow1962) in #12 / #13, whose
+  Windows-parity series is what made this job worth having.)*
+
 - **A change the watcher dropped can no longer sit unrecovered.** The watcher
   drops events when its 100-slot channel fills and sets a flag that schedules a
   full rescan — measured on 2026-09-17, a 500-file burst produced 793 failed

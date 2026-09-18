@@ -289,6 +289,10 @@ pub fn projection_drift(ctx: &Context) -> Result<ProjectionDrift> {
 /// `.mdkb/.gitignore` inert and the entry projection untrackable — silently.
 /// Reported, never repaired: rewriting a `.gitignore` at the repo root, which
 /// mdkb does not own, is not something a tool should do behind your back.
+///
+/// The probe path reaches git through `rel_key`: `strip_prefix` yields the
+/// native separator, and git reads a `\` in a pathspec as a glob escape, so the
+/// Windows spelling silently matched nothing and every store looked unshadowed.
 pub(crate) fn gitignore_shadow(root: &Path, entries_dir: &Path) -> Option<String> {
     let git_root = crate::git::find_git_root(root)?;
     let probe = entries_dir.join("probe.md");
@@ -297,7 +301,7 @@ pub(crate) fn gitignore_shadow(root: &Path, entries_dir: &Path) -> Option<String
         .arg("-C")
         .arg(&git_root)
         .args(["check-ignore", "-v", "--no-index", "--"])
-        .arg(rel)
+        .arg(crate::domain::rel_key(rel))
         .output()
         .ok()?;
     // Exit 1 with no output = not ignored, which is the healthy state.
@@ -782,13 +786,18 @@ fn partition_deletions(
 
 /// `(entry ids present in HEAD, entry ids deleted somewhere in reachable history)`
 /// for the projection directory, or `None` when git cannot answer.
+///
+/// The pathspec reaches git through `rel_key`: `strip_prefix` yields the native
+/// separator, and git reads a `\` in a pathspec as a glob escape, so on Windows
+/// both listings came back empty and every deletion was demoted to suspect.
+/// Git's own output is always `/`-separated, so only the argument needs this.
 fn committed_deletions(
     root: &Path,
     entries_dir: &Path,
 ) -> Option<(HashSet<String>, HashSet<String>)> {
     let git_root = crate::git::find_git_root(root)?;
     let rel = entries_dir.strip_prefix(&git_root).ok()?;
-    let pathspec = format!("{}/", rel.to_str()?);
+    let pathspec = format!("{}/", crate::domain::rel_key(rel));
 
     let run = |args: &[&str]| -> Option<String> {
         let out = std::process::Command::new("git")
