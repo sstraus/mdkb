@@ -150,6 +150,24 @@
 
 ### Fixed
 
+- **A lifecycle hook outside a project ends quietly instead of refusing.** The
+  store-anchoring guard sits at the top of `run_cli` and covered every command
+  but `init`, so the five events the harness fires unconditionally —
+  `session-start`, `user-prompt-submit`, `pre-tool-use`, `post-tool-use`,
+  `stop` — reported `refusing to anchor a store at …: it holds git repositories
+  (or is your home directory)` every time a session started outside a repo.
+  Twice per event, in fact: the installed hook line is
+  `if ! mdkb hook X; then MDKB_NO_DAEMON=1 mdkb hook X; fi`, so a failure ran
+  the whole thing again.
+
+  The guard is unchanged and still correct — a store at a repo container or at
+  `$HOME` would index every repository underneath it. What changed is who hears
+  about it. An event nobody asked for, with no store to record into and no
+  human reading its stderr, now exits 0 in silence. Everything invoked on
+  purpose still fails loudly, `mdkb hook search`, `reindex`, `memory-write`,
+  `memory-confirm` and `status` included: silence there would hide the miss
+  from the caller that meant to read or write something.
+
 - **The distiller spawn tests run on Windows instead of assuming a Unix shell.**
   Thirteen unit tests drove the distiller with `sh -c` stubs — `cat` to echo the
   prompt back, `printf` to emit a distilled prior. Neither program exists on

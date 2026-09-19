@@ -2344,3 +2344,62 @@ fn smoke_eval_judge_bm25_runs() {
         "expected a bm25 accuracy line: {text}"
     );
 }
+
+/// A directory a store may not be anchored at: it holds a git repository, so a
+/// store here would index every repository underneath it.
+fn container_of_repos() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("some-project").join(".git")).unwrap();
+    tmp
+}
+
+#[test]
+fn smoke_lifecycle_hooks_are_silent_where_no_store_may_be_anchored() {
+    // The harness fires these five wherever the agent happens to be. Outside a
+    // project there is nothing to record and nobody reading stderr, so the
+    // refusal that is correct for a human command is pure noise here — it was
+    // printed twice on every session started outside a repo.
+    let tmp = container_of_repos();
+    for event in [
+        "session-start",
+        "user-prompt-submit",
+        "pre-tool-use",
+        "post-tool-use",
+        "stop",
+    ] {
+        let out = run(&["hook", event], tmp.path());
+        assert!(
+            out.status.success(),
+            "hook {event} must exit 0 outside a project: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            "hook {event} must say nothing outside a project: stdout={:?} stderr={:?}",
+            stdout(&out),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn smoke_a_command_a_human_ran_still_refuses_to_anchor_there() {
+    // The guard is not weakened, only narrowed: anything invoked on purpose
+    // still says why it did nothing. `hook status` is in this half too — an
+    // agent asked for it, so silence would hide the miss from the caller.
+    let tmp = container_of_repos();
+    for args in [["search", "anything"], ["hook", "status"]] {
+        let out = run(&args, tmp.path());
+        assert!(
+            !out.status.success(),
+            "`mdkb {}` must fail where no store may be anchored",
+            args.join(" ")
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("refusing to anchor a store"),
+            "`mdkb {}` must name the refusal: {stderr}",
+            args.join(" ")
+        );
+    }
+}

@@ -214,6 +214,26 @@ fn should_detach_from_argv() -> bool {
     has_serve && has_daemon && has_detach
 }
 
+/// The five events the harness fires on its own, as opposed to the `hook`
+/// subcommands an agent invokes deliberately.
+///
+/// The distinction decides what happens where no store can be anchored: an
+/// event nobody asked for is dropped, while `hook search` or `hook
+/// memory-write` still fails loudly, because silence there would hide a miss
+/// from the caller that meant to write or read something.
+fn is_lifecycle_hook(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Hook(
+            HookCommand::SessionStart
+                | HookCommand::UserPromptSubmit
+                | HookCommand::PostToolUse
+                | HookCommand::PreToolUse
+                | HookCommand::Stop
+        )
+    )
+}
+
 async fn run() -> Result<()> {
     let cli = Cli::parse_args();
     let format = cli.format;
@@ -253,14 +273,23 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         mdkb::git::resolve_main_worktree(&raw_cwd)
     } else {
         let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(std::path::PathBuf::from);
-        mdkb::git::resolve_project_root(&raw_cwd, hint.as_deref()).ok_or_else(|| {
-            mdkb::Error::other(format!(
-                "refusing to anchor a store at {}: it holds git repositories (or is your home \
-                 directory), so a store here would index every repository underneath it. Run \
-                 mdkb from inside a project, or `mdkb init` here if you really mean it.",
-                raw_cwd.display()
-            ))
-        })?
+        match mdkb::git::resolve_project_root(&raw_cwd, hint.as_deref()) {
+            Some(root) => root,
+            // A lifecycle hook fires wherever the agent happens to be, which
+            // includes directories no store may be anchored at. It has no
+            // human reading its stderr and nothing to record here, so it ends
+            // quietly instead of repeating the refusal on every event.
+            None if is_lifecycle_hook(&cli.command) => return Ok(()),
+            None => {
+                return Err(mdkb::Error::other(format!(
+                    "refusing to anchor a store at {}: it holds git repositories (or is your \
+                     home directory), so a store here would index every repository underneath \
+                     it. Run mdkb from inside a project, or `mdkb init` here if you really \
+                     mean it.",
+                    raw_cwd.display()
+                )));
+            }
+        }
     };
     let cwd = cwd.canonicalize().unwrap_or(cwd);
 
