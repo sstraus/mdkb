@@ -150,6 +150,23 @@
 
 ### Fixed
 
+- **The distiller spawn tests run on Windows instead of assuming a Unix shell.**
+  Thirteen unit tests drove the distiller with `sh -c` stubs — `cat` to echo the
+  prompt back, `printf` to emit a distilled prior. Neither program exists on
+  Windows, so all thirteen failed there with `program not found`, and they were
+  newer than the last CI run that reached the lib suite: the spawn path had
+  never executed on the platform whose process model differs most.
+
+  They now build a stub the spawn path really executes — an `sh` script on Unix,
+  a PowerShell script on Windows — with the canned stdout and stderr in files
+  beside it. Nothing the test feeds the parser travels on the command line,
+  because `cmd.exe` does not undo the MSVCRT-style quote escaping Rust applies
+  to arguments and the distilled JSON would arrive mangled; `powershell -File`
+  also carries a multi-line prompt into argv intact, which a batch stub cannot
+  promise. Coverage is kept rather than gated off: Windows `--lib` goes from
+  1953 passed / 13 failed to 1955 passed / 0 failed, and the whole suite is
+  green on the host — 48 integration targets, 442 passed, 0 failed.
+
 - **The store's own paths stop being two different spellings on Windows.**
   `Context::open` canonicalizes the store directory, deliberately: locks are
   keyed on that path as a string, and two spellings of one directory give two

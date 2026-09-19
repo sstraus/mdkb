@@ -539,6 +539,8 @@ mod tests {
     use super::*;
     use crate::domain::prior_detect::CandidateReason;
     use crate::domain::prior_episode::ToolUse;
+    use crate::test_support::{Stub, StubArgv, StubStdin};
+    use tempfile::TempDir;
 
     fn valid_json() -> &'static str {
         r#"{"is_reusable":true,
@@ -855,8 +857,15 @@ mod tests {
         // A distiller that exits non-zero without emitting JSON returns Ok with
         // whatever it wrote to stdout (empty here); parse_distilled then rejects
         // it as NotJson. The hook proceeds — no crash, no block.
-        let out = run_distiller_cli("sh", &["-c".into(), "exit 1".into()], "prompt")
-            .expect("spawn of sh must succeed even though the script exits non-zero");
+        let dir = TempDir::new().unwrap();
+        let (program, args) = Stub {
+            exit: 1,
+            stdin: StubStdin::Ignored,
+            ..Default::default()
+        }
+        .build(dir.path());
+        let out = run_distiller_cli(&program, &args, "prompt")
+            .expect("spawn of the stub must succeed even though it exits non-zero");
         assert_eq!(parse_distilled(&out.stdout), Err(DistillReject::NotJson));
     }
 
@@ -867,7 +876,14 @@ mod tests {
     #[test]
     fn run_distiller_cli_swallows_broken_pipe_on_a_prompt_that_is_never_read() {
         let huge = "x".repeat(4 * 1024 * 1024);
-        let out = run_distiller_cli("sh", &["-c".into(), "exit 3".into()], &huge)
+        let dir = TempDir::new().unwrap();
+        let (program, args) = Stub {
+            exit: 3,
+            stdin: StubStdin::Ignored,
+            ..Default::default()
+        }
+        .build(dir.path());
+        let out = run_distiller_cli(&program, &args, &huge)
             .expect("a distiller that never reads stdin is not an error");
         assert_eq!(parse_distilled(&out.stdout), Err(DistillReject::NotJson));
     }
@@ -875,9 +891,14 @@ mod tests {
     #[test]
     fn run_distiller_cli_pipes_prompt_on_stdin() {
         // The prompt is delivered on stdin (never argv) and stdout is captured.
-        // `cat` echoes stdin back, proving the round-trip does not deadlock.
-        let out = run_distiller_cli("sh", &["-c".into(), "cat".into()], "hello-prompt")
-            .expect("cat stub must run");
+        // The stub echoes stdin back, proving the round-trip does not deadlock.
+        let dir = TempDir::new().unwrap();
+        let (program, args) = Stub {
+            stdin: StubStdin::Echoed,
+            ..Default::default()
+        }
+        .build(dir.path());
+        let out = run_distiller_cli(&program, &args, "hello-prompt").expect("stub must run");
         assert_eq!(out.stdout, "hello-prompt");
         assert_eq!(out.exit_code, Some(0));
     }
@@ -887,15 +908,15 @@ mod tests {
     /// stderr left "exited with code 1 and said: ''", which names no cause.
     #[test]
     fn a_failure_with_empty_stdout_reports_stderr_instead() {
-        let run = run_distiller_cli(
-            "sh",
-            &[
-                "-c".into(),
-                "echo 'stream error: unexpected status 400 Bad Request' >&2; exit 1".into(),
-            ],
-            "p",
-        )
-        .expect("stub must spawn");
+        let dir = TempDir::new().unwrap();
+        let (program, args) = Stub {
+            stderr: "stream error: unexpected status 400 Bad Request\n",
+            exit: 1,
+            stdin: StubStdin::Ignored,
+            ..Default::default()
+        }
+        .build(dir.path());
+        let run = run_distiller_cli(&program, &args, "p").expect("stub must spawn");
         assert!(run.stdout.is_empty());
         assert!(run.stderr.contains("400 Bad Request"), "{:?}", run.stderr);
 
@@ -910,15 +931,16 @@ mod tests {
     /// a working codex run is progress logging and would only add noise.
     #[test]
     fn a_failure_with_stdout_reports_stdout() {
-        let run = run_distiller_cli(
-            "sh",
-            &[
-                "-c".into(),
-                "echo 'loading model'>&2; printf 'usage: distill'; exit 2".into(),
-            ],
-            "p",
-        )
-        .expect("stub must spawn");
+        let dir = TempDir::new().unwrap();
+        let (program, args) = Stub {
+            stdout: "usage: distill",
+            stderr: "loading model\n",
+            exit: 2,
+            stdin: StubStdin::Ignored,
+            ..Default::default()
+        }
+        .build(dir.path());
+        let run = run_distiller_cli(&program, &args, "p").expect("stub must spawn");
         let msg = distiller_failure("codex", &run, None).unwrap();
         assert!(msg.contains("usage: distill"), "{msg}");
         assert!(
@@ -1044,8 +1066,15 @@ mod tests {
     /// with it.
     #[test]
     fn run_distiller_cli_reports_the_exit_code() {
-        let out = run_distiller_cli("sh", &["-c".into(), "echo out; exit 7".into()], "p")
-            .expect("stub must spawn");
+        let dir = TempDir::new().unwrap();
+        let (program, args) = Stub {
+            stdout: "out\n",
+            exit: 7,
+            stdin: StubStdin::Ignored,
+            ..Default::default()
+        }
+        .build(dir.path());
+        let out = run_distiller_cli(&program, &args, "p").expect("stub must spawn");
         assert_eq!(out.exit_code, Some(7));
         assert_eq!(out.stdout.trim(), "out");
         assert!(!out.succeeded());
@@ -1057,16 +1086,17 @@ mod tests {
     /// block reading it cannot hang the mining task.
     #[test]
     fn prompt_placeholder_goes_to_argv_and_leaves_stdin_closed() {
-        let args = [
-            "-c".to_string(),
-            "cat; printf 'ARG=%s' \"$1\"".to_string(),
-            "sh".to_string(),
-            "{prompt}".to_string(),
-        ];
-        let out = run_distiller_cli("sh", &args, "hello-prompt").expect("stub must spawn");
+        let dir = TempDir::new().unwrap();
+        let (program, args) = Stub {
+            stdout: "ARG=",
+            argv: StubArgv::Echoed,
+            ..Default::default()
+        }
+        .build(dir.path());
+        let out = run_distiller_cli(&program, &args, "hello-prompt").expect("stub must spawn");
         assert_eq!(
             out.stdout, "ARG=hello-prompt",
-            "the prompt must arrive in argv, and `cat` must read an empty stdin"
+            "the prompt must arrive in argv, and the stub must read an empty stdin"
         );
     }
 

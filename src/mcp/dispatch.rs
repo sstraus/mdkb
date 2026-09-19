@@ -5682,6 +5682,7 @@ pub async fn dispatch_call(
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::test_support::{Stub, StubArgv, StubStdin};
     use tempfile::TempDir;
     use tokio::sync::Mutex;
 
@@ -10056,47 +10057,61 @@ mod tests {
         let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
         let not_reusable = distilled.replace(r#""is_reusable":true"#, r#""is_reusable":false"#);
 
-        // (transcript, distiller shell script, expected outcome, a substring the
-        // reason must carry — empty when no reason belongs on that outcome).
-        let cases: Vec<(&str, String, &str, &str)> = vec![
+        // (transcript, distiller stub, expected outcome, a substring the reason
+        // must carry — empty when no reason belongs on that outcome).
+        let cases: Vec<(&str, Stub, &str, &str)> = vec![
             (
                 MINE_BORING_TRANSCRIPT,
-                format!("cat >/dev/null; printf '%s' '{distilled}'"),
+                Stub {
+                    stdout: distilled,
+                    ..Default::default()
+                },
                 "gated",
                 "",
             ),
             (
                 MINE_FIX_TRANSCRIPT,
-                format!("cat >/dev/null; printf '%s' '{distilled}'"),
+                Stub {
+                    stdout: distilled,
+                    ..Default::default()
+                },
                 "distilled",
                 "",
             ),
             (
                 MINE_FIX_TRANSCRIPT,
-                format!("cat >/dev/null; printf '%s' '{not_reusable}'"),
+                Stub {
+                    stdout: &not_reusable,
+                    ..Default::default()
+                },
                 "rejected",
                 "reusable",
             ),
             (
                 MINE_FIX_TRANSCRIPT,
-                "cat >/dev/null; echo 'model overloaded' >&2; exit 1".to_string(),
+                Stub {
+                    stderr: "model overloaded\n",
+                    exit: 1,
+                    ..Default::default()
+                },
                 "failed",
                 "model overloaded",
             ),
         ];
 
-        for (transcript_body, script, expected, reason_needle) in cases {
+        for (transcript_body, stub, expected, reason_needle) in cases {
             let tmp = TempDir::new().unwrap();
             let handle = make_handle(&tmp);
             let transcript = tmp.path().join("transcript.jsonl");
             std::fs::write(&transcript, transcript_body).unwrap();
+            let (program, args) = stub.build(tmp.path());
 
             mine_episode(
                 Arc::clone(&handle),
                 transcript.to_string_lossy().into_owned(),
                 format!("sess-{expected}"),
-                "sh".to_string(),
-                vec!["-c".to_string(), script],
+                program,
+                args,
             )
             .await;
 
@@ -10144,16 +10159,18 @@ mod tests {
         std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
 
         // The same lesson from two distinct sessions: the recurrence gate.
+        let (program, args) = Stub {
+            stdout: distilled,
+            ..Default::default()
+        }
+        .build(tmp.path());
         for session in ["sess-a", "sess-b"] {
             mine_episode(
                 Arc::clone(&handle),
                 transcript.to_string_lossy().into_owned(),
                 session.to_string(),
-                "sh".to_string(),
-                vec![
-                    "-c".to_string(),
-                    format!("cat >/dev/null; printf '%s' '{distilled}'"),
-                ],
+                program.clone(),
+                args.clone(),
             )
             .await;
         }
@@ -10180,13 +10197,12 @@ mod tests {
         std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
 
         // Fake distiller: consume stdin (the prompt), emit a valid distilled prior.
-        // JSON uses only double quotes so it survives single-quote shell wrapping.
         let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
-        let program = "sh".to_string();
-        let args = vec![
-            "-c".to_string(),
-            format!("cat >/dev/null; printf '%s' '{distilled}'"),
-        ];
+        let (program, args) = Stub {
+            stdout: distilled,
+            ..Default::default()
+        }
+        .build(tmp.path());
 
         mine_episode(
             Arc::clone(&handle),
@@ -10227,16 +10243,18 @@ mod tests {
         std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
 
         let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
-        let args = vec![
-            "-c".to_string(),
-            format!("cat >/dev/null; printf 'Here you go:\\n```json\\n%s\\n```\\n' '{distilled}'"),
-        ];
+        let fenced = format!("Here you go:\n```json\n{distilled}\n```\n");
+        let (program, args) = Stub {
+            stdout: &fenced,
+            ..Default::default()
+        }
+        .build(tmp.path());
 
         mine_episode(
             Arc::clone(&handle),
             transcript.to_string_lossy().into_owned(),
             "sess-fenced".to_string(),
-            "sh".to_string(),
+            program,
             args,
         )
         .await;
@@ -10272,15 +10290,21 @@ mod tests {
         let cluster_id = cluster_id_for_key(&key);
 
         // Exits non-zero with a usage message, the shape of a misconfigured CLI.
+        let broken_dir = tmp.path().join("broken");
+        std::fs::create_dir(&broken_dir).unwrap();
+        let (program, args) = Stub {
+            stdout: "usage: distill [OPTIONS]",
+            exit: 2,
+            stdin: StubStdin::Ignored,
+            ..Default::default()
+        }
+        .build(&broken_dir);
         mine_episode(
             Arc::clone(&handle),
             transcript.to_string_lossy().into_owned(),
             "sess-broken".to_string(),
-            "sh".to_string(),
-            vec![
-                "-c".to_string(),
-                "printf 'usage: distill [OPTIONS]'; exit 2".to_string(),
-            ],
+            program,
+            args,
         )
         .await;
         ensure_handle_context(&handle).await.unwrap();
@@ -10293,20 +10317,23 @@ mod tests {
             );
         }
 
-        // The prompt arrives in argv: the stub echoes $1 back as the answer, so a
-        // cluster appears only if substitution happened.
+        // The prompt arrives in argv: the stub answers only when it got an
+        // argument, so a cluster appears only if substitution happened.
         let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let argv_dir = tmp.path().join("argv");
+        std::fs::create_dir(&argv_dir).unwrap();
+        let (program, args) = Stub {
+            stdout: distilled,
+            argv: StubArgv::Required,
+            ..Default::default()
+        }
+        .build(&argv_dir);
         mine_episode(
             Arc::clone(&handle),
             transcript.to_string_lossy().into_owned(),
             "sess-argv".to_string(),
-            "sh".to_string(),
-            vec![
-                "-c".to_string(),
-                format!("test -n \"$1\" && printf '%s' '{distilled}'"),
-                "sh".to_string(),
-                "{prompt}".to_string(),
-            ],
+            program,
+            args,
         )
         .await;
         let guard = handle.ctx.lock().await;
@@ -10339,11 +10366,11 @@ mod tests {
         // trigger key → one cluster whose distinct_sessions climbs to the promotion
         // gate (PROMOTION_MIN_SESSIONS = 2).
         let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template instead.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
-        let program = "sh".to_string();
-        let args = vec![
-            "-c".to_string(),
-            format!("cat >/dev/null; printf '%s' '{distilled}'"),
-        ];
+        let (program, args) = Stub {
+            stdout: distilled,
+            ..Default::default()
+        }
+        .build(tmp.path());
 
         for session in ["sess-1", "sess-2"] {
             mine_episode(

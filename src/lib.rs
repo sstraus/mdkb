@@ -23,6 +23,8 @@ pub mod llm;
 pub mod mcp;
 pub mod metrics;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod watcher;
 
 // Re-export main types
