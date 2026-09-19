@@ -3652,8 +3652,11 @@ fn format_quarantine_banner(mdkb_dir: &std::path::Path, doc_count: i64) -> Optio
             .map(|d| d.format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "unknown date".to_string());
         out.push_str(&format!(
-            "⚠️ mdkb index was CORRUPT and quarantined ({date}): salvaged {} memory entries, {} edges. {docs_status} Remove `.mdkb/{}` once verified to clear this warning.\n",
-            r.memory_entries_salvaged, r.memory_edges_salvaged, r.corrupt_file
+            "⚠️ mdkb index was CORRUPT and quarantined ({date}): salvaged {} memory entries, {} edges. {docs_status} The copy `.mdkb/{}` is deleted automatically {} days after quarantine, and this warning goes with it.\n",
+            r.memory_entries_salvaged,
+            r.memory_edges_salvaged,
+            r.corrupt_file,
+            crate::store::heal::QUARANTINE_RETENTION.as_secs() / 86_400
         ));
     }
     Some(out)

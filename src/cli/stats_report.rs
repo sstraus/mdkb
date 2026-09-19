@@ -25,8 +25,8 @@ pub struct StatsReport {
     pub sessions: SessionsSummary,
     pub hooks: HooksSummary,
     /// Outstanding autoheal quarantines (a corrupt index was rebuilt). Non-empty
-    /// until the operator removes the `*.corrupt-*` files — a persistent, loud
-    /// data-loss warning.
+    /// until `store::heal::sweep_expired_quarantines` retires the `*.corrupt-*`
+    /// copy — a persistent, loud data-loss warning for as long as it lives.
     pub quarantine: Vec<crate::store::heal::QuarantineReport>,
 }
 

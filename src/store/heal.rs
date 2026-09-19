@@ -33,6 +33,19 @@ pub const CHECK_INTERVAL: Duration = Duration::from_hours(6);
 /// contention before an open fails.
 pub const PROBE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a quarantined `*.corrupt-*` copy stays on disk before a store open
+/// deletes it. Its `.report.json` sidecar is kept forever.
+///
+/// The forensics live in the report, not in the copy: [`diagnose`] already
+/// extracted everything the file could say, and a quarantined database on its
+/// own has never answered how the corruption happened. Meanwhile the copy is
+/// the size of the index (56 MB in the case that motivated this) and keeps the
+/// quarantine banner up long after the rebuild succeeded, which trains the
+/// operator to ignore a corruption warning. Fifteen days covers an absence
+/// long enough to miss the banner entirely without keeping the file for good.
+// 15 days, spelled in hours because `Duration::from_days` is still unstable.
+pub const QUARANTINE_RETENTION: Duration = Duration::from_hours(24 * 15);
+
 /// Outcome of [`ensure_sound`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Heal {
@@ -638,6 +651,54 @@ pub fn quarantine_reports(mdkb_dir: &Path) -> Vec<QuarantineReport> {
     reports
 }
 
+/// Delete every quarantined database copy in `mdkb_dir` older than
+/// [`QUARANTINE_RETENTION`], keeping the `.report.json` sidecars.
+///
+/// The `-wal`/`-shm` siblings go with the copy: they belong to the corrupt
+/// generation and are unreadable without it.
+///
+/// Age comes from the `.corrupt-<unix_secs>` suffix, not from the file mtime,
+/// because a copy is renamed rather than written — its mtime is the mtime of
+/// the last write to the *healthy* generation, which can be arbitrarily older
+/// than the quarantine.
+pub fn sweep_expired_quarantines(mdkb_dir: &Path) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    sweep_expired_quarantines_at(mdkb_dir, QUARANTINE_RETENTION, now);
+}
+
+/// [`sweep_expired_quarantines`] with an injectable retention and clock.
+fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: i64) {
+    let Ok(entries) = std::fs::read_dir(mdkb_dir) else {
+        return;
+    };
+    let retention_secs = retention.as_secs() as i64;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        // Everything the quarantine renamed — the DB and its `-wal`/`-shm` —
+        // but never the report that outlives them.
+        if !name.contains(".corrupt-") || name.ends_with(".report.json") {
+            continue;
+        }
+        let Some(quarantined_at) = quarantine_ts(&name) else {
+            continue;
+        };
+        // A negative age (a copy stamped in the future by a skewed clock) is
+        // not an expiry. Keep it.
+        if now_secs - quarantined_at <= retention_secs {
+            continue;
+        }
+        // Best-effort. Windows refuses to unlink a file another process still
+        // holds open, and a sweep must never fail the open that triggered it —
+        // the copy just survives to the next one.
+        if let Err(e) = std::fs::remove_file(entry.path()) {
+            tracing::debug!("quarantine sweep left {name} in place: {e}");
+        }
+    }
+}
+
 /// Probe `db_path` for structural corruption (throttled by [`CHECK_INTERVAL`])
 /// and quarantine it if corrupt.
 ///
@@ -1184,6 +1245,90 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("index.sqlite"), b"db").unwrap();
         assert!(quarantine_reports(dir.path()).is_empty());
+    }
+
+    /// Lay down a quarantined copy stamped `age` seconds ago, with the `-wal`
+    /// and `.report.json` siblings a real quarantine leaves beside it. Returns
+    /// the `now` the sweep must be given.
+    fn quarantine_aged(dir: &Path, age: i64) -> (PathBuf, i64) {
+        let now = 1_800_000_000_i64;
+        let corrupt = dir.join(format!("index.sqlite.corrupt-{}", now - age));
+        std::fs::write(&corrupt, b"corrupt bytes").unwrap();
+        std::fs::write(with_suffix(&corrupt, "-wal"), b"wal").unwrap();
+        std::fs::write(report_path(&corrupt), br#"{"corrupt_file":"x"}"#).unwrap();
+        (corrupt, now)
+    }
+
+    #[test]
+    fn a_copy_one_second_past_the_retention_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (corrupt, now) = quarantine_aged(dir.path(), QUARANTINE_RETENTION.as_secs() as i64 + 1);
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+
+        assert!(!corrupt.exists(), "expired copy must be gone");
+        assert!(
+            !with_suffix(&corrupt, "-wal").exists(),
+            "the -wal belongs to the corrupt generation and goes with it"
+        );
+        assert!(
+            report_path(&corrupt).exists(),
+            "the forensics outlive the copy"
+        );
+        assert!(
+            quarantine_reports(dir.path()).is_empty(),
+            "the banner is gated on the copy, so it must clear with it"
+        );
+    }
+
+    #[test]
+    fn a_copy_one_second_short_of_the_retention_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (corrupt, now) = quarantine_aged(dir.path(), QUARANTINE_RETENTION.as_secs() as i64 - 1);
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+
+        assert!(corrupt.exists(), "inside the retention, nothing is removed");
+        assert!(with_suffix(&corrupt, "-wal").exists());
+        assert_eq!(
+            quarantine_reports(dir.path()).len(),
+            1,
+            "and the warning stays up"
+        );
+    }
+
+    #[test]
+    fn the_sweep_spares_the_live_index_and_a_future_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("index.sqlite");
+        std::fs::write(&live, b"the working database").unwrap();
+        // A clock that ran backwards stamps a copy in the future. Negative age
+        // is not expiry.
+        let skewed = dir.path().join("index.sqlite.corrupt-1900000000");
+        std::fs::write(&skewed, b"x").unwrap();
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, 1_800_000_000);
+
+        assert!(live.exists(), "the sweep never touches the live database");
+        assert!(skewed.exists());
+    }
+
+    #[test]
+    fn a_copy_still_held_open_does_not_fail_the_sweep() {
+        // Windows refuses to unlink an open file; Unix unlinks it happily. The
+        // sweep must return normally either way — its caller is `Context::open`,
+        // and a store must not fail to open because a stale copy is locked.
+        let dir = tempfile::tempdir().unwrap();
+        let (corrupt, now) = quarantine_aged(dir.path(), QUARANTINE_RETENTION.as_secs() as i64 + 1);
+        let held = std::fs::File::open(&corrupt).unwrap();
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+
+        assert!(
+            report_path(&corrupt).exists(),
+            "whatever happened to the copy, the report is still there"
+        );
+        drop(held);
     }
 
     #[test]

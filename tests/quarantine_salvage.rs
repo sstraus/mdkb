@@ -192,3 +192,54 @@ fn a_healthy_store_is_not_rebuilt() {
     );
     assert_eq!(collections::list_collections(&ctx.conn).unwrap().len(), 1);
 }
+
+/// A quarantined copy is retired by an ordinary store open once it is older
+/// than the retention, and the warning it raised goes with it.
+///
+/// The banner is the point. A copy nothing ever deletes keeps a corruption
+/// warning on screen for weeks after the rebuild succeeded, which teaches the
+/// operator that corruption warnings are noise.
+#[test]
+fn an_expired_quarantine_is_retired_by_the_next_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonicalize");
+    handle_init(&root).expect("init");
+
+    let mdkb_dir = root.join(".mdkb");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        - mdkb::store::heal::QUARANTINE_RETENTION.as_secs()
+        - 3600;
+    let stale = mdkb_dir.join(format!("index.sqlite.corrupt-{stamp}"));
+    std::fs::write(&stale, b"a copy from a quarantine long recovered").expect("stale copy");
+    std::fs::write(
+        mdkb_dir.join(format!("index.sqlite.corrupt-{stamp}.report.json")),
+        br#"{"corrupt_file":"index.sqlite"}"#,
+    )
+    .expect("report");
+
+    // Held open for the whole open: on Windows this makes the unlink fail, and
+    // the store must open anyway.
+    let held = std::fs::File::open(&stale).expect("hold the copy open");
+    let ctx = Context::open(&root).expect("a locked stale copy must not fail the open");
+    drop(ctx);
+    drop(held);
+
+    // Second open: on Unix the first one already unlinked it; on Windows the
+    // handle is now closed, so this one succeeds.
+    drop(Context::open(&root).expect("reopen"));
+
+    assert!(!stale.exists(), "the expired copy must be gone");
+    assert!(
+        mdkb::store::heal::quarantine_reports(&mdkb_dir).is_empty(),
+        "and with it the quarantine warning"
+    );
+    assert!(
+        mdkb_dir
+            .join(format!("index.sqlite.corrupt-{stamp}.report.json"))
+            .exists(),
+        "the report stays — it is where the forensics actually live"
+    );
+}

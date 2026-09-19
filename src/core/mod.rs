@@ -343,6 +343,13 @@ impl Context {
             false
         };
 
+        // Retire quarantined copies that have outlived their retention. On the
+        // open path rather than on a timer: this is the only moment mdkb is
+        // guaranteed to run against the store, and the sweep is one directory
+        // listing. It runs after the salvage above, so a copy can never be
+        // removed before the entries have been read out of it.
+        crate::store::heal::sweep_expired_quarantines(&mdkb_dir);
+
         Ok(Self {
             conn,
             root: root.to_path_buf(),
@@ -576,6 +583,7 @@ pub mod dup;
 pub mod graph;
 pub mod indexing;
 pub mod memory;
+pub mod memory_audit;
 pub mod memory_sync;
 pub mod ops;
 pub mod routing;

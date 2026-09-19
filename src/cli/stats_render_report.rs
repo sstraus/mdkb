@@ -65,9 +65,13 @@ fn render_quarantine(
     // Status and remediation are per-store, not per-file: emit them once.
     lines.push(String::new());
     lines.push(format!("  {docs_status}"));
-    // Mirrors the scan predicate in `store::heal::quarantine_reports` (any name
-    // containing `.corrupt-`), so it also clears quarantined `code.sqlite`.
-    lines.push("  clear with: rm .mdkb/*.corrupt-*".to_string());
+    // No manual remedy: `store::heal::sweep_expired_quarantines` deletes the
+    // copy on a store open once it is older than the retention, and the banner
+    // goes with it. Say when, so the warning does not read as permanent.
+    lines.push(format!(
+        "  copy removed automatically {} days after quarantine",
+        crate::store::heal::QUARANTINE_RETENTION.as_secs() / 86_400
+    ));
     out.push_str(&frame(
         "⚠ INDEX QUARANTINED (was corrupt)",
         &lines.join("\n"),
@@ -531,18 +535,18 @@ mod tests {
         }
     }
 
-    /// The banner exists to tell the operator how to clear it. `frame`
-    /// ellipsizes overlong lines, so a too-wide layout silently eats the
-    /// `rm` command and the warning becomes unclearable — exactly the state
-    /// found in the wild (a healthy store nagging about a 3-week-old file).
+    /// The banner exists to tell the operator when it will clear. `frame`
+    /// ellipsizes overlong lines, so a too-wide layout silently eats that
+    /// sentence and the warning reads as permanent — exactly the state found
+    /// in the wild (a healthy store nagging about a 3-week-old file).
     #[test]
     fn render_quarantine_keeps_cleanup_command_intact() {
         let mut r = fixture_report();
         r.quarantine = vec![quarantine_fixture(1_700_000_000)];
         let out = render(&r, false);
         assert!(
-            out.contains("clear with: rm .mdkb/*.corrupt-*"),
-            "remediation command truncated or missing: {out}"
+            out.contains("copy removed automatically 15 days after quarantine"),
+            "retention sentence truncated or missing: {out}"
         );
         assert!(
             out.contains("index.sqlite.corrupt-1700000000 (2023-11-14)"),
@@ -585,7 +589,7 @@ mod tests {
         assert!(out.contains("index.sqlite.corrupt-1700000000"));
         assert!(out.contains("index.sqlite.corrupt-1700086400"));
         assert_eq!(
-            out.matches("clear with:").count(),
+            out.matches("removed automatically").count(),
             1,
             "remediation repeated per file: {out}"
         );
