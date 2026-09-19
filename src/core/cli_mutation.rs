@@ -90,6 +90,9 @@ pub enum CliMutation {
         days: u32,
         dry_run: bool,
     },
+    MemoryAudit {
+        dry_run: bool,
+    },
     #[cfg(feature = "llm")]
     MemoryCondense {
         tag: Option<String>,
@@ -202,6 +205,9 @@ pub enum CliMutationResult {
     },
     MemoryPruned {
         ids: Vec<String>,
+    },
+    MemoryAudited {
+        outcome: crate::core::memory_audit::AuditOutcome,
     },
     #[cfg(feature = "llm")]
     MemoryCondensed {
@@ -392,6 +398,9 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
         }
         MemoryPrune { days, dry_run } => R::MemoryPruned {
             ids: crate::core::memory::handle_memory_prune(ctx, days, dry_run)?,
+        },
+        MemoryAudit { dry_run } => R::MemoryAudited {
+            outcome: crate::core::memory_audit::handle_memory_audit(ctx, dry_run)?,
         },
         #[cfg(feature = "llm")]
         MemoryCondense {

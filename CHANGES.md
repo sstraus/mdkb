@@ -38,7 +38,71 @@
   behavioural-prior injection counters. Either write would change what a later
   real injection does, and so would corrupt the counters it exists to produce.
 
+- **`mdkb memory audit` — which stored entries deserve a fresh look, and no
+  opinion about any of them.** Nothing ever asked whether a stored decision was
+  still true. Confidence decay is purely time-based and computed at read,
+  `archive_expired` only runs inside `mdkb update`, and confirm/refute is
+  something a human types. Nothing recorded WHEN an entry was last
+  re-evaluated either, so a re-read could not tell a fresh judgement from an
+  ancient one.
+
+  **The shape this deliberately is not: an AI sweep.** A model has no ground
+  truth to check a stored entry against, so it would stamp confident "still
+  valid" on entries nobody verified — the failure story 092 already ruled out
+  under another name (a prior does not gain confidence from silence). So the
+  audit SELECTS from signals the store already holds and decides nothing:
+
+  * a path an entry cites that is no longer in the working tree **but that git
+    has heard of**. A path git has never seen is prose that happened to look
+    like one, and reporting it would fill the audit with noise;
+  * a commit under a cited path made after the entry was last written, for
+    entries older than `memory.audit.stale_after_days`;
+  * two active entries the embedding cannot tell apart — the write path's own
+    `find_duplicate` rule applied to pairs that never met, because they were
+    written far enough apart — or two joined by an unresolved `contradicts`
+    edge;
+  * expired entries, and lifecycle records past `memory.audit.aged_lifecycle_days`.
+
+  **The one write is a new `last_audited_at` column (schema v28).** Not
+  `last_confirmed_at`, which is the decay reference: writing that would refresh
+  the confidence of every entry a sweep merely looked at. Not `last_refuted_at`
+  either, which would claim the opposite lie. An audit that changes nothing
+  writes no memory revision, does not move `updated_at`, and so never rewrites
+  a git-tracked entry file. `--dry-run` skips the stamp too.
+
+  On demand only — no scheduler, no daemon sweep. `smoke_memory_audit_runs_on_
+  demand_only_and_reports_json_without_prose` proves it by running an index
+  pass and a SessionStart hook and asserting the stamp is still unset.
+
+  **Upgrading is one-way for the store.** v28 is an additive `ALTER TABLE`, but
+  `refuse_future_schema` stops an older binary opening a store a newer one has
+  migrated. Install the new binary and `mdkb daemon restart` before opening a
+  store with it.
+
 ### Changed
+
+- **A quarantined index copy is retired after 15 days instead of by hand.** The
+  autoheal path left two artifacts beside the store — the corrupt database copy
+  and its `.report.json` sidecar — and nothing ever removed either. A copy from
+  2026-09-12 was still on disk a week later at 56 MB, with the stats banner and
+  the SessionStart warmup still warning about a quarantine that had fully
+  recovered: 623 documents re-indexed, `damaged_tables` empty, no entry lost.
+  A warning that cannot clear itself teaches the operator to skip corruption
+  warnings, which is the opposite of the point.
+
+  `store::heal::sweep_expired_quarantines` now deletes a `*.corrupt-*` copy
+  (with its `-wal`/`-shm` siblings) once it is older than
+  `QUARANTINE_RETENTION`, on the existing `Context::open` path — no scheduler,
+  no daemon timer — and after the salvage, so a copy can never be removed
+  before its memory entries have been read out of it. Age comes from the
+  `.corrupt-<unix_secs>` suffix, not the mtime: a quarantine renames the file,
+  so its mtime is the last write to the *healthy* generation.
+
+  **The `.report.json` survives the deletion.** `heal.rs` already records that
+  a quarantined file on its own has never answered how the corruption happened;
+  the forensics are the 1.4 KB report, not the 56 MB copy.
+
+  Both banners now say when the copy goes rather than printing an `rm`.
 
 - **An accepted duplication cluster stays accepted when its membership
   changes.** The ignore-list was keyed on a digest of the whole membership, so

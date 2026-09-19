@@ -280,6 +280,102 @@ fn parse_name_only_log(stdout: &str) -> Vec<Vec<String>> {
     groups
 }
 
+/// Newest commit time, per path, for everything committed at or after
+/// `since_unix`. Paths are repo-relative with forward slashes, as git prints
+/// them on every platform.
+///
+/// One walk rather than one `git log -- <path>` per path: `mdkb memory audit`
+/// asks the same question of every path every entry cites, and the answer is a
+/// single lookup once the map is built.
+///
+/// An empty map, never an error, when `root` is not in a repository or the
+/// repository has no commits: an audit of a store in a directory nobody has
+/// ever committed has nothing to say about source drift, which is not a
+/// failure.
+pub fn paths_changed_since(
+    root: &Path,
+    since_unix: i64,
+) -> crate::error::Result<std::collections::HashMap<String, i64>> {
+    use crate::error::Error;
+    use std::collections::HashMap;
+
+    if find_git_root(root).is_none() {
+        return Ok(HashMap::new());
+    }
+
+    // `%x00%ct` puts a NUL in front of every commit time. A path cannot
+    // contain a NUL on any filesystem git supports, so the header lines are
+    // unambiguous in a way a `commit `-style prefix is not.
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "log",
+            // `@<seconds>` is git's explicit unix-epoch form. A bare number
+            // reaches approxidate, which also has to consider reading it as a
+            // year or a date — same answer today, one guess away from not
+            // being.
+            &format!("--since=@{since_unix}"),
+            "--name-only",
+            "--no-renames",
+            "--pretty=format:%x00%ct",
+        ])
+        .output()
+        .map_err(|e| Error::other(format!("cannot run git log: {e}")))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("does not have any commits yet") {
+            return Ok(HashMap::new());
+        }
+        return Err(Error::other(format!("git log failed: {}", stderr.trim())));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut changed: HashMap<String, i64> = HashMap::new();
+    let mut commit_time = 0_i64;
+    for line in stdout.lines() {
+        if let Some(ts) = line.strip_prefix('\0') {
+            commit_time = ts.trim().parse().unwrap_or(0);
+            continue;
+        }
+        if line.is_empty() {
+            continue;
+        }
+        // `git log` walks newest-first, so the first time a path is seen is
+        // already its newest commit — but a `--since` boundary is not a
+        // guarantee of ordering across merges, so take the max explicitly.
+        changed
+            .entry(line.to_string())
+            .and_modify(|t| *t = (*t).max(commit_time))
+            .or_insert(commit_time);
+    }
+    Ok(changed)
+}
+
+/// Whether git has ever recorded a commit touching `rel_path`.
+///
+/// The question a dead reference needs answered. A path that is not on disk
+/// and that git has never heard of is prose that happened to look like a path,
+/// not a reference that stopped resolving — reporting it would fill an audit
+/// with noise, which is the one thing a gardening command cannot afford.
+///
+/// `rel_path` is passed as its own argv token after `--`, so a value starting
+/// with `-` is a pathspec and not an option.
+pub fn path_ever_existed(root: &Path, rel_path: &str) -> bool {
+    if find_git_root(root).is_none() {
+        return false;
+    }
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["log", "-1", "--pretty=format:%H", "--"])
+        .arg(rel_path)
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
 /// Walk up from `start` (inclusive) looking for a git repository root — a
 /// directory containing `.git` (a directory for a normal repo, a file for a
 /// secondary worktree). Returns the nearest such directory, or `None`.

@@ -310,6 +310,9 @@ pub fn mutation_request(
                 days: *days,
                 dry_run: *dry_run,
             },
+            // A mutation even though it decides nothing: the `last_audited_at`
+            // stamp is a write, so it goes through the daemon like every other.
+            MemoryCommand::Audit { dry_run } => M::MemoryAudit { dry_run: *dry_run },
             #[cfg(feature = "llm")]
             MemoryCommand::Condense {
                 tag,

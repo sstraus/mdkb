@@ -10,6 +10,7 @@ pub mod hybrid;
 pub mod identity;
 pub mod maintenance;
 pub mod memory;
+pub mod memory_audit;
 pub mod memory_file;
 pub mod memory_graph;
 pub mod mutation_lock;

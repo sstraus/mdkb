@@ -240,7 +240,18 @@ fn smoke_quarantine_banner_reports_the_active_store_only() {
         &run_env(&["hook", "session-start"], &repo.root, &ns_env),
         "namespaced hook (creates the store)",
     );
-    std::fs::write(repo.root.join(".mdkb/index.sqlite.corrupt-1700000000"), b"").unwrap();
+    // Stamped now, not at a fixed past date: a copy older than the retention is
+    // swept by the very open this test performs, and the banner would be gone
+    // for the right reason while looking like the wrong one.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        repo.root.join(format!(".mdkb/index.sqlite.corrupt-{now}")),
+        b"",
+    )
+    .unwrap();
 
     // Control: the default store reports its own quarantine.
     let out = run_env(
@@ -267,7 +278,7 @@ fn smoke_quarantine_banner_reports_the_active_store_only() {
     // And it does report its own.
     std::fs::write(
         repo.root
-            .join(".mdkb/namespaces/test/index.sqlite.corrupt-1700000001"),
+            .join(format!(".mdkb/namespaces/test/index.sqlite.corrupt-{now}")),
         b"",
     )
     .unwrap();
@@ -800,6 +811,63 @@ fn smoke_collection_add_remove() {
 }
 
 // ── Memory ──────────────────────────────────────────────────────────
+
+/// `memory audit` is an on-demand gardening command: nothing else may run it.
+///
+/// Proved by the stamp it is the only writer of. Index, hook and open all run
+/// against a store with one entry; if any of them swept, `last_audited_at`
+/// would be set and the audit's own report would say the entry had been
+/// audited before.
+#[test]
+fn smoke_memory_audit_runs_on_demand_only_and_reports_json_without_prose() {
+    let repo = Repo::new();
+    assert_ok(
+        &run(
+            &["memory", "add", "audited", "-t", "Audited", "-c", "a body"],
+            &repo.root,
+        ),
+        "memory add",
+    );
+
+    // Everything that runs on its own: an index pass, a session-start hook,
+    // and the store opens each of those performs.
+    assert_ok(&run(&["update"], &repo.root), "update");
+    assert_hook_output_valid(
+        &run_env(
+            &["hook", "session-start"],
+            &repo.root,
+            &[("MDKB_NO_DAEMON", "1")],
+        ),
+        "hook session-start",
+    );
+
+    let out = run(&["--format", "json", "memory", "audit"], &repo.root);
+    assert_ok(&out, "memory audit --format json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout(&out).trim()).expect("audit --format json must be pure JSON");
+
+    assert!(
+        parsed["scanned"].as_u64().unwrap_or(0) >= 1,
+        "the audit must have looked at the entry: {parsed}"
+    );
+    for candidate in parsed["candidates"].as_array().unwrap_or(&Vec::new()) {
+        assert_eq!(
+            candidate["previously_audited_at"],
+            serde_json::Value::Null,
+            "nothing but `memory audit` may set the audit stamp: {candidate}"
+        );
+    }
+
+    // And the JSON carries data, not sentences: every signal is a tagged
+    // variant, never a rendered line.
+    let text = stdout(&out);
+    for prose in ["which is gone", "worth re-reading", "decides nothing"] {
+        assert!(
+            !text.contains(prose),
+            "machine output must carry no prose, found {prose:?}: {text}"
+        );
+    }
+}
 
 #[test]
 fn smoke_memory_lifecycle() {

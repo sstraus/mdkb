@@ -197,6 +197,38 @@ pub const RECALL_AUTO_MIN_COSINE_DEFAULT: f32 = 0.50;
 pub struct MemoryConfig {
     /// Maximum entries in warmup index.
     pub warmup_limit: usize,
+
+    /// Thresholds for `mdkb memory audit`.
+    pub audit: MemoryAuditConfig,
+}
+
+/// What `mdkb memory audit` treats as old enough, close enough or aged enough
+/// to be worth a human look.
+///
+/// Every key is a SELECTION threshold. None of them decides anything about an
+/// entry: the audit lists candidates and writes no confirmation, refutation or
+/// supersession, so a threshold set too loose costs reading time and nothing
+/// else.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemoryAuditConfig {
+    /// An entry untouched for this many days is old enough that a change under
+    /// one of the paths it cites is worth reporting. Default 180: shorter and a
+    /// normal quarter of commits flags the whole store, which is the same as
+    /// flagging nothing.
+    pub stale_after_days: u32,
+
+    /// Age at which an unread lifecycle entry (reminder, prior, handoff) is
+    /// listed. Default 90, the same figure `mdkb memory prune` defaults to —
+    /// the audit reports what a prune would take, so the two must not disagree.
+    pub aged_lifecycle_days: u32,
+
+    /// Cosine similarity at or above which two active entries are reported as
+    /// near-duplicates. Default 0.9488 — `store::memory::NEAR_DUPLICATE_DISTANCE`
+    /// (0.32) read as a cosine, so the audit flags exactly the pairs the write
+    /// path would have refused had they arrived in the other order.
+    /// `audit_default_similarity_tracks_the_write_path` pins the two together.
+    pub near_duplicate_similarity: f32,
 }
 
 /// Dotted paths of the keys in `raw_toml` that no field of [`Config`] reads.
@@ -781,6 +813,17 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             warmup_limit: DEFAULT_WARMUP_LIMIT,
+            audit: MemoryAuditConfig::default(),
+        }
+    }
+}
+
+impl Default for MemoryAuditConfig {
+    fn default() -> Self {
+        Self {
+            stale_after_days: 180,
+            aged_lifecycle_days: 90,
+            near_duplicate_similarity: 0.9488,
         }
     }
 }
@@ -1085,6 +1128,48 @@ mod tests {
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(config.memory.warmup_limit, parsed.memory.warmup_limit);
+    }
+
+    /// The audit reports the pairs the write path would have refused. If the
+    /// two numbers drift apart, `mdkb memory audit` starts either flagging
+    /// pairs `memory add` happily accepts or staying silent about pairs it
+    /// rejects — in both cases the audit is describing a rule the store does
+    /// not apply.
+    #[test]
+    fn audit_default_similarity_tracks_the_write_path() {
+        let from_write_path = crate::store::hybrid::cosine_from_distance(
+            crate::store::memory::NEAR_DUPLICATE_DISTANCE,
+        );
+        let default = f64::from(MemoryAuditConfig::default().near_duplicate_similarity);
+        assert!(
+            (default - from_write_path).abs() < 1e-4,
+            "audit floor {default} does not match the write path's {from_write_path}"
+        );
+    }
+
+    /// `aged_lifecycle_days` and `mdkb memory prune --days` answer the same
+    /// question — "is this lifecycle record stale" — so a reader who runs the
+    /// audit must see exactly what a prune would take.
+    #[test]
+    fn audit_lifecycle_age_matches_the_prune_default() {
+        use clap::CommandFactory;
+        let prune_default = crate::cli::Cli::command()
+            .find_subcommand("memory")
+            .and_then(|m| m.find_subcommand("prune").cloned())
+            .and_then(|p| {
+                p.get_arguments()
+                    .find(|a| a.get_id() == "days")
+                    .and_then(|a| a.get_default_values().first().cloned())
+            })
+            .expect("memory prune must have a --days default")
+            .to_string_lossy()
+            .parse::<u32>()
+            .expect("the default must be a number");
+        assert_eq!(
+            MemoryAuditConfig::default().aged_lifecycle_days,
+            prune_default,
+            "the audit must report what a prune would take"
+        );
     }
 
     #[test]

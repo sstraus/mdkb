@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 27;
+pub const SCHEMA_VERSION: i32 = 28;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -176,6 +176,7 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     corrections INTEGER DEFAULT 0,    -- Negative confidence signals
     last_confirmed_at INTEGER,        -- Timestamp of last confirmation
     last_refuted_at INTEGER,          -- Timestamp of last refutation; never moves last_confirmed_at
+    last_audited_at INTEGER,          -- Timestamp of last `memory audit` pass; a look, not a verdict: never a decay reference
     source_type TEXT DEFAULT 'user_statement',  -- official_docs, user_statement, inference
     expires_at INTEGER,                        -- Unix timestamp; NULL = permanent
     due_at INTEGER,                            -- Unix timestamp; surfaces reminders at/after this time
@@ -1011,6 +1012,35 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 report.emptied.len(),
                 report.newly_promotable.len(),
             );
+        }
+    }
+
+    // Migration from v27 to v28: record WHEN an entry was last LOOKED AT by
+    // `mdkb memory audit`.
+    //
+    // A third stamp rather than a reuse of either existing one, because an
+    // audit decides nothing. `last_confirmed_at` is the decay reference, so
+    // writing it would silently refresh confidence on entries nobody verified —
+    // exactly the "a prior does not gain confidence from silence" failure story
+    // 092 ruled out. `last_refuted_at` would claim the opposite lie. This column
+    // answers only "when did a mechanical sweep last consider this", which is
+    // what a re-read needs to tell a fresh judgement from an ancient one.
+    //
+    // NULL on every existing row on purpose: nothing has been audited yet, and
+    // back-filling a date would be inventing one.
+    if from_version < 28 && table_exists(conn, "memory_entries") {
+        let has_audited: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'last_audited_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !has_audited {
+            conn.execute(
+                "ALTER TABLE memory_entries ADD COLUMN last_audited_at INTEGER",
+                [],
+            )?;
         }
     }
 

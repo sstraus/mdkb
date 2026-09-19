@@ -1154,6 +1154,10 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     let pruned = handle_memory_prune(&ctx, days, dry_run)?;
                     format_prune_result(&pruned, days, dry_run, cli.format);
                 }
+                MemoryCommand::Audit { dry_run } => {
+                    let outcome = mdkb::core::memory_audit::handle_memory_audit(&ctx, dry_run)?;
+                    format_audit_result(&outcome, dry_run, cli.format);
+                }
                 #[cfg(feature = "llm")]
                 MemoryCommand::Condense {
                     tag,
@@ -1426,6 +1430,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
 {0} compact                                            # vacuum both databases
 {0} compact --prune-sessions --older-than 90d --export dir  # hard-delete archived transcripts (exports first)
 {0} memory prune --days 90 --dry-run                   # preview: expired entries + reminders/priors/handoffs unread for 90d
+{0} memory audit                                       # entries worth re-reading (dead refs, drifted source, duplicates); decides nothing
 
 # Daemon (the daemon owns every write; the CLI routes mutations to it)
 {0} daemon status                                      # is it running, and against which store
@@ -2224,6 +2229,9 @@ fn print_routed_result(
         (Command::Memory(MemoryCommand::Prune { days, dry_run }), R::MemoryPruned { ids }) => {
             format_prune_result(ids, *days, *dry_run, format);
         }
+        (Command::Memory(MemoryCommand::Audit { dry_run }), R::MemoryAudited { outcome }) => {
+            format_audit_result(outcome, *dry_run, format);
+        }
         #[cfg(feature = "llm")]
         (
             Command::Memory(MemoryCommand::Condense { dry_run, .. }),
@@ -2690,6 +2698,85 @@ fn print_memory_sync_warnings(s: &mdkb::core::memory_sync::MemorySyncSummary) {
     }
     if let Some(warning) = &s.gitignore_shadowed {
         println!("⚠ {warning}");
+    }
+}
+
+/// Render one audit signal as the single line a human reads.
+///
+/// Kept out of the JSON arm on purpose: the structured output carries the
+/// variant and its fields, and a machine reading it does not need a sentence.
+fn audit_signal_line(signal: &mdkb::core::memory_audit::AuditSignal) -> String {
+    use mdkb::core::memory_audit::AuditSignal as S;
+    let date = |ts: i64| {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| ts.to_string())
+    };
+    match signal {
+        S::DeadCodeReference { reference } => format!("cites {reference}, which is gone"),
+        S::SourceChangedSince { path, changed_at } => {
+            format!(
+                "{path} changed on {} since this was written",
+                date(*changed_at)
+            )
+        }
+        S::NearDuplicate { other, similarity } => {
+            format!("near-duplicate of {other} ({similarity:.3})")
+        }
+        S::Contradicts { other } => format!("contradicts {other}, unresolved"),
+        S::Expired { expires_at } => format!("expired on {}", date(*expires_at)),
+        S::AgedLifecycle { last_touched } => {
+            format!("lifecycle entry unread since {}", date(*last_touched))
+        }
+    }
+}
+
+fn format_audit_result(
+    outcome: &mdkb::core::memory_audit::AuditOutcome,
+    dry_run: bool,
+    format: OutputFormat,
+) {
+    match format {
+        OutputFormat::Json => {
+            println!("{}", serde_json::to_string_pretty(outcome).unwrap());
+        }
+        OutputFormat::Csv => {
+            println!("id,entry_type,signal_count");
+            for c in &outcome.candidates {
+                println!("{},{},{}", c.id, c.entry_type, c.signals.len());
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            if outcome.candidates.is_empty() {
+                println!(
+                    "Scanned {} entries; nothing selected for re-reading.",
+                    outcome.scanned
+                );
+                return;
+            }
+            println!(
+                "Scanned {} entries; {} worth re-reading. The audit decides nothing \
+                 — confirm, refute or supersede by hand.",
+                outcome.scanned,
+                outcome.candidates.len()
+            );
+            for c in &outcome.candidates {
+                let seen_before = match c.previously_audited_at {
+                    Some(ts) => chrono::DateTime::from_timestamp(ts, 0)
+                        .map(|d| format!(", last audited {}", d.format("%Y-%m-%d")))
+                        .unwrap_or_default(),
+                    None => String::new(),
+                };
+                println!("\n  {} [{}]{seen_before}", c.id, c.entry_type);
+                println!("    {}", c.title);
+                for signal in &c.signals {
+                    println!("    - {}", audit_signal_line(signal));
+                }
+            }
+            if dry_run {
+                println!("\n(dry run: nothing was recorded as audited)");
+            }
+        }
     }
 }
 

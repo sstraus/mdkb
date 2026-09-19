@@ -362,7 +362,7 @@ impl EntryType {
 
     /// SQL `IN (...)` list of the wire names of every type for which `pred`
     /// holds, so a query filtering on a type class cannot drift from the enum.
-    fn sql_list(pred: impl Fn(&EntryType) -> bool) -> String {
+    pub(crate) fn sql_list(pred: impl Fn(&EntryType) -> bool) -> String {
         Self::ALL
             .iter()
             .filter(|t| pred(t))

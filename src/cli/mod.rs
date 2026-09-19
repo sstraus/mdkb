@@ -930,6 +930,18 @@ pub enum MemoryCommand {
         dry_run: bool,
     },
 
+    /// List entries worth re-reading, selected from mechanical signals
+    ///
+    /// Reports dead code references, source changed since a measurement,
+    /// near-duplicate and contradicting pairs, and expired or aged entries.
+    /// It decides nothing: no confirmation, refutation or supersession is
+    /// written. Thresholds live under `[memory.audit]` in `.mdkb/config.toml`.
+    Audit {
+        /// Select and report without recording that the entries were looked at
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Consolidate related memory entries (requires --features llm)
     #[cfg(feature = "llm")]
     Condense {
