@@ -59,6 +59,10 @@ pub enum AuditSignal {
     /// The entry cites a path that is gone from the working tree, or a line
     /// number past the end of a file that is still there.
     DeadCodeReference { reference: String },
+    /// Git failed while checking whether a cited path ever existed, so
+    /// whether it is dead could not be determined this pass. Must never be
+    /// silently read as "resolves".
+    ReferenceCheckFailed { reference: String },
     /// A cited path was committed after this entry was last written.
     SourceChangedSince { path: String, changed_at: i64 },
     /// Another active entry the embedding places at `similarity` or closer.
@@ -94,6 +98,20 @@ pub struct AuditOutcome {
     /// When this pass ran — the value written to `last_audited_at`.
     pub audited_at: i64,
     pub candidates: Vec<AuditCandidate>,
+    /// Entries selected for no reason other than a reference git failed to
+    /// check. Kept out of `candidates` on purpose: "I could not check" is not
+    /// a finding about the entry, and folding it into the same list would
+    /// tell an operator an entry is worth re-reading for a reason that has
+    /// nothing to do with the entry's own quality — a git failure, not a
+    /// dead reference, drifted source, duplicate or contradiction. Still
+    /// reported, never silently dropped.
+    pub unchecked: Vec<AuditCandidate>,
+    /// Whether the near-duplicate pass had any embedding to check against.
+    /// `false` — no active entry has one: no model available, auto-embed
+    /// disabled, or entries written by a path that skips it — must read as
+    /// "not checked", not fold into the same silence as "checked, found
+    /// nothing": the two only look alike from the outside.
+    pub near_duplicate_checked: bool,
 }
 
 /// Run an audit: select, then stamp.
@@ -138,26 +156,56 @@ fn select(
         .map(|r| r.updated_at)
         .min();
     let changed = match oldest_stale {
-        Some(since) => crate::git::paths_changed_since(ctx.root(), since).unwrap_or_default(),
+        Some(since) => match crate::git::paths_changed_since(ctx.root(), since) {
+            Ok(map) => map,
+            Err(e) => {
+                // Discarding this silently is the other half of the same
+                // defect class as a dead reference misread as resolved: every
+                // stale entry would lose its SourceChangedSince signal with
+                // no trace that git ever failed to answer.
+                tracing::warn!(
+                    error = %e,
+                    "git failed while checking for source drift; SourceChangedSince is skipped this pass"
+                );
+                HashMap::new()
+            }
+        },
         None => HashMap::new(),
     };
 
-    let mut resolution: HashMap<String, bool> = HashMap::new();
+    let rows_by_id: HashMap<&str, &AuditRow> = rows.iter().map(|r| (r.id.as_str(), r)).collect();
+
+    // Keyed on the path alone, not the `path:LINE` reference, so the same
+    // dead path cited at ten lines costs one git spawn, not ten.
+    let mut path_statuses: HashMap<&str, PathStatus> = HashMap::new();
     for (id, reference) in &refs {
         let (path, line) = split_line_suffix(reference);
-        let resolves = *resolution
-            .entry(reference.clone())
-            .or_insert_with(|| reference_resolves(ctx.root(), path, line));
-        if !resolves {
-            by_id
-                .entry(id.clone())
-                .or_default()
-                .push(AuditSignal::DeadCodeReference {
-                    reference: reference.clone(),
-                });
-            continue;
+        let cached_status = *path_statuses
+            .entry(path)
+            .or_insert_with(|| path_status(ctx.root(), path));
+        let status = resolve_status(ctx.root(), path, cached_status, line);
+        match status {
+            Resolution::Dead => {
+                by_id
+                    .entry(id.clone())
+                    .or_default()
+                    .push(AuditSignal::DeadCodeReference {
+                        reference: reference.clone(),
+                    });
+                continue;
+            }
+            Resolution::CheckFailed => {
+                by_id
+                    .entry(id.clone())
+                    .or_default()
+                    .push(AuditSignal::ReferenceCheckFailed {
+                        reference: reference.clone(),
+                    });
+                continue;
+            }
+            Resolution::Resolves => {}
         }
-        let Some(row) = rows.iter().find(|r| &r.id == id) else {
+        let Some(row) = rows_by_id.get(id.as_str()) else {
             continue;
         };
         if row.updated_at > stale_cutoff {
@@ -177,9 +225,15 @@ fn select(
     }
 
     // ── Signal 3: pairs the store already relates ────────────────────────────
-    for (a, b, similarity) in
-        memory_audit::near_duplicate_pairs(&ctx.conn, config.near_duplicate_similarity)?
-    {
+    // `rows` is already the caller's own rowid->id map — no need to make
+    // `near_duplicate_pairs` query it a second time.
+    let ids_by_rowid: HashMap<i64, String> = rows.iter().map(|r| (r.rowid, r.id.clone())).collect();
+    let (near_duplicate_checked, near_duplicate_pairs) = memory_audit::near_duplicate_pairs(
+        &ctx.conn,
+        config.near_duplicate_similarity,
+        &ids_by_rowid,
+    )?;
+    for (a, b, similarity) in near_duplicate_pairs {
         by_id
             .entry(a.clone())
             .or_default()
@@ -215,36 +269,74 @@ fn select(
         by_id.entry(id).or_default().push(signal);
     }
 
-    let candidates = rows
-        .iter()
-        .filter_map(|row| {
-            let signals = by_id.remove(&row.id)?;
-            Some(AuditCandidate {
-                id: row.id.clone(),
-                title: row.title.clone(),
-                entry_type: row.entry_type.clone(),
-                updated_at: row.updated_at,
-                previously_audited_at: row.last_audited_at,
-                signals,
-            })
-        })
-        .collect();
+    // A `ReferenceCheckFailed`-only entry did not earn its place by any
+    // property of its own content — git simply could not answer. Splitting
+    // it into `unchecked` rather than `candidates` is what keeps "N worth
+    // re-reading" honest: an entry with a genuine finding alongside a check
+    // failure still belongs in `candidates`, signal and all.
+    let mut candidates = Vec::new();
+    let mut unchecked = Vec::new();
+    for row in rows {
+        let Some(signals) = by_id.remove(&row.id) else {
+            continue;
+        };
+        let candidate = AuditCandidate {
+            id: row.id.clone(),
+            title: row.title.clone(),
+            entry_type: row.entry_type.clone(),
+            updated_at: row.updated_at,
+            previously_audited_at: row.last_audited_at,
+            signals,
+        };
+        if candidate
+            .signals
+            .iter()
+            .all(|s| matches!(s, AuditSignal::ReferenceCheckFailed { .. }))
+        {
+            unchecked.push(candidate);
+        } else {
+            candidates.push(candidate);
+        }
+    }
 
     Ok(AuditOutcome {
         scanned: rows.len(),
         audited_at: now,
         candidates,
+        unchecked,
+        near_duplicate_checked,
     })
+}
+
+/// True if any component of `path` is `..`.
+///
+/// `path_ref_regex` matches `[\w.\-]+` per segment, which admits `..`
+/// unfiltered — `../../../../etc/passwd.conf` reads as a path reference to
+/// the pattern alone. The audit is scoped to the project root; a `..`
+/// component means the reference is asking to climb out of it, which is an
+/// escape, not a citation. Checked component-wise rather than by substring,
+/// so a legitimate filename like `..bashrc` is not caught by mistake.
+fn has_parent_dir_component(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
 /// Every `(entry id, path reference)` pair the store's entries mention, in
 /// entry order, deduplicated per entry.
+///
+/// A `..` component is dropped here, at extraction — the earliest point —
+/// so it never reaches [`reference_resolves`] and never causes a filesystem
+/// call outside the project root.
 fn collect_references(rows: &[AuditRow]) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for row in rows {
         let mut seen = std::collections::HashSet::new();
         for m in path_ref_regex().find_iter(&row.content) {
             let reference = m.as_str().to_string();
+            if has_parent_dir_component(&reference) {
+                continue;
+            }
             if seen.insert(reference.clone()) {
                 out.push((row.id.clone(), reference));
             }
@@ -264,27 +356,117 @@ fn split_line_suffix(reference: &str) -> (&str, Option<usize>) {
     }
 }
 
+/// What [`reference_resolves`] established about one cited reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resolution {
+    /// The file is there, or git never heard of a path that is not.
+    Resolves,
+    /// A real dead reference: the path is gone, but git has recorded it, or
+    /// a cited line is past the end of a file that is still there.
+    Dead,
+    /// Git failed while answering, so this pass could not tell `Resolves`
+    /// from `Dead`. Deliberately its own outcome — folding it into either of
+    /// the other two is the bug this type exists to close.
+    CheckFailed,
+}
+
+/// What [`path_status`] established about one cited path, independent of any
+/// line number — the part that is worth caching per path, since it is the
+/// part that can spawn `git`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathStatus {
+    /// A `..` component — refused before any filesystem call, defense in
+    /// depth against a caller that reaches this function some other way.
+    Escaped,
+    /// The file is on disk.
+    Exists,
+    /// The file is gone but git has recorded it: a real dead reference.
+    GoneButRecorded,
+    /// The file is gone and git has never heard of it: prose shaped like a
+    /// path, not a real reference.
+    NeverExisted,
+    /// Git failed while answering, so this pass could not tell whether the
+    /// path ever existed.
+    CheckFailed,
+}
+
+/// Whether a cited path exists, without regard to any line number.
+///
+/// This is the expensive half of resolving a reference — the half that may
+/// spawn `git` — and the only half that depends on the path alone, which is
+/// what makes it safe to cache per path rather than per `path:LINE`
+/// reference.
+fn path_status(root: &Path, rel_path: &str) -> PathStatus {
+    if has_parent_dir_component(rel_path) {
+        return PathStatus::Escaped;
+    }
+    if root.join(rel_path).is_file() {
+        return PathStatus::Exists;
+    }
+    match crate::git::path_ever_existed(root, rel_path) {
+        Ok(true) => PathStatus::GoneButRecorded,
+        Ok(false) => PathStatus::NeverExisted,
+        Err(e) => {
+            tracing::warn!(
+                path = rel_path,
+                error = %e,
+                "git failed while checking whether a cited reference ever existed"
+            );
+            PathStatus::CheckFailed
+        }
+    }
+}
+
+/// Combines a path's [`PathStatus`] with the line a particular reference
+/// cited. Cheap and line-dependent, unlike `path_status` — never spawns a
+/// process, so there is nothing to gain from caching it.
+fn resolve_status(
+    root: &Path,
+    rel_path: &str,
+    status: PathStatus,
+    line: Option<usize>,
+) -> Resolution {
+    match status {
+        PathStatus::Escaped | PathStatus::NeverExisted => Resolution::Resolves,
+        PathStatus::GoneButRecorded => Resolution::Dead,
+        PathStatus::CheckFailed => Resolution::CheckFailed,
+        PathStatus::Exists => {
+            let Some(line) = line else {
+                return Resolution::Resolves;
+            };
+            let full = root.join(rel_path);
+            let Ok(text) = std::fs::read_to_string(&full) else {
+                // Unreadable or not UTF-8 — the file exists, which is all
+                // this signal claims to know.
+                return Resolution::Resolves;
+            };
+            if line >= 1 && line <= text.lines().count() {
+                Resolution::Resolves
+            } else {
+                Resolution::Dead
+            }
+        }
+    }
+}
+
 /// Whether a cited reference still points at something.
 ///
-/// Three outcomes, and only the middle one is a finding:
+/// Four outcomes, and only `Dead` is a finding on its own:
 /// * the file is there (and long enough, when a line was cited) — resolves;
 /// * the file is gone but git has heard of it — a real dead reference;
 /// * the file is gone and git has never heard of it — prose shaped like a
-///   path. Treated as resolving, because reporting it is noise.
-fn reference_resolves(root: &Path, rel_path: &str, line: Option<usize>) -> bool {
-    let full = root.join(rel_path);
-    if full.is_file() {
-        let Some(line) = line else {
-            return true;
-        };
-        let Ok(text) = std::fs::read_to_string(&full) else {
-            // Unreadable or not UTF-8 — the file exists, which is all this
-            // signal claims to know.
-            return true;
-        };
-        return line >= 1 && line <= text.lines().count();
-    }
-    !crate::git::path_ever_existed(root, rel_path)
+///   path. Treated as resolving, because reporting it is noise;
+/// * the file is gone and git itself failed to answer — the check could not
+///   be completed, which must never be read as "resolves".
+///
+/// A thin wrapper over [`path_status`] and [`resolve_status`] — the split
+/// that lets [`select`] cache the expensive, path-only part across every
+/// line a path is cited at. `select` calls the two halves directly for that
+/// caching; this whole-reference form only survives for the tests below,
+/// which predate the split and still exercise it as one call.
+#[cfg(test)]
+fn reference_resolves(root: &Path, rel_path: &str, line: Option<usize>) -> Resolution {
+    resolve_status(root, rel_path, path_status(root, rel_path), line)
 }
 
 #[cfg(test)]
@@ -313,6 +495,59 @@ mod tests {
         );
     }
 
+    /// Confirms the premise story 114 is built on: the regex alone admits a
+    /// `..` component, so something downstream must refuse it.
+    #[test]
+    fn the_path_regex_matches_a_reference_with_parent_dir_components() {
+        let re = path_ref_regex();
+        let found: Vec<&str> = re
+            .find_iter("see ../../../../etc/passwd.conf for details")
+            .map(|m| m.as_str())
+            .collect();
+        assert_eq!(found, vec!["../../../../etc/passwd.conf"]);
+    }
+
+    #[test]
+    fn a_reference_with_a_parent_dir_component_is_not_extracted() {
+        let row = AuditRow {
+            rowid: 1,
+            id: "leaky".to_string(),
+            title: "leaky".to_string(),
+            entry_type: "topic".to_string(),
+            content: "see ../../../../etc/passwd.conf for details".to_string(),
+            updated_at: 0,
+            last_audited_at: None,
+        };
+
+        let refs = collect_references(std::slice::from_ref(&row));
+
+        assert!(
+            refs.is_empty(),
+            "a '..' component must never reach reference_resolves: {refs:?}"
+        );
+    }
+
+    #[test]
+    fn a_reference_with_a_parent_dir_component_is_never_stat_ed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        // A real file OUTSIDE the project root, one line long. If the audit
+        // ever stat-ed a `..` reference, citing a line number past this
+        // file's single line would resolve to `Dead` — proving the check ran
+        // against it. It must not: the escape is refused before any stat.
+        std::fs::write(dir.path().join("secret.txt"), "one line\n").unwrap();
+
+        let status = reference_resolves(&root, "../secret.txt", Some(99));
+
+        assert_eq!(
+            status,
+            Resolution::Resolves,
+            "a '..' component must be refused before any filesystem call, \
+             never evaluated against a path outside the project root"
+        );
+    }
+
     #[test]
     fn the_line_suffix_is_split_off_only_when_it_is_a_number() {
         assert_eq!(
@@ -329,9 +564,13 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/a.rs"), "one\ntwo\n").unwrap();
 
-        assert!(reference_resolves(dir.path(), "src/a.rs", Some(2)));
-        assert!(
-            !reference_resolves(dir.path(), "src/a.rs", Some(99)),
+        assert_eq!(
+            reference_resolves(dir.path(), "src/a.rs", Some(2)),
+            Resolution::Resolves
+        );
+        assert_eq!(
+            reference_resolves(dir.path(), "src/a.rs", Some(99)),
+            Resolution::Dead,
             "a citation past EOF points at nothing, even though the file is there"
         );
     }
@@ -339,9 +578,31 @@ mod tests {
     #[test]
     fn prose_shaped_like_a_path_is_not_reported_as_a_dead_reference() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(
+        assert_eq!(
             reference_resolves(dir.path(), "and/or.md", None),
+            Resolution::Resolves,
             "git never heard of it, so it was never a reference"
+        );
+    }
+
+    /// The defect this story closes: a git failure must never be read as
+    /// "resolves" just because it is also not a dead reference.
+    #[test]
+    fn a_git_failure_is_reported_as_check_failed_not_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        // `.git` exists (so this is not the "no repository" case), but `HEAD`
+        // is corrupt enough that git refuses to run at all.
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["init", "-q"])
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "garbage\n").unwrap();
+
+        assert_eq!(
+            reference_resolves(dir.path(), "src/gone.rs", None),
+            Resolution::CheckFailed
         );
     }
 }

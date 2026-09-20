@@ -360,20 +360,36 @@ pub fn paths_changed_since(
 /// not a reference that stopped resolving — reporting it would fill an audit
 /// with noise, which is the one thing a gardening command cannot afford.
 ///
+/// `Ok(false)` covers both a repository that ran clean and genuinely never
+/// recorded the path, and no git repository at `root` at all — the caller
+/// must not distinguish those. `Err` is reserved for git actually failing to
+/// answer (spawn failure, or a non-zero exit for a reason other than "no
+/// history"), which must never collapse into "never existed": that read is
+/// what turns a real dead reference into a false "resolves".
+///
 /// `rel_path` is passed as its own argv token after `--`, so a value starting
 /// with `-` is a pathspec and not an option.
-pub fn path_ever_existed(root: &Path, rel_path: &str) -> bool {
+pub fn path_ever_existed(root: &Path, rel_path: &str) -> crate::error::Result<bool> {
+    use crate::error::Error;
+
     if find_git_root(root).is_none() {
-        return false;
+        return Ok(false);
     }
-    std::process::Command::new("git")
+    let output = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
         .args(["log", "-1", "--pretty=format:%H", "--"])
         .arg(rel_path)
         .output()
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+        .map_err(|e| Error::other(format!("cannot run git log: {e}")))?;
+
+    if !output.status.success() {
+        return Err(Error::other(format!(
+            "git log failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(!output.stdout.is_empty())
 }
 
 /// Walk up from `start` (inclusive) looking for a git repository root — a
@@ -1312,5 +1328,49 @@ mod tests {
             history,
             CoChangeHistory::Commits(vec![vec!["a.rs".to_string()]])
         );
+    }
+
+    // ── path_ever_existed ───────────────────────────────────────────────────
+
+    #[test]
+    fn path_ever_existed_is_false_for_a_path_git_never_recorded() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "a.rs", "x", "2026-06-01T12:00:00");
+
+        assert!(!path_ever_existed(tmp.path(), "never.rs").unwrap());
+    }
+
+    #[test]
+    fn path_ever_existed_is_true_for_a_path_git_has_committed() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "a.rs", "x", "2026-06-01T12:00:00");
+
+        assert!(path_ever_existed(tmp.path(), "a.rs").unwrap());
+    }
+
+    #[test]
+    fn path_ever_existed_is_false_when_there_is_no_git_repository() {
+        let tmp = TempDir::new().unwrap();
+
+        assert!(!path_ever_existed(tmp.path(), "whatever.rs").unwrap());
+    }
+
+    #[test]
+    fn path_ever_existed_errs_distinctly_when_git_fails_to_answer() {
+        // `.git` still exists as a directory, so `find_git_root` matches and
+        // this is not the "no repository" case — but `HEAD` is corrupt enough
+        // that git refuses to run at all. A bare bool could not tell this
+        // apart from "never existed"; that collapse is the bug this type
+        // exists to close.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "a.rs", "x", "2026-06-01T12:00:00");
+        std::fs::write(tmp.path().join(".git/HEAD"), "garbage\n").unwrap();
+
+        let result = path_ever_existed(tmp.path(), "a.rs");
+
+        assert!(result.is_err(), "{result:?}");
     }
 }

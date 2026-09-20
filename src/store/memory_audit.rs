@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::Result;
-use crate::store::memory::EntryType;
+use crate::store::memory::prunable_predicate_sql;
 
 /// How many neighbours each entry's near-duplicate probe inspects.
 ///
@@ -34,6 +34,12 @@ const NEAR_DUPLICATE_NEIGHBOURS: usize = 5;
 /// The columns the audit reads off an entry. Deliberately not a
 /// [`crate::store::memory::MemoryEntry`]: the audit needs `last_audited_at`,
 /// which that struct does not carry, and none of the rest.
+///
+/// Every field here has a reader in `core::memory_audit`: `rowid` builds the
+/// map `near_duplicate_pairs` resolves ids from, the rest feed the signals
+/// directly. `last_accessed` and `expires_at` used to be selected too, and
+/// nothing ever read them — `dead_code` misses a `pub` field with no reader,
+/// so they sat there until this story's audit found them by hand.
 #[derive(Debug, Clone)]
 pub struct AuditRow {
     pub rowid: i64,
@@ -44,8 +50,6 @@ pub struct AuditRow {
     /// Last write to the entry — the reference for "has the code moved since
     /// this was measured".
     pub updated_at: i64,
-    pub last_accessed: Option<i64>,
-    pub expires_at: Option<i64>,
     /// When a previous audit last looked at this entry. `None` = never.
     pub last_audited_at: Option<i64>,
 }
@@ -53,7 +57,7 @@ pub struct AuditRow {
 /// Every active entry, in the order the audit reports them.
 pub fn auditable_entries(conn: &Connection) -> Result<Vec<AuditRow>> {
     let mut stmt = conn.prepare(
-        "SELECT rowid, id, title, entry_type, content, updated_at, last_accessed, expires_at, last_audited_at
+        "SELECT rowid, id, title, entry_type, content, updated_at, last_audited_at
          FROM memory_entries
          WHERE status = 'active'
          ORDER BY id",
@@ -66,9 +70,7 @@ pub fn auditable_entries(conn: &Connection) -> Result<Vec<AuditRow>> {
             entry_type: row.get(3)?,
             content: row.get(4)?,
             updated_at: row.get(5)?,
-            last_accessed: row.get(6)?,
-            expires_at: row.get(7)?,
-            last_audited_at: row.get(8)?,
+            last_audited_at: row.get(6)?,
         })
     })?;
     let mut out = Vec::new();
@@ -135,22 +137,49 @@ pub fn contradicting_pairs(conn: &Connection) -> Result<Vec<(String, String)>> {
 /// Pairs of active entries whose embeddings sit at or above `min_similarity`.
 ///
 /// This is the write path's own duplicate rule applied in both directions.
+/// What [`near_duplicate_pairs`] returns: whether the pass had anything to
+/// check at all, and the pairs it found — the two slugs and their similarity.
+///
+/// Named because the `bool` and the `Vec` must travel together: a caller that
+/// kept only the `Vec` would read an empty one as "checked, found nothing"
+/// when it can also mean "no entry has an embedding".
+pub type NearDuplicateOutcome = (bool, Vec<(String, String, f64)>);
+
 /// `find_duplicate` refuses a NEW entry that lands this close to an existing
 /// one, but two entries written far enough apart — or before the rule existed —
 /// never met each other. The audit is where they do.
 ///
 /// A store with no embeddings (no model pulled, or `mdkb embed` never run)
 /// yields an empty list rather than an error: the other three signals need no
-/// model, and an audit must not require one.
-pub fn near_duplicate_pairs(
+/// model, and an audit must not require one. The returned `bool` is the fact
+/// an empty `Vec` alone cannot carry: whether the pass had anything to check
+/// against at all. `false` means "no active entry has an embedding" — the
+/// table may not even exist yet, or it exists and is simply empty — and the
+/// caller must report that as a skip, not as "checked, found nothing".
+///
+/// `ids_by_rowid` is supplied by the caller rather than queried here: the
+/// audit already built `AuditRow`s from `SELECT rowid, id, ... WHERE status =
+/// 'active'`, so it already holds every rowid this function could possibly
+/// need. Querying it again here was the same active-entries scan run twice
+/// per audit pass for no reason.
+///
+/// Cost: one KNN query (`memory_vector_search`) per active embedding against
+/// the whole `vec_memory` table, which sqlite-vec does not partition —
+/// `O(entries_with_embeddings × active_entries)`. Nothing here ages
+/// embeddings out: durable types (topic, problem, decision) are never pruned
+/// by age, so the table — and this pass's cost — grows without bound as the
+/// store grows. A store in the low thousands of embedded entries is still a
+/// sub-second pass; a store in the tens of thousands is the point to revisit
+/// this with an actual partition or a cheaper pre-filter, not before.
+pub fn near_duplicate_pairs<S: std::hash::BuildHasher>(
     conn: &Connection,
     min_similarity: f32,
-) -> Result<Vec<(String, String, f64)>> {
+    ids_by_rowid: &HashMap<i64, String, S>,
+) -> Result<NearDuplicateOutcome> {
     let embeddings = active_memory_embeddings(conn)?;
     if embeddings.is_empty() {
-        return Ok(Vec::new());
+        return Ok((false, Vec::new()));
     }
-    let ids = active_ids_by_rowid(conn)?;
 
     let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
@@ -175,14 +204,15 @@ pub fn near_duplicate_pairs(
             if !seen.insert(key) {
                 continue;
             }
-            let (Some(a), Some(b)) = (ids.get(rowid), ids.get(&other_rowid)) else {
+            let (Some(a), Some(b)) = (ids_by_rowid.get(rowid), ids_by_rowid.get(&other_rowid))
+            else {
                 continue; // a neighbour that is no longer active
             };
             out.push((a.clone(), b.clone(), similarity));
         }
     }
     out.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-    Ok(out)
+    Ok((true, out))
 }
 
 /// Embeddings of the active entries, read from the plain mirror table rather
@@ -230,48 +260,28 @@ fn active_memory_embeddings(conn: &Connection) -> Result<Vec<(i64, Vec<f32>)>> {
     Ok(out)
 }
 
-fn active_ids_by_rowid(conn: &Connection) -> Result<HashMap<i64, String>> {
-    let mut stmt = conn.prepare("SELECT rowid, id FROM memory_entries WHERE status = 'active'")?;
-    let rows = stmt.query_map([], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
-    let mut out = HashMap::new();
-    for row in rows {
-        let (rowid, id) = row?;
-        out.insert(rowid, id);
-    }
-    Ok(out)
-}
-
 /// Active entries that a prune would take: expired by `expires_at`, or a
 /// lifecycle record (reminder, prior, handoff) untouched for `aged_days`.
 ///
-/// Durable types — topic, problem, decision — are never selected for age, the
-/// same rule `crate::store::memory::prunable_entry_ids` applies, because age is
-/// not evidence that a decision stopped holding.
+/// The selection rule is exactly [`crate::store::memory::prunable_entry_ids`]'s
+/// — same predicate, same handoff exception, same `expires_at` boundary — so
+/// the audit reports what a prune would actually take, not an approximation
+/// of it.
 pub fn expired_or_aged(
     conn: &Connection,
     aged_days: u32,
     now: i64,
 ) -> Result<Vec<(String, LifecycleReason)>> {
     let cutoff = now - (i64::from(aged_days) * 86_400);
-    let lifecycle = EntryType::sql_list(|t| !t.is_durable());
     let mut stmt = conn.prepare(&format!(
         "SELECT id,
-                CASE WHEN expires_at IS NOT NULL AND expires_at <= ?2 THEN 1 ELSE 0 END AS expired,
+                CASE WHEN expires_at IS NOT NULL AND expires_at < ?2 THEN 1 ELSE 0 END AS expired,
                 expires_at,
                 COALESCE(last_accessed, created_at) AS touched
          FROM memory_entries
-         WHERE status = 'active'
-           AND (
-                (expires_at IS NOT NULL AND expires_at <= ?2)
-                OR (
-                    entry_type IN ({lifecycle})
-                    AND COALESCE(last_accessed, created_at) < ?1
-                    AND (due_at IS NULL OR due_at < ?1)
-                )
-           )
-         ORDER BY id"
+         WHERE {}
+         ORDER BY id",
+        prunable_predicate_sql()
     ))?;
     let rows = stmt.query_map(params![cutoff, now], |row| {
         let id: String = row.get(0)?;
@@ -400,6 +410,41 @@ mod tests {
         assert!(matches!(selected[0].1, LifecycleReason::Expired { .. }));
     }
 
+    /// The same exception `prunable_entry_ids` applies: the newest active
+    /// handoff is the next session's thread, not a stale lifecycle record,
+    /// however far past `aged_days` it sits.
+    #[test]
+    fn the_newest_active_handoff_is_not_reported_however_stale() {
+        let conn = store();
+        let now = 1_000_000_000;
+        let old = now - 200 * 86_400;
+        add(&conn, "only-handoff", "handoff", old);
+
+        let selected = expired_or_aged(&conn, 90, now).unwrap();
+        let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
+        assert!(
+            ids.is_empty(),
+            "the newest handoff must never be reported as aged: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn an_aged_handoff_is_reported_once_a_fresher_one_exists() {
+        let conn = store();
+        let now = 1_000_000_000;
+        let old = now - 200 * 86_400;
+        add(&conn, "handoff-old", "handoff", old);
+        add(&conn, "handoff-newest", "handoff", now);
+
+        let selected = expired_or_aged(&conn, 90, now).unwrap();
+        let ids: Vec<&str> = selected.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["handoff-old"],
+            "only the superseded handoff is stale; the newest is exempt"
+        );
+    }
+
     #[test]
     fn a_contradicts_edge_between_live_entries_is_a_pair() {
         let conn = store();
@@ -432,9 +477,65 @@ mod tests {
         let conn = store();
         add(&conn, "a", "topic", 1_000);
         add(&conn, "b", "topic", 1_000);
+        let (ran, pairs) = near_duplicate_pairs(&conn, 0.9488, &HashMap::new()).unwrap();
         assert!(
-            near_duplicate_pairs(&conn, 0.9488).unwrap().is_empty(),
+            pairs.is_empty(),
             "three of the four signals need no model; the audit must run without one"
+        );
+        assert!(
+            !ran,
+            "no entry has an embedding, so the pass never actually ran"
+        );
+    }
+
+    /// The caller (`select`, in core::memory_audit) already queried every
+    /// active entry's rowid to build its `AuditRow`s, so it already holds the
+    /// rowid->id map. This proves `near_duplicate_pairs` actually resolves
+    /// ids from THAT map rather than silently re-querying its own: an empty,
+    /// deliberately-wrong map must yield no pairs even with a real
+    /// near-duplicate present, and the correct map must find it.
+    #[test]
+    fn near_duplicate_pairs_resolves_ids_from_the_caller_supplied_map_only() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(crate::store::vectors::init_sqlite_vec);
+
+        let conn = store();
+        crate::store::vectors::init_vector_schema(&conn).unwrap();
+        add(&conn, "a", "topic", 1_000);
+        add(&conn, "b", "topic", 1_000);
+        let rowid_a: i64 = conn
+            .query_row("SELECT rowid FROM memory_entries WHERE id = 'a'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let rowid_b: i64 = conn
+            .query_row("SELECT rowid FROM memory_entries WHERE id = 'b'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let vector: Vec<f32> = (0..384).map(|i| ((i % 7) as f32) - 3.0).collect();
+        crate::store::vectors::store_memory_embedding(&conn, rowid_a, &vector, "test").unwrap();
+        crate::store::vectors::store_memory_embedding(&conn, rowid_b, &vector, "test").unwrap();
+
+        let (ran, pairs) = near_duplicate_pairs(&conn, 0.9488, &HashMap::new()).unwrap();
+        assert!(
+            ran,
+            "embeddings are stored for both entries, so the pass did run"
+        );
+        assert!(
+            pairs.is_empty(),
+            "an empty caller-supplied map must yield no pairs — if it did, \
+             the function is still querying its own ids internally"
+        );
+
+        let ids: HashMap<i64, String> =
+            HashMap::from([(rowid_a, "a".to_string()), (rowid_b, "b".to_string())]);
+        let (ran, pairs) = near_duplicate_pairs(&conn, 0.9488, &ids).unwrap();
+        assert!(ran);
+        assert_eq!(
+            pairs.len(),
+            1,
+            "the same embeddings with the correct map must find the pair: {pairs:?}"
         );
     }
 }

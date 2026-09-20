@@ -2150,37 +2150,26 @@ fn archive_ids(conn: &Connection, ids: &[String], now: i64) -> Result<()> {
     Ok(())
 }
 
-/// Which entries the store no longer needs: every entry past its `expires_at`,
-/// plus lifecycle entries (reminder, prior, handoff) older than `days` that
-/// nothing has read since.
+/// The WHERE clause of a prune, shared with
+/// [`crate::store::memory_audit::expired_or_aged`] so the audit's "what a
+/// prune would take" report cannot drift from what a prune actually takes —
+/// story 112 found the two spelled out separately and disagreeing, on both
+/// the handoff exception and the `expires_at` boundary. Bind `?1` to the age
+/// cutoff and `?2` to now.
 ///
-/// Durable types (topic, problem, decision) are never archived for age or
+/// Durable types (topic, problem, decision) are never selected for age or
 /// absence of use. `search` does not record an access — `SearchMemoryConfig`
 /// keeps SELECT idempotent on purpose — so `last_accessed` is NULL for an
 /// entry consulted daily and an entry consulted never; a prune keyed on it
 /// would archive the most valuable knowledge in the store first. Only an
 /// explicit TTL retires them.
 ///
-/// Two lifecycle exceptions: the newest handoff is the next session's thread
-/// (the same rule as `archive_expired`), and a reminder not yet past its
-/// `due_at` has simply not happened yet.
-///
-/// Selection only: nothing is written, so the caller decides when — and in
-/// which order — the rows change. [`handle_memory_prune`] needs that, because
-/// the markdown projection of every id must reach `archive/` *before* the row
-/// leaves the active set; a row archived while its file stays in `entries/` is
-/// revived by the next `sync_memory_files` pass.
-///
-/// [`handle_memory_prune`]: crate::core::memory::handle_memory_prune
-pub fn prunable_entry_ids(conn: &Connection, days: u32) -> Result<Vec<String>> {
-    let now = Utc::now().timestamp();
-    let cutoff = now - (i64::from(days) * 24 * 60 * 60);
-
+/// Two lifecycle exceptions: the newest handoff is the next session's thread,
+/// and a reminder not yet past its `due_at` has simply not happened yet.
+pub(crate) fn prunable_predicate_sql() -> String {
     let lifecycle = EntryType::sql_list(|t| !t.is_durable());
-    let mut stmt = conn.prepare(&format!(
-        r#"
-        SELECT id FROM memory_entries
-        WHERE status = 'active'
+    format!(
+        "status = 'active'
         AND (
             (expires_at IS NOT NULL AND expires_at < ?2)
             OR (
@@ -2193,8 +2182,29 @@ pub fn prunable_entry_ids(conn: &Connection, days: u32) -> Result<Vec<String>> {
                     ORDER BY updated_at DESC LIMIT 1
                 )
             )
-        )
-        "#
+        )"
+    )
+}
+
+/// Which entries the store no longer needs: every entry past its `expires_at`,
+/// plus lifecycle entries (reminder, prior, handoff) older than `days` that
+/// nothing has read since. See [`prunable_predicate_sql`] for the exact
+/// selection rule.
+///
+/// Selection only: nothing is written, so the caller decides when — and in
+/// which order — the rows change. [`handle_memory_prune`] needs that, because
+/// the markdown projection of every id must reach `archive/` *before* the row
+/// leaves the active set; a row archived while its file stays in `entries/` is
+/// revived by the next `sync_memory_files` pass.
+///
+/// [`handle_memory_prune`]: crate::core::memory::handle_memory_prune
+pub fn prunable_entry_ids(conn: &Connection, days: u32) -> Result<Vec<String>> {
+    let now = Utc::now().timestamp();
+    let cutoff = now - (i64::from(days) * 24 * 60 * 60);
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id FROM memory_entries WHERE {}",
+        prunable_predicate_sql()
     ))?;
 
     let ids: Vec<String> = stmt
