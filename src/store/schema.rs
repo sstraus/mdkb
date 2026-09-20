@@ -2991,4 +2991,48 @@ mod tests {
             "FTS must still resolve both survivors by their own rowid"
         );
     }
+
+    #[test]
+    fn test_migrate_v27_to_v28_adds_last_audited_at() {
+        // A v27 database already has memory_entries (created by SCHEMA_SQL) but
+        // without the last_audited_at column; init_schema must ALTER it in.
+        let conn = setup_db();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute("ALTER TABLE memory_entries DROP COLUMN last_audited_at", [])
+            .unwrap();
+        conn.execute_batch("INSERT INTO schema_version (version) VALUES (27);")
+            .unwrap();
+
+        // A row that existed before the migration ran.
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('pre-migration', 'Pre', 'Content', 'topic', '[]', 1000, 1000)",
+            [],
+        )
+        .unwrap();
+
+        init_schema(&conn).expect("v27→v28 migration failed");
+
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+        let has_audited: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'last_audited_at'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        assert!(has_audited, "migration must add the last_audited_at column");
+
+        let last_audited_at: Option<i64> = conn
+            .query_row(
+                "SELECT last_audited_at FROM memory_entries WHERE id = 'pre-migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            last_audited_at.is_none(),
+            "row that predates the migration must read back NULL for last_audited_at"
+        );
+    }
 }
