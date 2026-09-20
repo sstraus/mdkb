@@ -70,7 +70,7 @@ fn render_quarantine(
     // goes with it. Say when, so the warning does not read as permanent.
     lines.push(format!(
         "  copy removed automatically {} days after quarantine",
-        crate::store::heal::QUARANTINE_RETENTION.as_secs() / 86_400
+        crate::store::heal::QUARANTINE_RETENTION_DAYS
     ));
     out.push_str(&frame(
         "⚠ INDEX QUARANTINED (was corrupt)",

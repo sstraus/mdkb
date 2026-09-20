@@ -1349,104 +1349,115 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             return Ok(());
         }
         Command::Cheatsheet => {
-            let bin = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.to_str().map(String::from))
-                .unwrap_or_else(|| "mdkb".to_string());
             print!(
                 "\
 # Search
-{0} search <query>                                    # docs + memory (default)
-{0} search <query> --scope memory                     # memory only
-{0} search <query> --scope memory --entry-type TYPE    # filter by type
-{0} search <query> --scope docs                        # documents only
-{0} search <query> --scope symbols                     # symbol definitions (fuzzy)
-{0} search <query> --scope symbols --file hook         # path substring, not a glob
-{0} search <query> --scope code                        # semantic code search
-{0} search <query> -c <collection>                     # a collection is -c, NOT --scope
-{0} get <id|path|collection/path|collection:path|slug> # id, path (with or without .md), or memory slug
-{0} get <id> --lines 10:50                             # line range
-{0} mget <pattern>                                     # several documents at once
+mdkb search <query>                                    # docs + memory (default)
+mdkb search <query> --scope memory                     # memory only
+mdkb search <query> --scope memory --entry-type TYPE    # filter by type
+mdkb search <query> --scope docs                        # documents only
+mdkb search <query> --scope symbols                     # symbol definitions (fuzzy)
+mdkb search <query> --scope symbols --file hook         # path substring, not a glob
+mdkb search <query> --scope code                        # semantic code search
+mdkb search <query> -c <collection>                     # a collection is -c, NOT --scope
+mdkb get <id|path|collection/path|collection:path|slug> # id, path (with or without .md), or memory slug
+mdkb get <id> --lines 10:50                             # line range
+mdkb mget <pattern>                                     # several documents at once
 
 # Memory (--entry-type: topic, problem, decision, reminder, prior)
-{0} memory add <id> --title T --content C              # create (default: topic)
-{0} memory add <id> --title T --content C --source-type official_docs  # provenance/trust
-{0} memory add <id> --title T --content C --entry-type prior --tags t1,t2
-{0} memory add <id> --title T --content C --entry-type reminder --due-in 3600
-{0} memory confirm <id> --outcome confirmed            # raise confidence (or refuted)
-{0} memory link <id> <relation> <target>              # typed edge (supports|contradicts|supersedes|derived_from|relates_to)
-{0} memory link <id> derived_from <path> --doc        # link to a document; --agent records provenance
-{0} memory rm <id>                                     # delete
-{0} memory list                                        # list active entries
-{0} memory show <id>                                   # one entry in full
-{0} memory search <query>                              # memory only, same as search --scope memory
-{0} memory warmup                                      # compact index to load at session start
-{0} memory history <id>                                # revisions, including versions a conflict superseded
+mdkb memory add <id> --title T --content C              # create (default: topic)
+mdkb memory add <id> --title T --content C --source-type official_docs  # provenance/trust
+mdkb memory add <id> --title T --content C --entry-type prior --tags t1,t2
+mdkb memory add <id> --title T --content C --entry-type reminder --due-in 3600
+mdkb memory confirm <id> --outcome confirmed            # raise confidence (or refuted)
+mdkb memory link <id> <relation> <target>              # typed edge (supports|contradicts|supersedes|derived_from|relates_to)
+mdkb memory link <id> derived_from <path> --doc        # link to a document; --agent records provenance
+mdkb memory rm <id>                                     # delete
+mdkb memory list                                        # list active entries
+mdkb memory show <id>                                   # one entry in full
+mdkb memory search <query>                              # memory only, same as search --scope memory
+mdkb memory warmup                                      # compact index to load at session start
+mdkb memory history <id>                                # revisions, including versions a conflict superseded
 
 # Memory projection (entries live in the database; .mdkb/memory/entries/*.md is
 # the git-tracked copy, and the only copy that survives losing the database)
-{0} memory export                                      # write missing entries to disk; add --overwrite to refresh all
-{0} memory sync                                        # reconcile database and disk both ways
-{0} memory import <path>                               # load a JSON file or a folder of markdown
+mdkb memory export                                      # write missing entries to disk; add --overwrite to refresh all
+mdkb memory sync                                        # reconcile database and disk both ways
+mdkb memory import <path>                               # load a JSON file or a folder of markdown
 
 # Code intelligence
-{0} code callers <symbol>                              # who calls this?
-{0} code calls <symbol>                                # what does this call?
-{0} code impact <symbol>                               # transitive dependency graph
-{0} code search <query>                                # fuzzy symbol search
-{0} code find <name>                                   # exact symbol lookup; --kind and --file narrow it
-{0} code info                                          # code index counts
+mdkb code callers <symbol>                              # who calls this?
+mdkb code calls <symbol>                                # what does this call?
+mdkb code impact <symbol>                               # transitive dependency graph
+mdkb code search <query>                                # fuzzy symbol search
+mdkb code find <name>                                   # exact symbol lookup; --kind and --file narrow it
+mdkb code info                                          # code index counts
 
 # Audits (both read the code index)
-{0} dup                                                # duplication sweep; structural pass only, no model
-{0} dup --semantic                                     # add the embedding pass: minutes, not seconds ([code.duplication] semantic = true makes it standing)
-{0} dup --since HEAD                                   # review mode: only clusters the change touched
-{0} coupling                                           # files that change together without referencing each other
+mdkb dup                                                # duplication sweep; structural pass only, no model
+mdkb dup --semantic                                     # add the embedding pass: minutes, not seconds ([code.duplication] semantic = true makes it standing)
+mdkb dup --since HEAD                                   # review mode: only clusters the change touched
+mdkb coupling                                           # files that change together without referencing each other
 
 # Knowledge graph (frontmatter + wikilink edges; refs accept collection-prefixed paths)
-{0} graph links <entity>                               # outgoing edges (endpoints shown as paths, with 'via' relation)
-{0} graph backlinks <entity>                           # incoming edges
-{0} graph neighbors <entity> --depth 2                 # adjacent entities (undirected), each with 'via'
-{0} graph path <a> <b>                                 # shortest path between two entities
-{0} graph dangling [-c <collection>]                   # refs resolving to no doc (full scan; explicit only)
-{0} graph hubs --relation owner --limit 20             # entities by degree centrality (full scan; explicit only)
+mdkb graph links <entity>                               # outgoing edges (endpoints shown as paths, with 'via' relation)
+mdkb graph backlinks <entity>                           # incoming edges
+mdkb graph neighbors <entity> --depth 2                 # adjacent entities (undirected), each with 'via'
+mdkb graph path <a> <b>                                 # shortest path between two entities
+mdkb graph dangling [-c <collection>]                   # refs resolving to no doc (full scan; explicit only)
+mdkb graph hubs --relation owner --limit 20             # entities by degree centrality (full scan; explicit only)
 
 # Collections
-{0} collection list                                    # name, path, pattern, doc count per collection
-{0} collection add <name> <path> -p '**/*.md'          # register a collection
-{0} collection update <name> --path <path> -p '**/*.md' # change path/pattern without dropping matching embeddings
+mdkb collection list                                    # name, path, pattern, doc count per collection
+mdkb collection add <name> <path> -p '**/*.md'          # register a collection
+mdkb collection update <name> --path <path> -p '**/*.md' # change path/pattern without dropping matching embeddings
 
 # Developer feedback (local; prompt text is never stored)
-{0} setup developer                                    # enable private per-repository recall telemetry
-{0} metrics status                                     # activation, retention, key, stored event count
-{0} metrics quality --period 7                         # zero results, repeated searches, score bands
-{0} metrics latency --period 7                         # recall count and latency
-{0} metrics purge --yes                                # delete all stored query telemetry
+mdkb setup developer                                    # enable private per-repository recall telemetry
+mdkb metrics status                                     # activation, retention, key, stored event count
+mdkb metrics quality --period 7                         # zero results, repeated searches, score bands
+mdkb metrics latency --period 7                         # recall count and latency
+mdkb metrics purge --yes                                # delete all stored query telemetry
 
 # Maintenance
-{0} update                                             # reindex all (auto-embeds docs + backfills memory)
-{0} embed --collection claude_sessions                # embed a specific collection (sessions excluded by default)
-{0} stats                                              # index health, hooks, mining, sessions
-{0} compact                                            # vacuum both databases
-{0} compact --prune-sessions --older-than 90d --export dir  # hard-delete archived transcripts (exports first)
-{0} memory prune --days 90 --dry-run                   # preview: expired entries + reminders/priors/handoffs unread for 90d
-{0} memory audit                                       # entries worth re-reading (dead refs, drifted source, duplicates); decides nothing
+mdkb update                                             # reindex all (auto-embeds docs + backfills memory)
+mdkb embed --collection claude_sessions                # embed a specific collection (sessions excluded by default)
+mdkb stats                                              # index health, hooks, mining, sessions
+mdkb compact                                            # vacuum both databases
+mdkb compact --prune-sessions --older-than 90d --export dir  # hard-delete archived transcripts (exports first)
+mdkb memory prune --days 90 --dry-run                   # preview: expired entries + reminders/priors/handoffs unread for 90d
+mdkb memory audit                                       # entries worth re-reading (dead refs, drifted source, duplicates); decides nothing
 
 # Daemon (the daemon owns every write; the CLI routes mutations to it)
-{0} daemon status                                      # is it running, and against which store
-{0} daemon restart                                     # after upgrading the binary
-MDKB_NO_DAEMON=1 {0} <cmd>                             # run in-process instead, for debugging
-MDKB_NAMESPACE=<name> {0} <cmd>                        # use .mdkb/namespaces/<name>/ instead; test runners get `test` unasked
+mdkb daemon status                                      # is it running, and against which store
+mdkb daemon restart                                     # after upgrading the binary
+MDKB_NO_DAEMON=1 mdkb <cmd>                             # run in-process instead, for debugging
+MDKB_NAMESPACE=<name> mdkb <cmd>                        # use .mdkb/namespaces/<name>/ instead; test runners get `test` unasked
 
 # Naming
-{0} surface                                            # each MCP tool next to its CLI equivalent
-{0} schema [COMMAND]                                   # the CLI as JSON, for machine callers
+mdkb surface                                            # each MCP tool next to its CLI equivalent
+mdkb schema [COMMAND]                                   # the CLI as JSON, for machine callers
+
+# Repo selector (the MCP `root` parameter; the CLI always works in the current repo)
+root=\"/abs/path\"                                        # one repo by path; need not be a known repo
+root=\"name\"                                             # one repo by name, the last component of a known root
+root=\"name,/abs/path\"                                   # several repos, comma-separated, names and paths mixed
+root=\"*\"                                                # every known repo (`mdkb daemon status` lists them)
+# Only `search` fans out; every other tool needs a selector naming one repo.
+# A comma always separates repos, so a path containing one is refused, not split.
 
 # A store carries a schema version. When the binary is newer, read-only commands
-# refuse rather than migrate silently — run `{0} update` once to migrate it.
-",
-                bin
+# refuse rather than migrate silently — run `mdkb update` once to migrate it.
+"
             );
+            if let Some(exe) = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(String::from))
+            {
+                println!(
+                    "\n# Fallback: if `mdkb` is not on PATH, this binary answered from: {exe}"
+                );
+            }
         }
         Command::Schema { command } => {
             use clap::CommandFactory;
@@ -2701,32 +2712,43 @@ fn print_memory_sync_warnings(s: &mdkb::core::memory_sync::MemorySyncSummary) {
     }
 }
 
+/// Render an audit timestamp as the day a human reads.
+///
+/// One function for every date the audit prints: the signal lines and the
+/// "last audited" note showed the same derivation typed twice. A timestamp
+/// chrono cannot turn into a date is printed raw rather than dropped — the
+/// audit exists to report, and a number the reader can question beats a
+/// silence they cannot.
+fn audit_date(ts: i64) -> String {
+    chrono::DateTime::from_timestamp(ts, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| ts.to_string())
+}
+
 /// Render one audit signal as the single line a human reads.
 ///
 /// Kept out of the JSON arm on purpose: the structured output carries the
 /// variant and its fields, and a machine reading it does not need a sentence.
 fn audit_signal_line(signal: &mdkb::core::memory_audit::AuditSignal) -> String {
     use mdkb::core::memory_audit::AuditSignal as S;
-    let date = |ts: i64| {
-        chrono::DateTime::from_timestamp(ts, 0)
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| ts.to_string())
-    };
     match signal {
         S::DeadCodeReference { reference } => format!("cites {reference}, which is gone"),
         S::SourceChangedSince { path, changed_at } => {
             format!(
                 "{path} changed on {} since this was written",
-                date(*changed_at)
+                audit_date(*changed_at)
             )
         }
         S::NearDuplicate { other, similarity } => {
             format!("near-duplicate of {other} ({similarity:.3})")
         }
         S::Contradicts { other } => format!("contradicts {other}, unresolved"),
-        S::Expired { expires_at } => format!("expired on {}", date(*expires_at)),
+        S::Expired { expires_at } => format!("expired on {}", audit_date(*expires_at)),
         S::AgedLifecycle { last_touched } => {
-            format!("lifecycle entry unread since {}", date(*last_touched))
+            format!("lifecycle entry unread since {}", audit_date(*last_touched))
+        }
+        S::ReferenceCheckFailed { reference } => {
+            format!("could not check whether {reference} is still live: git failed to answer")
         }
     }
 }
@@ -2752,6 +2774,7 @@ fn format_audit_result(
                     "Scanned {} entries; nothing selected for re-reading.",
                     outcome.scanned
                 );
+                print_audit_gaps(outcome);
                 return;
             }
             println!(
@@ -2762,9 +2785,7 @@ fn format_audit_result(
             );
             for c in &outcome.candidates {
                 let seen_before = match c.previously_audited_at {
-                    Some(ts) => chrono::DateTime::from_timestamp(ts, 0)
-                        .map(|d| format!(", last audited {}", d.format("%Y-%m-%d")))
-                        .unwrap_or_default(),
+                    Some(ts) => format!(", last audited {}", audit_date(ts)),
                     None => String::new(),
                 };
                 println!("\n  {} [{}]{seen_before}", c.id, c.entry_type);
@@ -2773,11 +2794,60 @@ fn format_audit_result(
                     println!("    - {}", audit_signal_line(signal));
                 }
             }
+            print_audit_gaps(outcome);
             if dry_run {
                 println!("\n(dry run: nothing was recorded as audited)");
             }
         }
     }
+}
+
+/// Report everything the audit could not judge: entries whose only signal is a
+/// reference git could not check, and a whole pass that never ran.
+///
+/// One function for both, called once per rendering path, because they answer
+/// the same question — what is missing from the number above? An entry held
+/// back for a check failure is kept out of the "worth re-reading" count: that
+/// is a fact about git, not about the entry, and a broken repository must not
+/// inflate the number an operator reads. Printed on the empty path too —
+/// "scanned, nothing found" is the wrong answer when the check never ran.
+fn print_audit_gaps(outcome: &mdkb::core::memory_audit::AuditOutcome) {
+    let text = audit_gaps_text(outcome);
+    if !text.is_empty() {
+        print!("{text}");
+    }
+}
+
+/// The text of [`print_audit_gaps`], built rather than printed.
+///
+/// Separate so the wording can be asserted in a test: whether the audit
+/// admits a gap must not depend on whether an embedding model happens to be
+/// installed on the machine running the suite.
+fn audit_gaps_text(outcome: &mdkb::core::memory_audit::AuditOutcome) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if !outcome.unchecked.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{} entr{} carried a reference git could not check, so it was not judged.",
+            outcome.unchecked.len(),
+            if outcome.unchecked.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+        for c in &outcome.unchecked {
+            let _ = writeln!(out, "  {} [{}] {}", c.id, c.entry_type, c.title);
+        }
+    }
+    if !outcome.near_duplicate_checked {
+        let _ = writeln!(
+            out,
+            "\nNear-duplicate check skipped: no entry has an embedding yet (run `mdkb embed`)."
+        );
+    }
+    out
 }
 
 fn format_prune_result(pruned: &[String], days: u32, dry_run: bool, format: OutputFormat) {
@@ -4537,8 +4607,76 @@ fn command_to_json(cmd: &clap::Command) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use super::audit_date;
     use super::is_server_invocation;
     use super::{McpRunMode, resolve_mcp_run_mode};
+
+    use super::audit_gaps_text;
+    use mdkb::core::memory_audit::{AuditCandidate, AuditOutcome};
+
+    fn outcome(unchecked: Vec<AuditCandidate>, near_duplicate_checked: bool) -> AuditOutcome {
+        AuditOutcome {
+            scanned: 3,
+            audited_at: 1_758_326_400,
+            candidates: Vec::new(),
+            unchecked,
+            near_duplicate_checked,
+        }
+    }
+
+    fn candidate(id: &str) -> AuditCandidate {
+        AuditCandidate {
+            id: id.to_string(),
+            title: "A title".to_string(),
+            entry_type: "decision".to_string(),
+            updated_at: 1_758_326_400,
+            previously_audited_at: None,
+            signals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_pass_that_never_ran_says_so_instead_of_reporting_nothing() {
+        let text = audit_gaps_text(&outcome(Vec::new(), false));
+        assert!(
+            text.contains("Near-duplicate check skipped"),
+            "a skipped pass must be named, not folded into 'found nothing': {text:?}"
+        );
+        assert!(
+            text.contains("mdkb embed"),
+            "the operator needs the command that fixes it: {text:?}"
+        );
+    }
+
+    #[test]
+    fn an_audit_that_ran_every_pass_and_judged_every_entry_admits_no_gap() {
+        assert_eq!(
+            audit_gaps_text(&outcome(Vec::new(), true)),
+            "",
+            "with nothing missing there is nothing to confess"
+        );
+    }
+
+    #[test]
+    fn both_gaps_are_reported_together_not_one_instead_of_the_other() {
+        let text = audit_gaps_text(&outcome(vec![candidate("stale-ref")], false));
+        assert!(text.contains("stale-ref"), "{text:?}");
+        assert!(text.contains("git could not check"), "{text:?}");
+        assert!(text.contains("Near-duplicate check skipped"), "{text:?}");
+    }
+
+    #[test]
+    fn every_audit_date_is_the_day_it_falls_on() {
+        assert_eq!(audit_date(1_758_326_400), "2025-09-20");
+    }
+
+    #[test]
+    fn a_timestamp_no_calendar_holds_is_printed_raw_not_dropped() {
+        // Both audit surfaces share this fallback: the "last audited" note used
+        // to swallow such a timestamp and print nothing, which reads as "never
+        // audited". A number the reader can question is the honest answer.
+        assert_eq!(audit_date(i64::MAX), i64::MAX.to_string());
+    }
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

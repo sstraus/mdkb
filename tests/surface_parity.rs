@@ -240,23 +240,17 @@ fn the_cheatsheet_names_only_commands_that_exist() {
     assert!(out.status.success(), "`mdkb cheatsheet` must exit 0");
     let text = String::from_utf8_lossy(&out.stdout);
 
-    // The cheatsheet substitutes the real binary path, so each command line
-    // starts with it rather than a placeholder. Checked explicitly: an earlier
-    // version of this test looked for a `{0} ` prefix that the output never
-    // contains, so it scanned nothing and passed for the wrong reason.
-    let bin = Path::new(env!("CARGO_BIN_EXE_mdkb"));
+    // Command lines start with the bare binary name. They used to start with
+    // the resolved executable path, which put a machine-specific path on every
+    // line; matching that path is what this test did before. The `checked`
+    // count at the bottom is what keeps either shape honest: an earlier
+    // version looked for a `{0} ` prefix the output never contains, so it
+    // scanned nothing and passed for the wrong reason.
     let mut checked = 0usize;
     let mut broken = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        // The executable path may contain spaces. Find the first separator for
-        // which the whole prefix is the same native path instead of splitting
-        // at the first space in the string.
-        let Some(rest) = line
-            .match_indices(' ')
-            .find(|(i, _)| Path::new(&line[..*i]) == bin)
-            .map(|(i, _)| &line[i + 1..])
-        else {
+        let Some(rest) = line.strip_prefix("mdkb ") else {
             continue;
         };
         let words: Vec<&str> = rest
@@ -1404,10 +1398,20 @@ async fn an_unindexed_repository_is_reported_rather_than_refused_on_both_surface
 #[tokio::test]
 async fn the_duplicates_scope_is_refused_across_repositories() {
     let repo = dup_repo();
-    let handles = [repo.handle()];
+    // A registry that knows this one repo, so the refusal has to come from the
+    // scope. An empty registry would be refused too — for the other reason —
+    // and this test would pass without proving anything. `state_dir` is a
+    // throwaway: nothing here may read or write the real `~/.mdkb`.
+    let state = tempfile::tempdir().expect("state dir");
+    let registry = mdkb::daemon::registry::RepoRegistry::new(mdkb::daemon::config::DaemonConfig {
+        whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
+        state_dir: Some(state.path().to_path_buf()),
+        ..Default::default()
+    });
+    registry.get_or_open(&repo.root).expect("register the repo");
 
     let err =
-        mdkb::mcp::dispatch::cross_repo_search_impl(&handles, &params("duplicates", "", None))
+        mdkb::mcp::dispatch::cross_repo_search_impl(&registry, &params("duplicates", "", None))
             .await
             .expect_err("cross-repo duplicates must be refused");
     let msg = err.to_string();
