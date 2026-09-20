@@ -2341,6 +2341,27 @@ mod tests {
         );
     }
 
+    /// `tools/list` is re-sent on every API request of a session — 283 requests
+    /// against 22 user messages in one measured session — so it is charged far
+    /// more often than the instructions that `test_base_instructions_token_budget`
+    /// guards, and it is the larger half of the always-on payload. The ceiling
+    /// sits just above the measured size: it catches growth, it does not demand
+    /// a cut. Measured 2026-09-20: 3880 tokens over 12 tools.
+    #[test]
+    fn tools_list_payload_token_budget() {
+        const BUDGET: usize = 3900;
+
+        let tools = McpServer::tool_router().list_all();
+        let payload = serde_json::to_string(&tools).expect("tools serialize");
+        let tokens = count_tokens(&payload);
+        assert!(
+            tokens <= BUDGET,
+            "tools/list payload exceeds its {BUDGET}-token budget: {tokens} tokens. \
+             Every tool description and field schema is charged on every request — \
+             cut one before raising this number."
+        );
+    }
+
     #[test]
     fn every_advertised_tool_has_complete_annotations() {
         let tools = McpServer::tool_router().list_all();
@@ -2391,11 +2412,6 @@ mod tests {
                 tool.name
             );
         }
-
-        eprintln!(
-            "tools/list tool metadata size: {} bytes",
-            serde_json::to_vec(&tools).unwrap().len()
-        );
     }
 
     #[test]

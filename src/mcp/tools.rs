@@ -66,27 +66,27 @@ pub struct SearchParams {
     #[serde(default)]
     pub include_superseded: bool,
 
-    /// Search scope: "docs", "memory", "code", "symbols", or "duplicates". Omit to search docs+memory.
+    /// Search scope: "docs", "memory", "code", "symbols", or "duplicates". Omit to search docs+memory. A field's [tag] lists the scopes it applies under; other scopes ignore it.
     #[serde(default)]
     pub scope: Option<String>,
 
-    /// Filter by symbol kind (scope="code"/"symbols", e.g., "function", "struct") or entry type (scope="memory", e.g., "problem", "decision").
+    /// [code|symbols] symbol kind, e.g. "function", "struct". [memory] entry type, e.g. "problem", "decision".
     #[serde(default)]
     pub kind: Option<String>,
 
-    /// Minimum similarity score 0.0-1.0 when scope is "code" or "duplicates". Omit to use the configured threshold. For scope="duplicates" it also enables the semantic pass, which loads a model and takes minutes on a large repository — omit it for the fast structural sweep.
+    /// [code|duplicates] Minimum similarity 0.0-1.0. Omit to use the configured threshold. Under "duplicates" it also enables the semantic pass, which loads a model and takes minutes on a large repository — omit it for the fast structural sweep.
     #[serde(default)]
     pub threshold: Option<f32>,
 
-    /// Filter by file path: substring match when scope is "symbols", path prefix when scope is "duplicates". Omit with scope="duplicates" to sweep the repository; query is then ignored.
+    /// [symbols] file path substring. [duplicates] file path prefix; omit it to sweep the repository, which ignores query.
     #[serde(default)]
     pub file: Option<String>,
 
-    /// Minimum confidence threshold 0.0-1.0 when scope is "memory". Entries below this are excluded. Omit or 0.0 = no filter.
+    /// [memory] Minimum confidence 0.0-1.0; entries below it are excluded, in the default docs+memory search too. Omit or 0.0 = no filter.
     #[serde(default)]
     pub min_confidence: Option<f64>,
 
-    /// Git ref when scope is "duplicates": report only clusters touching what changed since it, still scored against the whole index. Use it to ask what the current change duplicated.
+    /// [duplicates] Git ref: report only clusters touching what changed since it, still scored against the whole index — what did this change duplicate.
     #[serde(default)]
     pub since: Option<String>,
 }
