@@ -18,7 +18,8 @@ pub mod stats_report;
 use std::path::PathBuf;
 
 use clap::builder::PossibleValuesParser;
-use clap::{Parser, Subcommand};
+use clap::error::{ContextKind, ContextValue, ErrorKind};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::eval::recall::Mode as EvalMode;
 use crate::store::memory::{EntryType, SourceType};
@@ -1331,7 +1332,74 @@ pub enum CodeCommand {
 
 impl Cli {
     /// Parse CLI arguments.
+    ///
+    /// An unrecognized subcommand is the one clap usage error that does not
+    /// already name what a caller needs: a missing argument is listed by
+    /// name, and a near-miss typo gets a did-you-mean tip, but an unknown
+    /// subcommand prints only a bare usage line. A model that hits it spends
+    /// a whole extra request on `--help` to find the valid names. This
+    /// augments that one error kind with the subcommand list of the exact
+    /// command level the invalid word was given to, without touching any
+    /// other error's formatting.
     pub fn parse_args() -> Self {
-        Self::parse()
+        Self::try_parse().unwrap_or_else(|err| augment_invalid_subcommand_error(err).exit())
     }
+}
+
+/// Appends a "valid subcommands: ..." tip to an [`ErrorKind::InvalidSubcommand`]
+/// error, reusing clap's own tip-rendering machinery so the addition is styled
+/// and placed exactly like the existing did-you-mean tip. Any other error
+/// kind is returned unchanged.
+fn augment_invalid_subcommand_error(mut err: clap::Error) -> clap::Error {
+    if err.kind() != ErrorKind::InvalidSubcommand {
+        return err;
+    }
+    let Some(names) = valid_subcommands_for_error(&err) else {
+        return err;
+    };
+    if names.is_empty() {
+        return err;
+    }
+
+    let mut suggested = match err.get(ContextKind::Suggested) {
+        Some(ContextValue::StyledStrs(existing)) => existing.clone(),
+        _ => Vec::new(),
+    };
+    suggested.push(format!("valid subcommands: {}", names.join(", ")).into());
+    err.insert(ContextKind::Suggested, ContextValue::StyledStrs(suggested));
+    err
+}
+
+/// Finds the exact command level an invalid subcommand was given to and
+/// returns its visible subcommand names, in declaration order.
+///
+/// clap's `InvalidSubcommand` error carries the offending word but not which
+/// nested command it failed under (that context is only recorded for
+/// `MissingSubcommand`). The error's own usage line already names that
+/// command path — e.g. "Usage: mdkb memory [OPTIONS] <COMMAND>" — since
+/// clap built it for the exact command that rejected the word. Walking
+/// `Cli::command()` down that path re-finds the same [`clap::Command`].
+fn valid_subcommands_for_error(err: &clap::Error) -> Option<Vec<String>> {
+    let ContextValue::StyledStr(usage) = err.get(ContextKind::Usage)? else {
+        return None;
+    };
+    let usage = usage.to_string();
+    let mut path = usage
+        .strip_prefix("Usage:")
+        .unwrap_or(usage.as_str())
+        .split_whitespace()
+        .take_while(|tok| !tok.starts_with('[') && !tok.starts_with('<'));
+    path.next(); // the binary name, not a subcommand
+
+    let mut cmd = Cli::command();
+    for name in path {
+        cmd = cmd.find_subcommand(name)?.clone();
+    }
+
+    Some(
+        cmd.get_subcommands()
+            .filter(|s| !s.is_hide_set())
+            .map(|s| s.get_name().to_string())
+            .collect(),
+    )
 }
