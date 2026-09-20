@@ -46,6 +46,13 @@ pub const PROBE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 // 15 days, spelled in hours because `Duration::from_days` is still unstable.
 pub const QUARANTINE_RETENTION: Duration = Duration::from_hours(24 * 15);
 
+/// [`QUARANTINE_RETENTION`] in whole days, for the surfaces that tell the
+/// operator when the copy goes away.
+///
+/// Derived here so the two banners — `mdkb stats` and the MCP status payload —
+/// cannot drift from the retention the sweep actually enforces.
+pub const QUARANTINE_RETENTION_DAYS: u64 = QUARANTINE_RETENTION.as_secs() / 86_400;
+
 /// Outcome of [`ensure_sound`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Heal {
@@ -390,10 +397,53 @@ pub fn salvage_memory(fresh: &Connection, corrupt_path: &Path) -> Salvage {
     salvage
 }
 
+/// Physical column names of `table` in the attached schema `schema`, in the
+/// order the rows actually store them.
+///
+/// An absent or unreadable table yields an empty list, which the caller reads
+/// as "nothing to copy" — the best-effort contract, not an error.
+fn table_columns(conn: &Connection, schema: &str, table: &str) -> Vec<String> {
+    let Ok(mut stmt) = conn.prepare("SELECT name FROM pragma_table_info(?1, ?2)") else {
+        return Vec::new();
+    };
+    stmt.query_map(params![table, schema], |r| r.get::<_, String>(0))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// Double-quote an identifier so it can be interpolated into SQL.
+///
+/// Table names in this module are constants, but column names are read out of a
+/// quarantined database: they are data, and a name carrying a quote or a
+/// reserved word must not be able to change the statement around it.
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Copy one whole table from the attached `corrupt` db into `main`, returning the
 /// number of rows recovered. `table` is a hardcoded constant (never user input),
-/// so the format-string SQL carries no injection risk. Same schema on both sides
-/// means `SELECT *` column order matches.
+/// so the format-string SQL carries no injection risk.
+///
+/// The columns are matched BY NAME, over the intersection of the two tables,
+/// because two stores at the same schema version do NOT agree on physical
+/// column order: `ALTER TABLE ADD COLUMN` appends to the end of the row while
+/// `CREATE TABLE` puts the column where the schema text does. A store that
+/// reached the version by migration and one created fresh therefore lay their
+/// rows out differently, and `SELECT *` — which is positional — copies each
+/// value into whatever column happens to sit at that index.
+///
+/// Measured 2026-09-20 on this repo, `pragma_table_info('memory_entries')` on
+/// the live index against a quarantined copy: index 15 was `last_refuted_at` in
+/// one and `source_type` in the other, and every column after it was shifted by
+/// two. 113 of 119 salvaged entries held `source_type` in `last_refuted_at`,
+/// `due_at` in `source_type` and `projected_hash` in `created_agent`; `mdkb
+/// memory sync` died with `Invalid column type Text at index: 15, name:
+/// last_refuted_at`, and the confidence multiplier read a blank `source_type`.
+/// The salvage had logged "salvaged 113 memory entries" over it.
+///
+/// A column only the fresh schema has takes its own default. A column only the
+/// quarantined store has cannot be kept, so it is named in a loud log with the
+/// rows it affects — dropping data quietly is how this defect class hides.
 fn salvage_table(fresh: &Connection, table: &str) -> usize {
     let present: usize = fresh
         .query_row(&format!("SELECT COUNT(*) FROM corrupt.{table}"), [], |r| {
@@ -403,8 +453,46 @@ fn salvage_table(fresh: &Connection, table: &str) -> usize {
     if present == 0 {
         return 0;
     }
+    let target = table_columns(fresh, "main", table);
+    let source = table_columns(fresh, "corrupt", table);
+    let shared: Vec<&String> = target.iter().filter(|c| source.contains(c)).collect();
+    if shared.is_empty() {
+        tracing::error!(
+            "memory salvage: {present} rows in {table} could NOT be recovered — the quarantined table shares no column name with the current schema — they are LOST"
+        );
+        return 0;
+    }
+    let dropped: Vec<&str> = source
+        .iter()
+        .filter(|c| !target.contains(c))
+        .map(String::as_str)
+        .collect();
+    if !dropped.is_empty() {
+        tracing::warn!(
+            "memory salvage: {table} column(s) {} exist only in the quarantined store — their values are DROPPED from all {present} salvaged row(s), the current schema has nowhere to put them",
+            dropped.join(", ")
+        );
+    }
+    let defaulted: Vec<&str> = target
+        .iter()
+        .filter(|c| !source.contains(c))
+        .map(String::as_str)
+        .collect();
+    if !defaulted.is_empty() {
+        tracing::info!(
+            "memory salvage: {table} column(s) {} are absent from the quarantined store — all {present} salvaged row(s) take the schema default",
+            defaulted.join(", ")
+        );
+    }
+    let columns = shared
+        .iter()
+        .map(|c| quote_ident(c))
+        .collect::<Vec<_>>()
+        .join(", ");
     match fresh.execute(
-        &format!("INSERT OR IGNORE INTO main.{table} SELECT * FROM corrupt.{table}"),
+        &format!(
+            "INSERT OR IGNORE INTO main.{table} ({columns}) SELECT {columns} FROM corrupt.{table}"
+        ),
         [],
     ) {
         Ok(inserted) => {
@@ -1426,5 +1514,271 @@ mod tests {
             quarantine_reports(dir.path()).is_empty(),
             "not a name mdkb generates, so not reported either — sweep and banner agree"
         );
+    }
+
+    /// A quarantined store whose `memory_entries` reached the current schema by
+    /// `ALTER TABLE`, so its physical column order is the MIGRATION order, not
+    /// the CREATE order. Every long-lived store on disk has this shape.
+    ///
+    /// Dropping then re-adding reproduces what the v25 and v28 migrations did:
+    /// `ALTER TABLE ADD COLUMN` appends, so `last_refuted_at` and
+    /// `last_audited_at` sit at the end of the row instead of after
+    /// `last_confirmed_at`.
+    fn make_migrated_memory_db(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        for col in ["last_refuted_at", "last_audited_at"] {
+            conn.execute(&format!("ALTER TABLE memory_entries DROP COLUMN {col}"), [])
+                .unwrap();
+        }
+        for col in ["last_refuted_at", "last_audited_at"] {
+            conn.execute(
+                &format!("ALTER TABLE memory_entries ADD COLUMN {col} INTEGER"),
+                [],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    /// One memory entry with a distinct, recognisable value in every column the
+    /// two orders disagree about.
+    fn insert_full_entry(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO memory_entries (
+                 id, title, content, entry_type, tags, status, created_at,
+                 updated_at, corrections, last_confirmed_at, source_type,
+                 expires_at, due_at, created_session, created_agent,
+                 projected_at, projected_hash)
+             VALUES ('m0', 'Title', 'body', 'decision', '[\"a\"]', 'active', 1, 2,
+                 4, 100, 'official_docs', 400, 500, 'sess-9', 'agent-9', 600,
+                 'hash-9')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// The salvaged row of [`insert_full_entry`], read back BY NAME.
+    fn read_full_entry(
+        conn: &Connection,
+    ) -> (i64, i64, String, i64, i64, String, String, i64, String) {
+        conn.query_row(
+            "SELECT corrections, last_confirmed_at, source_type, expires_at,
+                    due_at, created_session, created_agent, projected_at,
+                    projected_hash
+             FROM memory_entries WHERE id = 'm0'",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                ))
+            },
+        )
+        .unwrap()
+    }
+
+    fn expected_full_entry() -> (i64, i64, String, i64, i64, String, String, i64, String) {
+        (
+            4,
+            100,
+            "official_docs".to_string(),
+            400,
+            500,
+            "sess-9".to_string(),
+            "agent-9".to_string(),
+            600,
+            "hash-9".to_string(),
+        )
+    }
+
+    /// Run `f` with a tracing subscriber that captures what was logged.
+    ///
+    /// A dropped column has to be provable, not taken on faith: the defect this
+    /// guards against logged "salvaged 113 memory entries" over a scrambling.
+    fn captured_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn salvage_copies_by_column_name_not_by_position() {
+        // Story 128-870a: `SELECT *` is positional, and two stores at the SAME
+        // schema version have different physical column order when one got
+        // there by migration. Measured 2026-09-20 on this repo: 113 of 119 live
+        // entries held source_type in last_refuted_at, due_at in source_type,
+        // projected_hash in created_agent, and `memory sync` died with
+        // "Invalid column type Text at index: 15, name: last_refuted_at".
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-456");
+        let corrupt_conn = make_migrated_memory_db(&corrupt);
+        insert_full_entry(&corrupt_conn);
+        drop(corrupt_conn);
+
+        let fresh = Connection::open(dir.path().join("index.sqlite")).unwrap();
+        crate::store::schema::init_schema(&fresh).unwrap();
+
+        assert_eq!(salvage_memory(&fresh, &corrupt).entries, 1);
+        assert_eq!(
+            read_full_entry(&fresh),
+            expected_full_entry(),
+            "every field must land in the column of its own NAME"
+        );
+    }
+
+    #[test]
+    fn a_column_the_quarantined_store_lacks_keeps_its_default() {
+        // The fresh schema is ahead of the quarantined one. Positionally this
+        // is 23 values into 24 columns — SQLite rejects the whole statement and
+        // the table is lost. By name, the absent column simply defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-457");
+        let corrupt_conn = Connection::open(&corrupt).unwrap();
+        crate::store::schema::init_schema(&corrupt_conn).unwrap();
+        corrupt_conn
+            .execute("ALTER TABLE memory_entries DROP COLUMN confirmations", [])
+            .unwrap();
+        insert_full_entry(&corrupt_conn);
+        drop(corrupt_conn);
+
+        let fresh = Connection::open(dir.path().join("index.sqlite")).unwrap();
+        crate::store::schema::init_schema(&fresh).unwrap();
+
+        assert_eq!(salvage_memory(&fresh, &corrupt).entries, 1);
+        let confirmations: i64 = fresh
+            .query_row(
+                "SELECT confirmations FROM memory_entries WHERE id = 'm0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(confirmations, 0, "the column's own DEFAULT, not a shift");
+        assert_eq!(
+            read_full_entry(&fresh),
+            expected_full_entry(),
+            "no later column may shift up into the gap"
+        );
+    }
+
+    #[test]
+    fn a_column_only_the_quarantined_store_has_is_dropped_loudly() {
+        // The quarantined store is ahead of the fresh schema (a downgrade, or a
+        // column removed by a migration). Its extra column cannot be kept, so
+        // it must be named in the log with the rows it affects — dropping data
+        // silently is how this whole defect class hides.
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-458");
+        let corrupt_conn = Connection::open(&corrupt).unwrap();
+        crate::store::schema::init_schema(&corrupt_conn).unwrap();
+        corrupt_conn
+            .execute("ALTER TABLE memory_entries ADD COLUMN legacy_note TEXT", [])
+            .unwrap();
+        insert_full_entry(&corrupt_conn);
+        corrupt_conn
+            .execute(
+                "UPDATE memory_entries SET legacy_note = 'gone' WHERE id = 'm0'",
+                [],
+            )
+            .unwrap();
+        drop(corrupt_conn);
+
+        let fresh = Connection::open(dir.path().join("index.sqlite")).unwrap();
+        crate::store::schema::init_schema(&fresh).unwrap();
+
+        let mut entries = 0;
+        let logs = captured_logs(|| entries = salvage_memory(&fresh, &corrupt).entries);
+
+        assert_eq!(entries, 1, "the row is still salvaged");
+        assert_eq!(read_full_entry(&fresh), expected_full_entry());
+        assert!(
+            logs.contains("legacy_note"),
+            "the dropped column must be named: {logs}"
+        );
+        assert!(
+            logs.contains("memory_entries"),
+            "the table must be named: {logs}"
+        );
+        assert!(
+            logs.contains('1'),
+            "the affected row count must be stated: {logs}"
+        );
+    }
+
+    #[test]
+    fn a_column_name_that_is_a_reserved_word_is_still_copied() {
+        // The column list is no longer a constant — it is read out of the
+        // quarantined database and interpolated into SQL. Bare, `group` is a
+        // syntax error and the whole table would be reported LOST.
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-459");
+        let corrupt_conn = Connection::open(&corrupt).unwrap();
+        crate::store::schema::init_schema(&corrupt_conn).unwrap();
+        corrupt_conn
+            .execute("ALTER TABLE memory_entries ADD COLUMN \"group\" TEXT", [])
+            .unwrap();
+        insert_full_entry(&corrupt_conn);
+        corrupt_conn
+            .execute(
+                "UPDATE memory_entries SET \"group\" = 'kept' WHERE id = 'm0'",
+                [],
+            )
+            .unwrap();
+        drop(corrupt_conn);
+
+        let fresh = Connection::open(dir.path().join("index.sqlite")).unwrap();
+        crate::store::schema::init_schema(&fresh).unwrap();
+        fresh
+            .execute("ALTER TABLE memory_entries ADD COLUMN \"group\" TEXT", [])
+            .unwrap();
+
+        assert_eq!(salvage_memory(&fresh, &corrupt).entries, 1);
+        let group: String = fresh
+            .query_row(
+                "SELECT \"group\" FROM memory_entries WHERE id = 'm0'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(group, "kept");
+        assert_eq!(read_full_entry(&fresh), expected_full_entry());
+    }
+
+    #[test]
+    fn an_identifier_with_a_quote_in_it_cannot_end_its_own_quoting() {
+        // SQLite doubles an embedded `"` inside a quoted identifier. Anything
+        // else lets a column name read from a foreign file close the quote and
+        // continue the statement.
+        assert_eq!(quote_ident("source_type"), "\"source_type\"");
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
     }
 }
