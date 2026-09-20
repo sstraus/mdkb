@@ -14,6 +14,7 @@ use crate::core::Context;
 use crate::error::{Error, Result};
 
 use super::config::DaemonConfig;
+use super::repo_map::RepoMap;
 
 /// Per-repo state: wraps all resources needed to serve MCP tools for one repository.
 pub struct RepoHandle {
@@ -165,6 +166,10 @@ pub struct RepoRegistry {
     handles: DashMap<PathBuf, Arc<RepoHandle>>,
     max_active: usize,
     daemon_config: DaemonConfig,
+    /// Every repo this daemon has ever opened, persisted across restarts.
+    /// Deliberately not `handles`: that one is capped at `max_active` and
+    /// starts empty in every process.
+    repo_map: RepoMap,
     /// Serializes the check-evict-insert triple so concurrent callers cannot
     /// both pass the capacity check before either inserts, which would exceed max_active.
     open_gate: std::sync::Mutex<()>,
@@ -181,12 +186,18 @@ impl std::fmt::Debug for RepoRegistry {
 
 impl RepoRegistry {
     /// Create a new registry from daemon config.
+    ///
+    /// Loading the config loads the repo map with it: the persisted set and the
+    /// `[[repos]]` of `daemon.toml` are unioned here, so a restarted daemon
+    /// knows its repos before any client knocks.
     pub fn new(config: DaemonConfig) -> Self {
         let max_active = config.max_active_repos;
+        let repo_map = RepoMap::open(config.repo_map_path(), &config.repos);
         Self {
             handles: DashMap::new(),
             max_active,
             daemon_config: config,
+            repo_map,
             open_gate: std::sync::Mutex::new(()),
         }
     }
@@ -233,8 +244,26 @@ impl RepoRegistry {
         }
 
         // Open new handle
-        let handle = Arc::new(RepoHandle::open(&canonical, &self.daemon_config.priors)?);
+        let handle = match RepoHandle::open(&canonical, &self.daemon_config.priors) {
+            Ok(handle) => Arc::new(handle),
+            Err(e) => {
+                // An open that fails is not evidence the repo is gone: a schema
+                // newer than this binary, a corrupt index and a held lock all
+                // land here, and all of them read again from another binary or
+                // a moment later. Say so and leave the root on the map.
+                if self.repo_map.contains(&canonical) {
+                    tracing::warn!(
+                        root = %canonical.display(),
+                        "Known repo failed to open ({e}); kept on the map — an unreadable store is not a deleted repo"
+                    );
+                }
+                return Err(e);
+            }
+        };
         self.handles.insert(canonical.clone(), Arc::clone(&handle));
+        // Recorded only here: after the whitelist check and after the store
+        // opened, so a refused or broken root never enters the map.
+        self.repo_map.record(&canonical);
         tracing::info!("Registered repo: {}", canonical.display());
 
         drop(_gate);
@@ -269,12 +298,77 @@ impl RepoRegistry {
         self.handles.len()
     }
 
+    /// Every repo this daemon knows, whether or not a handle is open for it.
+    ///
+    /// Survives both LRU eviction and a daemon restart, so it answers "which
+    /// repos are there" where [`list`](Self::list) answers "which repos are
+    /// open right now".
+    pub fn known_roots(&self) -> Vec<PathBuf> {
+        self.repo_map.roots()
+    }
+
     /// Get all active repo handles (for cross-repo operations).
     pub fn all_handles(&self) -> Vec<Arc<RepoHandle>> {
         self.handles
             .iter()
             .map(|entry| Arc::clone(entry.value()))
             .collect()
+    }
+
+    /// Each of `roots` with a read-only context or the reason it has none. The
+    /// caller owns the contexts and drops them when it is done.
+    ///
+    /// This is what a cross-repo READ fans out over.
+    /// [`all_handles`](Self::all_handles) is not: it returns the at-most
+    /// `max_active_repos` handles that happen to be open, so a repo that is
+    /// known but closed — every repo, after a restart — would be absent from
+    /// the answer without ever being mentioned. That is the false negative this
+    /// exists to remove.
+    ///
+    /// Which roots to read is the caller's decision, because the `root`
+    /// selector already made it: `*` means every known root, a list means those
+    /// roots, and this opens what it is given rather than deciding again.
+    ///
+    /// [`get_or_open`](Self::get_or_open) is the wrong tool for a read: it
+    /// mounts the repo, takes an LRU slot (evicting the repo the caller is
+    /// actually working in) and spawns a file watcher. A read needs none of
+    /// that, so each store is opened read-only instead — no migration, no
+    /// autoheal, no `-wal`/`-shm` pair, nothing left behind. Nothing here
+    /// touches the handle table at all, so LRU recency is unchanged.
+    ///
+    /// The whitelist is re-checked here rather than trusted from the moment the
+    /// root was recorded: `daemon.toml` can be edited while the map persists.
+    pub fn open_read_only(
+        &self,
+        roots: &[PathBuf],
+    ) -> Vec<(PathBuf, std::result::Result<Context, String>)> {
+        roots
+            .iter()
+            .map(|root| {
+                let read = self.read_only_context(root);
+                (root.clone(), read)
+            })
+            .collect()
+    }
+
+    /// Open one known root read-only, or say why not.
+    ///
+    /// The reasons come from [`repo_map::classify`], so a root the map calls
+    /// absent and a root the map calls unreadable are named here exactly as the
+    /// map names them. An open that fails past the probe — a schema newer than
+    /// this binary, a corrupt file, a held lock — carries the store's own error
+    /// text, because "cannot be read" without the reason is what leaves an
+    /// operator guessing.
+    fn read_only_context(&self, root: &Path) -> std::result::Result<Context, String> {
+        if let Err(e) = self.daemon_config.check_whitelist(root) {
+            return Err(format!("outside the daemon whitelist: {e}"));
+        }
+        match super::repo_map::classify(root) {
+            super::repo_map::RootHealth::Healthy => {}
+            super::repo_map::RootHealth::Unreadable(why) => return Err(why),
+            absent => return Err(absent.reason().to_string()),
+        }
+        Context::open_read_only(root).map_err(|e| e.to_string())
     }
 
     /// Evict the least recently used repo handle.
@@ -732,6 +826,159 @@ mod tests {
         // The critical invariant: root1's handle was evicted and dropped,
         // so its watcher JoinHandle was aborted via Drop. We can't directly
         // observe thread count here, but the Drop impl logs and aborts.
+    }
+
+    /// A daemon home for the repo map. Without one the map keeps its set in
+    /// memory and writes nothing, which is what every other test in this file
+    /// relies on to stay clear of the real `~/.mdkb`.
+    fn allow_temp_config_with_state(state: &Path) -> DaemonConfig {
+        DaemonConfig {
+            state_dir: Some(state.to_path_buf()),
+            ..allow_temp_config()
+        }
+    }
+
+    /// AC#1 — a repo opened by one process is known to the next. Two
+    /// registries over one daemon home stand in for a restart: the first
+    /// process is gone, only `repos.json` connects them.
+    #[test]
+    fn a_repo_opened_once_is_known_after_a_restart() {
+        let state = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+
+        let before = RepoRegistry::new(allow_temp_config_with_state(state.path()));
+        before.get_or_open(&root).unwrap();
+        assert_eq!(before.known_roots(), vec![root.canonicalize().unwrap()]);
+        drop(before);
+
+        let restarted = RepoRegistry::new(allow_temp_config_with_state(state.path()));
+        assert_eq!(
+            restarted.known_roots(),
+            vec![root.canonicalize().unwrap()],
+            "the map is what one daemon leaves behind for the next"
+        );
+        assert_eq!(
+            restarted.active_count(),
+            0,
+            "knowing a repo is not holding it open: the handle LRU still starts empty"
+        );
+    }
+
+    /// AC#1 — the record happens after the whitelist check, so a refused root
+    /// never enters the map. A map that recorded attempts would hand the next
+    /// daemon a list of roots it was never allowed to touch.
+    #[test]
+    fn a_root_refused_by_the_whitelist_is_never_recorded() {
+        let state = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+
+        let registry = RepoRegistry::new(DaemonConfig {
+            whitelist_dirs: vec!["/nonexistent/allowed".to_string()],
+            state_dir: Some(state.path().to_path_buf()),
+            ..DaemonConfig::default()
+        });
+
+        assert!(registry.get_or_open(&root).is_err());
+        assert!(registry.known_roots().is_empty());
+        assert!(
+            !state.path().join("repos.json").exists(),
+            "a refused open writes nothing at all"
+        );
+    }
+
+    /// AC#6 — knowing a root is not permission to open it. A root persisted by
+    /// an earlier daemon, under a whitelist that has since been narrowed, is
+    /// still refused: the map feeds `get_or_open`, it does not bypass it.
+    #[test]
+    fn a_persisted_root_outside_the_whitelist_is_still_refused() {
+        let state = TempDir::new().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let outside = make_repo(&tmp);
+        std::fs::write(
+            state.path().join("repos.json"),
+            serde_json::json!({
+                "version": 1,
+                "repos": [{ "root": outside.to_string_lossy() }],
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let registry = RepoRegistry::new(DaemonConfig {
+            whitelist_dirs: vec!["/nonexistent/allowed".to_string()],
+            state_dir: Some(state.path().to_path_buf()),
+            ..DaemonConfig::default()
+        });
+
+        assert_eq!(
+            registry.known_roots(),
+            vec![outside.canonicalize().unwrap()],
+            "the root is known"
+        );
+        let err = registry.get_or_open(&outside).unwrap_err().to_string();
+        assert!(err.contains("whitelist"), "and still refused: {err}");
+        assert_eq!(registry.active_count(), 0);
+    }
+
+    /// AC#8 — the map is not the active-handle LRU. A root evicted from
+    /// `handles` stays known.
+    #[test]
+    fn a_root_evicted_from_the_handle_lru_stays_on_the_map() {
+        let state = TempDir::new().unwrap();
+        let tmps: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let roots: Vec<PathBuf> = tmps.iter().map(make_repo).collect();
+
+        let registry = RepoRegistry::new(DaemonConfig {
+            max_active_repos: 2,
+            ..allow_temp_config_with_state(state.path())
+        });
+        for root in &roots {
+            registry.get_or_open(root).unwrap();
+        }
+
+        assert_eq!(registry.active_count(), 2, "the handle cap is unchanged");
+        assert_eq!(
+            registry.known_roots().len(),
+            3,
+            "all three are still known: eviction frees resources, it does not forget a repo"
+        );
+    }
+
+    /// AC#5 — `daemon.toml` is hand-owned config. Its `[[repos]]` are unioned
+    /// into the map at startup and the file itself is left byte for byte alone.
+    #[test]
+    fn daemon_toml_repos_join_the_map_and_the_file_is_never_rewritten() {
+        let state = TempDir::new().unwrap();
+        let tmp_configured = TempDir::new().unwrap();
+        let tmp_opened = TempDir::new().unwrap();
+        let configured = make_repo(&tmp_configured);
+        let opened = make_repo(&tmp_opened);
+
+        let config_path = state.path().join("daemon.toml");
+        let written = format!(
+            "max_active_repos = 4\nwhitelist_dirs = [\"{}\"]\n\n[[repos]]\nroot = \"{}\"\n",
+            std::env::temp_dir().to_string_lossy(),
+            configured.to_string_lossy(),
+        );
+        std::fs::write(&config_path, &written).unwrap();
+
+        let config = DaemonConfig::load_or_default(&config_path).unwrap();
+        let registry = RepoRegistry::new(config);
+        registry.get_or_open(&opened).unwrap();
+
+        let mut expected = vec![
+            configured.canonicalize().unwrap(),
+            opened.canonicalize().unwrap(),
+        ];
+        expected.sort();
+        assert_eq!(registry.known_roots(), expected);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            written,
+            "the daemon must never rewrite the operator's config"
+        );
     }
 
     #[test]

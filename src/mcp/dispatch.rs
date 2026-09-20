@@ -26,8 +26,8 @@ use crate::code::indexing::IndexFacade;
 use crate::core::Context;
 use crate::core::cli_mutation::{CliMutation, CliMutationResult};
 use crate::core::indexing::{UpdateOutcome, UpdateRequest, update_documents};
-use crate::core::search::{handle_hybrid_search, handle_mget};
-use crate::daemon::registry::RepoHandle;
+use crate::core::search::{handle_hybrid_search, handle_mget, hybrid_search_fts};
+use crate::daemon::registry::{RepoHandle, RepoRegistry};
 use crate::domain::{SearchResult, UpdateResult};
 use crate::error::ErrorKind;
 use crate::metrics::{
@@ -102,8 +102,8 @@ fn close_context_on_reported_corruption<T>(
 use super::tools::RelatesInput;
 use super::tools::{
     CodeFindParams, CodeGraphParams, GetParams, GraphParams, MemoryConfirmParams,
-    MemoryDeleteParams, MemoryListParams, MemoryWriteBatchEntry, SearchParams,
-    SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
+    MemoryDeleteParams, MemoryListParams, MemoryWriteBatchEntry, RootSelector, RootTerm,
+    SearchParams, SymbolAtPositionParams, SymbolsInFileParams, UsageParams,
 };
 
 const MAX_HOOK_PROMPT_FINGERPRINTS: usize = 32;
@@ -1574,22 +1574,89 @@ pub async fn search_impl(
     }
 }
 
-/// `search` (cross-repo) — fan out across the registered handles, merge with
-/// score-descending sort, and truncate to `params.limit`. Memory results from
-/// each repo are formatted as a single pseudo-result for compatibility with
-/// `SearchResult`-based aggregation.
+/// Turn a raw `root` value into the roots it names, for every caller that has a
+/// registry behind it.
+///
+/// The single bridge between [`RootSelector`], which knows the grammar and no
+/// daemon, and [`RepoRegistry`], which knows the repos and no grammar. Both the
+/// per-repo path (`resolve_handle`) and the fan-out come through here, so the
+/// string is interpreted in exactly one place.
+///
+/// `known` is the map unioned with whatever is open. `get_or_open` records
+/// every handle it opens, so the two agree in practice; the union is kept so a
+/// handle inserted by any other path is reachable by `root="*"` rather than
+/// invisible. Reading the handle table does not `touch()` it, so LRU recency is
+/// unchanged.
+pub fn resolve_root_selector(
+    registry: &RepoRegistry,
+    root: Option<&str>,
+) -> Result<(RootSelector, Vec<std::path::PathBuf>), McpError> {
+    let selector = RootSelector::parse(root).map_err(mcp_error)?;
+    let open: Vec<std::path::PathBuf> = registry
+        .all_handles()
+        .iter()
+        .map(|handle| handle.root.clone())
+        .collect();
+    let known: Vec<std::path::PathBuf> = {
+        let mut set: std::collections::BTreeSet<std::path::PathBuf> =
+            registry.known_roots().into_iter().collect();
+        set.extend(open.iter().cloned());
+        set.into_iter().collect()
+    };
+    let roots = selector.resolve(&known, &open).map_err(mcp_error)?;
+    Ok((selector, roots))
+}
+
+/// What the fan-out learned about one repo.
+///
+/// `Err` is "not searched, and here is why". A repo that could not be read is
+/// NOT an empty repo, and collapsing the two is the defect this type exists to
+/// prevent: "No results across repos" used to be the answer both for a search
+/// that found nothing and for a store this binary refused to open.
+struct RepoOutcome {
+    root: std::path::PathBuf,
+    results: std::result::Result<Vec<SearchResult>, String>,
+}
+
+/// The coverage footer: what was read, out of what is known, and what was not.
+///
+/// Always emitted, including when every repo was searched. The denominator is
+/// what makes an empty result readable — without it, a reader cannot tell a
+/// query that matched nothing from a fan-out that only looked at one repo.
+fn format_cross_repo_coverage(
+    searched: usize,
+    known: usize,
+    skipped: &[(std::path::PathBuf, String)],
+) -> String {
+    let mut out = format!("\n_Searched {searched} of {known} known repos._\n");
+    if !skipped.is_empty() {
+        out.push_str(&format!("**Not searched ({}):**\n", skipped.len()));
+        for (root, why) in skipped {
+            out.push_str(&format!("- {} — {why}\n", root.display()));
+        }
+    }
+    out
+}
+
+/// `search` (cross-repo) — fan out across every repo the daemon knows, merge
+/// with score-descending sort, and truncate to `params.limit`. Memory results
+/// from each repo are formatted as a single pseudo-result for compatibility
+/// with `SearchResult`-based aggregation.
+///
+/// The roots come from [`resolve_root_selector`] — every known root for `*`, or
+/// the ones a comma-separated list named. They are not the open handles: those
+/// are at most `max_active_repos`, LRU-evicted, and empty after a daemon
+/// restart, so fanning out over them silently omits every repo that is known
+/// but closed. Each store is opened READ-ONLY for the duration of the search —
+/// no handle, no watcher, no LRU slot taken from the repo the caller is working
+/// in — and the ones that could not be opened are reported, never counted as
+/// empty.
 ///
 /// Code/symbols scopes are rejected — those indexes are per-repo only.
 pub async fn cross_repo_search_impl(
-    handles: &[Arc<RepoHandle>],
+    registry: &RepoRegistry,
     params: &SearchParams,
 ) -> Result<(String, usize), McpError> {
-    if handles.is_empty() {
-        return Err(mcp_error(
-            "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
-        ));
-    }
-
     let scope = params
         .scope
         .as_deref()
@@ -1611,89 +1678,85 @@ pub async fn cross_repo_search_impl(
         ));
     }
 
-    // Fan-out concurrently across all repos, then merge. Per-repo errors are
-    // logged and treated as empty results so a single failing repo does not
-    // abort the whole cross-repo search.
-    let per_repo_futures = handles.iter().map(|handle| {
-        let handle = Arc::clone(handle);
-        let query = params.query.clone();
-        let collection = params.collection.clone();
-        let include_superseded = params.include_superseded;
-        let min_confidence = params.min_confidence;
-        let memory_cfg = handle.config.search.memory.clone();
+    // Which repos, through the one parser. Each with a read-only context or the
+    // reason it has none: opening happens here, once, so the fan-out below
+    // never decides whether a repo is reachable — it only searches what it was
+    // handed.
+    let (_, roots) = resolve_root_selector(registry, params.root.as_deref())?;
+    let targets = registry.open_read_only(&roots);
+    if targets.is_empty() {
+        return Err(mcp_error(
+            "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
+        ));
+    }
+    let known = targets.len();
 
+    // Embed ONCE, before the fan-out. The query is the same text for every
+    // repo, so embedding inside the per-repo future bought N identical vectors
+    // at one ONNX inference each. `hybrid_search_fts` and
+    // `search_entries_recall` both take a pre-computed vector for exactly this
+    // reason; `None` degrades both to BM25-only, as it always did.
+    let fts_query = search::escape_fts5_query(&params.query);
+    let query_embedding = embed_query_off_lock(&params.query).await;
+    let query_embedding = query_embedding.as_deref();
+
+    // Fan out concurrently. A repo whose search FAILS is reported as not
+    // searched, never merged in as an empty result.
+    let per_repo_futures = targets.into_iter().map(|(root, opened)| {
+        let fts_query = &fts_query;
+        let params = &params;
         async move {
-            if let Err(e) = ensure_handle_context(&handle).await {
-                tracing::warn!(
-                    "cross_repo_search: skipping {}: {}",
-                    handle.root.display(),
-                    e.message
-                );
-                return Vec::<SearchResult>::new();
-            }
-            // Embed off the runtime before locking — memory scope only needs it.
-            let query_embedding = if scope == Some(crate::mcp::tools::SearchScope::Memory) {
-                embed_query_off_lock(&query).await
-            } else {
-                None
+            let ctx = match opened {
+                Ok(ctx) => ctx,
+                Err(why) => {
+                    tracing::warn!(root = %root.display(), "cross_repo_search: not searched ({why})");
+                    return RepoOutcome { root, results: Err(why) };
+                }
             };
-
-            let mut ctx_guard = handle.ctx.lock().await;
-
-            let repo_tag = handle.root.display().to_string();
+            // The repo's own config, not the caller's: recall thresholds are a
+            // per-repo setting and a read-only target has no handle to carry one.
+            let memory_cfg = crate::Config::load_or_default(&ctx.config_path)
+                .search
+                .memory;
+            let repo_tag = root.display().to_string();
             let mut repo_results: Vec<SearchResult> = Vec::new();
 
             match scope {
                 Some(crate::mcp::tools::SearchScope::Docs) | None => {
-                    let result = crate::core::run_guarded_read(
-                        &mut ctx_guard,
-                        "cross-repo document search",
-                        |ctx| {
-                            handle_hybrid_search(
-                                ctx,
-                                &query,
-                                limit,
-                                collection.as_deref(),
-                                include_superseded,
-                            )
-                        },
-                    );
-                    match result {
-                        Some(Ok(mut results)) => {
+                    match hybrid_search_fts(
+                        &ctx,
+                        fts_query,
+                        query_embedding,
+                        limit,
+                        params.collection.as_deref(),
+                        params.include_superseded,
+                    ) {
+                        Ok(mut results) => {
                             for r in &mut results {
                                 r.repo_root = Some(repo_tag.clone());
                             }
                             repo_results.extend(results);
                         }
-                        Some(Err(e)) => {
-                            tracing::warn!(
-                                "cross_repo_search: docs search failed on {}: {e}",
-                                repo_tag
-                            );
+                        Err(e) => {
+                            let why = format!("document search failed: {e}");
+                            tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
+                            return RepoOutcome { root, results: Err(why) };
                         }
-                        None => {}
                     }
                 }
                 Some(crate::mcp::tools::SearchScope::Memory) => {
-                    let result = crate::core::run_guarded_read(
-                        &mut ctx_guard,
-                        "cross-repo memory search",
-                        |ctx| {
-                            memory::search_entries_recall(
-                                &ctx.conn,
-                                &query,
-                                query_embedding.as_deref(),
-                                limit,
-                                None,
-                                &memory_cfg,
-                            )
-                        },
-                    );
-                    match result {
-                        Some(Ok(entries)) => {
+                    match memory::search_entries_recall(
+                        &ctx.conn,
+                        &params.query,
+                        query_embedding,
+                        limit,
+                        None,
+                        &memory_cfg,
+                    ) {
+                        Ok(entries) => {
                             let entries: Vec<memory::MemoryEntry> =
                                 entries.into_iter().map(|result| result.entry).collect();
-                            let entries = apply_min_confidence(entries, min_confidence);
+                            let entries = apply_min_confidence(entries, params.min_confidence);
                             if !entries.is_empty() {
                                 let text = format_memory_search_results(&entries);
                                 let mut pseudo = SearchResult {
@@ -1714,27 +1777,33 @@ pub async fn cross_repo_search_impl(
                                 repo_results.push(pseudo);
                             }
                         }
-                        Some(Err(e)) => {
-                            tracing::warn!(
-                                "cross_repo_search: memory search failed on {}: {e}",
-                                repo_tag
-                            );
+                        Err(e) => {
+                            let why = format!("memory search failed: {e}");
+                            tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
+                            return RepoOutcome { root, results: Err(why) };
                         }
-                        None => {}
                     }
                 }
+                // Rejected above: code/symbols/duplicates never reach the fan-out.
                 _ => {}
             }
 
-            repo_results
+            RepoOutcome { root, results: Ok(repo_results) }
         }
     });
 
-    let mut all_results: Vec<SearchResult> = join_all(per_repo_futures)
-        .await
-        .into_iter()
-        .flatten()
-        .collect();
+    let mut searched = 0_usize;
+    let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut all_results: Vec<SearchResult> = Vec::new();
+    for outcome in join_all(per_repo_futures).await {
+        match outcome.results {
+            Ok(results) => {
+                searched += 1;
+                all_results.extend(results);
+            }
+            Err(why) => skipped.push((outcome.root, why)),
+        }
+    }
 
     all_results.sort_by(|a, b| {
         b.score
@@ -1743,11 +1812,12 @@ pub async fn cross_repo_search_impl(
     });
     all_results.truncate(limit);
 
-    let output = if all_results.is_empty() {
-        "No results across repos. Try broader terms.".to_string()
+    let mut output = if all_results.is_empty() {
+        format!("No results across the {searched} repos searched. Try broader terms.")
     } else {
         format_search_results(&all_results, limit)
     };
+    output.push_str(&format_cross_repo_coverage(searched, known, &skipped));
 
     let count = all_results.len();
     Ok((output, count))
@@ -3198,7 +3268,8 @@ fn log_hook_event_with_reason(
     );
 }
 
-/// [`log_hook_event`] plus the per-phase split of `elapsed_ms`.
+/// [`log_hook_event`] plus the per-phase split of `elapsed_ms`, and the reason
+/// the outcome carries.
 ///
 /// `elapsed_ms` alone says a hook was slow and nothing about where the time
 /// went: SessionStart averaged 476 ms against a 200 ms budget for as long as
@@ -3210,6 +3281,7 @@ fn log_hook_event_with_phases(
     root: std::path::PathBuf,
     event: &str,
     outcome: &str,
+    reason: Option<&str>,
     phases: &PhaseTimings,
     elapsed_ms: u64,
     slow_threshold_ms: u64,
@@ -3218,7 +3290,7 @@ fn log_hook_event_with_phases(
         root,
         event,
         outcome,
-        None,
+        reason,
         phases.as_json().map(|value| ("phases", value)),
         elapsed_ms,
         slow_threshold_ms,
@@ -3656,7 +3728,7 @@ fn format_quarantine_banner(mdkb_dir: &std::path::Path, doc_count: i64) -> Optio
             r.memory_entries_salvaged,
             r.memory_edges_salvaged,
             r.corrupt_file,
-            crate::store::heal::QUARANTINE_RETENTION.as_secs() / 86_400
+            crate::store::heal::QUARANTINE_RETENTION_DAYS
         ));
     }
     Some(out)
@@ -3736,6 +3808,62 @@ impl PhaseTimings {
     }
 }
 
+/// What one SessionStart run did, as recorded in `hook-events.jsonl`.
+///
+/// Every early return used to answer `json!({})`, which the dispatcher turned
+/// into one undifferentiated `skipped`: a store that refused to open — the
+/// v27/v28 binary mismatch, 21 dead hook runs in one morning — was recorded
+/// exactly like hooks being switched off on purpose. The payload is unchanged,
+/// because stdout silence is the contract for every one of these; the row is
+/// what now says which silence it was.
+///
+/// Same shape as [`MiningOutcome`], for the same reason: the outcome is written
+/// once, at the boundary, so "one row per run, and it says what happened" is a
+/// property of the shape rather than a rule each `return` has to remember.
+#[derive(Debug)]
+pub enum SessionStartOutcome {
+    /// Context to inject.
+    Fired(Value),
+    /// `hooks.session_start_enabled = false` — off on purpose, nothing wrong.
+    Disabled,
+    /// No store under the root the hook ran against. Also nothing wrong, and
+    /// distinct from `Disabled`: one is a decision, the other is a repo that
+    /// was never initialized.
+    NoStore,
+    /// The store could not be reached, or a read against it failed. Nobody
+    /// asked for this silence — it is a fault, and never a skip.
+    Failed(String),
+}
+
+impl SessionStartOutcome {
+    /// The `outcome` field of the row.
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Fired(_) => "fired",
+            Self::Disabled => "disabled",
+            Self::NoStore => "no_store",
+            Self::Failed(_) => "failed",
+        }
+    }
+
+    /// The `reason` field, which only a fault carries: it names which read
+    /// failed and what SQLite or the store said about it.
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Failed(reason) => Some(reason),
+            Self::Fired(_) | Self::Disabled | Self::NoStore => None,
+        }
+    }
+
+    /// The hook payload: the context when there is one, `{}` otherwise.
+    fn into_value(self) -> Value {
+        match self {
+            Self::Fired(value) => value,
+            Self::Disabled | Self::NoStore | Self::Failed(_) => json!({}),
+        }
+    }
+}
+
 /// `session_cwd` is the validated session working directory (see
 /// [`hook_session_cwd`]) — the only signal that says which project inside a
 /// multi-project store this session belongs to. `None` means unscoped: every
@@ -3744,7 +3872,10 @@ pub async fn hook_session_start_impl(
     handle: &Arc<RepoHandle>,
     session_cwd: Option<&std::path::Path>,
 ) -> Value {
-    hook_session_start_timed(handle, session_cwd).await.0
+    hook_session_start_timed(handle, session_cwd)
+        .await
+        .0
+        .into_value()
 }
 
 /// [`hook_session_start_impl`] and the per-phase split of the time it took.
@@ -3754,7 +3885,7 @@ pub async fn hook_session_start_impl(
 pub async fn hook_session_start_timed(
     handle: &Arc<RepoHandle>,
     session_cwd: Option<&std::path::Path>,
-) -> (Value, PhaseTimings) {
+) -> (SessionStartOutcome, PhaseTimings) {
     let mut phases = PhaseTimings::new();
     let out = hook_session_start_inner(handle, session_cwd, &mut phases).await;
     (out, phases)
@@ -3764,16 +3895,24 @@ async fn hook_session_start_inner(
     handle: &Arc<RepoHandle>,
     session_cwd: Option<&std::path::Path>,
     phases: &mut PhaseTimings,
-) -> Value {
+) -> SessionStartOutcome {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
-        return json!({});
+        return SessionStartOutcome::Disabled;
     }
     if !handle.root.join(".mdkb").is_dir() {
-        return json!({});
+        return SessionStartOutcome::NoStore;
     }
-    if ensure_handle_context(handle).await.is_err() {
-        return json!({});
+    // warn!, not debug!: this is the branch a broken store lands on — a schema
+    // the binary cannot serve, a held lock, a corrupt index — and an operator
+    // reading default-level logs must see it without turning anything on.
+    if let Err(error) = ensure_handle_context(handle).await {
+        tracing::warn!(
+            root = %handle.root.display(),
+            "hook.session_start: the store would not open, so this session starts with no context: {}",
+            error.message
+        );
+        return SessionStartOutcome::Failed(format!("store unavailable: {}", error.message));
     }
     // First open of the store in this process: it can carry a schema migration
     // and the sqlite-vec load, neither of which the warmup query should be
@@ -3810,9 +3949,14 @@ async fn hook_session_start_inner(
             Some(Ok(data)) => data,
             Some(Err(error)) => {
                 tracing::warn!("hook.session_start warmup failed: {error}");
-                return json!({});
+                return SessionStartOutcome::Failed(format!("warmup read failed: {error}"));
             }
-            None => return json!({}),
+            None => {
+                tracing::warn!(
+                    "hook.session_start: the context was released before the warmup ran"
+                );
+                return SessionStartOutcome::Failed("context closed before warmup".to_string());
+            }
         };
     drop(ctx_guard);
     // Ranked warmup pool, document count, collection list and the projection
@@ -3844,9 +3988,16 @@ async fn hook_session_start_inner(
             Some(Ok(anchor)) => anchor,
             Some(Err(error)) => {
                 tracing::warn!("hook.session_start handoff lookup failed: {error}");
-                return json!({});
+                return SessionStartOutcome::Failed(format!("handoff lookup failed: {error}"));
             }
-            None => return json!({}),
+            None => {
+                tracing::warn!(
+                    "hook.session_start: the context was released before the handoff lookup ran"
+                );
+                return SessionStartOutcome::Failed(
+                    "context closed before handoff lookup".to_string(),
+                );
+            }
         }
     };
     phases.mark("handoff");
@@ -3871,7 +4022,15 @@ async fn hook_session_start_inner(
     // dependency is superseded or net-refuted in the primary store. Never mutates
     // stored confidence.
     let mut stale_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if ensure_handle_context(handle).await.is_ok() {
+    if let Err(error) = ensure_handle_context(handle).await {
+        // Not fatal — the warmup lines are already in hand, so the hook still
+        // fires, just without the markers. Said out loud all the same: a
+        // discarded error is how the silence this story fixes got started.
+        tracing::warn!(
+            "hook.session_start: no context for the stale-dependency markers: {}",
+            error.message
+        );
+    } else {
         let mut ctx_guard = handle.ctx.lock().await;
         let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
         match crate::core::run_guarded_read(&mut ctx_guard, "hook stale dependencies", |ctx| {
@@ -3934,9 +4093,9 @@ async fn hook_session_start_inner(
             body.push('\n');
         }
     }
-    body.push_str(&format!(
-        "\n**mdkb:** `* query` = recall | `{bin} cheatsheet` = search/code/graph/audit/memory\n"
-    ));
+    body.push_str(
+        "\n**mdkb:** `* query` = recall | `mdkb cheatsheet` = search/code/graph/audit/memory (partial; `mdkb --help` lists the rest)\n",
+    );
 
     // Check code index staleness. If stale, kick a detached refresh instead of
     // asking the user to run a manual command from a latency-sensitive hook.
@@ -3969,12 +4128,12 @@ async fn hook_session_start_inner(
     // read-only, for its last scan timestamp.
     phases.mark("code_check");
 
-    json!({
+    SessionStartOutcome::Fired(json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext": body,
         }
-    })
+    }))
 }
 
 /// Post-recall 1-hop expansion: for the top recalled seeds, surface active memory
@@ -5446,10 +5605,22 @@ pub async fn dispatch_call(
         "search" => {
             let sp: SearchParams = serde_json::from_value(params)
                 .map_err(|e| mcp_error(format!("search: invalid params: {e}")))?;
-            if sp.root.as_deref() == Some("*") {
-                return Err(mcp_error(
-                    "Cross-repo search via dispatch_call is not supported (no registry handle).",
-                ));
+            // The same parser as the MCP server, not a second reading of the
+            // string. This path already holds the handle for the root it was
+            // called with and has no registry behind it, so it can serve a
+            // single absolute path — which is what the hook socket always sends
+            // — and nothing that needs the map or a fan-out.
+            match RootSelector::parse(sp.root.as_deref()).map_err(mcp_error)? {
+                RootSelector::Default => {}
+                RootSelector::List(ref terms)
+                    if terms.len() == 1 && matches!(terms[0], RootTerm::Path(_)) => {}
+                _ => {
+                    return Err(mcp_error(
+                        "Only a single absolute root is supported here (no registry handle): \
+                         a repo name or a cross-repo selector needs the MCP server. \
+                         Run `mdkb cheatsheet` for the root grammar.",
+                    ));
+                }
             }
             let (text, count) = search_impl(&handle, &sp).await?;
             let tokens = count_tokens(&text);
@@ -5562,17 +5733,23 @@ pub async fn dispatch_call(
             dctx.reset_hook_session(&key);
             let t0 = std::time::Instant::now();
             let session_cwd = hook_session_cwd(&params, &handle.root);
-            let (result, phases) = hook_session_start_timed(&handle, session_cwd.as_deref()).await;
+            let (outcome, phases) = hook_session_start_timed(&handle, session_cwd.as_deref()).await;
             let ms = t0.elapsed().as_millis() as u64;
-            let outcome = if result == json!({}) {
-                "skipped"
-            } else {
-                "fired"
-            };
+            let label = outcome.label();
+            let reason = outcome.reason().map(str::to_string);
+            let result = outcome.into_value();
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || {
-                log_hook_event_with_phases(root, "session_start", outcome, &phases, ms, budget);
+                log_hook_event_with_phases(
+                    root,
+                    "session_start",
+                    label,
+                    reason.as_deref(),
+                    &phases,
+                    ms,
+                    budget,
+                );
             });
             record_hook_call(&handle, tool_name).await;
             Ok(result)
@@ -9052,9 +9229,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cross_repo_search_impl_rejects_empty_handles() {
+    async fn cross_repo_search_impl_rejects_an_empty_registry() {
+        // `state_dir: None` keeps the map in memory: a registry built in a test
+        // never reads or writes the real `~/.mdkb`.
+        let registry = RepoRegistry::new(crate::DaemonConfig::default());
         let params = search_params("anything", None);
-        let err = cross_repo_search_impl(&[], &params)
+        let err = cross_repo_search_impl(&registry, &params)
             .await
             .expect_err("should error");
         let msg = err.to_string();
@@ -9076,10 +9256,11 @@ mod tests {
         .await
         .expect_err("should error");
         let msg = err.to_string();
-        assert!(
-            msg.contains("Cross-repo search via dispatch_call is not supported"),
-            "msg: {msg}"
-        );
+        // Story 126-5dab widened the rejection from the `"*"` string to every
+        // selector this path cannot serve, so it is the reason and the pointer
+        // that are asserted, not the old sentence.
+        assert!(msg.contains("no registry handle"), "msg: {msg}");
+        assert!(msg.contains("mdkb cheatsheet"), "msg: {msg}");
     }
 
     fn get_params(id: &str) -> GetParams {
@@ -9577,6 +9758,139 @@ mod tests {
         });
         let result = hook_session_start_impl(&handle, None).await;
         assert_eq!(result, json!({}));
+    }
+
+    // ── SessionStart: a silence that does not say why is a false negative ─────
+
+    /// Every `session_start` row written under `root`.
+    ///
+    /// The dispatcher logs from a detached `spawn_blocking`, so the row lands
+    /// shortly after the call returns rather than before it.
+    async fn session_start_events(root: &std::path::Path) -> Vec<Value> {
+        let dir = crate::store::namespace::store_dir(root).unwrap_or_else(|_| root.join(".mdkb"));
+        for _ in 0..200 {
+            let rows: Vec<Value> = std::fs::read_to_string(dir.join("hook-events.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                .filter(|v| v.get("event").and_then(Value::as_str) == Some("session_start"))
+                .collect();
+            if !rows.is_empty() {
+                return rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        Vec::new()
+    }
+
+    /// Run SessionStart through the dispatcher — the only caller that writes the
+    /// event row — and return (row, hook payload).
+    async fn session_start_row(handle: &Arc<RepoHandle>) -> (Value, Value) {
+        let dctx = make_dctx();
+        let result = dispatch_call(
+            "hook.session_start",
+            json!({ "session_id": "s-outcome" }),
+            Arc::clone(handle),
+            &dctx,
+        )
+        .await
+        .expect("the hook contract never errors out of dispatch");
+        let rows = session_start_events(&handle.root).await;
+        assert_eq!(rows.len(), 1, "exactly one row per run, got {rows:?}");
+        (rows.into_iter().next().unwrap(), result)
+    }
+
+    /// A hook switched off on purpose is a legitimate negative — and must be
+    /// named as one, so it is never confused with a store that broke.
+    #[tokio::test]
+    async fn session_start_that_is_switched_off_records_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.session_start_enabled = false;
+        });
+
+        let (row, result) = session_start_row(&handle).await;
+
+        assert_eq!(result, json!({}), "a disabled hook stays silent on stdout");
+        assert_eq!(
+            row["outcome"], "disabled",
+            "hooks switched off must be recorded as such: {row}"
+        );
+    }
+
+    /// The defect this story exists for: the store refuses to open — the v27/v28
+    /// binary mismatch, 21 failed hook runs in one morning — and the row said
+    /// `skipped`, exactly what a hook that is off on purpose says.
+    #[tokio::test]
+    async fn session_start_against_a_store_that_refuses_to_open_records_failed() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.expect("initialize");
+        {
+            // A store from the future, then closed: the next open must refuse it.
+            let mut slot = handle.ctx.lock().await;
+            let ctx = slot.take().expect("context was just initialized");
+            ctx.conn
+                .execute("UPDATE schema_version SET version = ?", [9999])
+                .expect("write a schema version this binary cannot serve");
+        }
+
+        let (row, result) = session_start_row(&handle).await;
+
+        assert_eq!(
+            result,
+            json!({}),
+            "a broken store still says nothing on stdout"
+        );
+        assert_eq!(
+            row["outcome"], "failed",
+            "a store that will not open is not a skip: {row}"
+        );
+        let reason = row["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("9999"),
+            "the reason must carry the underlying error: {row}"
+        );
+    }
+
+    /// The positive control: a healthy repo emits its context, end to end
+    /// through the dispatcher, and the row says `fired`.
+    #[tokio::test]
+    async fn session_start_on_a_healthy_store_fires_with_context() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "warmup-entry").await;
+
+        let (row, result) = session_start_row(&handle).await;
+
+        assert_eq!(row["outcome"], "fired", "{row}");
+        assert!(
+            row.get("reason").is_none(),
+            "a firing hook has no reason: {row}"
+        );
+        let body = result
+            .pointer("/hookSpecificOutput/additionalContext")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            body.contains("warmup-entry"),
+            "a healthy repo must emit its context: {body:?}"
+        );
+    }
+
+    /// No store under the root: nothing to serve, and nowhere to write a row
+    /// either (the event log lives inside the store that is missing), so this
+    /// one is asserted on the outcome itself.
+    #[tokio::test]
+    async fn session_start_without_a_store_directory_records_no_store() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        std::fs::remove_dir_all(handle.root.join(".mdkb")).expect("remove the store");
+
+        let (outcome, _) = hook_session_start_timed(&handle, None).await;
+
+        assert_eq!(outcome.label(), "no_store");
+        assert_eq!(outcome.into_value(), json!({}));
     }
 
     #[tokio::test]

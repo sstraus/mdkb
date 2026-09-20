@@ -15,6 +15,21 @@ const DEFAULT_PID_NAME: &str = "daemon.pid";
 /// Default maximum number of concurrently active repo handles.
 const DEFAULT_MAX_ACTIVE_REPOS: usize = 5;
 
+/// Daemon-owned state: the set of repositories the daemon knows about.
+const REPO_MAP_NAME: &str = "repos.json";
+
+/// The directory a config file sits in, when it names one.
+///
+/// A bare file name has an empty parent, which would put daemon state in
+/// whatever directory the process happens to be in; that counts as no
+/// directory at all.
+fn state_dir_of(config_path: &Path) -> Option<PathBuf> {
+    config_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
 /// Resolve the current user's home directory: `HOME`, then `USERPROFILE`, then
 /// [`directories::BaseDirs`].
 ///
@@ -84,6 +99,17 @@ pub struct DaemonConfig {
     /// keys without restating the whole section.
     #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
     pub priors: toml::Table,
+
+    /// Directory holding daemon-owned state, next to the `daemon.toml` this was
+    /// loaded from. Never read from or written to that file — it names where
+    /// the file lives, so it cannot live inside it.
+    ///
+    /// `None` for a config built in memory: nothing on disk backs it, so
+    /// nothing may be persisted on its behalf. That is what keeps a
+    /// `DaemonConfig::default()` in a test from writing into the real
+    /// `~/.mdkb`.
+    #[serde(skip)]
+    pub state_dir: Option<PathBuf>,
 }
 
 /// A pre-registered repository entry.
@@ -101,21 +127,35 @@ impl Default for DaemonConfig {
             whitelist_dirs: Vec::new(),
             repos: Vec::new(),
             priors: toml::Table::new(),
+            state_dir: None,
         }
     }
 }
 
 impl DaemonConfig {
     /// Load config from a TOML file, or return default if the file doesn't exist.
+    ///
+    /// Either way the result carries the directory `path` sits in as its
+    /// [`state_dir`](Self::state_dir): a daemon that has a config path has a
+    /// home to keep its own state in, whether or not an operator has written a
+    /// `daemon.toml` there yet.
     pub fn load_or_default(path: &Path) -> Result<Self> {
-        if path.exists() {
+        let mut config = if path.exists() {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| Error::other(format!("Failed to read daemon config: {e}")))?;
             toml::from_str(&content)
-                .map_err(|e| Error::config(format!("Failed to parse daemon config: {e}")))
+                .map_err(|e| Error::config(format!("Failed to parse daemon config: {e}")))?
         } else {
-            Ok(Self::default())
-        }
+            Self::default()
+        };
+        config.state_dir = state_dir_of(path);
+        Ok(config)
+    }
+
+    /// Where the persisted repo map lives, or `None` when no directory backs
+    /// this config.
+    pub fn repo_map_path(&self) -> Option<PathBuf> {
+        self.state_dir.as_ref().map(|d| d.join(REPO_MAP_NAME))
     }
 
     /// Save config to a TOML file.
@@ -302,11 +342,18 @@ mod tests {
                 },
             ],
             priors: toml::from_str("mining_enabled = true\ndistiller_program = \"codex\"").unwrap(),
+            state_dir: Some(PathBuf::from("/Users/me/.mdkb")),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: DaemonConfig = toml::from_str(&toml_str).unwrap();
 
+        // `state_dir` says where this file lives, so it never appears in it.
+        assert!(
+            !toml_str.contains("state_dir"),
+            "runtime state leaked into the operator's config: {toml_str}"
+        );
+        assert_eq!(parsed.state_dir, None);
         assert_eq!(parsed.max_active_repos, 10);
         assert_eq!(parsed.socket_path.as_deref(), Some("~/.mdkb/daemon.sock"));
         assert_eq!(parsed.whitelist_dirs.len(), 2);
@@ -359,6 +406,7 @@ whitelist_dirs = ["~/Code"]
                 root: "/foo/bar".to_string(),
             }],
             priors: toml::Table::new(),
+            state_dir: None,
         };
         config.save(&path).unwrap();
 
@@ -366,6 +414,37 @@ whitelist_dirs = ["~/Code"]
         assert_eq!(loaded.max_active_repos, 7);
         assert_eq!(loaded.whitelist_dirs, vec!["~/Gits"]);
         assert_eq!(loaded.repos.len(), 1);
+    }
+
+    /// A config loaded from a file knows the directory it came from, so the
+    /// daemon can keep its own state beside it — with or without a
+    /// `daemon.toml` already written there.
+    #[test]
+    fn a_loaded_config_knows_where_its_state_lives() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("daemon.toml");
+
+        let absent = DaemonConfig::load_or_default(&path).unwrap();
+        assert_eq!(absent.state_dir.as_deref(), Some(tmp.path()));
+        assert_eq!(absent.repo_map_path(), Some(tmp.path().join("repos.json")));
+
+        std::fs::write(&path, "max_active_repos = 3\n").unwrap();
+        let present = DaemonConfig::load_or_default(&path).unwrap();
+        assert_eq!(present.max_active_repos, 3);
+        assert_eq!(present.repo_map_path(), Some(tmp.path().join("repos.json")));
+    }
+
+    /// A config nothing on disk backs has nowhere to put state, and must not
+    /// invent one: a bare file name would make it the process working
+    /// directory.
+    #[test]
+    fn a_config_with_no_directory_behind_it_has_no_state_path() {
+        assert_eq!(DaemonConfig::default().repo_map_path(), None);
+        assert_eq!(state_dir_of(Path::new("daemon.toml")), None);
+        assert_eq!(
+            state_dir_of(Path::new("/etc/mdkb/daemon.toml")),
+            Some(PathBuf::from("/etc/mdkb"))
+        );
     }
 
     #[test]

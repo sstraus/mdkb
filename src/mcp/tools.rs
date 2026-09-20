@@ -1,7 +1,193 @@
 //! MCP tool definitions and parameters.
 
+use std::path::{Path, PathBuf};
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Where the `root` grammar is documented. Every error this module produces
+/// points here, and nothing else does: the grammar is not in the tool schemas
+/// and not in the server instructions, because both are charged on every
+/// request of every session while the cheatsheet costs nothing until an
+/// operator asks for it.
+const GRAMMAR_HINT: &str = "Run `mdkb cheatsheet` for the root grammar.";
+
+/// One item of a `root` selector.
+///
+/// The two are told apart syntactically, by [`Path::is_absolute`] alone, before
+/// anything is looked up or touched on disk. That is what keeps an absolute
+/// path behaving exactly as it always did: a path to a repo the map has never
+/// heard of is still a path, and a repo name can never shadow one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootTerm {
+    /// An absolute path, used as written.
+    Path(PathBuf),
+    /// A repo name, resolved against the known roots by last path component.
+    Name(String),
+}
+
+/// A parsed `root` selector — the ONE place the `root` string is interpreted.
+///
+/// Every tool goes through this instead of matching on the string, which is
+/// what `resolve_handle` used to do: an absolute path or nothing, with `"*"`
+/// special-cased and rejected everywhere but `search`.
+///
+/// # The comma rule
+///
+/// A comma is the list separator, always. A path that contains one is therefore
+/// ambiguous — `/srv/my,repo` is both a real directory and a two-item list —
+/// and [`parse`](Self::parse) REFUSES it by name rather than splitting it into
+/// two selectors that resolve to nothing. An input that cannot mean one thing
+/// is not answered as if it did; that is the same rule criterion 3 applies to
+/// an ambiguous name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootSelector {
+    /// No `root` given: whatever the caller's default repo is.
+    Default,
+    /// `*` — every known root.
+    All,
+    /// One or more explicit terms, in the order the caller wrote them.
+    List(Vec<RootTerm>),
+}
+
+impl RootSelector {
+    /// Parse a raw `root` value. Fails only on an input that cannot mean one
+    /// thing; an unknown or ambiguous NAME is a resolution failure, not a
+    /// parse failure, because parsing does not know the map.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let Some(raw) = raw else {
+            return Ok(Self::Default);
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(Self::Default);
+        }
+        if trimmed == "*" {
+            return Ok(Self::All);
+        }
+
+        if trimmed.contains(',') && Path::new(trimmed).exists() {
+            return Err(format!(
+                "root=\"{trimmed}\" is both an existing path and a comma-separated list, \
+                 so it cannot be resolved either way. A comma separates repos; a path \
+                 containing one cannot be selected by path — select it by name instead. \
+                 {GRAMMAR_HINT}"
+            ));
+        }
+
+        let mut terms = Vec::new();
+        for segment in trimmed.split(',') {
+            let segment = segment.trim();
+            if segment.is_empty() {
+                return Err(format!(
+                    "root=\"{trimmed}\" has an empty item. {GRAMMAR_HINT}"
+                ));
+            }
+            if segment == "*" {
+                return Err(format!(
+                    "root=\"*\" means every known repo and cannot be combined with other \
+                     items. {GRAMMAR_HINT}"
+                ));
+            }
+            terms.push(if Path::new(segment).is_absolute() {
+                RootTerm::Path(PathBuf::from(segment))
+            } else {
+                RootTerm::Name(segment.to_string())
+            });
+        }
+        Ok(Self::List(terms))
+    }
+
+    /// The roots this selector names.
+    ///
+    /// `known` is every root the daemon knows; `open` is the subset with a live
+    /// handle, which is what [`Self::Default`] has always meant. Neither is read
+    /// for a path term, so an absolute path resolves with an empty map.
+    ///
+    /// Duplicates are collapsed, keeping first position: a list that names one
+    /// repo twice is one repo, not a doubled fan-out.
+    pub fn resolve(&self, known: &[PathBuf], open: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
+        let resolved = match self {
+            Self::Default => open.to_vec(),
+            Self::All => known.to_vec(),
+            Self::List(terms) => terms
+                .iter()
+                .map(|term| resolve_term(term, known))
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        Ok(resolved
+            .into_iter()
+            .filter(|root| seen.insert(root.clone()))
+            .collect())
+    }
+
+    /// What a tool that cannot fan out says about a selector naming `count`
+    /// repos. Names the tool that CAN, the way the old `root="*"` message did.
+    /// Why a tool that reads one repo refuses `*`.
+    ///
+    /// Distinct from [`Self::multi_root_rejection`]: `*` is refused for what it
+    /// means, not for how many repos happen to be known. Refusing it only when
+    /// it resolves to several would accept it on a daemon with one repo open
+    /// and answer as if the caller had named that repo.
+    pub fn wildcard_rejection() -> String {
+        "root=\"*\" is supported only by search. Pass the exact repository root for get and \
+         other tools."
+            .to_string()
+    }
+
+    pub fn multi_root_rejection(count: usize) -> String {
+        format!(
+            "This root selector names {count} repos, and only `search` fans out across \
+             repos. Pass one repo — a name or an absolute path. {GRAMMAR_HINT}"
+        )
+    }
+}
+
+/// Resolve one term. A path is itself; a name is looked up by last component.
+fn resolve_term(term: &RootTerm, known: &[PathBuf]) -> Result<PathBuf, String> {
+    let name = match term {
+        RootTerm::Path(path) => return Ok(path.clone()),
+        RootTerm::Name(name) => name,
+    };
+
+    let hits: Vec<&PathBuf> = known
+        .iter()
+        .filter(|root| root.file_name().and_then(|n| n.to_str()) == Some(name.as_str()))
+        .collect();
+
+    match hits.len() {
+        1 => Ok(hits[0].clone()),
+        // Neither arm may look like an empty result: "no such repo" and "which
+        // of these two" are facts the caller can act on, and a search that
+        // quietly returned nothing would hide both.
+        0 => Err(format!(
+            "No known repo is named \"{name}\". Known: {}. {GRAMMAR_HINT}",
+            known_names(known)
+        )),
+        _ => Err(format!(
+            "\"{name}\" names {} repos: {}. Pass one of those paths. {GRAMMAR_HINT}",
+            hits.len(),
+            hits.iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// The names a caller could have written, for an error that is actionable.
+fn known_names(known: &[PathBuf]) -> String {
+    if known.is_empty() {
+        return "no repos are registered".to_string();
+    }
+    known
+        .iter()
+        .filter_map(|root| root.file_name().and_then(|n| n.to_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// Closed set of scopes accepted by [`SearchParams`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,7 +236,6 @@ pub struct SearchParams {
     /// Search query text.
     pub query: String,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo. Use "*" for cross-repo search.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -101,7 +286,6 @@ pub struct GetParams {
     /// Document ID, path, or memory slug.
     pub id: String,
 
-    /// Exact repository root path (daemon mode). Omit for default/standalone repo. "*" is supported only by search.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -120,7 +304,6 @@ pub struct MemoryWriteParams {
     /// Entry ID (slug, e.g., "auth-oauth2-flow").
     pub id: String,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -252,7 +435,6 @@ pub struct MemoryWriteBatchParams {
     /// Memory entries to write (max 20).
     pub entries: Vec<MemoryWriteBatchEntry>,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -267,7 +449,6 @@ pub struct MemoryDeleteParams {
     /// Memory entry ID.
     pub id: String,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -282,7 +463,6 @@ pub struct MemoryConfirmParams {
     /// Memory entry ID.
     pub id: String,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -293,7 +473,6 @@ pub struct MemoryConfirmParams {
 /// Parameters for the memory_list tool.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct MemoryListParams {
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -324,7 +503,6 @@ pub struct CodeGraphParams {
     /// Symbol name to look up.
     pub name: String,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -351,7 +529,6 @@ pub struct GraphParams {
     /// Entity to query: a document path, numeric ID, or raw slug.
     pub entity: String,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 
@@ -396,7 +573,6 @@ pub struct UsageParams {
     #[serde(default = "default_session_only")]
     pub session_only: bool,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 }
@@ -411,7 +587,6 @@ pub struct SymbolsInFileParams {
     /// Relative file path from repo root.
     pub file: String,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 }
@@ -434,7 +609,6 @@ pub struct CodeFindParams {
     #[serde(default)]
     pub limit: Option<u32>,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 }
@@ -453,7 +627,6 @@ pub struct SymbolAtPositionParams {
     #[serde(default)]
     pub col: Option<u32>,
 
-    /// Repository root path (daemon mode). Omit for default/standalone repo.
     #[serde(default)]
     pub root: Option<String>,
 }

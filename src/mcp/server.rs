@@ -32,7 +32,8 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 
 use super::tools::{
     CodeGraphParams, GetParams, GraphParams, MemoryConfirmParams, MemoryDeleteParams,
-    MemoryListParams, MemoryWriteBatchParams, MemoryWriteParams, SearchParams, UsageParams,
+    MemoryListParams, MemoryWriteBatchParams, MemoryWriteParams, RootSelector, SearchParams,
+    UsageParams,
 };
 
 /// Create an MCP error from a message.
@@ -225,16 +226,15 @@ impl McpServer {
         self.registry.is_some()
     }
 
-    /// Cross-repo search: fan out to all registered repos, merge results with RRF.
+    /// Cross-repo search: fan out over the roots the selector names, merged with RRF.
     async fn cross_repo_search(&self, params: &SearchParams) -> Result<CallToolResult, McpError> {
         let registry = self
             .registry
             .as_ref()
             .ok_or_else(|| mcp_error("Cross-repo search requires global mode (--global)."))?;
 
-        let handles = registry.all_handles();
         let (output, result_count) =
-            super::dispatch::cross_repo_search_impl(&handles, params).await?;
+            super::dispatch::cross_repo_search_impl(registry, params).await?;
 
         let tokens = count_tokens(&output);
         self.metrics.record_search(tokens, result_count);
@@ -247,44 +247,34 @@ impl McpServer {
     /// Resolve the repo handle for a tool call.
     ///
     /// - Standalone mode: returns cached handle (shares Arcs with self).
-    /// - Global mode, `root` = None, 1 registered repo: auto-selects it.
-    /// - Global mode, `root` = None, N > 1 repos: error listing available roots.
-    /// - Global mode, `root` = Some(path): resolves from registry.
-    /// - `root` = "*": rejected here; only `search` handles cross-repo fan-out.
+    /// - Global mode: the `root` selector is parsed by [`RootSelector`] and must
+    ///   name exactly one repo. A selector naming several is rejected here and
+    ///   names the tool that can fan out — `search` — as `root="*"` used to.
     async fn resolve_handle(&self, root: Option<&str>) -> Result<Arc<RepoHandle>, McpError> {
         if let Some(registry) = &self.registry {
-            // Global mode: resolve from registry
-            let handle = match root {
-                None => {
-                    let handles = registry.all_handles();
-                    match handles.len() {
-                        0 => {
-                            return Err(mcp_error(
-                                "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
-                            ));
-                        }
-                        1 => handles.into_iter().next().unwrap(),
-                        _ => {
-                            let roots: Vec<_> = registry
-                                .list()
-                                .into_iter()
-                                .map(|(p, _)| p.display().to_string())
-                                .collect();
-                            return Err(mcp_error(format!(
-                                "Multiple repos registered. Specify root: {}",
-                                roots.join(", ")
-                            )));
-                        }
-                    }
-                }
-                Some("*") => {
+            let (selector, roots) = super::dispatch::resolve_root_selector(registry, root)?;
+            if selector == RootSelector::All {
+                return Err(mcp_error(RootSelector::wildcard_rejection()));
+            }
+            let handle = match roots.len() {
+                0 => {
                     return Err(mcp_error(
-                        "root=\"*\" is supported only by search. Pass the exact repository root for get and other tools.",
+                        "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
                     ));
                 }
-                Some(path) => registry
-                    .get_or_open(Path::new(path))
+                1 => registry
+                    .get_or_open(&roots[0])
                     .map_err(|e| mcp_error(format!("{e}")))?,
+                // No `root` and several repos open is a different fact from a
+                // selector that named several: the caller has not chosen yet.
+                _ if selector == RootSelector::Default => {
+                    let names: Vec<_> = roots.iter().map(|p| p.display().to_string()).collect();
+                    return Err(mcp_error(format!(
+                        "Multiple repos registered. Specify root: {}",
+                        names.join(", ")
+                    )));
+                }
+                n => return Err(mcp_error(RootSelector::multi_root_rejection(n))),
             };
             Self::ensure_handle_context(&handle).await?;
             Ok(handle)
@@ -557,8 +547,21 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        if params.root.as_deref() == Some("*") {
+        // `search` is the one tool that fans out, so it resolves the selector
+        // itself. `*` always goes to the fan-out — even over one repo, so the
+        // answer still states its coverage, and even in standalone mode, where
+        // the fan-out refuses. A standalone server holds one store and no map:
+        // answering `*` from it would report one repo as if it were every repo.
+        if RootSelector::parse(params.root.as_deref()).map_err(mcp_error)? == RootSelector::All {
             return self.cross_repo_search(&params).await;
+        }
+        // A list naming more than one repo fans out too.
+        if let Some(registry) = &self.registry {
+            let (_, roots) =
+                super::dispatch::resolve_root_selector(registry, params.root.as_deref())?;
+            if roots.len() > 1 {
+                return self.cross_repo_search(&params).await;
+            }
         }
 
         let handle = self.resolve_handle(params.root.as_deref()).await?;
@@ -1895,7 +1898,7 @@ mdkb is a **semantic** search engine (fuzzy, concept-based). It does NOT match l
 - `memory_confirm(id, outcome=\"confirmed\"|\"refuted\")` — adjust belief (+/-1, floor 0) instead of rewriting.
 - `memory_delete` — remove stale entries.
 
-`search` returns IDs → `get(id)` for full content. Use `root=\"*\"` only for cross-repo search. Then call `get` with the exact `repo` shown on the selected result; `get` does not accept `root=\"*\"`.
+`search` returns IDs → `get(id)` for full content. For a result from another repo, call `get` with the exact `repo` shown on it.
 
 ### Reminders
 
@@ -2341,15 +2344,65 @@ mod tests {
         );
     }
 
+    /// Criterion 9 (story 126-5dab). The `root` grammar is charged on every
+    /// request when it lives in a tool schema and on every session when it
+    /// lives in the instructions. It lives in `mdkb cheatsheet` instead, which
+    /// costs nothing until an operator asks for it.
+    ///
+    /// Narrow on purpose: the `root` PROPERTY must carry no description, and no
+    /// description anywhere may teach the selector syntax. "Relative file path
+    /// from repo root" describes `path`, not `root`, and stays.
+    #[test]
+    fn no_tool_schema_and_no_instruction_describes_root() {
+        let tools = McpServer::tool_router().list_all();
+        let mut documented = Vec::new();
+        let mut grammar = Vec::new();
+
+        for tool in &tools {
+            let schema = serde_json::to_value(&tool.input_schema).expect("schema serializes");
+            if schema.pointer("/properties/root/description").is_some() {
+                documented.push(tool.name.to_string());
+            }
+            if serde_json::to_string(&schema)
+                .expect("schema serializes")
+                .contains("root=")
+            {
+                grammar.push(tool.name.to_string());
+            }
+        }
+
+        assert!(
+            documented.is_empty(),
+            "these tools describe `root` in their schema, which is charged on every \
+             request: {documented:?}. The grammar belongs in `mdkb cheatsheet`."
+        );
+        assert!(
+            grammar.is_empty(),
+            "these tool schemas teach the root selector syntax: {grammar:?}"
+        );
+
+        let instructions = build_server_instructions(&[]);
+        assert!(
+            !instructions.contains("root="),
+            "the server instructions teach the root selector syntax; \
+             it belongs in `mdkb cheatsheet`:\n{instructions}"
+        );
+    }
+
     /// `tools/list` is re-sent on every API request of a session — 283 requests
     /// against 22 user messages in one measured session — so it is charged far
     /// more often than the instructions that `test_base_instructions_token_budget`
     /// guards, and it is the larger half of the always-on payload. The ceiling
     /// sits just above the measured size: it catches growth, it does not demand
-    /// a cut. Measured 2026-09-20: 3880 tokens over 12 tools.
+    /// a cut.
+    ///
+    /// Measured 2026-09-20: 3880 tokens over 12 tools, then 3680 once story
+    /// 126-5dab moved the `root` grammar out of 13 field descriptions and into
+    /// `mdkb cheatsheet`. A richer grammar must not cost more on every request,
+    /// so the ceiling came DOWN with the payload.
     #[test]
     fn tools_list_payload_token_budget() {
-        const BUDGET: usize = 3900;
+        const BUDGET: usize = 3700;
 
         let tools = McpServer::tool_router().list_all();
         let payload = serde_json::to_string(&tools).expect("tools serialize");

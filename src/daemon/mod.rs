@@ -7,6 +7,7 @@ pub mod hook_runtime;
 #[cfg(unix)]
 pub mod ipc_server;
 pub mod registry;
+pub mod repo_map;
 #[cfg(unix)]
 pub mod singleton;
 #[cfg(unix)]
