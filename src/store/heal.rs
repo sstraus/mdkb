@@ -574,11 +574,36 @@ fn report_path(corrupt_path: &Path) -> PathBuf {
     with_suffix(corrupt_path, ".report.json")
 }
 
-/// Parse the trailing `.corrupt-<unix_secs>` suffix into its timestamp.
+/// True only for the exact suffix shapes mdkb generates for a quarantined
+/// copy: `.corrupt-<unix_secs>`, optionally followed by `-<collision>` (from
+/// [`available_quarantine_path`]) and/or `-wal`/`-shm` (from the sidecar
+/// rename in [`quarantine`]) — every one of those components is digits only.
+/// A bare `contains(".corrupt-")` matches anything with that substring
+/// anywhere under `.mdkb`, which is too wide a blast radius for the
+/// irreversible `remove_file` the sweep gates on it. Returns the timestamp
+/// digits on a match.
+fn quarantine_suffix(name: &str) -> Option<&str> {
+    let (_, suffix) = name.rsplit_once(".corrupt-")?;
+    let suffix = suffix
+        .strip_suffix("-wal")
+        .or_else(|| suffix.strip_suffix("-shm"))
+        .unwrap_or(suffix);
+    let ts_part = match suffix.split_once('-') {
+        Some((ts, collision)) => {
+            if collision.is_empty() || !collision.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            ts
+        }
+        None => suffix,
+    };
+    (!ts_part.is_empty() && ts_part.bytes().all(|b| b.is_ascii_digit())).then_some(ts_part)
+}
+
+/// Parse the trailing `.corrupt-<unix_secs>` suffix into its timestamp. `None`
+/// for anything that is not a name mdkb generates — see [`quarantine_suffix`].
 fn quarantine_ts(name: &str) -> Option<i64> {
-    name.rsplit_once(".corrupt-")
-        .and_then(|(_, suffix)| suffix.split('-').next())
-        .and_then(|ts| ts.parse::<i64>().ok())
+    quarantine_suffix(name).and_then(|ts| ts.parse::<i64>().ok())
 }
 
 /// Write the quarantine report sidecar. Best-effort — a failed write only costs
@@ -630,7 +655,7 @@ pub fn quarantine_reports(mdkb_dir: &Path) -> Vec<QuarantineReport> {
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         // The corrupt DB itself, not the sidecar or WAL/SHM siblings.
-        if !name.contains(".corrupt-")
+        if quarantine_suffix(&name).is_none()
             || name.ends_with(".report.json")
             || name.ends_with("-wal")
             || name.ends_with("-shm")
@@ -679,7 +704,7 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
         let name = entry.file_name().to_string_lossy().into_owned();
         // Everything the quarantine renamed — the DB and its `-wal`/`-shm` —
         // but never the report that outlives them.
-        if !name.contains(".corrupt-") || name.ends_with(".report.json") {
+        if quarantine_suffix(&name).is_none() || name.ends_with(".report.json") {
             continue;
         }
         let Some(quarantined_at) = quarantine_ts(&name) else {
@@ -692,9 +717,11 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
         }
         // Best-effort. Windows refuses to unlink a file another process still
         // holds open, and a sweep must never fail the open that triggered it —
-        // the copy just survives to the next one.
+        // the copy just survives to the next one. The banner promises removal
+        // "N days after quarantine", so a failure to keep that promise must be
+        // visible at an operator-facing level, not buried at debug.
         if let Err(e) = std::fs::remove_file(entry.path()) {
-            tracing::debug!("quarantine sweep left {name} in place: {e}");
+            tracing::warn!("quarantine sweep left {name} in place: {e}");
         }
     }
 }
@@ -1341,5 +1368,63 @@ mod tests {
         assert_eq!(reports.len(), 1);
         assert_eq!(reports[0].quarantined_at, 42);
         assert_eq!(reports[0].memory_entries_salvaged, 0);
+    }
+
+    #[test]
+    fn a_copy_exactly_at_the_retention_boundary_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let (corrupt, now) = quarantine_aged(dir.path(), QUARANTINE_RETENTION.as_secs() as i64);
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+
+        assert!(
+            corrupt.exists(),
+            "exactly at the boundary is not yet expired"
+        );
+        assert_eq!(quarantine_reports(dir.path()).len(), 1);
+    }
+
+    #[test]
+    fn sweep_never_deletes_a_file_that_merely_contains_the_corrupt_substring() {
+        // Real quarantine names are `.corrupt-<unix_secs>`, optionally followed
+        // by `-<collision>` and/or `-wal`/`-shm` — all digits. A name with a
+        // leading digit token after `.corrupt-` but a non-digit remainder is
+        // not a shape mdkb ever generates. The old bare `contains(".corrupt-")`
+        // gate plus `quarantine_ts` taking only the first dash token read this
+        // as timestamp 0 — maximally expired — and deleted it on first sweep.
+        let dir = tempfile::tempdir().unwrap();
+        let stray = dir.path().join("notes.corrupt-0-explains-the-outage.md");
+        std::fs::write(&stray, b"not a quarantine copy").unwrap();
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, 1_800_000_000);
+
+        assert!(
+            stray.exists(),
+            "a file matching only by substring must survive the sweep"
+        );
+    }
+
+    #[test]
+    fn a_malformed_timestamp_is_neither_reported_nor_swept() {
+        // The sweep and the banner must agree on what an unparseable suffix
+        // means: previously quarantine_reports defaulted it to timestamp 0
+        // (always shown) while the sweep skipped it (never deleted) — a
+        // banner the sweep could never clear.
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = dir
+            .path()
+            .join("index.sqlite.corrupt-0-explains-the-outage.md");
+        std::fs::write(&malformed, b"x").unwrap();
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, 1_800_000_000);
+        assert!(
+            malformed.exists(),
+            "sweep must not delete on an unparseable suffix"
+        );
+
+        assert!(
+            quarantine_reports(dir.path()).is_empty(),
+            "not a name mdkb generates, so not reported either — sweep and banner agree"
+        );
     }
 }
