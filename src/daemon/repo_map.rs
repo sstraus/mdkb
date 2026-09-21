@@ -205,6 +205,7 @@ impl std::fmt::Debug for RepoMap {
         f.debug_struct("RepoMap")
             .field("path", &self.path)
             .field("known", &self.roots.lock().map(|r| r.len()).unwrap_or(0))
+            .field("replaceable", &self.replaceable)
             .finish()
     }
 }
