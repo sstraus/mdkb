@@ -96,6 +96,12 @@ pub const DEFAULT_EMBED_NICE: i32 = 15;
 ///
 /// Returns the new priority when it changed something. `nice <= 0` is a no-op
 /// so a caller can honour a config of 0 without branching.
+///
+/// Unix only. Windows has no `getpriority`/`PRIO_PROCESS`; lowering a process
+/// there means `SetPriorityClass`, a `windows-sys` dependency this crate does
+/// not carry for one batch-job nicety. The Windows build returns `None`, which
+/// the contract above already means: nothing changed.
+#[cfg(unix)]
 pub fn lower_process_priority(nice: i32) -> Option<i32> {
     if nice <= 0 {
         return None;
@@ -104,9 +110,9 @@ pub fn lower_process_priority(nice: i32) -> Option<i32> {
     // is why `getpriority` needs it: -1 is a legal priority AND the error
     // return, so errno must be cleared first to tell the two apart.
     unsafe {
-        *libc::__error() = 0;
+        *errno_slot() = 0;
         let current = libc::getpriority(libc::PRIO_PROCESS, 0);
-        if current == -1 && *libc::__error() != 0 {
+        if current == -1 && *errno_slot() != 0 {
             tracing::debug!("embedding: could not read process priority; leaving it alone");
             return None;
         }
@@ -117,6 +123,53 @@ pub fn lower_process_priority(nice: i32) -> Option<i32> {
         }
         Some(target)
     }
+}
+
+#[cfg(not(unix))]
+pub fn lower_process_priority(_nice: i32) -> Option<i32> {
+    None
+}
+
+/// The address of `errno`, which every libc spells differently.
+///
+/// Apple and the BSDs export `__error`, glibc and musl `__errno_location`,
+/// Android and the NetBSD family `__errno`. Calling the Darwin name
+/// unconditionally is what broke the Linux and Windows builds; keep the
+/// spelling in exactly one place, and refuse to compile on a unix this has
+/// never been checked against rather than guess at its libc.
+///
+/// # Safety
+/// The returned pointer is valid for the calling thread only.
+#[cfg(unix)]
+unsafe fn errno_slot() -> *mut libc::c_int {
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly"
+    ))]
+    unsafe {
+        libc::__error()
+    }
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::__errno_location()
+    }
+    #[cfg(any(target_os = "android", target_os = "netbsd", target_os = "openbsd"))]
+    unsafe {
+        libc::__errno()
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "linux",
+        target_os = "android",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    compile_error!("errno_slot: unhandled unix target; name this libc's errno symbol");
 }
 
 impl EmbeddingService {
@@ -320,16 +373,19 @@ mod tests {
     /// can put back. Serialised, and each one only ever moves it further down
     /// by a small amount, so the test binary ends a little nicer than it
     /// started and nothing else is affected.
+    #[cfg(unix)]
     static PRIORITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(unix)]
     fn current_nice() -> i32 {
         unsafe {
-            *libc::__error() = 0;
+            *errno_slot() = 0;
             libc::getpriority(libc::PRIO_PROCESS, 0)
         }
     }
 
     #[test]
+    #[cfg(unix)]
     fn lowering_moves_the_process_down_by_the_requested_amount() {
         let _serial = PRIORITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = current_nice();
@@ -339,6 +395,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn lowering_is_one_way_and_the_api_does_not_pretend_otherwise() {
         // The measurement that killed the first design: an unprivileged
         // process cannot raise its own priority back. A scoped guard would
@@ -352,6 +409,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn zero_is_a_no_op() {
         let _serial = PRIORITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = current_nice();
