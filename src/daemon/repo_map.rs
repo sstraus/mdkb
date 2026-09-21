@@ -134,7 +134,7 @@ pub fn discover_nested_stores(roots: &[PathBuf]) -> BTreeSet<PathBuf> {
 /// Read the persisted roots without triage, normalization, or a write-back.
 /// Reporting commands use this path so inspecting coverage cannot change it.
 pub fn read_known_roots(path: &Path) -> Vec<PathBuf> {
-    read_file(path).into_iter().collect()
+    read_file(path).roots.into_iter().collect()
 }
 
 /// The outcome of one pass over the known roots.
@@ -161,7 +161,10 @@ struct Triage {
 /// wrote is the one that belongs in that log line.
 fn canonical_key(root: &Path) -> PathBuf {
     let resolved = crate::git::resolve_main_worktree(root);
-    resolved.canonicalize().unwrap_or(resolved)
+    // `canonicalize` returns `\\?\C:\...` on Windows, which names the same file
+    // and compares equal to nothing. Every key written that way would be a
+    // second entry for a repo already on the map.
+    crate::domain::canonicalize_plain(&resolved).unwrap_or(resolved)
 }
 
 /// Split known roots into the ones the map keeps and the ones it drops.
@@ -189,6 +192,12 @@ pub struct RepoMap {
     /// Held across the file write so two recorders cannot interleave a set with
     /// a rename and persist a map that never existed in memory.
     roots: Mutex<BTreeSet<PathBuf>>,
+    /// May this process overwrite what is on disk?
+    ///
+    /// False when the file exists and could not be understood. Re-discovery is
+    /// cheap; a map replaced by an empty one because this binary could not
+    /// parse it is a set of repos nobody can get back.
+    replaceable: bool,
 }
 
 impl std::fmt::Debug for RepoMap {
@@ -207,10 +216,14 @@ impl RepoMap {
     /// A seed that no longer exists is dropped from the map but stays in
     /// `daemon.toml`, which this never rewrites: the operator's list is theirs.
     pub fn open(path: Option<PathBuf>, seeds: &[RepoEntry]) -> Self {
-        let loaded = match &path {
+        let read = match &path {
             Some(p) => read_file(p),
-            None => BTreeSet::new(),
+            None => MapRead {
+                roots: BTreeSet::new(),
+                replaceable: true,
+            },
         };
+        let loaded = read.roots;
         let before = loaded.len();
 
         let mut union: BTreeSet<PathBuf> = loaded.iter().map(|r| canonical_key(r)).collect();
@@ -241,6 +254,7 @@ impl RepoMap {
         let map = Self {
             path,
             roots: Mutex::new(triaged.kept),
+            replaceable: read.replaceable,
         };
         // Persist only when the set on disk is not the set in hand: every CLI
         // hook builds a registry, and rewriting an unchanged map on each one
@@ -290,6 +304,13 @@ impl RepoMap {
         let Some(path) = &self.path else {
             return;
         };
+        if !self.replaceable {
+            tracing::warn!(
+                path = %path.display(),
+                "Not overwriting a repo map this binary could not read; the set is correct in memory only"
+            );
+            return;
+        }
         if let Err(e) = write_atomic(path, roots) {
             tracing::warn!(
                 path = %path.display(),
@@ -299,38 +320,105 @@ impl RepoMap {
     }
 }
 
+/// What a read of the persisted map produced.
+///
+/// The distinction that matters is not "empty or not" but "may this be
+/// overwritten". A map that is absent may: there is nothing to lose. A map
+/// that exists and could not be understood may not — the next `persist` would
+/// replace a recoverable file with whatever this process happens to know,
+/// which for a daemon that just started is nothing at all.
+struct MapRead {
+    roots: BTreeSet<PathBuf>,
+    /// False when the file exists but could not be read, parsed, or is newer
+    /// than this binary understands.
+    replaceable: bool,
+}
+
 /// Read the persisted set. Any failure yields an empty set and a warning: a
 /// map that cannot be parsed must not take the daemon down with it.
-fn read_file(path: &Path) -> BTreeSet<PathBuf> {
+fn read_file(path: &Path) -> MapRead {
+    let empty = |replaceable| MapRead {
+        roots: BTreeSet::new(),
+        replaceable,
+    };
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BTreeSet::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return empty(true),
         Err(e) => {
-            tracing::warn!(path = %path.display(), "Could not read the repo map: {e}");
-            return BTreeSet::new();
+            tracing::warn!(
+                path = %path.display(),
+                "Could not read the repo map: {e} — keeping the file, not replacing it"
+            );
+            return empty(false);
         }
     };
     match serde_json::from_str::<RepoMapFile>(&content) {
         Ok(file) => {
+            if file.version > FORMAT_VERSION {
+                // Writing our own FORMAT_VERSION over this would silently
+                // downgrade a map a newer binary owns, dropping whatever that
+                // format carries which this one cannot represent.
+                tracing::warn!(
+                    path = %path.display(),
+                    found = file.version,
+                    known = FORMAT_VERSION,
+                    "Repo map was written by a newer mdkb; reading it, and leaving it alone"
+                );
+                return MapRead {
+                    roots: file
+                        .repos
+                        .into_iter()
+                        .map(|r| PathBuf::from(r.root))
+                        .collect(),
+                    replaceable: false,
+                };
+            }
             if file.version != FORMAT_VERSION {
                 tracing::warn!(
                     path = %path.display(),
                     found = file.version,
                     known = FORMAT_VERSION,
-                    "Repo map written by a different format version; reading it anyway"
+                    "Repo map written by an older format version; reading it anyway"
                 );
             }
-            file.repos
-                .into_iter()
-                .map(|r| PathBuf::from(r.root))
-                .collect()
+            MapRead {
+                roots: file
+                    .repos
+                    .into_iter()
+                    .map(|r| PathBuf::from(r.root))
+                    .collect(),
+                replaceable: true,
+            }
         }
         Err(e) => {
-            tracing::warn!(
-                path = %path.display(),
-                "Repo map is not valid JSON ({e}); starting from an empty map"
-            );
-            BTreeSet::new()
+            // Quarantine rather than overwrite, and rather than refuse to
+            // write. Overwriting loses the only copy of a set somebody may
+            // need; refusing leaves the map broken for every later process,
+            // which is what the daemon has a map for in the first place.
+            // Moving it aside does neither: the bytes survive under a name
+            // nothing reads, and the next record rebuilds a good file.
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let aside = path.with_extension(format!("json.corrupt-{stamp}"));
+            match std::fs::rename(path, &aside) {
+                Ok(()) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        quarantined = %aside.display(),
+                        "Repo map is not valid JSON ({e}); moved aside, rebuilding from discovery"
+                    );
+                    empty(true)
+                }
+                Err(move_err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "Repo map is not valid JSON ({e}) and could not be moved aside ({move_err}); leaving it untouched"
+                    );
+                    empty(false)
+                }
+            }
         }
     }
 }
@@ -356,14 +444,33 @@ fn write_atomic(path: &Path, roots: &BTreeSet<PathBuf>) -> std::io::Result<()> {
     };
     let json = serde_json::to_string_pretty(&file).map_err(std::io::Error::other)?;
 
-    let tmp = path.with_extension("json.tmp");
-    {
+    // The temp name carries the pid. A single shared `repos.json.tmp` is not a
+    // private scratch file: two processes writing at once both create and
+    // truncate it, interleave their bytes, and one of them renames the result
+    // over the map. The rename is atomic; picking the name was not.
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let write = (|| -> std::io::Result<()> {
         let mut handle = std::fs::File::create(&tmp)?;
         handle.write_all(json.as_bytes())?;
         handle.write_all(b"\n")?;
         handle.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if write.is_err() {
+        // A failed write must not leave its scratch file behind for every
+        // later process to wonder about.
+        let _ = std::fs::remove_file(&tmp);
+        return write;
     }
-    std::fs::rename(&tmp, path)
+    // The rename itself is only durable once the directory entry is. Best
+    // effort: a filesystem that refuses the fsync has still published a
+    // complete file.
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -613,6 +720,70 @@ mod tests {
         let root = make_repo(tmp.path(), "alpha");
         map.record(&root);
         assert_eq!(RepoMap::open(Some(path), &[]).roots(), vec![root]);
+    }
+
+    /// The corrupt bytes survive the repair.
+    ///
+    /// Repairing by overwriting would destroy the only copy of a set somebody
+    /// may still need to read — the roots are in there, however malformed the
+    /// JSON around them is.
+    #[test]
+    fn a_corrupt_map_is_moved_aside_rather_than_overwritten() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("repos.json");
+        std::fs::write(&path, "{ this is not json").unwrap();
+
+        let map = RepoMap::open(Some(path.clone()), &[]);
+        map.record(&make_repo(tmp.path(), "alpha"));
+
+        let quarantined: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("repos.json.corrupt-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one copy, named for when it was set aside"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(&quarantined[0])).unwrap(),
+            "{ this is not json",
+            "and it holds what could not be parsed, byte for byte"
+        );
+    }
+
+    /// A map a newer mdkb owns is read and never written back.
+    ///
+    /// Writing this binary's FORMAT_VERSION over it would silently drop
+    /// whatever the newer format carries that this one cannot represent, and
+    /// the newer binary would find its own map downgraded underneath it.
+    #[test]
+    fn a_map_from_a_newer_format_is_read_but_not_rewritten() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("repos.json");
+        let existing = make_repo(tmp.path(), "alpha");
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version": {}, "repos": [{{"root": "{}"}}]}}"#,
+                FORMAT_VERSION + 1,
+                existing.display()
+            ),
+        )
+        .unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let map = RepoMap::open(Some(path.clone()), &[]);
+        assert_eq!(map.roots(), vec![existing], "the newer map is still read");
+
+        map.record(&make_repo(tmp.path(), "beta"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "and nothing this binary does rewrites it"
+        );
     }
 
     /// Recording is idempotent: the second record of a root neither duplicates
