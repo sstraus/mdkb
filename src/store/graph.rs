@@ -254,8 +254,68 @@ pub fn ref_forms(reference: &str) -> Vec<String> {
     forms
 }
 
+/// The document that DECLARED this reference as one of its identities.
+///
+/// `MIN(doc_id)`, not `LIMIT 1`: two documents may claim one name, and an
+/// unordered pick would let the same query answer differently after a VACUUM.
+/// The collision itself is reported by [`alias_collisions`] — resolving it
+/// silently is a wrong answer served confidently, so both exist.
+fn resolve_by_alias(conn: &Connection, reference: &str) -> Option<i64> {
+    conn.query_row(
+        "SELECT MIN(doc_id) FROM document_aliases WHERE alias = ?1",
+        params![reference],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .ok()
+    .flatten()
+}
+
+/// One name claimed by more than one document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AliasCollision {
+    pub alias: String,
+    /// Every claimant, ascending. The first is the one resolution picks.
+    pub doc_ids: Vec<i64>,
+}
+
+/// Every contested identity in the store.
+///
+/// A repository defect, not an index failure: the documents are all indexed and
+/// resolution stays deterministic, but exactly one of the claimants is
+/// reachable by that name and the author has to be told which.
+pub fn alias_collisions(conn: &Connection) -> Result<Vec<AliasCollision>> {
+    let mut stmt = conn.prepare(
+        "SELECT alias, doc_id FROM document_aliases
+         WHERE alias IN (
+             SELECT alias FROM document_aliases
+             GROUP BY alias HAVING COUNT(DISTINCT doc_id) > 1
+         )
+         ORDER BY alias, doc_id",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+
+    let mut out: Vec<AliasCollision> = Vec::new();
+    for row in rows {
+        let (alias, doc_id) = row?;
+        match out.last_mut() {
+            Some(last) if last.alias == alias => last.doc_ids.push(doc_id),
+            _ => out.push(AliasCollision {
+                alias,
+                doc_ids: vec![doc_id],
+            }),
+        }
+    }
+    Ok(out)
+}
+
 /// Resolve a reference to a document id by matching `relative_path` against any
-/// of its equivalent forms. Returns `None` for dangling references.
+/// of its equivalent forms, then — only if every form missed — against the
+/// identities documents declare for themselves. Returns `None` for dangling
+/// references.
+///
+/// The order is the whole design. A reference that names a real file must keep
+/// naming it even when some other document claims that string as an alias, so
+/// identity resolution never runs while a path form can still hit.
 pub fn resolve_ref_to_doc(conn: &Connection, reference: &str) -> Result<Option<i64>> {
     for form in ref_forms(reference) {
         let id: Option<i64> = conn
@@ -269,7 +329,7 @@ pub fn resolve_ref_to_doc(conn: &Connection, reference: &str) -> Result<Option<i
             return Ok(id);
         }
     }
-    Ok(None)
+    Ok(resolve_by_alias(conn, reference))
 }
 
 /// Prefixes a collection-qualified reference may carry: the basename of each
@@ -325,6 +385,9 @@ pub fn resolvable_forms(conn: &Connection, reference: &str) -> Vec<String> {
 /// Resolve an entity reference to a document id, tolerating collection-prefixed
 /// paths (`map/people/x.md` == `people/x.md`). For hot traversal paths use
 /// [`resolve_ref_to_doc`] instead (it skips the collection lookup).
+///
+/// Falls back to a declared identity last, for the same reason and in the same
+/// order as [`resolve_ref_to_doc`].
 pub fn resolve_entity_ref(conn: &Connection, reference: &str) -> Result<Option<i64>> {
     for form in resolvable_forms(conn, reference) {
         let id: Option<i64> = conn
@@ -338,7 +401,7 @@ pub fn resolve_entity_ref(conn: &Connection, reference: &str) -> Result<Option<i
             return Ok(id);
         }
     }
-    Ok(None)
+    Ok(resolve_by_alias(conn, reference))
 }
 
 fn doc_relative_path(conn: &Connection, doc_id: i64) -> Option<String> {
@@ -674,6 +737,113 @@ mod tests {
         )
         .unwrap();
         conn.last_insert_rowid()
+    }
+
+    /// A document that declares `alias` as one of its identities.
+    fn declare(conn: &Connection, path: &str, alias: &str) -> i64 {
+        let doc = insert_doc(conn, path);
+        add_alias(conn, doc, alias, "id").unwrap();
+        doc
+    }
+
+    #[test]
+    fn a_path_still_wins_over_another_document_s_alias() {
+        // The regression that matters: identity resolution is a fallback, not a
+        // competitor. If it ever runs first, every reference that happens to
+        // look like someone's alias stops pointing at the file it names.
+        let conn = setup_db();
+        let by_path = insert_doc(&conn, "alice.md");
+        let claimant = insert_doc(&conn, "people/a.md");
+        add_alias(&conn, claimant, "alice.md", "aliases").unwrap();
+
+        assert_eq!(resolve_ref_to_doc(&conn, "alice.md").unwrap(), Some(by_path));
+        assert_eq!(
+            resolve_entity_ref(&conn, "alice.md").unwrap(),
+            Some(by_path)
+        );
+    }
+
+    #[test]
+    fn a_declared_identity_resolves_when_no_path_matches() {
+        let conn = setup_db();
+        let doc = declare(&conn, "people/alice.md", "person:alice");
+
+        assert_eq!(
+            resolve_ref_to_doc(&conn, "person:alice").unwrap(),
+            Some(doc),
+            "the document that declared the name answers to it"
+        );
+        assert_eq!(
+            resolve_entity_ref(&conn, "person:alice").unwrap(),
+            Some(doc)
+        );
+        assert_eq!(
+            resolve_to_path(&conn, "person:alice").unwrap().as_deref(),
+            Some("people/alice.md"),
+            "resolution returns a doc id; the path comes from the document"
+        );
+    }
+
+    #[test]
+    fn a_name_nobody_declares_still_dangles() {
+        let conn = setup_db();
+        insert_doc(&conn, "people/alice.md");
+
+        assert_eq!(resolve_ref_to_doc(&conn, "person:nobody").unwrap(), None);
+        assert_eq!(resolve_entity_ref(&conn, "person:nobody").unwrap(), None);
+    }
+
+    #[test]
+    fn a_contested_identity_resolves_to_the_lower_doc_id() {
+        // Deterministic, not arbitrary: a `LIMIT 1` without an ORDER BY would
+        // let the same query answer differently after a VACUUM.
+        let conn = setup_db();
+        let first = declare(&conn, "people/a.md", "person:alice");
+        let second = declare(&conn, "people/b.md", "person:alice");
+        assert!(first < second);
+
+        assert_eq!(
+            resolve_ref_to_doc(&conn, "person:alice").unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            resolve_entity_ref(&conn, "person:alice").unwrap(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn a_contested_identity_is_retrievable_for_reporting() {
+        // Resolving it silently would serve a wrong answer confidently. The
+        // collision has to be something a report can name.
+        let conn = setup_db();
+        let a = declare(&conn, "people/a.md", "person:alice");
+        let b = declare(&conn, "people/b.md", "person:alice");
+        declare(&conn, "people/c.md", "person:bob");
+
+        let collisions = alias_collisions(&conn).unwrap();
+        assert_eq!(
+            collisions.len(),
+            1,
+            "only the contested name is reported, not every alias"
+        );
+        assert_eq!(collisions[0].alias, "person:alice");
+        assert_eq!(collisions[0].doc_ids, vec![a, b]);
+    }
+
+    #[test]
+    fn one_document_claiming_a_name_twice_is_not_a_collision() {
+        // `id:` and `aliases:` may repeat the same string. That is one claim.
+        let conn = setup_db();
+        let doc = insert_doc(&conn, "people/a.md");
+        add_alias(&conn, doc, "person:alice", "id").unwrap();
+        add_alias(&conn, doc, "person:alice", "aliases").unwrap();
+
+        assert!(alias_collisions(&conn).unwrap().is_empty());
+        assert_eq!(
+            resolve_ref_to_doc(&conn, "person:alice").unwrap(),
+            Some(doc)
+        );
     }
 
     #[test]
