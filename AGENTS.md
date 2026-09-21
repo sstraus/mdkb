@@ -107,12 +107,26 @@ against the new output before closing the work.
 
 ## Testing
 
-Before any commit, run `cargo test` to verify the full suite (unit + integration + smoke). Never assume a failure is pre-existing — builds are green on main.
+**Run the targets your change touches, not the suite.** A commit is verified by
+the module and integration targets that cover what it edited — `cargo test --lib
+store::schema`, `cargo test --test graph_identity`. The full `cargo test` runs
+**once per batch of work**, not once per commit: it is ~7 minutes, and running it
+after every commit buys nothing the targeted run did not already prove.
+
+This paragraph used to say the opposite ("before any commit, run `cargo test`").
+It contradicted the global rule in `~/.claude/CLAUDE.md`, and on 2026-09-21 a
+session followed it and burned three full suite runs inside one batch.
+
+Never assume a failure is pre-existing — builds are green on main.
 
 Key test targets:
-- `cargo test` — full suite (2343 test functions, 41 `#[ignore]`d — those need the ONNX model)
+- `cargo test` — full suite (2343 test functions, 41 `#[ignore]`d — those need the ONNX model). Once per batch.
 - `cargo test --test cli_smoke` — CLI smoke test exercising every subcommand (72 tests)
 - `cargo test --test e2e_hooks` — hook lifecycle end-to-end
 - `cargo test --test e2e_hook_client` — daemon hook socket round-trip
+
+A change to `src/store/schema.rs` is the one case that earns a wider run than
+its own module: `SCHEMA_VERSION` is read by `core::mod`, `readonly_context` and
+every migration test. Run those three by name, still not the suite.
 
 @.claude/wiz-claude.md
