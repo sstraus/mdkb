@@ -261,10 +261,24 @@ pub fn handle_update_force(
         // has not moved. Same transaction, so a failed update leaves neither
         // the documents nor the graph half-written.
         if config.graph.enabled {
+            // Identities first: `detect_relation_keys` and every reference
+            // resolution below score against what documents declare, so a key
+            // added to `identity_keys` has to be on the table before either
+            // reads it.
+            extract_identities_pass(&ctx.conn, &config.graph)?;
             // Detected AFTER indexing, so the identities written this run are
             // available to resolve against.
             let relations = detect_persist_and_resolve_relations(&ctx.conn, &config.graph);
             extract_edges_pass(&ctx.conn, &relations, None)?;
+            // The store has been able to find these since v29 and nothing
+            // asked. Resolution stays deterministic, so this is a repository
+            // defect rather than an index failure — and the author is the only
+            // one who can say which claimant was meant.
+            result.contested_identities = crate::store::graph::alias_collisions(&ctx.conn)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| format!("{}: {} documents claim it", c.alias, c.doc_ids.len()))
+                .collect();
         }
         // Reclaim content rows stranded by prior updates/removes (and the
         // pre-fix backlog). No-op once the table is clean.
@@ -1360,6 +1374,59 @@ pub(crate) fn extract_edges_pass(
             .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
             .filter(|v| !v.is_null());
         replace_frontmatter_edges(conn, doc_id, frontmatter.as_ref(), relations);
+    }
+    Ok(())
+}
+
+/// Rewrite every current document's declared identities from the CURRENT
+/// `identity_keys`.
+///
+/// The same reason `extract_edges_pass` exists, for the other config-owned
+/// allowlist. `identity_keys` lives in config and can change with no file
+/// changing, and `update` skips a file whose mtime has not moved — so
+/// `process_identities`, which only runs inside `index_single_file`, could
+/// never see the change. Adding `uid` to `identity_keys` and running
+/// `mdkb update` on an already-indexed store wrote no `uid` row at all: every
+/// `uid:` reference stayed dangling, and under `relations = "auto"` the
+/// detector scored the key at zero and declined to extract it — a setting that
+/// silently did nothing until somebody happened to edit every file.
+///
+/// Reads `metadata` rather than re-parsing the file, exactly as the edge pass
+/// does: the frontmatter is already in the index, and a pass that re-read the
+/// tree would cost a full walk to answer a question the store can answer.
+pub(crate) fn extract_identities_pass(
+    conn: &Connection,
+    cfg: &crate::config::GraphConfig,
+) -> crate::error::Result<()> {
+    use crate::store::graph;
+
+    let mut stmt = conn.prepare(
+        "SELECT id, metadata FROM documents WHERE (status = 'current' OR status IS NULL)",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (doc_id, metadata) = row?;
+        let frontmatter = metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .filter(|v| !v.is_null());
+        // Clearing first is what makes a REMOVED key take effect: an identity
+        // the author stopped declaring must stop resolving.
+        if let Err(e) = graph::delete_aliases_for_doc(conn, doc_id) {
+            tracing::warn!("Graph: failed to clear identities for doc {doc_id}: {e}");
+            continue;
+        }
+        for key in &cfg.identity_keys {
+            for alias in
+                crate::domain::frontmatter::extract_relation_refs(frontmatter.as_ref(), key)
+            {
+                if let Err(e) = graph::add_alias(conn, doc_id, &alias, key) {
+                    tracing::warn!("Graph: failed to record identity '{alias}' ({key}): {e}");
+                }
+            }
+        }
     }
     Ok(())
 }

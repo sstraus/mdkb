@@ -832,6 +832,77 @@ fn a_revert_through_the_supported_command_is_not_undone_by_the_next_update() {
     );
 }
 
+/// Adding a key to `identity_keys` reaches a store where no file changed.
+///
+/// `process_identities` runs only inside `index_single_file`, which returns
+/// early when the mtime has not moved — so the setting did nothing at all
+/// until somebody happened to edit every file. The same class
+/// `extract_edges_pass` exists to close for `frontmatter_relations`.
+#[test]
+fn an_identity_keys_change_reaches_documents_nothing_touched() {
+    let env = Env::new();
+    env.write("who.md", "---\nid: doc:who\nuid: legacy-7\n---\n\n# Who\n");
+    handle_update(&env.ctx, &env.root).expect("first update");
+
+    let before: i64 = env
+        .ctx
+        .conn
+        .query_row(
+            "SELECT count(*) FROM document_aliases WHERE alias = 'legacy-7'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, 0, "`uid` is not an identity key yet");
+
+    // The only thing that changes is the config. No file is touched.
+    std::fs::write(
+        env.root.join(".mdkb/config.toml"),
+        "[graph]\nidentity_keys = [\"id\", \"aliases\", \"uid\"]\n",
+    )
+    .expect("write config");
+
+    handle_update(&env.ctx, &env.root).expect("second update");
+
+    let after: i64 = env
+        .ctx
+        .conn
+        .query_row(
+            "SELECT count(*) FROM document_aliases WHERE alias = 'legacy-7'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after, 1,
+        "the new key reached a document nothing else touched"
+    );
+}
+
+/// Two documents claiming one identity is reported, not resolved in silence.
+///
+/// `alias_collisions` has existed since v29 and had no production caller, so
+/// the store could find these and told nobody. Resolution stays deterministic
+/// — the lowest doc id wins — which is exactly why it needs saying: every
+/// reference means one document and the other is unreachable by that name.
+#[test]
+fn an_identity_two_documents_claim_is_reported_by_update() {
+    let env = Env::new();
+    env.write("people/alice.md", "---\nid: person:alice\n---\n\n# Alice\n");
+    env.write(
+        "people/alice-2.md",
+        "---\nid: person:alice\n---\n\n# Alice again\n",
+    );
+
+    let result = handle_update(&env.ctx, &env.root).expect("update");
+
+    assert_eq!(
+        result.contested_identities,
+        vec!["person:alice: 2 documents claim it".to_string()],
+        "the copy-paste is a repository defect, and only the author can fix it"
+    );
+}
+
 /// Running twice reports the upgrade once. A notice on every update is noise.
 #[test]
 fn the_upgrade_is_reported_once_not_every_run() {

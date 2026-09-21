@@ -2600,6 +2600,17 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
                 }
                 println!("  Revert one with: mdkb collection update <name> --pattern '<old>'");
             }
+            if !result.contested_identities.is_empty() {
+                println!("Identities more than one document claims:");
+                for collision in &result.contested_identities {
+                    println!("  - {collision}");
+                }
+                println!(
+                    "  Every reference to one of these resolves to a single document and the \
+                     others are unreachable by that name. Find them with: mdkb graph backlinks \
+                     <identity>"
+                );
+            }
             if !result.errors.is_empty() {
                 println!("Errors:    {}", result.errors.len());
                 for err in &result.errors {

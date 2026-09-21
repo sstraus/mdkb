@@ -308,6 +308,15 @@ pub struct UpdateResult {
     /// see it happened and revert it.
     #[serde(default)]
     pub pattern_upgrades: Vec<String>,
+    /// Identities more than one document claims, as `alias: n documents`.
+    ///
+    /// A repository defect, not an index failure. Resolution stays
+    /// deterministic — the lowest doc id wins — but exactly one of the
+    /// claimants is reachable by that name and every reference to it silently
+    /// means that one. `alias_collisions` has existed since v29 to find these
+    /// and nothing called it, so the store knew and told nobody.
+    #[serde(default)]
+    pub contested_identities: Vec<String>,
 }
 
 /// One collection's document count after an update.
