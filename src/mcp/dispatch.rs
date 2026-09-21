@@ -403,11 +403,21 @@ impl DispatchContext {
     /// Run `fut` in the background, keeping it awaitable when the caller asked
     /// for that (see [`DispatchContext::background`]).
     fn spawn_background(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
-        let handle = tokio::spawn(fut);
+        self.adopt(tokio::spawn(fut));
+    }
+
+    /// Track a task somebody else already spawned.
+    ///
+    /// [`DispatchContext::spawn_background`] owns the future; this takes the
+    /// handle of one that is already running, so a helper that spawns
+    /// internally does not have to be turned inside out to be waited on.
+    fn adopt<T: Send + 'static>(&self, handle: tokio::task::JoinHandle<T>) {
         if let Some(slot) = &self.background
             && let Ok(mut pending) = slot.lock()
         {
-            pending.push(handle);
+            pending.push(tokio::spawn(async move {
+                let _ = handle.await;
+            }));
         }
     }
 
@@ -3872,7 +3882,7 @@ pub async fn hook_session_start_impl(
     handle: &Arc<RepoHandle>,
     session_cwd: Option<&std::path::Path>,
 ) -> Value {
-    hook_session_start_timed(handle, session_cwd)
+    hook_session_start_timed(handle, session_cwd, None)
         .await
         .0
         .into_value()
@@ -3885,9 +3895,10 @@ pub async fn hook_session_start_impl(
 pub async fn hook_session_start_timed(
     handle: &Arc<RepoHandle>,
     session_cwd: Option<&std::path::Path>,
+    dctx: Option<&DispatchContext>,
 ) -> (SessionStartOutcome, PhaseTimings) {
     let mut phases = PhaseTimings::new();
-    let out = hook_session_start_inner(handle, session_cwd, &mut phases).await;
+    let out = hook_session_start_inner(handle, session_cwd, &mut phases, dctx).await;
     (out, phases)
 }
 
@@ -3895,6 +3906,7 @@ async fn hook_session_start_inner(
     handle: &Arc<RepoHandle>,
     session_cwd: Option<&std::path::Path>,
     phases: &mut PhaseTimings,
+    dctx: Option<&DispatchContext>,
 ) -> SessionStartOutcome {
     let cfg = &handle.config.hooks;
     if !cfg.session_start_enabled {
@@ -4056,8 +4068,14 @@ async fn hook_session_start_inner(
     // here — after the function's last await — so it fires independently of
     // whether warmup produced any output (a repo
     // with pending embeddings but an empty/filtered warmup still gets drained).
-    // Single-flight + best-effort; the ctx lock is already released.
-    spawn_embedding_backfill(Arc::clone(handle));
+    // Single-flight + best-effort; the ctx lock is already released. Tracked
+    // through `dctx` where there is one: the in-process route exits with the
+    // hook, and an untracked task dies before it drains.
+    if let Some(task) = spawn_embedding_backfill(Arc::clone(handle))
+        && let Some(dctx) = dctx
+    {
+        dctx.adopt(task);
+    }
 
     let bin = std::env::current_exe()
         .ok()
@@ -4774,7 +4792,14 @@ fn hook_stop_impl(handle: Arc<RepoHandle>, event: &Value, dctx: &DispatchContext
     // Drain mid-session cold-model `memory_write`s in the background. Independent
     // of prior mining — must run even when mining is kill-switched off — so it
     // goes before the mining gate. Single-flight + best-effort.
-    spawn_embedding_backfill(Arc::clone(&handle));
+    //
+    // Handed to `dctx` for the same reason mining is: on the in-process route
+    // this process exits as soon as the hook returns, and a task nobody holds
+    // dies with it — the entries written this session would keep their missing
+    // embeddings forever.
+    if let Some(task) = spawn_embedding_backfill(Arc::clone(&handle)) {
+        dctx.adopt(task);
+    }
 
     let transcript_path = event
         .get("transcript_path")
@@ -5733,7 +5758,8 @@ pub async fn dispatch_call(
             dctx.reset_hook_session(&key);
             let t0 = std::time::Instant::now();
             let session_cwd = hook_session_cwd(&params, &handle.root);
-            let (outcome, phases) = hook_session_start_timed(&handle, session_cwd.as_deref()).await;
+            let (outcome, phases) =
+                hook_session_start_timed(&handle, session_cwd.as_deref(), Some(dctx)).await;
             let ms = t0.elapsed().as_millis() as u64;
             let label = outcome.label();
             let reason = outcome.reason().map(str::to_string);
@@ -5803,7 +5829,17 @@ pub async fn dispatch_call(
                 log_hook_event(root, "post_tool_use", outcome, ms, budget);
             });
             record_hook_call(&handle, tool_name).await;
-            Ok(json!({}))
+            // `queued` is bookkeeping between this arm and the reindex channel,
+            // not a field of the hook envelope: an edit that only enqueues must
+            // leave stdout empty. What does have to survive is the prior's
+            // `hookSpecificOutput` — it was built, and `record_injection`
+            // already counted it as shown, so returning `{}` here taught the
+            // store to believe in an injection the model never saw.
+            let mut result = result;
+            if let Some(object) = result.as_object_mut() {
+                object.remove("queued");
+            }
+            Ok(result)
         }
         "hook.pre_tool_use" => {
             let t0 = std::time::Instant::now();
@@ -9887,7 +9923,7 @@ mod tests {
         let handle = make_handle(&tmp);
         std::fs::remove_dir_all(handle.root.join(".mdkb")).expect("remove the store");
 
-        let (outcome, _) = hook_session_start_timed(&handle, None).await;
+        let (outcome, _) = hook_session_start_timed(&handle, None, None).await;
 
         assert_eq!(outcome.label(), "no_store");
         assert_eq!(outcome.into_value(), json!({}));
