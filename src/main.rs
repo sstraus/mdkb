@@ -25,6 +25,7 @@ use mdkb::cli::handlers::{
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
     handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
     handle_graph_dangling, handle_graph_hubs, handle_graph_links, handle_graph_neighbors,
+    handle_graph_relations,
     handle_graph_path, handle_history, handle_init, handle_memory_add, handle_memory_confirm,
     handle_memory_export, handle_memory_import, handle_memory_import_dir,
     handle_memory_import_file, handle_memory_link, handle_memory_list, handle_memory_prune,
@@ -1261,6 +1262,17 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     let hubs = handle_graph_hubs(&ctx, relation.as_deref(), limit)?;
                     format_graph_hubs(&hubs, cli.format);
                 }
+                GraphCommand::Relations { apply } => {
+                    let found = handle_graph_relations(&ctx)?;
+                    let mode =
+                        mdkb::config::Config::load_or_default(&ctx.config_path).graph.relations;
+                    let applied = if apply {
+                        apply_relations_if_useful(&ctx, mode, &found)?
+                    } else {
+                        None
+                    };
+                    format_graph_relations(&found, mode, applied.as_ref(), cli.format);
+                }
             }
         }
         Command::Experiment(cmd) => {
@@ -1406,6 +1418,7 @@ mdkb graph neighbors <entity> --depth 2                 # adjacent entities (und
 mdkb graph path <a> <b>                                 # shortest path between two entities
 mdkb graph dangling [-c <collection>]                   # refs resolving to no doc (full scan; explicit only)
 mdkb graph hubs --relation owner --limit 20             # entities by degree centrality (full scan; explicit only)
+mdkb graph relations [--apply]                          # keys whose values name real docs; --apply writes them (no-op in auto mode)
 
 # Collections
 mdkb collection list                                    # name, path, pattern, doc count per collection
@@ -3167,6 +3180,122 @@ fn format_collection_list(
                         c.name, c.path, c.pattern, c.doc_count
                     );
                 }
+            }
+        }
+    }
+}
+
+/// Apply the detected keys, unless the mode makes that pointless.
+///
+/// Under `auto` the keys are already extracted, so writing them into the
+/// config would only freeze today's derivation into a file that then has to be
+/// maintained by hand. Returns `None` when nothing was attempted.
+fn apply_relations_if_useful(
+    ctx: &mdkb::core::Context,
+    mode: mdkb::config::RelationMode,
+    found: &mdkb::core::graph::RelationDetection,
+) -> mdkb::error::Result<Option<mdkb::core::graph::AppliedRelations>> {
+    if mode == mdkb::config::RelationMode::Auto {
+        return Ok(None);
+    }
+    let keys: Vec<String> = found.candidates.iter().map(|c| c.key.clone()).collect();
+    mdkb::core::graph::apply_detected_relations(&ctx.config_path, &keys).map(Some)
+}
+
+fn format_graph_relations(
+    found: &mdkb::core::graph::RelationDetection,
+    mode: mdkb::config::RelationMode,
+    applied: Option<&mdkb::core::graph::AppliedRelations>,
+    format: OutputFormat,
+) {
+    match format {
+        OutputFormat::Json => {
+            let rows: Vec<serde_json::Value> = found
+                .examined
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "key": c.key,
+                        "hits": c.hits,
+                        "total": c.total,
+                        "score": c.score(),
+                        "is_relation": c.is_relation(),
+                    })
+                })
+                .collect();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "mode": format!("{mode:?}").to_lowercase(),
+                    "documents": found.documents,
+                    "identities": found.identities,
+                    "keys": rows,
+                    "applied": applied.map(|a| a.added.clone()),
+                }))
+                .unwrap()
+            );
+        }
+        OutputFormat::Csv => {
+            println!("key,hits,total,score,is_relation");
+            for c in &found.examined {
+                println!(
+                    "{},{},{},{:.3},{}",
+                    c.key,
+                    c.hits,
+                    c.total,
+                    c.score(),
+                    c.is_relation()
+                );
+            }
+        }
+        OutputFormat::Markdown | OutputFormat::Text => {
+            if found.examined.is_empty() {
+                println!("No frontmatter keys carry document references.");
+            } else {
+                println!("| Key | Hits | Total | Score | Relation |");
+                println!("|-----|------|-------|-------|----------|");
+                for c in &found.examined {
+                    println!(
+                        "| {} | {} | {} | {:.2} | {} |",
+                        c.key,
+                        c.hits,
+                        c.total,
+                        c.score(),
+                        if c.is_relation() { "yes" } else { "no" }
+                    );
+                }
+            }
+            println!();
+            println!(
+                "mode: {}  documents: {}  declared identities: {}",
+                format!("{mode:?}").to_lowercase(),
+                found.documents,
+                found.identities
+            );
+            // An empty result has two causes and they call for opposite
+            // actions, so the command says which one it is rather than
+            // leaving the reader to assume the corpus has no relations.
+            if found.candidates.is_empty() && found.has_no_identity_space() {
+                println!(
+                    "No document declares an `id:` or `aliases:`, so nothing can resolve by name \
+                     and no key can be measured. This is a missing precondition, not a finding."
+                );
+            } else if found.candidates.is_empty() {
+                println!("No key reaches the threshold: measured, not assumed.");
+            }
+            match applied {
+                Some(a) if a.added.is_empty() => {
+                    println!("--apply: nothing to add, config.toml untouched.")
+                }
+                Some(a) => println!("--apply: added {} to graph.frontmatter_relations.", a.added.join(", ")),
+                None if mode == mdkb::config::RelationMode::Auto => {}
+                None => {}
+            }
+            if mode == mdkb::config::RelationMode::Auto {
+                println!(
+                    "relations = \"auto\": these keys are already extracted. `--apply` is a no-op \
+                     and the config is never written."
+                );
             }
         }
     }

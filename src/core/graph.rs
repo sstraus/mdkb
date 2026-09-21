@@ -541,6 +541,219 @@ pub fn detect_relation_keys(
     })
 }
 
+/// What `--apply` changed, so the command can report it instead of claiming it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedRelations {
+    /// Keys written that were not in `frontmatter_relations` before.
+    pub added: Vec<String>,
+    /// The full list now in the file.
+    pub result: Vec<String>,
+}
+
+/// Write detected keys into `graph.frontmatter_relations` in `config.toml`.
+///
+/// Edits the document in place with `toml_edit` rather than serializing
+/// `Config`. Serializing would materialise every default into the file, which
+/// this repository has already paid for once: a key *present* in the file
+/// takes the file's value, so writing the whole config freezes every setting
+/// at whatever it was the day the command ran.
+///
+/// Union, never replace: a key the user wrote by hand is not removed because
+/// the detector did not happen to find it this run.
+pub fn apply_detected_relations(config_path: &Path, detected: &[String]) -> Result<AppliedRelations> {
+    if let Some(key) = detected
+        .iter()
+        .find(|k| NEVER_DERIVED.contains(&k.as_str()))
+    {
+        // The detector already excludes these. Refusing here too means a
+        // caller that assembles the list some other way cannot get one in.
+        return Err(ErrorKind::ConfigInvalid {
+            field: "graph.frontmatter_relations".to_string(),
+            message: format!("'{key}' belongs to the evolution subsystem and cannot be applied"),
+        }
+        .into());
+    }
+
+    let raw = std::fs::read_to_string(config_path).map_err(|e| {
+        Error::from(ErrorKind::ConfigInvalid {
+            field: "config.toml".to_string(),
+            message: format!("cannot read {}: {e}", config_path.display()),
+        })
+    })?;
+    let mut doc: toml_edit::DocumentMut = raw.parse().map_err(|e| {
+        Error::from(ErrorKind::ConfigInvalid {
+            field: "config.toml".to_string(),
+            message: format!("cannot parse {}: {e}", config_path.display()),
+        })
+    })?;
+
+    let existing: Vec<String> = doc
+        .get("graph")
+        .and_then(|g| g.get("frontmatter_relations"))
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_else(|| crate::config::GraphConfig::default().frontmatter_relations);
+
+    let mut result = existing.clone();
+    let mut added = Vec::new();
+    for key in detected {
+        if !result.contains(key) {
+            result.push(key.clone());
+            added.push(key.clone());
+        }
+    }
+
+    if !added.is_empty() {
+        let mut array = toml_edit::Array::new();
+        for key in &result {
+            array.push(key.as_str());
+        }
+        doc["graph"]["frontmatter_relations"] = toml_edit::value(array);
+        // A table mdkb created rather than the user is still the user's file;
+        // leave every other line exactly as it was.
+        if let Some(table) = doc["graph"].as_table_mut() {
+            table.set_implicit(false);
+        }
+        std::fs::write(config_path, doc.to_string()).map_err(|e| {
+            Error::from(ErrorKind::ConfigInvalid {
+                field: "config.toml".to_string(),
+                message: format!("cannot write {}: {e}", config_path.display()),
+            })
+        })?;
+    }
+
+    Ok(AppliedRelations { added, result })
+}
+
+/// Handle `mdkb graph relations`.
+pub fn handle_graph_relations(ctx: &Context) -> Result<RelationDetection> {
+    let config = crate::config::Config::load_or_default(&ctx.config_path);
+    detect_relation_keys(&ctx.conn, &config.graph)
+}
+
+#[cfg(test)]
+mod relation_apply_tests {
+    use super::*;
+
+    fn write_config(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("config.toml");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// What `mdkb init` actually writes: every default, commented out.
+    const SHIPPED: &str = "# mdkb configuration.\n\n# [graph]\n# enabled = true\n# frontmatter_relations = [\n#     \"owner\",\n# ]\n\n# [hooks]\n# warmup_limit = 10\n";
+
+    #[test]
+    fn applying_to_a_fully_commented_config_starts_from_the_shipped_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), SHIPPED);
+
+        let applied = apply_detected_relations(&path, &["org".to_string()]).unwrap();
+
+        assert_eq!(applied.added, vec!["org".to_string()]);
+        assert_eq!(
+            applied.result,
+            vec!["owner", "stakeholders", "themes", "related", "org"],
+            "an absent key means the default is in force, so the union is with the default"
+        );
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("org"));
+        assert!(
+            written.contains("# [hooks]"),
+            "every other commented default survives untouched"
+        );
+    }
+
+    #[test]
+    fn applying_unions_with_what_the_user_already_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(
+            dir.path(),
+            "[graph]\nfrontmatter_relations = [\"owner\", \"mine\"]\nenabled = true\n",
+        );
+
+        let applied =
+            apply_detected_relations(&path, &["org".to_string(), "owner".to_string()]).unwrap();
+
+        assert_eq!(applied.added, vec!["org".to_string()], "`owner` was already there");
+        assert_eq!(applied.result, vec!["owner", "mine", "org"]);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            written.contains("mine"),
+            "a key the detector did not find is not removed"
+        );
+        assert!(written.contains("enabled = true"), "sibling settings survive");
+    }
+
+    #[test]
+    fn applying_twice_changes_nothing_the_second_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "[graph]\nfrontmatter_relations = [\"owner\"]\n");
+
+        apply_detected_relations(&path, &["org".to_string()]).unwrap();
+        let after_first = std::fs::read_to_string(&path).unwrap();
+
+        let applied = apply_detected_relations(&path, &["org".to_string()]).unwrap();
+
+        assert!(applied.added.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            after_first,
+            "a no-op must not rewrite the file"
+        );
+    }
+
+    #[test]
+    fn nothing_detected_leaves_the_file_byte_identical() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), SHIPPED);
+
+        let applied = apply_detected_relations(&path, &[]).unwrap();
+
+        assert!(applied.added.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            SHIPPED,
+            "with nothing to add the config is not touched at all"
+        );
+    }
+
+    #[test]
+    fn an_evolution_key_can_never_be_applied() {
+        // The detector excludes these, so this is the second barrier: a caller
+        // that assembles the list some other way still cannot get one in.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), SHIPPED);
+
+        let err = apply_detected_relations(&path, &["supersedes".to_string()])
+            .expect_err("must be refused");
+
+        assert!(err.to_string().contains("supersedes"));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            SHIPPED,
+            "a refused apply must not have written anything"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_config_is_reported_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_config(dir.path(), "[graph\nbroken = \n");
+
+        let err = apply_detected_relations(&path, &["org".to_string()])
+            .expect_err("a broken config must not be silently replaced");
+
+        assert!(err.to_string().contains("config.toml"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains("broken"));
+    }
+}
+
 #[cfg(test)]
 mod relation_detection_tests {
     use super::*;

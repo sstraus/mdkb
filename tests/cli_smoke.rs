@@ -2471,3 +2471,105 @@ fn smoke_a_command_a_human_ran_still_refuses_to_anchor_there() {
         );
     }
 }
+
+/// Set a live `[graph]` section on top of the shipped commented config.
+fn set_graph_mode(root: &std::path::Path, body: &str) {
+    let path = root.join(".mdkb/config.toml");
+    let base = std::fs::read_to_string(&path).expect("read config");
+    let base = match base.find("\n[graph]\n") {
+        Some(at) => base[..at].to_string(),
+        None => base,
+    };
+    std::fs::write(&path, format!("{base}\n[graph]\n{body}\n")).expect("write config");
+}
+
+#[test]
+fn smoke_graph_relations() {
+    let repo = Repo::new();
+    std::fs::create_dir_all(repo.root.join("docs/orgs")).unwrap();
+    std::fs::write(
+        repo.root.join("docs/orgs/acme.md"),
+        "---\nid: org:acme\n---\n# Acme\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.root.join("docs/m1.md"),
+        "---\nowner: alice\norg: [org:acme]\ntype: meeting\n---\nbody\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.root.join("docs/m2.md"),
+        "---\nowner: bob\norg: [org:acme]\ntype: meeting\n---\nbody\n",
+    )
+    .unwrap();
+    run(&["update"], &repo.root);
+
+    // Default mode is auto: the command runs and names the detected key.
+    let listed = run(&["graph", "relations"], &repo.root);
+    assert_ok(&listed, "graph relations");
+    let out = stdout(&listed);
+    assert!(out.contains("org"), "must list the detected key, got: {out}");
+    assert!(
+        out.contains("type"),
+        "must also show the key that scored zero, so the reader can see it was measured: {out}"
+    );
+
+    let json = run(&["--format", "json", "graph", "relations"], &repo.root);
+    assert_ok(&json, "graph relations json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(stdout(&json).trim()).expect("relations json valid");
+    assert_eq!(parsed["mode"], "auto");
+    assert!(parsed["identities"].as_u64().unwrap() >= 1);
+
+    // --apply under auto: exits 0, says it is a no-op, and does not write.
+    let config_path = repo.root.join(".mdkb/config.toml");
+    let before = std::fs::read_to_string(&config_path).unwrap();
+    let applied_auto = run(&["graph", "relations", "--apply"], &repo.root);
+    assert_ok(&applied_auto, "graph relations --apply under auto");
+    assert_eq!(
+        std::fs::read_to_string(&config_path).unwrap(),
+        before,
+        "auto must not write the config even when --apply is passed"
+    );
+
+    // --apply under manual: writes the detected key into the allowlist.
+    set_graph_mode(
+        &repo.root,
+        "relations = \"manual\"\nfrontmatter_relations = [\"owner\"]",
+    );
+    let applied = run(&["graph", "relations", "--apply"], &repo.root);
+    assert_ok(&applied, "graph relations --apply under manual");
+    let written = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        written.contains("\"org\""),
+        "--apply must add the detected key, got: {written}"
+    );
+
+    // semi runs and exits 0 too.
+    set_graph_mode(&repo.root, "relations = \"semi\"");
+    assert_ok(&run(&["graph", "relations"], &repo.root), "semi");
+
+    // csv shape.
+    let csv = run(&["--format", "csv", "graph", "relations"], &repo.root);
+    assert_ok(&csv, "graph relations csv");
+    assert!(stdout(&csv).starts_with("key,hits,total,score,is_relation"));
+}
+
+#[test]
+fn smoke_graph_relations_without_an_identity_space_says_why() {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.root.join("docs/a.md"),
+        "---\nowner: Alice Smith\nstatus: draft\n---\nbody\n",
+    )
+    .unwrap();
+    run(&["update"], &repo.root);
+
+    let listed = run(&["graph", "relations"], &repo.root);
+    assert_ok(&listed, "graph relations with no identities");
+    let out = stdout(&listed);
+    assert!(
+        out.contains("missing precondition"),
+        "an empty result must distinguish 'no identity space' from 'no relations', got: {out}"
+    );
+}

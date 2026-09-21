@@ -1094,6 +1094,16 @@ pub enum GraphCommand {
         collection: Option<String>,
     },
 
+    /// Frontmatter keys whose values name indexed documents (full scan; explicit use only)
+    Relations {
+        /// Write the detected keys into `graph.frontmatter_relations`.
+        ///
+        /// A no-op under `graph.relations = "auto"`, which already extracts
+        /// them without touching the config.
+        #[arg(long)]
+        apply: bool,
+    },
+
     /// Entities ranked by degree centrality (full scan; explicit use only)
     Hubs {
         /// Filter to a single relation type
