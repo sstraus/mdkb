@@ -288,6 +288,25 @@ pub struct Salvage {
     pub revisions: usize,
     /// Mined behavioural priors (candidates + clusters) recovered.
     pub priors: usize,
+    /// Did every table come across whole?
+    ///
+    /// False when the ATTACH failed, when a table's rows could not be counted
+    /// or read, or when fewer rows landed than were present. The counts alone
+    /// cannot carry this: a salvage that recovered nothing because the file
+    /// would not open reports 0/0, and so does a store whose memory table was
+    /// genuinely empty. Only this flag separates them, and the quarantine
+    /// sweep needs that distinction before it deletes the only copy.
+    pub complete: bool,
+}
+
+impl Salvage {
+    /// A salvage that never got off the ground.
+    fn failed() -> Self {
+        Self {
+            complete: false,
+            ..Default::default()
+        }
+    }
 }
 
 /// Tables that a quarantine must carry into the fresh database, in the order
@@ -368,11 +387,15 @@ pub fn salvage_memory(fresh: &Connection, corrupt_path: &Path) -> Salvage {
              registrations may be lost",
             corrupt_path.display()
         );
-        return Salvage::default();
+        return Salvage::failed();
     }
-    let mut salvage = Salvage::default();
+    let mut salvage = Salvage {
+        complete: true,
+        ..Default::default()
+    };
     for table in SALVAGED_TABLES {
-        let rows = salvage_table(fresh, table);
+        let (rows, whole) = salvage_table(fresh, table);
+        salvage.complete &= whole;
         match table {
             "memory_entries" => salvage.entries = rows,
             "memory_edges" => salvage.edges = rows,
@@ -383,7 +406,9 @@ pub fn salvage_memory(fresh: &Connection, corrupt_path: &Path) -> Salvage {
     }
     // Candidates reference a cluster, so clusters go first; counted together
     // because the pair is one feature to the operator.
-    salvage.priors += salvage_table(fresh, "prior_candidates");
+    let (candidates, candidates_whole) = salvage_table(fresh, "prior_candidates");
+    salvage.priors += candidates;
+    salvage.complete &= candidates_whole;
     if let Err(e) = fresh.execute("DETACH DATABASE corrupt", []) {
         tracing::warn!("salvage: detach failed: {e}");
     }
@@ -444,14 +469,24 @@ fn quote_ident(name: &str) -> String {
 /// A column only the fresh schema has takes its own default. A column only the
 /// quarantined store has cannot be kept, so it is named in a loud log with the
 /// rows it affects — dropping data quietly is how this defect class hides.
-fn salvage_table(fresh: &Connection, table: &str) -> usize {
-    let present: usize = fresh
-        .query_row(&format!("SELECT COUNT(*) FROM corrupt.{table}"), [], |r| {
+fn salvage_table(fresh: &Connection, table: &str) -> (usize, bool) {
+    let present: usize =
+        match fresh.query_row(&format!("SELECT COUNT(*) FROM corrupt.{table}"), [], |r| {
             r.get(0)
-        })
-        .unwrap_or(0);
+        }) {
+            Ok(n) => n,
+            Err(e) => {
+                // The count itself is a read of the table's pages. When those are
+                // the torn ones this fails, and treating it as "empty" is how a
+                // total loss gets reported as a clean salvage of nothing.
+                tracing::error!(
+                    "memory salvage: {table} could not even be counted ({e}) — its rows are LOST"
+                );
+                return (0, false);
+            }
+        };
     if present == 0 {
-        return 0;
+        return (0, true);
     }
     let target = table_columns(fresh, "main", table);
     let source = table_columns(fresh, "corrupt", table);
@@ -460,7 +495,7 @@ fn salvage_table(fresh: &Connection, table: &str) -> usize {
         tracing::error!(
             "memory salvage: {present} rows in {table} could NOT be recovered — the quarantined table shares no column name with the current schema — they are LOST"
         );
-        return 0;
+        return (0, false);
     }
     let dropped: Vec<&str> = source
         .iter()
@@ -502,13 +537,13 @@ fn salvage_table(fresh: &Connection, table: &str) -> usize {
                     "memory salvage: {not_recovered} of {present} rows in {table} were NOT recovered (INSERT OR IGNORE skipped them)"
                 );
             }
-            inserted
+            (inserted, inserted >= present)
         }
         Err(e) => {
             tracing::error!(
                 "memory salvage: {present} rows in {table} could NOT be recovered ({e}) — they are LOST"
             );
-            0
+            (0, false)
         }
     }
 }
@@ -532,6 +567,14 @@ pub struct QuarantineReport {
     pub memory_entries_salvaged: usize,
     /// Memory edges recovered into the fresh database.
     pub memory_edges_salvaged: usize,
+    /// Did the salvage bring every table across whole?
+    ///
+    /// `serde(default)` is `false`, which is the safe direction: a report
+    /// written before this field existed reads as "not known to have
+    /// succeeded", so the sweep keeps its copy instead of deleting evidence on
+    /// the strength of a field nobody wrote.
+    #[serde(default)]
+    pub salvage_succeeded: bool,
     /// `PRAGMA quick_check` rows: the damage as SQLite describes it.
     #[serde(default)]
     pub quick_check: Vec<String>,
@@ -713,6 +756,7 @@ pub fn write_report(corrupt_path: &Path, salvage: Salvage) {
         corrupt_file: name,
         memory_entries_salvaged: salvage.entries,
         memory_edges_salvaged: salvage.edges,
+        salvage_succeeded: salvage.complete,
         quick_check: diagnosis.quick_check,
         damaged_tables: diagnosis.damaged_tables,
         db_bytes: diagnosis.db_bytes,
@@ -787,6 +831,26 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
     let Ok(entries) = std::fs::read_dir(mdkb_dir) else {
         return;
     };
+    // Which quarantines were actually salvaged?
+    //
+    // `memory_entries` and `memory_edges` live only in `index.sqlite`, so
+    // until the salvage succeeds the quarantined copy is the ONLY carrier of
+    // that data. Age is not evidence that it was recovered: a crash between
+    // the quarantine and the salvage leaves no report at all, and an ATTACH
+    // that failed leaves one reporting 0 entries — the same text a genuinely
+    // empty memory table produces. Deleting on age alone turns a recoverable
+    // state into a permanent loss, fifteen days later, in silence.
+    let salvaged: std::collections::HashSet<i64> = std::fs::read_dir(mdkb_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".report.json"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .filter_map(|raw| serde_json::from_str::<QuarantineReport>(&raw).ok())
+        .filter(|r| r.salvage_succeeded)
+        .map(|r| r.quarantined_at)
+        .collect();
+
     let retention_secs = retention.as_secs() as i64;
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -801,6 +865,15 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
         // A negative age (a copy stamped in the future by a skewed clock) is
         // not an expiry. Keep it.
         if now_secs - quarantined_at <= retention_secs {
+            continue;
+        }
+        // Expired, but never salvaged: this copy is the last one standing
+        // between the operator and the loss. Keep it and say why, once per
+        // sweep, at a level they will see.
+        if !salvaged.contains(&quarantined_at) {
+            tracing::warn!(
+                "quarantine {name} is past its retention but its salvage never succeeded;                  keeping it — it may hold the only copy of those memory entries"
+            );
             continue;
         }
         // Best-effort. Windows refuses to unlink a file another process still
@@ -1366,12 +1439,68 @@ mod tests {
     /// and `.report.json` siblings a real quarantine leaves beside it. Returns
     /// the `now` the sweep must be given.
     fn quarantine_aged(dir: &Path, age: i64) -> (PathBuf, i64) {
+        quarantine_aged_with(dir, age, true)
+    }
+
+    /// As [`quarantine_aged`], but choosing whether the sidecar records a
+    /// salvage that actually worked. The sweep reads exactly that.
+    fn quarantine_aged_with(dir: &Path, age: i64, salvaged: bool) -> (PathBuf, i64) {
         let now = 1_800_000_000_i64;
-        let corrupt = dir.join(format!("index.sqlite.corrupt-{}", now - age));
+        let stamp = now - age;
+        let corrupt = dir.join(format!("index.sqlite.corrupt-{stamp}"));
         std::fs::write(&corrupt, b"corrupt bytes").unwrap();
         std::fs::write(with_suffix(&corrupt, "-wal"), b"wal").unwrap();
-        std::fs::write(report_path(&corrupt), br#"{"corrupt_file":"x"}"#).unwrap();
+        std::fs::write(
+            report_path(&corrupt),
+            format!(
+                r#"{{"corrupt_file":"x","quarantined_at":{stamp},"memory_entries_salvaged":0,"memory_edges_salvaged":0,"salvage_succeeded":{salvaged}}}"#
+            ),
+        )
+        .unwrap();
         (corrupt, now)
+    }
+
+    /// An expired copy whose salvage never succeeded is KEPT.
+    ///
+    /// `memory_entries` and `memory_edges` exist nowhere else, so until the
+    /// salvage lands this file is the only copy. Two reachable states produce
+    /// it: a crash between quarantine and salvage, which writes no report at
+    /// all, and an ATTACH that failed, which writes one reporting nothing
+    /// recovered. Neither is distinguishable from a clean salvage by age, and
+    /// deleting on age turned both into permanent loss.
+    #[test]
+    fn an_expired_copy_whose_salvage_failed_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (corrupt, now) =
+            quarantine_aged_with(dir.path(), QUARANTINE_RETENTION.as_secs() as i64 + 1, false);
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+
+        assert!(
+            corrupt.exists(),
+            "the only carrier of those memory entries must survive its retention"
+        );
+        assert!(
+            with_suffix(&corrupt, "-wal").exists(),
+            "and so must its wal"
+        );
+    }
+
+    /// A quarantine with no report at all — the crash case — is kept too.
+    #[test]
+    fn an_expired_copy_with_no_report_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_i64;
+        let stamp = now - (QUARANTINE_RETENTION.as_secs() as i64 + 1);
+        let corrupt = dir.path().join(format!("index.sqlite.corrupt-{stamp}"));
+        std::fs::write(&corrupt, b"corrupt bytes").unwrap();
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+
+        assert!(
+            corrupt.exists(),
+            "no report means the salvage never ran, not that it succeeded"
+        );
     }
 
     #[test]

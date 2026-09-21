@@ -214,9 +214,13 @@ fn an_expired_quarantine_is_retired_by_the_next_open() {
         - 3600;
     let stale = mdkb_dir.join(format!("index.sqlite.corrupt-{stamp}"));
     std::fs::write(&stale, b"a copy from a quarantine long recovered").expect("stale copy");
+    // "long recovered" is the whole premise: the sidecar has to say the
+    // salvage worked, because that is what licenses the deletion.
     std::fs::write(
         mdkb_dir.join(format!("index.sqlite.corrupt-{stamp}.report.json")),
-        br#"{"corrupt_file":"index.sqlite"}"#,
+        format!(
+            r#"{{"corrupt_file":"index.sqlite","quarantined_at":{stamp},"memory_entries_salvaged":4,"memory_edges_salvaged":1,"salvage_succeeded":true}}"#
+        ),
     )
     .expect("report");
 
@@ -241,5 +245,44 @@ fn an_expired_quarantine_is_retired_by_the_next_open() {
             .join(format!("index.sqlite.corrupt-{stamp}.report.json"))
             .exists(),
         "the report stays — it is where the forensics actually live"
+    );
+}
+
+/// The mirror image: an expired copy whose salvage never succeeded stays.
+///
+/// `memory_entries` and `memory_edges` live only in `index.sqlite`, so a
+/// quarantine that was never salvaged is the sole carrier of whatever it holds.
+/// Retiring it on age would turn a state the operator could still recover from
+/// into a permanent loss, and the banner they read says "no action needed".
+#[test]
+fn an_expired_quarantine_that_was_never_salvaged_is_kept() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().canonicalize().expect("canonicalize");
+    handle_init(&root).expect("init");
+
+    let mdkb_dir = root.join(".mdkb");
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        - mdkb::store::heal::QUARANTINE_RETENTION.as_secs()
+        - 3600;
+    let stale = mdkb_dir.join(format!("index.sqlite.corrupt-{stamp}"));
+    std::fs::write(&stale, b"the only copy of those memory entries").expect("stale copy");
+    // The shape an ATTACH failure leaves: a report that recovered nothing.
+    std::fs::write(
+        mdkb_dir.join(format!("index.sqlite.corrupt-{stamp}.report.json")),
+        format!(
+            r#"{{"corrupt_file":"index.sqlite","quarantined_at":{stamp},"memory_entries_salvaged":0,"memory_edges_salvaged":0,"salvage_succeeded":false}}"#
+        ),
+    )
+    .expect("report");
+
+    drop(Context::open(&root).expect("open"));
+    drop(Context::open(&root).expect("reopen"));
+
+    assert!(
+        stale.exists(),
+        "age is not evidence that the salvage ran; the copy stays"
     );
 }
