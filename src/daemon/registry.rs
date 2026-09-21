@@ -310,9 +310,30 @@ impl RepoRegistry {
     /// Known roots plus stores nested below them, found by a read-only
     /// filesystem walk. Discovery does not add handles or persist map entries.
     pub fn discoverable_roots(&self) -> Vec<PathBuf> {
+        self.discoverable_roots_under(&[])
+    }
+
+    /// The same, also walking `extra` — the workspace an MCP client declared.
+    ///
+    /// A directory that merely holds repositories anchors no store, so nothing
+    /// registers it and it never enters the map. Walking only the map therefore
+    /// found nothing under it, and a `root`-less call fell back to whatever
+    /// happened to be open — while the log line said "kept as the fan-out
+    /// scope; stores nested below it answer". They did not answer, because
+    /// nobody looked. Passing the scope in is what makes that sentence true.
+    pub fn discoverable_roots_under(&self, extra: &[PathBuf]) -> Vec<PathBuf> {
         let known = self.known_roots();
         let mut roots: std::collections::BTreeSet<PathBuf> = known.iter().cloned().collect();
-        roots.extend(super::repo_map::discover_nested_stores(&known));
+        let mut walk: Vec<PathBuf> = known;
+        // A scope already covered by a known root adds nothing but a second
+        // walk of the same tree.
+        let uncovered: Vec<PathBuf> = extra
+            .iter()
+            .filter(|e| !walk.iter().any(|k| e.starts_with(k)))
+            .cloned()
+            .collect();
+        walk.extend(uncovered);
+        roots.extend(super::repo_map::discover_nested_stores(&walk));
         roots.into_iter().collect()
     }
 
@@ -508,6 +529,57 @@ mod tests {
             whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
             ..DaemonConfig::default()
         }
+    }
+
+    /// A store under the client's workspace is found even though nothing
+    /// registered that workspace.
+    ///
+    /// A directory that merely HOLDS repositories anchors no store of its own,
+    /// so it never enters the map and walking the map never reaches below it.
+    /// The log line told the operator "kept as the fan-out scope; stores nested
+    /// below it answer" while nothing was looking — and a `root`-less call fell
+    /// back to whatever else happened to be open, which is the behaviour the
+    /// scope exists to replace.
+    #[test]
+    fn a_store_under_the_client_scope_is_discoverable_only_when_the_scope_is_passed() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let nested = workspace.join("customer-x");
+        std::fs::create_dir_all(nested.join(".mdkb")).unwrap();
+        // Discovery identifies a store by its SQLite file, not by the folder.
+        std::fs::write(nested.join(".mdkb/index.sqlite"), b"").unwrap();
+
+        let registry = RepoRegistry::new(allow_temp_config());
+
+        assert!(
+            registry.discoverable_roots().is_empty(),
+            "nothing is on the map, so walking the map finds nothing"
+        );
+
+        let found = registry.discoverable_roots_under(&[workspace.clone()]);
+        assert_eq!(
+            found,
+            vec![nested.canonicalize().unwrap()],
+            "with the workspace in hand, the store below it answers"
+        );
+    }
+
+    /// A scope already covered by a known root is not walked twice.
+    #[test]
+    fn a_scope_inside_a_known_root_adds_no_second_walk() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        let registry = RepoRegistry::new(allow_temp_config());
+        registry
+            .get_or_open(&root)
+            .expect("open puts it on the map");
+
+        let with_child = registry.discoverable_roots_under(&[root.join("sub")]);
+        let without = registry.discoverable_roots();
+        assert_eq!(
+            with_child, without,
+            "a scope beneath a root already on the map changes nothing"
+        );
     }
 
     #[test]

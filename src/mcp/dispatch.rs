@@ -1615,7 +1615,10 @@ pub fn resolve_root_selector(
     let known: Vec<std::path::PathBuf> = {
         let mut set: std::collections::BTreeSet<std::path::PathBuf> = if selector.needs_discovery()
         {
-            registry.discoverable_roots().into_iter().collect()
+            registry
+                .discoverable_roots_under(scope)
+                .into_iter()
+                .collect()
         } else {
             registry.known_roots().into_iter().collect()
         };

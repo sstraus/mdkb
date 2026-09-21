@@ -360,6 +360,15 @@ impl McpServer {
     ) {
         match peer.list_roots().await {
             Ok(result) => {
+                // Collected, then assigned as a set. This runs on `initialize`
+                // AND on `roots/list_changed`, and the whole point of that
+                // notification is that the client's root SET changed — which
+                // includes removals. Pushing only meant a workspace the client
+                // had closed stayed in scope for the life of the connection,
+                // so a `root`-less call kept fanning out over its stores and a
+                // `root`-less `get` kept refusing with a count that named
+                // repositories the client no longer had open.
+                let mut collected: Vec<PathBuf> = Vec::new();
                 for root in &result.roots {
                     if let Some(path) = uri_to_path(&root.uri) {
                         // Record the workspace before deciding anything about
@@ -367,12 +376,20 @@ impl McpServer {
                         // the scope the caller is working in, and dropping it is
                         // what made a `root`-less call answer about unrelated
                         // repos (story 141-2032).
-                        let scope = path.canonicalize().unwrap_or_else(|_| path.clone());
-                        {
-                            let mut roots = client_roots.lock().await;
-                            if !roots.contains(&scope) {
-                                roots.push(scope);
-                            }
+                        //
+                        // Normalised through `resolve_main_worktree` because
+                        // every root the map stores goes through it too. A
+                        // client working in a linked worktree declares
+                        // `.worktrees/mdkb-x` while the map holds the main
+                        // worktree, so an un-normalised scope matched no known
+                        // root at all and the call fell back to whatever
+                        // happened to be open — silently, which is the failure
+                        // this scope exists to prevent.
+                        let resolved = crate::git::resolve_main_worktree(&path);
+                        let scope = crate::domain::canonicalize_plain(&resolved)
+                            .unwrap_or_else(|_| resolved.clone());
+                        if !collected.contains(&scope) {
+                            collected.push(scope);
                         }
                         // Anchor the client-provided root the same way hooks do
                         // (nearest existing store → git root → launch dir) so
@@ -401,8 +418,14 @@ impl McpServer {
                         tracing::warn!("Ignoring non-file root URI: {}", root.uri);
                     }
                 }
+                // Assigned, not merged: this IS the client's scope now.
+                *client_roots.lock().await = collected;
             }
             Err(e) => {
+                // The scope is left exactly as it was. A client that cannot
+                // answer `roots/list` has not told us its roots changed; it has
+                // told us nothing, and clearing on nothing is how a working
+                // connection loses its scope.
                 tracing::debug!("Client does not support roots/list: {e}");
             }
         }
