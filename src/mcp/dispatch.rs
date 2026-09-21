@@ -1609,7 +1609,7 @@ pub fn resolve_root_selector(
         .collect();
     let known: Vec<std::path::PathBuf> = {
         let mut set: std::collections::BTreeSet<std::path::PathBuf> =
-            registry.known_roots().into_iter().collect();
+            registry.discoverable_roots().into_iter().collect();
         set.extend(open.iter().cloned());
         set.into_iter().collect()
     };
@@ -1626,6 +1626,7 @@ pub fn resolve_root_selector(
 struct RepoOutcome {
     root: std::path::PathBuf,
     results: std::result::Result<Vec<SearchResult>, String>,
+    no_collections: bool,
 }
 
 /// The coverage footer: what was read, out of what is known, and what was not.
@@ -1637,12 +1638,22 @@ fn format_cross_repo_coverage(
     searched: usize,
     known: usize,
     skipped: &[(std::path::PathBuf, String)],
+    no_collections: &[std::path::PathBuf],
 ) -> String {
-    let mut out = format!("\n_Searched {searched} of {known} known repos._\n");
+    let mut out = format!("\n_Searched {searched} of {known} discoverable repos._\n");
     if !skipped.is_empty() {
         out.push_str(&format!("**Not searched ({}):**\n", skipped.len()));
         for (root, why) in skipped {
             out.push_str(&format!("- {} — {why}\n", root.display()));
+        }
+    }
+    if !no_collections.is_empty() {
+        out.push_str(&format!(
+            "**No registered collections ({}); run `mdkb update`:**\n",
+            no_collections.len()
+        ));
+        for root in no_collections {
+            out.push_str(&format!("- {}\n", root.display()));
         }
     }
     out
@@ -1720,7 +1731,18 @@ pub async fn cross_repo_search_impl(
                 Ok(ctx) => ctx,
                 Err(why) => {
                     tracing::warn!(root = %root.display(), "cross_repo_search: not searched ({why})");
-                    return RepoOutcome { root, results: Err(why) };
+                    return RepoOutcome { root, results: Err(why), no_collections: false };
+                }
+            };
+            let no_collections = match crate::store::collections::list_collections(&ctx.conn) {
+                Ok(collections) => collections.is_empty(),
+                Err(e) => {
+                    let why = format!("collection registry could not be read: {e}");
+                    return RepoOutcome {
+                        root,
+                        results: Err(why),
+                        no_collections: false,
+                    };
                 }
             };
             // The repo's own config, not the caller's: recall thresholds are a
@@ -1750,7 +1772,7 @@ pub async fn cross_repo_search_impl(
                         Err(e) => {
                             let why = format!("document search failed: {e}");
                             tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
-                            return RepoOutcome { root, results: Err(why) };
+                            return RepoOutcome { root, results: Err(why), no_collections };
                         }
                     }
                 }
@@ -1790,7 +1812,7 @@ pub async fn cross_repo_search_impl(
                         Err(e) => {
                             let why = format!("memory search failed: {e}");
                             tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
-                            return RepoOutcome { root, results: Err(why) };
+                            return RepoOutcome { root, results: Err(why), no_collections };
                         }
                     }
                 }
@@ -1798,14 +1820,18 @@ pub async fn cross_repo_search_impl(
                 _ => {}
             }
 
-            RepoOutcome { root, results: Ok(repo_results) }
+            RepoOutcome { root, results: Ok(repo_results), no_collections }
         }
     });
 
     let mut searched = 0_usize;
     let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
     let mut all_results: Vec<SearchResult> = Vec::new();
+    let mut no_collections = Vec::new();
     for outcome in join_all(per_repo_futures).await {
+        if outcome.no_collections {
+            no_collections.push(outcome.root.clone());
+        }
         match outcome.results {
             Ok(results) => {
                 searched += 1;
@@ -1827,7 +1853,7 @@ pub async fn cross_repo_search_impl(
     } else {
         format_search_results(&all_results, limit)
     };
-    output.push_str(&format_cross_repo_coverage(searched, known, &skipped));
+    output.push_str(&format_cross_repo_coverage(searched, known, &skipped, &no_collections));
 
     let count = all_results.len();
     Ok((output, count))

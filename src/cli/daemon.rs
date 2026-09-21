@@ -101,6 +101,21 @@ mod platform {
             println!("mdkb daemon: not running");
         }
         println!("  base:       {}", s.base_dir.display());
+        let known = crate::daemon::repo_map::read_known_roots(&s.base_dir.join("repos.json"));
+        let discoverable = crate::daemon::repo_map::discover_nested_stores(&known);
+        println!(
+            "  repos:      {} known, {} discoverable",
+            known.len(),
+            discoverable.len()
+        );
+        for root in &discoverable {
+            let status = if known.contains(root) {
+                "known"
+            } else {
+                "discovered"
+            };
+            println!("    [{status}] {}", root.display());
+        }
         println!(
             "  mcp  sock:  {} {}",
             s.mcp_sock.display(),

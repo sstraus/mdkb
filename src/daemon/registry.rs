@@ -307,6 +307,15 @@ impl RepoRegistry {
         self.repo_map.roots()
     }
 
+    /// Known roots plus stores nested below them, found by a read-only
+    /// filesystem walk. Discovery does not add handles or persist map entries.
+    pub fn discoverable_roots(&self) -> Vec<PathBuf> {
+        let known = self.known_roots();
+        let mut roots: std::collections::BTreeSet<PathBuf> = known.iter().cloned().collect();
+        roots.extend(super::repo_map::discover_nested_stores(&known));
+        roots.into_iter().collect()
+    }
+
     /// Get all active repo handles (for cross-repo operations).
     pub fn all_handles(&self) -> Vec<Arc<RepoHandle>> {
         self.handles

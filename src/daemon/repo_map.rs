@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use walkdir::WalkDir;
 
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +106,36 @@ pub fn classify(root: &Path) -> RootHealth {
         Ok(_) => RootHealth::Healthy,
         Err(e) => RootHealth::Unreadable(e.to_string()),
     }
+}
+
+/// Find stores below roots the daemon already knows, without opening or
+/// registering them. A store is identified by its SQLite file; walking stops
+/// at `.mdkb` so index internals are never traversed.
+pub fn discover_nested_stores(roots: &[PathBuf]) -> BTreeSet<PathBuf> {
+    let mut found = BTreeSet::new();
+    for root in roots {
+        let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
+            let name = entry.file_name().to_string_lossy();
+            !matches!(name.as_ref(), ".git" | "target" | "node_modules")
+                && name != ".mdkb"
+        });
+        for entry in walker.filter_map(Result::ok) {
+            if !entry.file_type().is_dir() {
+                continue;
+            }
+            let candidate = entry.path().join(".mdkb/index.sqlite");
+            if candidate.is_file() {
+                found.insert(canonical_key(entry.path()));
+            }
+        }
+    }
+    found
+}
+
+/// Read the persisted roots without triage, normalization, or a write-back.
+/// Reporting commands use this path so inspecting coverage cannot change it.
+pub fn read_known_roots(path: &Path) -> Vec<PathBuf> {
+    read_file(path).into_iter().collect()
 }
 
 /// The outcome of one pass over the known roots.

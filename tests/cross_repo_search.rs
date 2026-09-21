@@ -139,7 +139,7 @@ async fn a_known_repo_that_is_not_open_is_still_searched() {
         "a known repo must be searched even with no handle open for it: {output}"
     );
     assert!(
-        output.contains("Searched 2 of 2 known repos"),
+        output.contains("Searched 2 of 2 discoverable repos"),
         "the answer must state its coverage: {output}"
     );
 }
@@ -208,7 +208,7 @@ async fn a_store_this_binary_cannot_read_is_reported_not_counted_as_empty() {
 
     assert!(count >= 1, "the healthy repo is still searched: {output}");
     assert!(
-        output.contains("Searched 1 of 2 known repos"),
+        output.contains("Searched 1 of 2 discoverable repos"),
         "the coverage must exclude the repo that was not read: {output}"
     );
     assert!(
@@ -244,7 +244,71 @@ async fn an_empty_result_states_how_much_was_searched() {
 
     assert_eq!(count, 0, "nothing matches that token: {output}");
     assert!(
-        output.contains("Searched 2 of 2 known repos"),
+        output.contains("Searched 2 of 2 discoverable repos"),
         "an empty answer must still state its coverage: {output}"
+    );
+}
+
+/// Story 140-822c: an empty collection registry is not the same fact as a
+/// healthy corpus with no matching document. The answer must name both the
+/// condition and the command that normally repairs it.
+#[tokio::test]
+async fn a_store_with_no_collections_is_not_reported_as_a_plain_no_match() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let empty = repo_with_entry(repos.path(), "empty", "unrelated");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    registry.get_or_open(&empty).expect("open empty store");
+
+    let (output, count) = cross_repo_search_impl(&registry, &memory_search("quelli_frast"))
+        .await
+        .expect("search");
+
+    assert_eq!(count, 0, "the fixture has no match: {output}");
+    assert!(output.contains("No registered collections (1)"), "{output}");
+    assert!(output.contains(&empty.display().to_string()), "{output}");
+    assert!(output.contains("mdkb update"), "{output}");
+}
+
+/// Story 141-2032: a store below a known root must not depend on a client
+/// having opened it first. Discovery is filesystem-only; opening for search is
+/// still the existing read-only path.
+#[tokio::test]
+async fn a_nested_store_is_discovered_without_being_opened_first() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let parent = repo_with_entry(repos.path(), "parent", "unrelated");
+    let nested = repo_with_entry(&parent, "nested", "nested_signal");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    registry.get_or_open(&parent).expect("open only the parent");
+    assert_eq!(registry.known_roots(), vec![parent.clone()]);
+
+    let before = std::fs::metadata(nested.join(".mdkb/index.sqlite"))
+        .expect("nested index")
+        .modified()
+        .expect("mtime");
+    let (output, count) = cross_repo_search_impl(&registry, &memory_search("nested_signal"))
+        .await
+        .expect("search");
+    let after = std::fs::metadata(nested.join(".mdkb/index.sqlite"))
+        .expect("nested index")
+        .modified()
+        .expect("mtime");
+
+    assert!(count >= 1 && output.contains("nested_signal"), "{output}");
+    assert!(
+        output.contains("Searched 2 of 2 discoverable repos"),
+        "{output}"
+    );
+    assert_eq!(
+        before, after,
+        "discovery and read-only search must not mutate the store"
+    );
+    assert_eq!(
+        registry.known_roots(),
+        vec![parent],
+        "discovery must not register the child"
     );
 }

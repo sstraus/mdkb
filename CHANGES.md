@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Fixed
+
+- **Empty collection registries are no longer reported as ordinary empty
+  results.** `search`, `graph`, and `stats` now name the condition and point to
+  `mdkb update`; cross-repository search names every affected root separately.
+  Found by the maintainer's 2026-09-21 fleet audit.
+
+- **Cross-repository search now discovers nested stores below known roots.**
+  Discovery reads only directory entries and opens each discovered store
+  read-only: it does not register, migrate, or mount the store. `daemon status`
+  lists known and discoverable roots separately, so coverage no longer depends
+  on which child repositories a client happened to open. Found by the
+  maintainer's 2026-09-21 fleet audit.
+
 ## 3.10.0 (2026-09-21)
 
 ### Added
