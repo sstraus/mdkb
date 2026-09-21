@@ -279,6 +279,86 @@ fn a_commit_under_a_cited_path_is_reported_only_for_an_old_entry() {
     );
 }
 
+/// The same drift signal, with the store BELOW the git root.
+///
+/// `git log --name-only` prints paths relative to the repository root, not to
+/// the `-C` directory, while every lookup here uses a path relative to the
+/// mdkb project root. The two agree only when the store sits at the git root —
+/// which is exactly where the test above puts it, so it could never catch
+/// this. In a store at `repo/sub`, git answered `sub/src/live.rs` and the
+/// audit asked for `src/live.rs`: the map was built, consulted, and never
+/// matched, so drift reported nothing and the pass looked clean.
+#[test]
+fn drift_is_found_when_the_store_sits_below_the_git_root() {
+    let outer = tempfile::tempdir().expect("tempdir");
+    let repo = outer.path().canonicalize().expect("canonicalize");
+    git(&repo, &["init", "-q"]);
+
+    let root = repo.join("sub");
+    std::fs::create_dir_all(&root).expect("mkdir sub");
+    handle_init(&root).expect("init");
+    {
+        let ctx = Context::open(&root).expect("open");
+        handle_memory_add(
+            &ctx,
+            "old-measurement",
+            "old-measurement",
+            "problem",
+            None,
+            "measured in src/live.rs",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+        )
+        .expect("add");
+    }
+
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+    std::fs::write(root.join("src/live.rs"), "fn live() {}\n").expect("write");
+    git(&repo, &["add", "-A"]);
+    git_commit(&repo, "add");
+
+    {
+        let ctx = Context::open(&root).expect("open");
+        let long_ago = chrono::Utc::now().timestamp() - 300 * 86_400;
+        ctx.conn
+            .execute(
+                "UPDATE memory_entries SET updated_at = ?1 WHERE id = 'old-measurement'",
+                [long_ago],
+            )
+            .expect("backdate");
+    }
+
+    std::fs::write(root.join("src/live.rs"), "fn live() { changed(); }\n").expect("rewrite");
+    git(&repo, &["add", "-A"]);
+    git_commit(&repo, "change");
+
+    let ctx = Context::open(&root).expect("reopen");
+    let outcome = handle_memory_audit(&ctx, false).expect("audit");
+
+    let drifted: Vec<&str> = outcome
+        .candidates
+        .iter()
+        .filter(|c| {
+            c.signals
+                .iter()
+                .any(|s| matches!(s, AuditSignal::SourceChangedSince { .. }))
+        })
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(
+        drifted,
+        vec!["old-measurement"],
+        "a store below the git root must see its own drift; got {:?}",
+        outcome.candidates
+    );
+}
+
 /// The defect story 116 closes: a store with no embeddings for any active
 /// entry (no model ever pulled, `mdkb embed` simply never run, or
 /// auto-embed-on-add disabled) must say so rather than report the same

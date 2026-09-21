@@ -316,6 +316,16 @@ pub fn paths_changed_since(
             // year or a date — same answer today, one guess away from not
             // being.
             &format!("--since=@{since_unix}"),
+            // Paths relative to `root`, not to the repository root. Without
+            // this a store at `repo/sub` gets keys like `sub/src/live.rs`
+            // while every caller looks up `src/live.rs`, so the map is built,
+            // consulted, and never matches — a signal that reports nothing and
+            // calls it a clean pass. It also scopes the walk to the subtree,
+            // which is the question being asked. Measured: from `repo/sub`,
+            // `--name-only` alone prints `sub/src/live.rs` and `--relative`
+            // prints `src/live.rs`; from the repository root it changes
+            // nothing.
+            "--relative",
             "--name-only",
             "--no-renames",
             "--pretty=format:%x00%ct",
