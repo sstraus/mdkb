@@ -195,6 +195,16 @@ stores. Collections divide <em>search</em>; only a store boundary divides the <e
 matter. Resolution tries the reference, then without a leading <code>./</code> or <code>/</code>, then with
 <code>.md</code> added or removed, then all of those again with a leading collection name stripped.
 So <code>map/people/alice</code> and <code>people/alice.md</code> reach the same document.</p>
+<p><strong>Paths are not the only way a reference resolves.</strong> When every path form has missed —
+and only then — resolution falls back to the identities a document declares for itself in
+frontmatter (<code>id:</code> and <code>aliases:</code>, configurable as
+<code>graph.identity_keys</code>). That is what makes <code>person:alice</code> reach
+<code>people/alice.md</code> on a typed corpus. The order is load-bearing: a reference naming a real
+file keeps naming that file even when another document claims the same string as an alias.
+Identities are per store, like edges, so a name declared in one store never resolves from
+another.</p>
+<p>Two documents claiming one identity is a repository defect rather than an index failure:
+resolution takes the lowest document id deterministically and the collision stays reportable.</p>
 <div class="src">docs/graph.md; src/store/graph.rs</div>
 
 <h2>5. Fan-out across repositories — cross-repo search <span class="tag live">live</span></h2>

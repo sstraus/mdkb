@@ -102,15 +102,71 @@ doc_neighbor_cap = 3   # cap on neighbor lines when a prompt names a document
 ```
 
 Add your own vocabulary to `frontmatter_relations` — `depends_on`, `replaces`,
-`team`, whatever the repository already writes. A plain `mdkb update` will not
-apply the change to documents it has already seen: it skips files whose mtime
-has not moved, and their edges with them. Run `mdkb update --force` once after
-editing the allowlist.
+`team`, whatever the repository already writes. A plain `mdkb update` applies
+the change: edges are rebuilt as a pass over the store after indexing, so a key
+you add reaches documents no file change touched. `--force` is no longer needed
+for this, and a doc telling you otherwise is out of date.
 
-Which keys are relations is a decision only the repository can make: a relation
-target is any string or list of strings, so `type: person` and `org: [org:acme]`
-are indistinguishable by value. The README explains what auto-detection would do
-to `graph hubs`. See also
+## Identity: how a name resolves
+
+A document declares what it *is* in frontmatter:
+
+```yaml
+id: person:alice
+aliases: ["@alice", alice@example.com]
+```
+
+Those names go into `document_aliases`, and resolution uses them **after**
+every path form has missed — never before. A reference that names a real file
+keeps naming that file even when another document claims the same string as an
+alias. Without this, a typed corpus resolves nothing: measured on a 331-document
+graph, 181 of 182 edges targeted an `id:` that a document in the store
+declared, and not one of them resolved.
+
+`graph.identity_keys` (default `["id", "aliases"]`) is the list of keys that
+count as a claim. Two documents claiming one name is a repository defect, not
+an index failure: resolution takes the lowest document id deterministically,
+and the collision stays reportable.
+
+## Relation modes
+
+```toml
+[graph]
+relations = "auto"     # auto | semi | manual
+```
+
+A relation target is any string or list of strings, so `type: person` and
+`org: [org:acme]` cannot be told apart by looking at the value. What separates
+them is whether the value names something the index knows. That is a
+measurement, and it is what the detector runs on every index: the share of a
+key's values that resolve to a document. Free text can never score, so metadata
+cannot enter the graph.
+
+| Mode | Extracts | Reports |
+|------|----------|---------|
+| `auto` (default) | `frontmatter_relations` ∪ detected | nothing — there is nothing outstanding |
+| `semi` | `frontmatter_relations` only | one SessionStart line naming what it is not extracting |
+| `manual` | `frontmatter_relations` only | nothing |
+
+**`auto` never writes `config.toml`.** Derivation re-reads the corpus on every
+index, so it follows the repository. A tool that records its own guess in your
+config hands you a list to maintain by hand.
+
+```bash
+mdkb graph relations            # every key with its hits, total and score
+mdkb graph relations --apply    # write the detected keys into the allowlist
+```
+
+`--apply` is a no-op under `auto` — the keys are already extracted — and says
+so. Under `semi` and `manual` it unions the detected keys into
+`frontmatter_relations`, editing that one value and leaving the rest of your
+config alone.
+
+`supersedes`, `updates`, `corrects`, `extends` and `retracts` are owned by the
+evolution subsystem. They are never derived and config validation rejects them
+in the allowlist.
+
+See also
 [cross-folder-flows.html](cross-folder-flows.html) for how a store is chosen for a
 working directory and how the graph boundary follows the store boundary.
 

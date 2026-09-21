@@ -595,12 +595,11 @@ removes the edge and repeated updates do not duplicate it. Memory edges are
 written transactionally with `memory_write` or explicitly with `memory link`.
 MDKB never invents a taxonomy or rewrites documents from graph analysis.
 
-#### Why you must declare `frontmatter_relations`
+#### Why you no longer have to declare `frontmatter_relations`
 
-Frontmatter holds identity, metadata and relations in one map, and MDKB cannot
-tell them apart by looking at the values. A relation target is any string, or
-any list of strings — that is the whole rule. In this node, six keys carry a
-value of that shape and only two of them are relations:
+Frontmatter holds identity, metadata and relations in one map, and a relation
+target is any string, or any list of strings — that is the whole rule. In this
+node, six keys carry a value of that shape and only two of them are relations:
 
 ```yaml
 id: person:arnaud-tauveron          # identity
@@ -611,36 +610,49 @@ role: Data Scientist (@Lansweeper/cloud)
 org: ["org:lansweeper"]             # relation
 ```
 
-Auto-detection would therefore make `type: person` an edge. In a repository
-with 29 people that is one node with degree 29, and it outranks every real
-entity in `graph hubs`. `source: slack`, each `date:`, and each free-text
-`role:` become nodes too. The graph fills with metadata and the queries that
-depend on degree stop being usable. The allowlist is where you state which of
-your keys mean "points at something" — it is the taxonomy MDKB declines to
-invent, written down once.
+Nothing about the *value* separates them. What separates them is whether the
+value names something the index knows, and that is a measurement MDKB can make:
+the share of a key's values that resolve to a document, by path or by the
+identity that document declares. Free text can never score, so metadata cannot
+enter the graph. Measured on a 404-document corpus, 17 relation keys scored
+1.0 and 23 metadata keys — `type`, `name`, `date`, `role`, `status`, `github`,
+`slug`, `horizon`, `source` and the rest — scored 0.0, with no middle band.
 
-The default `["owner", "stakeholders", "themes", "related"]` is a starting
-vocabulary, not a detection. A repository that writes other keys gets a partial
-graph, and nothing reports it: the edges that were never extracted cannot show
-up in `graph dangling` or `graph hubs`. Check your own keys against the
-allowlist before you trust a traversal:
+This is why naive auto-detection was the wrong answer and measured detection is
+the right one. Guessing from shape alone would have made `type: person` an edge:
+one node with degree 29 in a repository with 29 people, outranking every real
+entity in `graph hubs`, with `source: slack`, every `date:` and every free-text
+`role:` becoming nodes beside it.
+
+`graph.relations` defaults to `"auto"`: the detected keys are unioned with
+`frontmatter_relations` on every index, and **your `config.toml` is never
+written to**. Derivation re-reads the corpus, so it follows the repository
+instead of freezing a snapshot you then maintain by hand.
 
 ```bash
-# every `key:` line in use, by frequency — read the list against your allowlist
-grep -rhoE '^[a-z_]+:' --include='*.md' . | sort | uniq -c | sort -rn
+mdkb graph relations            # every key with hits, total and score
+mdkb graph relations --apply    # write them into the allowlist (semi/manual)
 ```
 
-Measured on a 62-node operational graph: the four default keys extracted 56
-edges. Adding the twelve keys the repository actually wrote — `org`,
-`attendees`, `initiative`, `people`, `decisions`, `projects` and the rest —
-took it to 182 edges over the same files. Nothing was missing from the
-documents; the reader was configured for someone else's vocabulary.
+Set `relations = "semi"` to keep extracting only what you declared while
+SessionStart names, in one line, the keys it is not extracting. Set
+`"manual"` to hear nothing.
+
+The stakes for getting this wrong are quiet: a repository writing keys outside
+the allowlist gets a partial graph and nothing reports it, because edges that
+were never extracted cannot appear in `graph dangling` or `graph hubs`.
+Measured on a 62-node operational graph, the four default keys extracted 56
+edges; the twelve keys the repository actually wrote took it to 182 over the
+same files. Nothing was missing from the documents — the reader was configured
+for someone else's vocabulary. That is the failure `auto` removes.
 
 `supersedes`, `updates`, `corrects`, `extends` and `retracts` belong to the
-evolution subsystem. Config validation rejects them in the allowlist.
+evolution subsystem. They are never derived and config validation rejects them
+in the allowlist.
 
-After you edit the allowlist run `mdkb update --force` once. A plain `mdkb
-update` skips files whose mtime has not moved, and skips their edges with them.
+Editing the allowlist by hand still works and no longer needs `--force`: edges
+are rebuilt as a pass over the store after indexing, so the change reaches
+documents no file touched.
 
 ```bash
 mdkb graph links project.md                 # outgoing edges (owner, themes, links_to, ...)

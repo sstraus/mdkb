@@ -463,6 +463,9 @@ impl RelationDetection {
 /// Excluded before scoring: [`NEVER_DERIVED`] and the configured
 /// `identity_keys` — a key cannot be both what a document IS and what it
 /// points at.
+///
+/// A value that resolves to the document carrying it does not count either.
+/// That is a document restating its own name, not a reference to anything.
 pub fn detect_relation_keys(
     conn: &rusqlite::Connection,
     cfg: &crate::config::GraphConfig,
@@ -479,13 +482,14 @@ pub fn detect_relation_keys(
     let mut documents = 0usize;
 
     let mut stmt = conn.prepare(
-        "SELECT metadata FROM documents
+        "SELECT id, metadata FROM documents
          WHERE (status = 'current' OR status IS NULL) AND metadata IS NOT NULL",
     )?;
-    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
 
     for row in rows {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&row?) else {
+        let (doc_id, metadata) = row?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&metadata) else {
             continue;
         };
         let Some(object) = value.as_object() else {
@@ -512,8 +516,15 @@ pub fn detect_relation_keys(
                 });
             for target in refs {
                 entry.total += 1;
-                if crate::store::graph::resolve_entity_ref(conn, &target)?.is_some() {
-                    entry.hits += 1;
+                // Resolving to the document that wrote the value is not a
+                // reference, it is the document restating its own name.
+                // Measured on a live corpus: `github: "@handle"` on a person
+                // who lists that handle in `aliases:` scored 1.0 and would
+                // have added a self-loop to every such node, distorting every
+                // degree in `graph hubs`.
+                match crate::store::graph::resolve_entity_ref(conn, &target)? {
+                    Some(id) if id != doc_id => entry.hits += 1,
+                    _ => {}
                 }
             }
         }
@@ -928,6 +939,40 @@ mod relation_detection_tests {
         assert!(found.candidates.is_empty());
         assert!(!found.has_no_identity_space());
         assert_eq!(found.identities, 1);
+    }
+
+    #[test]
+    fn a_key_that_only_points_at_its_own_document_is_not_a_relation() {
+        // Measured on brainstorming/work 2026-09-21: `github: "@handle"` on a
+        // person who also lists that handle in `aliases:` resolves — to
+        // itself. Four such keys scored 1.0 and would have added four
+        // self-loops, which distort every degree in `graph hubs`. A relation
+        // points AT SOMETHING ELSE.
+        let conn = setup();
+        doc(
+            &conn,
+            "people/alice.md",
+            r#"{"id":"person:alice","aliases":["@alice"],"github":"@alice"}"#,
+        );
+        doc(
+            &conn,
+            "people/bob.md",
+            r#"{"id":"person:bob","aliases":["@bob"],"github":"@bob","knows":["person:alice"]}"#,
+        );
+
+        let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
+
+        let github = found.examined.iter().find(|c| c.key == "github").unwrap();
+        assert_eq!(
+            (github.hits, github.total),
+            (0, 2),
+            "resolving to yourself is not a reference"
+        );
+        assert!(!github.is_relation());
+        assert!(
+            found.examined.iter().any(|c| c.key == "knows" && c.is_relation()),
+            "a key pointing at another document is still a relation"
+        );
     }
 
     #[test]
