@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 28;
+pub const SCHEMA_VERSION: i32 = 29;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -373,6 +373,30 @@ CREATE INDEX IF NOT EXISTS idx_memedges_target ON memory_edges(target_ref);
 "#;
 
 /// SQL for setting BM25 column weights (title 10x, body 1x).
+/// The `document_aliases` table, kept out of `SCHEMA_SQL` because the v29
+/// migration must create it as well: `migrate_schema` is reachable without
+/// `SCHEMA_SQL` having run, and the backfill has nothing to write into
+/// otherwise. One definition, executed from both places.
+const DOCUMENT_ALIASES_SQL: &str = r#"
+-- Identities a document DECLARES for itself: `id:` and each `aliases:` entry.
+-- An edge target is stored verbatim, so a reference like `person:alice` only
+-- resolves if some document claims that name. Not a column on `documents`
+-- because `aliases:` is a list and one document may claim several names.
+--
+-- No global UNIQUE on `alias` on purpose: two documents claiming one identity
+-- is a repository defect to report, and refusing the insert would turn it into
+-- a failed index.
+CREATE TABLE IF NOT EXISTS document_aliases (
+    doc_id INTEGER NOT NULL,
+    alias  TEXT    NOT NULL,
+    source_key TEXT NOT NULL,            -- which frontmatter key declared it
+    FOREIGN KEY(doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+    UNIQUE(doc_id, alias)
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_aliases_alias ON document_aliases(alias);
+"#;
+
 const BM25_WEIGHTS_SQL: &str = r#"
 INSERT OR REPLACE INTO documents_fts(documents_fts, rank) VALUES('rank', 'bm25(10.0, 1.0)');
 "#;
@@ -389,6 +413,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
     // Create schema
     conn.execute_batch(SCHEMA_SQL)?;
+    conn.execute_batch(DOCUMENT_ALIASES_SQL)?;
 
     // Set BM25 weights
     conn.execute_batch(BM25_WEIGHTS_SQL)?;
@@ -1041,6 +1066,58 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                 "ALTER TABLE memory_entries ADD COLUMN last_audited_at INTEGER",
                 [],
             )?;
+        }
+    }
+
+    // Migration from v28 to v29: recover the identities documents already
+    // declare, from the frontmatter already in the store.
+    //
+    // `documents.metadata` holds the whole frontmatter as JSON, so the backfill
+    // is pure SQL and no file is re-read. Unlike the `ALTER TABLE` blocks above
+    // this one needs no `pragma_table_info` probe: `CREATE TABLE IF NOT EXISTS`
+    // and `INSERT OR IGNORE` are both idempotent, so a probe would always be
+    // true. The table is created here and not left to `SCHEMA_SQL` because
+    // `migrate_schema` is called directly on stores that never saw it.
+    //
+    // Every JSON call is guarded. `metadata` is free text from a frontmatter
+    // parser: it can be NULL, it can fail `json_valid`, `id:` can be a number,
+    // and `aliases:` can be a bare scalar. An unguarded `json_each` on any of
+    // those raises and takes the whole migration — and the store — with it.
+    //
+    // `id` is inserted before `aliases` on purpose: a document that repeats its
+    // `id:` inside `aliases:` keeps one row, and `UNIQUE(doc_id, alias)` makes
+    // the first writer win, so the row is attributed to `id`.
+    if from_version < 29 && table_exists(conn, "documents") {
+        conn.execute_batch(DOCUMENT_ALIASES_SQL)?;
+        let ids = conn.execute(
+            "INSERT OR IGNORE INTO document_aliases (doc_id, alias, source_key)
+             SELECT id, json_extract(metadata, '$.id'), 'id'
+             FROM documents
+             WHERE metadata IS NOT NULL
+               AND json_valid(metadata)
+               AND json_type(metadata, '$.id') = 'text'
+               AND trim(json_extract(metadata, '$.id')) <> ''",
+            [],
+        )?;
+        let aliases = conn.execute(
+            "INSERT OR IGNORE INTO document_aliases (doc_id, alias, source_key)
+             SELECT d.id, j.value, 'aliases'
+             FROM documents d,
+                  json_each(
+                      CASE WHEN d.metadata IS NOT NULL
+                            AND json_valid(d.metadata)
+                            AND json_type(d.metadata, '$.aliases') = 'array'
+                           THEN json_extract(d.metadata, '$.aliases')
+                           ELSE '[]' END
+                  ) j
+             WHERE j.type = 'text' AND trim(j.value) <> ''",
+            [],
+        )?;
+        if ids + aliases > 0 {
+            tracing::info!(
+                "migration: recovered {ids} declared id(s) and {aliases} alias(es) from \
+                 frontmatter already in the store; no reindex needed"
+            );
         }
     }
 
@@ -3033,6 +3110,164 @@ mod tests {
         assert!(
             last_audited_at.is_none(),
             "row that predates the migration must read back NULL for last_audited_at"
+        );
+    }
+
+    /// Seed a `documents` row with the given frontmatter JSON in `metadata`.
+    ///
+    /// The collection and the content row exist only to satisfy the two
+    /// foreign keys; the backfill reads neither.
+    fn seed_document(conn: &Connection, path: &str, hash: &str, metadata: &str) -> i64 {
+        conn.execute(
+            "INSERT OR IGNORE INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('docs', './docs', '**/*.md', 1, 1)",
+            [],
+        )
+        .expect("insert collection");
+        conn.execute(
+            "INSERT OR IGNORE INTO content (hash, body, created_at) VALUES (?1, 'body', 1)",
+            [hash],
+        )
+        .expect("insert content");
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, title, metadata, \
+             file_modified_at, indexed_at)
+             VALUES ('docs', ?1, ?2, 'T', ?3, 1, 1)",
+            [path, hash, metadata],
+        )
+        .expect("insert document");
+        conn.last_insert_rowid()
+    }
+
+    fn aliases_of(conn: &Connection, doc_id: i64) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT alias, source_key FROM document_aliases WHERE doc_id = ?1 \
+                 ORDER BY source_key, alias",
+            )
+            .expect("prepare");
+        stmt.query_map([doc_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect")
+    }
+
+    #[test]
+    fn test_migrate_v28_to_v29_backfills_declared_identities() {
+        // The frontmatter is already in `documents.metadata`, so the identities
+        // can be recovered in SQL without re-reading a single file.
+        let conn = setup_db();
+        // `SCHEMA_SQL` alone is the v28 shape: `document_aliases` lives in
+        // `DOCUMENT_ALIASES_SQL`, which only v29 runs.
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute_batch("INSERT INTO schema_version (version) VALUES (28);")
+            .unwrap();
+
+        let declared = seed_document(
+            &conn,
+            "people/a.md",
+            "h1",
+            r#"{"id":"person:a","aliases":["x"],"type":"person"}"#,
+        );
+        let multi = seed_document(
+            &conn,
+            "people/b.md",
+            "h2",
+            r#"{"id":"person:b","aliases":["@b","b@example.com"]}"#,
+        );
+        let bare = seed_document(&conn, "notes/c.md", "h3", r#"{"type":"note"}"#);
+        // `aliases:` written as a scalar, not a list — `json_each` would raise
+        // on it, so the backfill has to skip it rather than fail the migration.
+        let scalar = seed_document(&conn, "notes/d.md", "h4", r#"{"aliases":"solo"}"#);
+        let no_metadata = {
+            conn.execute(
+                "INSERT OR IGNORE INTO content (hash, body, created_at) VALUES ('h5', 'b', 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO documents (collection, relative_path, hash, title, \
+                 file_modified_at, indexed_at)
+                 VALUES ('docs', 'notes/e.md', 'h5', 'T', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+
+        init_schema(&conn).expect("v28→v29 migration failed");
+
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+        assert_eq!(
+            aliases_of(&conn, declared),
+            vec![
+                ("x".to_string(), "aliases".to_string()),
+                ("person:a".to_string(), "id".to_string()),
+            ],
+            "`id` and each `aliases` entry are backfilled, and nothing else is"
+        );
+        assert_eq!(
+            aliases_of(&conn, multi),
+            vec![
+                ("@b".to_string(), "aliases".to_string()),
+                ("b@example.com".to_string(), "aliases".to_string()),
+                ("person:b".to_string(), "id".to_string()),
+            ],
+            "a list of aliases contributes one row each"
+        );
+        assert!(
+            aliases_of(&conn, bare).is_empty(),
+            "a document declaring no identity key contributes no row"
+        );
+        assert!(
+            aliases_of(&conn, scalar).is_empty(),
+            "`aliases:` that is not a list is skipped, not an error"
+        );
+        assert!(
+            aliases_of(&conn, no_metadata).is_empty(),
+            "a document with NULL metadata contributes no row"
+        );
+    }
+
+    #[test]
+    fn test_document_aliases_cascade_and_unique() {
+        let conn = setup_db();
+        init_schema(&conn).expect("init_schema failed");
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        let doc = seed_document(&conn, "people/a.md", "h1", r#"{"id":"person:a"}"#);
+        conn.execute(
+            "INSERT INTO document_aliases (doc_id, alias, source_key) VALUES (?1, 'person:a', 'id')",
+            [doc],
+        )
+        .expect("insert alias");
+
+        // Two documents may claim one identity: that is a repository defect to
+        // report, never an insert failure.
+        let other = seed_document(&conn, "people/b.md", "h2", r#"{"id":"person:a"}"#);
+        conn.execute(
+            "INSERT INTO document_aliases (doc_id, alias, source_key) VALUES (?1, 'person:a', 'id')",
+            [other],
+        )
+        .expect("a duplicate claim from another document must be storable");
+
+        // The same document claiming the same alias twice is not.
+        let repeat = conn.execute(
+            "INSERT INTO document_aliases (doc_id, alias, source_key) VALUES (?1, 'person:a', 'aliases')",
+            [doc],
+        );
+        assert!(repeat.is_err(), "UNIQUE(doc_id, alias) must reject a repeat");
+
+        conn.execute("DELETE FROM documents WHERE id = ?1", [doc])
+            .expect("delete document");
+        assert!(
+            aliases_of(&conn, doc).is_empty(),
+            "aliases must cascade with the document that declared them"
+        );
+        assert_eq!(
+            aliases_of(&conn, other).len(),
+            1,
+            "another document's claim survives"
         );
     }
 }
