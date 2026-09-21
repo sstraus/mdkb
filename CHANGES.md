@@ -93,7 +93,75 @@
   **Upgrading is one-way for the store.** v28 is an additive `ALTER TABLE`, but
   `refuse_future_schema` stops an older binary opening a store a newer one has
   migrated. Install the new binary and `mdkb daemon restart` before opening a
-  store with it.
+  store with it. This release does not stop at v28: the relation work below
+  carries the store to **v30**, and the same one-way rule covers the whole jump.
+
+- **The knowledge graph decides its own relation keys, and says what it
+  measured.** `graph.frontmatter_relations` was a hand-written allowlist, so a
+  repository whose documents relate through `org:` or `attendees:` got no edges
+  from them until somebody noticed and typed the key in. The keys are now
+  derived from the corpus on every index run: a frontmatter key is a relation
+  when its values name things the index can resolve, which is a property of the
+  documents and not of anybody's memory of them.
+
+  **`graph.relations` picks who decides**, and none of the three rewrites the
+  config file:
+
+  * `auto` (default) — derive on every run and union with the allowlist. It
+    follows the repository instead of freezing a snapshot of it.
+  * `semi` — extract the allowlist only, and report what derivation found.
+    SessionStart names the keys nothing is extracting, so the finding reaches
+    somebody who can act on it.
+  * `manual` — extract the allowlist only, and report nothing.
+
+  `mdkb graph relations` shows which keys name real documents, with the counts
+  behind each; `--apply` writes the ones you accept into the config.
+
+  **A reference now resolves to the document that declared it.** `person:alice`
+  is a name, not a path, so it resolves only because some document claims it.
+  `graph.identity_keys` (`id`, `aliases`) are the keys that count as that claim,
+  indexing records them, and reference resolution falls back to them after the
+  path forms miss. A key cannot be both an identity and a relation without the
+  document pointing at itself, and a key that only points at its own document is
+  not reported as a relation.
+
+  **Editing the allowlist no longer needs `mdkb update --force`.** An allowlist
+  change reaches documents nothing else touched, which is the only way a widened
+  key is anything other than a promise about future edits.
+
+  **Schema v29 and v30.** v29 adds `document_aliases` and backfills the
+  identities documents already declared; v30 adds a table for what the detector
+  measured, left empty on purpose — nothing is inferred at migration time, and a
+  hook reading an empty table says nothing, which is the correct answer until a
+  detection has actually happened.
+
+- **Cross-repository search: one daemon answers about every repository it
+  knows.** A search, a graph query or a memory read used to mean the one store
+  the client happened to be anchored to. The daemon now keeps a map of known
+  roots in `repos.json`, seeded from `[[repos]]` in `daemon.toml` and extended
+  by every store it opens, and that map survives a restart.
+
+  **The `root` parameter is the grammar for saying which.** An absolute path is
+  itself; a bare name is resolved against the known roots by last component, and
+  an ambiguous one is refused by naming the candidates rather than picking one;
+  a comma-separated list means those repositories; `*` means all of them and is
+  accepted only by `search`, because fanning out a read is meaningful and
+  fanning out a write is not. A call with no `root` means the workspace the
+  client declared and the stores nested beneath it.
+
+  **Coverage is always stated.** A fan-out reports what it read, out of what is
+  known, and what it skipped and why — a repository that could not be opened is
+  not an empty repository, and the footer is what stops the two reading the
+  same. `daemon status` lists known and discoverable roots separately, and
+  `max_active_repos` (default 5) bounds how many stores are held open at once.
+
+- **`search.embed_nice` — embedding takes the idle cores and yields the busy
+  ones.** Default 15. `mdkb embed` lowers its own scheduling priority so a
+  backfill over a large corpus stops competing with the editor and the hooks
+  running beside it. Unix only, and one-way: measured, an unprivileged process
+  may lower its own priority and may not raise it back, which is why the call is
+  made by a process whose whole job is to embed and then exit, and never by the
+  daemon.
 
 ### Changed
 
@@ -228,7 +296,51 @@
   is the defect itself. Their evidence and old matcher stay on the row, so the
   lesson can be re-expressed by hand with a named selector.
 
+- **`mdkb update` corrects a collection pattern mdkb itself wrote.** `_root`
+  was `*.md`, which indexed the files beside the README and silently ignored
+  every subdirectory (issue #8). The fix to `**/*.md` could never reach a store
+  that had already materialised the old value, because convention detection
+  skips by collection NAME. An update now rewrites a superseded pattern and
+  prints what it changed, because widening a pattern can multiply a store's
+  index — one measured store went from 49 to 690 documents.
+
+  Only a collection mdkb wrote is eligible. mdkb may correct its own past
+  output; it may not overrule somebody who deliberately narrowed a collection,
+  and `source` is the record of which is which.
+
+- **A command that migrates the store says so.** The migration is not a schema
+  bump alone — v21 deletes memory entries with unreadable ids, v23 and v26
+  archive prior clusters, v27 moves prior candidates — so a fleet survey run
+  with a reporting command rewrites every store it reads. Both the read path and
+  the write path now announce it on stderr, naming the version they came from
+  and warning that the migration rewrites memory entries and prior clusters.
+
+- **`mdkb memory audit --format json` gained `unchecked` and
+  `near_duplicate_checked`.** A store with no embeddings for any active entry
+  used to report the same "nothing found" a real check produces. The two fields
+  say which signals could not run, so a clean report reads as a clean report.
+
 ### Fixed
+
+- **`mdkb mcp` no longer dies in a directory that holds repositories.** The
+  anchoring guard refused to start in a folder that is not itself a project,
+  which is exactly what a container of repositories is; it returned `-32000`
+  where it should have served every repository beneath it.
+
+- **A frontmatter block the parser refuses is reported, not swallowed.** It used
+  to be written as the JSON string `null`, which the v29 identity backfill and
+  `graph relations` both skip without a word — so a document with a quoting
+  mistake in its frontmatter was silently absent from the graph.
+
+- **Nine further fixes, each small and each user-visible.** `stats` reads the
+  context's config path rather than a rebuilt one; the HTTPS transport drains on
+  the return path and matches the socket's error codes; hook background work
+  outlives the hook that spawned it; confirming a promoted prior cluster renews
+  the entry it projects; an inactive neighbour neither blocks a memory write nor
+  gets pruned; `mdkb memory add --dry-run` answers the write the store would
+  actually make; `mdkb cheatsheet` stops emitting a machine-specific path;
+  quarantine salvage copies by column name rather than by position; and an
+  unknown subcommand names the ones that exist instead of only refusing.
 
 - **A `config.toml` that cannot be parsed now says why.** `load_or_default` was
   `load(path).unwrap_or_default()`. A TOML syntax error, an unknown enum value

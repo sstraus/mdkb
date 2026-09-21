@@ -92,9 +92,23 @@ Input: any JSON (ignored).
 Output always includes a compact power-feature hint in an initialized
 repository. The payload can contain, in order: an outstanding quarantine or
 projection-drift warning, the latest project-scoped handoff in full, due
-reminders, ranked memory, and the one-line feature map. The map is present even
-when the memory index is empty; disabled hooks and uninitialized repositories
-remain silent.
+reminders, ranked memory, an unextracted-relation notice, and the one-line
+feature map. The map is present even when the memory index is empty; disabled
+hooks and uninitialized repositories remain silent.
+
+**Unextracted relations.** Under `graph.relations = "semi"` only, and only when
+the detector found frontmatter keys that point at indexed documents and are not
+being extracted, one line names them with their hit counts:
+
+```
+graph: 5 frontmatter keys point at indexed documents but are not extracted
+(org 43, attendees 34, themes 28, +2). `mdkb graph relations` to see them,
+`--apply` to extract. Set graph.relations="auto" to stop asking.
+```
+
+It is one line, it names at most three keys and counts the rest, and `auto` and
+`manual` never emit it — `auto` because it already extracts them, `manual`
+because being asked is the thing that mode opts out of.
 
 ```json
 {

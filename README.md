@@ -470,6 +470,12 @@ Generate semantic embeddings (downloads ~30MB ONNX model on first run):
 mdkb embed
 ```
 
+`mdkb embed` lowers its own scheduling priority by `search.embed_nice` (default
+15) so a backfill over a large corpus yields to the editor and the hooks running
+beside it. Unix only, and one-way — an unprivileged process may lower its own
+priority and may not raise it back, which is why only this command does it and
+never the daemon. Set it to `0` to leave the priority alone.
+
 ### Audits: duplication and hidden coupling
 
 Two audits read the same index. `dup` reports what the repository says twice;
@@ -677,8 +683,32 @@ search.
 
 **[docs/cross-folder-flows.html](docs/cross-folder-flows.html)** — every
 cross-folder flow in one page: how a store is chosen for a working directory,
-why a container of repositories is refused, how collections scope folders
-inside one store, and how cross-repo search fans out and states its coverage.
+how a directory that merely holds repositories is served rather than refused,
+how collections scope folders inside one store, and how cross-repo search fans
+out and states its coverage.
+
+### Cross-repository search
+
+One daemon answers about every repository it knows. The map of known roots
+lives in `repos.json`, is seeded from `[[repos]]` in `daemon.toml`, is extended
+by every store the daemon opens, and survives a restart. `mdkb daemon status`
+lists the known and the discoverable roots separately.
+
+The MCP `root` parameter says which repositories a call means:
+
+| `root` | Means |
+| --- | --- |
+| omitted | the workspace the client declared, and every store nested beneath it |
+| `/abs/path` | that repository |
+| `mdkb` | the known root with that last path component; an ambiguous name is refused by naming the candidates |
+| `a,b` | those repositories |
+| `*` | every known repository — accepted by `search` only |
+
+`*` is search-only on purpose: fanning out a read is meaningful, fanning out a
+write is not. A fan-out always states its coverage — what it read, out of what
+is known, and what it skipped and why — because a repository that could not be
+opened is not an empty repository. `max_active_repos` in `daemon.toml`
+(default 5) bounds how many stores are held open at once.
 
 ### Memory
 
@@ -690,6 +720,11 @@ mdkb memory add pay-bill -t "Pay electricity bill" -T reminder --due-in 86400 \
 mdkb memory list
 mdkb memory search "authentication"
 mdkb memory history auth-patterns
+
+# Which stored entries deserve a fresh look. Selects from signals the store
+# already holds and decides nothing; --dry-run does not even stamp them.
+mdkb memory audit
+mdkb memory audit --format json
 
 # Export all entries to .mdkb/memory/entries/ (one .md file per entry)
 mdkb memory export
@@ -795,6 +830,19 @@ respect_gitignore = true
 [mcp]
 max_response_tokens = 50000
 max_document_tokens = 10000
+
+[search]
+# Scheduling priority `mdkb embed` gives up while it works. 0 disables it.
+embed_nice = 15
+
+[graph]
+# How the extracted relation-key set is decided:
+#   auto   — derive it from the corpus on every run, unioned with the allowlist
+#   semi   — allowlist only, and report what derivation found
+#   manual — allowlist only, and report nothing
+relations = "auto"
+# Frontmatter keys that declare what a document IS, not what it points at.
+identity_keys = ["id", "aliases"]
 ```
 
 `mdkb init` writes every setting with its default, commented out. A key mdkb does not read is ignored on load; `mdkb update` warns and names it by its dotted path.
