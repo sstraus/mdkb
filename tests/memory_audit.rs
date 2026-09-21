@@ -230,6 +230,10 @@ fn git_commit(root: &std::path::Path, message: &str) {
 /// store after a normal quarter.
 #[test]
 fn a_commit_under_a_cited_path_is_reported_only_for_an_old_entry() {
+    // Serialised against the spy test: `PATH` is process-global, and a
+    // real `git` spawned while the spy's tempdir is being dropped fails to
+    // exec at all. Measured — 1 run in 4 of this file.
+    let _lock = env_lock();
     let (_dir, root) = store_with(&[
         ("old-measurement", "problem", "measured in src/live.rs"),
         ("fresh-measurement", "problem", "also about src/live.rs"),
@@ -290,6 +294,10 @@ fn a_commit_under_a_cited_path_is_reported_only_for_an_old_entry() {
 /// matched, so drift reported nothing and the pass looked clean.
 #[test]
 fn drift_is_found_when_the_store_sits_below_the_git_root() {
+    // Serialised against the spy test: `PATH` is process-global, and a
+    // real `git` spawned while the spy's tempdir is being dropped fails to
+    // exec at all. Measured — 1 run in 4 of this file.
+    let _lock = env_lock();
     let outer = tempfile::tempdir().expect("tempdir");
     let repo = outer.path().canonicalize().expect("canonicalize");
     git(&repo, &["init", "-q"]);
@@ -369,6 +377,10 @@ fn drift_is_found_when_the_store_sits_below_the_git_root() {
 /// one signal over.
 #[test]
 fn a_drift_pass_git_could_not_run_says_so_in_the_outcome() {
+    // Serialised against the spy test: `PATH` is process-global, and a
+    // real `git` spawned while the spy's tempdir is being dropped fails to
+    // exec at all. Measured — 1 run in 4 of this file.
+    let _lock = env_lock();
     let (_dir, root) = store_with(&[("old-measurement", "problem", "measured in src/live.rs")]);
 
     git(&root, &["init", "-q"]);
@@ -529,6 +541,10 @@ fn identical_embeddings_make_both_entries_candidates() {
 /// file that never existed is prose that looked like a path.
 #[test]
 fn a_dead_reference_is_reported_and_prose_is_not() {
+    // Serialised against the spy test: `PATH` is process-global, and a
+    // real `git` spawned while the spy's tempdir is being dropped fails to
+    // exec at all. Measured — 1 run in 4 of this file.
+    let _lock = env_lock();
     let (_dir, root) = store_with(&[
         ("cites-gone", "topic", "the fix is in src/gone.rs"),
         ("cites-prose", "topic", "we weighed this and/or that.md"),
@@ -606,6 +622,10 @@ fn a_store_with_no_git_repo_reports_no_dead_reference_for_a_missing_path() {
 /// about the entry, so it belongs in `unchecked`, not `candidates`.
 #[test]
 fn a_git_failure_is_reported_as_could_not_check_not_resolved() {
+    // Serialised against the spy test: `PATH` is process-global, and a
+    // real `git` spawned while the spy's tempdir is being dropped fails to
+    // exec at all. Measured — 1 run in 4 of this file.
+    let _lock = env_lock();
     let (_dir, root) = store_with(&[("cites-gone", "topic", "the fix is in src/gone.rs")]);
 
     // A real repo, so `find_git_root` matches — but `HEAD` is corrupt enough
@@ -660,6 +680,10 @@ fn a_git_failure_is_reported_as_could_not_check_not_resolved() {
 /// layer up.
 #[test]
 fn candidates_is_empty_but_unchecked_is_not_when_git_fails_on_the_only_reference() {
+    // Serialised against the spy test: `PATH` is process-global, and a
+    // real `git` spawned while the spy's tempdir is being dropped fails to
+    // exec at all. Measured — 1 run in 4 of this file.
+    let _lock = env_lock();
     let (_dir, root) = store_with(&[("cites-gone", "topic", "the fix is in src/gone.rs")]);
 
     git(&root, &["init", "-q"]);
@@ -771,7 +795,10 @@ fn an_aged_lifecycle_entry_is_reported_out_of_the_audit() {
 }
 
 /// `PATH` is process-global, so a test that prepends a spy `git` to it must be
-/// the only one touching `PATH` while it runs. Mirrors
+/// the only one touching `PATH` while it runs — and every test that SPAWNS a
+/// real `git` has to hold this too, not only the one that writes `PATH`. A
+/// spawn that reads `PATH` while the spy's tempdir is being dropped execs a
+/// path that no longer exists and fails outright. Mirrors
 /// `tests/cli/common.rs::env_lock`, duplicated here because each top-level
 /// file under `tests/` is its own integration test binary.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
