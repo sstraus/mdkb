@@ -377,3 +377,389 @@ pub struct CollectionInfo {
     pub doc_count: i64,
 }
 const MAX_COLLECTION_NAME_LEN: usize = 100;
+
+// ==================== Relation-Key Detection ====================
+
+/// Frontmatter keys the evolution subsystem owns.
+///
+/// They point at documents and therefore score like relations, but an edge
+/// from them would duplicate a relationship `store::evolution` already models
+/// with its own semantics. Excluded from detection, never derived.
+pub const NEVER_DERIVED: &[&str] = &[
+    "supersedes",
+    "updates",
+    "corrects",
+    "extends",
+    "retracts",
+];
+
+/// The share of a key's values that must name something the index knows before
+/// the key counts as a relation.
+///
+/// Measured 2026-09-21 on `brainstorming/work`, 404 documents: 17 relation keys
+/// scored 1.0 and 23 metadata keys (`type`, `name`, `date`, `role`, `status`,
+/// `github`, `slug`, `horizon`, `source`, …) scored 0.0. There was no middle
+/// band, so any threshold strictly between 0 and 1 separates them. Half is the
+/// honest expression of "most of its values name real things" and leaves room
+/// for a corpus with a few dangling targets.
+pub const RELATION_THRESHOLD: f64 = 0.5;
+
+/// One frontmatter key, and how much of it names things the index knows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationCandidate {
+    pub key: String,
+    /// Values that resolved to a document, by path or by declared identity.
+    pub hits: usize,
+    /// Values examined. A key whose values are free text scores `hits == 0`.
+    pub total: usize,
+}
+
+impl RelationCandidate {
+    pub fn score(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / self.total as f64
+        }
+    }
+
+    pub fn is_relation(&self) -> bool {
+        self.total > 0 && self.score() >= RELATION_THRESHOLD
+    }
+}
+
+/// What a detection run looked at, not just what it concluded.
+///
+/// The empty case has two very different causes — a corpus whose keys are all
+/// metadata, and a corpus with no identity space for anything to resolve
+/// against — and a caller that cannot tell them apart will report a guess as a
+/// finding. `identities` is what separates them.
+#[derive(Debug, Clone)]
+pub struct RelationDetection {
+    /// Keys at or above [`RELATION_THRESHOLD`], best first.
+    pub candidates: Vec<RelationCandidate>,
+    /// Every key scored, including the ones that scored zero.
+    pub examined: Vec<RelationCandidate>,
+    /// Documents whose frontmatter was readable.
+    pub documents: usize,
+    /// Rows in `document_aliases`. Zero means nothing can resolve by name.
+    pub identities: usize,
+}
+
+impl RelationDetection {
+    /// True when the corpus offers nothing to resolve against, so an empty
+    /// result says nothing about the keys.
+    pub fn has_no_identity_space(&self) -> bool {
+        self.identities == 0
+    }
+}
+
+/// Which frontmatter keys name things the index knows.
+///
+/// Measured, not guessed. Free text can never score, so metadata cannot enter
+/// the graph: `type: person` only becomes a relation if some document actually
+/// declares `person` as its identity, and in a real corpus none does.
+///
+/// Excluded before scoring: [`NEVER_DERIVED`] and the configured
+/// `identity_keys` — a key cannot be both what a document IS and what it
+/// points at.
+pub fn detect_relation_keys(
+    conn: &rusqlite::Connection,
+    cfg: &crate::config::GraphConfig,
+) -> Result<RelationDetection> {
+    use std::collections::BTreeMap;
+
+    let identities: usize = conn
+        .query_row("SELECT COUNT(*) FROM document_aliases", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .unwrap_or(0) as usize;
+
+    let mut scores: BTreeMap<String, RelationCandidate> = BTreeMap::new();
+    let mut documents = 0usize;
+
+    let mut stmt = conn.prepare(
+        "SELECT metadata FROM documents
+         WHERE (status = 'current' OR status IS NULL) AND metadata IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+
+    for row in rows {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&row?) else {
+            continue;
+        };
+        let Some(object) = value.as_object() else {
+            continue;
+        };
+        documents += 1;
+
+        for key in object.keys() {
+            if NEVER_DERIVED.contains(&key.as_str())
+                || cfg.identity_keys.iter().any(|k| k == key)
+            {
+                continue;
+            }
+            let refs = crate::domain::frontmatter::extract_relation_refs(Some(&value), key);
+            if refs.is_empty() {
+                continue;
+            }
+            let entry = scores
+                .entry(key.clone())
+                .or_insert_with(|| RelationCandidate {
+                    key: key.clone(),
+                    hits: 0,
+                    total: 0,
+                });
+            for target in refs {
+                entry.total += 1;
+                if crate::store::graph::resolve_entity_ref(conn, &target)?.is_some() {
+                    entry.hits += 1;
+                }
+            }
+        }
+    }
+
+    let mut examined: Vec<RelationCandidate> = scores.into_values().collect();
+    examined.sort_by(|a, b| {
+        b.score()
+            .partial_cmp(&a.score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| b.total.cmp(&a.total))
+            .then_with(|| a.key.cmp(&b.key))
+    });
+    let candidates = examined
+        .iter()
+        .filter(|c| c.is_relation())
+        .cloned()
+        .collect();
+
+    Ok(RelationDetection {
+        candidates,
+        examined,
+        documents,
+        identities,
+    })
+}
+
+#[cfg(test)]
+mod relation_detection_tests {
+    use super::*;
+    use crate::config::GraphConfig;
+    use crate::store::schema::init_schema;
+    use rusqlite::{Connection, params};
+
+    fn setup() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('docs', './docs', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Index a document at `path` carrying `metadata`, and record every
+    /// identity it declares, exactly as `process_identities` would.
+    fn doc(conn: &Connection, path: &str, metadata: &str) -> i64 {
+        let hash = format!("h-{path}");
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES (?1, '# x', 1)",
+            params![hash],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, metadata, file_modified_at, indexed_at)
+             VALUES ('docs', ?1, ?2, ?3, 1, 1)",
+            params![path, hash, metadata],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+        let parsed: serde_json::Value = serde_json::from_str(metadata).unwrap();
+        for key in ["id", "aliases"] {
+            for alias in crate::domain::frontmatter::extract_relation_refs(Some(&parsed), key) {
+                crate::store::graph::add_alias(conn, id, &alias, key).unwrap();
+            }
+        }
+        id
+    }
+
+    /// A miniature of the measured corpus: typed people and orgs that declare
+    /// their names, meetings that point at them, and metadata that does not.
+    fn seed_typed_corpus(conn: &Connection) {
+        doc(conn, "people/alice.md", r#"{"id":"person:alice","type":"person","name":"Alice","role":"Data Scientist"}"#);
+        doc(conn, "people/bob.md", r#"{"id":"person:bob","type":"person","name":"Bob","role":"Engineer"}"#);
+        doc(conn, "orgs/acme.md", r#"{"id":"org:acme","type":"org","name":"Acme"}"#);
+        doc(
+            conn,
+            "meetings/m1.md",
+            r#"{"id":"meeting:m1","type":"meeting","date":"2026-05-01","status":"done","attendees":["person:alice","person:bob"],"org":["org:acme"],"supersedes":["person:alice"]}"#,
+        );
+        doc(
+            conn,
+            "meetings/m2.md",
+            r#"{"id":"meeting:m2","type":"meeting","date":"2026-05-02","status":"done","attendees":["person:alice"],"org":["org:acme"]}"#,
+        );
+    }
+
+    #[test]
+    fn relation_keys_score_one_and_metadata_keys_score_zero() {
+        let conn = setup();
+        seed_typed_corpus(&conn);
+
+        let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
+        let score = |k: &str| {
+            found
+                .examined
+                .iter()
+                .find(|c| c.key == k)
+                .unwrap_or_else(|| panic!("key {k} was never examined"))
+                .score()
+        };
+
+        assert_eq!(score("attendees"), 1.0);
+        assert_eq!(score("org"), 1.0);
+        assert_eq!(score("type"), 0.0, "`type: person` must not become an edge");
+        assert_eq!(score("name"), 0.0);
+        assert_eq!(score("role"), 0.0);
+        assert_eq!(score("date"), 0.0);
+        assert_eq!(score("status"), 0.0);
+
+        let keys: Vec<&str> = found.candidates.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(keys, vec!["attendees", "org"]);
+    }
+
+    #[test]
+    fn evolution_keys_are_never_derived_even_when_they_resolve() {
+        // `supersedes: [person:alice]` in the fixture resolves perfectly. It
+        // still must not appear: evolution already models that relationship.
+        let conn = setup();
+        seed_typed_corpus(&conn);
+
+        let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
+        for key in NEVER_DERIVED {
+            assert!(
+                !found.examined.iter().any(|c| &c.key == key),
+                "{key} must not even be scored"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_keys_are_not_relation_candidates() {
+        // `id` resolves to the document that wrote it — itself. A key cannot be
+        // both what a document IS and what it points at.
+        let conn = setup();
+        seed_typed_corpus(&conn);
+
+        let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
+        assert!(!found.examined.iter().any(|c| c.key == "id"));
+        assert!(!found.candidates.iter().any(|c| c.key == "id"));
+    }
+
+    #[test]
+    fn a_configured_identity_key_is_excluded_too() {
+        let conn = setup();
+        seed_typed_corpus(&conn);
+        let cfg = GraphConfig {
+            identity_keys: vec!["type".to_string()],
+            ..GraphConfig::default()
+        };
+
+        let found = detect_relation_keys(&conn, &cfg).unwrap();
+        assert!(!found.examined.iter().any(|c| c.key == "type"));
+        assert!(
+            found.examined.iter().any(|c| c.key == "id"),
+            "`id` is only excluded because it is configured as an identity key"
+        );
+    }
+
+    #[test]
+    fn a_corpus_with_no_identity_space_proposes_nothing_and_says_so() {
+        // Untyped documents, plain-text frontmatter. Returning candidates here
+        // would be a guess dressed as a measurement.
+        let conn = setup();
+        let hash = "h-plain";
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES (?1, '# x', 1)",
+            params![hash],
+        )
+        .unwrap();
+        let metadata = r#"{"owner":"Alice Smith","status":"draft"}"#;
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, metadata, file_modified_at, indexed_at)
+             VALUES ('docs', 'a.md', ?1, ?2, 1, 1)",
+            params![hash, metadata],
+        )
+        .unwrap();
+
+        let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
+        assert!(found.candidates.is_empty());
+        assert!(
+            found.has_no_identity_space(),
+            "the caller must be able to say WHY nothing was found"
+        );
+        assert_eq!(found.documents, 1);
+    }
+
+    #[test]
+    fn an_empty_result_with_an_identity_space_is_a_real_finding() {
+        // The other empty case: things CAN resolve, and these keys still do
+        // not. That is a measurement, not a missing precondition.
+        let conn = setup();
+        doc(&conn, "people/alice.md", r#"{"id":"person:alice","status":"draft"}"#);
+
+        let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
+        assert!(found.candidates.is_empty());
+        assert!(!found.has_no_identity_space());
+        assert_eq!(found.identities, 1);
+    }
+
+    #[test]
+    fn a_partly_dangling_key_is_still_a_relation() {
+        // Real corpora point at documents that are not indexed yet. A key must
+        // not stop being a relation because one of its targets is missing.
+        let conn = setup();
+        doc(&conn, "people/alice.md", r#"{"id":"person:alice"}"#);
+        doc(
+            &conn,
+            "m.md",
+            r#"{"attendees":["person:alice","person:ghost"]}"#,
+        );
+
+        let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
+        let attendees = found
+            .examined
+            .iter()
+            .find(|c| c.key == "attendees")
+            .expect("scored");
+        assert_eq!((attendees.hits, attendees.total), (1, 2));
+        assert_eq!(attendees.score(), 0.5);
+        assert!(
+            attendees.is_relation(),
+            "at the threshold, not below it: half its targets are real"
+        );
+    }
+
+    #[test]
+    fn a_path_valued_key_resolves_without_any_identity() {
+        // Detection is identity-aware, not identity-only: a key whose values
+        // are relative paths was always resolvable and must still score.
+        let conn = setup();
+        doc(&conn, "b.md", "{}");
+        doc(&conn, "a.md", r#"{"related":["b.md"]}"#);
+
+        let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
+        assert_eq!(
+            found
+                .examined
+                .iter()
+                .find(|c| c.key == "related")
+                .unwrap()
+                .score(),
+            1.0
+        );
+    }
+}
