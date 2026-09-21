@@ -44,7 +44,6 @@ pub async fn run_https_server(
 
     let server_handle = axum_server::Handle::new();
     let shutdown_handle = server_handle.clone();
-    let shutdown_gate = Arc::clone(&work_gate);
 
     // Spawn shutdown listener
     tokio::spawn(async move {
@@ -56,11 +55,6 @@ pub async fn run_https_server(
         shutdown_handle.graceful_shutdown(Some(
             crate::daemon::hook_runtime::WORK_DRAIN_GRACE + std::time::Duration::from_secs(5),
         ));
-        let _ = crate::daemon::hook_runtime::drain_in_flight_work(
-            &shutdown_gate,
-            crate::daemon::hook_runtime::WORK_DRAIN_GRACE,
-        )
-        .await;
     });
 
     axum_server::bind_rustls(addr, tls_config)
@@ -68,6 +62,17 @@ pub async fn run_https_server(
         .serve(router.into_make_service())
         .await
         .map_err(|e| crate::error::Error::mcp(format!("HTTPS server error: {e}")))?;
+
+    // On the return path, like the HTTP transport — not in the detached
+    // listener above. `main` gives the runtime one second after this function
+    // returns, and axum-server counts connections, not the `spawn_blocking`
+    // write a handler is still holding the gate across. Draining here is what
+    // makes the return mean the writes finished.
+    let _ = crate::daemon::hook_runtime::drain_in_flight_work(
+        &work_gate,
+        crate::daemon::hook_runtime::WORK_DRAIN_GRACE,
+    )
+    .await;
 
     Ok(())
 }

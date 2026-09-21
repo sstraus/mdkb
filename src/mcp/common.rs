@@ -68,7 +68,7 @@ async fn hook_handler(
     let mut params: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(value @ serde_json::Value::Object(_)) => value,
         Ok(_) => {
-            return json_rpc_parse_error("hook body must be a JSON object").into_response();
+            return json_rpc_invalid_request("hook body must be a JSON object").into_response();
         }
         Err(error) => {
             return json_rpc_parse_error(&format!("parse error: {error}")).into_response();
@@ -111,14 +111,27 @@ async fn hook_handler(
         .into_response()
 }
 
+/// A body that parsed but is not an object: the shape is wrong, not the JSON.
+///
+/// The Unix hook socket answers `-32600` here and reserves `-32700` for a
+/// `serde_json` failure. Both transports promise the same envelope, so this
+/// one says the same thing.
+fn json_rpc_invalid_request(message: &str) -> Response {
+    json_rpc_error(-32600, message)
+}
+
 fn json_rpc_parse_error(message: &str) -> Response {
+    json_rpc_error(-32700, message)
+}
+
+fn json_rpc_error(code: i32, message: &str) -> Response {
     (
         StatusCode::OK,
         [(header::CONTENT_TYPE, "application/json")],
         serde_json::json!({
             "jsonrpc": "2.0",
             "id": null,
-            "error": {"code": -32700, "message": message},
+            "error": {"code": code, "message": message},
         })
         .to_string(),
     )
