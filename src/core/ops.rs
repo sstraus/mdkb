@@ -340,7 +340,7 @@ pub struct TelemetryStatus {
 }
 
 pub fn handle_metrics_status(ctx: &Context, root: &Path) -> Result<TelemetryStatus> {
-    let config = crate::Config::load_or_default(root.join(".mdkb/config.toml"));
+    let config = crate::Config::load_or_default(&ctx.config_path);
     Ok(TelemetryStatus {
         enabled: config.telemetry.query_events,
         retention_days: config.telemetry.retention_days,
