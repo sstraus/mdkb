@@ -62,6 +62,63 @@ fn cap_rayon_global_pool() {
         .build_global();
 }
 
+/// How much nicer than its caller a dedicated embedding process runs.
+///
+/// Not a thread cap. fastembed's ONNX sessions set
+/// `with_intra_threads(available_parallelism())` and `InitOptions` exposes no
+/// knob for it at the pinned version, so the thread count is not ours to
+/// choose. Priority is, and it expresses the behaviour that was actually
+/// wanted: take every idle core, yield the moment something else wants one.
+/// A static cap cannot do the first half and a load sampler is a scheduler
+/// nobody should have to maintain.
+///
+/// Measured 2026-09-21 on 14 cores: `mdkb embed` at the caller's priority held
+/// 900–1080% and took the load average from 10 to 27. Reniced to +15 it still
+/// held 858% with the machine otherwise idle, while a higher-priority
+/// competitor ran unimpeded.
+pub const DEFAULT_EMBED_NICE: i32 = 15;
+
+/// Lower this process's scheduling priority, permanently.
+///
+/// **One-way.** Measured 2026-09-21: an unprivileged process may lower its own
+/// priority and may not raise it back — `setpriority` returns `EPERM`. So this
+/// cannot be a scoped RAII guard, and the first version of it, which tried to
+/// restore on drop, was wrong.
+///
+/// That is why the policy lives at the CLI boundary and not in this library:
+/// call it only from a process whose whole job is to embed and then exit. A
+/// daemon or MCP server that called it would answer every later hook at the
+/// lowered priority, for as long as it lived, with no way back.
+///
+/// Process-wide rather than per-thread on purpose: the CPU is burned by ORT's
+/// own worker threads, and a thread-scoped change would leave exactly the
+/// threads that matter running at full priority.
+///
+/// Returns the new priority when it changed something. `nice <= 0` is a no-op
+/// so a caller can honour a config of 0 without branching.
+pub fn lower_process_priority(nice: i32) -> Option<i32> {
+    if nice <= 0 {
+        return None;
+    }
+    // SAFETY: getpriority/setpriority on the current process. The errno dance
+    // is why `getpriority` needs it: -1 is a legal priority AND the error
+    // return, so errno must be cleared first to tell the two apart.
+    unsafe {
+        *libc::__error() = 0;
+        let current = libc::getpriority(libc::PRIO_PROCESS, 0);
+        if current == -1 && *libc::__error() != 0 {
+            tracing::debug!("embedding: could not read process priority; leaving it alone");
+            return None;
+        }
+        let target = current + nice;
+        if libc::setpriority(libc::PRIO_PROCESS, 0, target) != 0 {
+            tracing::debug!("embedding: could not lower process priority");
+            return None;
+        }
+        Some(target)
+    }
+}
+
 impl EmbeddingService {
     /// Create a new embedding service, downloading the model if needed.
     ///
@@ -256,6 +313,50 @@ mod tests {
             path.file_name().and_then(|n| n.to_str()),
             Some("models--Qdrant--all-MiniLM-L6-v2-onnx")
         );
+    }
+
+    /// Priority is per PROCESS and lowering it is IRREVERSIBLE without
+    /// privilege, so these tests share one piece of global state that nothing
+    /// can put back. Serialised, and each one only ever moves it further down
+    /// by a small amount, so the test binary ends a little nicer than it
+    /// started and nothing else is affected.
+    static PRIORITY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn current_nice() -> i32 {
+        unsafe {
+            *libc::__error() = 0;
+            libc::getpriority(libc::PRIO_PROCESS, 0)
+        }
+    }
+
+    #[test]
+    fn lowering_moves_the_process_down_by_the_requested_amount() {
+        let _serial = PRIORITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = current_nice();
+        let applied = lower_process_priority(1);
+        assert_eq!(applied, Some(before + 1));
+        assert_eq!(current_nice(), before + 1);
+    }
+
+    #[test]
+    fn lowering_is_one_way_and_the_api_does_not_pretend_otherwise() {
+        // The measurement that killed the first design: an unprivileged
+        // process cannot raise its own priority back. A scoped guard would
+        // have silently failed to restore, leaving a daemon demoted forever.
+        let _serial = PRIORITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = current_nice();
+        lower_process_priority(1);
+        let raised = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, before) };
+        assert_eq!(raised, -1, "raising priority must fail without privilege");
+        assert_eq!(current_nice(), before + 1, "and leave it where it was put");
+    }
+
+    #[test]
+    fn zero_is_a_no_op() {
+        let _serial = PRIORITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let before = current_nice();
+        assert_eq!(lower_process_priority(0), None);
+        assert_eq!(current_nice(), before, "a config of 0 changes nothing");
     }
 
     #[test]

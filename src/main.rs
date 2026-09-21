@@ -678,6 +678,20 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Embed { collection } => {
             let ctx = open_writer(&cwd)?;
+            // This process exists to embed and then exit, which is the only
+            // place the drop is safe: it cannot be undone without privilege,
+            // so a long-lived process that did it would stay demoted. See
+            // `llm::lower_process_priority` and the layering test that keeps
+            // it out of the daemon.
+            let nice = mdkb::config::Config::load_or_default(&ctx.config_path)
+                .search
+                .embed_nice;
+            if let Some(applied) = mdkb::llm::lower_process_priority(nice) {
+                eprintln!(
+                    "mdkb: embedding at nice {applied} — it takes every idle core and \
+                     yields the busy ones. Set search.embed_nice = 0 to disable."
+                );
+            }
             let result = handle_embed(&ctx, collection.as_deref())?;
             format_embed_result(&result, cli.format);
         }

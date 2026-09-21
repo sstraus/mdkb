@@ -6,7 +6,7 @@
 pub mod embeddings;
 
 #[doc(inline)]
-pub use embeddings::{EmbeddingService, cosine_similarity};
+pub use embeddings::{DEFAULT_EMBED_NICE, EmbeddingService, cosine_similarity, lower_process_priority};
 
 use std::sync::{Arc, Mutex};
 

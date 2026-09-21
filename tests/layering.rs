@@ -81,3 +81,38 @@ fn no_adapter_reaches_into_the_cli_adapter() {
         offenders.join("\n")
     );
 }
+
+/// A one-way priority drop must never be reachable from a long-lived process.
+///
+/// Measured 2026-09-21: an unprivileged process can lower its own scheduling
+/// priority and cannot raise it back. A daemon or MCP server that lowered
+/// itself while embedding would answer every later hook at that priority for
+/// as long as it lived. The policy belongs at the CLI boundary, where the
+/// process exists to do one job and then exit — so this asserts the call is
+/// not reachable from anywhere that outlives a command.
+#[test]
+fn only_a_short_lived_command_lowers_its_own_priority() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    rust_files(&root.join("src/daemon"), &mut files);
+    rust_files(&root.join("src/mcp"), &mut files);
+    rust_files(&root.join("src/core"), &mut files);
+    rust_files(&root.join("src/store"), &mut files);
+    assert!(!files.is_empty(), "the check must actually find source files");
+
+    let offenders: Vec<String> = files
+        .iter()
+        .filter(|f| {
+            std::fs::read_to_string(f)
+                .map(|c| c.contains("lower_process_priority"))
+                .unwrap_or(false)
+        })
+        .map(|f| f.display().to_string())
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "lower_process_priority is irreversible and must stay in the CLI \
+         entrypoint; found in: {offenders:?}"
+    );
+}

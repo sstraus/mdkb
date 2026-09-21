@@ -120,6 +120,15 @@ pub struct SearchConfig {
     /// memory but don't exercise embeddings.
     pub auto_embed_memory: bool,
 
+    /// How much nicer than its caller a dedicated embedding command runs.
+    ///
+    /// `mdkb embed` saturates every core — ONNX sets one worker thread per
+    /// core and exposes no cap — so it drops its own priority instead: all the
+    /// idle cores, none of the busy ones. 0 disables it. Applies only to
+    /// short-lived commands; the daemon never lowers itself, because the drop
+    /// cannot be undone without privilege.
+    pub embed_nice: i32,
+
     /// Memory-scope search tuning.
     pub memory: SearchMemoryConfig,
 }
@@ -858,6 +867,7 @@ impl Default for SearchConfig {
             auto_embed_docs: true,
             auto_embed_sessions: false,
             auto_embed_memory: true,
+            embed_nice: crate::llm::DEFAULT_EMBED_NICE,
             memory: SearchMemoryConfig::default(),
         }
     }
