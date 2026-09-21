@@ -114,15 +114,33 @@ fn print_eval_recall(runs: &[mdkb::eval::ModeRun<mdkb::eval::recall::RecallRepor
 /// deciding whether to mention it.
 fn open_reader(cwd: &std::path::Path) -> mdkb::error::Result<mdkb::core::Context> {
     let ctx = mdkb::core::Context::open_read_only_migrating(cwd)?;
+    announce_migration(&ctx, "This was a read command");
+    Ok(ctx)
+}
+
+/// Open a store for writing, and say so out loud if that migrated it.
+///
+/// The write path migrates identically and is the one an operator reaches for
+/// deliberately on an old store — `mdkb update` on a v20 repo runs every
+/// data-mutating step there is. Shipping the notice on reads alone left the
+/// higher-impact path silent, which is the half of this the first pass missed.
+fn open_writer(cwd: &std::path::Path) -> mdkb::error::Result<mdkb::core::Context> {
+    let ctx = mdkb::core::Context::open_writer_admitted(cwd)?;
+    announce_migration(&ctx, "The command you ran migrated it");
+    Ok(ctx)
+}
+
+/// One message, one owner. Both openers route here so a reader and a writer
+/// cannot drift into describing the same event differently.
+fn announce_migration(ctx: &mdkb::core::Context, lead: &str) {
     if let Some(from) = ctx.migrated_from {
         eprintln!(
-            "mdkb: migrated this store from schema v{from} to v{}. This was a read \
-             command; the migration also rewrites memory entries and prior clusters. \
-             Back up .mdkb/index.sqlite before the next one if that matters.",
+            "mdkb: migrated this store from schema v{from} to v{}. {lead}; the \
+             migration also rewrites memory entries and prior clusters. Back up \
+             .mdkb/index.sqlite before the next one if that matters.",
             mdkb::store::schema::SCHEMA_VERSION
         );
     }
-    Ok(ctx)
 }
 
 fn main() {
@@ -384,7 +402,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             let ctx = if matches!(&cmd, CollectionCommand::List) {
                 open_reader(&cwd)?
             } else {
-                Context::open_writer_admitted(&cwd)?
+                open_writer(&cwd)?
             };
             match cmd {
                 CollectionCommand::Add {
@@ -653,13 +671,13 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             format_mget_results(&results, cli.format);
         }
         Command::Update { files, force } => {
-            let ctx = Context::open_writer_admitted(&cwd)?;
+            let ctx = open_writer(&cwd)?;
             let request = UpdateRequest { files, force };
             let outcome = run_update_in_process(&ctx, &cwd, &request)?;
             format_update_outcome(&outcome, cli.format);
         }
         Command::Embed { collection } => {
-            let ctx = Context::open_writer_admitted(&cwd)?;
+            let ctx = open_writer(&cwd)?;
             let result = handle_embed(&ctx, collection.as_deref())?;
             format_embed_result(&result, cli.format);
         }
@@ -777,7 +795,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             older_than,
             export,
         } => {
-            let ctx = Context::open_writer_admitted(&cwd)?;
+            let ctx = open_writer(&cwd)?;
             let mdkb_dir = ctx.db_path.parent().expect("db_path has parent");
             let _mutation_guard = mdkb::store::mutation_lock::acquire(&ctx.db_path, "compact")?;
             mdkb::store::heal::invalidate_marker(&ctx.db_path);
@@ -863,7 +881,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         "refusing to delete query telemetry without --yes",
                     ));
                 }
-                let ctx = Context::open_writer_admitted(&cwd)?;
+                let ctx = open_writer(&cwd)?;
                 let deleted = handle_metrics_purge(&ctx)?;
                 println!("Deleted {deleted} query telemetry event(s)");
             }
@@ -977,7 +995,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             ) {
                 open_reader(&cwd)?
             } else {
-                Context::open_writer_admitted(&cwd)?
+                open_writer(&cwd)?
             };
             match cmd {
                 MemoryCommand::Add {
@@ -1203,7 +1221,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Evolve(cmd) => {
-            let ctx = Context::open_writer_admitted(&cwd)?;
+            let ctx = open_writer(&cwd)?;
             match cmd {
                 EvolveCommand::Supersedes { new, old, reason } => {
                     let id = handle_evolve_supersedes(&ctx, &new, &old, reason.as_deref())?;
@@ -1308,7 +1326,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             ) {
                 open_reader(&cwd)?
             } else {
-                Context::open_writer_admitted(&cwd)?
+                open_writer(&cwd)?
             };
             match cmd {
                 ExperimentCommand::Create {
@@ -1356,7 +1374,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Journal(cmd) => {
-            let ctx = Context::open_writer_admitted(&cwd)?;
+            let ctx = open_writer(&cwd)?;
             match cmd {
                 JournalCommand::Import { path, dry_run } => {
                     let result = mdkb::cli::handlers::handle_journal_import(
@@ -1756,7 +1774,7 @@ root=\"*\"                                                # every known repo (`m
                 sessions_path,
                 project_root,
             } => {
-                let ctx = Context::open_writer_admitted(&cwd)?;
+                let ctx = open_writer(&cwd)?;
                 let sessions_base = match sessions_path {
                     Some(p) => std::path::PathBuf::from(p),
                     None => mdkb::daemon::config::home_dir()?.join(".claude/projects"),

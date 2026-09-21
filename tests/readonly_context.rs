@@ -313,6 +313,33 @@ fn the_migrating_wrapper_says_that_it_migrated() {
     assert_eq!(v, SCHEMA_VERSION, "and it really did migrate");
 }
 
+/// The WRITE path migrates too, and it is the one an operator reaches for.
+///
+/// 139 shipped with the notice scoped to read commands, which left the higher
+/// impact path silent: `mdkb update` is what somebody deliberately runs on an
+/// old store, and it performs the same data-mutating steps. Caught by the
+/// fleet-audit agent with a controlled test — two copies of one v20 store,
+/// `stats` announced and `update` said nothing, both reaching v30.
+#[test]
+fn the_writer_reports_the_migration_too() {
+    let (_dir, root) = store();
+    set_schema_version(&root, 11);
+
+    let ctx = Context::open(&root).expect("opens and migrates");
+
+    assert_eq!(
+        ctx.migrated_from,
+        Some(11),
+        "a write open that migrated must carry it, exactly like the read path"
+    );
+}
+
+#[test]
+fn a_writer_on_a_current_store_reports_no_migration() {
+    let (_dir, root) = store();
+    assert_eq!(Context::open(&root).expect("opens").migrated_from, None);
+}
+
 /// A store already at the current version is not a migration and must not be
 /// announced as one — a notice on every command is a notice nobody reads.
 #[test]

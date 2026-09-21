@@ -323,7 +323,15 @@ impl Context {
         // Run schema migrations and vector table creation on every open.
         // This ensures tables added in newer versions (e.g. vec_memory)
         // exist even on databases created by older versions.
+        //
+        // Read BEFORE the migration, because afterwards there is nothing left
+        // to tell you it happened. The write path migrates exactly like the
+        // read one and it is the path an operator reaches for deliberately on
+        // an old store, so it owes the same answer.
+        let version_before = schema::get_schema_version(&conn).unwrap_or(None);
         schema::init_schema(&conn)?;
+        let migrated_from =
+            version_before.filter(|v| *v < schema::SCHEMA_VERSION);
         vectors::init_vector_schema(&conn)?;
         // Stats tables (sessions/call_log/query_events) so hook-call telemetry
         // and query_events work on every transport, including the daemon-less
@@ -368,7 +376,7 @@ impl Context {
             db_path,
             rebuilt_from_corruption,
             corrupt_in_use: false,
-            migrated_from: None,
+            migrated_from,
             _live_guard: Some(live_guard),
         })
     }
