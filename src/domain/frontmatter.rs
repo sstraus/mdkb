@@ -40,8 +40,21 @@ pub struct EvolutionRef {
 /// Parsed frontmatter result.
 #[derive(Debug, Clone, Default)]
 pub struct ParsedDocument {
-    /// YAML frontmatter as JSON value, if present.
+    /// YAML frontmatter as JSON value, if present AND parseable.
+    ///
+    /// `None` covers two very different documents — one with no frontmatter
+    /// block, and one whose block the parser refused. `frontmatter_error`
+    /// separates them.
     pub frontmatter: Option<Value>,
+
+    /// Why the frontmatter block was rejected, when there was one and it did
+    /// not parse.
+    ///
+    /// `None` on a document with no block at all: nothing failed, so there is
+    /// nothing to report. This field exists because the two cases were
+    /// indistinguishable, and that is how 34 documents across the fleet lost
+    /// their entire frontmatter with `mdkb update` printing no error.
+    pub frontmatter_error: Option<String>,
 
     /// Document body without frontmatter.
     pub body: String,
@@ -70,7 +83,21 @@ pub fn parse_frontmatter(content: &str) -> ParsedDocument {
     let matter = Matter::<YAML>::new();
     let result = matter.parse(content);
 
-    let frontmatter: Option<Value> = result.data.and_then(|d| d.deserialize().ok());
+    // The engine does not return an error for a block it cannot read: it
+    // hands back a Pod that deserializes cleanly to `Value::Null`. Measured
+    // 2026-09-21 — `aliases: [@sstraus]` yields `Some(Null)`, a document with
+    // no block yields `None`, and only a good block yields `Some(Object)`.
+    // So the discarded `.ok()` was never the whole story; the signal is a
+    // non-empty raw block that produced anything other than an object.
+    let raw_block = result.matter.trim().to_string();
+    let parsed_value: Option<Value> = result.data.and_then(|d| d.deserialize().ok());
+    let (frontmatter, frontmatter_error) = match parsed_value {
+        Some(value) if value.is_object() => (Some(value), None),
+        // A block was written and the parser made nothing of it.
+        _ if !raw_block.is_empty() => (None, Some(frontmatter_error_for(&raw_block))),
+        // No block at all. Nothing failed.
+        _ => (None, None),
+    };
     let body = result.content.to_string();
 
     let title = extract_title(frontmatter.as_ref(), &body);
@@ -82,6 +109,7 @@ pub fn parse_frontmatter(content: &str) -> ParsedDocument {
 
     ParsedDocument {
         frontmatter,
+        frontmatter_error,
         body,
         title,
         tags,
@@ -90,6 +118,28 @@ pub fn parse_frontmatter(content: &str) -> ParsedDocument {
         corrects,
         extends,
     }
+}
+
+/// The message a rejected frontmatter block gets.
+///
+/// Carries the block itself, truncated. A message that says only "parse
+/// failed" sends the reader through the whole file; the block is short and
+/// naming it is usually enough to see the missing quote.
+fn frontmatter_error_for(raw_block: &str) -> String {
+    const MAX: usize = 200;
+    // One line per error. The block is multi-line and a store with nineteen
+    // broken documents would otherwise print a hundred lines nobody reads.
+    let flat: String = raw_block
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    let mut shown: String = flat.chars().take(MAX).collect();
+    if flat.chars().count() > MAX {
+        shown.push('…');
+    }
+    format!("frontmatter block is not valid YAML mapping: {shown}")
 }
 
 /// Extract title from frontmatter or first H1 in body.
@@ -236,6 +286,87 @@ fn parse_evolution_ref(value: &Value) -> Option<EvolutionRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_block_that_fails_to_parse_is_distinguishable_from_no_block() {
+        // The whole defect: both used to look like "this document has no
+        // frontmatter", so nothing ever looked.
+        let broken = parse_frontmatter("---\naliases: [@sstraus]\n---\nbody");
+        assert!(
+            broken.frontmatter.is_none(),
+            "a block that did not parse yields no frontmatter, not a null one"
+        );
+        assert!(
+            broken.frontmatter_error.is_some(),
+            "and it says so: {:?}",
+            broken.frontmatter_error
+        );
+
+        let absent = parse_frontmatter("just body\n");
+        assert!(absent.frontmatter.is_none());
+        assert!(
+            absent.frontmatter_error.is_none(),
+            "a document with no block has nothing to report"
+        );
+
+        let good = parse_frontmatter("---\nowner: alice\n---\nbody");
+        assert!(good.frontmatter.is_some());
+        assert!(good.frontmatter_error.is_none());
+    }
+
+    #[test]
+    fn the_error_names_the_offending_block() {
+        // A message that says only "parse failed" sends the reader looking
+        // through a whole file. The block is short; quote it.
+        let parsed = parse_frontmatter("---\naliases: [@sstraus]\n---\nbody");
+        let error = parsed.frontmatter_error.expect("must report");
+        assert!(
+            error.contains("aliases: [@sstraus]"),
+            "the message must carry the block that failed, got: {error}"
+        );
+    }
+
+    #[test]
+    fn the_four_real_world_shapes_are_all_caught() {
+        // Measured on the live fleet 2026-09-21: 34 broken documents, four
+        // causes. Every one of them must now be reported rather than silently
+        // becoming a document with no metadata.
+        let cases = [
+            ("unquoted @ in a flow sequence", "---\naliases: [@sstraus]\n---\nb"),
+            (
+                "double-encoded list",
+                "---\ndependencies: [\"[\"720-c1c3\"\", \"\"724-ddba\"]\"]\n---\nb",
+            ),
+            (
+                "unescaped inner quotes",
+                "---\ntitle: \"P1: get_batch misreports errors as \"Not found\"\"\n---\nb",
+            ),
+            (
+                "unquoted title starting with a bracket",
+                "---\ntitle: [STALE-DEP] query-time flag\nid: x\n---\nb",
+            ),
+        ];
+        for (label, content) in cases {
+            let parsed = parse_frontmatter(content);
+            assert!(
+                parsed.frontmatter_error.is_some(),
+                "{label} must be reported, got frontmatter={:?}",
+                parsed.frontmatter
+            );
+            assert!(
+                parsed.frontmatter.is_none(),
+                "{label} must not yield usable frontmatter"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_only_document_still_gets_its_title_from_the_h1() {
+        // The failure path must not cost the document everything else.
+        let parsed = parse_frontmatter("---\naliases: [@x]\n---\n\n# Real Title\n\nbody\n");
+        assert_eq!(parsed.title.as_deref(), Some("Real Title"));
+        assert!(parsed.frontmatter_error.is_some());
+    }
 
     #[test]
     fn test_extract_relation_refs_single_string() {

@@ -584,3 +584,72 @@ fn switching_to_manual_clears_what_was_measured() {
         "manual must leave nothing behind for the hook to read"
     );
 }
+
+/// A frontmatter block the parser refuses must be reported, not swallowed.
+///
+/// Measured on the fleet 2026-09-21: 34 documents across three stores had
+/// lost their whole frontmatter and `mdkb update` had printed no error for
+/// any of them.
+#[test]
+fn a_broken_frontmatter_block_is_reported_by_update() {
+    let env = Env::new();
+    env.write("good.md", "---\nowner: alice\n---\n\n# Good\n");
+    env.write("broken.md", "---\naliases: [@sstraus]\nid: person:x\n---\n\n# Broken\n");
+
+    let result = handle_update(&env.ctx, &env.root).expect("update");
+
+    assert_eq!(
+        result.errors.len(),
+        1,
+        "exactly the broken one is reported, got: {:?}",
+        result.errors
+    );
+    let error = &result.errors[0];
+    assert!(error.contains("broken.md"), "must name the file: {error}");
+    assert!(
+        error.contains("aliases: [@sstraus]"),
+        "must carry the block: {error}"
+    );
+
+    // The document is still indexed — losing it entirely would be worse than
+    // losing its metadata — but it claims no identity it never parsed.
+    assert!(env.aliases("broken.md").is_empty());
+    assert_eq!(env.edges("good.md").len(), 1, "the good document is unaffected");
+}
+
+/// `metadata` must never be written as the JSON string `null`.
+///
+/// That value is what made the failure invisible to every later reader: the
+/// v29 identity backfill and `graph relations` both skip it without a word.
+#[test]
+fn a_broken_block_never_writes_the_json_string_null() {
+    let env = Env::new();
+    env.write("broken.md", "---\ntitle: \"a \"b\" c\"\n---\n\n# Broken\n");
+    let _ = handle_update(&env.ctx, &env.root);
+
+    let metadata: Option<String> = env
+        .ctx
+        .conn
+        .query_row(
+            "SELECT metadata FROM documents WHERE relative_path = 'broken.md'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("document is indexed");
+    assert_ne!(
+        metadata.as_deref(),
+        Some("null"),
+        "the JSON string null is what hid this class for months"
+    );
+    assert_eq!(
+        env.ctx
+            .conn
+            .query_row(
+                "SELECT count(*) FROM documents WHERE metadata = 'null'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+        0
+    );
+}

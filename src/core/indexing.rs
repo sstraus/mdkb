@@ -872,6 +872,18 @@ pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateR
     };
 
     let parsed = parse_frontmatter(&content);
+
+    // A block the parser refused is reported, never swallowed. The document
+    // is still indexed — losing it entirely is worse than losing its
+    // metadata — but the reader is told which file and which block, because
+    // the alternative is what happened to 34 documents across the fleet:
+    // their whole frontmatter gone and `update` printing no error at all.
+    if let Some(why) = &parsed.frontmatter_error {
+        result
+            .errors
+            .push(format!("{display_name}: {why}"));
+    }
+
     let now = chrono::Utc::now().timestamp();
 
     let doc = Document {
