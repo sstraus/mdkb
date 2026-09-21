@@ -285,6 +285,50 @@ fn an_older_store_is_refused_rather_than_migrated() {
     );
 }
 
+/// The migrating wrapper may migrate, but it may not do it in silence.
+///
+/// Measured 2026-09-21: a copy of a v20 store was at v30 immediately after
+/// `mdkb graph relations`, a command that only reports. The migration is not
+/// a schema bump alone — v21 deletes memory entries with unreadable ids, v23
+/// and v26 archive prior clusters, v27 moves prior candidates. 82 of 102
+/// stores on this machine are older than v28, so a fleet survey run with a
+/// report command rewrites all of them.
+#[test]
+fn the_migrating_wrapper_says_that_it_migrated() {
+    let (_dir, root) = store();
+    set_schema_version(&root, 11);
+
+    let ctx = Context::open_read_only_migrating(&root).expect("migrates and opens");
+
+    assert_eq!(
+        ctx.migrated_from,
+        Some(11),
+        "the context must carry the version it migrated from, so the caller can say so"
+    );
+
+    let conn = rusqlite::Connection::open(root.join(".mdkb/index.sqlite")).unwrap();
+    let v: i32 = conn
+        .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(v, SCHEMA_VERSION, "and it really did migrate");
+}
+
+/// A store already at the current version is not a migration and must not be
+/// announced as one — a notice on every command is a notice nobody reads.
+#[test]
+fn opening_a_current_store_reports_no_migration() {
+    let (_dir, root) = store();
+
+    let ctx = Context::open_read_only_migrating(&root).expect("opens");
+
+    assert_eq!(ctx.migrated_from, None);
+    assert_eq!(
+        Context::open_read_only(&root).expect("opens").migrated_from,
+        None,
+        "the strict reader never migrates, so it never reports one"
+    );
+}
+
 /// `mdkb search` and `mdkb stats` must work with no daemon reachable and no
 /// daemon spawnable — the read path cannot depend on the writer being up.
 #[test]

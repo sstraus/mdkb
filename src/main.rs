@@ -99,6 +99,32 @@ fn print_eval_recall(runs: &[mdkb::eval::ModeRun<mdkb::eval::recall::RecallRepor
     }
 }
 
+/// Open a store for reading, and say so out loud if that migrated it.
+///
+/// `Context::open_read_only_migrating` deliberately migrates a stale store
+/// rather than refusing: a read command that works is worth more than one
+/// that sends you to run `mdkb update` first. What it must not do is stay
+/// quiet about it. The migration is not a schema bump alone — v21 deletes
+/// memory entries with unreadable ids, v23 and v26 archive prior clusters,
+/// v27 moves prior candidates — and 82 of the 102 stores measured on this
+/// machine are older than v28, so a fleet survey run with a reporting command
+/// rewrites every one of them.
+///
+/// One place owns this message, rather than seventeen call sites each
+/// deciding whether to mention it.
+fn open_reader(cwd: &std::path::Path) -> mdkb::error::Result<mdkb::core::Context> {
+    let ctx = mdkb::core::Context::open_read_only_migrating(cwd)?;
+    if let Some(from) = ctx.migrated_from {
+        eprintln!(
+            "mdkb: migrated this store from schema v{from} to v{}. This was a read \
+             command; the migration also rewrites memory entries and prior clusters. \
+             Back up .mdkb/index.sqlite before the next one if that matters.",
+            mdkb::store::schema::SCHEMA_VERSION
+        );
+    }
+    Ok(ctx)
+}
+
 fn main() {
     // A `Result` returned from `main` is printed with `{:?}`, which for our
     // error type is the struct dump `Error { kind: .., backtrace: .. }` and
@@ -356,7 +382,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Collection(cmd) => {
             let ctx = if matches!(&cmd, CollectionCommand::List) {
-                Context::open_read_only_migrating(&cwd)?
+                open_reader(&cwd)?
             } else {
                 Context::open_writer_admitted(&cwd)?
             };
@@ -408,7 +434,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             file,
             entry_type,
         } => {
-            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let ctx = open_reader(&cwd)?;
             match scope.as_deref() {
                 Some("docs") => {
                     let results = handle_hybrid_search(
@@ -539,7 +565,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             // Read-only, and tolerant of a repository nobody has indexed: the
             // report says so and exits 0. An audit that has nothing to audit is
             // not a failure.
-            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let ctx = open_reader(&cwd)?;
             let report = run_dup(
                 &cwd,
                 Some(&ctx.conn),
@@ -573,7 +599,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Get { id, lines } => {
             use mdkb::cli::handlers::GetResult;
-            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let ctx = open_reader(&cwd)?;
 
             // Detect glob pattern (contains * or ?)
             if id.contains('*') || id.contains('?') {
@@ -622,7 +648,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             pattern,
             collection,
         } => {
-            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let ctx = open_reader(&cwd)?;
             let results = handle_mget(&ctx, &pattern, collection.as_deref())?;
             format_mget_results(&results, cli.format);
         }
@@ -736,7 +762,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::Stats { no_color } => {
-            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let ctx = open_reader(&cwd)?;
             let report = mdkb::cli::stats_report::collect_report(&ctx)?;
             if let mdkb::cli::OutputFormat::Json = cli.format {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -807,27 +833,27 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Metrics(cmd) => match cmd {
             MetricsCommand::Status => {
-                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let ctx = open_reader(&cwd)?;
                 let status = handle_metrics_status(&ctx, &cwd)?;
                 format_telemetry_status(&status, cli.format);
             }
             MetricsCommand::Show { period } => {
-                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let ctx = open_reader(&cwd)?;
                 let metrics = handle_metrics_show(&ctx, period)?;
                 format_metrics_summary(&metrics, period, cli.format);
             }
             MetricsCommand::Latency { period } => {
-                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let ctx = open_reader(&cwd)?;
                 let stats = handle_metrics_latency(&ctx)?;
                 format_latency_stats(&stats, period, cli.format);
             }
             MetricsCommand::Quality { period } => {
-                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let ctx = open_reader(&cwd)?;
                 let metrics = handle_metrics_show(&ctx, period)?;
                 format_quality_metrics(&metrics, period, cli.format);
             }
             MetricsCommand::Export { period } => {
-                let ctx = Context::open_read_only_migrating(&cwd)?;
+                let ctx = open_reader(&cwd)?;
                 let events = handle_metrics_export(&ctx, period)?;
                 format_metrics_export(&events, cli.format);
             }
@@ -949,7 +975,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     | MemoryCommand::History { .. }
                     | MemoryCommand::Export { .. }
             ) {
-                Context::open_read_only_migrating(&cwd)?
+                open_reader(&cwd)?
             } else {
                 Context::open_writer_admitted(&cwd)?
             };
@@ -1213,12 +1239,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::History { path } => {
-            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let ctx = open_reader(&cwd)?;
             let history = handle_history(&ctx, &path)?;
             format_evolution_history(&history, cli.format);
         }
         Command::Current { path } => {
-            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let ctx = open_reader(&cwd)?;
             if let Some(doc) = handle_current(&ctx, &path)? {
                 format_current_document(&doc, cli.format);
             } else {
@@ -1226,12 +1252,12 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
         }
         Command::SupersededBy { path } => {
-            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let ctx = open_reader(&cwd)?;
             let evolutions = handle_superseded_by(&ctx, &path)?;
             format_superseded_by(&evolutions, cli.format);
         }
         Command::Graph(cmd) => {
-            let ctx = Context::open_read_only_migrating(&cwd)?;
+            let ctx = open_reader(&cwd)?;
             match cmd {
                 GraphCommand::Links { entity, relation } => {
                     let edges = handle_graph_links(&ctx, &entity, relation.as_deref())?;
@@ -1280,7 +1306,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 &cmd,
                 ExperimentCommand::Status { .. } | ExperimentCommand::List { .. }
             ) {
-                Context::open_read_only_migrating(&cwd)?
+                open_reader(&cwd)?
             } else {
                 Context::open_writer_admitted(&cwd)?
             };
@@ -1459,8 +1485,10 @@ root=\"*\"                                                # every known repo (`m
 # Only `search` fans out; every other tool needs a selector naming one repo.
 # A comma always separates repos, so a path containing one is refused, not split.
 
-# A store carries a schema version. When the binary is newer, read-only commands
-# refuse rather than migrate silently — run `mdkb update` once to migrate it.
+# A store carries a schema version. When the STORE is newer than the binary,
+# every command refuses rather than touch it. When the store is OLDER, a read
+# command migrates it and says so on stderr — that migration also rewrites
+# memory entries and prior clusters, so back the store up first if it matters.
 "
             );
             if let Some(exe) = std::env::current_exe()

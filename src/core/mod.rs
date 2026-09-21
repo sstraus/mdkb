@@ -40,6 +40,17 @@ pub struct Context {
     /// malformed database. Retained so existing callers can inspect `Context`
     /// without an unrelated API break.
     pub corrupt_in_use: bool,
+    /// The schema version this store was on before
+    /// [`Context::open_read_only_migrating`] migrated it, when it did.
+    ///
+    /// `None` on every other path, including a store already current. The
+    /// migration is deliberate — a read command on a stale store is more
+    /// useful than a refusal — but it is not a schema bump alone: v21 deletes
+    /// memory entries with unreadable ids, v23 and v26 archive prior clusters,
+    /// v27 moves prior candidates. A caller that does not say it happened is
+    /// mutating data behind the user, which is what a reporting command was
+    /// doing until this field existed.
+    pub migrated_from: Option<i32>,
     /// Shared advisory lock announcing this connection for as long as the
     /// context lives, so no other process renames the database files underneath
     /// it. Never read — its whole job is to exist until drop.
@@ -357,6 +368,7 @@ impl Context {
             db_path,
             rebuilt_from_corruption,
             corrupt_in_use: false,
+            migrated_from: None,
             _live_guard: Some(live_guard),
         })
     }
@@ -438,6 +450,7 @@ impl Context {
             db_path,
             rebuilt_from_corruption: false,
             corrupt_in_use: false,
+            migrated_from: None,
             _live_guard: None,
         })
     }
@@ -462,11 +475,22 @@ impl Context {
         let root = root.as_ref();
         match Self::open_read_only(root) {
             Err(e) if matches!(e.kind(), ErrorKind::SchemaStale { .. }) => {
+                let found = match e.kind() {
+                    ErrorKind::SchemaStale { found, .. } => Some(*found),
+                    _ => None,
+                };
                 tracing::info!("{e}; migrating under the writer lock, then retrying the read");
                 // Dropped immediately: the migration is the point, the write
                 // connection is not. The read below reopens read-only.
                 drop(Self::open(root)?);
-                Self::open_read_only(root)
+                // Recorded, not merely logged: `tracing::info!` is invisible at
+                // the default level, and the caller is the only one who can
+                // tell the user that a command they read as read-only just
+                // rewrote their store.
+                Self::open_read_only(root).map(|mut ctx| {
+                    ctx.migrated_from = found;
+                    ctx
+                })
             }
             other => other,
         }
@@ -515,6 +539,7 @@ impl Context {
             db_path,
             rebuilt_from_corruption: false,
             corrupt_in_use: false,
+            migrated_from: None,
             _live_guard: Some(live_guard),
         })
     }
