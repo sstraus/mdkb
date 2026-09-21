@@ -359,6 +359,90 @@ fn drift_is_found_when_the_store_sits_below_the_git_root() {
     );
 }
 
+/// Git failing must show up in the STRUCTURED outcome, not only on stderr.
+///
+/// `--format json` is what the dashboard plugin and the MCP consumers read,
+/// and a `tracing::warn!` reaches none of them. Without a field for it a
+/// degraded audit — git absent, a corrupt `HEAD`, a repository this binary
+/// cannot read — is byte-for-byte the same as a complete one that found no
+/// drift. That is the defect `unchecked` already closes for dead references,
+/// one signal over.
+#[test]
+fn a_drift_pass_git_could_not_run_says_so_in_the_outcome() {
+    let (_dir, root) = store_with(&[("old-measurement", "problem", "measured in src/live.rs")]);
+
+    git(&root, &["init", "-q"]);
+    std::fs::create_dir_all(root.join("src")).expect("mkdir");
+    std::fs::write(root.join("src/live.rs"), "fn live() {}\n").expect("write");
+    git(&root, &["add", "src/live.rs"]);
+    git_commit(&root, "add");
+
+    {
+        let ctx = Context::open(&root).expect("open");
+        // Backdate past `stale_after_days`, or the drift pass is never reached
+        // and the test would pass for the wrong reason.
+        let long_ago = chrono::Utc::now().timestamp() - 300 * 86_400;
+        ctx.conn
+            .execute(
+                "UPDATE memory_entries SET updated_at = ?1 WHERE id = 'old-measurement'",
+                [long_ago],
+            )
+            .expect("backdate");
+    }
+
+    // Break the repository the way a real one breaks: HEAD points nowhere git
+    // can follow.
+    std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/\n").expect("corrupt HEAD");
+
+    let ctx = Context::open(&root).expect("reopen");
+    let outcome = handle_memory_audit(&ctx, false).expect("the audit still runs");
+
+    assert!(
+        !outcome.source_drift_checked,
+        "git could not answer, so the pass did not run and the report must say so"
+    );
+}
+
+/// A store that is only partly embedded must not report a complete pass.
+///
+/// The flag used to be false only when NOTHING was embedded, so three embedded
+/// entries out of nine hundred read as "checked" while 897 were never compared
+/// against anything. Partial coverage is the common state — entries written
+/// before the model was pulled, or by a path that skips auto-embed.
+#[test]
+fn a_partly_embedded_store_reports_how_far_the_duplicate_pass_reached() {
+    let (_dir, root) = store_with(&[
+        ("one", "problem", "the first entry"),
+        ("two", "problem", "the second entry"),
+        ("three", "problem", "the third entry"),
+    ]);
+
+    let ctx = Context::open(&root).expect("open");
+    // Leave one entry embedded and strip the other two: the shape a store
+    // reaches when entries were written before the model was available. Adds
+    // embed by default here, so partial coverage has to be made, not waited for.
+    ctx.conn
+        .execute(
+            "DELETE FROM memory_embeddings WHERE rowid IN \
+             (SELECT rowid FROM memory_entries WHERE id IN ('two', 'three'))",
+            [],
+        )
+        .expect("strip two embeddings");
+
+    let outcome = handle_memory_audit(&ctx, false).expect("audit");
+
+    assert!(
+        outcome.near_duplicate_checked,
+        "one embedding is still something to check against"
+    );
+    assert_eq!(outcome.near_duplicate_coverage.embedded, 1);
+    assert_eq!(outcome.near_duplicate_coverage.scanned, 3);
+    assert!(
+        !outcome.near_duplicate_coverage.complete(),
+        "and two entries were never compared against anything"
+    );
+}
+
 /// The defect story 116 closes: a store with no embeddings for any active
 /// entry (no model ever pulled, `mdkb embed` simply never run, or
 /// auto-embed-on-add disabled) must say so rather than report the same

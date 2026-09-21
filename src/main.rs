@@ -3006,6 +3006,16 @@ fn audit_gaps_text(outcome: &mdkb::core::memory_audit::AuditOutcome) -> String {
             out,
             "\nNear-duplicate check skipped: no entry has an embedding yet (run `mdkb embed`)."
         );
+    } else if !outcome.near_duplicate_coverage.complete() {
+        // "It ran" is not the same as "it looked at everything", and the
+        // difference is what the operator needs to decide whether a clean
+        // result means anything.
+        let _ = writeln!(
+            out,
+            "\nNear-duplicate check covered {} of {} entries; the rest have no embedding yet \
+             (run `mdkb embed`).",
+            outcome.near_duplicate_coverage.embedded, outcome.near_duplicate_coverage.scanned
+        );
     }
     out
 }
@@ -4977,6 +4987,11 @@ mod tests {
             candidates: Vec::new(),
             unchecked,
             near_duplicate_checked,
+            near_duplicate_coverage: mdkb::store::memory_audit::NearDuplicateCoverage {
+                embedded: if near_duplicate_checked { 3 } else { 0 },
+                scanned: 3,
+            },
+            source_drift_checked: true,
         }
     }
 

@@ -137,13 +137,36 @@ pub fn contradicting_pairs(conn: &Connection) -> Result<Vec<(String, String)>> {
 /// Pairs of active entries whose embeddings sit at or above `min_similarity`.
 ///
 /// This is the write path's own duplicate rule applied in both directions.
-/// What [`near_duplicate_pairs`] returns: whether the pass had anything to
-/// check at all, and the pairs it found — the two slugs and their similarity.
+/// What [`near_duplicate_pairs`] returns: how far the pass reached, and the
+/// pairs it found — the two slugs and their similarity.
 ///
-/// Named because the `bool` and the `Vec` must travel together: a caller that
-/// kept only the `Vec` would read an empty one as "checked, found nothing"
-/// when it can also mean "no entry has an embedding".
-pub type NearDuplicateOutcome = (bool, Vec<(String, String, f64)>);
+/// The coverage travels with the pairs because an empty `Vec` has three
+/// meanings — checked everything and found nothing, checked a tenth of the
+/// store, checked nothing at all — and only the first is a clean result. A
+/// bool could separate the third from the other two and nothing more, which
+/// made partial coverage, the common state, indistinguishable from complete.
+pub type NearDuplicateOutcome = (NearDuplicateCoverage, Vec<(String, String, f64)>);
+
+/// How much of the store the near-duplicate pass could actually see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct NearDuplicateCoverage {
+    /// Active entries that have an embedding, and so could be compared.
+    pub embedded: usize,
+    /// Active entries the audit looked at.
+    pub scanned: usize,
+}
+
+impl NearDuplicateCoverage {
+    /// Did the pass have anything at all to check against?
+    pub fn checked(&self) -> bool {
+        self.embedded > 0
+    }
+
+    /// Did it see every entry it scanned?
+    pub fn complete(&self) -> bool {
+        self.embedded >= self.scanned
+    }
+}
 
 /// `find_duplicate` refuses a NEW entry that lands this close to an existing
 /// one, but two entries written far enough apart — or before the rule existed —
@@ -177,8 +200,12 @@ pub fn near_duplicate_pairs<S: std::hash::BuildHasher>(
     ids_by_rowid: &HashMap<i64, String, S>,
 ) -> Result<NearDuplicateOutcome> {
     let embeddings = active_memory_embeddings(conn)?;
+    let coverage = NearDuplicateCoverage {
+        embedded: embeddings.len(),
+        scanned: ids_by_rowid.len(),
+    };
     if embeddings.is_empty() {
-        return Ok((false, Vec::new()));
+        return Ok((coverage, Vec::new()));
     }
 
     let mut seen = std::collections::HashSet::new();
@@ -212,7 +239,7 @@ pub fn near_duplicate_pairs<S: std::hash::BuildHasher>(
         }
     }
     out.sort_by(|a, b| b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
-    Ok((true, out))
+    Ok((coverage, out))
 }
 
 /// Embeddings of the active entries, read from the plain mirror table rather
@@ -483,7 +510,7 @@ mod tests {
             "three of the four signals need no model; the audit must run without one"
         );
         assert!(
-            !ran,
+            !ran.checked(),
             "no entry has an embedding, so the pass never actually ran"
         );
     }
@@ -519,7 +546,7 @@ mod tests {
 
         let (ran, pairs) = near_duplicate_pairs(&conn, 0.9488, &HashMap::new()).unwrap();
         assert!(
-            ran,
+            ran.checked(),
             "embeddings are stored for both entries, so the pass did run"
         );
         assert!(
@@ -531,7 +558,11 @@ mod tests {
         let ids: HashMap<i64, String> =
             HashMap::from([(rowid_a, "a".to_string()), (rowid_b, "b".to_string())]);
         let (ran, pairs) = near_duplicate_pairs(&conn, 0.9488, &ids).unwrap();
-        assert!(ran);
+        assert!(ran.checked());
+        assert!(
+            ran.complete(),
+            "both scanned entries are embedded, so the pass saw everything: {ran:?}"
+        );
         assert_eq!(
             pairs.len(),
             1,

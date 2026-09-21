@@ -112,6 +112,20 @@ pub struct AuditOutcome {
     /// "not checked", not fold into the same silence as "checked, found
     /// nothing": the two only look alike from the outside.
     pub near_duplicate_checked: bool,
+    /// How far that pass actually reached. `near_duplicate_checked` only ever
+    /// separated "no embeddings at all" from "at least one", so a store with
+    /// three embedded entries out of nine hundred reported a pass that ran —
+    /// while 897 entries were never compared against anything. Partial
+    /// coverage is the common state, not the rare one.
+    pub near_duplicate_coverage: crate::store::memory_audit::NearDuplicateCoverage,
+    /// Whether the source-drift pass ran at all.
+    ///
+    /// `false` when git could not answer — no git on PATH, a corrupt `HEAD`,
+    /// a repository this binary cannot read. The warning goes to stderr, which
+    /// no machine consumer reads, so without this field a degraded audit is
+    /// indistinguishable from a complete one in `--format json`. Same defect
+    /// class `unchecked` exists to close, one signal over.
+    pub source_drift_checked: bool,
 }
 
 /// Run an audit: select, then stamp.
@@ -155,10 +169,12 @@ fn select(
         .filter(|r| r.updated_at <= stale_cutoff)
         .map(|r| r.updated_at)
         .min();
+    let mut source_drift_checked = true;
     let changed = match oldest_stale {
         Some(since) => match crate::git::paths_changed_since(ctx.root(), since) {
             Ok(map) => map,
             Err(e) => {
+                source_drift_checked = false;
                 // Discarding this silently is the other half of the same
                 // defect class as a dead reference misread as resolved: every
                 // stale entry would lose its SourceChangedSince signal with
@@ -228,7 +244,7 @@ fn select(
     // `rows` is already the caller's own rowid->id map — no need to make
     // `near_duplicate_pairs` query it a second time.
     let ids_by_rowid: HashMap<i64, String> = rows.iter().map(|r| (r.rowid, r.id.clone())).collect();
-    let (near_duplicate_checked, near_duplicate_pairs) = memory_audit::near_duplicate_pairs(
+    let (near_duplicate_coverage, near_duplicate_pairs) = memory_audit::near_duplicate_pairs(
         &ctx.conn,
         config.near_duplicate_similarity,
         &ids_by_rowid,
@@ -304,7 +320,9 @@ fn select(
         audited_at: now,
         candidates,
         unchecked,
-        near_duplicate_checked,
+        near_duplicate_checked: near_duplicate_coverage.checked(),
+        near_duplicate_coverage,
+        source_drift_checked,
     })
 }
 
