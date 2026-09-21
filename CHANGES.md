@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 3.10.0 (2026-09-21)
+
 ### Added
 
 - **A second recall floor, and a shadow mode to decide the first one on.** The
@@ -213,6 +215,27 @@
   lesson can be re-expressed by hand with a named selector.
 
 ### Fixed
+
+- **A `config.toml` that cannot be parsed now says why.** `load_or_default` was
+  `load(path).unwrap_or_default()`. A TOML syntax error, an unknown enum value
+  or a wrong type discarded the whole file — not the one bad field, every
+  setting the user had written — while `load` had already produced a precise
+  message naming the key and the values it accepts. Nothing logged it and
+  nothing returned it, so the user read a config they had edited and a program
+  that ignored all of it. Found while adding `graph.relations`: serde correctly
+  rejects `relations = "sometimes"` and names the three valid values, and the
+  fallback threw that message away and yielded `auto`.
+
+  `Config::load_or_report` returns the defaults **and** that message.
+  `load_or_default` keeps its infallible signature and logs it through
+  `tracing`; `mdkb update` and `mdkb stats` print it on stderr — where a
+  diagnostic belongs, and the only place it can appear under `--format json`
+  without changing a shape the TUICommander dashboard plugin parses. The
+  whole-file fallback stays, now as a decision rather than an accident: a store
+  must open when its config does not, and serde aborts the entire
+  deserialisation on the first bad value, so there is no half-config to keep.
+  `docs/decisions/2026-09-21-unreadable-config-fallback.md` records why
+  per-field recovery was rejected.
 
 - **A lifecycle hook outside a project ends quietly instead of refusing.** The
   store-anchoring guard sits at the top of `run_cli` and covered every command
