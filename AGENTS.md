@@ -107,14 +107,14 @@ against the new output before closing the work.
 
 ## Testing
 
-**Run the targets your change touches, not the suite.** A commit is verified by
-the module and integration targets that cover what it edited — `cargo test --lib
+**Select tests by behavioral impact, including unchanged consumers.** A commit is verified by
+the module and integration targets that cover its impact — `cargo test --lib
 store::schema`, `cargo test --test graph_identity`. The full `cargo test` runs
 **once per batch of work**, not once per commit: it is ~7 minutes, and running it
 after every commit buys nothing the targeted run did not already prove.
 
 This paragraph used to say the opposite ("before any commit, run `cargo test`").
-It contradicted the global rule in `~/.claude/CLAUDE.md`, and on 2026-09-21 a
+It contradicted the shared test-cost policy now maintained in `~/Gits/AGENTS.md`, and on 2026-09-21 a
 session followed it and burned three full suite runs inside one batch.
 
 Never assume a failure is pre-existing — builds are green on main.
