@@ -254,6 +254,14 @@ pub fn handle_update_force(
 
     with_transaction(&ctx.conn, || {
         update_all_collections(ctx, root, &config, &collections, force, &mut result)?;
+        // Frontmatter edges are rebuilt here, after every collection, rather
+        // than per document: the allowlist lives in config and can change with
+        // no file changing, and the per-document path skips a file whose mtime
+        // has not moved. Same transaction, so a failed update leaves neither
+        // the documents nor the graph half-written.
+        if config.graph.enabled {
+            extract_edges_pass(&ctx.conn, &config.graph.frontmatter_relations)?;
+        }
         // Reclaim content rows stranded by prior updates/removes (and the
         // pre-fix backlog). No-op once the table is clean.
         documents::gc_orphaned_content(&ctx.conn)?;
@@ -863,7 +871,20 @@ pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateR
 
             if graph_cfg.enabled {
                 process_identities(&ctx.conn, doc_id, &parsed, graph_cfg);
-                process_graph_edges(&ctx.conn, doc_id, &parsed, graph_cfg);
+                // Both kinds, because this is also the single-file path the
+                // daemon watcher takes on every save, and that path runs in
+                // its own transaction with no whole-corpus pass after it.
+                // `extract_edges_pass` is a superset, not a competitor: it
+                // reaches the documents this loop SKIPPED, which is what makes
+                // an allowlist change apply without `--force`. Both write the
+                // same rows from the same data, so the overlap is idempotent.
+                replace_frontmatter_edges(
+                    &ctx.conn,
+                    doc_id,
+                    parsed.frontmatter.as_ref(),
+                    &graph_cfg.frontmatter_relations,
+                );
+                process_wikilink_edges(&ctx.conn, doc_id, &parsed, graph_cfg);
             }
         }
         Err(e) => {
@@ -1114,12 +1135,74 @@ pub(crate) fn process_identities(
     }
 }
 
-/// Populate knowledge-graph edges for a freshly indexed document.
+/// Replace a document's frontmatter-derived edges from its parsed frontmatter.
 ///
-/// Replaces the document's outgoing edges (idempotent re-index): edges from
-/// allowlisted frontmatter keys (strong) and body wikilinks (soft). Target refs
-/// are stored verbatim — dangling targets survive and resolve on later indexing.
-pub(crate) fn process_graph_edges(
+/// Target refs are stored verbatim — a dangling target survives and starts
+/// resolving once its document is indexed. Only `KIND_FRONTMATTER` rows are
+/// touched; the document's wikilinks belong to
+/// [`process_wikilink_edges`].
+pub(crate) fn replace_frontmatter_edges(
+    conn: &Connection,
+    doc_id: i64,
+    frontmatter: Option<&serde_json::Value>,
+    relations: &[String],
+) {
+    use crate::store::graph;
+
+    if let Err(e) = graph::delete_edges_for_source_kind(conn, doc_id, graph::KIND_FRONTMATTER) {
+        tracing::warn!("Graph: failed to clear frontmatter edges for doc {doc_id}: {e}");
+        return;
+    }
+
+    for key in relations {
+        for target in crate::domain::frontmatter::extract_relation_refs(frontmatter, key) {
+            if let Err(e) =
+                graph::add_edge(conn, doc_id, &target, key, graph::KIND_FRONTMATTER, None)
+            {
+                tracing::warn!("Graph: failed to add frontmatter edge '{key}->{target}': {e}");
+            }
+        }
+    }
+}
+
+/// Re-extract frontmatter edges for every current document, from the
+/// frontmatter already in the store.
+///
+/// Decoupled from document indexing on purpose. The allowlist that decides
+/// which keys become edges lives in config, so it can change with no file
+/// changing — and `update` skips a file whose mtime has not moved. Before this
+/// pass, widening `frontmatter_relations` silently did nothing until someone
+/// thought to pass `--force`.
+///
+/// Reads `documents.metadata`, never the filesystem: one query over the table
+/// rather than a re-read of every file. Body wikilinks are NOT here, because
+/// they depend on content rather than on config — see
+/// [`process_wikilink_edges`].
+pub(crate) fn extract_edges_pass(
+    conn: &Connection,
+    relations: &[String],
+) -> crate::error::Result<()> {
+    let mut stmt =
+        conn.prepare("SELECT id, metadata FROM documents WHERE status = 'current' OR status IS NULL")?;
+    let rows = stmt.query_map([], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (doc_id, metadata) = row?;
+        let frontmatter = metadata
+            .as_deref()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
+            .filter(|v| !v.is_null());
+        replace_frontmatter_edges(conn, doc_id, frontmatter.as_ref(), relations);
+    }
+    Ok(())
+}
+
+/// Replace a freshly indexed document's body-derived wikilink edges.
+///
+/// Stays on the per-document path: a wikilink is in the body, so it can only
+/// change when the file does. Only `KIND_WIKILINK` rows are touched.
+pub(crate) fn process_wikilink_edges(
     conn: &Connection,
     doc_id: i64,
     parsed: &ParsedDocument,
@@ -1127,21 +1210,9 @@ pub(crate) fn process_graph_edges(
 ) {
     use crate::store::graph;
 
-    if let Err(e) = graph::delete_edges_for_source(conn, doc_id) {
-        tracing::warn!("Graph: failed to clear edges for doc {doc_id}: {e}");
+    if let Err(e) = graph::delete_edges_for_source_kind(conn, doc_id, graph::KIND_WIKILINK) {
+        tracing::warn!("Graph: failed to clear wikilink edges for doc {doc_id}: {e}");
         return;
-    }
-
-    for key in &cfg.frontmatter_relations {
-        for target in
-            crate::domain::frontmatter::extract_relation_refs(parsed.frontmatter.as_ref(), key)
-        {
-            if let Err(e) =
-                graph::add_edge(conn, doc_id, &target, key, graph::KIND_FRONTMATTER, None)
-            {
-                tracing::warn!("Graph: failed to add frontmatter edge '{key}->{target}': {e}");
-            }
-        }
     }
 
     if cfg.include_wikilinks {

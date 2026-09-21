@@ -72,6 +72,25 @@ pub fn delete_edges_for_source(conn: &Connection, source_doc_id: i64) -> Result<
     Ok(rows)
 }
 
+/// Delete a document's outgoing edges of one kind only.
+///
+/// The two kinds have different owners: frontmatter edges are rebuilt by the
+/// post-index pass, because the allowlist that produces them lives in config
+/// and can change with no file changing. Wikilink edges come from the body and
+/// are rebuilt only when the document is re-read. Clearing both from either
+/// place would make one owner silently delete the other's work.
+pub fn delete_edges_for_source_kind(
+    conn: &Connection,
+    source_doc_id: i64,
+    source_kind: &str,
+) -> Result<usize> {
+    let rows = conn.execute(
+        "DELETE FROM edges WHERE source_doc_id = ?1 AND source_kind = ?2",
+        params![source_doc_id, source_kind],
+    )?;
+    Ok(rows)
+}
+
 /// Record a name a document declares for itself.
 ///
 /// `INSERT OR IGNORE`: a document that writes the same string under both `id:`

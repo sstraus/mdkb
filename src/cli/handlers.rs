@@ -60,7 +60,7 @@ pub use crate::core::sessions::handle_session_index;
 mod tests {
     use super::*;
     use crate::core::Context;
-    use crate::core::indexing::process_graph_edges;
+    use crate::core::indexing::{process_wikilink_edges, replace_frontmatter_edges};
     use crate::core::ops::{apply_line_range, log_slow_embed, should_embed_collection};
     use crate::domain::frontmatter::parse_frontmatter;
     use crate::store::evolution::RelationshipType;
@@ -943,13 +943,18 @@ mod tests {
         );
 
         // Re-running the hook (simulating re-index) must not duplicate edges.
+        // The two halves are called separately because they have separate
+        // owners: the post-index pass rebuilds frontmatter edges, the
+        // per-document path rebuilds wikilinks.
         let parsed = parse_frontmatter(body);
-        process_graph_edges(
+        let cfg = crate::config::GraphConfig::default();
+        replace_frontmatter_edges(
             &ctx.conn,
             doc.id,
-            &parsed,
-            &crate::config::GraphConfig::default(),
+            parsed.frontmatter.as_ref(),
+            &cfg.frontmatter_relations,
         );
+        process_wikilink_edges(&ctx.conn, doc.id, &parsed, &cfg);
         let after = graph::get_outgoing(&ctx.conn, doc.id, None).unwrap();
         assert_eq!(after.len(), 3, "re-index must be idempotent");
 

@@ -7,6 +7,7 @@
 use std::path::PathBuf;
 
 use mdkb::cli::handlers::{handle_collection_add, handle_init, handle_update};
+use mdkb::core::indexing::handle_update_files;
 use mdkb::core::Context;
 use tempfile::TempDir;
 
@@ -53,6 +54,24 @@ impl Env {
 
     fn update(&self) {
         handle_update(&self.ctx, &self.root).expect("update");
+    }
+
+    /// Every outgoing edge of the named document as `(relation, target)`.
+    fn edges(&self, relative_path: &str) -> Vec<(String, String)> {
+        let mut stmt = self
+            .ctx
+            .conn
+            .prepare(
+                "SELECT e.relation, e.target_ref
+                 FROM edges e JOIN documents d ON d.id = e.source_doc_id
+                 WHERE d.relative_path = ?1
+                 ORDER BY e.relation, e.target_ref",
+            )
+            .expect("prepare");
+        stmt.query_map([relative_path], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("query")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("collect")
     }
 
     /// `(alias, source_key)` for every identity the named document declares.
@@ -192,4 +211,171 @@ fn identity_keys_are_configurable() {
         vec![("alice".to_string(), "slug".to_string())],
         "the configured keys are the identity keys -- `id` is only the default"
     );
+}
+
+/// Widening the allowlist must reach documents already indexed.
+///
+/// Before the edge pass this silently did nothing: extraction was welded to
+/// document indexing, and `update` skips a file whose mtime has not moved. The
+/// user read a config they had edited and a graph that ignored it.
+#[test]
+fn widening_the_allowlist_applies_without_force() {
+    let env = Env::new();
+    env.write(
+        "a.md",
+        "---\nowner: alice\norg: org:acme\n---\n\n# A\n",
+    );
+    env.update();
+    assert_eq!(
+        env.edges("a.md"),
+        vec![("owner".to_string(), "alice".to_string())],
+        "`org` is not in the default allowlist yet"
+    );
+
+    let config_path = env.root.join(".mdkb/config.toml");
+    let config = std::fs::read_to_string(&config_path).expect("read config");
+    std::fs::write(
+        &config_path,
+        format!(
+            "{config}\n[graph]\nfrontmatter_relations = [\"owner\", \"org\"]\n"
+        ),
+    )
+    .expect("write config");
+
+    // No `--force`, and not one file has changed.
+    let ctx = Context::open(&env.root).expect("reopen");
+    handle_update(&ctx, &env.root).expect("update");
+    let env = Env {
+        _dir: env._dir,
+        root: env.root,
+        ctx,
+    };
+
+    assert_eq!(
+        env.edges("a.md"),
+        vec![
+            ("org".to_string(), "org:acme".to_string()),
+            ("owner".to_string(), "alice".to_string()),
+        ],
+        "the widened allowlist reaches a document nothing touched"
+    );
+}
+
+#[test]
+fn narrowing_the_allowlist_removes_the_edges_it_dropped() {
+    let env = Env::new();
+    let config_path = env.root.join(".mdkb/config.toml");
+    let base = std::fs::read_to_string(&config_path).expect("read config");
+    std::fs::write(
+        &config_path,
+        format!("{base}\n[graph]\nfrontmatter_relations = [\"owner\", \"org\"]\n"),
+    )
+    .expect("write config");
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    env.write("a.md", "---\nowner: alice\norg: org:acme\n---\n\n# A\n");
+    env.update();
+    assert_eq!(env.edges("a.md").len(), 2);
+
+    std::fs::write(
+        &config_path,
+        format!("{base}\n[graph]\nfrontmatter_relations = [\"owner\"]\n"),
+    )
+    .expect("write config");
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    handle_update(&env.ctx, &env.root).expect("update");
+
+    assert_eq!(
+        env.edges("a.md"),
+        vec![("owner".to_string(), "alice".to_string())],
+        "a key removed from the allowlist stops producing edges"
+    );
+}
+
+#[test]
+fn a_wikilink_edge_survives_the_frontmatter_pass() {
+    // The pass owns frontmatter edges because those are the ones the config
+    // decides. Wikilinks come from the body and must not be collateral.
+    let env = Env::new();
+    env.write("a.md", "---\nowner: alice\n---\n\nSee [[b]].\n");
+    env.update();
+
+    let mut found = env.edges("a.md");
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            ("links_to".to_string(), "b".to_string()),
+            ("owner".to_string(), "alice".to_string()),
+        ],
+        "both kinds coexist after a full update"
+    );
+
+    // A second update re-runs the pass over an unchanged corpus.
+    env.update();
+    let mut again = env.edges("a.md");
+    again.sort();
+    assert_eq!(again, found, "the pass is idempotent and spares the wikilink");
+}
+
+#[test]
+fn a_second_update_does_not_change_the_edge_count() {
+    let env = Env::new();
+    env.write("a.md", "---\nowner: alice\nrelated: [b.md, c.md]\n---\n\n[[b]]\n");
+    env.write("b.md", "---\nowner: bob\n---\n\n# B\n");
+    env.update();
+    let first: i64 = env
+        .ctx
+        .conn
+        .query_row("SELECT count(*) FROM edges", [], |r| r.get(0))
+        .unwrap();
+
+    env.update();
+    let second: i64 = env
+        .ctx
+        .conn
+        .query_row("SELECT count(*) FROM edges", [], |r| r.get(0))
+        .unwrap();
+
+    assert_eq!(first, second, "mdkb update twice must be idempotent");
+    assert!(first > 0, "the fixture must actually produce edges");
+}
+
+/// The single-file path is what the daemon watcher uses on every save.
+///
+/// It runs in its own transaction and never sees the whole-corpus pass, so it
+/// has to build the document's own frontmatter edges itself. Without this a
+/// newly saved file had wikilinks and no relations until someone happened to
+/// run a full `update`.
+#[test]
+fn indexing_one_named_file_builds_its_frontmatter_edges() {
+    let env = Env::new();
+    env.write("a.md", "---\nowner: alice\n---\n\nSee [[b]].\n");
+
+    handle_update_files(&env.ctx, &env.root, &["docs/a.md".to_string()]).expect("update --files");
+
+    let mut found = env.edges("a.md");
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            ("links_to".to_string(), "b".to_string()),
+            ("owner".to_string(), "alice".to_string()),
+        ],
+        "a file indexed by name gets both edge kinds"
+    );
+
+    // And re-saving it does not duplicate either kind.
+    env.rewrite("a.md", "---\nowner: alice\n---\n\nSee [[b]].\n");
+    handle_update_files(&env.ctx, &env.root, &["docs/a.md".to_string()]).expect("update --files");
+    let mut again = env.edges("a.md");
+    again.sort();
+    assert_eq!(again, found, "a second save is idempotent on both kinds");
 }
