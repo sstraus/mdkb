@@ -142,50 +142,6 @@ fn announce_migration(ctx: &mdkb::core::Context, lead: &str) {
     }
 }
 
-/// Warn BEFORE a routed mutation, because after it there is nobody to ask.
-///
-/// `open_reader`/`open_writer` own the notice for a command that runs
-/// in-process, and a routed one never reaches either: `run_cli` returns at
-/// `print_routed_result`. The daemon does the migration, has no terminal, and
-/// the result envelope has no channel to carry the fact back — so a store went
-/// from v27 to v30 through a routed `mdkb update` with nothing on stderr,
-/// while the read path announced it loudly. Both commits that exist to make
-/// migrations visible missed the path most users are on.
-///
-/// Reading the version here rather than reporting it afterwards is the better
-/// half of the accident: the operator is told before their memory entries and
-/// prior clusters are rewritten, not after. Best-effort throughout — a store
-/// that cannot be read says nothing and the command proceeds, because a
-/// warning is not worth failing a mutation over.
-fn pending_migration_notice(cwd: &std::path::Path) -> Option<String> {
-    let db = cwd.join(".mdkb/index.sqlite");
-    if !db.exists() {
-        return None;
-    }
-    let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &db,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) else {
-        return None;
-    };
-    if conn
-        .execute_batch("PRAGMA busy_timeout = 2000; PRAGMA query_only = ON;")
-        .is_err()
-    {
-        return None;
-    }
-    let found = mdkb::store::schema::get_schema_version(&conn).ok()??;
-    if found >= mdkb::store::schema::SCHEMA_VERSION {
-        return None;
-    }
-    Some(format!(
-        "mdkb: this store is at schema v{found} and the command you ran will migrate it to \
-         v{}. The migration also rewrites memory entries and prior clusters. Back up \
-         .mdkb/index.sqlite first if that matters.",
-        mdkb::store::schema::SCHEMA_VERSION
-    ))
-}
-
 /// A readable store with no registered document collections is not a healthy
 /// empty result. Keep the notice on stderr so JSON and CSV stdout stay valid.
 fn announce_no_collections(ctx: &mdkb::core::Context) -> mdkb::error::Result<()> {
@@ -417,12 +373,6 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         use mdkb::cli::hook_client::MutationFailure;
         let request = mdkb::core::routing::mutation_request(&mut cli.command, &raw_cwd, &cwd)?
             .ok_or_else(|| mdkb::Error::other("mutating command has no cli.mutate mapping"))?;
-        // Before handing the store to the daemon, not after: a routed mutation
-        // returns at `print_routed_result` and never opens the store here, so
-        // this is the only point at which the CLI can say anything about it.
-        if let Some(notice) = pending_migration_notice(&cwd) {
-            eprintln!("{notice}");
-        }
         match mdkb::cli::hook_client::call_cli_mutation(&request, &cwd).await {
             Ok(result) => {
                 print_routed_result(&cli.command, &result, cli.format)?;
@@ -4924,68 +4874,8 @@ fn command_to_json(cmd: &clap::Command) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
-
-    /// A routed mutation is the only path that can migrate a store without a
-    /// word: it returns at `print_routed_result` and never opens the store in
-    /// this process, so neither `open_reader` nor `open_writer` gets a chance
-    /// to speak. Measured before the fix: v27 to v30 through a routed
-    /// `mdkb update`, nothing on stderr.
-    #[test]
-    fn a_store_behind_the_current_schema_gets_a_notice_before_it_is_handed_over() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).expect("mkdir");
-        let conn = rusqlite::Connection::open(root.join(".mdkb/index.sqlite")).expect("open");
-        conn.execute_batch(
-            "CREATE TABLE schema_version (version INTEGER); INSERT INTO schema_version VALUES (27);",
-        )
-        .expect("seed v27");
-        drop(conn);
-
-        let notice = pending_migration_notice(&root).expect("a stale store must be announced");
-        assert!(
-            notice.contains("v27"),
-            "it names where the store is: {notice}"
-        );
-        assert!(
-            notice.contains(&format!("v{}", mdkb::store::schema::SCHEMA_VERSION)),
-            "and where it is going: {notice}"
-        );
-        assert!(
-            notice.contains("memory entries"),
-            "the cost is the point, not the version number: {notice}"
-        );
-    }
-
-    /// A store already current says nothing. A notice on every command is a
-    /// notice nobody reads.
-    #[test]
-    fn a_current_store_is_not_announced() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let root = dir.path().to_path_buf();
-        std::fs::create_dir_all(root.join(".mdkb")).expect("mkdir");
-        let conn = rusqlite::Connection::open(root.join(".mdkb/index.sqlite")).expect("open");
-        conn.execute_batch(&format!(
-            "CREATE TABLE schema_version (version INTEGER); INSERT INTO schema_version VALUES ({});",
-            mdkb::store::schema::SCHEMA_VERSION
-        ))
-        .expect("seed current");
-        drop(conn);
-
-        assert!(pending_migration_notice(&root).is_none());
-    }
-
-    /// No store, no opinion. A `mdkb init` in a fresh directory must not be
-    /// preceded by a migration warning about a file that does not exist.
-    #[test]
-    fn a_directory_with_no_store_is_not_announced() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        assert!(pending_migration_notice(dir.path()).is_none());
-    }
-
     use super::audit_date;
     use super::is_server_invocation;
-    use super::pending_migration_notice;
     use super::{McpRunMode, resolve_mcp_run_mode};
 
     use super::audit_gaps_text;
