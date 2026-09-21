@@ -1608,9 +1608,17 @@ pub fn resolve_root_selector(
         .iter()
         .map(|handle| handle.root.clone())
         .collect();
+    // Discovery is a recursive walk of every known root. Pay it only for the
+    // selectors whose answer it can change: an explicit path is itself, and
+    // walking 9355 directories to confirm that is latency charged to every
+    // interactive call for nothing.
     let known: Vec<std::path::PathBuf> = {
-        let mut set: std::collections::BTreeSet<std::path::PathBuf> =
-            registry.discoverable_roots().into_iter().collect();
+        let mut set: std::collections::BTreeSet<std::path::PathBuf> = if selector.needs_discovery()
+        {
+            registry.discoverable_roots().into_iter().collect()
+        } else {
+            registry.known_roots().into_iter().collect()
+        };
         set.extend(open.iter().cloned());
         set.into_iter().collect()
     };

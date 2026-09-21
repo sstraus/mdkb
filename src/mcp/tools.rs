@@ -137,6 +137,25 @@ impl RootSelector {
             .to_string()
     }
 
+    /// Does resolving this selector need the filesystem walk for nested
+    /// stores, or only the roots already on the map?
+    ///
+    /// `Default` and `*` mean "every store under here", which is a question
+    /// only the walk can answer. An explicit PATH is itself and reads no map
+    /// at all; a NAME is looked up among known roots, and a store nobody has
+    /// recorded can still be named, so that one needs discovery too.
+    ///
+    /// The walk visits every directory beneath every known root — on this
+    /// machine 9355 of them across 13 roots — and it was being paid on every
+    /// `get`, `memory_write` and `graph` call whose `root` was an explicit
+    /// path, where it could not change the answer.
+    pub fn needs_discovery(&self) -> bool {
+        match self {
+            Self::Default | Self::All => true,
+            Self::List(terms) => terms.iter().any(|t| matches!(t, RootTerm::Name(_))),
+        }
+    }
+
     pub fn multi_root_rejection(count: usize) -> String {
         format!(
             "This root selector names {count} repos, and only `search` fans out across \
@@ -951,5 +970,29 @@ mod tests {
             enum_values(&relates_property_schema("target_kind")),
             vec!["memory".to_string(), "doc".to_string()],
         );
+    }
+
+    #[test]
+    fn only_the_selectors_that_can_change_answer_pay_for_discovery() {
+        // An explicit path is itself: `resolve_term` returns it without ever
+        // reading the known set, so the walk cannot change the result.
+        assert!(!RootSelector::parse(Some("/a/b")).unwrap().needs_discovery());
+        assert!(
+            !RootSelector::parse(Some("/a/b,/c/d"))
+                .unwrap()
+                .needs_discovery()
+        );
+        // A name is looked up among known roots, and a nested store nobody
+        // recorded is findable only by the walk.
+        assert!(RootSelector::parse(Some("mdkb")).unwrap().needs_discovery());
+        assert!(
+            RootSelector::parse(Some("/a/b,mdkb"))
+                .unwrap()
+                .needs_discovery(),
+            "one name in the list is enough"
+        );
+        // Both of these mean "every store under here".
+        assert!(RootSelector::parse(None).unwrap().needs_discovery());
+        assert!(RootSelector::parse(Some("*")).unwrap().needs_discovery());
     }
 }
