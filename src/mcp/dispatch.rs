@@ -1600,6 +1600,7 @@ pub async fn search_impl(
 pub fn resolve_root_selector(
     registry: &RepoRegistry,
     root: Option<&str>,
+    scope: &[std::path::PathBuf],
 ) -> Result<(RootSelector, Vec<std::path::PathBuf>), McpError> {
     let selector = RootSelector::parse(root).map_err(mcp_error)?;
     let open: Vec<std::path::PathBuf> = registry
@@ -1612,6 +1613,13 @@ pub fn resolve_root_selector(
             registry.discoverable_roots().into_iter().collect();
         set.extend(open.iter().cloned());
         set.into_iter().collect()
+    };
+    // A `root`-less call means the workspace the client declared and every
+    // store nested beneath it, not whatever happens to hold a live handle.
+    let open = if selector == RootSelector::Default {
+        crate::mcp::tools::default_roots(scope, &known, &open)
+    } else {
+        open
     };
     let roots = selector.resolve(&known, &open).map_err(mcp_error)?;
     Ok((selector, roots))
@@ -1677,6 +1685,7 @@ fn format_cross_repo_coverage(
 pub async fn cross_repo_search_impl(
     registry: &RepoRegistry,
     params: &SearchParams,
+    client_scope: &[std::path::PathBuf],
 ) -> Result<(String, usize), McpError> {
     let scope = params
         .scope
@@ -1703,7 +1712,7 @@ pub async fn cross_repo_search_impl(
     // reason it has none: opening happens here, once, so the fan-out below
     // never decides whether a repo is reachable — it only searches what it was
     // handed.
-    let (_, roots) = resolve_root_selector(registry, params.root.as_deref())?;
+    let (_, roots) = resolve_root_selector(registry, params.root.as_deref(), client_scope)?;
     let targets = registry.open_read_only(&roots);
     if targets.is_empty() {
         return Err(mcp_error(
@@ -9325,7 +9334,7 @@ mod tests {
         // never reads or writes the real `~/.mdkb`.
         let registry = RepoRegistry::new(crate::DaemonConfig::default());
         let params = search_params("anything", None);
-        let err = cross_repo_search_impl(&registry, &params)
+        let err = cross_repo_search_impl(&registry, &params, &[])
             .await
             .expect_err("should error");
         let msg = err.to_string();

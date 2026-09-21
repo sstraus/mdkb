@@ -145,6 +145,30 @@ impl RootSelector {
     }
 }
 
+/// The repos a `root`-less call means, given the workspace the client declared.
+///
+/// `Default` used to mean `open`: whatever happened to have a live handle. That
+/// is an accident of LRU order, not a decision — a call from a workspace whose
+/// store was never opened answered about five unrelated repos and named none of
+/// them. `scope` is what the client said it is working on (its MCP roots), so a
+/// `root`-less call means that workspace **and every store nested beneath it**:
+/// a hierarchy is not re-indexed into one store, it is fanned out over.
+///
+/// Falls back to `open` when the scope names nothing known — a workspace with
+/// no store under it must not silently become an empty answer.
+pub fn default_roots(scope: &[PathBuf], known: &[PathBuf], open: &[PathBuf]) -> Vec<PathBuf> {
+    let within: Vec<PathBuf> = known
+        .iter()
+        .filter(|root| scope.iter().any(|s| root.starts_with(s)))
+        .cloned()
+        .collect();
+    if within.is_empty() {
+        open.to_vec()
+    } else {
+        within
+    }
+}
+
 /// Resolve one term. A path is itself; a name is looked up by last component.
 fn resolve_term(term: &RootTerm, known: &[PathBuf]) -> Result<PathBuf, String> {
     let name = match term {
@@ -633,6 +657,64 @@ pub struct SymbolAtPositionParams {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_rootless_call_means_the_workspace_and_every_store_beneath_it() {
+        let scope = [PathBuf::from("/a")];
+        let known = [
+            PathBuf::from("/a"),
+            PathBuf::from("/a/work"),
+            PathBuf::from("/a/work/people/x"),
+            PathBuf::from("/b"),
+        ];
+        let open = [PathBuf::from("/b")];
+
+        let got = default_roots(&scope, &known, &open);
+
+        assert_eq!(
+            got,
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/a/work"),
+                PathBuf::from("/a/work/people/x")
+            ],
+            "the hierarchy is fanned out over, and an unrelated open repo is not in it"
+        );
+    }
+
+    #[test]
+    fn without_a_declared_workspace_the_open_repos_still_answer() {
+        let known = [PathBuf::from("/a"), PathBuf::from("/b")];
+        let open = [PathBuf::from("/b")];
+
+        assert_eq!(default_roots(&[], &known, &open), vec![PathBuf::from("/b")]);
+    }
+
+    #[test]
+    fn a_workspace_with_no_store_beneath_it_does_not_become_an_empty_answer() {
+        let scope = [PathBuf::from("/nowhere")];
+        let known = [PathBuf::from("/a")];
+        let open = [PathBuf::from("/a")];
+
+        assert_eq!(
+            default_roots(&scope, &known, &open),
+            vec![PathBuf::from("/a")],
+            "falling back to open is better than answering about nothing"
+        );
+    }
+
+    #[test]
+    fn a_sibling_that_merely_shares_a_name_prefix_is_not_beneath_the_workspace() {
+        let scope = [PathBuf::from("/a")];
+        let known = [PathBuf::from("/a"), PathBuf::from("/ab")];
+        let open = [PathBuf::from("/ab")];
+
+        assert_eq!(
+            default_roots(&scope, &known, &open),
+            vec![PathBuf::from("/a")],
+            "/ab is not under /a"
+        );
+    }
     use super::*;
 
     #[test]

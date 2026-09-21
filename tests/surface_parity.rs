@@ -1411,7 +1411,7 @@ async fn the_duplicates_scope_is_refused_across_repositories() {
     registry.get_or_open(&repo.root).expect("register the repo");
 
     let err =
-        mdkb::mcp::dispatch::cross_repo_search_impl(&registry, &params("duplicates", "", None))
+        mdkb::mcp::dispatch::cross_repo_search_impl(&registry, &params("duplicates", "", None), &[])
             .await
             .expect_err("cross-repo duplicates must be refused");
     let msg = err.to_string();

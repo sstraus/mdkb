@@ -102,7 +102,7 @@ async fn an_open_repo_is_searched() {
     let registry = RepoRegistry::new(one_slot_config(state.path()));
     registry.get_or_open(&open).expect("open the repo");
 
-    let (output, count) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"))
+    let (output, count) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"), &[])
         .await
         .expect("search");
 
@@ -130,7 +130,7 @@ async fn a_known_repo_that_is_not_open_is_still_searched() {
     );
     assert_eq!(registry.known_roots().len(), 2, "both roots are known");
 
-    let (output, count) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"))
+    let (output, count) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"), &[])
         .await
         .expect("search");
 
@@ -159,7 +159,7 @@ async fn the_fan_out_takes_no_handle_and_evicts_nothing() {
     registry.get_or_open(&working_in).expect("open the second");
 
     let before: Vec<PathBuf> = registry.list().into_iter().map(|(p, _)| p).collect();
-    let _ = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"))
+    let _ = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"), &[])
         .await
         .expect("search");
     let after: Vec<PathBuf> = registry.list().into_iter().map(|(p, _)| p).collect();
@@ -202,7 +202,7 @@ async fn a_store_this_binary_cannot_read_is_reported_not_counted_as_empty() {
             .expect("write a schema version this binary cannot serve");
     }
 
-    let (output, count) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"))
+    let (output, count) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"), &[])
         .await
         .expect("one unreadable repo must not abort the fan-out");
 
@@ -238,7 +238,7 @@ async fn an_empty_result_states_how_much_was_searched() {
     registry.get_or_open(&first).expect("first");
     registry.get_or_open(&second).expect("second");
 
-    let (output, count) = cross_repo_search_impl(&registry, &memory_search("quelli_frast"))
+    let (output, count) = cross_repo_search_impl(&registry, &memory_search("quelli_frast"), &[])
         .await
         .expect("search");
 
@@ -261,7 +261,7 @@ async fn a_store_with_no_collections_is_not_reported_as_a_plain_no_match() {
     let registry = RepoRegistry::new(one_slot_config(state.path()));
     registry.get_or_open(&empty).expect("open empty store");
 
-    let (output, count) = cross_repo_search_impl(&registry, &memory_search("quelli_frast"))
+    let (output, count) = cross_repo_search_impl(&registry, &memory_search("quelli_frast"), &[])
         .await
         .expect("search");
 
@@ -289,7 +289,7 @@ async fn a_nested_store_is_discovered_without_being_opened_first() {
         .expect("nested index")
         .modified()
         .expect("mtime");
-    let (output, count) = cross_repo_search_impl(&registry, &memory_search("nested_signal"))
+    let (output, count) = cross_repo_search_impl(&registry, &memory_search("nested_signal"), &[])
         .await
         .expect("search");
     let after = std::fs::metadata(nested.join(".mdkb/index.sqlite"))
@@ -310,5 +310,43 @@ async fn a_nested_store_is_discovered_without_being_opened_first() {
         registry.known_roots(),
         vec![parent],
         "discovery must not register the child"
+    );
+}
+
+/// A workspace that holds a hierarchy of stores is not re-indexed into one
+/// store — it is fanned out over. Before this, a `root`-less call meant
+/// "whatever happens to hold a live handle", so a call from a workspace whose
+/// own store was never opened answered about unrelated repos and named none of
+/// the stores beneath it.
+#[test]
+fn a_rootless_default_reaches_the_stores_nested_under_the_declared_workspace() {
+    use mdkb::mcp::tools::default_roots;
+    use std::path::PathBuf;
+
+    let workspace = PathBuf::from("/ws");
+    let known = vec![
+        workspace.clone(),
+        workspace.join("work"),
+        workspace.join("work/people/hr"),
+        PathBuf::from("/elsewhere/unrelated"),
+    ];
+    // The unrelated repo is the only one with a live handle — exactly the state
+    // that made the old default answer about it.
+    let open = vec![PathBuf::from("/elsewhere/unrelated")];
+
+    let reached = default_roots(std::slice::from_ref(&workspace), &known, &open);
+
+    assert_eq!(
+        reached,
+        vec![
+            workspace.clone(),
+            workspace.join("work"),
+            workspace.join("work/people/hr"),
+        ],
+        "the hierarchy answers, the unrelated open repo does not"
+    );
+    assert!(
+        !reached.contains(&PathBuf::from("/elsewhere/unrelated")),
+        "an open repo outside the workspace must not be in a rootless answer"
     );
 }

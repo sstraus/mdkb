@@ -80,6 +80,14 @@ pub struct McpServer {
     standalone_handle: Option<Arc<RepoHandle>>,
     /// Persistent tool call counter — drives drift-gated `PRAGMA optimize`.
     persistent_call_count: Arc<AtomicU64>,
+    /// The workspace the client declared through `roots/list`, per connection.
+    ///
+    /// Recorded whether or not a store may be anchored there: this is the scope
+    /// a `root`-less call means, not a directory to create anything in. Before
+    /// it existed, an unanchorable workspace was dropped with a `tracing::warn`
+    /// nobody reads, and every tool then answered about whatever repos happened
+    /// to be open.
+    client_roots: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -156,6 +164,7 @@ impl McpServer {
             registry: None,
             standalone_handle: Some(standalone_handle),
             persistent_call_count: Arc::new(AtomicU64::new(0)),
+            client_roots: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -196,6 +205,7 @@ impl McpServer {
             registry: None,
             standalone_handle: Some(standalone_handle),
             persistent_call_count: Arc::new(AtomicU64::new(0)),
+            client_roots: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -218,6 +228,7 @@ impl McpServer {
             registry: Some(registry),
             standalone_handle: None, // global mode uses registry instead
             persistent_call_count: Arc::new(AtomicU64::new(0)),
+            client_roots: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -234,7 +245,12 @@ impl McpServer {
             .ok_or_else(|| mcp_error("Cross-repo search requires global mode (--global)."))?;
 
         let (output, result_count) =
-            super::dispatch::cross_repo_search_impl(registry, params).await?;
+            super::dispatch::cross_repo_search_impl(
+                registry,
+                params,
+                &self.client_roots.lock().await.clone(),
+            )
+            .await?;
 
         let tokens = count_tokens(&output);
         self.metrics.record_search(tokens, result_count);
@@ -252,7 +268,9 @@ impl McpServer {
     ///   names the tool that can fan out — `search` — as `root="*"` used to.
     async fn resolve_handle(&self, root: Option<&str>) -> Result<Arc<RepoHandle>, McpError> {
         if let Some(registry) = &self.registry {
-            let (selector, roots) = super::dispatch::resolve_root_selector(registry, root)?;
+            let scope = self.client_roots.lock().await.clone();
+            let (selector, roots) =
+                super::dispatch::resolve_root_selector(registry, root, &scope)?;
             if selector == RootSelector::All {
                 return Err(mcp_error(RootSelector::wildcard_rejection()));
             }
@@ -267,10 +285,28 @@ impl McpServer {
                     .map_err(|e| mcp_error(format!("{e}")))?,
                 // No `root` and several repos open is a different fact from a
                 // selector that named several: the caller has not chosen yet.
+                // No `root` and several repos in scope is a different fact from
+                // a selector that named several: the caller has not chosen yet.
+                // A workspace holding a hierarchy of stores can reach dozens, so
+                // the list is capped — every path here is charged on a turn that
+                // produced no answer, and the count plus a sample is what the
+                // caller needs to pick one.
                 _ if selector == RootSelector::Default => {
-                    let names: Vec<_> = roots.iter().map(|p| p.display().to_string()).collect();
+                    const SHOWN: usize = 5;
+                    let names: Vec<_> = roots
+                        .iter()
+                        .take(SHOWN)
+                        .map(|p| p.display().to_string())
+                        .collect();
+                    let more = roots.len().saturating_sub(names.len());
+                    let tail = if more > 0 {
+                        format!(", and {more} more — root=\"*\" searches them all")
+                    } else {
+                        String::new()
+                    };
                     return Err(mcp_error(format!(
-                        "Multiple repos registered. Specify root: {}",
+                        "{} repos are in scope. Specify root: {}{tail}",
+                        roots.len(),
                         names.join(", ")
                     )));
                 }
@@ -319,19 +355,35 @@ impl McpServer {
     /// but every client mdkb serves still sends them and the daemon's
     /// multi-repo mode has no other source for the project path.
     #[allow(deprecated)]
-    async fn sync_roots_from_peer(peer: &rmcp::Peer<RoleServer>, registry: &RepoRegistry) {
+    async fn sync_roots_from_peer(
+        peer: &rmcp::Peer<RoleServer>,
+        registry: &RepoRegistry,
+        client_roots: &Mutex<Vec<PathBuf>>,
+    ) {
         match peer.list_roots().await {
             Ok(result) => {
                 for root in &result.roots {
                     if let Some(path) = uri_to_path(&root.uri) {
+                        // Record the workspace before deciding anything about
+                        // anchoring. A directory that may hold no store is still
+                        // the scope the caller is working in, and dropping it is
+                        // what made a `root`-less call answer about unrelated
+                        // repos (story 141-2032).
+                        let scope = path.canonicalize().unwrap_or_else(|_| path.clone());
+                        {
+                            let mut roots = client_roots.lock().await;
+                            if !roots.contains(&scope) {
+                                roots.push(scope);
+                            }
+                        }
                         // Anchor the client-provided root the same way hooks do
                         // (nearest existing store → git root → launch dir) so
                         // MCP and hooks converge on one store per project even
                         // when the client launched in a sub-directory.
                         let Some(anchor) = crate::git::resolve_project_root(&path, None) else {
-                            tracing::warn!(
-                                "Ignoring root {}: it holds git repositories (or is $HOME), so a \
-                                 store there would anchor every repo underneath it",
+                            tracing::info!(
+                                "No store may be anchored at {}: it holds git repositories (or is \
+                                 $HOME). Kept as the fan-out scope; stores nested below it answer.",
                                 path.display()
                             );
                             continue;
@@ -558,7 +610,11 @@ impl McpServer {
         // A list naming more than one repo fans out too.
         if let Some(registry) = &self.registry {
             let (_, roots) =
-                super::dispatch::resolve_root_selector(registry, params.root.as_deref())?;
+                super::dispatch::resolve_root_selector(
+                    registry,
+                    params.root.as_deref(),
+                    &self.client_roots.lock().await.clone(),
+                )?;
             if roots.len() > 1 {
                 return self.cross_repo_search(&params).await;
             }
@@ -939,8 +995,9 @@ impl ServerHandler for McpServer {
             // peer's `roots/list` reply is not guaranteed (tests, hooks).
             let registry = Arc::clone(registry);
             let peer = context.peer.clone();
+            let client_roots = Arc::clone(&self.client_roots);
             tokio::spawn(async move {
-                Self::sync_roots_from_peer(&peer, &registry).await;
+                Self::sync_roots_from_peer(&peer, &registry, &client_roots).await;
             });
         }
     }
@@ -949,8 +1006,9 @@ impl ServerHandler for McpServer {
         if let Some(registry) = &self.registry {
             let registry = Arc::clone(registry);
             let peer = context.peer.clone();
+            let client_roots = Arc::clone(&self.client_roots);
             tokio::spawn(async move {
-                Self::sync_roots_from_peer(&peer, &registry).await;
+                Self::sync_roots_from_peer(&peer, &registry, &client_roots).await;
             });
         }
     }
@@ -4308,10 +4366,19 @@ if (require.main === module) {
 
         let server = McpServer::global(registry);
         let err = server.resolve_handle(None).await.unwrap_err();
+        let text = format!("{err:?}");
+        // The contract is unchanged: a tool that reads one repo, given no
+        // choice and several candidates, refuses and says which. Only the
+        // wording moved, because a workspace holding a hierarchy can reach
+        // dozens and the list is now capped.
         assert!(
-            format!("{:?}", err).contains("Multiple repos"),
-            "Should error listing roots: {:?}",
-            err
+            text.contains("2 repos are in scope"),
+            "must state how many it could not choose between: {text}"
+        );
+        assert!(
+            text.contains(&tmp1.path().display().to_string())
+                || text.contains(&tmp2.path().display().to_string()),
+            "must name the roots it means: {text}"
         );
     }
 
