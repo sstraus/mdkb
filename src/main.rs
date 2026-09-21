@@ -672,6 +672,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Update { files, force } => {
             let ctx = open_writer(&cwd)?;
+            report_unreadable_config(&ctx.config_path);
             let request = UpdateRequest { files, force };
             let outcome = run_update_in_process(&ctx, &cwd, &request)?;
             format_update_outcome(&outcome, cli.format);
@@ -795,6 +796,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Stats { no_color } => {
             let ctx = open_reader(&cwd)?;
+            report_unreadable_config(&ctx.config_path);
             let report = mdkb::cli::stats_report::collect_report(&ctx)?;
             if let mdkb::cli::OutputFormat::Json = cli.format {
                 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -4130,6 +4132,23 @@ fn format_code_index_stats(stats: &mdkb::code::indexing::types::IndexStats, form
 /// which the MCP surface shares — the daemon answers interactive searches from
 /// a long-lived process, and backgrounding that would make every search pay for
 /// an audit nobody asked it to run.
+/// Tell the user, on stderr, that the config they wrote is being ignored.
+///
+/// `Config::load_or_default` warns through `tracing`, which reaches a log file
+/// and not the person who just edited `config.toml` and is now reading a store
+/// that behaves as if the file were empty. `update` and `stats` are the two
+/// commands that user runs to find out what the store is doing, so they are the
+/// two that say it out loud. stderr rather than stdout, and not a field on the
+/// result: it is a diagnostic, and it has to appear under `--format json` too
+/// without changing a shape the dashboard plugin parses.
+fn report_unreadable_config(config_path: &std::path::Path) {
+    let (_, problem) = mdkb::config::Config::load_or_report(config_path);
+    if let Some(problem) = problem {
+        eprintln!("mdkb: config.toml unreadable — using built-in defaults");
+        eprintln!("  {problem}");
+    }
+}
+
 fn run_dup(
     root: &std::path::Path,
     memory: Option<&rusqlite::Connection>,

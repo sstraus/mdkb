@@ -1010,9 +1010,44 @@ impl Config {
         Ok(config)
     }
 
-    /// Load configuration or return defaults if file doesn't exist.
+    /// Load configuration, or fall back to the built-in defaults and say why.
+    ///
+    /// The fallback is whole-file and deliberate: a store must still open when
+    /// its config does not parse, and serde aborts the entire deserialisation
+    /// on the first bad value, so there is no half-config left to keep. What
+    /// was *not* deliberate is losing the reason. [`Config::load`] already
+    /// produces a precise message — the key, the value it rejected, and the
+    /// values it accepts — and returning `Config::default()` on its own threw
+    /// that away, leaving a user who edited a file and a program that ignored
+    /// every line of it with nothing to go on. The second element carries the
+    /// message so a caller can put it in front of that user.
+    ///
+    /// An absent file is not a problem: that is the normal state of a store
+    /// nobody has configured, and it reports `None`.
+    pub fn load_or_report(path: impl AsRef<Path>) -> (Self, Option<String>) {
+        let path = path.as_ref();
+        match Self::load(path) {
+            Ok(config) => (config, None),
+            Err(e) if matches!(e.kind(), ErrorKind::ConfigNotFound { .. }) => {
+                (Self::default(), None)
+            }
+            Err(e) => (Self::default(), Some(format!("{}: {e}", path.display()))),
+        }
+    }
+
+    /// Load configuration or return defaults if the file doesn't exist.
+    ///
+    /// A file that exists but cannot be read is logged and then treated as
+    /// absent; a caller that must tell the user rather than the log uses
+    /// [`Config::load_or_report`].
     pub fn load_or_default(path: impl AsRef<Path>) -> Self {
-        Self::load(path).unwrap_or_default()
+        let (config, problem) = Self::load_or_report(path);
+        if let Some(problem) = problem {
+            tracing::warn!(
+                "{problem} \u{2014} every setting in that file is ignored, built-in defaults are in use"
+            );
+        }
+        config
     }
 
     /// Save configuration to a TOML file.
@@ -1444,6 +1479,59 @@ strategy = "invalid_strategy"
     fn test_load_or_default_nonexistent() {
         let config = Config::load_or_default("/nonexistent/config.toml");
         assert_eq!(config.memory.warmup_limit, DEFAULT_WARMUP_LIMIT);
+    }
+
+    #[test]
+    fn a_config_that_cannot_be_parsed_is_reported_not_swallowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[memory]\nwarmup_limit = \"twelve\"\n").unwrap();
+
+        let (config, problem) = Config::load_or_report(&config_path);
+
+        assert_eq!(config.memory.warmup_limit, DEFAULT_WARMUP_LIMIT);
+        let problem = problem.expect("a config that does not parse must be reported");
+        assert!(
+            problem.contains("warmup_limit"),
+            "must name the key: {problem}"
+        );
+        assert!(
+            problem.contains("config.toml"),
+            "must name the file: {problem}"
+        );
+    }
+
+    #[test]
+    fn an_absent_config_is_not_a_problem_to_report() {
+        let (config, problem) = Config::load_or_report("/nonexistent/config.toml");
+
+        assert_eq!(config.memory.warmup_limit, DEFAULT_WARMUP_LIMIT);
+        assert!(
+            problem.is_none(),
+            "an unconfigured store is the normal case, not a failure: {problem:?}"
+        );
+    }
+
+    /// The decided fallback, pinned: one bad value costs the whole file, and
+    /// the user is told rather than left to wonder why an edit did nothing.
+    #[test]
+    fn one_invalid_value_loses_the_whole_file_and_the_user_is_told() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[memory]\nwarmup_limit = 42\n\n[chunking]\nstrategy = \"invalid_strategy\"\n",
+        )
+        .unwrap();
+
+        let (config, problem) = Config::load_or_report(&config_path);
+
+        assert_eq!(
+            config.memory.warmup_limit, DEFAULT_WARMUP_LIMIT,
+            "the valid setting goes with the invalid one"
+        );
+        let problem = problem.expect("the loss must be reported, never silent");
+        assert!(problem.contains("strategy"), "must name the key: {problem}");
     }
 
     #[test]

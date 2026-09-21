@@ -2573,3 +2573,36 @@ fn smoke_graph_relations_without_an_identity_space_says_why() {
         "an empty result must distinguish 'no identity space' from 'no relations', got: {out}"
     );
 }
+
+/// A config that does not parse costs the user every setting in it. The two
+/// commands a user runs to find out what the store is doing say so, on stderr,
+/// instead of leaving the loss to the log nobody reads.
+#[test]
+fn smoke_an_unreadable_config_is_reported_by_update_and_stats() {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.root.join(".mdkb/config.toml"),
+        "[chunking]\nstrategy = \"invalid_strategy\"\n",
+    )
+    .unwrap();
+
+    let out = run(&["update"], &repo.root);
+    assert_ok(&out, "update with an unreadable config");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        err.contains("config.toml") && err.contains("defaults"),
+        "update must say the config was ignored, got stderr: {err}"
+    );
+    assert!(
+        err.contains("strategy"),
+        "update must carry the parser's reason, got stderr: {err}"
+    );
+
+    let out = run(&["stats"], &repo.root);
+    assert_ok(&out, "stats with an unreadable config");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert!(
+        err.contains("config.toml") && err.contains("defaults"),
+        "stats must say the config was ignored, got stderr: {err}"
+    );
+}
