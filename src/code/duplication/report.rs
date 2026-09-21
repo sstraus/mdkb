@@ -278,6 +278,7 @@ pub fn member_key(c: &DupCandidate) -> String {
         c.language.as_deref().unwrap_or(""),
         c.module_path.as_deref().unwrap_or(""),
         c.kind.as_str(),
+        c.owner_name.as_deref().unwrap_or(""),
         c.name.as_str(),
         c.signature.as_deref().unwrap_or(""),
     ]
@@ -495,6 +496,15 @@ pub fn render_csv(clusters: &[Cluster]) -> String {
             Evidence::Semantic { similarity } => (String::new(), format!("{similarity:.3}")),
         };
         let name = cluster.members.first().map_or("", |c| c.name.as_str());
+        // Every one of these walks the whole member list, and `cluster_hash`
+        // sorts and hashes it. They are cluster-wide values: computing them
+        // once per member makes a wide cluster cost O(members^2).
+        let cluster_hash = cluster.cluster_hash();
+        let copies = cluster.members.len();
+        let module_spread = cluster.module_spread();
+        let file_spread = cluster.file_spread();
+        let visibility = visibility_label(cluster.reach());
+        let duplicated_lines = cluster.duplicated_lines();
         for member in &cluster.members {
             let symbol = match &member.module_path {
                 Some(module) => format!("{module}::{}", member.name),
@@ -502,13 +512,13 @@ pub fn render_csv(clusters: &[Cluster]) -> String {
             };
             out.push_str(&format!(
                 "{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
-                cluster.cluster_hash(),
+                cluster_hash,
                 csv_field(name),
-                cluster.members.len(),
-                cluster.module_spread(),
-                cluster.file_spread(),
-                visibility_label(cluster.reach()),
-                cluster.duplicated_lines(),
+                copies,
+                module_spread,
+                file_spread,
+                visibility,
+                duplicated_lines,
                 cluster.evidence.kind(),
                 hamming,
                 similarity,
