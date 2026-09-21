@@ -5893,6 +5893,22 @@ pub async fn dispatch_call(
             let t0 = std::time::Instant::now();
             let result = hook_post_tool_use_impl(&handle, &params).await;
             let ms = t0.elapsed().as_millis() as u64;
+            // `queued` is bookkeeping between this arm and the reindex channel,
+            // not a field of the hook envelope: an edit that only enqueues must
+            // leave stdout empty. What does have to survive is the prior's
+            // `hookSpecificOutput` — it was built, and `record_injection`
+            // already counted it as shown, so returning `{}` here taught the
+            // store to believe in an injection the model never saw.
+            let mut result = result;
+            if let Some(object) = result.as_object_mut() {
+                object.remove("queued");
+            }
+            // Judged on the payload the host actually receives, and therefore
+            // AFTER the strip. A plain edit with no prior returns
+            // `{"queued": true}`, which is not empty, so every Write and Edit
+            // in a session wrote `fired` to `hook-events.jsonl` while stdout
+            // was empty — telemetry claiming an injection nobody saw, which is
+            // the failure this counter exists to detect.
             let outcome = if result == json!({}) {
                 "skipped"
             } else {
@@ -5904,16 +5920,6 @@ pub async fn dispatch_call(
                 log_hook_event(root, "post_tool_use", outcome, ms, budget);
             });
             record_hook_call(&handle, tool_name).await;
-            // `queued` is bookkeeping between this arm and the reindex channel,
-            // not a field of the hook envelope: an edit that only enqueues must
-            // leave stdout empty. What does have to survive is the prior's
-            // `hookSpecificOutput` — it was built, and `record_injection`
-            // already counted it as shown, so returning `{}` here taught the
-            // store to believe in an injection the model never saw.
-            let mut result = result;
-            if let Some(object) = result.as_object_mut() {
-                object.remove("queued");
-            }
             Ok(result)
         }
         "hook.pre_tool_use" => {

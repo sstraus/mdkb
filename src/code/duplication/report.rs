@@ -232,6 +232,12 @@ impl Cluster {
         self.members.iter().map(member_key).collect()
     }
 
+    /// The same members in the pre-`owner_name` key format, for matching a
+    /// snapshot that was written before the field existed.
+    pub fn legacy_member_keys(&self) -> BTreeSet<String> {
+        self.members.iter().map(legacy_member_key).collect()
+    }
+
     /// The members that were not in the accepted snapshot — everything a
     /// reviewer has not seen. Empty when the cluster was never accepted.
     pub fn added_members(&self) -> Vec<&DupCandidate> {
@@ -285,6 +291,44 @@ pub fn member_key(c: &DupCandidate) -> String {
     .join("\u{1f}")
 }
 
+/// Fields in a current [`member_key`]. Named so the legacy shim below states
+/// what it is comparing against instead of hiding a literal.
+const MEMBER_KEY_FIELDS: usize = 7;
+
+/// The same key as it was written before `owner_name` was a field.
+///
+/// `member_key` gained a seventh field, and a stored acceptance holds the
+/// six-field form. The two never compare equal — not even when `owner_name` is
+/// `None`, because an empty value still contributes its `\u{1f}` separator — so
+/// every duplication cluster a reviewer had accepted came back as an unreviewed
+/// finding, and the `dup-ignore-*` entry that suppressed it stayed in memory
+/// matching nothing.
+///
+/// Read-side only. Nothing writes this form again: a key recorded from now on
+/// carries the owner, and this exists so a decision somebody already made
+/// survives the upgrade that changed the format.
+fn legacy_member_key(c: &DupCandidate) -> String {
+    [
+        c.file_path.as_str(),
+        c.language.as_deref().unwrap_or(""),
+        c.module_path.as_deref().unwrap_or(""),
+        c.kind.as_str(),
+        c.name.as_str(),
+        c.signature.as_deref().unwrap_or(""),
+    ]
+    .join("\u{1f}")
+}
+
+/// Does this stored snapshot predate the `owner_name` field?
+///
+/// By field count, not by a version marker: none was written, and the count is
+/// unambiguous because no field may contain the separator.
+fn is_legacy_snapshot(members: &BTreeSet<String>) -> bool {
+    members
+        .iter()
+        .any(|m| m.split('\u{1f}').count() < MEMBER_KEY_FIELDS)
+}
+
 /// Identity of a cluster: SHA-256 over its sorted member keys, in full.
 ///
 /// All 64 hex characters, 256 bits. The first eight used to be stored, and 32
@@ -298,6 +342,20 @@ pub fn cluster_hash(members: &[DupCandidate]) -> String {
     keys.sort_unstable();
     let mut hasher = Sha256::new();
     // Record separator between members, unit separator inside them.
+    hasher.update(keys.join("\u{1e}").as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// The identity a cluster had before `owner_name` joined the key.
+///
+/// Read-side only, and for one purpose: an accepted entry that recorded no
+/// membership can be matched only by the hash prefix in its id, and that
+/// prefix was computed over the old keys. Without this, every snapshot-less
+/// acceptance made before the field was added stopped suppressing anything.
+pub fn legacy_cluster_hash(members: &[DupCandidate]) -> String {
+    let mut keys: Vec<String> = members.iter().map(legacy_member_key).collect();
+    keys.sort_unstable();
+    let mut hasher = Sha256::new();
     hasher.update(keys.join("\u{1e}").as_bytes());
     format!("{:x}", hasher.finalize())
 }
@@ -845,7 +903,9 @@ pub enum Verdict {
 /// is exactly why a removal used to make a finding reappear as new.
 pub fn verdict(accepted: &[Accepted], cluster: &Cluster) -> Verdict {
     let keys = cluster.member_keys();
+    let legacy_keys = cluster.legacy_member_keys();
     let hash = cluster.cluster_hash();
+    let legacy_hash = legacy_cluster_hash(&cluster.members);
     let mut grown: Option<&Accepted> = None;
     let mut by_prefix = 0usize;
     for entry in accepted {
@@ -858,17 +918,27 @@ pub fn verdict(accepted: &[Accepted], cluster: &Cluster) -> Verdict {
                 .entry_id
                 .strip_prefix(IGNORE_ID_PREFIX)
                 .unwrap_or_default();
-            if !typed.is_empty() && hash.starts_with(typed) {
+            // Either identity: an id written before `owner_name` joined the
+            // key holds a prefix of the old hash, and the decision it records
+            // is no less a decision for that.
+            if !typed.is_empty() && (hash.starts_with(typed) || legacy_hash.starts_with(typed)) {
                 by_prefix += 1;
             }
             continue;
+        };
+        // Compare in the format the snapshot was written in. A decision does
+        // not stop being a decision because the key format changed under it.
+        let keys = if is_legacy_snapshot(members) {
+            &legacy_keys
+        } else {
+            &keys
         };
         if keys.is_subset(members) {
             return Verdict::Accepted;
         }
         // A strict superset means the reviewed cluster grew. Keep looking —
         // another entry may cover it outright — but remember the best match.
-        if members.is_subset(&keys) && !members.is_empty() {
+        if members.is_subset(keys) && !members.is_empty() {
             let better =
                 grown.is_none_or(|g| g.members.as_ref().is_none_or(|m| m.len() < members.len()));
             if better {
@@ -967,6 +1037,88 @@ mod tests {
             members,
             evidence: Evidence::Semantic { similarity: 0.8 },
             accepted: None,
+        }
+    }
+
+    /// A decision made before `owner_name` joined the key still suppresses.
+    ///
+    /// The key gained a seventh field, and a six-field stored key never
+    /// compares equal to a seven-field one — not even when `owner_name` is
+    /// `None`, because the empty value still contributes its separator. So
+    /// every duplication a reviewer had accepted came back as an unreviewed
+    /// finding, and the `dup-ignore-*` entry that suppressed it stayed in
+    /// memory matching nothing. Nobody was told, because the change rode in a
+    /// commit about computing cluster values once.
+    #[test]
+    fn a_snapshot_written_before_owner_name_still_suppresses_its_cluster() {
+        let c = cluster(vec![
+            member(1, "parse", "a.rs", Some("m"), Visibility::Public, 20),
+            member(2, "parse", "b.rs", Some("m"), Visibility::Public, 20),
+        ]);
+        let stored = Accepted {
+            entry_id: format!("{IGNORE_ID_PREFIX}deadbeefcafe"),
+            members: Some(c.legacy_member_keys()),
+        };
+        assert_eq!(
+            verdict(&[stored], &c),
+            Verdict::Accepted,
+            "the format changed under the decision; the decision did not change"
+        );
+    }
+
+    /// And the id-only form too, whose prefix was computed over the old keys.
+    #[test]
+    fn a_snapshotless_entry_keyed_on_the_old_hash_still_suppresses() {
+        let c = cluster(vec![
+            member(1, "parse", "a.rs", Some("m"), Visibility::Public, 20),
+            member(2, "parse", "b.rs", Some("m"), Visibility::Public, 20),
+        ]);
+        let old = legacy_cluster_hash(&c.members);
+        assert_ne!(
+            old,
+            c.cluster_hash(),
+            "the fixture is only meaningful while the two identities differ"
+        );
+        let stored = Accepted {
+            entry_id: format!("{IGNORE_ID_PREFIX}{}", short_hash(&old)),
+            members: None,
+        };
+        assert_eq!(verdict(&[stored], &c), Verdict::Accepted);
+    }
+
+    /// A current snapshot keeps being compared in the current format: the shim
+    /// is a read-side fallback, not a loosening of the key.
+    #[test]
+    fn a_current_snapshot_is_still_matched_on_the_full_key() {
+        let c = cluster(vec![
+            member(1, "parse", "a.rs", Some("m"), Visibility::Public, 20),
+            member(2, "parse", "b.rs", Some("m"), Visibility::Public, 20),
+        ]);
+        let stored = Accepted {
+            entry_id: format!("{IGNORE_ID_PREFIX}{}", c.short_hash()),
+            members: Some(c.member_keys()),
+        };
+        assert_eq!(verdict(&[stored], &c), Verdict::Accepted);
+
+        let other = cluster(vec![member(
+            3,
+            "render",
+            "c.rs",
+            Some("m"),
+            Visibility::Public,
+            20,
+        )]);
+        assert_eq!(
+            verdict(&[stored_for(&c)], &other),
+            Verdict::Report,
+            "an unrelated cluster is not suppressed by either format"
+        );
+    }
+
+    fn stored_for(c: &Cluster) -> Accepted {
+        Accepted {
+            entry_id: format!("{IGNORE_ID_PREFIX}{}", c.short_hash()),
+            members: Some(c.member_keys()),
         }
     }
 
