@@ -26,7 +26,10 @@ pub struct PriorCluster {
     pub id: String,
     /// Normalized trigger identity used to dedup equivalent candidates.
     pub canonical_trigger_key: String,
-    /// `prompt` | `pre_tool` | `post_tool` | `stop` | `repo`.
+    /// `prompt` | `pre_tool` | `post_tool` — the kinds in
+    /// [`crate::domain::prior_distill::VALID_TRIGGER_KINDS`], each of which has
+    /// an injection point. Rows written before `stop` and `repo` were retired
+    /// may still carry them; nothing can match them.
     pub trigger_kind: String,
     /// JSON: machine-matchable condition (path glob, tool name, prompt terms).
     pub trigger_matcher: String,
@@ -1481,6 +1484,18 @@ pub fn apply_belief_from_memory(
                 AND state = 'refuted'
                 AND confirmed_count > refuted_count",
             params![cluster_id],
+        )?;
+        // `promote_cluster` stamps the projection once and nothing renews it,
+        // while `list_promoted_clusters` — the only read `match_injectable`
+        // makes — drops an entry whose `expires_at` has passed. Without this
+        // the confirmation above is real in the table and invisible in the
+        // session: the state says promoted and the prior never injects again.
+        conn.execute(
+            "UPDATE memory_entries SET expires_at = ?2 WHERE id = ?1",
+            params![
+                memory_id,
+                chrono::Utc::now().timestamp() + crate::store::memory::PRIOR_TTL_SECS
+            ],
         )?;
     }
     Ok(Some(cluster_id))
