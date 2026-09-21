@@ -671,9 +671,18 @@ fn a_dead_path_cited_from_two_entries_spawns_git_once() {
     let log = spy_dir.path().join("calls.log");
     std::fs::write(&log, "").expect("seed log");
     let script = spy_dir.path().join("git");
+    // Count only the spawns the audit makes against *this* repo. `PATH` is
+    // global to the process and the other tests in this binary spawn `git`
+    // too, without taking `env_lock` — a spy that logged unconditionally
+    // counted their calls as well, and failed whenever one overlapped. The
+    // audit reaches git as `git -C <root> ...` (see `git::path_ever_existed`),
+    // so the root argument is what identifies a call as ours.
+    let repo = root.display().to_string();
     std::fs::write(
         &script,
-        format!("#!/bin/sh\necho called >> {log:?}\nexec {real_git:?} \"$@\"\n"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = -C ] && [ \"$2\" = {repo:?} ]; then echo called >> {log:?}; fi\nexec {real_git:?} \"$@\"\n"
+        ),
     )
     .expect("write spy");
     {
