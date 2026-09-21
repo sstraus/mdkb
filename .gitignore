@@ -16,10 +16,11 @@ reviews/
 history/
 .wiz/
 .codex/**
-.mdkb/**
 marketing/
 # Scratch measurements: SQL and classifier scripts for one story's numbers.
 .scratch/
 
 # cargo-mutants run output
 mutants.out/
+.cargo/
+.agents/
