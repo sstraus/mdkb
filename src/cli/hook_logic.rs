@@ -635,6 +635,49 @@ pub fn is_mdkb_invocation(command: &str) -> bool {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+/// How many keys the SessionStart notice names before it stops counting.
+///
+/// Three plus a remainder. The line exists to make the reader curious enough
+/// to run `mdkb graph relations`; printing thirteen key names in a hook that
+/// fires on every session would be the opposite of that.
+const RELATION_NOTICE_KEYS: usize = 3;
+
+/// One line naming the relation keys that point at indexed documents and are
+/// not being extracted — or nothing at all.
+///
+/// Emitted only under `semi`. `auto` already extracts them, so there is
+/// nothing to tell; `manual` is the mode that means "stop telling me". A hook
+/// that fires on every session start has to earn each line it prints, and
+/// this one earns it by being the only place a silently partial graph becomes
+/// visible.
+pub fn relation_notice(
+    mode: crate::config::RelationMode,
+    undetected: &[crate::store::graph::RelationCandidateRow],
+) -> Option<String> {
+    if mode != crate::config::RelationMode::Semi || undetected.is_empty() {
+        return None;
+    }
+    let named: Vec<String> = undetected
+        .iter()
+        .take(RELATION_NOTICE_KEYS)
+        .map(|r| format!("{} {}", r.key, r.hits))
+        .collect();
+    let rest = undetected.len().saturating_sub(named.len());
+    let tail = if rest > 0 {
+        format!(", +{rest}")
+    } else {
+        String::new()
+    };
+    let plural = if undetected.len() == 1 { "key" } else { "keys" };
+    Some(format!(
+        "graph: {} frontmatter {plural} point at indexed documents but are not extracted \
+         ({}{tail}). `mdkb graph relations` to see them, `--apply` to extract. \
+         Set graph.relations=\"auto\" to stop asking.",
+        undetected.len(),
+        named.join(", "),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1021,5 +1064,66 @@ mod tests {
         let toks = path_like_tokens("see docs/architecture for the overview");
         assert!(toks.contains(&"docs/architecture".to_string()));
         assert!(toks.contains(&"architecture".to_string()));
+    }
+
+    use crate::config::RelationMode;
+    use crate::store::graph::RelationCandidateRow;
+
+    fn row(key: &str, hits: usize) -> RelationCandidateRow {
+        RelationCandidateRow {
+            key: key.to_string(),
+            hits,
+            total: hits,
+            extracted: false,
+        }
+    }
+
+    #[test]
+    fn semi_names_the_count_and_the_busiest_keys() {
+        let rows: Vec<RelationCandidateRow> = [
+            ("org", 43),
+            ("attendees", 34),
+            ("themes", 28),
+            ("d", 4),
+            ("e", 3),
+        ]
+        .iter()
+        .map(|(k, h)| row(k, *h))
+        .collect();
+
+        let line = relation_notice(RelationMode::Semi, &rows).expect("semi must speak");
+
+        assert!(line.starts_with("graph: 5 frontmatter keys"), "got: {line}");
+        assert!(line.contains("org 43, attendees 34, themes 28, +2"), "got: {line}");
+        assert!(line.contains("mdkb graph relations"), "got: {line}");
+        assert_eq!(line.lines().count(), 1, "exactly one line: {line}");
+    }
+
+    #[test]
+    fn a_short_list_has_no_remainder_suffix() {
+        let rows = vec![row("org", 43)];
+        let line = relation_notice(RelationMode::Semi, &rows).unwrap();
+        assert!(line.contains("1 frontmatter key point"), "singular: {line}");
+        assert!(!line.contains('+'), "no remainder to report: {line}");
+    }
+
+    #[test]
+    fn semi_with_nothing_undetected_says_nothing() {
+        assert_eq!(relation_notice(RelationMode::Semi, &[]), None);
+    }
+
+    #[test]
+    fn auto_and_manual_say_nothing_even_with_candidates() {
+        let rows = vec![row("org", 43)];
+        assert_eq!(
+            relation_notice(RelationMode::Auto, &rows),
+            None,
+            "auto already extracts them"
+        );
+        assert_eq!(
+            relation_notice(RelationMode::Manual, &rows),
+            None,
+            "manual is the mode that means stop asking"
+        );
     }
 }

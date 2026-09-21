@@ -4115,6 +4115,35 @@ async fn hook_session_start_inner(
         "\n**mdkb:** `* query` = recall | `mdkb cheatsheet` = search/code/graph/audit/memory (partial; `mdkb --help` lists the rest)\n",
     );
 
+    // One stored-aggregate read, no corpus scan: this hook has a 200 ms
+    // budget. `relation_candidates` is written by `mdkb update`, and an empty
+    // table simply produces nothing — which is the right answer until a
+    // detection has actually run.
+    {
+        let mut ctx_guard = handle.ctx.lock().await;
+        let undetected = crate::core::run_guarded_read(
+            &mut ctx_guard,
+            "hook relation candidates",
+            |ctx| crate::store::graph::undetected_relation_keys(&ctx.conn),
+        );
+        match undetected {
+            Some(Ok(rows)) => {
+                if let Some(line) = crate::cli::hook_logic::relation_notice(
+                    handle.config.graph.relations,
+                    &rows,
+                ) {
+                    body.push_str("\n");
+                    body.push_str(&line);
+                    body.push('\n');
+                }
+            }
+            Some(Err(error)) => {
+                tracing::warn!("hook.session_start relation candidates lookup failed: {error}")
+            }
+            None => {}
+        }
+    }
+
     // Check code index staleness. If stale, kick a detached refresh instead of
     // asking the user to run a manual command from a latency-sensitive hook.
     let code_db = handle.root.join(".mdkb/code.sqlite");

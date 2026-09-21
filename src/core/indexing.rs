@@ -262,7 +262,7 @@ pub fn handle_update_force(
         if config.graph.enabled {
             // Detected AFTER indexing, so the identities written this run are
             // available to resolve against.
-            let relations = effective_relations_for(&ctx.conn, &config.graph);
+            let relations = detect_persist_and_resolve_relations(&ctx.conn, &config.graph);
             extract_edges_pass(&ctx.conn, &relations, None)?;
         }
         // Reclaim content rows stranded by prior updates/removes (and the
@@ -1171,6 +1171,62 @@ pub(crate) fn process_identities(
 /// A detector failure degrades to the declared allowlist rather than failing
 /// the update: a graph missing the derived keys is recoverable, an update that
 /// refuses to run is not.
+/// Run detection, store what it measured, and return the keys to extract.
+///
+/// Only the full-update path calls this. Detection runs under `auto` AND
+/// `semi` — `semi` does not extract the derived keys but it is the mode whose
+/// whole purpose is to report them, and a report nobody measured is a guess.
+/// `manual` measures nothing and clears the table: a stale row left behind by
+/// an earlier `semi` run would keep being announced by a hook long after the
+/// user said stop.
+///
+/// Best-effort on the write. A store that cannot record the measurement still
+/// gets its edges.
+pub(crate) fn detect_persist_and_resolve_relations(
+    conn: &Connection,
+    cfg: &crate::config::GraphConfig,
+) -> Vec<String> {
+    use crate::config::RelationMode;
+    use crate::store::graph::{RelationCandidateRow, replace_relation_candidates};
+
+    if cfg.relations == RelationMode::Manual {
+        if let Err(e) = replace_relation_candidates(conn, &[]) {
+            tracing::warn!("Graph: failed to clear relation candidates: {e}");
+        }
+        return cfg.frontmatter_relations.clone();
+    }
+
+    let found = match crate::core::graph::detect_relation_keys(conn, cfg) {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!("Graph: relation detection failed, using the declared allowlist: {e}");
+            return cfg.frontmatter_relations.clone();
+        }
+    };
+    let detected: Vec<String> = found
+        .candidates
+        .iter()
+        .map(|c| c.key.clone())
+        .collect();
+    let effective = cfg.effective_relations(&detected);
+
+    let rows: Vec<RelationCandidateRow> = found
+        .candidates
+        .iter()
+        .map(|c| RelationCandidateRow {
+            key: c.key.clone(),
+            hits: c.hits,
+            total: c.total,
+            extracted: effective.contains(&c.key),
+        })
+        .collect();
+    if let Err(e) = replace_relation_candidates(conn, &rows) {
+        tracing::warn!("Graph: failed to record relation candidates: {e}");
+    }
+
+    effective
+}
+
 pub(crate) fn effective_relations_for(
     conn: &Connection,
     cfg: &crate::config::GraphConfig,

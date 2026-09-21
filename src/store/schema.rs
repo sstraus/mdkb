@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 29;
+pub const SCHEMA_VERSION: i32 = 30;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -397,6 +397,25 @@ CREATE TABLE IF NOT EXISTS document_aliases (
 CREATE INDEX IF NOT EXISTS idx_document_aliases_alias ON document_aliases(alias);
 "#;
 
+/// The `relation_candidates` table. Separate from `SCHEMA_SQL` for the same
+/// reason as `DOCUMENT_ALIASES_SQL`: the v30 migration must create it on a
+/// store that never ran `SCHEMA_SQL`.
+const RELATION_CANDIDATES_SQL: &str = r#"
+-- What the relation-key detector last measured, so a latency-bounded reader
+-- (SessionStart, 200 ms) can report it without scanning the corpus.
+--
+-- `extracted` records whether the key was in the effective extraction set on
+-- the run that wrote this row: a key already producing edges must not be
+-- reported as one the user is missing.
+CREATE TABLE IF NOT EXISTS relation_candidates (
+    key        TEXT PRIMARY KEY,
+    hits       INTEGER NOT NULL,
+    total      INTEGER NOT NULL,
+    extracted  INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+"#;
+
 const BM25_WEIGHTS_SQL: &str = r#"
 INSERT OR REPLACE INTO documents_fts(documents_fts, rank) VALUES('rank', 'bm25(10.0, 1.0)');
 "#;
@@ -414,6 +433,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // Create schema
     conn.execute_batch(SCHEMA_SQL)?;
     conn.execute_batch(DOCUMENT_ALIASES_SQL)?;
+    conn.execute_batch(RELATION_CANDIDATES_SQL)?;
 
     // Set BM25 weights
     conn.execute_batch(BM25_WEIGHTS_SQL)?;
@@ -1122,6 +1142,17 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
                  frontmatter already in the store; no reindex needed"
             );
         }
+    }
+
+    // Migration from v29 to v30: a place to keep what the relation-key
+    // detector measured.
+    //
+    // Left empty on purpose — nothing is inferred at migration time. The next
+    // `mdkb update` runs the detector and fills it. A hook that reads an empty
+    // table simply says nothing, which is the correct answer until a detection
+    // has actually happened.
+    if from_version < 30 {
+        conn.execute_batch(RELATION_CANDIDATES_SQL)?;
     }
 
     // Update schema version

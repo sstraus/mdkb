@@ -91,6 +91,59 @@ pub fn delete_edges_for_source_kind(
     Ok(rows)
 }
 
+/// One row of what the relation-key detector last measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelationCandidateRow {
+    pub key: String,
+    pub hits: usize,
+    pub total: usize,
+    /// Whether this key was in the effective extraction set on that run.
+    pub extracted: bool,
+}
+
+/// Replace the whole detection result.
+///
+/// Wholesale, like the edge and identity writes: a key that stopped appearing
+/// in the corpus must stop being reported, and a table that only ever grows
+/// would keep advertising a key nobody writes any more.
+pub fn replace_relation_candidates(
+    conn: &Connection,
+    rows: &[RelationCandidateRow],
+) -> Result<()> {
+    conn.execute("DELETE FROM relation_candidates", [])?;
+    let now = Utc::now().timestamp();
+    for row in rows {
+        conn.execute(
+            "INSERT OR REPLACE INTO relation_candidates (key, hits, total, extracted, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![row.key, row.hits as i64, row.total as i64, row.extracted, now],
+        )?;
+    }
+    Ok(())
+}
+
+/// Keys that name indexed documents and are NOT being extracted, busiest first.
+///
+/// One indexed read, no scan: this is what a latency-bounded hook is allowed
+/// to ask. A key already producing edges is excluded — reporting it would be
+/// noise on every session start.
+pub fn undetected_relation_keys(conn: &Connection) -> Result<Vec<RelationCandidateRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT key, hits, total FROM relation_candidates
+         WHERE extracted = 0
+         ORDER BY hits DESC, key ASC",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(RelationCandidateRow {
+            key: r.get(0)?,
+            hits: r.get::<_, i64>(1)? as usize,
+            total: r.get::<_, i64>(2)? as usize,
+            extracted: false,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
 /// Record a name a document declares for itself.
 ///
 /// `INSERT OR IGNORE`: a document that writes the same string under both `id:`
@@ -763,6 +816,69 @@ mod tests {
         let doc = insert_doc(conn, path);
         add_alias(conn, doc, alias, "id").unwrap();
         doc
+    }
+
+    #[test]
+    fn relation_candidates_are_replaced_wholesale() {
+        // A key that stopped appearing in the corpus must stop being reported.
+        let conn = setup_db();
+        replace_relation_candidates(
+            &conn,
+            &[
+                RelationCandidateRow { key: "org".into(), hits: 43, total: 43, extracted: false },
+                RelationCandidateRow { key: "gone".into(), hits: 2, total: 2, extracted: false },
+            ],
+        )
+        .unwrap();
+        replace_relation_candidates(
+            &conn,
+            &[RelationCandidateRow { key: "org".into(), hits: 44, total: 44, extracted: false }],
+        )
+        .unwrap();
+
+        let rows = undetected_relation_keys(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key, "org");
+        assert_eq!(rows[0].hits, 44);
+    }
+
+    #[test]
+    fn a_key_already_extracted_is_not_reported_as_undetected() {
+        // Telling the user about a key that is already producing edges is
+        // noise on every single session start.
+        let conn = setup_db();
+        replace_relation_candidates(
+            &conn,
+            &[
+                RelationCandidateRow { key: "owner".into(), hits: 10, total: 10, extracted: true },
+                RelationCandidateRow { key: "org".into(), hits: 43, total: 43, extracted: false },
+            ],
+        )
+        .unwrap();
+
+        let rows = undetected_relation_keys(&conn).unwrap();
+        assert_eq!(rows.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), vec!["org"]);
+    }
+
+    #[test]
+    fn undetected_keys_come_back_busiest_first() {
+        let conn = setup_db();
+        replace_relation_candidates(
+            &conn,
+            &[
+                RelationCandidateRow { key: "themes".into(), hits: 28, total: 28, extracted: false },
+                RelationCandidateRow { key: "org".into(), hits: 43, total: 43, extracted: false },
+                RelationCandidateRow { key: "attendees".into(), hits: 34, total: 34, extracted: false },
+            ],
+        )
+        .unwrap();
+
+        let keys: Vec<String> = undetected_relation_keys(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, vec!["org", "attendees", "themes"]);
     }
 
     #[test]

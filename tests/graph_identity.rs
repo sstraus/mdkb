@@ -504,3 +504,83 @@ fn the_single_file_route_honours_auto_too() {
         "a saved file gets the same graph a full update would build"
     );
 }
+
+/// The detection SessionStart reads has to be written by `update`, and it has
+/// to know which keys are already extracted — otherwise the hook advertises
+/// keys that are producing edges already.
+#[test]
+fn update_records_what_the_detector_measured() {
+    let env = Env::new();
+    env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
+    env.write("m1.md", "---\nowner: alice\norg: [org:acme]\ntype: meeting\n---\n\n# M1\n");
+    set_graph_config(&env.root, "relations = \"semi\"\nfrontmatter_relations = [\"owner\"]");
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    env.update();
+
+    let undetected = mdkb::store::graph::undetected_relation_keys(&env.ctx.conn).unwrap();
+    let keys: Vec<&str> = undetected.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["org"],
+        "`org` resolves and is not extracted; `owner` is extracted; `type` resolves to nothing"
+    );
+}
+
+/// Under `auto` every detected key IS extracted, so there is nothing to report
+/// and the hook must stay quiet.
+#[test]
+fn auto_leaves_nothing_undetected_to_report() {
+    let env = Env::new();
+    env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
+    env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
+    set_graph_config(&env.root, "relations = \"auto\"\nfrontmatter_relations = [\"owner\"]");
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    env.update();
+
+    assert!(
+        mdkb::store::graph::undetected_relation_keys(&env.ctx.conn)
+            .unwrap()
+            .is_empty(),
+        "auto extracts what it detects, so nothing is outstanding"
+    );
+}
+
+/// `manual` means stop measuring. A stale row from an earlier `semi` run must
+/// not survive the switch and keep being reported.
+#[test]
+fn switching_to_manual_clears_what_was_measured() {
+    let env = Env::new();
+    env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
+    env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
+    set_graph_config(&env.root, "relations = \"semi\"\nfrontmatter_relations = [\"owner\"]");
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    env.update();
+    assert!(!mdkb::store::graph::undetected_relation_keys(&env.ctx.conn).unwrap().is_empty());
+
+    set_graph_config(&env.root, "relations = \"manual\"\nfrontmatter_relations = [\"owner\"]");
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    env.update();
+
+    assert!(
+        mdkb::store::graph::undetected_relation_keys(&env.ctx.conn)
+            .unwrap()
+            .is_empty(),
+        "manual must leave nothing behind for the hook to read"
+    );
+}
