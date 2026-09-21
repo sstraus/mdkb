@@ -2499,6 +2499,18 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
             if let Some(warning) = &result.memory_gitignore_shadowed {
                 println!("⚠ {warning}");
             }
+            // Said out loud because widening a collection pattern can multiply
+            // a store's index — one measured store went from 49 documents to
+            // 690 — and the user needs to be able to see it and undo it.
+            if !result.pattern_upgrades.is_empty() {
+                println!("Corrected collection patterns mdkb had written:");
+                for upgrade in &result.pattern_upgrades {
+                    println!("  - {upgrade}");
+                }
+                println!(
+                    "  Revert one with: mdkb collection update <name> --pattern '<old>'"
+                );
+            }
             if !result.errors.is_empty() {
                 println!("Errors:    {}", result.errors.len());
                 for err in &result.errors {

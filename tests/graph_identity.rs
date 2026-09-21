@@ -653,3 +653,97 @@ fn a_broken_block_never_writes_the_json_string_null() {
         0
     );
 }
+
+/// A pattern mdkb wrote and has since corrected must reach the store.
+///
+/// `_root = '*.md'` indexed only the files beside the README and silently
+/// ignored the rest (issue #8). It was fixed to `**/*.md`, but convention
+/// detection skips by collection NAME, so the fix could never reach the 70
+/// stores measured on this machine that had already materialised the old one.
+#[test]
+fn a_superseded_convention_pattern_is_upgraded_on_update() {
+    let env = Env::new();
+    env.write("top.md", "---\nowner: alice\n---\n\n# Top\n");
+    env.write("deep/buried.md", "---\nowner: bob\n---\n\n# Buried\n");
+
+    // Recreate the legacy shape: a convention `_root` on the old pattern.
+    env.ctx
+        .conn
+        .execute(
+            "INSERT OR REPLACE INTO collections (name, path, pattern, source, created_at, updated_at)
+             VALUES ('_root', '.', '*.md', 'convention', 1, 1)",
+            [],
+        )
+        .expect("seed legacy _root");
+
+    let result = handle_update(&env.ctx, &env.root).expect("update");
+
+    let pattern: String = env
+        .ctx
+        .conn
+        .query_row(
+            "SELECT pattern FROM collections WHERE name = '_root'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pattern, "**/*.md", "the superseded pattern is corrected");
+    assert_eq!(
+        result.pattern_upgrades,
+        vec!["_root: '*.md' -> '**/*.md'".to_string()],
+        "and the update says so, because this can multiply a store's index"
+    );
+}
+
+/// A pattern a human chose is never touched, even though it looks identical.
+#[test]
+fn a_manual_pattern_survives_an_update() {
+    let env = Env::new();
+    env.write("top.md", "---\nowner: alice\n---\n\n# Top\n");
+    env.ctx
+        .conn
+        .execute(
+            "INSERT OR REPLACE INTO collections (name, path, pattern, source, created_at, updated_at)
+             VALUES ('_root', '.', '*.md', 'manual', 1, 1)",
+            [],
+        )
+        .expect("seed manual _root");
+
+    let result = handle_update(&env.ctx, &env.root).expect("update");
+
+    let pattern: String = env
+        .ctx
+        .conn
+        .query_row(
+            "SELECT pattern FROM collections WHERE name = '_root'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(pattern, "*.md", "source=manual is a choice, not a stale default");
+    assert!(result.pattern_upgrades.is_empty());
+}
+
+/// Running twice reports the upgrade once. A notice on every update is noise.
+#[test]
+fn the_upgrade_is_reported_once_not_every_run() {
+    let env = Env::new();
+    env.write("top.md", "---\nowner: alice\n---\n\n# Top\n");
+    env.ctx
+        .conn
+        .execute(
+            "INSERT OR REPLACE INTO collections (name, path, pattern, source, created_at, updated_at)
+             VALUES ('_root', '.', '*.md', 'convention', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+    assert_eq!(handle_update(&env.ctx, &env.root).unwrap().pattern_upgrades.len(), 1);
+    assert!(
+        handle_update(&env.ctx, &env.root)
+            .unwrap()
+            .pattern_upgrades
+            .is_empty(),
+        "the second run has nothing to correct"
+    );
+}

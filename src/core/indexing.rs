@@ -232,7 +232,7 @@ pub fn handle_update_force(
     housekeeping(root);
 
     // Detect and register convention-based collections before processing
-    apply_conventions(ctx, root)?;
+    let pattern_upgrades = apply_conventions(ctx, root)?;
 
     let config = Config::load_or_default(&ctx.config_path);
 
@@ -251,6 +251,7 @@ pub fn handle_update_force(
 
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult::default();
+    result.pattern_upgrades = pattern_upgrades;
 
     with_transaction(&ctx.conn, || {
         update_all_collections(ctx, root, &config, &collections, force, &mut result)?;
@@ -437,13 +438,46 @@ fn report_collection_deltas(
     write_collections_snapshot(ctx, &after);
 }
 /// Detect and register convention-based collections.
-pub(crate) fn apply_conventions(ctx: &Context, root: &Path) -> Result<()> {
+pub(crate) fn apply_conventions(ctx: &Context, root: &Path) -> Result<Vec<String>> {
     let config = crate::config::Config::load_or_default(&ctx.config_path);
     if !config.conventions.enabled {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let existing = collections::list_collections(&ctx.conn)?;
+
+    // Correct a pattern mdkb itself wrote and has since improved, before
+    // proposing anything new. Skip-by-name means a store that already holds
+    // the collection would otherwise never receive the fix — that is the
+    // whole defect, and `source = convention` is what makes the correction
+    // mdkb's own output rather than an override of somebody's choice.
+    let mut upgraded = Vec::new();
+    for upgrade in crate::domain::conventions::detect_pattern_upgrades(&existing) {
+        let Some(current) = existing.iter().find(|c| c.name == upgrade.name) else {
+            continue;
+        };
+        let corrected = Collection {
+            pattern: upgrade.to.clone(),
+            ..current.clone()
+        };
+        collections::add_collection(&ctx.conn, &corrected)?;
+        tracing::info!(
+            "Upgraded collection '{}' pattern {} -> {}",
+            upgrade.name,
+            upgrade.from,
+            upgrade.to
+        );
+        upgraded.push(format!(
+            "{}: '{}' -> '{}'",
+            upgrade.name, upgrade.from, upgrade.to
+        ));
+    }
+
+    let existing = if upgraded.is_empty() {
+        existing
+    } else {
+        collections::list_collections(&ctx.conn)?
+    };
     let proposals = crate::domain::conventions::detect_conventions(root, &existing);
 
     for proposal in &proposals {
@@ -452,7 +486,7 @@ pub(crate) fn apply_conventions(ctx: &Context, root: &Path) -> Result<()> {
         tracing::info!("Auto-detected collection: {} ({})", coll.name, coll.path);
     }
 
-    Ok(())
+    Ok(upgraded)
 }
 /// Update all collections within a transaction.
 fn update_all_collections(

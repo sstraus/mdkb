@@ -301,6 +301,14 @@ pub struct UpdateResult {
 
     /// Errors encountered during indexing.
     pub errors: Vec<String>,
+    /// Convention patterns this run corrected, as `name: 'old' -> 'new'`.
+    ///
+    /// Reported rather than silently applied: widening `_root` took one
+    /// measured store from 49 documents to 690, so a user has to be able to
+    /// see it happened and revert it.
+    #[serde(default)]
+    pub pattern_upgrades: Vec<String>,
+
 }
 
 /// One collection's document count after an update.
