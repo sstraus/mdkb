@@ -25,9 +25,8 @@ use mdkb::cli::handlers::{
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
     handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
     handle_graph_dangling, handle_graph_hubs, handle_graph_links, handle_graph_neighbors,
-    handle_graph_relations,
-    handle_graph_path, handle_history, handle_init, handle_memory_add, handle_memory_confirm,
-    handle_memory_export, handle_memory_import, handle_memory_import_dir,
+    handle_graph_path, handle_graph_relations, handle_history, handle_init, handle_memory_add,
+    handle_memory_confirm, handle_memory_export, handle_memory_import, handle_memory_import_dir,
     handle_memory_import_file, handle_memory_link, handle_memory_list, handle_memory_prune,
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
     handle_metrics_export, handle_metrics_latency, handle_metrics_purge, handle_metrics_show,
@@ -1349,8 +1348,9 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 }
                 GraphCommand::Relations { apply } => {
                     let found = handle_graph_relations(&ctx)?;
-                    let mode =
-                        mdkb::config::Config::load_or_default(&ctx.config_path).graph.relations;
+                    let mode = mdkb::config::Config::load_or_default(&ctx.config_path)
+                        .graph
+                        .relations;
                     let applied = if apply {
                         apply_relations_if_useful(&ctx, mode, &found)?
                     } else {
@@ -2548,9 +2548,7 @@ fn format_update_result(result: &mdkb::domain::UpdateResult, format: OutputForma
                 for upgrade in &result.pattern_upgrades {
                     println!("  - {upgrade}");
                 }
-                println!(
-                    "  Revert one with: mdkb collection update <name> --pattern '<old>'"
-                );
+                println!("  Revert one with: mdkb collection update <name> --pattern '<old>'");
             }
             if !result.errors.is_empty() {
                 println!("Errors:    {}", result.errors.len());
@@ -3386,7 +3384,10 @@ fn format_graph_relations(
                 Some(a) if a.added.is_empty() => {
                     println!("--apply: nothing to add, config.toml untouched.")
                 }
-                Some(a) => println!("--apply: added {} to graph.frontmatter_relations.", a.added.join(", ")),
+                Some(a) => println!(
+                    "--apply: added {} to graph.frontmatter_relations.",
+                    a.added.join(", ")
+                ),
                 None if mode == mdkb::config::RelationMode::Auto => {}
                 None => {}
             }

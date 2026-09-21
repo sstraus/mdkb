@@ -332,7 +332,10 @@ mod tests {
         // causes. Every one of them must now be reported rather than silently
         // becoming a document with no metadata.
         let cases = [
-            ("unquoted @ in a flow sequence", "---\naliases: [@sstraus]\n---\nb"),
+            (
+                "unquoted @ in a flow sequence",
+                "---\naliases: [@sstraus]\n---\nb",
+            ),
             (
                 "double-encoded list",
                 "---\ndependencies: [\"[\"720-c1c3\"\", \"\"724-ddba\"]\"]\n---\nb",

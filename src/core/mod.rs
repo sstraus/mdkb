@@ -330,8 +330,7 @@ impl Context {
         // an old store, so it owes the same answer.
         let version_before = schema::get_schema_version(&conn).unwrap_or(None);
         schema::init_schema(&conn)?;
-        let migrated_from =
-            version_before.filter(|v| *v < schema::SCHEMA_VERSION);
+        let migrated_from = version_before.filter(|v| *v < schema::SCHEMA_VERSION);
         vectors::init_vector_schema(&conn)?;
         // Stats tables (sessions/call_log/query_events) so hook-call telemetry
         // and query_events work on every transport, including the daemon-less

@@ -913,9 +913,7 @@ pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateR
     // the alternative is what happened to 34 documents across the fleet:
     // their whole frontmatter gone and `update` printing no error at all.
     if let Some(why) = &parsed.frontmatter_error {
-        result
-            .errors
-            .push(format!("{display_name}: {why}"));
+        result.errors.push(format!("{display_name}: {why}"));
     }
 
     let now = chrono::Utc::now().timestamp();
@@ -953,7 +951,12 @@ pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateR
                 // reaches the documents this loop SKIPPED, which is what makes
                 // an allowlist change apply without `--force`. Both write the
                 // same rows from the same data, so the overlap is idempotent.
-                replace_frontmatter_edges(&ctx.conn, doc_id, parsed.frontmatter.as_ref(), relations);
+                replace_frontmatter_edges(
+                    &ctx.conn,
+                    doc_id,
+                    parsed.frontmatter.as_ref(),
+                    relations,
+                );
                 process_wikilink_edges(&ctx.conn, doc_id, &parsed, graph_cfg);
             }
         }
@@ -1249,11 +1252,7 @@ pub(crate) fn detect_persist_and_resolve_relations(
             return cfg.frontmatter_relations.clone();
         }
     };
-    let detected: Vec<String> = found
-        .candidates
-        .iter()
-        .map(|c| c.key.clone())
-        .collect();
+    let detected: Vec<String> = found.candidates.iter().map(|c| c.key.clone()).collect();
     let effective = cfg.effective_relations(&detected);
 
     let rows: Vec<RelationCandidateRow> = found
@@ -1282,8 +1281,7 @@ pub(crate) fn effective_relations_for(
     }
     match crate::core::graph::detect_relation_keys(conn, cfg) {
         Ok(found) => {
-            let detected: Vec<String> =
-                found.candidates.into_iter().map(|c| c.key).collect();
+            let detected: Vec<String> = found.candidates.into_iter().map(|c| c.key).collect();
             cfg.effective_relations(&detected)
         }
         Err(e) => {

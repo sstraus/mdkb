@@ -2532,7 +2532,10 @@ fn smoke_graph_relations() {
     let listed = run(&["graph", "relations"], &repo.root);
     assert_ok(&listed, "graph relations");
     let out = stdout(&listed);
-    assert!(out.contains("org"), "must list the detected key, got: {out}");
+    assert!(
+        out.contains("org"),
+        "must list the detected key, got: {out}"
+    );
     assert!(
         out.contains("type"),
         "must also show the key that scored zero, so the reader can see it was measured: {out}"

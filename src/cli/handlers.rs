@@ -15,8 +15,7 @@ pub use crate::core::graph::{
     handle_collection_rename, handle_collection_update, handle_evolve_corrects,
     handle_evolve_extends, handle_evolve_retracts, handle_evolve_supersedes, handle_evolve_updates,
     handle_graph_backlinks, handle_graph_dangling, handle_graph_hubs, handle_graph_links,
-    handle_graph_neighbors, handle_graph_path, handle_graph_relations,
-    handle_superseded_by,
+    handle_graph_neighbors, handle_graph_path, handle_graph_relations, handle_superseded_by,
 };
 pub use crate::core::indexing::{
     handle_update, handle_update_files, handle_update_files_force, handle_update_force,

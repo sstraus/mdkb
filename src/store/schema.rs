@@ -3290,7 +3290,10 @@ mod tests {
             "INSERT INTO document_aliases (doc_id, alias, source_key) VALUES (?1, 'person:a', 'aliases')",
             [doc],
         );
-        assert!(repeat.is_err(), "UNIQUE(doc_id, alias) must reject a repeat");
+        assert!(
+            repeat.is_err(),
+            "UNIQUE(doc_id, alias) must reject a repeat"
+        );
 
         conn.execute("DELETE FROM documents WHERE id = ?1", [doc])
             .expect("delete document");

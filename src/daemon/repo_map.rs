@@ -116,8 +116,7 @@ pub fn discover_nested_stores(roots: &[PathBuf]) -> BTreeSet<PathBuf> {
     for root in roots {
         let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
-            !matches!(name.as_ref(), ".git" | "target" | "node_modules")
-                && name != ".mdkb"
+            !matches!(name.as_ref(), ".git" | "target" | "node_modules") && name != ".mdkb"
         });
         for entry in walker.filter_map(Result::ok) {
             if !entry.file_type().is_dir() {

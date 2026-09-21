@@ -1600,11 +1600,7 @@ strategy = "invalid_strategy"
 
         assert_eq!(
             cfg.effective_relations(&detected),
-            vec![
-                "owner".to_string(),
-                "themes".to_string(),
-                "org".to_string()
-            ],
+            vec!["owner".to_string(), "themes".to_string(), "org".to_string()],
             "declared first, detected appended, no duplicate for a key in both"
         );
     }

@@ -98,7 +98,10 @@ fn only_a_short_lived_command_lowers_its_own_priority() {
     rust_files(&root.join("src/mcp"), &mut files);
     rust_files(&root.join("src/core"), &mut files);
     rust_files(&root.join("src/store"), &mut files);
-    assert!(!files.is_empty(), "the check must actually find source files");
+    assert!(
+        !files.is_empty(),
+        "the check must actually find source files"
+    );
 
     let offenders: Vec<String> = files
         .iter()

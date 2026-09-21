@@ -308,7 +308,6 @@ pub struct UpdateResult {
     /// see it happened and revert it.
     #[serde(default)]
     pub pattern_upgrades: Vec<String>,
-
 }
 
 /// One collection's document count after an update.

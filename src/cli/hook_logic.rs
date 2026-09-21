@@ -1094,7 +1094,10 @@ mod tests {
         let line = relation_notice(RelationMode::Semi, &rows).expect("semi must speak");
 
         assert!(line.starts_with("graph: 5 frontmatter keys"), "got: {line}");
-        assert!(line.contains("org 43, attendees 34, themes 28, +2"), "got: {line}");
+        assert!(
+            line.contains("org 43, attendees 34, themes 28, +2"),
+            "got: {line}"
+        );
         assert!(line.contains("mdkb graph relations"), "got: {line}");
         assert_eq!(line.lines().count(), 1, "exactly one line: {line}");
     }

@@ -1862,7 +1862,12 @@ pub async fn cross_repo_search_impl(
     } else {
         format_search_results(&all_results, limit)
     };
-    output.push_str(&format_cross_repo_coverage(searched, known, &skipped, &no_collections));
+    output.push_str(&format_cross_repo_coverage(
+        searched,
+        known,
+        &skipped,
+        &no_collections,
+    ));
 
     let count = all_results.len();
     Ok((output, count))
@@ -4156,17 +4161,15 @@ async fn hook_session_start_inner(
     // detection has actually run.
     {
         let mut ctx_guard = handle.ctx.lock().await;
-        let undetected = crate::core::run_guarded_read(
-            &mut ctx_guard,
-            "hook relation candidates",
-            |ctx| crate::store::graph::undetected_relation_keys(&ctx.conn),
-        );
+        let undetected =
+            crate::core::run_guarded_read(&mut ctx_guard, "hook relation candidates", |ctx| {
+                crate::store::graph::undetected_relation_keys(&ctx.conn)
+            });
         match undetected {
             Some(Ok(rows)) => {
-                if let Some(line) = crate::cli::hook_logic::relation_notice(
-                    handle.config.graph.relations,
-                    &rows,
-                ) {
+                if let Some(line) =
+                    crate::cli::hook_logic::relation_notice(handle.config.graph.relations, &rows)
+                {
                     body.push_str("\n");
                     body.push_str(&line);
                     body.push('\n');

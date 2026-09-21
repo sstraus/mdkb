@@ -106,17 +106,20 @@ pub struct RelationCandidateRow {
 /// Wholesale, like the edge and identity writes: a key that stopped appearing
 /// in the corpus must stop being reported, and a table that only ever grows
 /// would keep advertising a key nobody writes any more.
-pub fn replace_relation_candidates(
-    conn: &Connection,
-    rows: &[RelationCandidateRow],
-) -> Result<()> {
+pub fn replace_relation_candidates(conn: &Connection, rows: &[RelationCandidateRow]) -> Result<()> {
     conn.execute("DELETE FROM relation_candidates", [])?;
     let now = Utc::now().timestamp();
     for row in rows {
         conn.execute(
             "INSERT OR REPLACE INTO relation_candidates (key, hits, total, extracted, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![row.key, row.hits as i64, row.total as i64, row.extracted, now],
+            params![
+                row.key,
+                row.hits as i64,
+                row.total as i64,
+                row.extracted,
+                now
+            ],
         )?;
     }
     Ok(())
@@ -825,14 +828,29 @@ mod tests {
         replace_relation_candidates(
             &conn,
             &[
-                RelationCandidateRow { key: "org".into(), hits: 43, total: 43, extracted: false },
-                RelationCandidateRow { key: "gone".into(), hits: 2, total: 2, extracted: false },
+                RelationCandidateRow {
+                    key: "org".into(),
+                    hits: 43,
+                    total: 43,
+                    extracted: false,
+                },
+                RelationCandidateRow {
+                    key: "gone".into(),
+                    hits: 2,
+                    total: 2,
+                    extracted: false,
+                },
             ],
         )
         .unwrap();
         replace_relation_candidates(
             &conn,
-            &[RelationCandidateRow { key: "org".into(), hits: 44, total: 44, extracted: false }],
+            &[RelationCandidateRow {
+                key: "org".into(),
+                hits: 44,
+                total: 44,
+                extracted: false,
+            }],
         )
         .unwrap();
 
@@ -850,14 +868,27 @@ mod tests {
         replace_relation_candidates(
             &conn,
             &[
-                RelationCandidateRow { key: "owner".into(), hits: 10, total: 10, extracted: true },
-                RelationCandidateRow { key: "org".into(), hits: 43, total: 43, extracted: false },
+                RelationCandidateRow {
+                    key: "owner".into(),
+                    hits: 10,
+                    total: 10,
+                    extracted: true,
+                },
+                RelationCandidateRow {
+                    key: "org".into(),
+                    hits: 43,
+                    total: 43,
+                    extracted: false,
+                },
             ],
         )
         .unwrap();
 
         let rows = undetected_relation_keys(&conn).unwrap();
-        assert_eq!(rows.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), vec!["org"]);
+        assert_eq!(
+            rows.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(),
+            vec!["org"]
+        );
     }
 
     #[test]
@@ -866,9 +897,24 @@ mod tests {
         replace_relation_candidates(
             &conn,
             &[
-                RelationCandidateRow { key: "themes".into(), hits: 28, total: 28, extracted: false },
-                RelationCandidateRow { key: "org".into(), hits: 43, total: 43, extracted: false },
-                RelationCandidateRow { key: "attendees".into(), hits: 34, total: 34, extracted: false },
+                RelationCandidateRow {
+                    key: "themes".into(),
+                    hits: 28,
+                    total: 28,
+                    extracted: false,
+                },
+                RelationCandidateRow {
+                    key: "org".into(),
+                    hits: 43,
+                    total: 43,
+                    extracted: false,
+                },
+                RelationCandidateRow {
+                    key: "attendees".into(),
+                    hits: 34,
+                    total: 34,
+                    extracted: false,
+                },
             ],
         )
         .unwrap();
@@ -891,7 +937,10 @@ mod tests {
         let claimant = insert_doc(&conn, "people/a.md");
         add_alias(&conn, claimant, "alice.md", "aliases").unwrap();
 
-        assert_eq!(resolve_ref_to_doc(&conn, "alice.md").unwrap(), Some(by_path));
+        assert_eq!(
+            resolve_ref_to_doc(&conn, "alice.md").unwrap(),
+            Some(by_path)
+        );
         assert_eq!(
             resolve_entity_ref(&conn, "alice.md").unwrap(),
             Some(by_path)

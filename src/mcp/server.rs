@@ -244,13 +244,12 @@ impl McpServer {
             .as_ref()
             .ok_or_else(|| mcp_error("Cross-repo search requires global mode (--global)."))?;
 
-        let (output, result_count) =
-            super::dispatch::cross_repo_search_impl(
-                registry,
-                params,
-                &self.client_roots.lock().await.clone(),
-            )
-            .await?;
+        let (output, result_count) = super::dispatch::cross_repo_search_impl(
+            registry,
+            params,
+            &self.client_roots.lock().await.clone(),
+        )
+        .await?;
 
         let tokens = count_tokens(&output);
         self.metrics.record_search(tokens, result_count);
@@ -269,8 +268,7 @@ impl McpServer {
     async fn resolve_handle(&self, root: Option<&str>) -> Result<Arc<RepoHandle>, McpError> {
         if let Some(registry) = &self.registry {
             let scope = self.client_roots.lock().await.clone();
-            let (selector, roots) =
-                super::dispatch::resolve_root_selector(registry, root, &scope)?;
+            let (selector, roots) = super::dispatch::resolve_root_selector(registry, root, &scope)?;
             if selector == RootSelector::All {
                 return Err(mcp_error(RootSelector::wildcard_rejection()));
             }
@@ -609,12 +607,11 @@ impl McpServer {
         }
         // A list naming more than one repo fans out too.
         if let Some(registry) = &self.registry {
-            let (_, roots) =
-                super::dispatch::resolve_root_selector(
-                    registry,
-                    params.root.as_deref(),
-                    &self.client_roots.lock().await.clone(),
-                )?;
+            let (_, roots) = super::dispatch::resolve_root_selector(
+                registry,
+                params.root.as_deref(),
+                &self.client_roots.lock().await.clone(),
+            )?;
             if roots.len() > 1 {
                 return self.cross_repo_search(&params).await;
             }
