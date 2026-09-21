@@ -172,17 +172,6 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
     }
 
     let existing = memory::get_entry_without_tracking(conn, input.id)?;
-    if input.dry_run {
-        let action = if existing.is_some() {
-            "update"
-        } else {
-            "create"
-        };
-        return Ok(format!(
-            "dry-run: would {action} memory entry '{}'",
-            input.id
-        ));
-    }
 
     let now = chrono::Utc::now().timestamp();
     let expires_at = match (input.ttl, entry_type) {
@@ -202,13 +191,38 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
     let embedding = input.embedding.or(self_embedded.as_deref());
 
     let mut contradicts_target = None;
-    if is_new {
-        if let Some(duplicate) = memory::find_duplicate(conn, input.id, input.title, embedding)? {
-            if input.on_conflict == Some("contradicts") {
-                contradicts_target = Some(duplicate.existing().id.clone());
-            } else {
-                return Err(duplicate.into());
-            }
+    let duplicate = if is_new {
+        memory::find_duplicate(conn, input.id, input.title, embedding)?
+    } else {
+        None
+    };
+
+    // The preview runs after the dedup check, not before it: a dry-run that
+    // says "would create" for a write the store is about to refuse answers the
+    // one question it was asked with the one answer that is wrong. Nothing
+    // above this point writes — `embed_for_write` only computes.
+    if input.dry_run {
+        return Ok(match (&duplicate, existing.is_some()) {
+            (Some(dup), _) if input.on_conflict == Some("contradicts") => format!(
+                "dry-run: would create memory entry '{}' as contradicting '{}'",
+                input.id,
+                dup.existing().id
+            ),
+            (Some(dup), _) => format!(
+                "dry-run: would fail: '{}' duplicates '{}'",
+                input.id,
+                dup.existing().id
+            ),
+            (None, true) => format!("dry-run: would update memory entry '{}'", input.id),
+            (None, false) => format!("dry-run: would create memory entry '{}'", input.id),
+        });
+    }
+
+    if let Some(duplicate) = duplicate {
+        if input.on_conflict == Some("contradicts") {
+            contradicts_target = Some(duplicate.existing().id.clone());
+        } else {
+            return Err(duplicate.into());
         }
     }
 
