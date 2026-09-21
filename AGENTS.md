@@ -1,8 +1,7 @@
 # AGENTS.md
 
 Repository conventions for any coding agent working on mdkb. Tracked in git on
-purpose: these outlive one machine and one assistant. Machine-local preferences
-belong in `CLAUDE.md`, which is gitignored.
+purpose: these outlive one machine and one assistant. `AGENTS.md` is canonical; `CLAUDE.md` is its relative sibling symlink.
 
 ## Credit the reporter in the changelog. Always.
 
@@ -75,3 +74,45 @@ observed in `Test Windows` or on the host in `~/Gits/CC_Playground/itview/.env`.
   about git — git for Windows accepts either separator in a pathspec.
 - A change that can only be verified on Windows says so in its commit message,
   and names the run or the host that proved it. Do not claim it works locally.
+
+## MCP output: every token must help Claude act correctly
+
+Every token emitted by the MCP server (instructions, tool descriptions, error messages, search results) is charged on every turn of every conversation. The goal is NOT to minimize tokens — it's to maximize signal.
+
+- **Server instructions**: teach Claude HOW to use the tools effectively. If a sentence prevents misuse or teaches a better workflow, it earns its tokens. If it explains something Claude already knows from the JSON Schema, cut it.
+- **Tool descriptions**: one sentence max. Parameter semantics belong in `/// doc` comments on struct fields (shown in JSON Schema), not in the tool description.
+- **Error messages**: state the fact. Include actionable hints ONLY when the correct next step is non-obvious.
+- **Search results**: data first. Include usage hints only when they teach Claude a more efficient access pattern (e.g., line ranges, scoping).
+- **Tool responses**: data, not noise. Don't repeat what Claude already knows. But DO include hints that guide Claude toward more efficient tool usage.
+
+When adding or modifying any MCP-facing text, ask: "does this help Claude get the right answer faster?" If yes, keep it. If no, cut it.
+
+## API changes must land in TUICommander too
+
+`~/Gits/personal/tuicommander` consumes this API on two levels, and both break silently:
+
+1. **The app itself** (`src-tauri/src/mdkb_client.rs`, `mdkb_daemon.rs`,
+   `mdkb_commands.rs`) speaks JSON-RPC to the mdkb daemon socket — `ping`, outline,
+   goto-definition, references, `code_find` — and depends on the response shapes and on
+   the symbol line convention (mdkb reports 0-based, TUIC surfaces 1-based).
+2. **The dashboard plugin** (`plugins/mdkb-dashboard`) shells out to
+   `mdkb --format json <cmd>` (`stats`, `memory list`, `update`, `code index --force`,
+   `embed`, `compact`) and parses the JSON.
+
+**Any change to the API surface — daemon RPC methods or payloads, MCP tools, CLI
+subcommands or flags, `--format json` output shapes — is not done until both consumers
+are updated, committed and pushed.** Bump `manifest.json` `version` when the plugin
+changes. A green `cargo test` here proves nothing about either consumer; check them
+against the new output before closing the work.
+
+## Testing
+
+Before any commit, run `cargo test` to verify the full suite (unit + integration + smoke). Never assume a failure is pre-existing — builds are green on main.
+
+Key test targets:
+- `cargo test` — full suite (2343 test functions, 41 `#[ignore]`d — those need the ONNX model)
+- `cargo test --test cli_smoke` — CLI smoke test exercising every subcommand (72 tests)
+- `cargo test --test e2e_hooks` — hook lifecycle end-to-end
+- `cargo test --test e2e_hook_client` — daemon hook socket round-trip
+
+@.claude/wiz-claude.md

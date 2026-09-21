@@ -595,6 +595,53 @@ removes the edge and repeated updates do not duplicate it. Memory edges are
 written transactionally with `memory_write` or explicitly with `memory link`.
 MDKB never invents a taxonomy or rewrites documents from graph analysis.
 
+#### Why you must declare `frontmatter_relations`
+
+Frontmatter holds identity, metadata and relations in one map, and MDKB cannot
+tell them apart by looking at the values. A relation target is any string, or
+any list of strings — that is the whole rule. In this node, six keys carry a
+value of that shape and only two of them are relations:
+
+```yaml
+id: person:arnaud-tauveron          # identity
+type: person                        # metadata
+name: Arnaud Tauveron               # metadata
+aliases: ["@ArnaudTurn-pro", arnaud.tauveron@lansweeper.com]
+role: Data Scientist (@Lansweeper/cloud)
+org: ["org:lansweeper"]             # relation
+```
+
+Auto-detection would therefore make `type: person` an edge. In a repository
+with 29 people that is one node with degree 29, and it outranks every real
+entity in `graph hubs`. `source: slack`, each `date:`, and each free-text
+`role:` become nodes too. The graph fills with metadata and the queries that
+depend on degree stop being usable. The allowlist is where you state which of
+your keys mean "points at something" — it is the taxonomy MDKB declines to
+invent, written down once.
+
+The default `["owner", "stakeholders", "themes", "related"]` is a starting
+vocabulary, not a detection. A repository that writes other keys gets a partial
+graph, and nothing reports it: the edges that were never extracted cannot show
+up in `graph dangling` or `graph hubs`. Check your own keys against the
+allowlist before you trust a traversal:
+
+```bash
+# every `key:` line in use, by frequency — read the list against your allowlist
+grep -rhoE '^[a-z_]+:' --include='*.md' . | sort | uniq -c | sort -rn
+```
+
+Measured on a 62-node operational graph: the four default keys extracted 56
+edges. Adding the twelve keys the repository actually wrote — `org`,
+`attendees`, `initiative`, `people`, `decisions`, `projects` and the rest —
+took it to 182 edges over the same files. Nothing was missing from the
+documents; the reader was configured for someone else's vocabulary.
+
+`supersedes`, `updates`, `corrects`, `extends` and `retracts` belong to the
+evolution subsystem. Config validation rejects them in the allowlist.
+
+After you edit the allowlist run `mdkb update --force` once. A plain `mdkb
+update` skips files whose mtime has not moved, and skips their edges with them.
+
 ```bash
 mdkb graph links project.md                 # outgoing edges (owner, themes, links_to, ...)
 mdkb graph links project.md --relation owner # filter by relation
@@ -615,6 +662,11 @@ reports: they identify reorganization work but never mutate the repository.
 **[docs/graph.md](docs/graph.md)** — how edges are created, how references
 resolve, what each query is for, and when to reach for the graph instead of
 search.
+
+**[docs/cross-folder-flows.html](docs/cross-folder-flows.html)** — every
+cross-folder flow in one page: how a store is chosen for a working directory,
+why a container of repositories is refused, how collections scope folders
+inside one store, and how cross-repo search fans out and states its coverage.
 
 ### Memory
 

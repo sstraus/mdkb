@@ -1,0 +1,344 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MDKB — Cross-folder flows</title>
+<style>
+  :root{
+    --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --line:#2a3242;
+    --tx:#e6edf3; --dim:#9aa7b8; --acc:#6ea8fe; --ok:#57caa0; --warn:#e3b341; --bad:#f47272;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  @media (prefers-color-scheme:light){
+    :root{--bg:#f7f9fc;--panel:#fff;--panel2:#f0f3f8;--line:#d8dee9;--tx:#1b2430;--dim:#5b6878;--acc:#2f6fd0;--ok:#1f8a63;--warn:#9a6b00;--bad:#c23b3b}
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);
+       font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+  .wrap{max-width:1040px;margin:0 auto;padding:48px 24px 96px}
+  h1{font-size:2rem;margin:0 0 .3em;letter-spacing:-.02em}
+  h2{font-size:1.3rem;margin:2.6em 0 .6em;padding-bottom:.3em;border-bottom:1px solid var(--line)}
+  h3{font-size:1.02rem;margin:1.8em 0 .4em;color:var(--acc)}
+  p{margin:.7em 0}
+  .lede{font-size:1.1rem;color:var(--dim);margin-bottom:2em}
+  code,kbd{font-family:var(--mono);font-size:.88em;background:var(--panel2);
+           border:1px solid var(--line);border-radius:4px;padding:.08em .35em}
+  pre{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+      padding:14px 16px;overflow-x:auto;font-family:var(--mono);font-size:.84rem;line-height:1.55}
+  pre code{background:none;border:0;padding:0}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px 20px;margin:14px 0}
+  .flow{border-left:3px solid var(--acc)}
+  .tag{display:inline-block;font-family:var(--mono);font-size:.72rem;letter-spacing:.04em;
+       text-transform:uppercase;padding:.15em .55em;border-radius:20px;border:1px solid var(--line);
+       color:var(--dim);background:var(--panel2);vertical-align:middle;margin-left:.5em}
+  .tag.live{color:var(--ok);border-color:var(--ok)}
+  .tag.dormant{color:var(--warn);border-color:var(--warn)}
+  .src{font-family:var(--mono);font-size:.78rem;color:var(--dim);margin-top:.8em}
+  .why{background:var(--panel2);border-left:3px solid var(--bad);border-radius:0 6px 6px 0;
+       padding:10px 14px;margin:.9em 0;font-size:.92rem}
+  .why b{color:var(--bad)}
+  table{width:100%;border-collapse:collapse;margin:1em 0;font-size:.9rem}
+  th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{color:var(--dim);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.04em}
+  td code{white-space:nowrap}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;margin:1.2em 0}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .kpi b{display:block;font-size:1.5rem;font-family:var(--mono);color:var(--acc);line-height:1.2}
+  .kpi span{font-size:.82rem;color:var(--dim)}
+  svg{max-width:100%;height:auto;display:block;margin:1.2em auto}
+  .legend{font-size:.82rem;color:var(--dim);text-align:center;margin-top:-.6em}
+  a{color:var(--acc)}
+  footer{margin-top:4em;padding-top:1.2em;border-top:1px solid var(--line);font-size:.85rem;color:var(--dim)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Cross-folder flows</h1>
+<p class="lede">MDKB keeps one store for one project. The folder you start from never decides
+what answers you — a rule decides, and the rule states what it covered. This page lists every
+cross-folder flow that is implemented, the rule each one applies, and the failure each one prevents.</p>
+
+<div class="grid">
+  <div class="kpi"><b>1 : 1</b><span>One project, one store. Never one store for a tree of projects.</span></div>
+  <div class="kpi"><b>N of M</b><span>A fan-out states its coverage. An empty answer is never silent.</span></div>
+  <div class="kpi"><b>read-only</b><span>Reading another repo takes no handle and evicts nothing.</span></div>
+</div>
+
+<h2>1. Where the store is — anchor resolution <span class="tag live">live</span></h2>
+<p>Every command starts by answering one question: which <code>.mdkb/</code> owns this working
+directory? The answer must not change when you move to a subfolder, and it must not expand
+when you move up.</p>
+
+<svg viewBox="0 0 900 470" role="img" aria-label="Anchor resolution decision tree">
+  <defs>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#6ea8fe"/>
+    </marker>
+    <style>
+      .b{fill:#161b22;stroke:#2a3242;rx:8}
+      .t{fill:#e6edf3;font:13px ui-monospace,Menlo,monospace}
+      .s{fill:#9aa7b8;font:11px ui-monospace,Menlo,monospace}
+      .e{stroke:#6ea8fe;stroke-width:1.4;fill:none;marker-end:url(#a)}
+      .ok{fill:#57caa0;font:12px ui-monospace,Menlo,monospace}
+      .no{fill:#f47272;font:12px ui-monospace,Menlo,monospace}
+    </style>
+  </defs>
+
+  <rect class="b" x="330" y="10" width="240" height="44"/>
+  <text class="t" x="350" y="30">cwd</text>
+  <text class="s" x="350" y="46">resolve_project_root(cwd, hint)</text>
+  <path class="e" d="M450,54 L450,88"/>
+
+  <rect class="b" x="310" y="88" width="280" height="40"/>
+  <text class="t" x="330" y="113">inside a git repo?</text>
+
+  <path class="e" d="M310,108 L180,108 L180,160"/>
+  <text class="ok" x="205" y="102">yes</text>
+  <path class="e" d="M590,108 L720,108 L720,160"/>
+  <text class="no" x="640" y="102">no</text>
+
+  <rect class="b" x="40" y="160" width="280" height="74"/>
+  <text class="t" x="58" y="182">nearest .mdkb at or below</text>
+  <text class="t" x="58" y="200">the repo root</text>
+  <text class="s" x="58" y="222">else the repo root itself</text>
+
+  <rect class="b" x="580" y="160" width="290" height="92"/>
+  <text class="t" x="598" y="182">nearest ancestor .mdkb</text>
+  <text class="s" x="598" y="200">that is a project, not a container</text>
+  <text class="s" x="598" y="218">else project_hint</text>
+  <text class="s" x="598" y="236">else cwd</text>
+
+  <path class="e" d="M180,234 L180,300"/>
+  <path class="e" d="M725,252 L725,300"/>
+
+  <rect class="b" x="40" y="300" width="280" height="56"/>
+  <text class="t" x="58" y="322">collapse to main worktree</text>
+  <text class="s" x="58" y="342">all worktrees share one store</text>
+
+  <rect class="b" x="580" y="300" width="290" height="56"/>
+  <text class="t" x="598" y="322">over_anchors(candidate)?</text>
+  <text class="s" x="598" y="342">holds git repos, or is $HOME / above</text>
+
+  <path class="e" d="M180,356 L180,410 L400,410"/>
+  <path class="e" d="M725,356 L725,410 L500,410"/>
+  <text class="no" x="745" y="382">true &#8594; refuse</text>
+
+  <rect class="b" x="330" y="390" width="240" height="44"/>
+  <text class="t" x="352" y="418">the store that answers</text>
+
+  <text class="s" x="40" y="462">The upward walk inside a repo is bounded by the repo root. A store is never borrowed from above it.</text>
+</svg>
+
+<table>
+  <tr><th>Guard</th><th>Rule</th><th>What it stops</th></tr>
+  <tr><td><code>holds_git_repos</code></td>
+      <td>True when any <em>immediate</em> child holds <code>.git</code>. It sees a directory and a worktree file alike.</td>
+      <td>A store on a container of repos, which indexes every repo below it.</td></tr>
+  <tr><td><code>is_home_or_above</code></td>
+      <td>True for <code>$HOME</code> and every ancestor of it.</td>
+      <td>A store that anchors everything the user owns. <code>$HOME</code> usually has no repo as an immediate child, so the container test alone lets it through.</td></tr>
+  <tr><td><code>over_anchors</code></td>
+      <td>Either of the two above. Applied to the adopted store, to the hint, and to the bare <code>cwd</code>.</td>
+      <td>Refusing to adopt a container store while creating one in the same directory.</td></tr>
+</table>
+
+<div class="why"><b>Measured.</b> With no guard on the fallback, a session started in <code>~/Gits</code>
+created <code>~/Gits/.mdkb</code>: 2.9 GB in nine minutes, ten cores at 100% for 24 hours (2026-08-19).
+A store at <code>$HOME</code> was measured at 1.2 GB indexing the whole home directory.</div>
+
+<p>When every candidate would over-anchor, the command stops and says so. It does not fall back
+to a smaller guess:</p>
+<pre><code>Error: refusing to anchor a store at /.../home: it holds git repositories
+(or is your home directory), so a store here would index every repository
+underneath it. Run mdkb from inside a project, or `mdkb init` here if you
+really mean it.</code></pre>
+<p><code>mdkb init</code> is the one command that bypasses the rule, so an operator who means it
+can still create the store. Every later command still applies the rule, so an init against the
+rule produces a store that nothing reads.</p>
+<div class="src">src/git.rs — <code>resolve_project_root</code> (541), <code>find_project_store_above</code> (499),
+<code>over_anchors</code> (468), <code>holds_git_repos</code> (440), <code>is_home_or_above</code> (454)</div>
+
+<h2>2. Worktrees collapse to one store <span class="tag live">live</span></h2>
+<p>The chosen directory is collapsed to the main worktree. Every worktree of a repository reads
+and writes the same store, so a feature branch checked out beside the main tree inherits the
+knowledge instead of starting empty. The anchor is immune to drift inside the repo:
+<code>cwd</code> is only a starting point for the bounded walk.</p>
+<div class="src">src/git.rs — <code>resolve_main_worktree</code></div>
+
+<h2>3. Folder scoping inside one store — collections <span class="tag live">live</span></h2>
+<p>A collection is a name, a path below the store root, and a glob. It is how one store holds many
+folders without mixing them in search.</p>
+<pre><code>mdkb collection add rfc ./engineering/RFC '**/*.md'
+mdkb search "capacity model" -c rfc --limit 5</code></pre>
+<table>
+  <tr><th>Behaviour</th><th>Detail</th></tr>
+  <tr><td>Path traversal is blocked</td>
+      <td>A path that resolves outside the root is refused. When the path does not exist yet, a literal <code>..</code> is refused.</td></tr>
+  <tr><td><code>collection update --pattern</code> keeps the documents</td>
+      <td>Fixing a glob no longer drops every row and re-embeds the folder. The next <code>mdkb update</code> reconciles incrementally.</td></tr>
+  <tr><td><code>collection update --path</code> does not carry rows over</td>
+      <td>A document is keyed by its path relative to the collection base. A new base is indexed from scratch.</td></tr>
+  <tr><td>Auto-registration by convention</td>
+      <td><code>[conventions] enabled</code> registers collections that follow the layout. The upsert makes it safe against a concurrent manual <code>collection add</code>.</td></tr>
+</table>
+<div class="src">src/core/graph.rs — <code>validate_collection_path</code> (142); src/store/collections.rs — <code>add_collection</code></div>
+
+<h2>4. The knowledge graph is per store <span class="tag live">live</span></h2>
+<p>Edges live in the store that indexed the document. <code>mdkb graph</code> filters by relation and
+by nothing else — there is no collection filter and no scope filter. <code>hubs</code>, <code>dangling</code>,
+<code>neighbors</code> and <code>path</code> read the whole store.</p>
+<p>This is a design statement, not a gap. Two bodies of knowledge that must not mix belong in two
+stores. Collections divide <em>search</em>; only a store boundary divides the <em>graph</em>.</p>
+<p>Target references are stored verbatim and resolved at query time, so indexing order does not
+matter. Resolution tries the reference, then without a leading <code>./</code> or <code>/</code>, then with
+<code>.md</code> added or removed, then all of those again with a leading collection name stripped.
+So <code>map/people/alice</code> and <code>people/alice.md</code> reach the same document.</p>
+<div class="src">docs/graph.md; src/store/graph.rs</div>
+
+<h2>5. Fan-out across repositories — cross-repo search <span class="tag live">live</span></h2>
+<p>One query, every repository the daemon knows. This is the flow that makes many small stores
+better than one large one: isolation by default, reach on request.</p>
+
+<svg viewBox="0 0 900 330" role="img" aria-label="Cross-repo search fan-out">
+  <defs>
+    <marker id="b2" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#6ea8fe"/>
+    </marker>
+    <style>
+      .bb{fill:#161b22;stroke:#2a3242;rx:8}
+      .tt{fill:#e6edf3;font:13px ui-monospace,Menlo,monospace}
+      .ss{fill:#9aa7b8;font:11px ui-monospace,Menlo,monospace}
+      .ee{stroke:#6ea8fe;stroke-width:1.4;fill:none;marker-end:url(#b2)}
+      .gg{stroke:#57caa0;stroke-width:1.4;fill:none;marker-end:url(#b2)}
+      .rr{stroke:#f47272;stroke-width:1.4;fill:none;stroke-dasharray:4 3;marker-end:url(#b2)}
+      .okt{fill:#57caa0;font:11px ui-monospace,Menlo,monospace}
+      .bat{fill:#f47272;font:11px ui-monospace,Menlo,monospace}
+    </style>
+  </defs>
+
+  <rect class="bb" x="20" y="120" width="210" height="60"/>
+  <text class="tt" x="38" y="145">search(root="*")</text>
+  <text class="ss" x="38" y="164">or "a,b" or /abs/path</text>
+
+  <path class="ee" d="M230,150 L300,150"/>
+
+  <rect class="bb" x="300" y="105" width="200" height="90"/>
+  <text class="tt" x="318" y="130">RepoMap</text>
+  <text class="ss" x="318" y="150">every root ever opened</text>
+  <text class="ss" x="318" y="168">survives a restart</text>
+  <text class="ss" x="318" y="186">daemon.toml [[repos]] unioned</text>
+
+  <path class="gg" d="M500,125 L590,55"/>
+  <path class="gg" d="M500,150 L590,150"/>
+  <path class="rr" d="M500,175 L590,245"/>
+
+  <rect class="bb" x="590" y="28" width="290" height="52"/>
+  <text class="tt" x="608" y="50">work/.mdkb</text>
+  <text class="okt" x="608" y="68">opened read-only — no handle, no LRU slot</text>
+
+  <rect class="bb" x="590" y="124" width="290" height="52"/>
+  <text class="tt" x="608" y="146">monfumo/.mdkb</text>
+  <text class="okt" x="608" y="164">opened read-only</text>
+
+  <rect class="bb" x="590" y="220" width="290" height="52"/>
+  <text class="tt" x="608" y="242">twitter/.mdkb</text>
+  <text class="bat" x="608" y="260">NOT SEARCHED — with its reason</text>
+
+  <rect class="bb" x="20" y="240" width="480" height="62"/>
+  <text class="tt" x="38" y="264">_Searched 2 of 3 known repos._</text>
+  <text class="ss" x="38" y="284">**Not searched (1):** /…/twitter — schema version too new</text>
+</svg>
+<p class="legend">The coverage footer is always emitted, including when every repo was searched.</p>
+
+<h3>The <code>root</code> grammar</h3>
+<table>
+  <tr><th>Form</th><th>Meaning</th></tr>
+  <tr><td><code>root="/abs/path"</code></td><td>One repo by path. It need not be a known repo.</td></tr>
+  <tr><td><code>root="name"</code></td><td>One repo by name — the last component of a known root.</td></tr>
+  <tr><td><code>root="name,/abs/path"</code></td><td>Several repos. Names and paths mix freely.</td></tr>
+  <tr><td><code>root="*"</code></td><td>Every known repo. It cannot be combined with other terms.</td></tr>
+</table>
+<p>A comma is always the separator. A path that contains one is ambiguous, so it is refused by
+name instead of split into two selectors that resolve to nothing. An absolute path and a name are
+told apart syntactically, before anything is looked up, so a repo name can never shadow a path.</p>
+
+<h3>What the fan-out guarantees</h3>
+<table>
+  <tr><th>Guarantee</th><th>Why it matters</th></tr>
+  <tr><td>Known, not open</td>
+      <td>Open handles are an LRU capped at <code>max_active_repos</code> and empty after a restart. Fanning out over them omits every known but closed repo, silently.</td></tr>
+  <tr><td>Read-only open</td>
+      <td>No handle, no watcher, no LRU slot taken from the repo the caller is working in.</td></tr>
+  <tr><td>A skipped repo is named</td>
+      <td>A store this binary cannot read is reported with its reason. It is never counted as empty.</td></tr>
+  <tr><td>Coverage is stated</td>
+      <td>Without the denominator, "no results" means both "nothing matched" and "never looked".</td></tr>
+  <tr><td>Only <code>search</code> fans out</td>
+      <td>Code, symbols and duplicate indexes are per-repo. Those scopes are rejected with a message that asks for a root.</td></tr>
+  <tr><td>The CLI stays local</td>
+      <td><code>root</code> is an MCP parameter. The CLI always works in the current repo.</td></tr>
+</table>
+<div class="src">src/daemon/repo_map.rs; src/mcp/dispatch.rs — <code>cross_repo_search_impl</code> (1666),
+<code>format_cross_repo_coverage</code> (1636); src/mcp/tools.rs — the <code>root</code> grammar</div>
+
+<h3>Health of a known root</h3>
+<p>The map records why a root did not answer, and the distinction is the point of the type. A store
+that cannot be read is a property of this binary, of a lock, or of file permissions. It is never
+evidence that the repository was deleted.</p>
+<table>
+  <tr><th>State</th><th>Meaning</th></tr>
+  <tr><td><code>Healthy</code></td><td>The root is there and its store can be listed.</td></tr>
+  <tr><td><code>Gone</code></td><td>Nothing exists at that path any more. The root is dropped.</td></tr>
+  <tr><td><code>NoStore</code></td><td>The path exists and holds no <code>.mdkb</code>.</td></tr>
+  <tr><td><code>Unreadable(reason)</code></td><td>The store is there and this process cannot read it.</td></tr>
+</table>
+<p>The map is written whole through temp and rename, so no reader sees a half-written file. No
+cross-process lock is taken: a writer holding an older set can drop a root another process just
+recorded, which costs one re-record on the next open.</p>
+
+<h2>6. Read-only layering onto ancestor stores <span class="tag dormant">implemented, not wired</span></h2>
+<p><code>discover_ancestor_stores</code> walks up from a store and collects the ancestors that
+<em>already</em> hold a <code>.mdkb</code>, nearest first, capped by depth. It never creates anything
+and never includes the store itself, so layering can add read provenance without bringing store
+proliferation back.</p>
+<p>It has no caller outside its tests. A nested repository does <b>not</b> inherit its parent's
+knowledge today. Treat two stores as hermetic.</p>
+<div class="src">src/git.rs — <code>discover_ancestor_stores</code> (564)</div>
+
+<h2>7. A worked example</h2>
+<p>A planning workspace that is not a git repository, with two branches that must not mix:</p>
+<pre><code>brainstorming/          not a git repo
+├── work/               .mdkb  ← 306 docs, 28 collections, 182 edges
+│   └── graph/          people, orgs, meetings, decisions, initiatives
+├── home/               no store
+│   ├── monfumo/        .git + .mdkb   ← own store
+│   ├── investimenti/   .git + .mdkb   ← own store
+│   └── twitter/        .mdkb          ← own store
+└── tools/              shared scripts</code></pre>
+<table>
+  <tr><th>Run from</th><th>Store that answers</th><th>Rule</th></tr>
+  <tr><td><code>work/</code></td><td><code>work/.mdkb</code></td><td>Nearest ancestor store that is a project.</td></tr>
+  <tr><td><code>work/engineering/RFC/</code></td><td><code>work/.mdkb</code></td><td>Same. A subfolder rediscovers its own store.</td></tr>
+  <tr><td><code>home/monfumo/</code></td><td><code>monfumo/.mdkb</code></td><td>Inside a repo. The store at the repo root wins.</td></tr>
+  <tr><td><code>home/twitter/</code></td><td><code>twitter/.mdkb</code></td><td>Not a repo, holds no repos, has a store.</td></tr>
+  <tr><td><code>home/</code></td><td><b>refused</b></td><td><code>home/</code> holds <code>monfumo/.git</code> and <code>investimenti/.git</code> as immediate children.</td></tr>
+</table>
+<div class="why"><b>The trap this makes visible.</b> Put a store at <code>brainstorming/.mdkb</code> and
+<code>home/</code> adopts it, because <code>brainstorming/</code> has no repo as an immediate child. The
+store stays empty, every <code>memory add</code> run from <code>home/</code> lands in it, and nothing
+ever reads it. Removing that store turns a silent write into a loud refusal.</div>
+<p>To give <code>home/</code> a branch store of its own, the two repositories have to stop being its
+immediate children — for example under <code>home/projects/</code>. The guard reads one level, by design:
+a deeper scan would make the anchor depend on how far down someone cloned a repository.</p>
+
+<footer>
+Part of the MDKB documentation. See <a href="graph.md">graph.md</a> for edge extraction and the
+<code>[graph]</code> section, and <code>mdkb cheatsheet</code> for the <code>root</code> grammar at the
+point of use.
+</footer>
+
+</div>
+</body>
+</html>

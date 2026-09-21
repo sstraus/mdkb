@@ -107,6 +107,13 @@ apply the change to documents it has already seen: it skips files whose mtime
 has not moved, and their edges with them. Run `mdkb update --force` once after
 editing the allowlist.
 
+Which keys are relations is a decision only the repository can make: a relation
+target is any string or list of strings, so `type: person` and `org: [org:acme]`
+are indistinguishable by value. The README explains what auto-detection would do
+to `graph hubs`. See also
+[cross-folder-flows.html](cross-folder-flows.html) for how a store is chosen for a
+working directory and how the graph boundary follows the store boundary.
+
 The three `expand_*` values are the only graph settings on a hot path. They cap
 how much the graph is allowed to add to each prompt injection; raise them
 deliberately.
