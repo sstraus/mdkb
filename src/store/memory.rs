@@ -1198,6 +1198,13 @@ pub fn find_duplicate(
         if entry.id == id {
             continue;
         }
+        // The title arm scopes itself to active rows; this one has to say so
+        // too. Archiving, superseding and pruning only flip `status` — the
+        // vector stays in `vec_memory`, which only a hard DELETE clears. A
+        // neighbour that search can no longer return must not refuse a write.
+        if entry.status != EntryStatus::Active {
+            continue;
+        }
         let similarity = crate::store::hybrid::cosine_from_distance(distance);
         return Ok(Some(Duplicate::Meaning {
             entry: Box::new(entry),
@@ -2176,12 +2183,12 @@ pub(crate) fn prunable_predicate_sql() -> String {
                 entry_type IN ({lifecycle})
                 AND COALESCE(last_accessed, created_at) < ?1
                 AND (due_at IS NULL OR due_at < ?1)
-                AND id IS NOT (
-                    SELECT id FROM memory_entries
-                    WHERE entry_type = 'handoff' AND status = 'active'
-                    ORDER BY updated_at DESC LIMIT 1
-                )
             )
+        )
+        AND id IS NOT (
+            SELECT id FROM memory_entries
+            WHERE entry_type = 'handoff' AND status = 'active'
+            ORDER BY updated_at DESC LIMIT 1
         )"
     )
 }
