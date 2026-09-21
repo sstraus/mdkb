@@ -6,9 +6,11 @@
 
 use std::path::PathBuf;
 
-use mdkb::cli::handlers::{handle_collection_add, handle_init, handle_update};
-use mdkb::core::indexing::handle_update_files;
+use mdkb::cli::handlers::{
+    handle_collection_add, handle_collection_update, handle_init, handle_update,
+};
 use mdkb::core::Context;
+use mdkb::core::indexing::handle_update_files;
 use tempfile::TempDir;
 
 struct Env {
@@ -225,10 +227,7 @@ fn identity_keys_are_configurable() {
 #[test]
 fn widening_the_allowlist_applies_without_force() {
     let env = Env::new();
-    env.write(
-        "a.md",
-        "---\nowner: alice\norg: org:acme\n---\n\n# A\n",
-    );
+    env.write("a.md", "---\nowner: alice\norg: org:acme\n---\n\n# A\n");
     env.update();
     assert_eq!(
         env.edges("a.md"),
@@ -240,9 +239,7 @@ fn widening_the_allowlist_applies_without_force() {
     let config = std::fs::read_to_string(&config_path).expect("read config");
     std::fs::write(
         &config_path,
-        format!(
-            "{config}\n[graph]\nfrontmatter_relations = [\"owner\", \"org\"]\n"
-        ),
+        format!("{config}\n[graph]\nfrontmatter_relations = [\"owner\", \"org\"]\n"),
     )
     .expect("write config");
 
@@ -326,13 +323,19 @@ fn a_wikilink_edge_survives_the_frontmatter_pass() {
     env.update();
     let mut again = env.edges("a.md");
     again.sort();
-    assert_eq!(again, found, "the pass is idempotent and spares the wikilink");
+    assert_eq!(
+        again, found,
+        "the pass is idempotent and spares the wikilink"
+    );
 }
 
 #[test]
 fn a_second_update_does_not_change_the_edge_count() {
     let env = Env::new();
-    env.write("a.md", "---\nowner: alice\nrelated: [b.md, c.md]\n---\n\n[[b]]\n");
+    env.write(
+        "a.md",
+        "---\nowner: alice\nrelated: [b.md, c.md]\n---\n\n[[b]]\n",
+    );
     env.write("b.md", "---\nowner: bob\n---\n\n# B\n");
     env.update();
     let first: i64 = env
@@ -403,7 +406,10 @@ fn auto_extracts_a_detected_key_without_touching_the_config() {
     env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
     env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
     env.write("m2.md", "---\nowner: bob\norg: [org:acme]\n---\n\n# M2\n");
-    set_graph_config(&env.root, "relations = \"auto\"\nfrontmatter_relations = [\"owner\"]");
+    set_graph_config(
+        &env.root,
+        "relations = \"auto\"\nfrontmatter_relations = [\"owner\"]",
+    );
 
     let config_path = env.root.join(".mdkb/config.toml");
     let before = std::fs::read_to_string(&config_path).expect("read config");
@@ -439,7 +445,10 @@ fn manual_extracts_only_the_declared_keys() {
     let env = Env::new();
     env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
     env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
-    set_graph_config(&env.root, "relations = \"manual\"\nfrontmatter_relations = [\"owner\"]");
+    set_graph_config(
+        &env.root,
+        "relations = \"manual\"\nfrontmatter_relations = [\"owner\"]",
+    );
 
     let env = Env {
         ctx: Context::open(&env.root).expect("reopen"),
@@ -461,7 +470,10 @@ fn semi_extracts_only_the_declared_keys() {
     let env = Env::new();
     env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
     env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
-    set_graph_config(&env.root, "relations = \"semi\"\nfrontmatter_relations = [\"owner\"]");
+    set_graph_config(
+        &env.root,
+        "relations = \"semi\"\nfrontmatter_relations = [\"owner\"]",
+    );
 
     let env = Env {
         ctx: Context::open(&env.root).expect("reopen"),
@@ -483,7 +495,10 @@ fn the_single_file_route_honours_auto_too() {
     let env = Env::new();
     env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
     env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
-    set_graph_config(&env.root, "relations = \"auto\"\nfrontmatter_relations = [\"owner\"]");
+    set_graph_config(
+        &env.root,
+        "relations = \"auto\"\nfrontmatter_relations = [\"owner\"]",
+    );
     let env = Env {
         ctx: Context::open(&env.root).expect("reopen"),
         _dir: env._dir,
@@ -512,8 +527,14 @@ fn the_single_file_route_honours_auto_too() {
 fn update_records_what_the_detector_measured() {
     let env = Env::new();
     env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
-    env.write("m1.md", "---\nowner: alice\norg: [org:acme]\ntype: meeting\n---\n\n# M1\n");
-    set_graph_config(&env.root, "relations = \"semi\"\nfrontmatter_relations = [\"owner\"]");
+    env.write(
+        "m1.md",
+        "---\nowner: alice\norg: [org:acme]\ntype: meeting\n---\n\n# M1\n",
+    );
+    set_graph_config(
+        &env.root,
+        "relations = \"semi\"\nfrontmatter_relations = [\"owner\"]",
+    );
     let env = Env {
         ctx: Context::open(&env.root).expect("reopen"),
         _dir: env._dir,
@@ -537,7 +558,10 @@ fn auto_leaves_nothing_undetected_to_report() {
     let env = Env::new();
     env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
     env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
-    set_graph_config(&env.root, "relations = \"auto\"\nfrontmatter_relations = [\"owner\"]");
+    set_graph_config(
+        &env.root,
+        "relations = \"auto\"\nfrontmatter_relations = [\"owner\"]",
+    );
     let env = Env {
         ctx: Context::open(&env.root).expect("reopen"),
         _dir: env._dir,
@@ -560,16 +584,26 @@ fn switching_to_manual_clears_what_was_measured() {
     let env = Env::new();
     env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
     env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
-    set_graph_config(&env.root, "relations = \"semi\"\nfrontmatter_relations = [\"owner\"]");
+    set_graph_config(
+        &env.root,
+        "relations = \"semi\"\nfrontmatter_relations = [\"owner\"]",
+    );
     let env = Env {
         ctx: Context::open(&env.root).expect("reopen"),
         _dir: env._dir,
         root: env.root,
     };
     env.update();
-    assert!(!mdkb::store::graph::undetected_relation_keys(&env.ctx.conn).unwrap().is_empty());
+    assert!(
+        !mdkb::store::graph::undetected_relation_keys(&env.ctx.conn)
+            .unwrap()
+            .is_empty()
+    );
 
-    set_graph_config(&env.root, "relations = \"manual\"\nfrontmatter_relations = [\"owner\"]");
+    set_graph_config(
+        &env.root,
+        "relations = \"manual\"\nfrontmatter_relations = [\"owner\"]",
+    );
     let env = Env {
         ctx: Context::open(&env.root).expect("reopen"),
         _dir: env._dir,
@@ -594,7 +628,10 @@ fn switching_to_manual_clears_what_was_measured() {
 fn a_broken_frontmatter_block_is_reported_by_update() {
     let env = Env::new();
     env.write("good.md", "---\nowner: alice\n---\n\n# Good\n");
-    env.write("broken.md", "---\naliases: [@sstraus]\nid: person:x\n---\n\n# Broken\n");
+    env.write(
+        "broken.md",
+        "---\naliases: [@sstraus]\nid: person:x\n---\n\n# Broken\n",
+    );
 
     let result = handle_update(&env.ctx, &env.root).expect("update");
 
@@ -614,7 +651,11 @@ fn a_broken_frontmatter_block_is_reported_by_update() {
     // The document is still indexed — losing it entirely would be worse than
     // losing its metadata — but it claims no identity it never parsed.
     assert!(env.aliases("broken.md").is_empty());
-    assert_eq!(env.edges("good.md").len(), 1, "the good document is unaffected");
+    assert_eq!(
+        env.edges("good.md").len(),
+        1,
+        "the good document is unaffected"
+    );
 }
 
 /// `metadata` must never be written as the JSON string `null`.
@@ -720,8 +761,75 @@ fn a_manual_pattern_survives_an_update() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(pattern, "*.md", "source=manual is a choice, not a stale default");
+    assert_eq!(
+        pattern, "*.md",
+        "source=manual is a choice, not a stale default"
+    );
     assert!(result.pattern_upgrades.is_empty());
+}
+
+/// A revert performed with the supported command has to survive the next update.
+///
+/// This is the hole the other two tests could not see, because both seed the
+/// row with SQL and neither goes through `mdkb collection update`. That command
+/// used to preserve `source`, so a user who narrowed `_root` back to `*.md`
+/// left the row at `source = convention`; the next update matched the
+/// superseded pair and put `**/*.md` back. The notice printed on that upgrade
+/// names `mdkb collection update` as the way to revert it — the very command
+/// that did not stick. Re-indexing a whole tree the user excluded on purpose,
+/// once per update, forever.
+#[test]
+fn a_revert_through_the_supported_command_is_not_undone_by_the_next_update() {
+    let env = Env::new();
+    env.write("top.md", "---\nowner: alice\n---\n\n# Top\n");
+    env.write("deep/buried.md", "---\nowner: bob\n---\n\n# Buried\n");
+
+    // The state a store reaches after the upgrade has been applied once.
+    env.ctx
+        .conn
+        .execute(
+            "INSERT OR REPLACE INTO collections (name, path, pattern, source, created_at, updated_at)
+             VALUES ('_root', '.', '**/*.md', 'convention', 1, 1)",
+            [],
+        )
+        .expect("seed upgraded _root");
+
+    // The user wants top-level markdown only, and says so the supported way.
+    handle_collection_update(&env.ctx, "_root", None, Some("*.md")).expect("revert the pattern");
+
+    let result = handle_update(&env.ctx, &env.root).expect("update");
+
+    let pattern: String = env
+        .ctx
+        .conn
+        .query_row(
+            "SELECT pattern FROM collections WHERE name = '_root'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pattern, "*.md",
+        "the revert holds: a pattern somebody typed is a choice"
+    );
+    assert!(
+        result.pattern_upgrades.is_empty(),
+        "and nothing is reported, because nothing was overruled"
+    );
+
+    let source: String = env
+        .ctx
+        .conn
+        .query_row(
+            "SELECT source FROM collections WHERE name = '_root'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        source, "manual",
+        "an explicit --pattern records whose decision the pattern is"
+    );
 }
 
 /// Running twice reports the upgrade once. A notice on every update is noise.
@@ -738,7 +846,13 @@ fn the_upgrade_is_reported_once_not_every_run() {
         )
         .unwrap();
 
-    assert_eq!(handle_update(&env.ctx, &env.root).unwrap().pattern_upgrades.len(), 1);
+    assert_eq!(
+        handle_update(&env.ctx, &env.root)
+            .unwrap()
+            .pattern_upgrades
+            .len(),
+        1
+    );
     assert!(
         handle_update(&env.ctx, &env.root)
             .unwrap()

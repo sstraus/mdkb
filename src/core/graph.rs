@@ -80,12 +80,26 @@ pub fn handle_collection_update(
             .map_err(|e| Error::other(format!("Invalid glob pattern '{pattern}': {e}")))?;
     }
 
-    // The upsert keeps `created_at` and `source`: this is the same collection,
-    // pointed somewhere else. A convention collection retargeted by hand stays
-    // a convention collection, so `apply_conventions` still leaves it alone.
+    // The upsert keeps `created_at`: this is the same collection, pointed
+    // somewhere else.
+    //
+    // `source` is different, and an explicit `--pattern` flips it to manual.
+    // It is the only record of whose decision the pattern is, and
+    // `detect_pattern_upgrades` reads it to decide whether mdkb may correct
+    // its own past output. Leaving a hand-narrowed collection at
+    // `source = convention` made that gate meaningless: the next `mdkb update`
+    // matched the superseded pair and put the old pattern back, so the revert
+    // this command exists to perform was undone on every run, forever. A
+    // pattern somebody typed is a choice, whatever wrote the first one.
+    let source = if pattern.is_some() {
+        crate::domain::COLLECTION_SOURCE_MANUAL.to_string()
+    } else {
+        existing.source.clone()
+    };
     let updated = Collection {
         path: path.unwrap_or(&existing.path).to_string(),
         pattern: pattern.unwrap_or(&existing.pattern).to_string(),
+        source,
         updated_at: chrono::Utc::now().timestamp(),
         ..existing
     };
@@ -385,13 +399,7 @@ const MAX_COLLECTION_NAME_LEN: usize = 100;
 /// They point at documents and therefore score like relations, but an edge
 /// from them would duplicate a relationship `store::evolution` already models
 /// with its own semantics. Excluded from detection, never derived.
-pub const NEVER_DERIVED: &[&str] = &[
-    "supersedes",
-    "updates",
-    "corrects",
-    "extends",
-    "retracts",
-];
+pub const NEVER_DERIVED: &[&str] = &["supersedes", "updates", "corrects", "extends", "retracts"];
 
 /// The share of a key's values that must name something the index knows before
 /// the key counts as a relation.
@@ -498,9 +506,7 @@ pub fn detect_relation_keys(
         documents += 1;
 
         for key in object.keys() {
-            if NEVER_DERIVED.contains(&key.as_str())
-                || cfg.identity_keys.iter().any(|k| k == key)
-            {
+            if NEVER_DERIVED.contains(&key.as_str()) || cfg.identity_keys.iter().any(|k| k == key) {
                 continue;
             }
             let refs = crate::domain::frontmatter::extract_relation_refs(Some(&value), key);
@@ -571,7 +577,10 @@ pub struct AppliedRelations {
 ///
 /// Union, never replace: a key the user wrote by hand is not removed because
 /// the detector did not happen to find it this run.
-pub fn apply_detected_relations(config_path: &Path, detected: &[String]) -> Result<AppliedRelations> {
+pub fn apply_detected_relations(
+    config_path: &Path,
+    detected: &[String],
+) -> Result<AppliedRelations> {
     if let Some(key) = detected
         .iter()
         .find(|k| NEVER_DERIVED.contains(&k.as_str()))
@@ -691,14 +700,21 @@ mod relation_apply_tests {
         let applied =
             apply_detected_relations(&path, &["org".to_string(), "owner".to_string()]).unwrap();
 
-        assert_eq!(applied.added, vec!["org".to_string()], "`owner` was already there");
+        assert_eq!(
+            applied.added,
+            vec!["org".to_string()],
+            "`owner` was already there"
+        );
         assert_eq!(applied.result, vec!["owner", "mine", "org"]);
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(
             written.contains("mine"),
             "a key the detector did not find is not removed"
         );
-        assert!(written.contains("enabled = true"), "sibling settings survive");
+        assert!(
+            written.contains("enabled = true"),
+            "sibling settings survive"
+        );
     }
 
     #[test]
@@ -813,9 +829,21 @@ mod relation_detection_tests {
     /// A miniature of the measured corpus: typed people and orgs that declare
     /// their names, meetings that point at them, and metadata that does not.
     fn seed_typed_corpus(conn: &Connection) {
-        doc(conn, "people/alice.md", r#"{"id":"person:alice","type":"person","name":"Alice","role":"Data Scientist"}"#);
-        doc(conn, "people/bob.md", r#"{"id":"person:bob","type":"person","name":"Bob","role":"Engineer"}"#);
-        doc(conn, "orgs/acme.md", r#"{"id":"org:acme","type":"org","name":"Acme"}"#);
+        doc(
+            conn,
+            "people/alice.md",
+            r#"{"id":"person:alice","type":"person","name":"Alice","role":"Data Scientist"}"#,
+        );
+        doc(
+            conn,
+            "people/bob.md",
+            r#"{"id":"person:bob","type":"person","name":"Bob","role":"Engineer"}"#,
+        );
+        doc(
+            conn,
+            "orgs/acme.md",
+            r#"{"id":"org:acme","type":"org","name":"Acme"}"#,
+        );
         doc(
             conn,
             "meetings/m1.md",
@@ -933,7 +961,11 @@ mod relation_detection_tests {
         // The other empty case: things CAN resolve, and these keys still do
         // not. That is a measurement, not a missing precondition.
         let conn = setup();
-        doc(&conn, "people/alice.md", r#"{"id":"person:alice","status":"draft"}"#);
+        doc(
+            &conn,
+            "people/alice.md",
+            r#"{"id":"person:alice","status":"draft"}"#,
+        );
 
         let found = detect_relation_keys(&conn, &GraphConfig::default()).unwrap();
         assert!(found.candidates.is_empty());
@@ -970,7 +1002,10 @@ mod relation_detection_tests {
         );
         assert!(!github.is_relation());
         assert!(
-            found.examined.iter().any(|c| c.key == "knows" && c.is_relation()),
+            found
+                .examined
+                .iter()
+                .any(|c| c.key == "knows" && c.is_relation()),
             "a key pointing at another document is still a relation"
         );
     }
