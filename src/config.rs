@@ -300,6 +300,25 @@ pub struct ConventionsConfig {
 }
 
 /// Knowledge-graph edge extraction settings.
+/// How the set of extracted relation keys is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RelationMode {
+    /// Derive the keys on every index run and union them with
+    /// `frontmatter_relations`.
+    ///
+    /// The config file is never rewritten. Derivation re-reads the corpus, so
+    /// it follows the repository instead of freezing a snapshot of it — and a
+    /// tool that edits the user's config to record its own guess is a tool
+    /// that has to be corrected by hand when the guess ages.
+    #[default]
+    Auto,
+    /// Extract `frontmatter_relations` only, and report what derivation found.
+    Semi,
+    /// Extract `frontmatter_relations` only, and report nothing.
+    Manual,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GraphConfig {
@@ -310,6 +329,10 @@ pub struct GraphConfig {
     /// (supersedes/updates/corrects/retracts/extends) are owned by the evolution
     /// subsystem and should not be listed here.
     pub frontmatter_relations: Vec<String>,
+
+    /// How the extracted key set is decided: derived and unioned (`auto`),
+    /// or the allowlist alone (`semi`, `manual`).
+    pub relations: RelationMode,
 
     /// Frontmatter keys that declare what a document IS, not what it points at.
     ///
@@ -771,6 +794,27 @@ impl Default for ConventionsConfig {
     }
 }
 
+impl GraphConfig {
+    /// The keys extraction will actually use this run.
+    ///
+    /// Under `auto` the declared allowlist comes first and the detected keys
+    /// are appended, so a key the user wrote keeps its position and a key in
+    /// both appears once. Under `semi` and `manual` the detector is still run
+    /// — its output is what those modes report — but it never reaches
+    /// extraction.
+    pub fn effective_relations(&self, detected: &[String]) -> Vec<String> {
+        let mut out = self.frontmatter_relations.clone();
+        if self.relations == RelationMode::Auto {
+            for key in detected {
+                if !out.contains(key) {
+                    out.push(key.clone());
+                }
+            }
+        }
+        out
+    }
+}
+
 impl Default for GraphConfig {
     fn default() -> Self {
         Self {
@@ -779,6 +823,7 @@ impl Default for GraphConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            relations: RelationMode::default(),
             identity_keys: ["id", "aliases"].iter().map(|s| s.to_string()).collect(),
             include_wikilinks: true,
             expand_seeds: 2,
@@ -1087,6 +1132,27 @@ impl Config {
             return Err(ErrorKind::ConfigInvalid {
                 field: "code.duplication.min_nodes".to_string(),
                 message: "must be greater than 0".to_string(),
+            }
+            .into());
+        }
+
+        // The evolution subsystem owns these keys and models the relationship
+        // with its own semantics. Listing one in the graph allowlist produces
+        // a second, untyped edge beside the one that already exists. Rejected
+        // in every mode: `auto` never derives them either.
+        if let Some(key) = self
+            .graph
+            .frontmatter_relations
+            .iter()
+            .find(|k| crate::core::graph::NEVER_DERIVED.contains(&k.as_str()))
+        {
+            return Err(ErrorKind::ConfigInvalid {
+                field: "graph.frontmatter_relations".to_string(),
+                message: format!(
+                    "'{key}' belongs to the evolution subsystem and cannot be a graph relation; \
+                     remove it (evolution keys: {})",
+                    crate::core::graph::NEVER_DERIVED.join(", ")
+                ),
             }
             .into());
         }
@@ -1418,6 +1484,87 @@ strategy = "invalid_strategy"
                 .contains(&"supersedes".to_string()),
             "evolution keys must not be in the graph allowlist"
         );
+    }
+
+    #[test]
+    fn relations_defaults_to_auto() {
+        assert_eq!(Config::default().graph.relations, RelationMode::Auto);
+    }
+
+    #[test]
+    fn auto_unions_the_detected_keys_with_the_declared_ones() {
+        let cfg = GraphConfig {
+            relations: RelationMode::Auto,
+            frontmatter_relations: vec!["owner".into(), "themes".into()],
+            ..GraphConfig::default()
+        };
+        let detected = ["org".to_string(), "owner".to_string()];
+
+        assert_eq!(
+            cfg.effective_relations(&detected),
+            vec![
+                "owner".to_string(),
+                "themes".to_string(),
+                "org".to_string()
+            ],
+            "declared first, detected appended, no duplicate for a key in both"
+        );
+    }
+
+    #[test]
+    fn semi_and_manual_extract_only_what_was_declared() {
+        let detected = ["org".to_string()];
+        for mode in [RelationMode::Semi, RelationMode::Manual] {
+            let cfg = GraphConfig {
+                relations: mode,
+                frontmatter_relations: vec!["owner".into()],
+                ..GraphConfig::default()
+            };
+            assert_eq!(
+                cfg.effective_relations(&detected),
+                vec!["owner".to_string()],
+                "{mode:?} must ignore the detector for extraction"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_relations_value_is_rejected_naming_the_three() {
+        let err = toml::from_str::<Config>("[graph]\nrelations = \"sometimes\"\n")
+            .expect_err("an unknown mode must not be accepted");
+        let message = err.to_string();
+        for expected in ["auto", "semi", "manual"] {
+            assert!(
+                message.contains(expected),
+                "the error must name `{expected}`; got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_evolution_key_in_the_allowlist_is_rejected_in_every_mode() {
+        // The evolution subsystem owns these. Listing one here would produce a
+        // second, untyped edge beside the relationship it already models.
+        for mode in [RelationMode::Auto, RelationMode::Semi, RelationMode::Manual] {
+            let mut config = Config::default();
+            config.graph.relations = mode;
+            config.graph.frontmatter_relations = vec!["owner".into(), "supersedes".into()];
+            let err = config
+                .validate()
+                .expect_err("supersedes must be refused in {mode:?}");
+            let message = err.to_string();
+            assert!(
+                message.contains("supersedes"),
+                "the error must name the offending key; got: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_allowlist_still_validates() {
+        let mut config = Config::default();
+        config.graph.frontmatter_relations = vec!["owner".into(), "org".into()];
+        config.validate().expect("an ordinary allowlist is fine");
     }
 
     #[test]

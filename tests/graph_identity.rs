@@ -33,7 +33,11 @@ impl Env {
     }
 
     fn write(&self, name: &str, body: &str) {
-        std::fs::write(self.root.join("docs").join(name), body).expect("write");
+        let path = self.root.join("docs").join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir");
+        }
+        std::fs::write(path, body).expect("write");
     }
 
     /// Rewrite a file and push its mtime into the future.
@@ -378,4 +382,125 @@ fn indexing_one_named_file_builds_its_frontmatter_edges() {
     let mut again = env.edges("a.md");
     again.sort();
     assert_eq!(again, found, "a second save is idempotent on both kinds");
+}
+
+/// Write a live `[graph]` section on top of the shipped commented config.
+fn set_graph_config(root: &std::path::Path, body: &str) {
+    let path = root.join(".mdkb/config.toml");
+    let base = std::fs::read_to_string(&path).expect("read config");
+    let base = match base.find("\n[graph]\n") {
+        Some(at) => base[..at].to_string(),
+        None => base,
+    };
+    std::fs::write(&path, format!("{base}\n[graph]\n{body}\n")).expect("write config");
+}
+
+/// Under `auto` a relation key the user never declared is still extracted —
+/// and the config file is not edited to record that.
+#[test]
+fn auto_extracts_a_detected_key_without_touching_the_config() {
+    let env = Env::new();
+    env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
+    env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
+    env.write("m2.md", "---\nowner: bob\norg: [org:acme]\n---\n\n# M2\n");
+    set_graph_config(&env.root, "relations = \"auto\"\nfrontmatter_relations = [\"owner\"]");
+
+    let config_path = env.root.join(".mdkb/config.toml");
+    let before = std::fs::read_to_string(&config_path).expect("read config");
+
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    env.update();
+
+    let mut found = env.edges("m1.md");
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            ("org".to_string(), "org:acme".to_string()),
+            ("owner".to_string(), "alice".to_string()),
+        ],
+        "`org` was detected, not declared, and still produced an edge"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config"),
+        before,
+        "auto must never rewrite the user's config to record its own guess"
+    );
+}
+
+/// Under `manual` the same corpus yields only what the user declared.
+#[test]
+fn manual_extracts_only_the_declared_keys() {
+    let env = Env::new();
+    env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
+    env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
+    set_graph_config(&env.root, "relations = \"manual\"\nfrontmatter_relations = [\"owner\"]");
+
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    env.update();
+
+    assert_eq!(
+        env.edges("m1.md"),
+        vec![("owner".to_string(), "alice".to_string())],
+        "manual ignores the detector"
+    );
+}
+
+/// `semi` reports but does not extract — same extraction as `manual`.
+#[test]
+fn semi_extracts_only_the_declared_keys() {
+    let env = Env::new();
+    env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
+    env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
+    set_graph_config(&env.root, "relations = \"semi\"\nfrontmatter_relations = [\"owner\"]");
+
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    env.update();
+
+    assert_eq!(
+        env.edges("m1.md"),
+        vec![("owner".to_string(), "alice".to_string())]
+    );
+}
+
+/// The watcher route must agree with the full update, or a saved file would
+/// keep a different graph from the one `mdkb update` builds.
+#[test]
+fn the_single_file_route_honours_auto_too() {
+    let env = Env::new();
+    env.write("orgs/acme.md", "---\nid: org:acme\n---\n\n# Acme\n");
+    env.write("m1.md", "---\nowner: alice\norg: [org:acme]\n---\n\n# M1\n");
+    set_graph_config(&env.root, "relations = \"auto\"\nfrontmatter_relations = [\"owner\"]");
+    let env = Env {
+        ctx: Context::open(&env.root).expect("reopen"),
+        _dir: env._dir,
+        root: env.root,
+    };
+    // Index the org first so its identity exists to resolve against.
+    handle_update_files(&env.ctx, &env.root, &["docs/orgs/acme.md".to_string()]).expect("files");
+    handle_update_files(&env.ctx, &env.root, &["docs/m1.md".to_string()]).expect("files");
+
+    let mut found = env.edges("m1.md");
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            ("org".to_string(), "org:acme".to_string()),
+            ("owner".to_string(), "alice".to_string()),
+        ],
+        "a saved file gets the same graph a full update would build"
+    );
 }

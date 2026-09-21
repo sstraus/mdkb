@@ -260,7 +260,10 @@ pub fn handle_update_force(
         // has not moved. Same transaction, so a failed update leaves neither
         // the documents nor the graph half-written.
         if config.graph.enabled {
-            extract_edges_pass(&ctx.conn, &config.graph.frontmatter_relations)?;
+            // Detected AFTER indexing, so the identities written this run are
+            // available to resolve against.
+            let relations = effective_relations_for(&ctx.conn, &config.graph);
+            extract_edges_pass(&ctx.conn, &relations, None)?;
         }
         // Reclaim content rows stranded by prior updates/removes (and the
         // pre-fix backlog). No-op once the table is clean.
@@ -566,6 +569,9 @@ fn update_collection(
     })?;
 
     // Get existing documents for this collection — prefetch to avoid N+1 queries
+    // Resolved once per collection rather than per file. Under `manual` and
+    // `semi` this is just the allowlist and costs nothing.
+    let relations = effective_relations_for(&ctx.conn, &config.graph);
     let existing_docs = documents::list_documents(&ctx.conn, &collection.name)?;
     let mut existing_by_path: HashMap<String, Document> = existing_docs
         .into_iter()
@@ -623,6 +629,7 @@ fn update_collection(
                 existing_doc: existing_doc.as_ref(),
                 display_name: &path.display().to_string(),
                 graph_cfg: &config.graph,
+                relations: &relations,
                 force,
             },
             result,
@@ -719,16 +726,33 @@ pub fn handle_update_files_force(
         .collect();
 
     let config = Config::load_or_default(&ctx.config_path);
+    let started_at = chrono::Utc::now().timestamp();
     with_transaction(&ctx.conn, || {
+        // Under `auto` the key set is derived from the corpus, so it has to be
+        // known before the first file is written. Derived ONCE per call, not
+        // per file: this is the route the daemon watcher takes on every save.
+        // DEFERRED (2026-09-21) — story 136 stores this aggregate at index
+        // time; reading it will replace this scan on the watcher path.
+        let relations = effective_relations_for(&ctx.conn, &config.graph);
         index_specified_files(
             ctx,
             &canonical_root,
             &matchers,
             files,
             &config.graph,
+            &relations,
             force,
             &mut result,
-        )
+        )?;
+        // Second pass, scoped to what this call just wrote. A new file can
+        // carry a relation key no indexed document had, and the detection
+        // above ran before that file existed in the store — so under `auto`
+        // the first save would build a graph a full `update` disagrees with.
+        if config.graph.enabled && config.graph.relations == crate::config::RelationMode::Auto {
+            let relations = effective_relations_for(&ctx.conn, &config.graph);
+            extract_edges_pass(&ctx.conn, &relations, Some(started_at))?;
+        }
+        Ok(())
     })?;
     crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
     Ok(result)
@@ -775,6 +799,10 @@ pub(crate) struct SingleFileInput<'a> {
     pub(crate) existing_doc: Option<&'a Document>,
     pub(crate) display_name: &'a str,
     pub(crate) graph_cfg: &'a crate::config::GraphConfig,
+    /// The keys extraction uses this run — `graph_cfg.effective_relations`,
+    /// already resolved. Passed in rather than computed here because under
+    /// `relations = "auto"` it costs a corpus scan, and this runs per file.
+    pub(crate) relations: &'a [String],
     pub(crate) force: bool,
 }
 pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateResult) {
@@ -786,6 +814,7 @@ pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateR
         existing_doc,
         display_name,
         graph_cfg,
+        relations,
         force,
     } = input;
     // Read file metadata for mtime
@@ -878,12 +907,7 @@ pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateR
                 // reaches the documents this loop SKIPPED, which is what makes
                 // an allowlist change apply without `--force`. Both write the
                 // same rows from the same data, so the overlap is idempotent.
-                replace_frontmatter_edges(
-                    &ctx.conn,
-                    doc_id,
-                    parsed.frontmatter.as_ref(),
-                    &graph_cfg.frontmatter_relations,
-                );
+                replace_frontmatter_edges(&ctx.conn, doc_id, parsed.frontmatter.as_ref(), relations);
                 process_wikilink_edges(&ctx.conn, doc_id, &parsed, graph_cfg);
             }
         }
@@ -901,6 +925,7 @@ pub(crate) fn index_specified_files(
     matchers: &[(&Collection, globset::GlobMatcher, PathBuf)],
     files: &[String],
     graph_cfg: &crate::config::GraphConfig,
+    relations: &[String],
     force: bool,
     result: &mut UpdateResult,
 ) -> Result<()> {
@@ -977,6 +1002,7 @@ pub(crate) fn index_specified_files(
                 existing_doc: existing_doc.as_ref(),
                 display_name: file_arg,
                 graph_cfg,
+                relations,
                 force,
             },
             result,
@@ -1135,6 +1161,36 @@ pub(crate) fn process_identities(
     }
 }
 
+/// The keys extraction uses this run.
+///
+/// Under `relations = "auto"` this runs the detector over the corpus and
+/// unions its output with the declared allowlist. Under `semi` and `manual`
+/// the detector is not run here at all — those modes report it elsewhere, and
+/// paying for a corpus scan on a path that will ignore the answer is waste.
+///
+/// A detector failure degrades to the declared allowlist rather than failing
+/// the update: a graph missing the derived keys is recoverable, an update that
+/// refuses to run is not.
+pub(crate) fn effective_relations_for(
+    conn: &Connection,
+    cfg: &crate::config::GraphConfig,
+) -> Vec<String> {
+    if cfg.relations != crate::config::RelationMode::Auto {
+        return cfg.frontmatter_relations.clone();
+    }
+    match crate::core::graph::detect_relation_keys(conn, cfg) {
+        Ok(found) => {
+            let detected: Vec<String> =
+                found.candidates.into_iter().map(|c| c.key).collect();
+            cfg.effective_relations(&detected)
+        }
+        Err(e) => {
+            tracing::warn!("Graph: relation detection failed, using the declared allowlist: {e}");
+            cfg.frontmatter_relations.clone()
+        }
+    }
+}
+
 /// Replace a document's frontmatter-derived edges from its parsed frontmatter.
 ///
 /// Target refs are stored verbatim — a dangling target survives and starts
@@ -1178,13 +1234,23 @@ pub(crate) fn replace_frontmatter_edges(
 /// rather than a re-read of every file. Body wikilinks are NOT here, because
 /// they depend on content rather than on config — see
 /// [`process_wikilink_edges`].
+///
+/// `since` scopes the pass to documents indexed at or after that timestamp.
+/// The single-file route uses it: a brand-new file can introduce a relation
+/// key that no indexed document carried yet, so detection has to run again
+/// once the file is in the store — but re-extracting the whole corpus on every
+/// save is not worth it.
 pub(crate) fn extract_edges_pass(
     conn: &Connection,
     relations: &[String],
+    since: Option<i64>,
 ) -> crate::error::Result<()> {
-    let mut stmt =
-        conn.prepare("SELECT id, metadata FROM documents WHERE status = 'current' OR status IS NULL")?;
-    let rows = stmt.query_map([], |r| {
+    let mut stmt = conn.prepare(
+        "SELECT id, metadata FROM documents
+         WHERE (status = 'current' OR status IS NULL)
+           AND (?1 IS NULL OR indexed_at >= ?1)",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![since], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
     })?;
     for row in rows {
