@@ -143,6 +143,17 @@ fn announce_migration(ctx: &mdkb::core::Context, lead: &str) {
     }
 }
 
+/// A readable store with no registered document collections is not a healthy
+/// empty result. Keep the notice on stderr so JSON and CSV stdout stay valid.
+fn announce_no_collections(ctx: &mdkb::core::Context) -> mdkb::error::Result<()> {
+    if mdkb::store::collections::list_collections(&ctx.conn)?.is_empty() {
+        eprintln!(
+            "mdkb: this store has no registered collections; run `mdkb update` to detect and index them."
+        );
+    }
+    Ok(())
+}
+
 fn main() {
     // A `Result` returned from `main` is printed with `{:?}`, which for our
     // error type is the struct dump `Error { kind: .., backtrace: .. }` and
@@ -316,6 +327,17 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
     // sub-directory finds the project's store instead of spawning a new one.
     let cwd = if matches!(cli.command, Command::Init) {
         mdkb::git::resolve_main_worktree(&raw_cwd)
+    } else if matches!(cli.command, Command::Mcp { .. }) {
+        // `mdkb mcp` anchors nothing: both run modes serve globally and take no
+        // cwd at all — `run_global_stdio_server` and `mcp_proxy::run_proxy`
+        // resolve a root per tool call. Holding it to the anchoring guard cost
+        // the whole connection and bought nothing: launched in a directory that
+        // holds repositories, it returned the refusal as an `Err` and died
+        // before writing a single JSON-RPC byte, so the client could only
+        // report `-32000 Connection closed`. Measured 2026-09-21 on
+        // CC_Playground/brainstorming, the day an immediate child repo appeared
+        // under it. The guard is unchanged for every command that does anchor.
+        raw_cwd.clone()
     } else {
         let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(std::path::PathBuf::from);
         match mdkb::git::resolve_project_root(&raw_cwd, hint.as_deref()) {
@@ -453,6 +475,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             entry_type,
         } => {
             let ctx = open_reader(&cwd)?;
+            announce_no_collections(&ctx)?;
             match scope.as_deref() {
                 Some("docs") => {
                     let results = handle_hybrid_search(
@@ -796,6 +819,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Stats { no_color } => {
             let ctx = open_reader(&cwd)?;
+            announce_no_collections(&ctx)?;
             report_unreadable_config(&ctx.config_path);
             let report = mdkb::cli::stats_report::collect_report(&ctx)?;
             if let mdkb::cli::OutputFormat::Json = cli.format {
@@ -1292,6 +1316,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         }
         Command::Graph(cmd) => {
             let ctx = open_reader(&cwd)?;
+            announce_no_collections(&ctx)?;
             match cmd {
                 GraphCommand::Links { entity, relation } => {
                     let edges = handle_graph_links(&ctx, &entity, relation.as_deref())?;

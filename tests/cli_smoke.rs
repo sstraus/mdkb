@@ -412,6 +412,30 @@ fn smoke_search() {
 }
 
 #[test]
+fn empty_collection_store_is_explicit_for_search_graph_and_stats() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    assert_ok(&run(&["init"], root), "init empty store");
+
+    for (args, succeeds) in [
+        (&["search", "nothing"][..], true),
+        (&["graph", "links", "missing"][..], false),
+        (&["stats"][..], true),
+    ] {
+        let out = run(args, root);
+        assert_eq!(
+            out.status.success(),
+            succeeds,
+            "unexpected status for mdkb {}",
+            args.join(" ")
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("no registered collections"), "{stderr}");
+        assert!(stderr.contains("mdkb update"), "{stderr}");
+    }
+}
+
+#[test]
 fn smoke_search_scope_docs() {
     let repo = Repo::new();
     run(&["update"], &repo.root);
@@ -2604,5 +2628,71 @@ fn smoke_an_unreadable_config_is_reported_by_update_and_stats() {
     assert!(
         err.contains("config.toml") && err.contains("defaults"),
         "stats must say the config was ignored, got stderr: {err}"
+    );
+}
+
+/// A directory that holds git repositories may hold no store, and every command
+/// that would anchor one there is right to refuse. `mdkb mcp` is not one of
+/// them: both of its run modes serve globally and take no cwd, so the refusal
+/// killed the process before a single JSON-RPC byte was written and the client
+/// could only report `-32000 Connection closed`.
+#[test]
+fn smoke_mcp_completes_the_handshake_in_a_directory_that_holds_repos() {
+    use std::io::{BufRead, BufReader};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let container = dir.path().to_path_buf();
+    // One immediate child repo is all it takes: this is what `holds_git_repos`
+    // reads, and what flipped the measured directory on 2026-09-21.
+    std::fs::create_dir_all(container.join("child/.git")).unwrap();
+
+    let mut child = cli::command()
+        .arg("mcp")
+        .current_dir(&container)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn mdkb mcp");
+
+    let mut stdin = child.stdin.take().expect("stdin");
+    stdin
+        .write_all(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":\
+              {\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\
+              \"clientInfo\":{\"name\":\"smoke\",\"version\":\"1\"}}}\n",
+        )
+        .expect("write initialize");
+    stdin.flush().expect("flush");
+
+    let stdout = child.stdout.take().expect("stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    let line = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap_or_default();
+
+    // Keep stdin alive until the response is read, then end the server.
+    drop(stdin);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let response: serde_json::Value = serde_json::from_str(line.trim()).unwrap_or_else(|e| {
+        panic!("mdkb mcp must answer initialize, got {line:?} ({e})");
+    });
+    assert_eq!(response["id"], 1, "must answer the request it was sent");
+    assert_eq!(
+        response["result"]["serverInfo"]["name"], "mdkb",
+        "must be a well-formed initialize result: {response}"
+    );
+
+    // The handshake must not have invented the store the guard exists to refuse.
+    assert!(
+        !container.join(".mdkb").exists(),
+        "serving must not anchor a store at a directory that holds repositories"
     );
 }
