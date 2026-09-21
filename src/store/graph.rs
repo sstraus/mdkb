@@ -72,6 +72,34 @@ pub fn delete_edges_for_source(conn: &Connection, source_doc_id: i64) -> Result<
     Ok(rows)
 }
 
+/// Record a name a document declares for itself.
+///
+/// `INSERT OR IGNORE`: a document that writes the same string under both `id:`
+/// and `aliases:` claims one name, not two. Two *different* documents claiming
+/// the same name is allowed on purpose — that is a repository defect to report,
+/// and refusing the insert would make one bad document fail the whole index.
+pub fn add_alias(conn: &Connection, doc_id: i64, alias: &str, source_key: &str) -> Result<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO document_aliases (doc_id, alias, source_key)
+         VALUES (?1, ?2, ?3)",
+        params![doc_id, alias, source_key],
+    )?;
+    Ok(())
+}
+
+/// Drop every identity a document declared.
+///
+/// Called before re-recording them, for the same reason as
+/// [`delete_edges_for_source`] and with more at stake: an accumulate-only table
+/// keeps answering to a name the author deleted.
+pub fn delete_aliases_for_doc(conn: &Connection, doc_id: i64) -> Result<usize> {
+    let rows = conn.execute(
+        "DELETE FROM document_aliases WHERE doc_id = ?1",
+        params![doc_id],
+    )?;
+    Ok(rows)
+}
+
 fn map_edge(row: &rusqlite::Row<'_>) -> rusqlite::Result<Edge> {
     Ok(Edge {
         id: row.get(0)?,

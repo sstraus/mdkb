@@ -862,6 +862,7 @@ pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateR
             }
 
             if graph_cfg.enabled {
+                process_identities(&ctx.conn, doc_id, &parsed, graph_cfg);
                 process_graph_edges(&ctx.conn, doc_id, &parsed, graph_cfg);
             }
         }
@@ -1081,6 +1082,38 @@ fn has_evolution_refs(parsed: &ParsedDocument) -> bool {
         || !parsed.corrects.is_empty()
         || !parsed.extends.is_empty()
 }
+/// Record the identities a freshly indexed document declares for itself.
+///
+/// Replace-wholesale, exactly like [`process_graph_edges`] and for a sharper
+/// reason: these rows are what makes `person:alice` resolve, so a name the
+/// author deleted would keep resolving forever if the old rows were left behind.
+///
+/// Best-effort per alias. A single bad row must not fail the document's index —
+/// the same policy the edge pass uses.
+pub(crate) fn process_identities(
+    conn: &Connection,
+    doc_id: i64,
+    parsed: &ParsedDocument,
+    cfg: &crate::config::GraphConfig,
+) {
+    use crate::store::graph;
+
+    if let Err(e) = graph::delete_aliases_for_doc(conn, doc_id) {
+        tracing::warn!("Graph: failed to clear identities for doc {doc_id}: {e}");
+        return;
+    }
+
+    for key in &cfg.identity_keys {
+        for alias in
+            crate::domain::frontmatter::extract_relation_refs(parsed.frontmatter.as_ref(), key)
+        {
+            if let Err(e) = graph::add_alias(conn, doc_id, &alias, key) {
+                tracing::warn!("Graph: failed to record identity '{alias}' ({key}): {e}");
+            }
+        }
+    }
+}
+
 /// Populate knowledge-graph edges for a freshly indexed document.
 ///
 /// Replaces the document's outgoing edges (idempotent re-index): edges from

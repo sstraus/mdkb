@@ -311,6 +311,14 @@ pub struct GraphConfig {
     /// subsystem and should not be listed here.
     pub frontmatter_relations: Vec<String>,
 
+    /// Frontmatter keys that declare what a document IS, not what it points at.
+    ///
+    /// A reference like `person:alice` is a name, not a path, so it resolves
+    /// only because some document claims it. These are the keys that count as a
+    /// claim. Kept apart from `frontmatter_relations`: a key cannot be both an
+    /// identity and a relation without the document pointing at itself.
+    pub identity_keys: Vec<String>,
+
     /// Extract body wikilinks (`[[target]]`) as soft edges.
     pub include_wikilinks: bool,
 
@@ -771,6 +779,7 @@ impl Default for GraphConfig {
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            identity_keys: ["id", "aliases"].iter().map(|s| s.to_string()).collect(),
             include_wikilinks: true,
             expand_seeds: 2,
             expand_neighbors: 3,

@@ -1084,6 +1084,9 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // and `aliases:` can be a bare scalar. An unguarded `json_each` on any of
     // those raises and takes the whole migration — and the store — with it.
     //
+    // The values are stored trimmed, because `extract_relation_refs` trims and a
+    // re-index must not produce a second row for the same name.
+    //
     // `id` is inserted before `aliases` on purpose: a document that repeats its
     // `id:` inside `aliases:` keeps one row, and `UNIQUE(doc_id, alias)` makes
     // the first writer win, so the row is attributed to `id`.
@@ -1091,7 +1094,7 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
         conn.execute_batch(DOCUMENT_ALIASES_SQL)?;
         let ids = conn.execute(
             "INSERT OR IGNORE INTO document_aliases (doc_id, alias, source_key)
-             SELECT id, json_extract(metadata, '$.id'), 'id'
+             SELECT id, trim(json_extract(metadata, '$.id')), 'id'
              FROM documents
              WHERE metadata IS NOT NULL
                AND json_valid(metadata)
@@ -1101,7 +1104,7 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
         )?;
         let aliases = conn.execute(
             "INSERT OR IGNORE INTO document_aliases (doc_id, alias, source_key)
-             SELECT d.id, j.value, 'aliases'
+             SELECT d.id, trim(j.value), 'aliases'
              FROM documents d,
                   json_each(
                       CASE WHEN d.metadata IS NOT NULL
