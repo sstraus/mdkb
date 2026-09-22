@@ -4238,6 +4238,36 @@ async fn hook_session_start_inner(
     }
     // Ranking plus the one graph query that marks a stale dependency.
     phases.mark("stale_deps");
+
+    // One stored-aggregate read, no corpus scan: this hook has a 200 ms
+    // budget. `relation_candidates` is written by `mdkb update`, and an empty
+    // table simply produces nothing — which is the right answer until a
+    // detection has actually run.
+    //
+    // Read HERE, not where the line is rendered. Rendering happens after
+    // `spawn_embedding_backfill`, and that task takes this same mutex inside
+    // `spawn_blocking` and holds it across the ONNX model load plus every
+    // pending embed. Taking the lock after the spawn meant the hook could wait
+    // out a model load against a 200 ms budget, with the time charged to
+    // `code_check` because that was the next mark.
+    let relation_notice = {
+        let mut ctx_guard = handle.ctx.lock().await;
+        let undetected =
+            crate::core::run_guarded_read(&mut ctx_guard, "hook relation candidates", |ctx| {
+                crate::store::graph::undetected_relation_keys(&ctx.conn)
+            });
+        match undetected {
+            Some(Ok(rows)) => {
+                crate::cli::hook_logic::relation_notice(handle.config.graph.relations, &rows)
+            }
+            Some(Err(error)) => {
+                tracing::warn!("hook.session_start relation candidates lookup failed: {error}");
+                None
+            }
+            None => None,
+        }
+    };
+    phases.mark("relations");
     lines.extend(ranked.iter().map(|e| {
         let prefix = if stale_ids.contains(&e.id) {
             "[STALE-DEP] "
@@ -4298,31 +4328,10 @@ async fn hook_session_start_inner(
         "\n**mdkb:** `* query` = recall | `mdkb cheatsheet` = search/code/graph/audit/memory (partial; `mdkb --help` lists the rest)\n",
     );
 
-    // One stored-aggregate read, no corpus scan: this hook has a 200 ms
-    // budget. `relation_candidates` is written by `mdkb update`, and an empty
-    // table simply produces nothing — which is the right answer until a
-    // detection has actually run.
-    {
-        let mut ctx_guard = handle.ctx.lock().await;
-        let undetected =
-            crate::core::run_guarded_read(&mut ctx_guard, "hook relation candidates", |ctx| {
-                crate::store::graph::undetected_relation_keys(&ctx.conn)
-            });
-        match undetected {
-            Some(Ok(rows)) => {
-                if let Some(line) =
-                    crate::cli::hook_logic::relation_notice(handle.config.graph.relations, &rows)
-                {
-                    body.push_str("\n");
-                    body.push_str(&line);
-                    body.push('\n');
-                }
-            }
-            Some(Err(error)) => {
-                tracing::warn!("hook.session_start relation candidates lookup failed: {error}")
-            }
-            None => {}
-        }
+    if let Some(line) = &relation_notice {
+        body.push('\n');
+        body.push_str(line);
+        body.push('\n');
     }
 
     // Check code index staleness. If stale, kick a detached refresh instead of

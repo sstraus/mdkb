@@ -255,3 +255,47 @@ fn hooks_e2e_malformed_daemon_toml_never_fails_the_host() {
         );
     }
 }
+
+/// The relation notice reaches the SessionStart body.
+///
+/// It is read before `spawn_embedding_backfill` fires, because that task holds
+/// the same ctx mutex across an ONNX model load — but the read has to keep
+/// producing the line, and a refactor that moves a read away from where its
+/// output is rendered is exactly the kind that silently drops it.
+#[test]
+fn hooks_e2e_session_start_names_undetected_relation_keys() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().canonicalize().expect("canonicalize");
+    handle_init(&root).expect("init");
+
+    std::fs::write(
+        root.join("acme.md"),
+        "---\nid: org:acme\n---\n\n# Acme\n\nThe organisation.\n",
+    )
+    .expect("write acme");
+    std::fs::write(
+        root.join("meeting.md"),
+        "---\norg: [org:acme]\n---\n\n# Meeting\n\nA meeting about the organisation.\n",
+    )
+    .expect("write meeting");
+    let config = root.join(".mdkb/config.toml");
+    let mut text = std::fs::read_to_string(&config).unwrap_or_default();
+    text.push_str("\n[graph]\nrelations = \"semi\"\n");
+    std::fs::write(&config, text).expect("write config");
+
+    let update = Command::new(mdkb_bin())
+        .arg("update")
+        .current_dir(&root)
+        .env("MDKB_NO_DAEMON", "1")
+        .output()
+        .expect("run update");
+    assert!(update.status.success(), "update failed: {update:?}");
+
+    let (stdout, _, code) = run_hook("session-start", &root, "");
+
+    assert_eq!(code, 0, "{stdout}");
+    assert!(
+        stdout.contains("frontmatter") && stdout.contains("mdkb graph relations"),
+        "the undetected `org` key must be named in the body: {stdout}"
+    );
+}

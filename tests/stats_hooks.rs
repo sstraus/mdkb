@@ -145,7 +145,14 @@ fn session_start_telemetry_carries_the_per_phase_split() {
         .get("phases")
         .and_then(serde_json::Value::as_object)
         .expect("the row must carry the per-phase split, not just the total");
-    for name in ["context", "warmup", "handoff", "stale_deps", "code_check"] {
+    for name in [
+        "context",
+        "warmup",
+        "handoff",
+        "stale_deps",
+        "relations",
+        "code_check",
+    ] {
         assert!(
             phases.contains_key(name),
             "phase `{name}` is missing from {phases:?}"

@@ -19,6 +19,15 @@
 
 ### Fixed
 
+- **SessionStart no longer waits on the lock the backfill it just spawned is
+  holding.** The undetected-relation-keys read took `handle.ctx` *after*
+  `spawn_embedding_backfill` had fired, and that task holds the same mutex
+  across the ONNX model load plus every pending embed — so a repository with
+  pending embeddings could make a 200 ms hook return seconds later, with the
+  time charged to `code_check` because that was the next phase mark. The read
+  now happens before the spawn, and the time it costs is charged to a new
+  `relations` phase. Found by the maintainer's 2026-09-21 fleet audit.
+
 - **The cross-repository coverage footer states the truth, and is bounded.**
   The denominator was the number of roots the selector resolved, so
   `root="alpha,beta"` on a daemon knowing thirty stores reported `Searched 2

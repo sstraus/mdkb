@@ -471,17 +471,18 @@ Every hook run appends a row to `.mdkb/hook-events.jsonl`; a run that exceeds
 `latency_budget_ms` is copied to `.mdkb/hook-slow.jsonl` as well. Exceeding the
 budget truncates nothing — the value only decides what gets flagged.
 
-SessionStart rows carry the split of `elapsed_ms` across the five phases, in the
+SessionStart rows carry the split of `elapsed_ms` across the six phases, in the
 order they run:
 
 ```json
 {"ts":…,"event":"session_start","outcome":"fired","elapsed_ms":494,
- "phases":{"context":132,"warmup":360,"handoff":0,"stale_deps":0,"code_check":0}}
+ "phases":{"context":132,"warmup":360,"handoff":0,"stale_deps":0,"relations":0,"code_check":0}}
 ```
 
 `context` is opening the store (schema check included), `warmup` the ranked
 entry query plus the document, collection and projection counts, `handoff` the
-newest-handoff lookup, `stale_deps` the dependency graph check, and
+newest-handoff lookup, `stale_deps` the dependency graph check, `relations` the
+stored-aggregate read behind the undetected-relation-keys notice, and
 `code_check` the read-only open of `code.sqlite`.
 
 **Measured 2026-09-17 on a 615-document store**: the first SessionStart against
