@@ -34,7 +34,10 @@ use serde_json::json;
 fn repo_with_entry(parent: &Path, name: &str, needle: &str) -> PathBuf {
     let root = parent.join(name);
     std::fs::create_dir_all(&root).expect("create repo root");
-    let root = root.canonicalize().expect("canonicalize");
+    // Plain, not `\\?\C:\...`: the registry keys a root the way
+    // `canonicalize_plain` spells it, and a prefixed path names a repo it
+    // would never find.
+    let root = mdkb::domain::canonicalize_plain(&root).expect("canonicalize");
     mdkb::cli::handlers::handle_init(&root).expect("init");
 
     let ctx = Context::open(&root).expect("open store");
@@ -511,7 +514,7 @@ fn a_rootless_single_target_call_refuses_a_container_that_anchors_no_store() {
     let repos = tempfile::tempdir().expect("repos");
     let container = repos.path().join("container");
     std::fs::create_dir_all(&container).expect("container");
-    let container = container.canonicalize().expect("canonicalize");
+    let container = mdkb::domain::canonicalize_plain(&container).expect("canonicalize");
     let alpha = repo_with_entry(&container, "alpha", "unrelated");
     let beta = repo_with_entry(&container, "beta", "unrelated");
 
