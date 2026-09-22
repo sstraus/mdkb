@@ -280,6 +280,8 @@ told apart syntactically, before anything is looked up, so a repo name can never
   <tr><th>Guarantee</th><th>Why it matters</th></tr>
   <tr><td>Known, not open</td>
       <td>Open handles are an LRU capped at <code>max_active_repos</code> and empty after a restart. Fanning out over them omits every known but closed repo, silently.</td></tr>
+  <tr><td>The walk is paid once per <code>discovery_cache_secs</code></td>
+      <td>Discovery walks every directory under every known root and under the declared workspace, which is bounded by the operator's choice of root and not by mdkb. The result is cached, keyed by the directories walked, so a changed root set misses and a repo the daemon opens is discoverable at once.</td></tr>
   <tr><td>Read-only open</td>
       <td>No handle, no watcher, no LRU slot taken from the repo the caller is working in.</td></tr>
   <tr><td>A skipped repo is named</td>

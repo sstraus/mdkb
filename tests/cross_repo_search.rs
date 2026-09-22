@@ -338,9 +338,10 @@ async fn a_rootless_search_reaches_the_stores_nested_under_the_declared_workspac
 
     let mut params = memory_search("nested_signal");
     params.root = None;
-    let (output, count) = cross_repo_search_impl(&registry, &params, &[workspace.clone()])
-        .await
-        .expect("search");
+    let (output, count) =
+        cross_repo_search_impl(&registry, &params, std::slice::from_ref(&workspace))
+            .await
+            .expect("search");
 
     assert!(
         count >= 1 && output.contains("nested_signal"),
@@ -368,7 +369,7 @@ fn a_rootless_single_target_call_means_the_declared_workspace() {
 
     let registry = RepoRegistry::new(one_slot_config(state.path()));
 
-    let chosen = resolve_single_root(&registry, None, &[workspace.clone()])
+    let chosen = resolve_single_root(&registry, None, std::slice::from_ref(&workspace))
         .expect("the declared workspace is the answer");
 
     assert_eq!(chosen, workspace, "the workspace anchors the call");

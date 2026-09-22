@@ -720,6 +720,16 @@ is known, and what it skipped and why — because a repository that could not be
 opened is not an empty repository. `max_active_repos` in `daemon.toml`
 (default 5) bounds how many stores are held open at once.
 
+Finding the stores nested under a root means walking it, and how big that
+walk is follows from the operator's choice of root: a repository is tens of
+directories, a directory that merely holds repositories can be hundreds of
+thousands. The result is therefore cached, keyed by the directories it
+covered — so a repository the daemon itself opens changes that set and is
+discoverable at once. `discovery_cache_secs` in `daemon.toml` (default 60,
+`0` disables the cache) bounds the one case nothing else can catch: a store
+created by another process, such as an `mdkb init` from the CLI or a clone
+carrying a committed `.mdkb/`.
+
 ### Memory
 
 ```bash

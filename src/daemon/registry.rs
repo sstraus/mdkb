@@ -173,6 +173,20 @@ pub struct RepoRegistry {
     /// Serializes the check-evict-insert triple so concurrent callers cannot
     /// both pass the capacity check before either inserts, which would exceed max_active.
     open_gate: std::sync::Mutex<()>,
+    /// The last nested-store walk, reusable while it is fresh and while the
+    /// set of directories it covered has not changed.
+    discovery: std::sync::Mutex<Option<Discovery>>,
+}
+
+/// One nested-store walk, and what it is valid for.
+///
+/// `walked` is the key, not the `extra` that was asked for: two calls with
+/// different scopes that both fall inside the same known root walk the same
+/// directories, and the second must not repeat the first.
+struct Discovery {
+    walked: Vec<PathBuf>,
+    roots: Vec<PathBuf>,
+    at: std::time::Instant,
 }
 
 impl std::fmt::Debug for RepoRegistry {
@@ -199,6 +213,7 @@ impl RepoRegistry {
             daemon_config: config,
             repo_map,
             open_gate: std::sync::Mutex::new(()),
+            discovery: std::sync::Mutex::new(None),
         }
     }
 
@@ -333,8 +348,55 @@ impl RepoRegistry {
             .cloned()
             .collect();
         walk.extend(uncovered);
-        roots.extend(super::repo_map::discover_nested_stores(&walk));
+        roots.extend(self.walk_for(&walk));
         roots.into_iter().collect()
+    }
+
+    /// The stores nested under `walk`, from the cache when it is still valid.
+    ///
+    /// Valid means two things, and both are needed. The TTL bounds a store
+    /// created behind the daemon's back. The `walked` comparison bounds the
+    /// other direction: a second client declaring a different workspace asks
+    /// about directories the cached walk never entered, and answering it from
+    /// that walk would report the first client's repos as the second's.
+    ///
+    /// That comparison is also the whole invalidation. Recording a repo
+    /// changes `known_roots`, which changes `walk`, which misses — so a repo
+    /// the daemon itself opens is discoverable on the very next call without
+    /// a second mechanism watching `record`. An explicit drop there was
+    /// written first and removed: both tests stayed green without it, which
+    /// makes it a second path to one transition, not a safety net.
+    /// The lock is NOT held across the walk. Two clients that declared
+    /// different workspaces would then serialize on a tree neither shares, and
+    /// the second would wait out the first's walk before starting its own —
+    /// slower than the uncached code it replaces. A concurrent miss walks
+    /// twice, exactly as before; the last one to finish wins the slot.
+    fn walk_for(&self, walk: &[PathBuf]) -> Vec<PathBuf> {
+        let ttl = std::time::Duration::from_secs(self.daemon_config.discovery_cache_secs);
+        if ttl.is_zero() {
+            return super::repo_map::discover_nested_stores(walk)
+                .into_iter()
+                .collect();
+        }
+        let fresh = |d: &Discovery| d.walked == walk && d.at.elapsed() < ttl;
+        if let Some(hit) = self
+            .discovery
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|d| fresh(d))
+        {
+            return hit.roots.clone();
+        }
+        let roots: Vec<PathBuf> = super::repo_map::discover_nested_stores(walk)
+            .into_iter()
+            .collect();
+        *self.discovery.lock().unwrap_or_else(|e| e.into_inner()) = Some(Discovery {
+            walked: walk.to_vec(),
+            roots: roots.clone(),
+            at: std::time::Instant::now(),
+        });
+        roots
     }
 
     /// Get all active repo handles (for cross-repo operations).
@@ -580,6 +642,107 @@ mod tests {
             with_child, without,
             "a scope beneath a root already on the map changes nothing"
         );
+    }
+
+    /// A store the walk would find, planted where only a second walk could see
+    /// it. Returns the key discovery would report it under — canonical, since
+    /// `/var` is a symlink to `/private/var` on macOS and the raw temp path
+    /// compares equal to nothing.
+    fn plant_store(at: PathBuf) -> PathBuf {
+        std::fs::create_dir_all(at.join(".mdkb")).unwrap();
+        std::fs::write(at.join(".mdkb/index.sqlite"), b"").unwrap();
+        crate::domain::canonicalize_plain(&at).unwrap_or(at)
+    }
+
+    fn config_with_ttl(secs: u64) -> DaemonConfig {
+        DaemonConfig {
+            discovery_cache_secs: secs,
+            ..allow_temp_config()
+        }
+    }
+
+    /// The walk is the cost this cache exists for, so the test asserts the
+    /// walk did not happen — by planting a store the walk cannot miss and
+    /// showing the answer does not have it.
+    #[test]
+    fn a_second_discovery_within_the_ttl_does_not_walk_again() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        registry.get_or_open(&root).expect("open");
+
+        let first = registry.discoverable_roots();
+        let nested = plant_store(root.join("nested"));
+
+        assert_eq!(
+            registry.discoverable_roots(),
+            first,
+            "a store planted after the walk cannot be in a cached answer: {}",
+            nested.display()
+        );
+    }
+
+    /// The TTL is what bounds a store created by another process — an
+    /// `mdkb init` from the CLI, a clone carrying a committed `.mdkb/`. The
+    /// daemon never sees that write, so nothing can invalidate on it.
+    #[test]
+    fn a_store_created_behind_the_cache_appears_after_the_ttl() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        let registry = RepoRegistry::new(config_with_ttl(1));
+        registry.get_or_open(&root).expect("open");
+
+        registry.discoverable_roots();
+        let nested = plant_store(root.join("nested"));
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+        assert!(
+            registry.discoverable_roots().contains(&nested),
+            "the TTL expired, so the walk must run again"
+        );
+    }
+
+    /// A repo the daemon itself opens must be discoverable on the very next
+    /// call, not a minute later: the daemon knows about that write, so aging
+    /// out would be a staleness it chose.
+    #[test]
+    fn a_repo_the_daemon_opens_is_discoverable_at_once() {
+        let tmp = TempDir::new().unwrap();
+        let first = make_repo(&tmp);
+        let registry = RepoRegistry::new(config_with_ttl(60));
+        registry.get_or_open(&first).expect("open first");
+
+        registry.discoverable_roots();
+        let nested = plant_store(first.join("nested"));
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&second).unwrap();
+        registry.get_or_open(&second).expect("open second");
+
+        assert!(
+            registry.discoverable_roots().contains(&nested),
+            "registering a repo changes the walk set, so the cached walk cannot answer"
+        );
+    }
+
+    /// The cache is keyed by the directories that were walked, not by time
+    /// alone. Two clients declaring different workspaces ask about different
+    /// trees, and answering the second from the first's walk would report one
+    /// client's repositories as the other's.
+    #[test]
+    fn a_different_declared_workspace_is_not_answered_from_the_previous_walk() {
+        let tmp = TempDir::new().unwrap();
+        let alpha = tmp.path().join("alpha");
+        let beta = tmp.path().join("beta");
+        let in_alpha = plant_store(alpha.join("one"));
+        let in_beta = plant_store(beta.join("two"));
+        let registry = RepoRegistry::new(config_with_ttl(60));
+
+        let seen_alpha = registry.discoverable_roots_under(&[alpha]);
+        let seen_beta = registry.discoverable_roots_under(&[beta]);
+
+        assert_eq!(seen_alpha, vec![in_alpha.clone()]);
+        assert_eq!(seen_beta, vec![in_beta]);
+        assert!(!seen_beta.contains(&in_alpha), "no cross-workspace leak");
     }
 
     #[test]

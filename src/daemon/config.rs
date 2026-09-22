@@ -15,6 +15,21 @@ const DEFAULT_PID_NAME: &str = "daemon.pid";
 /// Default maximum number of concurrently active repo handles.
 const DEFAULT_MAX_ACTIVE_REPOS: usize = 5;
 
+/// How long a nested-store discovery walk may be reused, in seconds.
+///
+/// The walk visits every directory under every known root and under the
+/// workspace a client declared. That is bounded by the operator's choice of
+/// root, not by mdkb: a normal repo is tens of directories, a container of
+/// repositories measured 265,946 after the `.git`/`target`/`node_modules`
+/// prunes — 12.7 s cold, and it was paid on every call.
+///
+/// A store the daemon itself registers drops the cache immediately, so this
+/// bounds one thing only: how long a store created by ANOTHER process — an
+/// `mdkb init` from the CLI, a `git clone` of a repo with a committed
+/// `.mdkb/` — stays invisible. A minute of that, against one walk per minute
+/// instead of one per call.
+const DEFAULT_DISCOVERY_CACHE_SECS: u64 = 60;
+
 /// Daemon-owned state: the set of repositories the daemon knows about.
 const REPO_MAP_NAME: &str = "repos.json";
 
@@ -92,6 +107,10 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub repos: Vec<RepoEntry>,
 
+    /// Seconds a nested-store discovery walk may be reused.
+    /// See [`DEFAULT_DISCOVERY_CACHE_SECS`]. `0` disables the cache.
+    pub discovery_cache_secs: u64,
+
     /// Global `[priors]` layer applied as the base for every repo. The distiller
     /// (program/args/model) is a machine-wide choice, so it belongs here — set it
     /// once instead of per-repo. A repo's `.mdkb/config.toml` `[priors]` overrides
@@ -126,6 +145,7 @@ impl Default for DaemonConfig {
             max_active_repos: DEFAULT_MAX_ACTIVE_REPOS,
             whitelist_dirs: Vec::new(),
             repos: Vec::new(),
+            discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
             priors: toml::Table::new(),
             state_dir: None,
         }
@@ -341,6 +361,7 @@ mod tests {
                     root: "/Users/me/Gits/projectB".to_string(),
                 },
             ],
+            discovery_cache_secs: 90,
             priors: toml::from_str("mining_enabled = true\ndistiller_program = \"codex\"").unwrap(),
             state_dir: Some(PathBuf::from("/Users/me/.mdkb")),
         };
@@ -405,6 +426,7 @@ whitelist_dirs = ["~/Code"]
             repos: vec![RepoEntry {
                 root: "/foo/bar".to_string(),
             }],
+            discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
             priors: toml::Table::new(),
             state_dir: None,
         };

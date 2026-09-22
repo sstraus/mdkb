@@ -19,6 +19,19 @@
 
 ### Fixed
 
+- **The nested-store walk is paid once per minute, not once per call.**
+  Discovery walked every directory under every known root and under the
+  declared workspace, uncached, on every `Default`, `*` and name resolution —
+  and the size of that walk follows from the operator's choice of root, not
+  from mdkb: a directory that merely holds repositories measured 265,946
+  directories after the `.git`/`target`/`node_modules` prunes. The result is
+  now cached, keyed by the directories it covered, so a changed root set
+  misses and a repository the daemon itself opens is discoverable on the next
+  call with no second mechanism. `discovery_cache_secs` in `daemon.toml`
+  (default 60, `0` disables) bounds the only case the key cannot catch: a
+  store created by another process. Found by the maintainer's 2026-09-21 fleet
+  audit.
+
 - **Empty collection registries are no longer reported as ordinary empty
   results.** `search`, `graph`, and `stats` now name the condition and point to
   `mdkb update`; cross-repository search names every affected root separately.
