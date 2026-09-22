@@ -13,7 +13,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use futures::future::join_all;
 use rmcp::ErrorData as McpError;
 use rmcp::model::ErrorCode;
 use serde_json::{Value, json};
@@ -1800,6 +1799,182 @@ fn format_cross_repo_coverage(
     out
 }
 
+/// Search one repo and say what happened, opening its store and closing it
+/// again. Synchronous on purpose: every call below is blocking SQLite work,
+/// and wrapping it in an `async` block bought nothing but a false name.
+fn search_one_repo(
+    registry: &RepoRegistry,
+    root: std::path::PathBuf,
+    params: &SearchParams,
+    scope: Option<crate::mcp::tools::SearchScope>,
+    limit: usize,
+    fts_query: &str,
+    query_embedding: Option<&[f32]>,
+) -> RepoOutcome {
+    // Opened HERE, one root at a time, and dropped when this function
+    // returns. The batch open this replaces held a live rusqlite connection
+    // for every selected root before the first search ran — 104 of them for
+    // one declared workspace on the maintainer's machine.
+    let ctx = match registry.read_only_context(&root) {
+        Ok(ctx) => ctx,
+        Err(why) => {
+            tracing::warn!(root = %root.display(), "cross_repo_search: not searched ({why})");
+            return RepoOutcome {
+                root,
+                results: Err(why),
+                no_collections: false,
+            };
+        }
+    };
+    // The probe answers "are there documents to search here", which
+    // is a question about a document query. For `scope="memory"` an
+    // empty document registry says nothing about the answer, so
+    // probing it can only produce a footer line advising `mdkb
+    // update` for a corpus the caller did not ask about — and an
+    // unreadable registry would report the repo as UNSEARCHED for a
+    // memory query that would have succeeded.
+    let no_collections = if matches!(scope, Some(crate::mcp::tools::SearchScope::Memory)) {
+        false
+    } else {
+        match crate::store::collections::list_collections(&ctx.conn) {
+            Ok(collections) => collections.is_empty(),
+            Err(e) => {
+                let why = format!("collection registry could not be read: {e}");
+                return RepoOutcome {
+                    root,
+                    results: Err(why),
+                    no_collections: false,
+                };
+            }
+        }
+    };
+    // The repo's own config, not the caller's: recall thresholds are a
+    // per-repo setting and a read-only target has no handle to carry one.
+    let memory_cfg = crate::Config::load_or_default(&ctx.config_path)
+        .search
+        .memory;
+    let repo_tag = root.display().to_string();
+    let mut repo_results: Vec<SearchResult> = Vec::new();
+
+    match scope {
+        Some(crate::mcp::tools::SearchScope::Docs) | None => {
+            match hybrid_search_fts(
+                &ctx,
+                fts_query,
+                query_embedding,
+                limit,
+                params.collection.as_deref(),
+                params.include_superseded,
+            ) {
+                Ok(mut results) => {
+                    for r in &mut results {
+                        r.repo_root = Some(repo_tag.clone());
+                    }
+                    repo_results.extend(results);
+                }
+                Err(e) => {
+                    let why = format!("document search failed: {e}");
+                    tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
+                    return RepoOutcome {
+                        root,
+                        results: Err(why),
+                        no_collections,
+                    };
+                }
+            }
+        }
+        Some(crate::mcp::tools::SearchScope::Memory) => {
+            match memory::search_entries_recall(
+                &ctx.conn,
+                &params.query,
+                query_embedding,
+                limit,
+                None,
+                &memory_cfg,
+            ) {
+                Ok(entries) => {
+                    let entries: Vec<memory::MemoryEntry> =
+                        entries.into_iter().map(|result| result.entry).collect();
+                    let entries = apply_min_confidence(entries, params.min_confidence);
+                    if !entries.is_empty() {
+                        let text = format_memory_search_results(&entries);
+                        let mut pseudo = SearchResult {
+                            id: 0,
+                            collection: "memory".to_string(),
+                            path: String::new(),
+                            title: None,
+                            score: 1.0,
+                            snippets: vec![text],
+                            status: None,
+                            superseded_by: None,
+                            repo_root: Some(repo_tag),
+                        };
+                        if let Some(e) = entries.first() {
+                            pseudo.path.clone_from(&e.id);
+                            pseudo.title = Some(e.title.clone());
+                        }
+                        repo_results.push(pseudo);
+                    }
+                }
+                Err(e) => {
+                    let why = format!("memory search failed: {e}");
+                    tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
+                    return RepoOutcome {
+                        root,
+                        results: Err(why),
+                        no_collections,
+                    };
+                }
+            }
+        }
+        // Rejected above: code/symbols/duplicates never reach the fan-out.
+        _ => {}
+    }
+
+    RepoOutcome {
+        root,
+        results: Ok(repo_results),
+        no_collections,
+    }
+}
+
+/// Every selected repo, in order, one store open at a time.
+///
+/// This runs inside a single `spawn_blocking`. Everything it does is blocking
+/// SQLite work, and the runtime it would otherwise occupy also serves the hook
+/// socket with its 200 ms budget.
+///
+/// It is serial, and says so. The `join_all` this replaces was introduced to
+/// make the fan-out concurrent, over futures containing no `.await` — so it
+/// polled each one to completion in order and was serial the whole time, under
+/// a comment claiming otherwise. Concurrency here is an optimisation that has
+/// to be measured (width 2/4/8, warm and cold) before it ships, not inferred
+/// from the fact that the disk is an SSD.
+fn search_roots_blocking(
+    registry: &RepoRegistry,
+    roots: &[std::path::PathBuf],
+    params: &SearchParams,
+    scope: Option<crate::mcp::tools::SearchScope>,
+    limit: usize,
+    fts_query: &str,
+    query_embedding: Option<&[f32]>,
+) -> Vec<RepoOutcome> {
+    roots
+        .iter()
+        .map(|root| {
+            search_one_repo(
+                registry,
+                root.clone(),
+                params,
+                scope,
+                limit,
+                fts_query,
+                query_embedding,
+            )
+        })
+        .collect()
+}
+
 /// `search` (cross-repo) — fan out across every repo the daemon knows, merge
 /// with score-descending sort, and truncate to `params.limit`. Memory results
 /// from each repo are formatted as a single pseudo-result for compatibility
@@ -1816,7 +1991,7 @@ fn format_cross_repo_coverage(
 ///
 /// Code/symbols scopes are rejected — those indexes are per-repo only.
 pub async fn cross_repo_search_impl(
-    registry: &RepoRegistry,
+    registry: &Arc<RepoRegistry>,
     params: &SearchParams,
     client_scope: &[std::path::PathBuf],
 ) -> Result<(String, usize), McpError> {
@@ -1841,146 +2016,52 @@ pub async fn cross_repo_search_impl(
         ));
     }
 
-    // Which repos, through the one parser. Each with a read-only context or the
-    // reason it has none: opening happens here, once, so the fan-out below
-    // never decides whether a repo is reachable — it only searches what it was
-    // handed.
+    // Which repos, through the one parser. The stores themselves are opened
+    // one at a time inside the blocking task below, so a selector naming a
+    // hundred repos costs one live connection, not a hundred.
     let resolution = resolve_root_selector(registry, params.root.as_deref(), client_scope)?;
-    let targets = registry.open_read_only(&resolution.roots);
-    if targets.is_empty() {
+    if resolution.roots.is_empty() {
         return Err(mcp_error(
             "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
         ));
     }
 
     // Embed ONCE, before the fan-out. The query is the same text for every
-    // repo, so embedding inside the per-repo future bought N identical vectors
+    // repo, so embedding inside the per-repo body bought N identical vectors
     // at one ONNX inference each. `hybrid_search_fts` and
     // `search_entries_recall` both take a pre-computed vector for exactly this
     // reason; `None` degrades both to BM25-only, as it always did.
     let fts_query = search::escape_fts5_query(&params.query);
     let query_embedding = embed_query_off_lock(&params.query).await;
-    let query_embedding = query_embedding.as_deref();
 
-    // Fan out concurrently. A repo whose search FAILS is reported as not
-    // searched, never merged in as an empty result.
-    let per_repo_futures = targets.into_iter().map(|(root, opened)| {
-        let fts_query = &fts_query;
-        let params = &params;
-        async move {
-            let ctx = match opened {
-                Ok(ctx) => ctx,
-                Err(why) => {
-                    tracing::warn!(root = %root.display(), "cross_repo_search: not searched ({why})");
-                    return RepoOutcome { root, results: Err(why), no_collections: false };
-                }
-            };
-            // The probe answers "are there documents to search here", which
-            // is a question about a document query. For `scope="memory"` an
-            // empty document registry says nothing about the answer, so
-            // probing it can only produce a footer line advising `mdkb
-            // update` for a corpus the caller did not ask about — and an
-            // unreadable registry would report the repo as UNSEARCHED for a
-            // memory query that would have succeeded.
-            let no_collections = if matches!(scope, Some(crate::mcp::tools::SearchScope::Memory)) {
-                false
-            } else {
-                match crate::store::collections::list_collections(&ctx.conn) {
-                    Ok(collections) => collections.is_empty(),
-                    Err(e) => {
-                        let why = format!("collection registry could not be read: {e}");
-                        return RepoOutcome {
-                            root,
-                            results: Err(why),
-                            no_collections: false,
-                        };
-                    }
-                }
-            };
-            // The repo's own config, not the caller's: recall thresholds are a
-            // per-repo setting and a read-only target has no handle to carry one.
-            let memory_cfg = crate::Config::load_or_default(&ctx.config_path)
-                .search
-                .memory;
-            let repo_tag = root.display().to_string();
-            let mut repo_results: Vec<SearchResult> = Vec::new();
-
-            match scope {
-                Some(crate::mcp::tools::SearchScope::Docs) | None => {
-                    match hybrid_search_fts(
-                        &ctx,
-                        fts_query,
-                        query_embedding,
-                        limit,
-                        params.collection.as_deref(),
-                        params.include_superseded,
-                    ) {
-                        Ok(mut results) => {
-                            for r in &mut results {
-                                r.repo_root = Some(repo_tag.clone());
-                            }
-                            repo_results.extend(results);
-                        }
-                        Err(e) => {
-                            let why = format!("document search failed: {e}");
-                            tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
-                            return RepoOutcome { root, results: Err(why), no_collections };
-                        }
-                    }
-                }
-                Some(crate::mcp::tools::SearchScope::Memory) => {
-                    match memory::search_entries_recall(
-                        &ctx.conn,
-                        &params.query,
-                        query_embedding,
-                        limit,
-                        None,
-                        &memory_cfg,
-                    ) {
-                        Ok(entries) => {
-                            let entries: Vec<memory::MemoryEntry> =
-                                entries.into_iter().map(|result| result.entry).collect();
-                            let entries = apply_min_confidence(entries, params.min_confidence);
-                            if !entries.is_empty() {
-                                let text = format_memory_search_results(&entries);
-                                let mut pseudo = SearchResult {
-                                    id: 0,
-                                    collection: "memory".to_string(),
-                                    path: String::new(),
-                                    title: None,
-                                    score: 1.0,
-                                    snippets: vec![text],
-                                    status: None,
-                                    superseded_by: None,
-                                    repo_root: Some(repo_tag),
-                                };
-                                if let Some(e) = entries.first() {
-                                    pseudo.path.clone_from(&e.id);
-                                    pseudo.title = Some(e.title.clone());
-                                }
-                                repo_results.push(pseudo);
-                            }
-                        }
-                        Err(e) => {
-                            let why = format!("memory search failed: {e}");
-                            tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
-                            return RepoOutcome { root, results: Err(why), no_collections };
-                        }
-                    }
-                }
-                // Rejected above: code/symbols/duplicates never reach the fan-out.
-                _ => {}
-            }
-
-            RepoOutcome { root, results: Ok(repo_results), no_collections }
-        }
-    });
+    // Off the runtime. Every repo's search is blocking SQLite work, and the
+    // runtime this used to occupy also serves the hook socket against a 200 ms
+    // budget: N repos searched on a worker meant the socket waited for the sum
+    // of all N. Owned data only, so nothing borrowed has to outlive the call.
+    let outcomes = {
+        let registry = Arc::clone(registry);
+        let roots = resolution.roots.clone();
+        let params = params.clone();
+        tokio::task::spawn_blocking(move || {
+            search_roots_blocking(
+                &registry,
+                &roots,
+                &params,
+                scope,
+                limit,
+                &fts_query,
+                query_embedding.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| mcp_error(format!("cross-repo search task failed: {e}")))?
+    };
 
     let mut searched = 0_usize;
     let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
     let mut all_results: Vec<SearchResult> = Vec::new();
     let mut no_collections = Vec::new();
-    for outcome in join_all(per_repo_futures).await {
+    for outcome in outcomes {
         if outcome.no_collections {
             no_collections.push(outcome.root.clone());
         }
@@ -9493,7 +9574,7 @@ mod tests {
     async fn cross_repo_search_impl_rejects_an_empty_registry() {
         // `state_dir: None` keeps the map in memory: a registry built in a test
         // never reads or writes the real `~/.mdkb`.
-        let registry = RepoRegistry::new(crate::DaemonConfig::default());
+        let registry = Arc::new(RepoRegistry::new(crate::DaemonConfig::default()));
         let params = search_params("anything", None);
         let err = cross_repo_search_impl(&registry, &params, &[])
             .await

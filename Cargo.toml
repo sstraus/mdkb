@@ -35,7 +35,6 @@ gray_matter = "0.2"
 # Async (for MCP)
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
-futures = { version = "0.3", default-features = false, features = ["alloc"] }
 
 # Concurrent collections
 dashmap = "6"

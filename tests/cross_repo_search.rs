@@ -111,7 +111,7 @@ async fn an_open_repo_is_searched() {
     let repos = tempfile::tempdir().expect("repos");
     let open = repo_with_entry(repos.path(), "open", "zonk_harvest");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     registry.get_or_open(&open).expect("open the repo");
 
     let (output, count) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"), &[])
@@ -131,7 +131,7 @@ async fn a_known_repo_that_is_not_open_is_still_searched() {
     let closed = repo_with_entry(repos.path(), "closed", "zonk_harvest");
     let open = repo_with_entry(repos.path(), "open", "unrelated");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     // Both roots become known; the second open evicts the first, so the repo
     // holding the match is known-but-closed — the daemon's steady state.
     registry.get_or_open(&closed).expect("open the first repo");
@@ -166,7 +166,7 @@ async fn the_fan_out_takes_no_handle_and_evicts_nothing() {
     let closed = repo_with_entry(repos.path(), "closed", "zonk_harvest");
     let working_in = repo_with_entry(repos.path(), "open", "unrelated");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     registry.get_or_open(&closed).expect("open the first repo");
     registry.get_or_open(&working_in).expect("open the second");
 
@@ -204,7 +204,7 @@ async fn a_store_this_binary_cannot_read_is_reported_not_counted_as_empty() {
     let from_the_future = repo_with_entry(repos.path(), "future", "zonk_harvest");
     let healthy = repo_with_entry(repos.path(), "healthy", "zonk_harvest");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     registry.get_or_open(&from_the_future).expect("first");
     registry.get_or_open(&healthy).expect("second");
     {
@@ -246,7 +246,7 @@ async fn an_empty_result_states_how_much_was_searched() {
     let first = repo_with_entry(repos.path(), "first", "zonk_harvest");
     let second = repo_with_entry(repos.path(), "second", "zonk_harvest");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     registry.get_or_open(&first).expect("first");
     registry.get_or_open(&second).expect("second");
 
@@ -270,7 +270,7 @@ async fn a_store_with_no_collections_is_not_reported_as_a_plain_no_match() {
     let repos = tempfile::tempdir().expect("repos");
     let empty = repo_with_entry(repos.path(), "empty", "unrelated");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     registry.get_or_open(&empty).expect("open empty store");
 
     let (output, count) = cross_repo_search_impl(&registry, &docs_search("quelli_frast"), &[])
@@ -293,7 +293,7 @@ async fn a_memory_query_is_not_advised_to_run_mdkb_update() {
     let repos = tempfile::tempdir().expect("repos");
     let empty = repo_with_entry(repos.path(), "empty", "unrelated");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     registry.get_or_open(&empty).expect("open empty store");
 
     let (output, _) = cross_repo_search_impl(&registry, &memory_search("quelli_frast"), &[])
@@ -316,7 +316,7 @@ async fn a_named_selection_does_not_report_itself_as_full_coverage() {
     let beta = repo_with_entry(repos.path(), "beta", "zonk_harvest");
     let gamma = repo_with_entry(repos.path(), "gamma", "zonk_harvest");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     for root in [&alpha, &beta, &gamma] {
         registry.get_or_open(root).expect("open");
     }
@@ -342,7 +342,7 @@ async fn a_rootless_search_names_the_workspace_as_its_denominator() {
     let elsewhere = repo_with_entry(repos.path(), "elsewhere", "zonk_harvest");
     let further = repo_with_entry(repos.path(), "further", "zonk_harvest");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     for root in [&workspace, &elsewhere, &further] {
         registry.get_or_open(root).expect("open");
     }
@@ -368,7 +368,7 @@ async fn the_not_searched_list_is_capped_and_says_how_many_it_left_out() {
     let repos = tempfile::tempdir().expect("repos");
     let readable = repo_with_entry(repos.path(), "readable", "zonk_harvest");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     registry.get_or_open(&readable).expect("open readable");
     for n in 0..7 {
         let future = repo_with_entry(repos.path(), &format!("future{n}"), "unrelated");
@@ -404,7 +404,7 @@ async fn a_nested_store_is_discovered_without_being_opened_first() {
     let parent = repo_with_entry(repos.path(), "parent", "unrelated");
     let nested = repo_with_entry(&parent, "nested", "nested_signal");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     registry.get_or_open(&parent).expect("open only the parent");
     assert_eq!(registry.known_roots(), vec![parent.clone()]);
 
@@ -451,7 +451,7 @@ async fn a_rootless_search_reaches_the_stores_nested_under_the_declared_workspac
     let _nested = repo_with_entry(&workspace, "nested", "nested_signal");
     let elsewhere = repo_with_entry(repos.path(), "elsewhere", "zonk_harvest");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
     // The repo OUTSIDE the workspace is the only one with a live handle: the
     // state that made the old default answer about it.
     registry.get_or_open(&elsewhere).expect("open elsewhere");
@@ -487,7 +487,7 @@ fn a_rootless_single_target_call_means_the_declared_workspace() {
     let workspace = repo_with_entry(repos.path(), "workspace", "unrelated");
     let nested = repo_with_entry(&workspace, "nested", "nested_signal");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
 
     let chosen = resolve_single_root(&registry, None, std::slice::from_ref(&workspace))
         .expect("the declared workspace is the answer");
@@ -515,7 +515,7 @@ fn a_rootless_single_target_call_refuses_a_container_that_anchors_no_store() {
     let alpha = repo_with_entry(&container, "alpha", "unrelated");
     let beta = repo_with_entry(&container, "beta", "unrelated");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
 
     let refusal = resolve_single_root(&registry, None, &[container])
         .expect_err("two stores and no anchor is the caller's choice to make");
@@ -538,7 +538,7 @@ fn two_declared_workspaces_that_are_both_stores_stay_ambiguous() {
     let first = repo_with_entry(repos.path(), "first", "unrelated");
     let second = repo_with_entry(repos.path(), "second", "unrelated");
 
-    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
 
     let refusal = resolve_single_root(&registry, None, &[first, second])
         .expect_err("two declared stores name no single repo");

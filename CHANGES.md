@@ -19,6 +19,22 @@
 
 ### Fixed
 
+- **The cross-repository fan-out runs off the runtime, and opens one store at
+  a time.** Each repo's search was an `async` block containing no `.await`, so
+  `join_all` polled every one of them to completion in order: the repos were
+  searched serially, synchronously, on the runtime worker that also serves the
+  hook socket against a 200 ms budget. The whole loop now runs inside one
+  `spawn_blocking`. The eager batch open went with it — a store is opened
+  immediately before its own search and dropped immediately after, so a
+  selector naming a hundred repos costs one live SQLite connection instead of
+  a hundred held for the length of the fan-out. The `futures` dependency is
+  gone; it existed only for that `join_all`. Found by the maintainer's
+  2026-09-21 fleet audit, and by a second opinion that established rayon was
+  not an option here — the global pool is deliberately capped to one thread to
+  keep ONNX from oversubscribing. Concurrency across repos remains unshipped
+  on purpose: it needs measurement, not the assumption that a wide fan-out is
+  faster.
+
 - **SessionStart no longer waits on the lock the backfill it just spawned is
   holding.** The undetected-relation-keys read took `handle.ctx` *after*
   `spawn_embedding_backfill` had fired, and that task holds the same mutex

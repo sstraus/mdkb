@@ -407,43 +407,27 @@ impl RepoRegistry {
             .collect()
     }
 
-    /// Each of `roots` with a read-only context or the reason it has none. The
-    /// caller owns the contexts and drops them when it is done.
+    /// Open one known root read-only, or say why not. One root, on purpose:
+    /// this is what a cross-repo READ opens, immediately before searching that
+    /// store and dropping it again, so a fan-out over a hundred stores holds
+    /// one connection rather than a hundred.
     ///
-    /// This is what a cross-repo READ fans out over.
-    /// [`all_handles`](Self::all_handles) is not: it returns the at-most
-    /// `max_active_repos` handles that happen to be open, so a repo that is
-    /// known but closed — every repo, after a restart — would be absent from
-    /// the answer without ever being mentioned. That is the false negative this
-    /// exists to remove.
-    ///
-    /// Which roots to read is the caller's decision, because the `root`
-    /// selector already made it: `*` means every known root, a list means those
-    /// roots, and this opens what it is given rather than deciding again.
+    /// [`all_handles`](Self::all_handles) is not what a read fans out over: it
+    /// returns the at-most `max_active_repos` handles that happen to be open,
+    /// so a repo that is known but closed — every repo, after a restart —
+    /// would be absent from the answer without ever being mentioned. That is
+    /// the false negative this exists to remove. Which roots to read is the
+    /// caller's decision, because the `root` selector already made it.
     ///
     /// [`get_or_open`](Self::get_or_open) is the wrong tool for a read: it
     /// mounts the repo, takes an LRU slot (evicting the repo the caller is
     /// actually working in) and spawns a file watcher. A read needs none of
-    /// that, so each store is opened read-only instead — no migration, no
+    /// that, so the store is opened read-only instead — no migration, no
     /// autoheal, no `-wal`/`-shm` pair, nothing left behind. Nothing here
     /// touches the handle table at all, so LRU recency is unchanged.
     ///
     /// The whitelist is re-checked here rather than trusted from the moment the
     /// root was recorded: `daemon.toml` can be edited while the map persists.
-    pub fn open_read_only(
-        &self,
-        roots: &[PathBuf],
-    ) -> Vec<(PathBuf, std::result::Result<Context, String>)> {
-        roots
-            .iter()
-            .map(|root| {
-                let read = self.read_only_context(root);
-                (root.clone(), read)
-            })
-            .collect()
-    }
-
-    /// Open one known root read-only, or say why not.
     ///
     /// The reasons come from [`repo_map::classify`], so a root the map calls
     /// absent and a root the map calls unreadable are named here exactly as the
@@ -451,7 +435,7 @@ impl RepoRegistry {
     /// this binary, a corrupt file, a held lock — carries the store's own error
     /// text, because "cannot be read" without the reason is what leaves an
     /// operator guessing.
-    fn read_only_context(&self, root: &Path) -> std::result::Result<Context, String> {
+    pub fn read_only_context(&self, root: &Path) -> std::result::Result<Context, String> {
         if let Err(e) = self.daemon_config.check_whitelist(root) {
             return Err(format!("outside the daemon whitelist: {e}"));
         }

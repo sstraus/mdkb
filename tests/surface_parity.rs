@@ -1403,11 +1403,13 @@ async fn the_duplicates_scope_is_refused_across_repositories() {
     // and this test would pass without proving anything. `state_dir` is a
     // throwaway: nothing here may read or write the real `~/.mdkb`.
     let state = tempfile::tempdir().expect("state dir");
-    let registry = mdkb::daemon::registry::RepoRegistry::new(mdkb::daemon::config::DaemonConfig {
-        whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
-        state_dir: Some(state.path().to_path_buf()),
-        ..Default::default()
-    });
+    let registry = std::sync::Arc::new(mdkb::daemon::registry::RepoRegistry::new(
+        mdkb::daemon::config::DaemonConfig {
+            whitelist_dirs: vec![std::env::temp_dir().to_string_lossy().to_string()],
+            state_dir: Some(state.path().to_path_buf()),
+            ..Default::default()
+        },
+    ));
     registry.get_or_open(&repo.root).expect("register the repo");
 
     let err = mdkb::mcp::dispatch::cross_repo_search_impl(
