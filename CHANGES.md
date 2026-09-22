@@ -381,12 +381,20 @@
   output; it may not overrule somebody who deliberately narrowed a collection,
   and `source` is the record of which is which.
 
-- **A command that migrates the store says so.** The migration is not a schema
-  bump alone — v21 deletes memory entries with unreadable ids, v23 and v26
-  archive prior clusters, v27 moves prior candidates — so a fleet survey run
-  with a reporting command rewrites every store it reads. Both the read path and
-  the write path now announce it on stderr, naming the version they came from
-  and warning that the migration rewrites memory entries and prior clusters.
+- **A READ command that migrates the store says so.** The migration is not a
+  schema bump alone — v21 deletes memory entries with unreadable ids, v23 and
+  v26 archive prior clusters, v27 moves prior candidates — so a fleet survey
+  run with a reporting command rewrites every store it reads. The read path
+  announces it on stderr, naming the version it came from and warning that the
+  migration rewrites memory entries and prior clusters.
+
+  **The write path does not, and this entry used to say it did.** The fix for
+  it was withdrawn before release: announcing on the write path meant opening
+  the store read-only first, which creates the `-shm` file a WAL database
+  requires and breaks the invariant that a routed mutation leaves no sidecar
+  behind. A routed mutation therefore still migrates in silence. The defect is
+  open, and the next attempt needs a way to read the stored version without
+  opening a connection.
 
 - **`mdkb memory audit --format json` gained `unchecked` and
   `near_duplicate_checked`.** A store with no embeddings for any active entry
