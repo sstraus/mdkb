@@ -367,6 +367,83 @@ fn drift_is_found_when_the_store_sits_below_the_git_root() {
     );
 }
 
+/// The same drift signal, for a file whose name is outside ASCII.
+///
+/// Git escapes every non-ASCII byte in a pathname and wraps the result in
+/// quotes, so `src/caffè.rs` comes back as `"src/caff\303\250.rs"`. That key
+/// matches nothing the audit looks up, so the file reports no drift and the
+/// pass reads as clean — the same false all-clear as the store-below-git-root
+/// case above, arrived at from the other direction.
+#[test]
+fn drift_is_found_for_a_path_whose_name_is_not_ascii() {
+    let _lock = env_lock();
+    let outer = tempfile::tempdir().expect("tempdir");
+    let root = outer.path().canonicalize().expect("canonicalize");
+    git(&root, &["init", "-q"]);
+    handle_init(&root).expect("init");
+
+    {
+        let ctx = Context::open(&root).expect("open");
+        handle_memory_add(
+            &ctx,
+            "old-measurement",
+            "old-measurement",
+            "problem",
+            None,
+            "measured in src/caffè.rs",
+            None,
+            None,
+            None,
+            None,
+            &[],
+            None,
+            None,
+            false,
+        )
+        .expect("add");
+    }
+
+    std::fs::create_dir_all(root.join("src")).expect("mkdir src");
+    std::fs::write(root.join("src/caffè.rs"), "fn live() {}\n").expect("write");
+    git(&root, &["add", "-A"]);
+    git_commit(&root, "add");
+
+    {
+        let ctx = Context::open(&root).expect("open");
+        let long_ago = chrono::Utc::now().timestamp() - 300 * 86_400;
+        ctx.conn
+            .execute(
+                "UPDATE memory_entries SET updated_at = ?1 WHERE id = 'old-measurement'",
+                [long_ago],
+            )
+            .expect("backdate");
+    }
+
+    std::fs::write(root.join("src/caffè.rs"), "fn live() { changed(); }\n").expect("rewrite");
+    git(&root, &["add", "-A"]);
+    git_commit(&root, "change");
+
+    let ctx = Context::open(&root).expect("reopen");
+    let outcome = handle_memory_audit(&ctx, false).expect("audit");
+
+    let drifted: Vec<&str> = outcome
+        .candidates
+        .iter()
+        .filter(|c| {
+            c.signals
+                .iter()
+                .any(|s| matches!(s, AuditSignal::SourceChangedSince { .. }))
+        })
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(
+        drifted,
+        vec!["old-measurement"],
+        "a non-ASCII path must not be invisible to the drift signal; got {:?}",
+        outcome.candidates
+    );
+}
+
 /// Git failing must show up in the STRUCTURED outcome, not only on stderr.
 ///
 /// `--format json` is what the dashboard plugin and the MCP consumers read,

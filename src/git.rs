@@ -310,6 +310,13 @@ pub fn paths_changed_since(
         .arg("-C")
         .arg(root)
         .args([
+            // Git escapes every byte outside ASCII in a pathname and wraps the
+            // result in quotes, so `src/caffè.rs` is printed as
+            // `"src/caff\303\250.rs"`. That key matches nothing a caller looks
+            // up, so those files report no drift — the same false all-clear
+            // `--relative` below was written to remove, for a different reason.
+            "-c",
+            "core.quotePath=false",
             "log",
             // `@<seconds>` is git's explicit unix-epoch form. A bare number
             // reaches approxidate, which also has to consider reading it as a

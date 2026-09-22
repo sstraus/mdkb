@@ -19,6 +19,14 @@
 
 ### Fixed
 
+- **A file whose name is outside ASCII is no longer invisible to the drift
+  signal.** `git log` escapes every non-ASCII byte in a pathname and wraps the
+  result in quotes, so `src/caffè.rs` came back as `"src/caff\303\250.rs"` —
+  a key nothing looks up. Those files reported no drift and the pass read as
+  clean, which is the same false all-clear the `--relative` fix removed for a
+  different reason. `core.quotePath=false` is now set on the invocation. Found
+  by the maintainer's 2026-09-21 fleet audit.
+
 - **A `root`-less search with a per-repository scope anchors instead of
   refusing.** `search` chose the fan-out whenever the selector resolved to
   more than one repository, before looking at the scope — and a `root`-less
