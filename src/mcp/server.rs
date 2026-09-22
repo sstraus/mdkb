@@ -4402,9 +4402,18 @@ if (require.main === module) {
             text.contains("2 repos are in scope"),
             "must state how many it could not choose between: {text}"
         );
+        // Canonical, because that is what the registry keyed them under: the
+        // Windows runner hands out a temp dir under the 8.3 name
+        // `C:\Users\RUNNER~1\...`, and the long name is the only spelling
+        // both sides share.
+        let named = |p: &std::path::Path| {
+            crate::domain::canonicalize_plain(p)
+                .unwrap()
+                .display()
+                .to_string()
+        };
         assert!(
-            text.contains(&tmp1.path().display().to_string())
-                || text.contains(&tmp2.path().display().to_string()),
+            text.contains(&named(tmp1.path())) || text.contains(&named(tmp2.path())),
             "must name the roots it means: {text}"
         );
     }
