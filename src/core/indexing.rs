@@ -250,8 +250,10 @@ pub fn handle_update_force(
     let before = documents_per_collection(&ctx.conn).unwrap_or_default();
 
     let collections = collections::list_collections(&ctx.conn)?;
-    let mut result = UpdateResult::default();
-    result.pattern_upgrades = pattern_upgrades;
+    let mut result = UpdateResult {
+        pattern_upgrades,
+        ..UpdateResult::default()
+    };
 
     with_transaction(&ctx.conn, || {
         update_all_collections(ctx, root, &config, &collections, force, &mut result)?;
@@ -783,13 +785,15 @@ pub fn handle_update_files_force(
         // time; reading it will replace this scan on the watcher path.
         let relations = effective_relations_for(&ctx.conn, &config.graph);
         index_specified_files(
-            ctx,
-            &canonical_root,
-            &matchers,
-            files,
-            &config.graph,
-            &relations,
-            force,
+            SpecifiedFilesInput {
+                ctx,
+                canonical_root: &canonical_root,
+                matchers: &matchers,
+                files,
+                graph_cfg: &config.graph,
+                relations: &relations,
+                force,
+            },
             &mut result,
         )?;
         // Second pass, scoped to what this call just wrote. A new file can
@@ -981,17 +985,34 @@ pub(crate) fn index_single_file(input: SingleFileInput<'_>, result: &mut UpdateR
         }
     }
 }
+/// What a targeted reindex is working on, bundled the way
+/// [`SingleFileInput`] already bundles the per-file arguments.
+pub(crate) struct SpecifiedFilesInput<'a> {
+    pub(crate) ctx: &'a Context,
+    pub(crate) canonical_root: &'a Path,
+    pub(crate) matchers: &'a [(&'a Collection, globset::GlobMatcher, PathBuf)],
+    pub(crate) files: &'a [String],
+    pub(crate) graph_cfg: &'a crate::config::GraphConfig,
+    /// The keys extraction uses this run, already resolved — see
+    /// [`SingleFileInput::relations`].
+    pub(crate) relations: &'a [String],
+    pub(crate) force: bool,
+}
+
 /// Process each user-supplied file path within a transaction.
 pub(crate) fn index_specified_files(
-    ctx: &Context,
-    canonical_root: &Path,
-    matchers: &[(&Collection, globset::GlobMatcher, PathBuf)],
-    files: &[String],
-    graph_cfg: &crate::config::GraphConfig,
-    relations: &[String],
-    force: bool,
+    input: SpecifiedFilesInput<'_>,
     result: &mut UpdateResult,
 ) -> Result<()> {
+    let SpecifiedFilesInput {
+        ctx,
+        canonical_root,
+        matchers,
+        files,
+        graph_cfg,
+        relations,
+        force,
+    } = input;
     for file_arg in files {
         let file_path = PathBuf::from(file_arg);
 

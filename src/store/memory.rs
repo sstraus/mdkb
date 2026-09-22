@@ -4616,7 +4616,7 @@ mod tests {
         );
         add_entry(&conn, &live).unwrap();
         let rowid = get_rowid(&conn, "writer-lock").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.3010), "test").unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.3050), "test").unwrap();
 
         let found = find_duplicate(
             &conn,

@@ -856,6 +856,11 @@ mod relation_detection_tests {
         );
     }
 
+    /// `score()` is `hits / total` over small integers, so 0.0, 0.5 and 1.0 are
+    /// each produced exactly and compare exactly. `float_cmp` is warning about
+    /// accumulated error that cannot arise from one division of two counts;
+    /// an epsilon here would let a wrong ratio pass.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn relation_keys_score_one_and_metadata_keys_score_zero() {
         let conn = setup();
@@ -1010,6 +1015,11 @@ mod relation_detection_tests {
         );
     }
 
+    /// `score()` is `hits / total` over small integers, so 0.0, 0.5 and 1.0 are
+    /// each produced exactly and compare exactly. `float_cmp` is warning about
+    /// accumulated error that cannot arise from one division of two counts;
+    /// an epsilon here would let a wrong ratio pass.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn a_partly_dangling_key_is_still_a_relation() {
         // Real corpora point at documents that are not indexed yet. A key must
@@ -1036,6 +1046,11 @@ mod relation_detection_tests {
         );
     }
 
+    /// `score()` is `hits / total` over small integers, so 0.0, 0.5 and 1.0 are
+    /// each produced exactly and compare exactly. `float_cmp` is warning about
+    /// accumulated error that cannot arise from one division of two counts;
+    /// an epsilon here would let a wrong ratio pass.
+    #[allow(clippy::float_cmp)]
     #[test]
     fn a_path_valued_key_resolves_without_any_identity() {
         // Detection is identity-aware, not identity-only: a key whose values
