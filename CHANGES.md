@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed
+
+- **A `root`-less call to a tool that cannot fan out now means the declared
+  workspace.** A rootless call means the workspace and every store nested
+  under it, which `search` fans out over and a single-target tool cannot use —
+  so `get`, `graph` and `memory_write` refused with a count, on every turn, in
+  any workspace holding more than one store. When the declared path is itself
+  a store it is now the answer, and the nested stores stay reachable only
+  through `search` or an explicit `root`, so a write never lands in a
+  sub-store nobody named. A workspace that anchors no store of its own still
+  names no repository, and still says so with the count and a sample. The
+  selector policy moved out of the MCP server into `resolve_single_root`, so
+  every single-target tool agrees on what `root` means. Found by the
+  maintainer's 2026-09-21 fleet audit.
+
 ### Fixed
 
 - **Empty collection registries are no longer reported as ordinary empty

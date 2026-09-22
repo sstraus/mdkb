@@ -1636,6 +1636,65 @@ pub fn resolve_root_selector(
     Ok((selector, roots))
 }
 
+/// The one repo a tool that cannot fan out means, or the reason it has none.
+///
+/// Every selector policy lives here rather than at the call site, so `get`,
+/// `graph` and `memory_write` cannot disagree about what `root` means.
+///
+/// - `*` is refused for what it means, not for how many repos it happens to
+///   resolve to: on a daemon with one repo open it would silently answer as if
+///   the caller had named that repo.
+/// - A `root`-less call resolves to the declared workspace when that path is
+///   itself a store ([`workspace_anchor`]). The stores nested under it are the
+///   fan-out's business, not this one's.
+/// - Anything else that names several repos is the caller's choice to make,
+///   and the error makes it makeable: the count, and a capped sample of paths.
+pub fn resolve_single_root(
+    registry: &RepoRegistry,
+    root: Option<&str>,
+    scope: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, McpError> {
+    let (selector, roots) = resolve_root_selector(registry, root, scope)?;
+    if selector == RootSelector::All {
+        return Err(mcp_error(RootSelector::wildcard_rejection()));
+    }
+    match roots.len() {
+        0 => Err(mcp_error(
+            "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
+        )),
+        1 => Ok(roots[0].clone()),
+        // No `root` and several repos in scope is a different fact from a
+        // selector that named several: the caller has not chosen yet, and the
+        // workspace it declared may already be the choice.
+        _ if selector == RootSelector::Default => {
+            crate::mcp::tools::workspace_anchor(scope, &roots).ok_or_else(|| {
+                // A workspace holding a hierarchy of stores can reach dozens,
+                // so the list is capped — every path here is charged on a turn
+                // that produced no answer, and the count plus a sample is what
+                // the caller needs to pick one.
+                const SHOWN: usize = 5;
+                let names: Vec<_> = roots
+                    .iter()
+                    .take(SHOWN)
+                    .map(|p| p.display().to_string())
+                    .collect();
+                let more = roots.len().saturating_sub(names.len());
+                let tail = if more > 0 {
+                    format!(", and {more} more — root=\"*\" searches them all")
+                } else {
+                    String::new()
+                };
+                mcp_error(format!(
+                    "{} repos are in scope. Specify root: {}{tail}",
+                    roots.len(),
+                    names.join(", ")
+                ))
+            })
+        }
+        n => Err(mcp_error(RootSelector::multi_root_rejection(n))),
+    }
+}
+
 /// What the fan-out learned about one repo.
 ///
 /// `Err` is "not searched, and here is why". A repo that could not be read is

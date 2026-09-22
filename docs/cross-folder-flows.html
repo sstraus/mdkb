@@ -265,6 +265,7 @@ better than one large one: isolation by default, reach on request.</p>
 <h3>The <code>root</code> grammar</h3>
 <table>
   <tr><th>Form</th><th>Meaning</th></tr>
+  <tr><td><em>omitted</em></td><td>The workspace the client declared, and every store nested beneath it. <code>search</code> fans out over all of them; a single-target tool means the workspace itself when that path is a store, and refuses when it anchors none.</td></tr>
   <tr><td><code>root="/abs/path"</code></td><td>One repo by path. It need not be a known repo.</td></tr>
   <tr><td><code>root="name"</code></td><td>One repo by name — the last component of a known root.</td></tr>
   <tr><td><code>root="name,/abs/path"</code></td><td>Several repos. Names and paths mix freely.</td></tr>

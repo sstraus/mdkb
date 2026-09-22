@@ -704,6 +704,16 @@ The MCP `root` parameter says which repositories a call means:
 | `a,b` | those repositories |
 | `*` | every known repository — accepted by `search` only |
 
+A `root`-less call means the workspace and the stores under it for `search`,
+which fans out. A tool that reads or writes one repository cannot use a set, so
+it takes the declared workspace itself when that path is a store — the stores
+nested under it answer only to `search` or to an explicit `root`, so a
+`memory_write` never lands in a sub-store nobody named. A workspace that
+anchors no store of its own, such as a directory that merely holds
+repositories, names no single repository either: the call is refused with the
+count and a sample of the paths, because choosing one of them is the caller's
+decision.
+
 `*` is search-only on purpose: fanning out a read is meaningful, fanning out a
 write is not. A fan-out always states its coverage — what it read, out of what
 is known, and what it skipped and why — because a repository that could not be

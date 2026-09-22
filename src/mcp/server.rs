@@ -262,54 +262,17 @@ impl McpServer {
     /// Resolve the repo handle for a tool call.
     ///
     /// - Standalone mode: returns cached handle (shares Arcs with self).
-    /// - Global mode: the `root` selector is parsed by [`RootSelector`] and must
-    ///   name exactly one repo. A selector naming several is rejected here and
-    ///   names the tool that can fan out — `search` — as `root="*"` used to.
+    /// - Global mode: [`resolve_single_root`](super::dispatch::resolve_single_root)
+    ///   turns the `root` selector into exactly one repo, or into the reason
+    ///   there is none. The policy lives there so every single-target tool
+    ///   agrees on what `root` means.
     async fn resolve_handle(&self, root: Option<&str>) -> Result<Arc<RepoHandle>, McpError> {
         if let Some(registry) = &self.registry {
             let scope = self.client_roots.lock().await.clone();
-            let (selector, roots) = super::dispatch::resolve_root_selector(registry, root, &scope)?;
-            if selector == RootSelector::All {
-                return Err(mcp_error(RootSelector::wildcard_rejection()));
-            }
-            let handle = match roots.len() {
-                0 => {
-                    return Err(mcp_error(
-                        "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
-                    ));
-                }
-                1 => registry
-                    .get_or_open(&roots[0])
-                    .map_err(|e| mcp_error(format!("{e}")))?,
-                // No `root` and several repos open is a different fact from a
-                // selector that named several: the caller has not chosen yet.
-                // No `root` and several repos in scope is a different fact from
-                // a selector that named several: the caller has not chosen yet.
-                // A workspace holding a hierarchy of stores can reach dozens, so
-                // the list is capped — every path here is charged on a turn that
-                // produced no answer, and the count plus a sample is what the
-                // caller needs to pick one.
-                _ if selector == RootSelector::Default => {
-                    const SHOWN: usize = 5;
-                    let names: Vec<_> = roots
-                        .iter()
-                        .take(SHOWN)
-                        .map(|p| p.display().to_string())
-                        .collect();
-                    let more = roots.len().saturating_sub(names.len());
-                    let tail = if more > 0 {
-                        format!(", and {more} more — root=\"*\" searches them all")
-                    } else {
-                        String::new()
-                    };
-                    return Err(mcp_error(format!(
-                        "{} repos are in scope. Specify root: {}{tail}",
-                        roots.len(),
-                        names.join(", ")
-                    )));
-                }
-                n => return Err(mcp_error(RootSelector::multi_root_rejection(n))),
-            };
+            let root = super::dispatch::resolve_single_root(registry, root, &scope)?;
+            let handle = registry
+                .get_or_open(&root)
+                .map_err(|e| mcp_error(format!("{e}")))?;
             Self::ensure_handle_context(&handle).await?;
             Ok(handle)
         } else {

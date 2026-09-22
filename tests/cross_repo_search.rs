@@ -313,40 +313,117 @@ async fn a_nested_store_is_discovered_without_being_opened_first() {
     );
 }
 
-/// A workspace that holds a hierarchy of stores is not re-indexed into one
-/// store — it is fanned out over. Before this, a `root`-less call meant
-/// "whatever happens to hold a live handle", so a call from a workspace whose
-/// own store was never opened answered about unrelated repos and named none of
-/// the stores beneath it.
-#[test]
-fn a_rootless_default_reaches_the_stores_nested_under_the_declared_workspace() {
-    use mdkb::mcp::tools::default_roots;
-    use std::path::PathBuf;
+/// A `root`-less search means the declared workspace and every store nested
+/// beneath it — not whatever happens to hold a live handle.
+///
+/// Story 141-2032 fixed the wiring; the test that came with it called
+/// `default_roots` with synthetic paths, which `src/mcp/tools.rs` already
+/// covers. What had no test was the wiring itself: `resolve_root_selector`
+/// feeding `default_roots` the union of discovery and the open handles, and
+/// the fan-out receiving a non-empty `client_scope`. Change that call to pass
+/// the open handles as `known` — the exact regression the story fixed — and
+/// only this test goes red.
+#[tokio::test]
+async fn a_rootless_search_reaches_the_stores_nested_under_the_declared_workspace() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let workspace = repo_with_entry(repos.path(), "workspace", "unrelated");
+    let _nested = repo_with_entry(&workspace, "nested", "nested_signal");
+    let elsewhere = repo_with_entry(repos.path(), "elsewhere", "zonk_harvest");
 
-    let workspace = PathBuf::from("/ws");
-    let known = vec![
-        workspace.clone(),
-        workspace.join("work"),
-        workspace.join("work/people/hr"),
-        PathBuf::from("/elsewhere/unrelated"),
-    ];
-    // The unrelated repo is the only one with a live handle — exactly the state
-    // that made the old default answer about it.
-    let open = vec![PathBuf::from("/elsewhere/unrelated")];
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    // The repo OUTSIDE the workspace is the only one with a live handle: the
+    // state that made the old default answer about it.
+    registry.get_or_open(&elsewhere).expect("open elsewhere");
 
-    let reached = default_roots(std::slice::from_ref(&workspace), &known, &open);
+    let mut params = memory_search("nested_signal");
+    params.root = None;
+    let (output, count) = cross_repo_search_impl(&registry, &params, &[workspace.clone()])
+        .await
+        .expect("search");
 
-    assert_eq!(
-        reached,
-        vec![
-            workspace.clone(),
-            workspace.join("work"),
-            workspace.join("work/people/hr"),
-        ],
-        "the hierarchy answers, the unrelated open repo does not"
+    assert!(
+        count >= 1 && output.contains("nested_signal"),
+        "the store nested under the declared workspace must answer: {output}"
     );
     assert!(
-        !reached.contains(&PathBuf::from("/elsewhere/unrelated")),
-        "an open repo outside the workspace must not be in a rootless answer"
+        !output.contains(&elsewhere.display().to_string()),
+        "an open repo outside the workspace must not be searched: {output}"
+    );
+}
+
+/// A tool that cannot fan out gets the workspace itself, not a refusal.
+///
+/// `default_roots` answers "every store in this workspace", which `search`
+/// wants and `get` cannot use. When the declared path is itself a store, the
+/// caller has already named its repo and there is nothing to disambiguate.
+#[test]
+fn a_rootless_single_target_call_means_the_declared_workspace() {
+    use mdkb::mcp::dispatch::resolve_single_root;
+
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let workspace = repo_with_entry(repos.path(), "workspace", "unrelated");
+    let nested = repo_with_entry(&workspace, "nested", "nested_signal");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+
+    let chosen = resolve_single_root(&registry, None, &[workspace.clone()])
+        .expect("the declared workspace is the answer");
+
+    assert_eq!(chosen, workspace, "the workspace anchors the call");
+    assert_ne!(
+        chosen, nested,
+        "a store nested under the workspace is the fan-out's business, not a \
+         single-target call's"
+    );
+}
+
+/// A container of repositories anchors no store, so it names no repo either.
+/// The refusal is the answer, and it has to be one the caller can act on: the
+/// count, and a sample of the paths.
+#[test]
+fn a_rootless_single_target_call_refuses_a_container_that_anchors_no_store() {
+    use mdkb::mcp::dispatch::resolve_single_root;
+
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let container = repos.path().join("container");
+    std::fs::create_dir_all(&container).expect("container");
+    let container = container.canonicalize().expect("canonicalize");
+    let alpha = repo_with_entry(&container, "alpha", "unrelated");
+    let beta = repo_with_entry(&container, "beta", "unrelated");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+
+    let refusal = resolve_single_root(&registry, None, &[container])
+        .expect_err("two stores and no anchor is the caller's choice to make");
+    let message = refusal.to_string();
+
+    assert!(message.contains("2 repos are in scope"), "{message}");
+    assert!(message.contains(&alpha.display().to_string()), "{message}");
+    assert!(message.contains(&beta.display().to_string()), "{message}");
+}
+
+/// Two declared workspaces that are each a store stay ambiguous: the caller
+/// declared both, and picking the first is an accident of ordering, not a
+/// decision.
+#[test]
+fn two_declared_workspaces_that_are_both_stores_stay_ambiguous() {
+    use mdkb::mcp::dispatch::resolve_single_root;
+
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let first = repo_with_entry(repos.path(), "first", "unrelated");
+    let second = repo_with_entry(repos.path(), "second", "unrelated");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+
+    let refusal = resolve_single_root(&registry, None, &[first, second])
+        .expect_err("two declared stores name no single repo");
+
+    assert!(
+        refusal.to_string().contains("2 repos are in scope"),
+        "{refusal}"
     );
 }

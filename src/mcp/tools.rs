@@ -188,6 +188,24 @@ pub fn default_roots(scope: &[PathBuf], known: &[PathBuf], open: &[PathBuf]) -> 
     }
 }
 
+/// The one store a `root`-less call means for a tool that cannot fan out.
+///
+/// [`default_roots`] answers "every store in this workspace", which is what a
+/// fan-out wants and what a single-target tool cannot use. The workspace the
+/// client declared is its own statement of what it is working on, so when that
+/// path is itself a store, that store is the answer — and the stores nested
+/// beneath it stay reachable only through `search` or an explicit root. A
+/// `memory_write` must never land in a sub-store nobody named.
+///
+/// `None` is "not a choice this function may make": a scope that anchors no
+/// store (a container of repositories, where nothing is more the caller's repo
+/// than anything else), or several declared paths that are each a store.
+pub fn workspace_anchor(scope: &[PathBuf], roots: &[PathBuf]) -> Option<PathBuf> {
+    let mut anchors = scope.iter().filter(|s| roots.contains(s));
+    let first = anchors.next()?;
+    anchors.next().is_none().then(|| first.clone())
+}
+
 /// Resolve one term. A path is itself; a name is looked up by last component.
 fn resolve_term(term: &RootTerm, known: &[PathBuf]) -> Result<PathBuf, String> {
     let name = match term {

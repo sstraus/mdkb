@@ -1537,11 +1537,13 @@ mdkb surface                                            # each MCP tool next to 
 mdkb schema [COMMAND]                                   # the CLI as JSON, for machine callers
 
 # Repo selector (the MCP `root` parameter; the CLI always works in the current repo)
+(omitted)                                               # the declared workspace, and every store nested under it
 root=\"/abs/path\"                                        # one repo by path; need not be a known repo
 root=\"name\"                                             # one repo by name, the last component of a known root
 root=\"name,/abs/path\"                                   # several repos, comma-separated, names and paths mixed
 root=\"*\"                                                # every known repo (`mdkb daemon status` lists them)
-# Only `search` fans out; every other tool needs a selector naming one repo.
+# Only `search` fans out; every other tool needs a selector naming one repo —
+# with `root` omitted that is the declared workspace itself, when it is a store.
 # A comma always separates repos, so a path containing one is refused, not split.
 
 # A store carries a schema version. When the STORE is newer than the binary,
