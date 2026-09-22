@@ -19,6 +19,13 @@
 
 ### Fixed
 
+- **Confirming a prior no longer shortens a TTL somebody set on purpose.** The
+  renewal that keeps a confirmed promotion injectable was written as an
+  assignment, and `memory add --ttl` reaches the same column — so a prior given
+  a year became a thirty-day prior the moment a person vouched for it, which is
+  the opposite of what a confirmation means. The renewal now takes the later of
+  the two. Found by the maintainer's 2026-09-21 fleet audit.
+
 - **A file whose name is outside ASCII is no longer invisible to the drift
   signal.** `git log` escapes every non-ASCII byte in a pathname and wraps the
   result in quotes, so `src/caffè.rs` came back as `"src/caff\303\250.rs"` —

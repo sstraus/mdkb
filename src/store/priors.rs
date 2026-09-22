@@ -1490,8 +1490,16 @@ pub fn apply_belief_from_memory(
         // makes — drops an entry whose `expires_at` has passed. Without this
         // the confirmation above is real in the table and invisible in the
         // session: the state says promoted and the prior never injects again.
+        //
+        // MAX, not assignment: this renews an expiry, and an expiry that is
+        // already further out was set by somebody who meant it. `--ttl` on
+        // `memory add` reaches the same column, so an unconditional write made
+        // a person vouching for a prior the thing that SHORTENED its life —
+        // the exact opposite of what the renewal is for.
         conn.execute(
-            "UPDATE memory_entries SET expires_at = ?2 WHERE id = ?1",
+            "UPDATE memory_entries
+                SET expires_at = MAX(COALESCE(expires_at, 0), ?2)
+              WHERE id = ?1",
             params![
                 memory_id,
                 chrono::Utc::now().timestamp() + crate::store::memory::PRIOR_TTL_SECS
@@ -3191,6 +3199,77 @@ mod tests {
         let after = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(after.confirmed_count, 1);
         assert_eq!(after.refuted_count, 1);
+    }
+
+    /// Vouching for a prior must not be what kills it.
+    ///
+    /// The renewal exists so a confirmed promotion stays injectable. Written
+    /// as an assignment it also moved an expiry BACKWARDS: `memory add --ttl`
+    /// reaches the same column, so a prior somebody gave a year became a
+    /// thirty-day prior the moment a person confirmed it.
+    #[test]
+    fn confirming_a_prior_never_shortens_an_expiry_somebody_set() {
+        let conn = conn();
+        let far = chrono::Utc::now().timestamp() + 10 * crate::store::memory::PRIOR_TTL_SECS;
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at, expires_at)
+             VALUES ('prior-a', 'l', 'l', 'prior', '[]', 100, 100, ?1)",
+            params![far],
+        )
+        .unwrap();
+        let mut c = cluster_with_signature("clu-a", Some("boom failed"));
+        c.promoted_memory_id = Some("prior-a".into());
+        c.state = "refuted".into();
+        c.refuted_count = 1;
+        upsert_cluster(&conn, &c).unwrap();
+
+        apply_belief_from_memory(&conn, "prior-a", 1).unwrap();
+
+        let kept: i64 = conn
+            .query_row(
+                "SELECT expires_at FROM memory_entries WHERE id = 'prior-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kept, far,
+            "a confirmation may extend an expiry, never cut it"
+        );
+    }
+
+    /// The renewal still does its job for the ordinary case: a prior whose
+    /// expiry is nearer than the default window is pushed back out, or the
+    /// state says promoted while the entry never injects again.
+    #[test]
+    fn confirming_a_prior_renews_an_expiry_that_is_closer_than_the_window() {
+        let conn = conn();
+        let soon = chrono::Utc::now().timestamp() + 60;
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at, expires_at)
+             VALUES ('prior-a', 'l', 'l', 'prior', '[]', 100, 100, ?1)",
+            params![soon],
+        )
+        .unwrap();
+        let mut c = cluster_with_signature("clu-a", Some("boom failed"));
+        c.promoted_memory_id = Some("prior-a".into());
+        c.state = "refuted".into();
+        c.refuted_count = 1;
+        upsert_cluster(&conn, &c).unwrap();
+
+        apply_belief_from_memory(&conn, "prior-a", 1).unwrap();
+
+        let renewed: i64 = conn
+            .query_row(
+                "SELECT expires_at FROM memory_entries WHERE id = 'prior-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            renewed > soon,
+            "a confirmation must push a near expiry out: {renewed} vs {soon}"
+        );
     }
 
     #[test]
