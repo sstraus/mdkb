@@ -4393,7 +4393,9 @@ if (require.main === module) {
 
         let server = McpServer::global(registry);
         let err = server.resolve_handle(None).await.unwrap_err();
-        let text = format!("{err:?}");
+        // The message, not `{err:?}`: the debug form escapes every backslash,
+        // so a Windows path in it matches no path anybody can hand back.
+        let text = err.message.to_string();
         // The contract is unchanged: a tool that reads one repo, given no
         // choice and several candidates, refuses and says which. Only the
         // wording moved, because a workspace holding a hierarchy can reach
