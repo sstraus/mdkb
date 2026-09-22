@@ -1096,9 +1096,20 @@ fn bm25_search_with_rowid(
 /// no import path consulted at all.
 pub const NEAR_DUPLICATE_DISTANCE: f32 = 0.32;
 
-/// How many neighbours [`find_duplicate`] inspects. The check asks "is this
-/// already here", not "what else is nearby", so a short list is enough.
+/// How many ACTIVE neighbours [`find_duplicate`] needs to inspect. The check
+/// asks "is this already here", not "what else is nearby", so a short list is
+/// enough.
 const NEAR_DUPLICATE_NEIGHBOURS: usize = 3;
+
+/// How many the vector index is asked for, to get that many active ones.
+///
+/// Archiving, superseding and pruning only flip `status`; the vector stays in
+/// `vec_memory` until a hard DELETE. The status filter therefore runs AFTER
+/// the KNN, so three nearest neighbours that are all inactive left a genuine
+/// active duplicate one rank further out uninspected, and the write was
+/// accepted. `memory_vector_search` over-fetches by the same factor on its
+/// `entry_type` arm, for the same reason.
+const NEAR_DUPLICATE_FETCH: usize = NEAR_DUPLICATE_NEIGHBOURS * 5;
 
 /// The wider band in which two entries are worth comparing but are not the same
 /// memory. Deliberately looser than [`NEAR_DUPLICATE_DISTANCE`]: anything
@@ -1182,12 +1193,8 @@ pub fn find_duplicate(
     let Some(embedding) = embedding else {
         return Ok(None);
     };
-    let neighbours = crate::store::vectors::memory_vector_search(
-        conn,
-        embedding,
-        NEAR_DUPLICATE_NEIGHBOURS,
-        None,
-    )?;
+    let neighbours =
+        crate::store::vectors::memory_vector_search(conn, embedding, NEAR_DUPLICATE_FETCH, None)?;
     for (rowid, distance) in neighbours {
         if distance >= NEAR_DUPLICATE_DISTANCE {
             continue;
@@ -4572,6 +4579,57 @@ mod tests {
             .is_none(),
             "a distant neighbour is not a duplicate"
         );
+    }
+
+    /// Archived neighbours must not use up the window a real duplicate needs.
+    ///
+    /// Archiving, superseding and pruning only flip `status`; the vector stays
+    /// in `vec_memory`. With the index asked for exactly as many neighbours as
+    /// the check inspects, three inactive ones nearer than the real duplicate
+    /// meant the duplicate was never looked at and the write was accepted.
+    #[test]
+    fn inactive_neighbours_do_not_hide_an_active_duplicate() {
+        use crate::store::vectors;
+        let conn = setup_db_with_vectors();
+
+        // Nearer than the real one, and all retired.
+        for n in 0..NEAR_DUPLICATE_NEIGHBOURS {
+            let id = format!("archived-{n}");
+            let mut entry = typed_entry(&id, &format!("Archived {n}"), "old", EntryType::Decision);
+            entry.status = EntryStatus::Archived;
+            add_entry(&conn, &entry).unwrap();
+            let rowid = get_rowid(&conn, &id).unwrap().unwrap();
+            vectors::store_memory_embedding(
+                &conn,
+                rowid,
+                &test_embedding(0.30 + n as f32 * 0.0001),
+                "test",
+            )
+            .unwrap();
+        }
+
+        let live = typed_entry(
+            "writer-lock",
+            "One writer, many readers",
+            "Serialise every mutation.",
+            EntryType::Decision,
+        );
+        add_entry(&conn, &live).unwrap();
+        let rowid = get_rowid(&conn, "writer-lock").unwrap().unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.3010), "test").unwrap();
+
+        let found = find_duplicate(
+            &conn,
+            "single-writer",
+            "Another title entirely",
+            Some(&test_embedding(0.30)),
+        )
+        .unwrap();
+
+        let Some(Duplicate::Meaning { entry, .. }) = found else {
+            panic!("the active duplicate must survive the archived neighbours: {found:?}");
+        };
+        assert_eq!(entry.id, "writer-lock");
     }
 
     /// `--entry-type` narrows the corpus; it must not switch search engines.

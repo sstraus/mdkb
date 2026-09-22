@@ -19,6 +19,15 @@
 
 ### Fixed
 
+- **An archived neighbour no longer hides a real near-duplicate.** The
+  duplicate check asked the vector index for three neighbours and then dropped
+  the ones that were not active — but archiving, superseding and pruning only
+  flip `status`, so the vector stays in the index. Three retired entries nearer
+  than the genuine duplicate meant the genuine one was never inspected and the
+  write went through. The index is now asked for five times as many, the way
+  the typed search arm beside it already does. Found by the maintainer's
+  2026-09-21 fleet audit.
+
 - **Confirming a prior no longer shortens a TTL somebody set on purpose.** The
   renewal that keeps a confirmed promotion injectable was written as an
   assignment, and `memory add --ttl` reaches the same column — so a prior given
