@@ -593,12 +593,12 @@ impl McpServer {
         }
         // A list naming more than one repo fans out too.
         if let Some(registry) = &self.registry {
-            let (_, roots) = super::dispatch::resolve_root_selector(
+            let resolved = super::dispatch::resolve_root_selector(
                 registry,
                 params.root.as_deref(),
                 &self.client_roots.lock().await.clone(),
             )?;
-            if roots.len() > 1 {
+            if resolved.roots.len() > 1 {
                 return self.cross_repo_search(&params).await;
             }
         }

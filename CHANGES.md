@@ -19,6 +19,18 @@
 
 ### Fixed
 
+- **The cross-repository coverage footer states the truth, and is bounded.**
+  The denominator was the number of roots the selector resolved, so
+  `root="alpha,beta"` on a daemon knowing thirty stores reported `Searched 2
+  of 2 discoverable repos` — read literally, complete coverage, which is the
+  false confidence the footer exists to destroy. It now reports what exists
+  and words the sentence from the selector: `N of M known repos` for `*`, `N
+  of M repos named (K known)` for a list, `N of M repos in this workspace (K
+  known)` for a rootless call. Both path lists stop at five names and then say
+  how many they left out, and a `scope="memory"` search no longer probes the
+  document collection registry nor advises `mdkb update` about a corpus it did
+  not ask about. Found by the maintainer's 2026-09-21 fleet audit.
+
 - **The nested-store walk is paid once per minute, not once per call.**
   Discovery walked every directory under every known root and under the
   declared workspace, uncached, on every `Default`, `*` and name resolution —

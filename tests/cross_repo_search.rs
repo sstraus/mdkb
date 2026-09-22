@@ -81,6 +81,18 @@ fn one_slot_config(state: &Path) -> DaemonConfig {
     }
 }
 
+/// The same search over documents. `scope` decides whether the empty-document
+/// -registry probe is a question about the answer at all.
+fn docs_search(query: &str) -> SearchParams {
+    serde_json::from_value(json!({
+        "query": query,
+        "root": "*",
+        "scope": "docs",
+        "limit": 10,
+    }))
+    .expect("search params")
+}
+
 fn memory_search(query: &str) -> SearchParams {
     serde_json::from_value(json!({
         "query": query,
@@ -139,7 +151,7 @@ async fn a_known_repo_that_is_not_open_is_still_searched() {
         "a known repo must be searched even with no handle open for it: {output}"
     );
     assert!(
-        output.contains("Searched 2 of 2 discoverable repos"),
+        output.contains("Searched 2 of 2 known repos"),
         "the answer must state its coverage: {output}"
     );
 }
@@ -208,7 +220,7 @@ async fn a_store_this_binary_cannot_read_is_reported_not_counted_as_empty() {
 
     assert!(count >= 1, "the healthy repo is still searched: {output}");
     assert!(
-        output.contains("Searched 1 of 2 discoverable repos"),
+        output.contains("Searched 1 of 2 known repos"),
         "the coverage must exclude the repo that was not read: {output}"
     );
     assert!(
@@ -244,7 +256,7 @@ async fn an_empty_result_states_how_much_was_searched() {
 
     assert_eq!(count, 0, "nothing matches that token: {output}");
     assert!(
-        output.contains("Searched 2 of 2 discoverable repos"),
+        output.contains("Searched 2 of 2 known repos"),
         "an empty answer must still state its coverage: {output}"
     );
 }
@@ -261,7 +273,7 @@ async fn a_store_with_no_collections_is_not_reported_as_a_plain_no_match() {
     let registry = RepoRegistry::new(one_slot_config(state.path()));
     registry.get_or_open(&empty).expect("open empty store");
 
-    let (output, count) = cross_repo_search_impl(&registry, &memory_search("quelli_frast"), &[])
+    let (output, count) = cross_repo_search_impl(&registry, &docs_search("quelli_frast"), &[])
         .await
         .expect("search");
 
@@ -269,6 +281,117 @@ async fn a_store_with_no_collections_is_not_reported_as_a_plain_no_match() {
     assert!(output.contains("No registered collections (1)"), "{output}");
     assert!(output.contains(&empty.display().to_string()), "{output}");
     assert!(output.contains("mdkb update"), "{output}");
+}
+
+/// The same store, the same empty document registry, a memory query: the
+/// notice must not appear. It answers "are there documents to search here",
+/// which says nothing about a memory query — and the repo's own MCP rule is
+/// that a token has to help the caller act.
+#[tokio::test]
+async fn a_memory_query_is_not_advised_to_run_mdkb_update() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let empty = repo_with_entry(repos.path(), "empty", "unrelated");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    registry.get_or_open(&empty).expect("open empty store");
+
+    let (output, _) = cross_repo_search_impl(&registry, &memory_search("quelli_frast"), &[])
+        .await
+        .expect("search");
+
+    assert!(!output.contains("No registered collections"), "{output}");
+    assert!(!output.contains("mdkb update"), "{output}");
+}
+
+/// "Searched 2 of 2" for a two-item list reads as complete coverage on a
+/// daemon that knows thirty stores — the same false confidence the footer was
+/// added to destroy. The denominator is what exists; the sentence says which
+/// of it the selector asked for.
+#[tokio::test]
+async fn a_named_selection_does_not_report_itself_as_full_coverage() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let alpha = repo_with_entry(repos.path(), "alpha", "zonk_harvest");
+    let beta = repo_with_entry(repos.path(), "beta", "zonk_harvest");
+    let gamma = repo_with_entry(repos.path(), "gamma", "zonk_harvest");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    for root in [&alpha, &beta, &gamma] {
+        registry.get_or_open(root).expect("open");
+    }
+
+    let mut params = memory_search("quelli_frast");
+    params.root = Some("alpha,beta".to_string());
+    let (output, _) = cross_repo_search_impl(&registry, &params, &[])
+        .await
+        .expect("search");
+
+    assert!(
+        output.contains("_Searched 2 of 2 repos named (3 known)._"),
+        "{output}"
+    );
+}
+
+/// The same for a workspace: three stores exist, the client declared one.
+#[tokio::test]
+async fn a_rootless_search_names_the_workspace_as_its_denominator() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let workspace = repo_with_entry(repos.path(), "workspace", "zonk_harvest");
+    let elsewhere = repo_with_entry(repos.path(), "elsewhere", "zonk_harvest");
+    let further = repo_with_entry(repos.path(), "further", "zonk_harvest");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    for root in [&workspace, &elsewhere, &further] {
+        registry.get_or_open(root).expect("open");
+    }
+
+    let mut params = memory_search("quelli_frast");
+    params.root = None;
+    let (output, _) = cross_repo_search_impl(&registry, &params, std::slice::from_ref(&workspace))
+        .await
+        .expect("search");
+
+    assert!(
+        output.contains("_Searched 1 of 1 repos in this workspace (3 known)._"),
+        "{output}"
+    );
+}
+
+/// Every path in the footer is charged on the turn, and on a "no results"
+/// answer it is charged for nothing. A workspace of stores this binary cannot
+/// read would otherwise print one absolute path per store.
+#[tokio::test]
+async fn the_not_searched_list_is_capped_and_says_how_many_it_left_out() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let readable = repo_with_entry(repos.path(), "readable", "zonk_harvest");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    registry.get_or_open(&readable).expect("open readable");
+    for n in 0..7 {
+        let future = repo_with_entry(repos.path(), &format!("future{n}"), "unrelated");
+        registry
+            .get_or_open(&future)
+            .expect("register before breaking it");
+        let ctx = Context::open(&future).expect("open");
+        ctx.conn
+            .execute("UPDATE schema_version SET version = ?", [9999])
+            .expect("a schema version this binary cannot serve");
+    }
+
+    let (output, _) = cross_repo_search_impl(&registry, &memory_search("quelli_frast"), &[])
+        .await
+        .expect("search");
+
+    assert!(output.contains("**Not searched (7):**"), "{output}");
+    assert_eq!(
+        output.matches("store schema is v9999").count(),
+        5,
+        "five named, the rest counted: {output}"
+    );
+    assert!(output.contains("…and 2 more"), "{output}");
 }
 
 /// Story 141-2032: a store below a known root must not depend on a client
@@ -298,10 +421,7 @@ async fn a_nested_store_is_discovered_without_being_opened_first() {
         .expect("mtime");
 
     assert!(count >= 1 && output.contains("nested_signal"), "{output}");
-    assert!(
-        output.contains("Searched 2 of 2 discoverable repos"),
-        "{output}"
-    );
+    assert!(output.contains("Searched 2 of 2 known repos"), "{output}");
     assert_eq!(
         before, after,
         "discovery and read-only search must not mutate the store"

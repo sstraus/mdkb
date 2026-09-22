@@ -1597,11 +1597,23 @@ pub async fn search_impl(
 /// handle inserted by any other path is reachable by `root="*"` rather than
 /// invisible. Reading the handle table does not `touch()` it, so LRU recency is
 /// unchanged.
+/// What a `root` selector resolved to, and what it resolved against.
+///
+/// `known` is the denominator: `roots` is only what the selector picked, and
+/// reporting "2 of 2" for a two-item list is the same false confidence the
+/// coverage footer exists to destroy.
+#[derive(Debug)]
+pub struct ResolvedRoots {
+    pub selector: RootSelector,
+    pub roots: Vec<std::path::PathBuf>,
+    pub known: usize,
+}
+
 pub fn resolve_root_selector(
     registry: &RepoRegistry,
     root: Option<&str>,
     scope: &[std::path::PathBuf],
-) -> Result<(RootSelector, Vec<std::path::PathBuf>), McpError> {
+) -> Result<ResolvedRoots, McpError> {
     let selector = RootSelector::parse(root).map_err(mcp_error)?;
     let open: Vec<std::path::PathBuf> = registry
         .all_handles()
@@ -1633,7 +1645,11 @@ pub fn resolve_root_selector(
         open
     };
     let roots = selector.resolve(&known, &open).map_err(mcp_error)?;
-    Ok((selector, roots))
+    Ok(ResolvedRoots {
+        selector,
+        roots,
+        known: known.len(),
+    })
 }
 
 /// The one repo a tool that cannot fan out means, or the reason it has none.
@@ -1654,7 +1670,9 @@ pub fn resolve_single_root(
     root: Option<&str>,
     scope: &[std::path::PathBuf],
 ) -> Result<std::path::PathBuf, McpError> {
-    let (selector, roots) = resolve_root_selector(registry, root, scope)?;
+    let ResolvedRoots {
+        selector, roots, ..
+    } = resolve_root_selector(registry, root, scope)?;
     if selector == RootSelector::All {
         return Err(mcp_error(RootSelector::wildcard_rejection()));
     }
@@ -1707,32 +1725,77 @@ struct RepoOutcome {
     no_collections: bool,
 }
 
-/// The coverage footer: what was read, out of what is known, and what was not.
+/// How many paths a footer list may name before it says "and N more".
+///
+/// Every path here is charged on the turn, and on a "no results" answer it is
+/// charged for nothing. `resolve_handle` caps its list at the same number for
+/// the same reason.
+const COVERAGE_SHOWN: usize = 5;
+
+/// One footer list: the caller's header, then at most [`COVERAGE_SHOWN`] lines.
+fn format_coverage_list(header: &str, lines: &[String]) -> String {
+    let mut out = format!("**{header}:**\n");
+    for line in lines.iter().take(COVERAGE_SHOWN) {
+        out.push_str(&format!("- {line}\n"));
+    }
+    let more = lines.len().saturating_sub(COVERAGE_SHOWN);
+    if more > 0 {
+        out.push_str(&format!("- …and {more} more\n"));
+    }
+    out
+}
+
+/// The coverage footer: what was read, out of what, and what was not.
 ///
 /// Always emitted, including when every repo was searched. The denominator is
 /// what makes an empty result readable — without it, a reader cannot tell a
 /// query that matched nothing from a fan-out that only looked at one repo.
+///
+/// The sentence is worded from the selector, because the selector decides what
+/// "all" means. `*` is every repo the daemon knows, so its denominator IS the
+/// total. A list, or a rootless call narrowed to one workspace, is a
+/// deliberately partial selection: reporting it as "2 of 2" reads as complete
+/// coverage, which is the false confidence this footer was added to destroy.
 fn format_cross_repo_coverage(
     searched: usize,
-    known: usize,
+    resolution: &ResolvedRoots,
     skipped: &[(std::path::PathBuf, String)],
     no_collections: &[std::path::PathBuf],
 ) -> String {
-    let mut out = format!("\n_Searched {searched} of {known} discoverable repos._\n");
-    if !skipped.is_empty() {
-        out.push_str(&format!("**Not searched ({}):**\n", skipped.len()));
-        for (root, why) in skipped {
-            out.push_str(&format!("- {} — {why}\n", root.display()));
+    let selected = resolution.roots.len();
+    let known = resolution.known;
+    let headline = match resolution.selector {
+        RootSelector::All => format!("_Searched {searched} of {known} known repos._"),
+        RootSelector::Default => {
+            format!("_Searched {searched} of {selected} repos in this workspace ({known} known)._")
         }
+        RootSelector::List(_) => {
+            format!("_Searched {searched} of {selected} repos named ({known} known)._")
+        }
+    };
+    let mut out = format!("\n{headline}\n");
+    if !skipped.is_empty() {
+        let lines: Vec<String> = skipped
+            .iter()
+            .map(|(root, why)| format!("{} — {why}", root.display()))
+            .collect();
+        out.push_str(&format_coverage_list(
+            &format!("Not searched ({})", lines.len()),
+            &lines,
+        ));
     }
     if !no_collections.is_empty() {
-        out.push_str(&format!(
-            "**No registered collections ({}); run `mdkb update`:**\n",
-            no_collections.len()
+        let lines: Vec<String> = no_collections
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect();
+        out.push_str(&format_coverage_list(
+            &format!(
+                "No registered collections ({}); run `mdkb update`",
+                lines.len()
+            ),
+            &lines,
         ));
-        for root in no_collections {
-            out.push_str(&format!("- {}\n", root.display()));
-        }
     }
     out
 }
@@ -1782,14 +1845,13 @@ pub async fn cross_repo_search_impl(
     // reason it has none: opening happens here, once, so the fan-out below
     // never decides whether a repo is reachable — it only searches what it was
     // handed.
-    let (_, roots) = resolve_root_selector(registry, params.root.as_deref(), client_scope)?;
-    let targets = registry.open_read_only(&roots);
+    let resolution = resolve_root_selector(registry, params.root.as_deref(), client_scope)?;
+    let targets = registry.open_read_only(&resolution.roots);
     if targets.is_empty() {
         return Err(mcp_error(
             "No repos registered. Pass root=\"/abs/path\" to open one, or provide MCP roots/list.",
         ));
     }
-    let known = targets.len();
 
     // Embed ONCE, before the fan-out. The query is the same text for every
     // repo, so embedding inside the per-repo future bought N identical vectors
@@ -1813,15 +1875,26 @@ pub async fn cross_repo_search_impl(
                     return RepoOutcome { root, results: Err(why), no_collections: false };
                 }
             };
-            let no_collections = match crate::store::collections::list_collections(&ctx.conn) {
-                Ok(collections) => collections.is_empty(),
-                Err(e) => {
-                    let why = format!("collection registry could not be read: {e}");
-                    return RepoOutcome {
-                        root,
-                        results: Err(why),
-                        no_collections: false,
-                    };
+            // The probe answers "are there documents to search here", which
+            // is a question about a document query. For `scope="memory"` an
+            // empty document registry says nothing about the answer, so
+            // probing it can only produce a footer line advising `mdkb
+            // update` for a corpus the caller did not ask about — and an
+            // unreadable registry would report the repo as UNSEARCHED for a
+            // memory query that would have succeeded.
+            let no_collections = if matches!(scope, Some(crate::mcp::tools::SearchScope::Memory)) {
+                false
+            } else {
+                match crate::store::collections::list_collections(&ctx.conn) {
+                    Ok(collections) => collections.is_empty(),
+                    Err(e) => {
+                        let why = format!("collection registry could not be read: {e}");
+                        return RepoOutcome {
+                            root,
+                            results: Err(why),
+                            no_collections: false,
+                        };
+                    }
                 }
             };
             // The repo's own config, not the caller's: recall thresholds are a
@@ -1934,7 +2007,7 @@ pub async fn cross_repo_search_impl(
     };
     output.push_str(&format_cross_repo_coverage(
         searched,
-        known,
+        &resolution,
         &skipped,
         &no_collections,
     ));

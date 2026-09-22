@@ -261,6 +261,13 @@ better than one large one: isolation by default, reach on request.</p>
   <text class="ss" x="38" y="284">**Not searched (1):** /…/twitter — schema version too new</text>
 </svg>
 <p class="legend">The coverage footer is always emitted, including when every repo was searched.</p>
+<p>The denominator is what exists, and the sentence is worded from the selector: <code>*</code> reports
+<em>N of M known repos</em>, a list reports <em>N of M repos named (K known)</em>, and a rootless call
+reports <em>N of M repos in this workspace (K known)</em> — so a deliberately partial selection cannot
+read as full coverage. Both path lists stop at five names and then say how many they left out, because
+every path is charged on the turn and on a "no results" answer it is charged for nothing. The
+"no registered collections" notice is a statement about documents, so a <code>scope="memory"</code>
+search neither probes the collection registry nor advises <code>mdkb update</code>.</p>
 
 <h3>The <code>root</code> grammar</h3>
 <table>
