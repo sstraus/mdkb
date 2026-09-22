@@ -3405,7 +3405,7 @@ fn format_graph_relations(
             }
             match applied {
                 Some(a) if a.added.is_empty() => {
-                    println!("--apply: nothing to add, config.toml untouched.")
+                    println!("--apply: nothing to add, config.toml untouched.");
                 }
                 Some(a) => println!(
                     "--apply: added {} to graph.frontmatter_relations.",

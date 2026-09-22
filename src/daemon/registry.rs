@@ -618,7 +618,7 @@ mod tests {
             "nothing is on the map, so walking the map finds nothing"
         );
 
-        let found = registry.discoverable_roots_under(&[workspace.clone()]);
+        let found = registry.discoverable_roots_under(std::slice::from_ref(&workspace));
         assert_eq!(
             found,
             vec![nested.canonicalize().unwrap()],
