@@ -886,8 +886,10 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 /// Restores `PATH` on drop, including if the test panics mid-assertion.
+#[cfg(unix)]
 struct RestorePath(Option<std::ffi::OsString>);
 
+#[cfg(unix)]
 impl Drop for RestorePath {
     fn drop(&mut self) {
         match self.0.take() {
@@ -907,6 +909,10 @@ impl Drop for RestorePath {
 /// appends a line to a counter file, then execs the real binary so the audit
 /// still gets correct answers from it. If the cache were still keyed on the
 /// whole reference string (the bug this story closes), this would count 2.
+/// The spy is a `/bin/sh` script made executable with a unix mode, so the
+/// proof runs where that exists. The caching it proves is not
+/// platform-specific.
+#[cfg(unix)]
 #[test]
 fn a_dead_path_cited_from_two_entries_spawns_git_once() {
     let _lock = env_lock();
