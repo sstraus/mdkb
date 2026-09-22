@@ -605,7 +605,7 @@ mod tests {
         let found = registry.discoverable_roots_under(std::slice::from_ref(&workspace));
         assert_eq!(
             found,
-            vec![nested.canonicalize().unwrap()],
+            vec![crate::domain::canonicalize_plain(&nested).unwrap()],
             "with the workspace in hand, the store below it answers"
         );
     }
@@ -1077,13 +1077,16 @@ mod tests {
 
         let before = RepoRegistry::new(allow_temp_config_with_state(state.path()));
         before.get_or_open(&root).unwrap();
-        assert_eq!(before.known_roots(), vec![root.canonicalize().unwrap()]);
+        assert_eq!(
+            before.known_roots(),
+            vec![crate::domain::canonicalize_plain(&root).unwrap()]
+        );
         drop(before);
 
         let restarted = RepoRegistry::new(allow_temp_config_with_state(state.path()));
         assert_eq!(
             restarted.known_roots(),
-            vec![root.canonicalize().unwrap()],
+            vec![crate::domain::canonicalize_plain(&root).unwrap()],
             "the map is what one daemon leaves behind for the next"
         );
         assert_eq!(
@@ -1142,7 +1145,7 @@ mod tests {
 
         assert_eq!(
             registry.known_roots(),
-            vec![outside.canonicalize().unwrap()],
+            vec![crate::domain::canonicalize_plain(&outside).unwrap()],
             "the root is known"
         );
         let err = registry.get_or_open(&outside).unwrap_err().to_string();
@@ -1186,7 +1189,9 @@ mod tests {
 
         let config_path = state.path().join("daemon.toml");
         let written = format!(
-            "max_active_repos = 4\nwhitelist_dirs = [\"{}\"]\n\n[[repos]]\nroot = \"{}\"\n",
+            // TOML literal strings: a Windows path is full of backslashes, and
+            // `\U` in a basic string is an invalid escape, not a path.
+            "max_active_repos = 4\nwhitelist_dirs = ['{}']\n\n[[repos]]\nroot = '{}'\n",
             std::env::temp_dir().to_string_lossy(),
             configured.to_string_lossy(),
         );
@@ -1197,8 +1202,8 @@ mod tests {
         registry.get_or_open(&opened).unwrap();
 
         let mut expected = vec![
-            configured.canonicalize().unwrap(),
-            opened.canonicalize().unwrap(),
+            crate::domain::canonicalize_plain(&configured).unwrap(),
+            crate::domain::canonicalize_plain(&opened).unwrap(),
         ];
         expected.sort();
         assert_eq!(registry.known_roots(), expected);

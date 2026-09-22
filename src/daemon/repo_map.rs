@@ -479,13 +479,14 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    /// A root that looks like a repo with a store. Returned canonicalized,
-    /// which is the spelling the map stores: a `TempDir` under `/var` on macOS
-    /// is really under `/private/var`.
+    /// A root that looks like a repo with a store. Returned under the key the
+    /// map stores it under: a `TempDir` under `/var` on macOS is really under
+    /// `/private/var`, and on Windows `canonicalize` alone would add the `\\?\`
+    /// prefix the map strips.
     fn make_repo(parent: &Path, name: &str) -> PathBuf {
         let root = parent.join(name);
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
-        root.canonicalize().unwrap()
+        canonical_key(&root)
     }
 
     fn entries(roots: &[&Path]) -> Vec<RepoEntry> {
