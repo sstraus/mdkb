@@ -33,7 +33,7 @@ use crate::watcher::{FileWatcher, WatcherConfig};
 use super::tools::{
     CodeGraphParams, GetParams, GraphParams, MemoryConfirmParams, MemoryDeleteParams,
     MemoryListParams, MemoryWriteBatchParams, MemoryWriteParams, RootSelector, SearchParams,
-    UsageParams,
+    SearchScope, UsageParams,
 };
 
 /// Create an MCP error from a message.
@@ -284,6 +284,20 @@ impl McpServer {
             self.ensure_context().await?;
             Ok(Arc::clone(handle))
         }
+    }
+
+    /// Declare the client's workspace scope, the way `roots/list` does.
+    ///
+    /// Production reaches this through [`sync_roots_from_peer`], which needs a
+    /// live MCP peer. Nothing else could set it, so every test in the suite
+    /// passed an empty scope and the scope-dependent behaviour — which repos a
+    /// `root`-less call means — had no test at any level. Test-only: the
+    /// assignment is the same one the peer path makes.
+    ///
+    /// [`sync_roots_from_peer`]: Self::sync_roots_from_peer
+    #[cfg(test)]
+    async fn declare_client_roots(&self, roots: Vec<PathBuf>) {
+        *self.client_roots.lock().await = roots;
     }
 
     /// Initialize database context on a RepoHandle (global mode).
@@ -591,8 +605,22 @@ impl McpServer {
         if RootSelector::parse(params.root.as_deref()).map_err(mcp_error)? == RootSelector::All {
             return self.cross_repo_search(&params).await;
         }
-        // A list naming more than one repo fans out too.
-        if let Some(registry) = &self.registry {
+        // A list naming more than one repo fans out too — but only for a
+        // scope that HAS a cross-repo answer. A rootless call from a workspace
+        // holding nested stores resolves to several repos, so deciding on the
+        // count alone sent `scope="code"` to a fan-out that refuses it, and
+        // told a caller who had named no root to name one. Those scopes take
+        // the single-target path instead, where the declared workspace anchors
+        // the call. An explicit `*` or a named list with such a scope is still
+        // refused: that contradiction is the caller's, and it is stated.
+        let fans_out = params
+            .scope
+            .as_deref()
+            .map(SearchScope::try_from)
+            .transpose()
+            .map_err(|()| mcp_error("Invalid search scope"))?
+            .is_none_or(SearchScope::fans_out);
+        if fans_out && let Some(registry) = &self.registry {
             let resolved = super::dispatch::resolve_root_selector(
                 registry,
                 params.root.as_deref(),
@@ -4362,6 +4390,95 @@ if (require.main === module) {
             text.contains(&tmp1.path().display().to_string())
                 || text.contains(&tmp2.path().display().to_string()),
             "must name the roots it means: {text}"
+        );
+    }
+
+    /// A scope that has no cross-repo answer must not be sent to the fan-out
+    /// just because the selector happened to resolve to several repos.
+    ///
+    /// A `root`-less call from a workspace holding nested stores resolves to
+    /// all of them, so deciding on that count alone answered `scope="code"`
+    /// with "Specify a root" — to a caller who had named no root, and whose
+    /// declared workspace was itself a store that `get` would have anchored
+    /// to from the same position.
+    #[tokio::test]
+    async fn a_rootless_search_with_a_per_repo_scope_anchors_to_the_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let nested = workspace.join("nested");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&nested).unwrap();
+
+        let registry = Arc::new(RepoRegistry::new(global_test_config()));
+        registry.get_or_open(&workspace).unwrap();
+        registry.get_or_open(&nested).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+
+        let server = McpServer::global(Arc::clone(&registry));
+        server.declare_client_roots(vec![workspace.clone()]).await;
+
+        let result = server
+            .search(Parameters(SearchParams {
+                query: "anything".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("code".to_string()),
+                kind: None,
+                file: None,
+                min_confidence: None,
+                since: None,
+                threshold: None,
+                root: None,
+            }))
+            .await;
+
+        let text = match result {
+            Ok(_) => String::new(),
+            Err(e) => format!("{e:?}"),
+        };
+        assert!(
+            !text.contains("Cross-repo search is not supported"),
+            "the call named no root, so it must anchor rather than demand one: {text}"
+        );
+        assert!(
+            !text.contains("repos are in scope"),
+            "the declared workspace is itself a store and is the answer: {text}"
+        );
+    }
+
+    /// An explicit `*` with a per-repo scope is a contradiction the caller
+    /// stated, and it is still refused as one.
+    #[tokio::test]
+    async fn an_explicit_wildcard_with_a_per_repo_scope_is_still_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(root.join(".mdkb")).unwrap();
+
+        let registry = Arc::new(RepoRegistry::new(global_test_config()));
+        registry.get_or_open(&root).unwrap();
+
+        let server = McpServer::global(registry);
+        let err = server
+            .search(Parameters(SearchParams {
+                query: "anything".to_string(),
+                limit: 10,
+                collection: None,
+                include_superseded: false,
+                scope: Some("code".to_string()),
+                kind: None,
+                file: None,
+                min_confidence: None,
+                since: None,
+                threshold: None,
+                root: Some("*".to_string()),
+            }))
+            .await
+            .expect_err("a wildcard code search has no answer");
+
+        assert!(
+            format!("{err:?}").contains("Cross-repo search is not supported"),
+            "{err:?}"
         );
     }
 

@@ -298,7 +298,7 @@ told apart syntactically, before anything is looked up, so a repo name can never
   <tr><td>Coverage is stated</td>
       <td>Without the denominator, "no results" means both "nothing matched" and "never looked".</td></tr>
   <tr><td>Only <code>search</code> fans out</td>
-      <td>Code, symbols and duplicate indexes are per-repo. Those scopes are rejected with a message that asks for a root.</td></tr>
+      <td>Code, symbols and duplicate indexes are per-repo, so only <code>docs</code> and <code>memory</code> have a cross-repository answer. A <code>root</code>-less search with one of the others anchors to the declared workspace instead, the way a single-target tool does; an explicit <code>*</code> or a named list with one of them is refused, because that contradiction is the caller's.</td></tr>
   <tr><td>An omitted scope means both</td>
       <td>No <code>scope</code> searches documents <em>and</em> memory, the same as against one repository. The fan-out used to read an omitted scope as "documents", so half the answer went missing without being mentioned.</td></tr>
   <tr><td>The CLI stays local</td>

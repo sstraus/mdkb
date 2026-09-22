@@ -269,6 +269,22 @@ impl SearchScope {
         Self::Duplicates,
     ];
 
+    /// Can this scope be answered across several repos at once?
+    ///
+    /// Code, symbol and duplication indexes are per-repo: there is no merged
+    /// answer to give, which is why the fan-out refuses them. Documents and
+    /// memory merge on score and have one.
+    ///
+    /// Asked BEFORE the fan-out is chosen, not inside it. A rootless call from
+    /// a workspace holding nested stores resolves to several repos, and
+    /// choosing the fan-out on that count alone turned `scope="code"` into
+    /// "Specify a root" for a caller who had named no root and whose declared
+    /// workspace was itself a store — while `get` from the same place
+    /// anchored to that workspace and answered.
+    pub const fn fans_out(self) -> bool {
+        matches!(self, Self::Docs | Self::Memory)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Docs => "docs",

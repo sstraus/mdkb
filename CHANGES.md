@@ -19,6 +19,18 @@
 
 ### Fixed
 
+- **A `root`-less search with a per-repository scope anchors instead of
+  refusing.** `search` chose the fan-out whenever the selector resolved to
+  more than one repository, before looking at the scope — and a `root`-less
+  call from a workspace holding nested stores resolves to all of them. So
+  `scope="code"` was answered with "Specify a root", to a caller who had named
+  no root and whose declared workspace was itself a store that `get` would
+  have anchored to from the same position. Only `docs` and `memory` have a
+  cross-repository answer; the others now take the single-target path. An
+  explicit `*` or a named list with such a scope is still refused, because
+  that contradiction is the caller's. Found by the maintainer's 2026-09-21
+  fleet audit.
+
 - **A cross-repository search with no `scope` searches memory again.** `scope`
   is documented as "omit to search docs+memory", and a search against one
   repository has always done both. The fan-out read an omitted scope as
