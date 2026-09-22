@@ -1856,8 +1856,16 @@ fn search_one_repo(
     let repo_tag = root.display().to_string();
     let mut repo_results: Vec<SearchResult> = Vec::new();
 
-    match scope {
-        Some(crate::mcp::tools::SearchScope::Docs) | None => {
+    // Two independent gates, not a match: an omitted scope means BOTH, the way
+    // `SearchParams` documents it and the way single-repo `search_impl` has
+    // always behaved. Collapsing `None` into the document arm made a
+    // cross-repo call with no scope return documents only, silently, while the
+    // same call against one repo returned documents and memory.
+    let wants_docs = matches!(scope, Some(crate::mcp::tools::SearchScope::Docs) | None);
+    let wants_memory = matches!(scope, Some(crate::mcp::tools::SearchScope::Memory) | None);
+
+    if wants_docs {
+        {
             match hybrid_search_fts(
                 &ctx,
                 fts_query,
@@ -1883,7 +1891,9 @@ fn search_one_repo(
                 }
             }
         }
-        Some(crate::mcp::tools::SearchScope::Memory) => {
+    }
+    if wants_memory {
+        {
             match memory::search_entries_recall(
                 &ctx.conn,
                 &params.query,
@@ -1907,7 +1917,7 @@ fn search_one_repo(
                             snippets: vec![text],
                             status: None,
                             superseded_by: None,
-                            repo_root: Some(repo_tag),
+                            repo_root: Some(repo_tag.clone()),
                         };
                         if let Some(e) = entries.first() {
                             pseudo.path.clone_from(&e.id);
@@ -1927,8 +1937,6 @@ fn search_one_repo(
                 }
             }
         }
-        // Rejected above: code/symbols/duplicates never reach the fan-out.
-        _ => {}
     }
 
     RepoOutcome {

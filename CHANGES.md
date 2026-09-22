@@ -19,6 +19,14 @@
 
 ### Fixed
 
+- **A cross-repository search with no `scope` searches memory again.** `scope`
+  is documented as "omit to search docs+memory", and a search against one
+  repository has always done both. The fan-out read an omitted scope as
+  "documents", so a cross-repository call returned documents only and said
+  nothing about the half it had skipped — the same parameter meaning two
+  different things on two code paths. Found by a second opinion on an
+  unrelated concurrency question, not by the review.
+
 - **The cross-repository fan-out runs off the runtime, and opens one store at
   a time.** Each repo's search was an `async` block containing no `.await`, so
   `join_all` polled every one of them to completion in order: the repos were

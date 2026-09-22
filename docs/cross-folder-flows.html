@@ -299,6 +299,8 @@ told apart syntactically, before anything is looked up, so a repo name can never
       <td>Without the denominator, "no results" means both "nothing matched" and "never looked".</td></tr>
   <tr><td>Only <code>search</code> fans out</td>
       <td>Code, symbols and duplicate indexes are per-repo. Those scopes are rejected with a message that asks for a root.</td></tr>
+  <tr><td>An omitted scope means both</td>
+      <td>No <code>scope</code> searches documents <em>and</em> memory, the same as against one repository. The fan-out used to read an omitted scope as "documents", so half the answer went missing without being mentioned.</td></tr>
   <tr><td>The CLI stays local</td>
       <td><code>root</code> is an MCP parameter. The CLI always works in the current repo.</td></tr>
 </table>

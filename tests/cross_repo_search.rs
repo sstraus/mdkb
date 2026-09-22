@@ -548,3 +548,43 @@ fn two_declared_workspaces_that_are_both_stores_stay_ambiguous() {
         "{refusal}"
     );
 }
+
+/// An omitted scope means documents AND memory, across repos as within one.
+///
+/// `SearchParams` documents `scope` as "omit to search docs+memory", and
+/// single-repo `search_impl` has always had a `None` arm that does both. The
+/// fan-out collapsed `None` into the document arm, so the same call across
+/// repos returned documents only — and said nothing about the half it skipped.
+#[tokio::test]
+async fn an_omitted_scope_searches_documents_and_memory() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let root = repo_with_entry(repos.path(), "both", "zonk_harvest");
+    std::fs::write(
+        root.join("doc.md"),
+        "# Quelli frast\n\nA document about quelli_frast, indexed so the document leg has something to match.\n",
+    )
+    .expect("write doc");
+    let update = std::process::Command::new(env!("CARGO_BIN_EXE_mdkb"))
+        .arg("update")
+        .current_dir(&root)
+        .env("MDKB_NO_DAEMON", "1")
+        .output()
+        .expect("run update");
+    assert!(update.status.success(), "update failed: {update:?}");
+
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
+    registry.get_or_open(&root).expect("open");
+
+    let mut params = memory_search("zonk_harvest");
+    params.scope = None;
+    let (output, count) = cross_repo_search_impl(&registry, &params, &[])
+        .await
+        .expect("search");
+
+    assert!(count >= 1, "the memory half must answer: {output}");
+    assert!(
+        output.contains("zonk_harvest"),
+        "the memory entry is the half the document leg cannot supply: {output}"
+    );
+}
