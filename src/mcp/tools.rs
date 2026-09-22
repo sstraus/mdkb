@@ -1010,13 +1010,24 @@ mod tests {
         );
     }
 
+    /// A path a term is told from a name by: `Path::is_absolute`, which on
+    /// Windows wants a drive — a rooted `/a/b` there is a name, not a path.
+    #[cfg(windows)]
+    const ABS_A: &str = r"C:\a\b";
+    #[cfg(windows)]
+    const ABS_B: &str = r"C:\c\d";
+    #[cfg(not(windows))]
+    const ABS_A: &str = "/a/b";
+    #[cfg(not(windows))]
+    const ABS_B: &str = "/c/d";
+
     #[test]
     fn only_the_selectors_that_can_change_answer_pay_for_discovery() {
         // An explicit path is itself: `resolve_term` returns it without ever
         // reading the known set, so the walk cannot change the result.
-        assert!(!RootSelector::parse(Some("/a/b")).unwrap().needs_discovery());
+        assert!(!RootSelector::parse(Some(ABS_A)).unwrap().needs_discovery());
         assert!(
-            !RootSelector::parse(Some("/a/b,/c/d"))
+            !RootSelector::parse(Some(&format!("{ABS_A},{ABS_B}")))
                 .unwrap()
                 .needs_discovery()
         );
@@ -1024,7 +1035,7 @@ mod tests {
         // recorded is findable only by the walk.
         assert!(RootSelector::parse(Some("mdkb")).unwrap().needs_discovery());
         assert!(
-            RootSelector::parse(Some("/a/b,mdkb"))
+            RootSelector::parse(Some(&format!("{ABS_A},mdkb")))
                 .unwrap()
                 .needs_discovery(),
             "one name in the list is enough"

@@ -766,13 +766,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("repos.json");
         let existing = make_repo(tmp.path(), "alpha");
+        // Built with `serde_json`, not `format!`: a Windows root is full of
+        // backslashes, and a hand-written `"C:\Users\..."` is not the JSON
+        // escape of that path — the map would read nothing and the test would
+        // prove nothing.
         std::fs::write(
             &path,
-            format!(
-                r#"{{"version": {}, "repos": [{{"root": "{}"}}]}}"#,
-                FORMAT_VERSION + 1,
-                existing.display()
-            ),
+            serde_json::json!({
+                "version": FORMAT_VERSION + 1,
+                "repos": [{ "root": existing.to_string_lossy() }],
+            })
+            .to_string(),
         )
         .unwrap();
         let before = std::fs::read_to_string(&path).unwrap();

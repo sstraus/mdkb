@@ -4355,7 +4355,10 @@ if (require.main === module) {
         let server = McpServer::global(Arc::clone(&registry));
         // No root param, 1 root registered → auto-selects
         let handle = server.resolve_handle(None).await.unwrap();
-        assert_eq!(handle.root, root.canonicalize().unwrap());
+        assert_eq!(
+            handle.root,
+            crate::domain::canonicalize_plain(&root).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -4425,7 +4428,7 @@ if (require.main === module) {
         let registry = Arc::new(RepoRegistry::new(global_test_config()));
         registry.get_or_open(&workspace).unwrap();
         registry.get_or_open(&nested).unwrap();
-        let workspace = workspace.canonicalize().unwrap();
+        let workspace = crate::domain::canonicalize_plain(&workspace).unwrap();
 
         let server = McpServer::global(Arc::clone(&registry));
         server.declare_client_roots(vec![workspace.clone()]).await;
@@ -4512,7 +4515,10 @@ if (require.main === module) {
             .resolve_handle(Some(tmp2.path().to_str().unwrap()))
             .await
             .unwrap();
-        assert_eq!(handle.root, tmp2.path().canonicalize().unwrap());
+        assert_eq!(
+            handle.root,
+            crate::domain::canonicalize_plain(tmp2.path()).unwrap()
+        );
     }
 
     #[tokio::test]

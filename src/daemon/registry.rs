@@ -541,7 +541,9 @@ fn spawn_watcher_for_handle(handle: &Arc<RepoHandle>) {
 /// so that all worktrees of the same repo share a single `.mdkb/` directory.
 fn canonicalize_root(root: &Path) -> Result<PathBuf> {
     let resolved = crate::git::resolve_main_worktree(root);
-    resolved.canonicalize().map_err(|e| {
+    // Plain, not `\\?\C:\...`: the same key `repo_map::canonical_key` writes,
+    // and the spelling the MCP "Specify root" error hands back to the caller.
+    crate::domain::canonicalize_plain(&resolved).map_err(|e| {
         Error::other(format!(
             "Failed to resolve repo path {}: {e}",
             resolved.display()
@@ -734,7 +736,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = make_repo(&tmp);
         let handle = RepoHandle::open(&root, &toml::Table::new()).unwrap();
-        assert_eq!(handle.root, root.canonicalize().unwrap());
+        assert_eq!(
+            handle.root,
+            crate::domain::canonicalize_plain(&root).unwrap()
+        );
     }
 
     #[test]
@@ -781,7 +786,10 @@ mod tests {
         let registry = RepoRegistry::new(allow_temp_config());
 
         let handle = registry.get_or_open(&root).unwrap();
-        assert_eq!(handle.root, root.canonicalize().unwrap());
+        assert_eq!(
+            handle.root,
+            crate::domain::canonicalize_plain(&root).unwrap()
+        );
         assert_eq!(registry.active_count(), 1);
 
         // Second call returns same handle
@@ -861,7 +869,10 @@ mod tests {
         registry.get_or_open(&root).unwrap();
         let entries = registry.list();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, root.canonicalize().unwrap());
+        assert_eq!(
+            entries[0].0,
+            crate::domain::canonicalize_plain(&root).unwrap()
+        );
     }
 
     #[test]
@@ -1225,7 +1236,7 @@ mod tests {
         registry.get_or_open(&root).unwrap();
 
         // Access with canonicalized path should return same handle
-        let canonical = root.canonicalize().unwrap();
+        let canonical = crate::domain::canonicalize_plain(&root).unwrap();
         assert!(registry.get(&canonical).is_some());
     }
 
@@ -1254,7 +1265,10 @@ mod tests {
 
         // Opening via worktree should resolve to main repo
         let handle = registry.get_or_open(&wt_root).unwrap();
-        assert_eq!(handle.root, main_root.canonicalize().unwrap());
+        assert_eq!(
+            handle.root,
+            crate::domain::canonicalize_plain(&main_root).unwrap()
+        );
 
         // Opening via main root returns the same handle
         let handle2 = registry.get_or_open(&main_root).unwrap();
