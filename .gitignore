@@ -24,3 +24,4 @@ marketing/
 mutants.out/
 .cargo/
 .agents/
+.mdkb/**
