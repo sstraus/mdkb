@@ -123,8 +123,6 @@ impl RootSelector {
             .collect())
     }
 
-    /// What a tool that cannot fan out says about a selector naming `count`
-    /// repos. Names the tool that CAN, the way the old `root="*"` message did.
     /// Why a tool that reads one repo refuses `*`.
     ///
     /// Distinct from [`Self::multi_root_rejection`]: `*` is refused for what it
@@ -156,6 +154,12 @@ impl RootSelector {
         }
     }
 
+    /// What a tool that cannot fan out says about a selector naming `count`
+    /// repos. Names the tool that CAN, the way the old `root="*"` message did.
+    ///
+    /// The count is in the message because the caller's next move depends on
+    /// it: a selector that named two repos is a typo to correct, one that
+    /// named thirty is a workspace to narrow.
     pub fn multi_root_rejection(count: usize) -> String {
         format!(
             "This root selector names {count} repos, and only `search` fans out across \

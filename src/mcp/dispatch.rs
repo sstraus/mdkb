@@ -1669,9 +1669,22 @@ pub fn resolve_single_root(
     root: Option<&str>,
     scope: &[std::path::PathBuf],
 ) -> Result<std::path::PathBuf, McpError> {
+    single_root(resolve_root_selector(registry, root, scope)?, scope)
+}
+
+/// The same choice, made from a resolution the caller already has.
+///
+/// `search` resolves the selector itself to decide whether to fan out. Calling
+/// [`resolve_single_root`] afterwards resolved it a second time, and the two
+/// resolutions read the registry at different instants: a repo registered
+/// between them changed the answer under a caller who had asked once.
+pub fn single_root(
+    resolution: ResolvedRoots,
+    scope: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, McpError> {
     let ResolvedRoots {
         selector, roots, ..
-    } = resolve_root_selector(registry, root, scope)?;
+    } = resolution;
     if selector == RootSelector::All {
         return Err(mcp_error(RootSelector::wildcard_rejection()));
     }

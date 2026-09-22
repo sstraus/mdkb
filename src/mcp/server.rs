@@ -270,11 +270,7 @@ impl McpServer {
         if let Some(registry) = &self.registry {
             let scope = self.client_roots.lock().await.clone();
             let root = super::dispatch::resolve_single_root(registry, root, &scope)?;
-            let handle = registry
-                .get_or_open(&root)
-                .map_err(|e| mcp_error(format!("{e}")))?;
-            Self::ensure_handle_context(&handle).await?;
-            Ok(handle)
+            Self::mount(registry, &root).await
         } else {
             // Standalone mode: use cached handle that shares self's Arcs
             let handle = self
@@ -284,6 +280,19 @@ impl McpServer {
             self.ensure_context().await?;
             Ok(Arc::clone(handle))
         }
+    }
+
+    /// Mount a root that is already chosen, with its context ready.
+    ///
+    /// Split out so a caller that has already resolved the selector — `search`,
+    /// which must resolve it to decide whether to fan out — does not resolve it
+    /// a second time to get the handle.
+    async fn mount(registry: &RepoRegistry, root: &Path) -> Result<Arc<RepoHandle>, McpError> {
+        let handle = registry
+            .get_or_open(root)
+            .map_err(|e| mcp_error(format!("{e}")))?;
+        Self::ensure_handle_context(&handle).await?;
+        Ok(handle)
     }
 
     /// Declare the client's workspace scope, the way `roots/list` does.
@@ -620,18 +629,22 @@ impl McpServer {
             .transpose()
             .map_err(|()| mcp_error("Invalid search scope"))?
             .is_none_or(SearchScope::fans_out);
-        if fans_out && let Some(registry) = &self.registry {
-            let resolved = super::dispatch::resolve_root_selector(
-                registry,
-                params.root.as_deref(),
-                &self.client_roots.lock().await.clone(),
-            )?;
+        let handle = if let (true, Some(registry)) = (fans_out, &self.registry) {
+            let scope = self.client_roots.lock().await.clone();
+            let resolved =
+                super::dispatch::resolve_root_selector(registry, params.root.as_deref(), &scope)?;
             if resolved.roots.len() > 1 {
                 return self.cross_repo_search(&params).await;
             }
-        }
-
-        let handle = self.resolve_handle(params.root.as_deref()).await?;
+            // The same resolution that decided against the fan-out picks the
+            // repo. Asking again would read the registry at a second instant,
+            // so a repo registered in between would change the answer under a
+            // caller who asked once.
+            let root = super::dispatch::single_root(resolved, &scope)?;
+            Self::mount(registry, &root).await?
+        } else {
+            self.resolve_handle(params.root.as_deref()).await?
+        };
         let (output, result_count) = super::dispatch::search_impl(&handle, &params).await?;
 
         let tokens = count_tokens(&output);
