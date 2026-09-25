@@ -387,6 +387,39 @@ fn indexing_one_named_file_builds_its_frontmatter_edges() {
     assert_eq!(again, found, "a second save is idempotent on both kinds");
 }
 
+#[cfg(unix)]
+#[test]
+fn targeted_index_rejects_a_symlink_to_a_file_outside_the_root() {
+    let env = Env::new();
+    let outside = tempfile::tempdir().expect("outside tempdir");
+    let target = outside.path().join("secret.md");
+    std::fs::write(&target, "outside the project").expect("outside file");
+    std::os::unix::fs::symlink(&target, env.root.join("docs/link.md")).expect("symlink");
+
+    let result = handle_update_files(&env.ctx, &env.root, &["docs/link.md".to_string()])
+        .expect("targeted update");
+
+    assert_eq!(result.added, 0);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.contains("escapes root directory")),
+        "a canonical path outside the root must be reported: {:?}",
+        result.errors
+    );
+    let stored: i64 = env
+        .ctx
+        .conn
+        .query_row(
+            "SELECT count(*) FROM documents WHERE relative_path = 'link.md'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("document count");
+    assert_eq!(stored, 0, "an outside file must not enter the index");
+}
+
 /// Write a live `[graph]` section on top of the shipped commented config.
 fn set_graph_config(root: &std::path::Path, body: &str) {
     let path = root.join(".mdkb/config.toml");

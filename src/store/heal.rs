@@ -1504,6 +1504,33 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "defect: 171-8ee1"]
+    fn a_successful_collision_copy_does_not_authorize_deleting_an_unsalvaged_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_i64;
+        let stamp = now - (QUARANTINE_RETENTION.as_secs() as i64 + 1);
+        let salvaged = dir.path().join(format!("index.sqlite.corrupt-{stamp}"));
+        let unsalvaged = dir.path().join(format!("index.sqlite.corrupt-{stamp}-1"));
+        std::fs::write(&salvaged, b"salvaged copy").unwrap();
+        std::fs::write(&unsalvaged, b"only remaining memory copy").unwrap();
+        std::fs::write(
+            report_path(&salvaged),
+            format!(
+                r#"{{"corrupt_file":"index.sqlite.corrupt-{stamp}","quarantined_at":{stamp},"memory_entries_salvaged":0,"memory_edges_salvaged":0,"salvage_succeeded":true}}"#
+            ),
+        )
+        .unwrap();
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+
+        assert!(!salvaged.exists(), "the reported copy is safe to remove");
+        assert!(
+            unsalvaged.exists(),
+            "one successful report must not authorize deleting a different copy"
+        );
+    }
+
+    #[test]
     fn a_copy_one_second_past_the_retention_is_deleted() {
         let dir = tempfile::tempdir().unwrap();
         let (corrupt, now) = quarantine_aged(dir.path(), QUARANTINE_RETENTION.as_secs() as i64 + 1);

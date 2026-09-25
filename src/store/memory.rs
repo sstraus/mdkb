@@ -4632,6 +4632,45 @@ mod tests {
         assert_eq!(entry.id, "writer-lock");
     }
 
+    #[test]
+    #[ignore = "defect: 172-e3c6"]
+    fn an_archive_larger_than_the_fetch_window_does_not_hide_a_live_duplicate() {
+        use crate::store::vectors;
+        let conn = setup_db_with_vectors();
+
+        for n in 0..NEAR_DUPLICATE_FETCH {
+            let id = format!("archived-{n}");
+            let mut entry = typed_entry(&id, &format!("Archived {n}"), "old", EntryType::Decision);
+            entry.status = EntryStatus::Archived;
+            add_entry(&conn, &entry).unwrap();
+            let rowid = get_rowid(&conn, &id).unwrap().unwrap();
+            vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.30), "test").unwrap();
+        }
+
+        let live = typed_entry(
+            "writer-lock",
+            "One writer, many readers",
+            "Serialise every mutation.",
+            EntryType::Decision,
+        );
+        add_entry(&conn, &live).unwrap();
+        let rowid = get_rowid(&conn, "writer-lock").unwrap().unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.3010), "test").unwrap();
+
+        let found = find_duplicate(
+            &conn,
+            "single-writer",
+            "Another title entirely",
+            Some(&test_embedding(0.30)),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(&found, Some(Duplicate::Meaning { entry, .. }) if entry.id == "writer-lock"),
+            "a live duplicate must remain visible beyond archived neighbours: {found:?}"
+        );
+    }
+
     /// `--entry-type` narrows the corpus; it must not switch search engines.
     ///
     /// The CLI used to answer a typed query with token-AND BM25 and no vector
