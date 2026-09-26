@@ -55,10 +55,33 @@ fn is_correction(text: &str) -> bool {
         .any(|w| CORRECTION_WORDS.contains(&w))
 }
 
+/// Transcript user records can also carry text injected by Claude's hooks.
+/// These anchored headers identify that text without rejecting a real user who
+/// discusses a hook message later in their own sentence.
+pub fn is_hook_generated_prompt(text: &str) -> bool {
+    let lower = text.trim_start().to_ascii_lowercase();
+    lower.starts_with("stop hook violation:")
+        || lower.starts_with("stop hook feedback:")
+        || lower.starts_with("<system-reminder>")
+}
+
+/// A prompt matcher should never target a synthetic header, even when the
+/// model includes some surrounding words in its `prompt_contains` selector.
+pub fn contains_hook_generated_marker(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("stop hook violation")
+        || lower.contains("stop hook feedback")
+        || lower.contains("<system-reminder>")
+}
+
 /// Detect whether an episode is a distillation candidate. `None` = skip (no LLM).
 pub fn detect_candidate(ep: &Episode) -> Option<CandidateSignal> {
     let error_fixed = !ep.errors.is_empty() && ep.had_corrective_action && ep.ended_clean;
-    let correction_text = ep.user_messages.iter().find(|m| is_correction(m)).cloned();
+    let correction_text = ep
+        .user_messages
+        .iter()
+        .find(|m| !is_hook_generated_prompt(m) && is_correction(m))
+        .cloned();
 
     if !error_fixed && correction_text.is_none() {
         return None;
@@ -179,5 +202,61 @@ mod tests {
         assert!(!is_correction("I know this looks fine, note the change"));
         assert!(is_correction("no, use ripgrep"));
         assert!(is_correction("next time prefer the generator"));
+    }
+
+    #[test]
+    fn hook_feedback_and_system_reminders_do_not_become_user_corrections() {
+        for synthetic in [
+            "STOP HOOK VIOLATION: do not ask again; continue the settled work.",
+            "Stop hook feedback: remember to finish the task before asking.",
+            "<system-reminder>Do not ask unless a real user choice blocks progress.</system-reminder>",
+        ] {
+            let ep = Episode {
+                user_messages: vec![synthetic.into()],
+                ..Episode::default()
+            };
+            assert!(
+                detect_candidate(&ep).is_none(),
+                "synthetic prompt: {synthetic}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_real_correction_survives_adjacent_hook_feedback() {
+        let correction = "No, update the generator instead of the generated file.";
+        let ep = Episode {
+            user_messages: vec![
+                "STOP HOOK VIOLATION: do not ask again.".into(),
+                correction.into(),
+            ],
+            ..Episode::default()
+        };
+        assert_eq!(
+            detect_candidate(&ep).unwrap().correction_text.as_deref(),
+            Some(correction)
+        );
+
+        let quoted = Episode {
+            user_messages: vec![
+                "No, document what STOP HOOK VIOLATION means for the operator.".into(),
+            ],
+            ..Episode::default()
+        };
+        assert!(
+            detect_candidate(&quoted).is_some(),
+            "a user's quotation is still user input"
+        );
+
+        let prose = Episode {
+            user_messages: vec![
+                "Stop hook feedback is wrong here; fix the reported behavior.".into(),
+            ],
+            ..Episode::default()
+        };
+        assert!(
+            detect_candidate(&prose).is_some(),
+            "ordinary user prose is still user input"
+        );
     }
 }

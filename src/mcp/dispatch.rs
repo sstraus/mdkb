@@ -4592,9 +4592,7 @@ fn graph_neighbor_cosine(blob: &[u8], query: &[f32]) -> Option<f32> {
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
-    if vector.iter().all(|value| *value == 0.0)
-        || query.iter().all(|value| *value == 0.0)
-    {
+    if vector.iter().all(|value| *value == 0.0) || query.iter().all(|value| *value == 0.0) {
         return None;
     }
     let score = crate::llm::embeddings::cosine_similarity(&vector, query);
@@ -5397,7 +5395,7 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
 enum MiningOutcome {
     /// The cheap detector turned the episode down — no LLM call was made. The
     /// common case by far: most sessions teach nothing.
-    Gated,
+    Gated(Option<&'static str>),
     /// A validated prior was integrated, and its cluster has not yet recurred
     /// across enough distinct sessions to be promoted.
     Distilled,
@@ -5415,7 +5413,7 @@ enum MiningOutcome {
 impl MiningOutcome {
     fn label(&self) -> &'static str {
         match self {
-            Self::Gated => "gated",
+            Self::Gated(_) => "gated",
             Self::Distilled => "distilled",
             Self::Promoted => "promoted",
             Self::Rejected(_) => "rejected",
@@ -5425,7 +5423,8 @@ impl MiningOutcome {
 
     fn reason(&self) -> Option<&str> {
         match self {
-            Self::Gated | Self::Distilled | Self::Promoted => None,
+            Self::Gated(reason) => *reason,
+            Self::Distilled | Self::Promoted => None,
             Self::Rejected(r) | Self::Failed(r) => Some(r),
         }
     }
@@ -5503,7 +5502,12 @@ async fn mine_episode_inner(
     let episode = parse_episode(&window);
     let Some(sig) = detect_candidate(&episode) else {
         // The cheap gate: most episodes teach nothing, no LLM call.
-        return MiningOutcome::Gated;
+        let reason = episode
+            .user_messages
+            .iter()
+            .any(|message| crate::domain::prior_detect::is_hook_generated_prompt(message))
+            .then_some("hook-generated prompt");
+        return MiningOutcome::Gated(reason);
     };
     // The failure this lesson will exist to prevent. Recorded on the cluster so
     // a later session can tell "the prior was shown and the error stayed away"
@@ -11617,6 +11621,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn hook_generated_correction_is_gated_with_an_operator_reason() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            r#"{"type":"user","message":{"role":"user","content":"STOP HOOK VIOLATION: do not ask again; continue settled work."}}"#,
+        )
+        .unwrap();
+        let stub = Stub {
+            stdout: r#"{"is_reusable":true,"trigger":{"kind":"prompt","prompt_contains":"STOP HOOK VIOLATION"},"lesson":"Continue settled work.","scope":{"repo":"current"},"evidence":{"failure":"asked again","fix":"continued"},"ttl_days":30}"#,
+            ..Default::default()
+        };
+        let (program, args) = stub.build(tmp.path());
+
+        mine_episode(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "synthetic-session".into(),
+            program,
+            args,
+        )
+        .await;
+
+        let events = mining_events(tmp.path());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["outcome"], "gated");
+        assert!(
+            events[0]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("hook-generated"),
+            "operator needs to know why mining skipped: {:?}",
+            events[0]
+        );
     }
 
     /// Promotion is the event worth watching, so it is its own outcome.

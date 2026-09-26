@@ -20,6 +20,65 @@ use std::collections::BTreeMap;
 use mdkb::store::Store;
 use mdkb::store::priors::recluster;
 
+/// Story 166: count the real "ask only when blocked" candidate family before
+/// and after the existing recluster pass, on a copy of the store only.
+#[test]
+#[ignore = "needs a copy of the TUICommander store"]
+fn reclustering_the_ask_only_when_blocked_family() {
+    let path = std::env::var("MDKB_RECLUSTER_STORE").expect("set copy path under ~/Gits");
+    let mut store = Store::open(&path).expect("open copied store");
+    let ids: Vec<String> = {
+        let mut stmt = store
+            .conn()
+            .prepare(
+                "SELECT c.id FROM prior_candidates c
+                 JOIN prior_clusters k ON k.id=c.cluster_id
+                 WHERE lower(k.lesson) LIKE '%ask%'
+                   AND (lower(k.lesson) LIKE '%block%'
+                        OR lower(k.lesson) LIKE '%choice%'
+                        OR lower(k.lesson) LIKE '%clarif%')",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    let groups = |store: &Store| -> usize {
+        let mut distinct = std::collections::HashSet::new();
+        for id in &ids {
+            let cluster: String = store
+                .conn()
+                .query_row(
+                    "SELECT cluster_id FROM prior_candidates WHERE id=?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            distinct.insert(cluster);
+        }
+        distinct.len()
+    };
+
+    let before = groups(&store);
+    let report = recluster(store.conn_mut(), chrono::Utc::now().timestamp()).unwrap();
+    let after = groups(&store);
+    println!(
+        "ask-only-when-blocked: {} candidate rows, {before} groups before, {after} after; {} moved, {} emptied",
+        ids.len(),
+        report.moved,
+        report.emptied.len()
+    );
+    assert!(
+        !ids.is_empty(),
+        "the copied store must contain the observed family"
+    );
+    assert!(
+        after <= before,
+        "reclustering must not split this lesson family"
+    );
+}
+
 /// Group the candidates by cluster before and after the pass, and report what
 /// happened to the lessons that name a budget limit.
 #[test]

@@ -27,6 +27,11 @@
 
 ### Fixed
 
+- **Prior mining ignores hook-generated corrections.** Stop-hook feedback and
+  system reminders no longer become user-correction candidates; gated episodes
+  record the reason, and prompt matchers targeting synthetic hook text are
+  rejected. Found by the maintainer's 2026-09-23 prior audit.
+
 - **Recall graph caps now keep the most relevant neighbors.** Eligible memory
   and document neighbors are scored against the prompt embedding before the
   cap; cold-model recall keeps deterministic newest-edge order. A read-only
