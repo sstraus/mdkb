@@ -101,6 +101,13 @@ expand_neighbors = 3   # hard cap on neighbors surfaced across all seeds
 doc_neighbor_cap = 3   # cap on neighbor lines when a prompt names a document
 ```
 
+Recall ranks eligible memory and document neighbors by cosine similarity to
+the prompt embedding before applying either neighbor cap. A target without a
+usable stored embedding follows scored targets. Equal scores retain the graph's
+newest-edge-first order. If the prompt embedding is unavailable, all eligible
+neighbors retain that deterministic edge order. This ranking uses the local
+embeddings already computed for recall; it makes no network request.
+
 Add your own vocabulary to `frontmatter_relations` — `depends_on`, `replaces`,
 `team`, whatever the repository already writes. A plain `mdkb update` applies
 the change: edges are rebuilt as a pass over the store after indexing, so a key

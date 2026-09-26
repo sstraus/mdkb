@@ -27,6 +27,12 @@
 
 ### Fixed
 
+- **Recall graph caps now keep the most relevant neighbors.** Eligible memory
+  and document neighbors are scored against the prompt embedding before the
+  cap; cold-model recall keeps deterministic newest-edge order. A read-only
+  2026-09-27 census found 19 TUICommander documents with more than three
+  eligible frontmatter neighbors, exposing the old truncation order.
+
 - **Expired, successfully salvaged quarantines with older report names are
   retired again.** A report naming `index.sqlite` authorizes only its matching
   unsuffixed quarantine copy; same-timestamp collision copies still require

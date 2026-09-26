@@ -4534,26 +4534,22 @@ async fn hook_session_start_inner(
 /// are excluded via `resolve_active`, which does not count as a read — bounded
 /// work on the recall hot path.
 /// `seeds` and `max_neighbors` are the configurable caps (`GraphConfig`); edges
-/// arrive `created_at DESC` from [`memory_graph::outgoing`], so candidates are
-/// ordered by recency before the cap truncates.
+/// arrive `created_at DESC` from [`memory_graph::outgoing`]. When the prompt has
+/// an embedding, eligible candidates are sorted by cosine before the cap;
+/// otherwise the stable sort preserves that recency order.
 fn expand_recall_neighbors(
     conn: &rusqlite::Connection,
     results: &[memory::MemoryEntry],
     seeds: usize,
     max_neighbors: usize,
+    query_embedding: Option<&[f32]>,
 ) -> crate::Result<Vec<String>> {
     let seen: std::collections::HashSet<&str> = results.iter().map(|e| e.id.as_str()).collect();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out: Vec<String> = Vec::new();
+    let mut candidates: Vec<(String, Option<f32>)> = Vec::new();
     for seed in results.iter().take(seeds) {
-        if out.len() >= max_neighbors {
-            break;
-        }
         let edges = memory_graph::outgoing(conn, &seed.id, None)?;
         for edge in edges {
-            if out.len() >= max_neighbors {
-                break;
-            }
             if edge.target_kind != TargetKind::Memory.as_str() {
                 continue;
             }
@@ -4561,11 +4557,57 @@ fn expand_recall_neighbors(
                 continue;
             }
             if let Some(n) = memory_graph::resolve_active(conn, &edge.target_ref)? {
-                out.push(format!("- [{}] {} (via {})", n.id, n.title, edge.relation));
+                let score = query_embedding.and_then(|query| {
+                    conn.query_row(
+                        "SELECT me.embedding FROM memory_embeddings me
+                         JOIN memory_entries m ON m.rowid=me.memory_rowid WHERE m.id=?1",
+                        [&n.id],
+                        |row| row.get::<_, Vec<u8>>(0),
+                    )
+                    .ok()
+                    .and_then(|blob| graph_neighbor_cosine(&blob, query))
+                });
+                candidates.push((
+                    format!("- [{}] {} (via {})", n.id, n.title, edge.relation),
+                    score,
+                ));
             }
         }
     }
-    Ok(out)
+    rank_graph_candidates(&mut candidates);
+    Ok(candidates
+        .into_iter()
+        .take(max_neighbors)
+        .map(|(line, _)| line)
+        .collect())
+}
+
+/// Invalid or mismatched stored vectors have no relevance score. Ranking them
+/// by insertion order is safer than treating malformed bytes as high cosine.
+fn graph_neighbor_cosine(blob: &[u8], query: &[f32]) -> Option<f32> {
+    if blob.len() != query.len() * 4 || query.is_empty() {
+        return None;
+    }
+    let vector: Vec<f32> = blob
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    if vector.iter().all(|value| *value == 0.0)
+        || query.iter().all(|value| *value == 0.0)
+    {
+        return None;
+    }
+    let score = crate::llm::embeddings::cosine_similarity(&vector, query);
+    score.is_finite().then_some(score)
+}
+
+fn rank_graph_candidates<T>(candidates: &mut [(T, Option<f32>)]) {
+    // Stable sort: ties and missing vectors keep the graph's original
+    // created_at-desc, target-ref order. None sorts after measured scores.
+    candidates.sort_by(|a, b| {
+        b.1.unwrap_or(f32::NEG_INFINITY)
+            .total_cmp(&a.1.unwrap_or(f32::NEG_INFINITY))
+    });
 }
 
 /// What a prompt gets from recall.
@@ -4733,6 +4775,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     let mut results: Vec<memory::MemoryEntry> = Vec::new();
     let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
     let mut top_cosine: Option<f64> = None;
+    let mut query_embedding: Option<Vec<f32>> = None;
     if let Some(ref q) = fts_query {
         if ensure_handle_context(handle).await.is_err() {
             return json!({});
@@ -4742,7 +4785,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         // CPU-bound ONNX inference would stall a worker every turn. `q`
         // (build_recall_query) is a pre-built OR-expression fed to the FTS leg
         // via `_fts`; embedding the FTS operators would be noise.
-        let query_embedding = embed_query_off_lock(prompt).await;
+        query_embedding = embed_query_off_lock(prompt).await;
         let mut ctx_guard = handle.ctx.lock().await;
         let limit = cfg.recall_limit.max(1);
         let search_t0 = std::time::Instant::now();
@@ -4887,6 +4930,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
                     &results,
                     handle.config.graph.expand_seeds,
                     handle.config.graph.expand_neighbors,
+                    query_embedding.as_deref(),
                 )?;
                 let ids: Vec<&str> = results.iter().map(|e| e.id.as_str()).collect();
                 let stale_ids = memory_graph::stale_dependency_ids(&ctx.conn, &ids)?;
@@ -4923,6 +4967,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
                         &path_tokens,
                         &seen,
                         handle.config.graph.doc_neighbor_cap,
+                        query_embedding.as_deref(),
                     )
                 },
             ) {
@@ -5157,41 +5202,54 @@ fn doc_graph_neighbors(
     tokens: &[String],
     seen: &std::collections::HashSet<String>,
     cap: usize,
+    query_embedding: Option<&[f32]>,
 ) -> crate::Result<Vec<(String, String)>> {
     use crate::store::graph;
-    let mut out: Vec<(String, String)> = Vec::new();
+    let mut candidates: Vec<((String, String), Option<f32>)> = Vec::new();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
     for tok in tokens {
-        if out.len() >= cap {
-            break;
-        }
         let Some(doc_id) = graph::resolve_ref_to_doc(conn, tok)? else {
             continue;
         };
         let edges = graph::get_outgoing(conn, doc_id, None)?;
         for edge in edges {
-            if out.len() >= cap {
-                break;
-            }
             if edge.source_kind != graph::KIND_FRONTMATTER {
                 continue;
             }
             // Only emit targets that resolve to an actual indexed document, with
             // their canonical path (so `[[b]]`, `b`, and `b.md` collapse to one
             // node). Frontmatter also carries entity relations (owner, themes, …)
-            // whose targets are tags, not navigable docs — `resolve_to_path`
-            // returns None for those, keeping the "related docs" block honest.
-            // One resolution pass per edge.
-            let Some(path) = graph::resolve_to_path(conn, &edge.target_ref)? else {
+            // whose targets are tags, not navigable docs. Keep the resolved id
+            // for the vector lookup: two collections can share a relative path.
+            let Some(target_id) = graph::resolve_ref_to_doc(conn, &edge.target_ref)? else {
                 continue;
             };
+            let path: String = conn.query_row(
+                "SELECT relative_path FROM documents WHERE id=?1",
+                [target_id],
+                |row| row.get(0),
+            )?;
             if seen.contains(&path) || !emitted.insert(path.clone()) {
                 continue;
             }
-            out.push((path, edge.relation));
+            let score = query_embedding.and_then(|query| {
+                conn.query_row(
+                    "SELECT embedding FROM embeddings WHERE document_id=?1",
+                    [target_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .ok()
+                .and_then(|blob| graph_neighbor_cosine(&blob, query))
+            });
+            candidates.push(((path, edge.relation), score));
         }
     }
-    Ok(out)
+    rank_graph_candidates(&mut candidates);
+    Ok(candidates
+        .into_iter()
+        .take(cap)
+        .map(|(item, _)| item)
+        .collect())
 }
 
 /// Number of trailing transcript lines that form the mined episode window.
@@ -8064,11 +8122,10 @@ mod tests {
         );
     }
 
-    /// Seed `n` entries (`n0`..) where `n0` has 3 outgoing edges, then return the
-    /// MINIMUM per-call expansion time over many iterations. The min (least-
-    /// preempted run) reflects true CPU cost and is stable under parallel test
-    /// load, unlike an absolute p95 which flakes when the suite saturates cores.
-    fn min_expand_us(conn: &rusqlite::Connection, n: usize) -> u128 {
+    /// Seed `n` entries (`n0`..) where `n0` has 3 embedded outgoing neighbors,
+    /// then measure the ranked path. Minimum tracks corpus scaling; p95 checks
+    /// the stated 10ms hot-path budget on the 1k fixture.
+    fn expand_latency_us(conn: &rusqlite::Connection, n: usize) -> (u128, u128) {
         for i in 0..n {
             conn.execute(
                 "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
@@ -8086,16 +8143,27 @@ mod tests {
                 MemoryRelation::Supports,
             )
             .unwrap();
+            let bytes = [j as f32, 1.0_f32]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            conn.execute(
+                "INSERT INTO memory_embeddings (memory_rowid, embedding, model, created_at)
+                 SELECT rowid, ?1, 'fixture', 1 FROM memory_entries WHERE id=?2",
+                rusqlite::params![bytes, format!("n{j}")],
+            )
+            .unwrap();
         }
         let seeds = vec![memory::get_entry(conn, "n0").unwrap().unwrap()];
-        let mut best = u128::MAX;
-        for _ in 0..50 {
+        let mut samples = Vec::with_capacity(100);
+        for _ in 0..100 {
             let t = std::time::Instant::now();
-            let out = expand_recall_neighbors(conn, &seeds, 2, 3).unwrap();
-            best = best.min(t.elapsed().as_micros());
+            let out = expand_recall_neighbors(conn, &seeds, 2, 3, Some(&[1.0, 0.0])).unwrap();
+            samples.push(t.elapsed().as_micros());
             assert_eq!(out.len(), 3, "must expand exactly the 3 capped neighbors");
         }
-        best
+        samples.sort_unstable();
+        (samples[0], samples[94])
     }
 
     #[test]
@@ -8202,7 +8270,9 @@ mod tests {
         ];
 
         assert_eq!(
-            expand_recall_neighbors(&conn, &seeds, 2, 3).unwrap().len(),
+            expand_recall_neighbors(&conn, &seeds, 2, 3, None)
+                .unwrap()
+                .len(),
             1
         );
 
@@ -8245,18 +8315,245 @@ mod tests {
 
         // Defaults (2 seeds, 3 neighbors) surface all three edges.
         assert_eq!(
-            expand_recall_neighbors(&conn, &seeds, 2, 3).unwrap().len(),
+            expand_recall_neighbors(&conn, &seeds, 2, 3, None)
+                .unwrap()
+                .len(),
             3
         );
         // A tighter neighbor cap truncates.
         assert_eq!(
-            expand_recall_neighbors(&conn, &seeds, 2, 1).unwrap().len(),
+            expand_recall_neighbors(&conn, &seeds, 2, 1, None)
+                .unwrap()
+                .len(),
             1
         );
         // Zero seeds disables expansion entirely.
         assert_eq!(
-            expand_recall_neighbors(&conn, &seeds, 0, 3).unwrap().len(),
+            expand_recall_neighbors(&conn, &seeds, 0, 3, None)
+                .unwrap()
+                .len(),
             0
+        );
+    }
+
+    #[test]
+    fn memory_expansion_picks_an_older_relevant_neighbor_before_newer_edges() {
+        crate::store::vectors::init_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        crate::store::vectors::init_vector_schema(&conn).unwrap();
+        for id in ["seed", "relevant", "newer-a", "newer-b"] {
+            conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
+                 VALUES (?1, ?1, 'body', 'topic', 1, 1)",
+                [id],
+            )
+            .unwrap();
+        }
+        for (id, timestamp, vector) in [
+            ("relevant", 1, [1.0_f32, 0.0]),
+            ("newer-a", 2, [0.0, 1.0]),
+            ("newer-b", 3, [0.0, -1.0]),
+        ] {
+            memory_graph::add_edge(
+                &conn,
+                "seed",
+                id,
+                TargetKind::Memory,
+                MemoryRelation::Supports,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE memory_edges SET created_at=?1 WHERE source_id='seed' AND target_ref=?2",
+                rusqlite::params![timestamp, id],
+            )
+            .unwrap();
+            let bytes = vector
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            conn.execute(
+                "INSERT INTO memory_embeddings (memory_rowid, embedding, model, created_at)
+                 SELECT rowid, ?1, 'fixture', 1 FROM memory_entries WHERE id=?2",
+                rusqlite::params![bytes, id],
+            )
+            .unwrap();
+        }
+        let seeds = vec![
+            memory::get_entry_without_tracking(&conn, "seed")
+                .unwrap()
+                .unwrap(),
+        ];
+
+        let out = expand_recall_neighbors(&conn, &seeds, 1, 1, Some(&[1.0, 0.0])).unwrap();
+        assert_eq!(
+            out,
+            ["- [relevant] relevant (via supports)"],
+            "identical vector has cosine 1; both newer orthogonal vectors have cosine 0"
+        );
+
+        let cold = expand_recall_neighbors(&conn, &seeds, 1, 1, None).unwrap();
+        assert_eq!(
+            cold,
+            ["- [newer-b] newer-b (via supports)"],
+            "without a prompt embedding, newest edge wins deterministically"
+        );
+        conn.execute(
+            "UPDATE memory_embeddings SET embedding=X'010203' WHERE memory_rowid=(SELECT rowid FROM memory_entries WHERE id='newer-b')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            expand_recall_neighbors(&conn, &seeds, 1, 1, Some(&[1.0, 0.0])).unwrap(),
+            ["- [relevant] relevant (via supports)"],
+            "malformed newer vector cannot outrank a measured match"
+        );
+    }
+
+    #[test]
+    fn a_zero_vector_has_no_relevance_score() {
+        let zero = [0.0_f32, 0.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(graph_neighbor_cosine(&zero, &[1.0, 0.0]), None);
+    }
+
+    #[test]
+    fn document_expansion_picks_an_older_relevant_neighbor_before_newer_edges() {
+        crate::store::vectors::init_sqlite_vec();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        crate::store::vectors::init_vector_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('docs', '.', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('other', './other', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('h', 'body', 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+             VALUES ('other', 'relevant.md', 'h', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let unrelated_duplicate = conn.last_insert_rowid();
+        let orthogonal = [0.0_f32, 1.0]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        conn.execute(
+            "INSERT INTO embeddings (document_id, embedding, model, created_at)
+             VALUES (?1, ?2, 'fixture', 1)",
+            rusqlite::params![unrelated_duplicate, orthogonal],
+        )
+        .unwrap();
+        for id in ["seed", "relevant", "newer-a", "newer-b"] {
+            conn.execute(
+                "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+                 VALUES ('docs', ?1, 'h', 1, 1)",
+                [format!("{id}.md")],
+            )
+            .unwrap();
+        }
+        let seed_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE relative_path='seed.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let relevant_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE collection='docs' AND relative_path='relevant.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        crate::store::graph::add_alias(&conn, relevant_id, "relevant-alias", "id").unwrap();
+        for (id, timestamp, vector) in [
+            ("relevant", 1, [1.0_f32, 0.0]),
+            ("newer-a", 2, [0.0, 1.0]),
+            ("newer-b", 3, [0.0, -1.0]),
+        ] {
+            let path = format!("{id}.md");
+            let edge_ref = if id == "relevant" {
+                "relevant-alias"
+            } else {
+                &path
+            };
+            crate::store::graph::add_edge(
+                &conn,
+                seed_id,
+                edge_ref,
+                "related",
+                crate::store::graph::KIND_FRONTMATTER,
+                None,
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE edges SET created_at=?1 WHERE source_doc_id=?2 AND target_ref=?3",
+                rusqlite::params![timestamp, seed_id, edge_ref],
+            )
+            .unwrap();
+            let bytes = vector
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>();
+            conn.execute(
+                "INSERT INTO embeddings (document_id, embedding, model, created_at)
+                 SELECT id, ?1, 'fixture', 1 FROM documents
+                 WHERE collection='docs' AND relative_path=?2",
+                rusqlite::params![bytes, path],
+            )
+            .unwrap();
+        }
+
+        let out = doc_graph_neighbors(
+            &conn,
+            &["seed.md".into()],
+            &std::collections::HashSet::new(),
+            1,
+            Some(&[1.0, 0.0]),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            [("relevant.md".into(), "related".into())],
+            "identical vector has cosine 1; both newer orthogonal vectors have cosine 0"
+        );
+
+        let cold = doc_graph_neighbors(
+            &conn,
+            &["seed.md".into()],
+            &std::collections::HashSet::new(),
+            1,
+            None,
+        )
+        .unwrap();
+        assert_eq!(cold, [("newer-b.md".into(), "related".into())]);
+        assert_eq!(
+            doc_graph_neighbors(
+                &conn,
+                &["seed.md".into()],
+                &std::collections::HashSet::new(),
+                1,
+                Some(&[f32::NAN, 0.0]),
+            )
+            .unwrap(),
+            cold,
+            "non-finite query scores fall back to stable edge order"
         );
     }
 
@@ -8268,18 +8565,19 @@ mod tests {
         let big_tmp = TempDir::new().unwrap();
         let big = make_handle(&big_tmp);
         ensure_handle_context(&big).await.expect("ctx");
-        let big_us = {
+        let (big_us, big_p95) = {
             let g = big.ctx.lock().await;
-            min_expand_us(&g.as_ref().unwrap().conn, 1000)
+            expand_latency_us(&g.as_ref().unwrap().conn, 1000)
         };
 
         let small_tmp = TempDir::new().unwrap();
         let small = make_handle(&small_tmp);
         ensure_handle_context(&small).await.expect("ctx");
-        let small_us = {
+        let (small_us, _) = {
             let g = small.ctx.lock().await;
-            min_expand_us(&g.as_ref().unwrap().conn, 10)
+            expand_latency_us(&g.as_ref().unwrap().conn, 10)
         };
+        eprintln!("ranked graph expansion 1k: min={big_us}us p95={big_p95}us");
 
         // Absolute backstop: real per-call cost is tens of µs; the min stays far
         // under the 10ms budget even on a saturated CI box.
@@ -8293,6 +8591,10 @@ mod tests {
         assert!(
             big_us <= small_us.max(1) * 10 + 200,
             "expansion appears to scale with corpus size: 1k={big_us}us vs 10={small_us}us"
+        );
+        assert!(
+            big_p95 < 10_000,
+            "ranked expansion p95={big_p95}us exceeds 10ms"
         );
     }
 
