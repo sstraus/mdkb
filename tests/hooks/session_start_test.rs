@@ -16,10 +16,13 @@ fn mdkb_bin() -> Command {
 }
 
 fn run_session_start_in(dir: &Path, stdin_json: &str) -> (i32, String) {
+    let home = tempfile::tempdir().expect("isolated hook home");
     let mut child = mdkb_bin()
         .args(["hook", "session-start"])
         .current_dir(dir)
         .env("MDKB_NO_DAEMON", "1")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -288,12 +291,16 @@ fn session_start_respects_mdkbignore_hooks_marker() {
 
 #[test]
 fn session_start_on_uninitialized_project_returns_silence() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let (code, stdout) = run_session_start_in(tmp.path(), "");
+    let parent = tempfile::tempdir().expect("tempdir");
+    fs::create_dir_all(parent.path().join(".mdkb")).expect("seed ancestor store");
+    let project = tempfile::tempdir_in(parent.path()).expect("uninitialized project");
+    // Catches: a bare temp directory can inherit an ambient ancestor store.
+    fs::create_dir(project.path().join(".git")).expect("independent project boundary");
+    let (code, stdout) = run_session_start_in(project.path(), "");
 
     assert_eq!(code, 0, "hook must never block, even without .mdkb/");
     assert!(
         stdout.trim().is_empty(),
-        "no .mdkb/ means no output, got: {stdout}"
+        "an uninitialized project must stay silent despite an ancestor store, got: {stdout}"
     );
 }
