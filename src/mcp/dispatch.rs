@@ -4627,7 +4627,9 @@ async fn hook_user_prompt_submit_impl_with_dedup(
 
     let (mode, prompt) = recall_mode(cfg, prompt);
     if mode == RecallMode::Off {
-        return json!({});
+        return prompt_prior_response(
+            prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
+        );
     }
     // Two floors, one knob each way round: the sigil lowers the bar because
     // somebody asked, the automatic path raises it because nobody did.
@@ -4636,16 +4638,15 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     // Shadow mode observes; it must not leave a trace that changes what a later
     // real injection does. The dedup map is per-session state — marking an
     // entry seen here would silence it on the sigil prompt that follows — so
-    // shadow runs with it detached, and the prior leg (which writes injection
-    // telemetry) is skipped outright below.
-    let dedup = if mode == RecallMode::Shadow {
+    // shadow recall runs with it detached. Literal prompt priors use the normal
+    // session dedup map because they are real injections even in shadow mode.
+    let recall_dedup = if mode == RecallMode::Shadow {
         None
     } else {
-        dedup
+        dedup.as_ref()
     };
 
-    let prompt_repeat = dedup
-        .as_ref()
+    let prompt_repeat = recall_dedup
         .map(|(dctx, key)| dctx.remember_hook_prompt(key, &prompt_fingerprint(prompt)))
         .unwrap_or(false);
     let wants_cg = prompt_wants_call_graph(prompt);
@@ -4661,7 +4662,9 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     };
 
     if fts_query.is_none() && !wants_cg && path_tokens.is_empty() {
-        return json!({});
+        return prompt_prior_response(
+            prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
+        );
     }
 
     let mut results: Vec<memory::MemoryEntry> = Vec::new();
@@ -4802,7 +4805,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         // existing relevance order within each group). THEN truncate to limit.
         results.sort_by_key(|e| !is_high_confidence_prior(e, now));
         results.truncate(limit);
-        if let Some((dctx, key)) = &dedup {
+        if let Some((dctx, key)) = recall_dedup {
             dctx.retain_new_hook_memories(key, &mut results);
         }
     }
@@ -4883,17 +4886,14 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         .iter()
         .map(|(path, relation)| format!("- {path} ({relation})"))
         .collect();
-    if let Some((dctx, key)) = &dedup {
+    if let Some((dctx, key)) = recall_dedup {
         dctx.retain_new_hook_related_lines(key, &mut doc_lines);
         dctx.retain_new_hook_related_lines(key, &mut related);
     }
 
-    // Shadow mode stops here: everything above is read-only, so the row records
-    // a full retrieval — and the dispatcher's stopwatch measures the real cost
-    // of the automatic path, which is one of the release criteria. The prior
-    // leg below is not read-only (`record_injection`), and a prior fires on a
-    // named trigger rather than on a threshold, so it is not what this question
-    // is about.
+    // Shadow mode records the full recall retrieval but does not emit it.
+    // Literal prompt priors are independent of that retrieval and can still
+    // inject, with their own telemetry and session deduplication.
     if mode == RecallMode::Shadow {
         *shadow = Some(ShadowRecall {
             session: session.to_string(),
@@ -4903,7 +4903,9 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             top_cosine,
             floor: search_cfg.min_recall_cosine,
         });
-        return json!({});
+        return prompt_prior_response(
+            prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
+        );
     }
 
     // Trigger-matched behavioral priors whose prompt pattern fires here.
@@ -4992,6 +4994,19 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
             "additionalContext": body,
+        }
+    })
+}
+
+/// A literal prompt trigger can answer independently of semantic recall.
+fn prompt_prior_response(prior: Option<String>) -> Value {
+    let Some(prior) = prior else {
+        return json!({});
+    };
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": format!("## mdkb: priors\n\n{prior}\n"),
         }
     })
 }
@@ -10443,6 +10458,99 @@ mod tests {
             .unwrap_or("");
         assert!(ctx.contains("## mdkb: priors"), "got: {result}");
         assert!(ctx.contains("Prefer ripgrep over grep"));
+    }
+
+    #[tokio::test]
+    async fn prompt_prior_ignores_recall_sigil_without_running_recall() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+            config.telemetry.query_events = true;
+        });
+        seed_promoted_prior(
+            &handle,
+            "prompt",
+            r#"{"prompt_contains":"ripgrep"}"#,
+            "Prefer ripgrep over grep for repository search.",
+        )
+        .await;
+
+        let mut shadow = None;
+        let hit = hook_user_prompt_submit_impl_with_dedup(
+            &handle,
+            "should I use ripgrep for searching?",
+            "sigil-free",
+            None,
+            &mut shadow,
+        )
+        .await;
+        assert!(
+            additional_context(&hit).contains("Prefer ripgrep over grep for repository search."),
+            "literal trigger must fire without a recall sigil: {hit}"
+        );
+        assert!(shadow.is_none(), "recall was not requested");
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let recalls: i64 = conn
+            .query_row("SELECT COUNT(*) FROM query_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(recalls, 0, "the recall search leg must not run");
+        drop(guard);
+
+        let miss = hook_user_prompt_submit_impl(&handle, "should I use find for searching?").await;
+        assert_eq!(miss, json!({}), "a nonmatching plain prompt stays silent");
+    }
+
+    #[tokio::test]
+    async fn prompt_prior_matches_when_recall_query_has_only_stopwords() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+        });
+        seed_promoted_prior(
+            &handle,
+            "prompt",
+            r#"{"prompt_contains":"the"}"#,
+            "Check the article before publishing.",
+        )
+        .await;
+        assert!(crate::store::search::build_recall_query("the and").is_none());
+
+        let hit = hook_user_prompt_submit_impl(&handle, "the and").await;
+        assert!(
+            additional_context(&hit).contains("Check the article before publishing."),
+            "literal trigger must not depend on content tokens: {hit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_mode_observes_recall_and_injects_only_prompt_trigger() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+            config.hooks.user_prompt_submit_shadow = true;
+        });
+        seed_promoted_prior(
+            &handle,
+            "prompt",
+            r#"{"prompt_contains":"ripgrep"}"#,
+            "Prefer ripgrep over grep for repository search.",
+        )
+        .await;
+
+        let mut shadow = None;
+        let hit = hook_user_prompt_submit_impl_with_dedup(
+            &handle,
+            "should I use ripgrep for searching?",
+            "shadow-trigger",
+            None,
+            &mut shadow,
+        )
+        .await;
+        assert!(shadow.is_some(), "shadow recall observation is retained");
+        let body = additional_context(&hit);
+        assert!(body.contains("Prefer ripgrep over grep for repository search."));
+        assert!(!body.contains("## mdkb: relevant context"));
     }
 
     #[tokio::test]
