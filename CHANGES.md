@@ -23,6 +23,14 @@
   dispatch and under 1 ms at the daemon handler's log resolution. Found by the
   maintainer's 2026-09-23 hook audit.
 
+### Fixed
+
+- **Expired, successfully salvaged quarantines with older report names are
+  retired again.** A report naming `index.sqlite` authorizes only its matching
+  unsuffixed quarantine copy; same-timestamp collision copies still require
+  their own successful reports. Found by the full test suite after the
+  exact-copy retention fix.
+
 ## 3.11.0 (2026-09-22)
 
 ### Changed

@@ -850,8 +850,13 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
             let timestamp = quarantine_ts(copy_name)?;
             let raw = std::fs::read_to_string(entry.path()).ok()?;
             let report: QuarantineReport = serde_json::from_str(&raw).ok()?;
+            // Older sidecars named the source database (index.sqlite) instead
+            // of its quarantined copy. That name authorizes only the original
+            // unsuffixed copy, never a same-second collision sibling.
+            let report_names_copy = report.corrupt_file == copy_name
+                || format!("{}.corrupt-{timestamp}", report.corrupt_file) == copy_name;
             (report.salvage_succeeded
-                && report.corrupt_file == copy_name
+                && report_names_copy
                 && report.quarantined_at == timestamp)
                 .then(|| copy_name.to_string())
         })
@@ -1544,6 +1549,29 @@ mod tests {
             "one successful report must not authorize deleting a different copy"
         );
         assert!(with_suffix(&unsalvaged, "-wal").exists());
+    }
+
+    #[test]
+    fn a_legacy_base_name_report_does_not_authorize_a_collision_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = 1_800_000_000_i64;
+        let stamp = now - (QUARANTINE_RETENTION.as_secs() as i64 + 1);
+        let original = dir.path().join(format!("index.sqlite.corrupt-{stamp}"));
+        let collision = dir.path().join(format!("index.sqlite.corrupt-{stamp}-1"));
+        std::fs::write(&original, b"recovered copy").unwrap();
+        std::fs::write(&collision, b"unrecovered copy").unwrap();
+        std::fs::write(
+            report_path(&original),
+            format!(
+                r#"{{"corrupt_file":"index.sqlite","quarantined_at":{stamp},"salvage_succeeded":true,"memory_entries_salvaged":1,"memory_edges_salvaged":0}}"#
+            ),
+        )
+        .unwrap();
+
+        sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+
+        assert!(!original.exists(), "the reported original was recovered");
+        assert!(collision.exists(), "a sibling without a report remains forensic evidence");
     }
 
     #[test]
