@@ -11357,11 +11357,12 @@ mod tests {
             promote_cluster(&ctx.conn, &cluster_id, chrono::Utc::now().timestamp()).unwrap();
         }
 
-        let result = hook_post_tool_use_impl(
-            &handle,
-            &json!({"tool_name": "Bash", "tool_input": {"command": "cargo build --lib"}}),
-        )
-        .await;
+        let bash_event = json!({
+            "tool_name": "Bash",
+            "tool_input": {"command": "cargo build --lib"},
+            "session_id": "build-session"
+        });
+        let result = hook_post_tool_use_impl(&handle, &bash_event).await;
         let injected = result["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or_default();
@@ -11373,6 +11374,36 @@ mod tests {
             result.get("queued").is_none(),
             "Bash queues no reindex; only the lesson is added: {result}"
         );
+        let repeated = hook_post_tool_use_impl(&handle, &bash_event).await;
+        assert_eq!(repeated, json!({}), "second Bash call stays silent");
+        let next_session = hook_post_tool_use_impl(
+            &handle,
+            &json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "cargo build --lib"},
+                "session_id": "later-session"
+            }),
+        )
+        .await;
+        assert!(
+            next_session["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Check mbx explain --last before blaming the build."),
+            "a distinct session gets the lesson again: {next_session}"
+        );
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            assert_eq!(
+                crate::store::priors::get_cluster(conn, &cluster_id)
+                    .unwrap()
+                    .unwrap()
+                    .injected_count,
+                2,
+                "only the two actual emissions count"
+            );
+        }
     }
 
     #[tokio::test]
