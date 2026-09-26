@@ -2116,6 +2116,82 @@ pub fn world() {
         );
     }
 
+    #[test]
+    fn a_factory_store_method_has_callers_through_the_exported_store() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            src_dir.path().join("terminals.ts"),
+            r#"function createTerminalsStore() {
+    function localHelper() { return { unrelated() { return 0; } }; }
+    const actions = {
+        getSubAgentTag(id: string): string | null { return id; },
+    };
+    return { ...actions };
+}
+function warmupOnly() { const temporary = createTerminalsStore(); }
+export const terminalsStore = createTerminalsStore();
+"#,
+        )
+        .unwrap();
+        fs::write(
+            src_dir.path().join("activity.ts"),
+            r#"import { terminalsStore } from "./terminals";
+export function snapshot(id: string) {
+    return terminalsStore.getSubAgentTag(id);
+}
+"#,
+        )
+        .unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        let method = facade
+            .get_symbol_by_name("getSubAgentTag")
+            .expect("the method must be searchable");
+        let callers = facade.get_callers_by_tier(method.id);
+        assert!(
+            callers
+                .iter()
+                .any(|(caller, _)| caller.name.as_ref() == "snapshot"),
+            "the exported store call must resolve: {callers:?}"
+        );
+    }
+
+    #[test]
+    fn same_named_object_methods_keep_their_distinct_callers() {
+        let src_dir = tempfile::tempdir().unwrap();
+        fs::write(
+            src_dir.path().join("stores.ts"),
+            "const other = { run() { return 1; } };\n\
+             const store = { run() { return 2; } };\n\
+             function snapshot() { return store.run(); }\n",
+        )
+        .unwrap();
+        let db_dir = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db_dir.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src_dir.path()).unwrap();
+
+        let mut calls_by_line: Vec<(u32, Vec<String>)> = facade
+            .find_symbols_by_name("run")
+            .into_iter()
+            .map(|method| {
+                let callers = facade
+                    .get_callers_by_tier(method.id)
+                    .into_iter()
+                    .map(|(caller, _)| caller.name.to_string())
+                    .collect();
+                (method.range.start_line, callers)
+            })
+            .collect();
+        calls_by_line.sort_by_key(|(line, _)| *line);
+        assert_eq!(
+            calls_by_line,
+            vec![(0, vec![]), (1, vec!["snapshot".to_string()])],
+            "store.run must not become a caller of other.run"
+        );
+    }
+
     /// Write one recognisable vector per indexed symbol and return them keyed by
     /// the text they stand for.
     ///

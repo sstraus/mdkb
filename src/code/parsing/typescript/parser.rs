@@ -92,6 +92,7 @@ impl TypeScriptParser {
         };
 
         let mut symbols = Vec::new();
+        let object_owners = Self::object_method_owners(tree.root_node(), code);
         self.extract_symbols_from_node(
             tree.root_node(),
             code,
@@ -103,6 +104,13 @@ impl TypeScriptParser {
 
         // Post-process: mark default/named exported symbols as Public
         for symbol in &mut symbols {
+            if matches!(symbol.kind, SymbolKind::Method | SymbolKind::Field) {
+                if let Some(owner) = object_owners.get(&symbol.range) {
+                    symbol.scope_context = Some(ScopeContext::ClassMember {
+                        class_name: Some(owner.as_str().into()),
+                    });
+                }
+            }
             if self.default_exported.contains(symbol.name.as_ref())
                 || self.named_exported.contains(symbol.name.as_ref())
             {
@@ -111,6 +119,158 @@ impl TypeScriptParser {
         }
 
         symbols
+    }
+
+    /// Name object members by the value used at a call site. A plain
+    /// `const store = { run() {} }` owns `run`; for a factory, follow only the
+    /// explicit `const store = factory()` and `return { ...actions }` chain.
+    /// Ambiguous factory aliases keep the direct object owner instead.
+    fn object_method_owners(root: Node, code: &str) -> std::collections::HashMap<Range, String> {
+        let mut variables = Vec::new();
+        let mut functions = Vec::new();
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "variable_declarator" => variables.push(node),
+                "function_declaration" => functions.push(node),
+                _ => {}
+            }
+            stack.extend(node.children(&mut node.walk()));
+        }
+
+        let mut owners = std::collections::HashMap::new();
+        let mut factory_aliases: std::collections::HashMap<&str, Vec<&str>> =
+            std::collections::HashMap::new();
+        for variable in &variables {
+            let (Some(name), Some(value)) = (
+                variable.child_by_field_name("name"),
+                variable.child_by_field_name("value"),
+            ) else {
+                continue;
+            };
+            if name.kind() != "identifier" {
+                continue;
+            }
+            let name = &code[name.byte_range()];
+            if value.kind() == "object" {
+                Self::name_object_members(value, name, &mut owners);
+            } else if value.kind() == "call_expression" {
+                let mut parent = variable.parent();
+                let mut local = false;
+                while let Some(node) = parent {
+                    if matches!(
+                        node.kind(),
+                        "function_declaration"
+                            | "function_expression"
+                            | "arrow_function"
+                            | "method_definition"
+                    ) {
+                        local = true;
+                        break;
+                    }
+                    parent = node.parent();
+                }
+                if local {
+                    continue;
+                }
+                if let Some(callee) = value.child_by_field_name("function") {
+                    if callee.kind() == "identifier" {
+                        factory_aliases
+                            .entry(&code[callee.byte_range()])
+                            .or_default()
+                            .push(name);
+                    }
+                }
+            }
+        }
+
+        for function in functions {
+            let Some(name) = function.child_by_field_name("name") else {
+                continue;
+            };
+            let Some([alias]) = factory_aliases
+                .get(&code[name.byte_range()])
+                .map(Vec::as_slice)
+            else {
+                continue;
+            };
+            let Some(body) = function.child_by_field_name("body") else {
+                continue;
+            };
+            let mut returns = Vec::new();
+            let mut stack = vec![body];
+            while let Some(node) = stack.pop() {
+                if node.kind() == "return_statement" {
+                    if let Some(object) = node.named_child(0).filter(|n| n.kind() == "object") {
+                        returns.push(object);
+                    }
+                } else if !matches!(
+                    node.kind(),
+                    "method_definition"
+                        | "arrow_function"
+                        | "function_declaration"
+                        | "function_expression"
+                ) {
+                    stack.extend(node.children(&mut node.walk()));
+                }
+            }
+            let [returned] = returns.as_slice() else {
+                continue;
+            };
+            Self::name_object_members(*returned, alias, &mut owners);
+            for item in returned.named_children(&mut returned.walk()) {
+                if item.kind() != "spread_element" {
+                    continue;
+                }
+                let Some(spread_name) = item.named_child(0).filter(|n| n.kind() == "identifier")
+                else {
+                    continue;
+                };
+                for variable in &variables {
+                    let Some(var_name) = variable.child_by_field_name("name") else {
+                        continue;
+                    };
+                    if code[var_name.byte_range()] != code[spread_name.byte_range()] {
+                        continue;
+                    }
+                    let mut parent = variable.parent();
+                    let mut inside_factory = false;
+                    while let Some(node) = parent {
+                        if node.kind() == "function_declaration" {
+                            inside_factory = node.id() == function.id();
+                            break;
+                        }
+                        parent = node.parent();
+                    }
+                    if inside_factory {
+                        if let Some(object) = variable
+                            .child_by_field_name("value")
+                            .filter(|n| n.kind() == "object")
+                        {
+                            Self::name_object_members(object, alias, &mut owners);
+                        }
+                    }
+                }
+            }
+        }
+        owners
+    }
+
+    fn name_object_members(
+        object: Node,
+        owner: &str,
+        owners: &mut std::collections::HashMap<Range, String>,
+    ) {
+        for item in object.named_children(&mut object.walk()) {
+            if item.kind() == "method_definition"
+                || (item.kind() == "pair"
+                    && item
+                        .child_by_field_name("value")
+                        .is_some_and(|value| value.kind() == "arrow_function"))
+            {
+                owners.insert(node_range(item), owner.to_string());
+            }
+        }
     }
 
     fn extract_symbols_from_node(
@@ -281,6 +441,86 @@ impl TypeScriptParser {
                     symbols,
                     (module_path, depth + 1),
                 );
+            }
+
+            // Class and interface members are handled by their owners above.
+            // A method in an object literal reaches this generic walk instead.
+            "method_definition" => {
+                let method_name = node
+                    .child_by_field_name("name")
+                    .map(|name| code[name.byte_range()].to_string());
+                let is_getter = node
+                    .children(&mut node.walk())
+                    .any(|child| child.kind() == "get");
+                let symbol = if is_getter {
+                    self.process_property(node, code, file_id, counter, module_path)
+                } else {
+                    self.process_method(node, code, file_id, counter, module_path)
+                };
+                if let Some(symbol) = symbol {
+                    symbols.push(symbol);
+                }
+                if let Some(body) = node.child_by_field_name("body") {
+                    self.context
+                        .enter_scope(ScopeType::Function { hoisting: false });
+                    let saved_fn = self.context.current_function().map(str::to_string);
+                    self.context.set_current_function(method_name);
+                    self.extract_symbols_from_node(
+                        body,
+                        code,
+                        file_id,
+                        counter,
+                        symbols,
+                        (module_path, depth + 1),
+                    );
+                    self.context.exit_scope();
+                    self.context.set_current_function(saved_fn);
+                }
+            }
+            "pair" => {
+                let value = node.child_by_field_name("value");
+                let key = node.child_by_field_name("key");
+                if let (Some(key), Some(value)) = (key, value) {
+                    if key.kind() == "property_identifier" && value.kind() == "arrow_function" {
+                        let name = code[key.byte_range()].to_string();
+                        symbols.push(self.create_symbol(
+                            counter.next_id(),
+                            name.clone(),
+                            SymbolKind::Method,
+                            file_id,
+                            node_range(node),
+                            (
+                                None,
+                                extract_jsdoc(&node, code),
+                                module_path,
+                                Visibility::Public,
+                            ),
+                        ));
+                        let saved_fn = self.context.current_function().map(str::to_string);
+                        self.context
+                            .enter_scope(ScopeType::Function { hoisting: false });
+                        self.context.set_current_function(Some(name));
+                        self.extract_symbols_from_node(
+                            value,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            (module_path, depth + 1),
+                        );
+                        self.context.exit_scope();
+                        self.context.set_current_function(saved_fn);
+                    } else {
+                        self.extract_symbols_from_node(
+                            value,
+                            code,
+                            file_id,
+                            counter,
+                            symbols,
+                            (module_path, depth + 1),
+                        );
+                    }
+                }
             }
 
             "export_statement" => {
@@ -720,6 +960,17 @@ impl TypeScriptParser {
                         self.context.set_current_class(saved_cls);
                     }
                 }
+            } else if let Some(value_node) = child.child_by_field_name("value") {
+                // Object literals assigned directly to a variable carry
+                // methods too; the arrow-body arm above is only one shape.
+                self.extract_symbols_from_node(
+                    value_node,
+                    code,
+                    file_id,
+                    counter,
+                    symbols,
+                    (module_path, depth + 1),
+                );
             }
         }
     }
@@ -922,10 +1173,15 @@ impl TypeScriptParser {
                 .map(|n| &code[n.byte_range()])
                 .or(current_fn),
             "arrow_function" => {
-                // Check parent for variable name
+                // A callable is named by either its variable or its object key.
                 node.parent()
-                    .filter(|p| p.kind() == "variable_declarator")
-                    .and_then(|p| p.child_by_field_name("name"))
+                    .and_then(|p| match p.kind() {
+                        "variable_declarator" => p.child_by_field_name("name"),
+                        "pair" => p
+                            .child_by_field_name("key")
+                            .filter(|key| key.kind() == "property_identifier"),
+                        _ => None,
+                    })
                     .map(|n| &code[n.byte_range()])
                     .or(current_fn)
             }
@@ -1419,6 +1675,104 @@ mod tests {
         assert!(
             calls.contains(&("m", "helper")),
             "the bare call must still be there, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_factory_object_method_is_a_symbol_and_has_a_qualified_caller() {
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = r#"
+const createTerminalsStore = () => ({
+    getSubAgentTag(id: string): string | null { return id; },
+});
+const terminalsStore = createTerminalsStore();
+function snapshot(id: string) {
+    return terminalsStore.getSubAgentTag(id);
+}
+"#;
+        let symbols =
+            parser.parse_symbols(code, FileId::new(1).unwrap(), &mut SymbolCounter::new());
+        assert!(
+            symbols
+                .iter()
+                .any(|symbol| symbol.name.as_ref() == "getSubAgentTag"
+                    && symbol.kind == SymbolKind::Method),
+            "factory object method missing from symbols: {symbols:?}"
+        );
+        assert!(
+            parser
+                .find_calls(code)
+                .iter()
+                .any(|call| call.caller == "snapshot"
+                    && call.target == "terminalsStore.getSubAgentTag"),
+            "qualified caller must be preserved"
+        );
+    }
+
+    #[test]
+    fn object_literal_callable_forms_are_indexed_without_treating_a_getter_as_a_call() {
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = r#"
+const store = {
+    shorthand() { return 1; },
+    arrow: () => 2,
+    async load() { return 3; },
+    nested: { deep() { return 4; } },
+    get current() { return 5; },
+};
+"#;
+        let symbols =
+            parser.parse_symbols(code, FileId::new(1).unwrap(), &mut SymbolCounter::new());
+        let named = |name: &str, kind| {
+            symbols
+                .iter()
+                .any(|symbol| symbol.name.as_ref() == name && symbol.kind == kind)
+        };
+        assert!(named("shorthand", SymbolKind::Method));
+        assert!(
+            named("arrow", SymbolKind::Method),
+            "arrow property is callable: {symbols:?}"
+        );
+        assert!(
+            named("load", SymbolKind::Method),
+            "async method is callable: {symbols:?}"
+        );
+        assert!(
+            named("deep", SymbolKind::Method),
+            "nested method is callable: {symbols:?}"
+        );
+        assert!(
+            named("current", SymbolKind::Field),
+            "getter is a value: {symbols:?}"
+        );
+        assert!(!symbols.iter().any(|symbol| symbol.name.as_ref() == "get"));
+    }
+
+    #[test]
+    fn a_direct_object_variable_exposes_its_shorthand_method() {
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = "const store = { shorthand() { return 1; } };";
+        let symbols =
+            parser.parse_symbols(code, FileId::new(1).unwrap(), &mut SymbolCounter::new());
+        assert!(
+            symbols
+                .iter()
+                .any(|symbol| symbol.name.as_ref() == "shorthand"
+                    && symbol.kind == SymbolKind::Method),
+            "the assigned object method must be searchable: {symbols:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_inside_an_object_arrow_property_belongs_to_that_property() {
+        let mut parser = TypeScriptParser::new().unwrap();
+        let code = "const store = { refresh: () => fetchState() };";
+        let calls = parser.find_calls(code);
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.caller == "refresh" && call.target == "fetchState"),
+            "the callable property owns its call: {calls:?}"
         );
     }
 
