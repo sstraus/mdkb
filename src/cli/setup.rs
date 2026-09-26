@@ -503,12 +503,8 @@ pub fn check_distiller(root: &Path) -> DistillerCheck {
 pub const HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
     ("SessionStart", "session-start", None),
     ("UserPromptSubmit", "user-prompt-submit", None),
-    (
-        "PostToolUse",
-        "post-tool-use",
-        Some("Edit|Write|NotebookEdit|MultiEdit"),
-    ),
-    ("PreToolUse", "pre-tool-use", Some("Grep|Bash")),
+    ("PostToolUse", "post-tool-use", None),
+    ("PreToolUse", "pre-tool-use", None),
     ("Stop", "stop", None),
 ];
 
@@ -1626,6 +1622,48 @@ mod tests {
             })
         });
         assert!(rtk_preserved, "unrelated rtk hook must be preserved");
+    }
+
+    #[test]
+    fn setup_replaces_scoped_tool_hooks_with_all_tool_registrations() {
+        let mut settings = serde_json::json!({
+            "hooks": {
+                "PreToolUse": [
+                    {"_managedBy":"mdkb","matcher":"Grep|Bash","hooks":[{"type":"command","command":"mdkb hook pre-tool-use"}]},
+                    {"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]}
+                ],
+                "PostToolUse": [
+                    {"_managedBy":"mdkb","matcher":"Edit|Write","hooks":[{"type":"command","command":"mdkb hook post-tool-use"}]}
+                ]
+            }
+        });
+        upsert_hook_entries(
+            &mut settings,
+            "/usr/bin/mdkb",
+            &std::collections::HashSet::new(),
+            false,
+            None,
+        );
+        for event in ["PreToolUse", "PostToolUse"] {
+            let entries = settings["hooks"][event].as_array().unwrap();
+            let managed: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry["_managedBy"] == "mdkb")
+                .collect();
+            assert_eq!(managed.len(), 1, "one mdkb registration for {event}");
+            assert!(
+                managed[0].get("matcher").is_none(),
+                "{event} must reach Edit, Agent and MCP tools too: {managed:?}"
+            );
+        }
+        assert!(
+            settings["hooks"]["PreToolUse"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["matcher"] == "Bash"),
+            "setup keeps another tool's hook"
+        );
     }
 
     /// A canonical single-scope install (one mdkb entry per event) is clean.

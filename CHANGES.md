@@ -12,6 +12,17 @@
   window. The log contains sizes and block names, never the prompt or lesson
   text. Measured need from the maintainer's 2026-09-23 hook audit.
 
+### Changed
+
+- **PreToolUse and PostToolUse hooks now register for every tool.** A prior
+  naming Edit, Agent, Bash, or an MCP tool can reach the handler that already
+  checks its trigger; an unmatched call remains silent. Existing Claude hook
+  registrations keep their old matcher until setup is run again with the
+  original scope, for example `mdkb setup hooks claude --scope local`. The
+  isolated warm-daemon baseline for unmatched calls was 17.171 ms p95 before
+  dispatch and under 1 ms at the daemon handler's log resolution. Found by the
+  maintainer's 2026-09-23 hook audit.
+
 ## 3.11.0 (2026-09-22)
 
 ### Changed

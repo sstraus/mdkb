@@ -10537,6 +10537,32 @@ mod tests {
         assert_eq!(row["payload_blocks"]["call_graph_hint"], context.len());
     }
 
+    #[tokio::test]
+    async fn unmatched_all_tool_hooks_return_no_context_or_payload_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        for (method, event, row_name) in [
+            (
+                "hook.pre_tool_use",
+                json!({"tool_name":"Agent","tool_input":{},"session_id":"empty-pre"}),
+                "pre_tool_use",
+            ),
+            (
+                "hook.post_tool_use",
+                json!({"tool_name":"Bash","tool_input":{"command":"true"},"session_id":"empty-post"}),
+                "post_tool_use",
+            ),
+        ] {
+            let result = dispatch_call(method, event, Arc::clone(&handle), &make_dctx())
+                .await
+                .unwrap();
+            assert_eq!(result, json!({}), "unmatched {method} must stay silent");
+            let row = hook_event_row(&handle.root, row_name).await;
+            assert_eq!(row["outcome"], "skipped");
+            assert!(row.get("payload_bytes").is_none(), "no host payload: {row}");
+        }
+    }
+
     /// A hook switched off on purpose is a legitimate negative — and must be
     /// named as one, so it is never confused with a store that broke.
     #[tokio::test]
