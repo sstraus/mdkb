@@ -1101,14 +1101,14 @@ pub const NEAR_DUPLICATE_DISTANCE: f32 = 0.32;
 /// enough.
 const NEAR_DUPLICATE_NEIGHBOURS: usize = 3;
 
-/// How many the vector index is asked for, to get that many active ones.
+/// Initial vector fetch size before growing past inactive neighbours.
 ///
 /// Archiving, superseding and pruning only flip `status`; the vector stays in
 /// `vec_memory` until a hard DELETE. The status filter therefore runs AFTER
-/// the KNN, so three nearest neighbours that are all inactive left a genuine
-/// active duplicate one rank further out uninspected, and the write was
-/// accepted. `memory_vector_search` over-fetches by the same factor on its
-/// `entry_type` arm, for the same reason.
+/// the KNN. This initial window avoids repeat queries in the common case;
+/// [`find_duplicate`] grows it until an active match, the distance threshold,
+/// or the end of the index is reached. `memory_vector_search` over-fetches by
+/// the same factor on its `entry_type` arm, for the same reason.
 const NEAR_DUPLICATE_FETCH: usize = NEAR_DUPLICATE_NEIGHBOURS * 5;
 
 /// The wider band in which two entries are worth comparing but are not the same
@@ -1193,32 +1193,42 @@ pub fn find_duplicate(
     let Some(embedding) = embedding else {
         return Ok(None);
     };
-    let neighbours =
-        crate::store::vectors::memory_vector_search(conn, embedding, NEAR_DUPLICATE_FETCH, None)?;
-    for (rowid, distance) in neighbours {
-        if distance >= NEAR_DUPLICATE_DISTANCE {
-            continue;
+    let mut fetch_limit = NEAR_DUPLICATE_FETCH;
+    loop {
+        let neighbours =
+            crate::store::vectors::memory_vector_search(conn, embedding, fetch_limit, None)?;
+        let exhausted = neighbours.len() < fetch_limit;
+        for (rowid, distance) in neighbours {
+            // The vector query orders by distance. Nothing after this row can
+            // be a duplicate, even if the current window is full.
+            if distance >= NEAR_DUPLICATE_DISTANCE {
+                return Ok(None);
+            }
+            let Some(entry) = get_entry_by_rowid(conn, rowid)? else {
+                continue;
+            };
+            if entry.id == id {
+                continue;
+            }
+            // Archived entries keep their vectors. They must not hide a live
+            // duplicate beyond the current fetch window.
+            if entry.status != EntryStatus::Active {
+                continue;
+            }
+            let similarity = crate::store::hybrid::cosine_from_distance(distance);
+            return Ok(Some(Duplicate::Meaning {
+                entry: Box::new(entry),
+                similarity,
+            }));
         }
-        let Some(entry) = get_entry_by_rowid(conn, rowid)? else {
-            continue;
-        };
-        if entry.id == id {
-            continue;
+        if exhausted {
+            return Ok(None);
         }
-        // The title arm scopes itself to active rows; this one has to say so
-        // too. Archiving, superseding and pruning only flip `status` — the
-        // vector stays in `vec_memory`, which only a hard DELETE clears. A
-        // neighbour that search can no longer return must not refuse a write.
-        if entry.status != EntryStatus::Active {
-            continue;
-        }
-        let similarity = crate::store::hybrid::cosine_from_distance(distance);
-        return Ok(Some(Duplicate::Meaning {
-            entry: Box::new(entry),
-            similarity,
-        }));
+        fetch_limit = fetch_limit
+            .checked_mul(2)
+            .filter(|limit| *limit <= i64::MAX as usize)
+            .ok_or_else(|| Error::other("memory duplicate search exceeded its result limit"))?;
     }
-    Ok(None)
 }
 
 /// The active entry carrying exactly this title, ignoring `exclude_id`.
@@ -4633,7 +4643,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: 172-e3c6"]
     fn an_archive_larger_than_the_fetch_window_does_not_hide_a_live_duplicate() {
         use crate::store::vectors;
         let conn = setup_db_with_vectors();

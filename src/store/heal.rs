@@ -840,15 +840,21 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
     // that failed leaves one reporting 0 entries — the same text a genuinely
     // empty memory table produces. Deleting on age alone turns a recoverable
     // state into a permanent loss, fifteen days later, in silence.
-    let salvaged: std::collections::HashSet<i64> = std::fs::read_dir(mdkb_dir)
+    let salvaged: std::collections::HashSet<String> = std::fs::read_dir(mdkb_dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".report.json"))
-        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
-        .filter_map(|raw| serde_json::from_str::<QuarantineReport>(&raw).ok())
-        .filter(|r| r.salvage_succeeded)
-        .map(|r| r.quarantined_at)
+        .filter_map(|entry| {
+            let file_name = entry.file_name().to_string_lossy().into_owned();
+            let copy_name = file_name.strip_suffix(".report.json")?;
+            let timestamp = quarantine_ts(copy_name)?;
+            let raw = std::fs::read_to_string(entry.path()).ok()?;
+            let report: QuarantineReport = serde_json::from_str(&raw).ok()?;
+            (report.salvage_succeeded
+                && report.corrupt_file == copy_name
+                && report.quarantined_at == timestamp)
+                .then(|| copy_name.to_string())
+        })
         .collect();
 
     let retention_secs = retention.as_secs() as i64;
@@ -870,10 +876,16 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
         // Expired, but never salvaged: this copy is the last one standing
         // between the operator and the loss. Keep it and say why, once per
         // sweep, at a level they will see.
-        if !salvaged.contains(&quarantined_at) {
-            tracing::warn!(
-                "quarantine {name} is past its retention but its salvage never succeeded;                  keeping it — it may hold the only copy of those memory entries"
-            );
+        let copy_name = name
+            .strip_suffix("-wal")
+            .or_else(|| name.strip_suffix("-shm"))
+            .unwrap_or(&name);
+        if !salvaged.contains(copy_name) {
+            if copy_name == name {
+                tracing::warn!(
+                    "quarantine {name} is past its retention but its salvage never succeeded; keeping it — it may hold the only copy of those memory entries"
+                );
+            }
             continue;
         }
         // Best-effort. Windows refuses to unlink a file another process still
@@ -1453,7 +1465,8 @@ mod tests {
         std::fs::write(
             report_path(&corrupt),
             format!(
-                r#"{{"corrupt_file":"x","quarantined_at":{stamp},"memory_entries_salvaged":0,"memory_edges_salvaged":0,"salvage_succeeded":{salvaged}}}"#
+                r#"{{"corrupt_file":"{}","quarantined_at":{stamp},"memory_entries_salvaged":0,"memory_edges_salvaged":0,"salvage_succeeded":{salvaged}}}"#,
+                corrupt.file_name().unwrap().to_string_lossy()
             ),
         )
         .unwrap();
@@ -1504,7 +1517,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "defect: 171-8ee1"]
     fn a_successful_collision_copy_does_not_authorize_deleting_an_unsalvaged_sibling() {
         let dir = tempfile::tempdir().unwrap();
         let now = 1_800_000_000_i64;
@@ -1513,6 +1525,8 @@ mod tests {
         let unsalvaged = dir.path().join(format!("index.sqlite.corrupt-{stamp}-1"));
         std::fs::write(&salvaged, b"salvaged copy").unwrap();
         std::fs::write(&unsalvaged, b"only remaining memory copy").unwrap();
+        std::fs::write(with_suffix(&salvaged, "-wal"), b"salvaged wal").unwrap();
+        std::fs::write(with_suffix(&unsalvaged, "-wal"), b"unsalvaged wal").unwrap();
         std::fs::write(
             report_path(&salvaged),
             format!(
@@ -1524,10 +1538,12 @@ mod tests {
         sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
 
         assert!(!salvaged.exists(), "the reported copy is safe to remove");
+        assert!(!with_suffix(&salvaged, "-wal").exists());
         assert!(
             unsalvaged.exists(),
             "one successful report must not authorize deleting a different copy"
         );
+        assert!(with_suffix(&unsalvaged, "-wal").exists());
     }
 
     #[test]
