@@ -1231,6 +1231,31 @@ pub fn record_injection(
     Ok(())
 }
 
+/// Reserve one tool-prior injection per cluster and session. The row and
+/// counter advance together, so a repeated hook event cannot inflate telemetry.
+pub fn record_tool_injection_once(
+    conn: &Connection,
+    cluster_id: &str,
+    session: &str,
+    now: i64,
+) -> Result<bool> {
+    let tx = conn.unchecked_transaction()?;
+    let inserted = tx.execute(
+        "INSERT INTO prior_injections (cluster_id, session, injected_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(cluster_id, session) DO NOTHING",
+        params![cluster_id, session, now],
+    )?;
+    if inserted == 1 {
+        tx.execute(
+            "UPDATE prior_clusters SET injected_count = injected_count + 1 WHERE id = ?1",
+            params![cluster_id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(inserted == 1)
+}
+
 // ============================================================================
 // The belief loop — an injected prior is confirmed or refuted by what followed
 // ============================================================================

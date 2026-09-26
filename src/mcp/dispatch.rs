@@ -5617,7 +5617,7 @@ async fn tool_prior_block(
     after: bool,
     session: &str,
 ) -> Option<String> {
-    use crate::store::priors::{TriggerContext, match_injectable, record_injection};
+    use crate::store::priors::{TriggerContext, match_injectable, record_tool_injection_once};
 
     if !handle.config.priors.injection_enabled {
         return None;
@@ -5638,6 +5638,9 @@ async fn tool_prior_block(
     let now = chrono::Utc::now().timestamp();
     let max = handle.config.priors.max_injected_per_hook;
     let label = if after { "post-tool" } else { "pre-tool" };
+    if max == 0 {
+        return None;
+    }
 
     // Read from the ALREADY-open context only — the tool hot path must never
     // force a DB open (the same reason `code_index_hits` guards on `.exists()`).
@@ -5659,7 +5662,9 @@ async fn tool_prior_block(
         }
     };
     let hits = crate::core::run_guarded_read(&mut ctx_guard, "tool prior lookup", |ctx| {
-        match_injectable(&ctx.conn, &tctx, now, max)
+        // The cap applies to fresh injections, not to already-seen matches.
+        // The matcher already loads and sorts all candidates before truncating.
+        match_injectable(&ctx.conn, &tctx, now, usize::MAX)
     })?
     .ok()?;
     if hits.is_empty() {
@@ -5668,16 +5673,22 @@ async fn tool_prior_block(
     let mut lines = Vec::with_capacity(hits.len());
     for c in &hits {
         let prior_id = c.id.clone();
-        if let Some(Err(error)) =
-            crate::core::run_guarded_write(&mut ctx_guard, "tool prior telemetry", |ctx| {
-                record_injection(&ctx.conn, &prior_id, session, now)
-            })
-        {
-            tracing::warn!("record {label} prior injection: {error}");
+        match crate::core::run_guarded_write(&mut ctx_guard, "tool prior telemetry", |ctx| {
+            record_tool_injection_once(&ctx.conn, &prior_id, session, now)
+        }) {
+            Some(Ok(true)) => lines.push(format!("mdkb prior: {}", c.lesson)),
+            Some(Ok(false)) | None => {}
+            Some(Err(error)) => tracing::warn!("record {label} prior injection: {error}"),
         }
-        lines.push(format!("mdkb prior: {}", c.lesson));
+        if lines.len() == max {
+            break;
+        }
     }
-    Some(lines.join("\n"))
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
+    }
 }
 
 /// Up to `limit` indexed definitions of `symbol`, formatted as a PreToolUse
@@ -11103,6 +11114,85 @@ mod tests {
             "injected block must carry the lesson: {hit}"
         );
 
+        let repeated = pretool_prior_block(
+            &handle,
+            "Edit",
+            &json!({"file_path": edit_path.to_string_lossy()}),
+            "sess-inject",
+        )
+        .await;
+        assert!(
+            repeated.is_none(),
+            "a session must see each prior once: {repeated:?}"
+        );
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            assert_eq!(
+                get_cluster(conn, &cluster_id)
+                    .unwrap()
+                    .unwrap()
+                    .injected_count,
+                1,
+                "a skipped duplicate must not increment injection telemetry"
+            );
+        }
+
+        // A new lesson installed after the first call remains eligible in the
+        // same session; deduplication is per prior, not per tool invocation.
+        let second_matcher = r#"{"path_glob":"src/generated/schema.rs"}"#;
+        let second_key = canonical_trigger_key("pre_tool", second_matcher);
+        let second_id = cluster_id_for_key(&second_key);
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            crate::store::priors::upsert_cluster(
+                conn,
+                &crate::store::priors::PriorCluster {
+                    id: second_id.clone(),
+                    canonical_trigger_key: second_key,
+                    trigger_kind: "pre_tool".into(),
+                    trigger_matcher: second_matcher.into(),
+                    lesson: "Check the schema generator output.".into(),
+                    scope: r#"{"repo":"current"}"#.into(),
+                    evidence_count: 2,
+                    distinct_sessions: 2,
+                    injected_count: 0,
+                    confirmed_count: 0,
+                    refuted_count: 0,
+                    state: "candidate".into(),
+                    promoted_memory_id: None,
+                    created_at: chrono::Utc::now().timestamp(),
+                    last_seen_at: chrono::Utc::now().timestamp(),
+                    error_signature: None,
+                },
+            )
+            .unwrap();
+            crate::store::priors::promote_cluster(conn, &second_id, chrono::Utc::now().timestamp())
+                .unwrap();
+        }
+        let second_call = pretool_prior_block(
+            &handle,
+            "Edit",
+            &json!({"file_path": edit_path.to_string_lossy()}),
+            "sess-inject",
+        )
+        .await
+        .expect("a newly matching prior must still inject");
+        assert_eq!(
+            second_call,
+            "mdkb prior: Check the schema generator output."
+        );
+
+        let next_session = pretool_prior_block(
+            &handle,
+            "Edit",
+            &json!({"file_path": tmp.path().join("src/generated/other.rs").to_string_lossy()}),
+            "sess-next",
+        )
+        .await;
+        assert_eq!(next_session.as_deref(), Some(hit.as_str()));
+
         // A path outside the glob surfaces nothing — injection is trigger-scoped,
         // never global.
         let unrelated_path = tmp.path().join("src/hand_written.rs");
@@ -11171,6 +11261,7 @@ mod tests {
         let event = json!({
             "tool_name": "Write",
             "tool_input": {"file_path": file.to_str().unwrap()},
+            "session_id": "post-once",
         });
         let result = hook_post_tool_use_impl(&handle, &event).await;
         let injected = result["hookSpecificOutput"]["additionalContext"]
@@ -11188,6 +11279,24 @@ mod tests {
             result["queued"], true,
             "injecting a prior must not cancel the reindex the hook exists for: {result}"
         );
+
+        let repeated = hook_post_tool_use_impl(&handle, &event).await;
+        assert!(
+            repeated.get("hookSpecificOutput").is_none(),
+            "a repeated PostToolUse in the same session must not show the prior: {repeated}"
+        );
+        assert_eq!(repeated["queued"], true, "reindex still runs: {repeated}");
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            assert_eq!(
+                crate::store::priors::get_cluster(conn, &cluster_id)
+                    .unwrap()
+                    .unwrap()
+                    .injected_count,
+                1
+            );
+        }
 
         // A tool call outside the glob gets the reindex and no lesson.
         let other = tmp.path().join("notes.md");
