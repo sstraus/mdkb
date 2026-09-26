@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Hook telemetry now records the bytes sent to the host and the blocks that
+  produced them.** `hook-events.jsonl` records the size of the actual
+  `additionalContext` and attributes bytes to SessionStart, search redirects,
+  code hits, priors, memory and document recall, related documents, and call
+  graph hints. `mdkb stats` aggregates these totals over its seven-day hook
+  window. The log contains sizes and block names, never the prompt or lesson
+  text. Measured need from the maintainer's 2026-09-23 hook audit.
+
 ## 3.11.0 (2026-09-22)
 
 ### Changed

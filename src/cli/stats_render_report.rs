@@ -312,6 +312,12 @@ fn render_hooks(out: &mut String, h: &HooksSummary) {
                 "\n  {:<17}  {:>5}  {:>5}  {:>5}  {:>3}%  {:>4}ms {:>4}ms",
                 e.event, e.invocations, e.fired, e.converted, hit_pct, e.avg_ms, e.p95_ms
             );
+            if e.payload_bytes > 0 {
+                let _ = write!(body, "\n    payload         {} B", e.payload_bytes);
+                for (block, bytes) in &e.payload_blocks {
+                    let _ = write!(body, "\n      {block:<20} {bytes} B");
+                }
+            }
         }
     }
 
@@ -674,6 +680,37 @@ mod tests {
     fn render_hooks_shows_slow_count() {
         let out = render(&fixture_report(), false);
         assert!(out.contains('3')); // slow_events_7d
+    }
+
+    #[test]
+    fn render_hooks_shows_payload_bytes_per_hook_and_block() {
+        let mut report = fixture_report();
+        report
+            .hooks
+            .events
+            .push(crate::cli::stats_report::HookEventStats {
+                event: "pre_tool_use".to_string(),
+                invocations: 2,
+                fired: 1,
+                converted: 0,
+                avg_ms: 3,
+                p95_ms: 5,
+                payload_bytes: 32,
+                payload_blocks: [
+                    ("search_redirect".to_string(), 20),
+                    ("prior".to_string(), 12),
+                ]
+                .into(),
+            });
+        let out = render(&report, false);
+        assert!(out.contains("32 B"), "hook payload total missing: {out}");
+        assert!(
+            out.contains("search_redirect"),
+            "redirect block missing: {out}"
+        );
+        assert!(out.contains("20 B"), "redirect bytes missing: {out}");
+        assert!(out.contains("prior"), "prior block missing: {out}");
+        assert!(out.contains("12 B"), "prior bytes missing: {out}");
     }
 
     #[test]

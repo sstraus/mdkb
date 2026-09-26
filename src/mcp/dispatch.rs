@@ -3485,6 +3485,47 @@ pub async fn usage_impl(
 /// keeping the log bounded without an external logrotate.
 pub const HOOK_LOG_CAP_BYTES: u64 = 1024 * 1024; // 1 MiB
 
+#[derive(Debug)]
+struct HookPayload {
+    bytes: usize,
+    blocks: std::collections::BTreeMap<&'static str, usize>,
+}
+
+impl HookPayload {
+    fn single(result: &Value, block: &'static str) -> Option<Self> {
+        let context = result
+            .pointer("/hookSpecificOutput/additionalContext")?
+            .as_str()?;
+        if context.is_empty() {
+            return None;
+        }
+        let mut blocks = std::collections::BTreeMap::new();
+        blocks.insert(block, context.len());
+        Some(Self {
+            bytes: context.len(),
+            blocks,
+        })
+    }
+
+    fn from_parts(result: &Value, parts: Vec<(&'static str, usize)>) -> Option<Self> {
+        let context = result
+            .pointer("/hookSpecificOutput/additionalContext")?
+            .as_str()?;
+        if context.is_empty() {
+            return None;
+        }
+        let mut blocks = std::collections::BTreeMap::new();
+        for (name, bytes) in parts {
+            *blocks.entry(name).or_insert(0) += bytes;
+        }
+        debug_assert_eq!(blocks.values().sum::<usize>(), context.len());
+        Some(Self {
+            bytes: context.len(),
+            blocks,
+        })
+    }
+}
+
 /// Append `line` (which must already end in `\n`) to `path`. If the file exceeds
 /// [`HOOK_LOG_CAP_BYTES`], the oldest half of its lines is dropped first so the
 /// newest history is retained. Best-effort — I/O errors are swallowed.
@@ -3535,6 +3576,7 @@ fn log_hook_event(
         outcome,
         None,
         None,
+        None,
         elapsed_ms,
         slow_threshold_ms,
     );
@@ -3558,6 +3600,7 @@ fn log_hook_event_with_reason(
         outcome,
         reason,
         None,
+        None,
         elapsed_ms,
         slow_threshold_ms,
     );
@@ -3578,6 +3621,7 @@ fn log_hook_event_with_phases(
     outcome: &str,
     reason: Option<&str>,
     phases: &PhaseTimings,
+    payload: Option<&HookPayload>,
     elapsed_ms: u64,
     slow_threshold_ms: u64,
 ) {
@@ -3587,6 +3631,7 @@ fn log_hook_event_with_phases(
         outcome,
         reason,
         phases.as_json().map(|value| ("phases", value)),
+        payload,
         elapsed_ms,
         slow_threshold_ms,
     );
@@ -3605,6 +3650,7 @@ fn log_hook_event_with_shadow(
     root: std::path::PathBuf,
     event: &str,
     shadow: &ShadowRecall,
+    payload: Option<&HookPayload>,
     elapsed_ms: u64,
     slow_threshold_ms: u64,
 ) {
@@ -3614,6 +3660,7 @@ fn log_hook_event_with_shadow(
         "shadow",
         None,
         Some(("shadow", shadow.as_json())),
+        payload,
         elapsed_ms,
         slow_threshold_ms,
     );
@@ -3629,6 +3676,7 @@ fn log_hook_event_full(
     outcome: &str,
     reason: Option<&str>,
     extra: Option<(&'static str, serde_json::Value)>,
+    hook_payload: Option<&HookPayload>,
     elapsed_ms: u64,
     slow_threshold_ms: u64,
 ) {
@@ -3644,6 +3692,10 @@ fn log_hook_event_full(
     }
     if let Some((field, value)) = extra {
         payload[field] = value;
+    }
+    if let Some(hook_payload) = hook_payload {
+        payload["payload_bytes"] = serde_json::json!(hook_payload.bytes);
+        payload["payload_blocks"] = serde_json::json!(hook_payload.blocks);
     }
     let mut line = payload.to_string();
     line.push('\n');
@@ -4598,8 +4650,16 @@ impl ShadowRecall {
 
 pub async fn hook_user_prompt_submit_impl(handle: &RepoHandle, prompt: &str) -> Value {
     let mut shadow = None;
-    hook_user_prompt_submit_impl_with_dedup(handle, prompt, UNKNOWN_SESSION, None, &mut shadow)
-        .await
+    let mut payload_parts = Vec::new();
+    hook_user_prompt_submit_impl_with_dedup(
+        handle,
+        prompt,
+        UNKNOWN_SESSION,
+        None,
+        &mut shadow,
+        &mut payload_parts,
+    )
+    .await
 }
 
 async fn hook_user_prompt_submit_impl_with_dedup(
@@ -4608,6 +4668,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     session: &str,
     dedup: Option<(&DispatchContext, String)>,
     shadow: &mut Option<ShadowRecall>,
+    payload_parts: &mut Vec<(&'static str, usize)>,
 ) -> Value {
     use crate::cli::hook_logic::prompt_wants_call_graph;
 
@@ -4629,6 +4690,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     if mode == RecallMode::Off {
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
+            payload_parts,
         );
     }
     // Two floors, one knob each way round: the sigil lowers the bar because
@@ -4664,6 +4726,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     if fts_query.is_none() && !wants_cg && path_tokens.is_empty() {
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
+            payload_parts,
         );
     }
 
@@ -4905,6 +4968,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         });
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
+            payload_parts,
         );
     }
 
@@ -4922,6 +4986,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     let mut body = String::new();
 
     if !results.is_empty() {
+        let start = body.len();
         body.push_str("## mdkb: relevant context\n\n");
         for entry in &results {
             let snippet_raw =
@@ -4947,9 +5012,11 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             body.push('\n');
         }
         body.push_str("\nIf your work corroborates any entry above, run `mdkb memory confirm <id> --outcome confirmed` instead of writing a new one.\n");
+        payload_parts.push(("recall_memory", body.len() - start));
     }
 
     if !doc_lines.is_empty() {
+        let start = body.len();
         if !body.is_empty() {
             body.push('\n');
         }
@@ -4958,9 +5025,11 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             body.push_str(line);
             body.push('\n');
         }
+        payload_parts.push(("recall_docs", body.len() - start));
     }
 
     if !related.is_empty() {
+        let start = body.len();
         if !body.is_empty() {
             body.push('\n');
         }
@@ -4969,21 +5038,26 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             body.push_str(line);
             body.push('\n');
         }
+        payload_parts.push(("related_docs", body.len() - start));
     }
 
     if let Some(prior) = prior_block {
+        let start = body.len();
         if !body.is_empty() {
             body.push('\n');
         }
         body.push_str("## mdkb: priors\n\n");
         body.push_str(&prior);
         body.push('\n');
+        payload_parts.push(("prior", body.len() - start));
     }
 
     if wants_cg {
+        let start = body.len();
         body.push_str(
             "\n💡 This looks like a call-graph query. Use `code_graph(name)` or `code_graph(name, direction=\"callers\"|\"callees\"|\"impact\")` — one MCP call replaces multi-file Grep.\n",
         );
+        payload_parts.push(("call_graph_hint", body.len() - start));
     }
 
     if body.is_empty() {
@@ -4999,14 +5073,19 @@ async fn hook_user_prompt_submit_impl_with_dedup(
 }
 
 /// A literal prompt trigger can answer independently of semantic recall.
-fn prompt_prior_response(prior: Option<String>) -> Value {
+fn prompt_prior_response(
+    prior: Option<String>,
+    payload_parts: &mut Vec<(&'static str, usize)>,
+) -> Value {
     let Some(prior) = prior else {
         return json!({});
     };
+    let context = format!("## mdkb: priors\n\n{prior}\n");
+    payload_parts.push(("prior", context.len()));
     json!({
         "hookSpecificOutput": {
             "hookEventName": "UserPromptSubmit",
-            "additionalContext": format!("## mdkb: priors\n\n{prior}\n"),
+            "additionalContext": context,
         }
     })
 }
@@ -5517,14 +5596,21 @@ pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Valu
 }
 
 pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value {
+    hook_pre_tool_use_with_payload(handle, event).await.0
+}
+
+async fn hook_pre_tool_use_with_payload(
+    handle: &RepoHandle,
+    event: &Value,
+) -> (Value, Option<HookPayload>) {
     if !handle.config.hooks.pre_tool_use_enabled {
-        return json!({});
+        return (json!({}), None);
     }
     let Some(tool_name) = event.get("tool_name").and_then(|v| v.as_str()) else {
-        return json!({});
+        return (json!({}), None);
     };
     let Some(tool_input) = event.get("tool_input") else {
-        return json!({});
+        return (json!({}), None);
     };
     let bin = std::env::current_exe()
         .ok()
@@ -5567,6 +5653,7 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
         None
     };
 
+    let has_code_hits = hits.is_some();
     let search_block = match (hits, suggestion) {
         (Some(block), _) => Some(block), // act
         (None, Some(s)) => Some(s),      // fall back to suggest
@@ -5579,6 +5666,24 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
     let prior_block =
         pretool_prior_block(handle, tool_name, tool_input, &event_session(event)).await;
 
+    let mut parts = Vec::new();
+    if let Some(search) = &search_block {
+        parts.push((
+            if has_code_hits {
+                "code_hits"
+            } else {
+                "search_redirect"
+            },
+            search.len(),
+        ));
+    }
+    if let Some(prior) = &prior_block {
+        parts.push((
+            "prior",
+            prior.len() + if search_block.is_some() { 2 } else { 0 },
+        ));
+    }
+
     let text = match (search_block, prior_block) {
         (Some(s), Some(p)) => Some(format!("{s}\n\n{p}")),
         (Some(s), None) => Some(s),
@@ -5586,7 +5691,7 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
         (None, None) => None,
     };
 
-    match text {
+    let result = match text {
         Some(text) => json!({
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -5594,7 +5699,9 @@ pub async fn hook_pre_tool_use_impl(handle: &RepoHandle, event: &Value) -> Value
             }
         }),
         None => json!({}),
-    }
+    };
+    let payload = HookPayload::from_parts(&result, parts);
+    (result, payload)
 }
 
 /// Promoted priors whose trigger matches this PreToolUse call.
@@ -6111,6 +6218,7 @@ pub async fn dispatch_call(
             let label = outcome.label();
             let reason = outcome.reason().map(str::to_string);
             let result = outcome.into_value();
+            let payload = HookPayload::single(&result, "session_start");
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || {
@@ -6120,6 +6228,7 @@ pub async fn dispatch_call(
                     label,
                     reason.as_deref(),
                     &phases,
+                    payload.as_ref(),
                     ms,
                     budget,
                 );
@@ -6136,14 +6245,17 @@ pub async fn dispatch_call(
             let session = event_session(&params);
             let t0 = std::time::Instant::now();
             let mut shadow = None;
+            let mut payload_parts = Vec::new();
             let result = hook_user_prompt_submit_impl_with_dedup(
                 &handle,
                 prompt,
                 &session,
                 Some((dctx, key)),
                 &mut shadow,
+                &mut payload_parts,
             )
             .await;
+            let payload = HookPayload::from_parts(&result, payload_parts);
             let ms = t0.elapsed().as_millis() as u64;
             let outcome = if result == json!({}) {
                 "skipped"
@@ -6154,9 +6266,25 @@ pub async fn dispatch_call(
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || match shadow {
                 Some(shadow) => {
-                    log_hook_event_with_shadow(root, "user_prompt_submit", &shadow, ms, budget);
+                    log_hook_event_with_shadow(
+                        root,
+                        "user_prompt_submit",
+                        &shadow,
+                        payload.as_ref(),
+                        ms,
+                        budget,
+                    );
                 }
-                None => log_hook_event(root, "user_prompt_submit", outcome, ms, budget),
+                None => log_hook_event_full(
+                    root,
+                    "user_prompt_submit",
+                    outcome,
+                    None,
+                    None,
+                    payload.as_ref(),
+                    ms,
+                    budget,
+                ),
             });
             record_hook_call(&handle, tool_name).await;
             Ok(result)
@@ -6188,15 +6316,25 @@ pub async fn dispatch_call(
             };
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
+            let payload = HookPayload::single(&result, "prior");
             tokio::task::spawn_blocking(move || {
-                log_hook_event(root, "post_tool_use", outcome, ms, budget);
+                log_hook_event_full(
+                    root,
+                    "post_tool_use",
+                    outcome,
+                    None,
+                    None,
+                    payload.as_ref(),
+                    ms,
+                    budget,
+                );
             });
             record_hook_call(&handle, tool_name).await;
             Ok(result)
         }
         "hook.pre_tool_use" => {
             let t0 = std::time::Instant::now();
-            let result = hook_pre_tool_use_impl(&handle, &params).await;
+            let (result, payload) = hook_pre_tool_use_with_payload(&handle, &params).await;
             let ms = t0.elapsed().as_millis() as u64;
             // "mdkb_invocation" is the conversion signal: a Bash command that
             // actually runs mdkb. Tracking it against "fired" measures whether
@@ -6218,7 +6356,16 @@ pub async fn dispatch_call(
             let root = handle.root.clone();
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || {
-                log_hook_event(root, "pre_tool_use", outcome, ms, budget);
+                log_hook_event_full(
+                    root,
+                    "pre_tool_use",
+                    outcome,
+                    None,
+                    None,
+                    payload.as_ref(),
+                    ms,
+                    budget,
+                );
             });
             record_hook_call(&handle, tool_name).await;
             Ok(result)
@@ -7701,6 +7848,7 @@ mod tests {
             UNKNOWN_SESSION,
             None,
             &mut shadow,
+            &mut Vec::new(),
         )
         .await;
 
@@ -7738,6 +7886,7 @@ mod tests {
             UNKNOWN_SESSION,
             Some((&dctx, key.clone())),
             &mut shadow,
+            &mut Vec::new(),
         )
         .await;
         assert_eq!(observed, json!({}));
@@ -7753,6 +7902,7 @@ mod tests {
             UNKNOWN_SESSION,
             Some((&dctx, key)),
             &mut ignored,
+            &mut Vec::new(),
         )
         .await;
         let body = additional_context(&injected);
@@ -10189,6 +10339,204 @@ mod tests {
         (rows.into_iter().next().unwrap(), result)
     }
 
+    #[tokio::test]
+    async fn session_start_log_counts_exact_host_payload_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "payload-fixture").await;
+        let (row, result) = session_start_row(&handle).await;
+        let host_context = additional_context(&result);
+        assert!(!host_context.is_empty(), "fixture must emit context");
+        assert_eq!(row["payload_bytes"], host_context.as_bytes().len());
+        assert_eq!(
+            row["payload_blocks"]["session_start"],
+            host_context.as_bytes().len()
+        );
+        assert!(
+            row.to_string().find("payload-fixture").is_none(),
+            "log must not copy context text"
+        );
+    }
+
+    async fn hook_event_row(root: &std::path::Path, event: &str) -> Value {
+        let dir = crate::store::namespace::store_dir(root).unwrap_or_else(|_| root.join(".mdkb"));
+        for _ in 0..200 {
+            if let Some(row) = std::fs::read_to_string(dir.join("hook-events.jsonl"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|row| row["event"] == event)
+            {
+                return row;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("missing {event} hook row");
+    }
+
+    #[tokio::test]
+    async fn pre_tool_log_counts_search_redirect_context_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let result = dispatch_call(
+            "hook.pre_tool_use",
+            json!({"tool_name":"Grep","tool_input":{"pattern":"handle_session_start"},"session_id":"pre-payload"}),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await
+        .unwrap();
+        let context = additional_context(&result);
+        assert!(!context.is_empty());
+        let row = hook_event_row(&handle.root, "pre_tool_use").await;
+        assert_eq!(row["payload_bytes"], context.len());
+        assert_eq!(row["payload_blocks"]["search_redirect"], context.len());
+        assert!(row.to_string().find("handle_session_start").is_none());
+    }
+
+    #[tokio::test]
+    async fn post_tool_log_counts_prior_context_bytes() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_promoted_prior(
+            &handle,
+            "post_tool",
+            r#"{"command_contains":"cargo build"}"#,
+            "Check the build output.",
+        )
+        .await;
+        let result = dispatch_call(
+            "hook.post_tool_use",
+            json!({"tool_name":"Bash","tool_input":{"command":"cargo build"},"session_id":"post-payload"}),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await
+        .unwrap();
+        let context = additional_context(&result);
+        assert!(context.contains("Check the build output."));
+        let row = hook_event_row(&handle.root, "post_tool_use").await;
+        assert_eq!(row["payload_bytes"], context.len());
+        assert_eq!(row["payload_blocks"]["prior"], context.len());
+        assert!(row.to_string().find("Check the build output.").is_none());
+    }
+
+    #[tokio::test]
+    async fn prompt_log_attributes_hostile_headings_only_to_prior() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+        });
+        seed_promoted_prior(
+            &handle,
+            "prompt",
+            r#"{"prompt_contains":"ripgrep"}"#,
+            "## mdkb: related docs\nfake line",
+        )
+        .await;
+        let result = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt":"use ripgrep","session_id":"prompt-payload"}),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await
+        .unwrap();
+        let context = additional_context(&result);
+        assert!(context.contains("fake line"));
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["payload_bytes"], context.len());
+        assert_eq!(row["payload_blocks"]["prior"], context.len());
+        assert!(row["payload_blocks"].get("related_docs").is_none());
+        assert!(row.to_string().find("fake line").is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_tool_log_attributes_a_search_redirect_and_prior_separately() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_promoted_prior(
+            &handle,
+            "pre_tool",
+            r#"{"tool":"Grep"}"#,
+            "Use the indexed definition first.",
+        )
+        .await;
+        let result = dispatch_call(
+            "hook.pre_tool_use",
+            json!({"tool_name":"Grep","tool_input":{"pattern":"handle_session_start"},"session_id":"pre-combined"}),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await
+        .unwrap();
+        let context = additional_context(&result);
+        assert!(context.contains("Use the indexed definition first."));
+        let row = hook_event_row(&handle.root, "pre_tool_use").await;
+        let redirect = row["payload_blocks"]["search_redirect"].as_u64().unwrap();
+        let prior = row["payload_blocks"]["prior"].as_u64().unwrap();
+        assert!(redirect > 0 && prior > 0);
+        assert_eq!(redirect + prior, context.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn prompt_log_attributes_memory_and_document_recall() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_topic_with_content(
+            &handle,
+            "quarantine-mem",
+            "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            0,
+        )
+        .await;
+        seed_document(
+            &handle,
+            "docs/quarantine.md",
+            "Quarantine handling",
+            "The autoheal routine quarantines a corrupt index before rebuilding it.",
+        )
+        .await;
+        let result = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt":"* how does quarantine autoheal work","session_id":"recall-payload"}),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await
+        .unwrap();
+        let context = additional_context(&result);
+        assert!(context.contains("quarantine-mem"));
+        assert!(context.contains("docs/quarantine.md"));
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        let memory = row["payload_blocks"]["recall_memory"].as_u64().unwrap();
+        let docs = row["payload_blocks"]["recall_docs"].as_u64().unwrap();
+        assert!(memory > 0 && docs > 0);
+        assert_eq!(memory + docs, context.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn prompt_log_attributes_call_graph_hint_without_recall_hits() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let result = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt":"* who calls nonexistentHandler","session_id":"graph-hint"}),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await
+        .unwrap();
+        let context = additional_context(&result);
+        assert!(
+            context.contains("call-graph query"),
+            "fixture must emit hint: {result}"
+        );
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["payload_bytes"], context.len());
+        assert_eq!(row["payload_blocks"]["call_graph_hint"], context.len());
+    }
+
     /// A hook switched off on purpose is a legitimate negative — and must be
     /// named as one, so it is never confused with a store that broke.
     #[tokio::test]
@@ -10482,6 +10830,7 @@ mod tests {
             "sigil-free",
             None,
             &mut shadow,
+            &mut Vec::new(),
         )
         .await;
         assert!(
@@ -10545,6 +10894,7 @@ mod tests {
             "shadow-trigger",
             None,
             &mut shadow,
+            &mut Vec::new(),
         )
         .await;
         assert!(shadow.is_some(), "shadow recall observation is retained");

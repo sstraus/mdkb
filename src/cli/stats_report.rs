@@ -189,6 +189,10 @@ pub struct HookEventStats {
     pub converted: usize,
     pub avg_ms: u64,
     pub p95_ms: u64,
+    /// Sum of context bytes returned to the host in this log window.
+    pub payload_bytes: u64,
+    /// Bytes attributed to each contributing hook block.
+    pub payload_blocks: std::collections::BTreeMap<String, u64>,
 }
 
 // ── collect_report ───────────────────────────────────────────────────────────
@@ -592,8 +596,17 @@ fn collect_mining(ctx: &Context) -> MiningStatus {
 }
 
 fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats> {
-    // Per entry: (fired, converted, elapsed_ms).
-    let mut buckets: HashMap<String, Vec<(bool, bool, u64)>> = HashMap::new();
+    // Per entry: (fired, converted, elapsed_ms, payload_bytes, block_bytes).
+    let mut buckets: HashMap<
+        String,
+        Vec<(
+            bool,
+            bool,
+            u64,
+            u64,
+            serde_json::Map<String, serde_json::Value>,
+        )>,
+    > = HashMap::new();
 
     for v in events {
         let event = v
@@ -612,10 +625,16 @@ fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats>
             .and_then(|o| o.as_str())
             .unwrap_or("skipped");
         let elapsed = v.get("elapsed_ms").and_then(|e| e.as_u64()).unwrap_or(0);
+        let payload_bytes = v.get("payload_bytes").and_then(|b| b.as_u64()).unwrap_or(0);
         buckets.entry(event).or_default().push((
-            outcome == "fired",
+            outcome == "fired" || payload_bytes > 0,
             outcome == "mdkb_invocation",
             elapsed,
+            payload_bytes,
+            v.get("payload_blocks")
+                .and_then(|b| b.as_object())
+                .cloned()
+                .unwrap_or_default(),
         ));
     }
 
@@ -623,10 +642,21 @@ fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats>
         .into_iter()
         .map(|(event, entries)| {
             let invocations = entries.len();
-            let fired = entries.iter().filter(|(f, _, _)| *f).count();
-            let converted = entries.iter().filter(|(_, c, _)| *c).count();
-            let mut latencies: Vec<u64> = entries.iter().map(|(_, _, ms)| *ms).collect();
+            let fired = entries.iter().filter(|(f, _, _, _, _)| *f).count();
+            let converted = entries.iter().filter(|(_, c, _, _, _)| *c).count();
+            let mut latencies: Vec<u64> = entries.iter().map(|(_, _, ms, _, _)| *ms).collect();
             latencies.sort_unstable();
+            let mut payload_bytes = 0u64;
+            let mut payload_blocks = std::collections::BTreeMap::new();
+            for (_, _, _, bytes, blocks) in &entries {
+                payload_bytes = payload_bytes.saturating_add(*bytes);
+                for (name, count) in blocks {
+                    if let Some(count) = count.as_u64() {
+                        let total: &mut u64 = payload_blocks.entry(name.clone()).or_insert(0);
+                        *total = total.saturating_add(count);
+                    }
+                }
+            }
             let avg_ms = if invocations > 0 {
                 latencies.iter().sum::<u64>() / invocations as u64
             } else {
@@ -644,6 +674,8 @@ fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats>
                 converted,
                 avg_ms,
                 p95_ms,
+                payload_bytes,
+                payload_blocks,
             }
         })
         .collect();
@@ -1043,7 +1075,7 @@ mod tests {
         let now = chrono::Utc::now().timestamp();
         let lines = [
             format!(
-                r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":5,"ts":{}}}"#,
+                r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":5,"payload_bytes":12,"payload_blocks":{{"search_redirect":12}},"ts":{}}}"#,
                 now
             ),
             format!(
@@ -1051,7 +1083,7 @@ mod tests {
                 now
             ),
             format!(
-                r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":10,"ts":{}}}"#,
+                r#"{{"event":"PreToolUse","outcome":"fired","elapsed_ms":10,"payload_bytes":20,"payload_blocks":{{"search_redirect":8,"prior":12}},"ts":{}}}"#,
                 now
             ),
             // Conversion signal: Claude actually ran mdkb after a redirect.
@@ -1085,6 +1117,10 @@ mod tests {
         assert_eq!(pre.converted, 1); // the mdkb_invocation
         assert_eq!(pre.avg_ms, 4); // (5+2+10+1)/4 = 4
         assert_eq!(pre.p95_ms, 10); // sorted: [1,2,5,10], idx ceil(4*0.95)-1 = 3 → 10
+        let pre_json = serde_json::to_value(pre).unwrap();
+        assert_eq!(pre_json["payload_bytes"], 32);
+        assert_eq!(pre_json["payload_blocks"]["search_redirect"], 20);
+        assert_eq!(pre_json["payload_blocks"]["prior"], 12);
 
         let post = report
             .hooks
