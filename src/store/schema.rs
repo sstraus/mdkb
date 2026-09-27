@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 30;
+pub const SCHEMA_VERSION: i32 = 31;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -312,6 +312,7 @@ CREATE TABLE IF NOT EXISTS prior_clusters (
     injected_count INTEGER NOT NULL DEFAULT 0,
     confirmed_count INTEGER NOT NULL DEFAULT 0,
     refuted_count INTEGER NOT NULL DEFAULT 0,
+    misfired_count INTEGER NOT NULL DEFAULT 0,
     state TEXT NOT NULL DEFAULT 'candidate',  -- candidate|promoted|refuted|expired|archived
     promoted_memory_id TEXT,                 -- memory_entries.id once promoted
     created_at INTEGER NOT NULL,
@@ -324,14 +325,14 @@ CREATE INDEX IF NOT EXISTS idx_prior_clusters_trigger ON prior_clusters(canonica
 CREATE INDEX IF NOT EXISTS idx_prior_clusters_state ON prior_clusters(state);
 
 -- One row per (cluster, session) in which the prior was injected, settled at the
--- next Stop hook into `confirmed` or `refuted`. The composite primary key is
--- what makes "confirmed at most once per session" structural rather than a rule
--- the settling code has to remember.
+-- next Stop hook into `refuted`, `unrefuted` or `unobservable`, or explicitly
+-- judged as `confirmed`, `refuted` or `misfired` by the model. The composite
+-- primary key makes one verdict per cluster and session structural.
 CREATE TABLE IF NOT EXISTS prior_injections (
     cluster_id TEXT NOT NULL,
     session TEXT NOT NULL,
     injected_at INTEGER NOT NULL,            -- first injection in this session
-    outcome TEXT,                            -- NULL until settled, then confirmed|refuted
+    outcome TEXT,                            -- NULL until settled; see outcomes above
     settled_at INTEGER,
     PRIMARY KEY (cluster_id, session),
     FOREIGN KEY(cluster_id) REFERENCES prior_clusters(id) ON DELETE CASCADE
@@ -1155,6 +1156,22 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
         conn.execute_batch(RELATION_CANDIDATES_SQL)?;
     }
 
+    // A trigger can fire out of context while the underlying lesson remains
+    // true. Keep that verdict separate from a refutation of the lesson.
+    if from_version < 31 && table_exists(conn, "prior_clusters") {
+        let has_misfired: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('prior_clusters') WHERE name = 'misfired_count')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_misfired {
+            conn.execute(
+                "ALTER TABLE prior_clusters ADD COLUMN misfired_count INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+    }
+
     // Update schema version
     conn.execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION])?;
 
@@ -1220,6 +1237,33 @@ mod tests {
             .expect("get_schema_version failed")
             .expect("version should be set");
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_migrate_v30_to_v31_preserves_priors_and_adds_misfire_counter() {
+        let conn = setup_db();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO prior_clusters (id, canonical_trigger_key, trigger_kind, trigger_matcher,
+             lesson, scope, created_at, last_seen_at) VALUES ('clu-old', 'k', 'prompt', '{}', 'l', '{}', 1, 2)",
+            [],
+        ).unwrap();
+        conn.execute("ALTER TABLE prior_clusters DROP COLUMN misfired_count", [])
+            .unwrap();
+        conn.execute("UPDATE schema_version SET version = 30", [])
+            .unwrap();
+
+        init_schema(&conn).expect("v30 to v31 migration");
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT misfired_count FROM prior_clusters WHERE id = 'clu-old'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(31));
     }
 
     #[test]

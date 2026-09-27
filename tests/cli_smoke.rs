@@ -59,6 +59,14 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+#[test]
+fn memory_confirm_help_describes_misfired_prior_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = run(&["memory", "confirm", "--help"], dir.path());
+    assert_ok(&out, "memory confirm --help");
+    assert!(stdout(&out).contains("misfired"), "{}", stdout(&out));
+}
+
 fn assert_hook_output_valid(out: &Output, label: &str) {
     let s = stdout(out);
     let trimmed = s.trim();

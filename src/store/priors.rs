@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
 use crate::domain::prior_distill::DistilledPrior;
-use crate::error::Result;
+use crate::error::{ErrorKind, Result};
 use crate::llm::cosine_similarity;
 use crate::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
 
@@ -42,12 +42,15 @@ pub struct PriorCluster {
     pub injected_count: i64,
     pub confirmed_count: i64,
     pub refuted_count: i64,
+    pub misfired_count: i64,
     /// `candidate` | `promoted` | `refuted` | `expired`.
     pub state: String,
     /// `memory_entries.id` once promoted; `None` while un-promoted.
     pub promoted_memory_id: Option<String>,
     pub created_at: i64,
     pub last_seen_at: i64,
+    /// Read-time freshness evidence, not a mined failure timestamp.
+    pub last_unrefuted_injection_at: Option<i64>,
     /// The tool-error signature this lesson exists to prevent, captured from the
     /// episode that first mined it. A session where the prior was injected and
     /// this signature did NOT come back confirms it; one where it did refutes it.
@@ -86,18 +89,34 @@ pub const INJECT_SCORE_THRESHOLD: f64 = 0.3;
 /// per-entry `source_authority` that made honestly-tagged AI priors
 /// permanently non-injectable (they could never reach the 0.7 memory gate).
 ///
-/// `score = recurrence × freshness × belief`, where
+/// `score = recurrence × freshness × belief × context_fit`, where
 /// - `recurrence = sessions / (sessions + 1)` — saturating; rewards a lesson
 ///   observed across independent sessions, not one noisy transcript.
-/// - `freshness = exp(-days_since_seen / (90 × strength))`, `strength` grows
+/// - `freshness = exp(-days_since_effective_use / (90 × strength))`, `strength` grows
 ///   with accumulated evidence so well-established lessons decay slower.
 /// - `belief = (1 + confirmed) / (2 + confirmed + refuted)` — a Beta posterior
 ///   where refutations are genuine negative evidence (not a floored decrement).
+/// - `context_fit = sessions / (sessions + misfired)` — a correct lesson shown
+///   in the wrong context loses reach without treating the lesson as false.
+///
+/// Freshness and belief worst cases at the promotion gate (zero days, two
+/// observations, no verdicts) are 1/3, 3/8 and 7/16 for 2, 3 and 7 sessions.
+/// One confirmation plus one refutation leaves the same scores. One additional
+/// refutation gives 4/15, 3/10 and 7/20 respectively; the last two can meet
+/// the 0.3 threshold despite negative evidence outnumbering positive evidence,
+/// so [`is_injectable`] also applies a majority veto.
 pub fn cluster_injection_score(c: &PriorCluster, now: i64) -> f64 {
     let sessions = c.distinct_sessions.max(0) as f64;
+    if sessions == 0.0 {
+        return 0.0;
+    }
     let recurrence = sessions / (sessions + 1.0);
 
-    let days = ((now - c.last_seen_at) as f64 / 86_400.0).max(0.0);
+    let freshness_at = c
+        .last_unrefuted_injection_at
+        .unwrap_or(c.last_seen_at)
+        .max(c.last_seen_at);
+    let days = ((now - freshness_at) as f64 / 86_400.0).max(0.0);
     let strength = 1.0 + (1.0 + c.evidence_count.max(0) as f64).ln();
     let freshness = (-days / (90.0 * strength)).exp();
 
@@ -105,13 +124,17 @@ pub fn cluster_injection_score(c: &PriorCluster, now: i64) -> f64 {
     let refuted = c.refuted_count.max(0) as f64;
     let belief = (1.0 + confirmed) / (2.0 + confirmed + refuted);
 
-    recurrence * freshness * belief
+    let context_fit = sessions / (sessions + c.misfired_count.max(0) as f64);
+
+    recurrence * freshness * belief * context_fit
 }
 
 /// Whether a cluster may be injected: only a `promoted` cluster whose score
 /// clears the threshold. Candidates and un-promoted clusters never inject.
 pub fn is_injectable(c: &PriorCluster, now: i64) -> bool {
-    c.state == "promoted" && cluster_injection_score(c, now) >= INJECT_SCORE_THRESHOLD
+    c.state == "promoted"
+        && c.refuted_count <= c.confirmed_count
+        && cluster_injection_score(c, now) >= INJECT_SCORE_THRESHOLD
 }
 
 /// Insert or update a prior cluster. Uses `ON CONFLICT DO UPDATE` (not
@@ -122,8 +145,8 @@ pub fn upsert_cluster(conn: &Connection, c: &PriorCluster) -> Result<()> {
         "INSERT INTO prior_clusters (
             id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
             evidence_count, distinct_sessions, injected_count, confirmed_count, refuted_count,
-            state, promoted_memory_id, created_at, last_seen_at, error_signature
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            state, promoted_memory_id, created_at, last_seen_at, error_signature, misfired_count
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
         ON CONFLICT(id) DO UPDATE SET
             canonical_trigger_key = excluded.canonical_trigger_key,
             trigger_kind = excluded.trigger_kind,
@@ -139,7 +162,8 @@ pub fn upsert_cluster(conn: &Connection, c: &PriorCluster) -> Result<()> {
             promoted_memory_id = excluded.promoted_memory_id,
             created_at = excluded.created_at,
             last_seen_at = excluded.last_seen_at,
-            error_signature = excluded.error_signature",
+            error_signature = excluded.error_signature,
+            misfired_count = excluded.misfired_count",
         params![
             c.id,
             c.canonical_trigger_key,
@@ -157,6 +181,7 @@ pub fn upsert_cluster(conn: &Connection, c: &PriorCluster) -> Result<()> {
             c.created_at,
             c.last_seen_at,
             c.error_signature,
+            c.misfired_count,
         ],
     )?;
     Ok(())
@@ -168,8 +193,10 @@ pub fn get_cluster(conn: &Connection, id: &str) -> Result<Option<PriorCluster>> 
         .query_row(
             "SELECT id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
                     evidence_count, distinct_sessions, injected_count, confirmed_count, refuted_count,
-                    state, promoted_memory_id, created_at, last_seen_at, error_signature
-             FROM prior_clusters WHERE id = ?1",
+                    state, promoted_memory_id, created_at, last_seen_at, error_signature, misfired_count,
+                    (SELECT MAX(i.injected_at) FROM prior_injections i
+                     WHERE i.cluster_id = c.id AND (i.outcome IS NULL OR i.outcome != 'refuted'))
+             FROM prior_clusters c WHERE id = ?1",
             params![id],
             |row| {
                 Ok(PriorCluster {
@@ -189,6 +216,8 @@ pub fn get_cluster(conn: &Connection, id: &str) -> Result<Option<PriorCluster>> 
                     created_at: row.get(13)?,
                     last_seen_at: row.get(14)?,
                     error_signature: row.get(15)?,
+                    misfired_count: row.get(16)?,
+                    last_unrefuted_injection_at: row.get(17)?,
                 })
             },
         )
@@ -517,10 +546,12 @@ pub fn integrate_candidate_with_embedding(
                 injected_count: 0,
                 confirmed_count: 0,
                 refuted_count: 0,
+                misfired_count: 0,
                 state: "candidate".into(),
                 promoted_memory_id: None,
                 created_at: now,
                 last_seen_at: now,
+                last_unrefuted_injection_at: None,
                 error_signature: None,
             },
         )?;
@@ -714,10 +745,12 @@ pub fn recluster(conn: &Connection, now: i64) -> Result<ReclusterReport> {
                         injected_count: 0,
                         confirmed_count: 0,
                         refuted_count: 0,
+                        misfired_count: 0,
                         state: "candidate".into(),
                         promoted_memory_id: None,
                         created_at: now,
                         last_seen_at: now,
+                        last_unrefuted_injection_at: None,
                         error_signature: None,
                     },
                 )?;
@@ -1074,7 +1107,9 @@ pub fn list_promoted_clusters(conn: &Connection, now: i64) -> Result<Vec<PriorCl
     let mut stmt = conn.prepare(
         "SELECT c.id, c.canonical_trigger_key, c.trigger_kind, c.trigger_matcher, c.lesson, c.scope,
                 c.evidence_count, c.distinct_sessions, c.injected_count, c.confirmed_count, c.refuted_count,
-                c.state, c.promoted_memory_id, c.created_at, c.last_seen_at, c.error_signature
+                c.state, c.promoted_memory_id, c.created_at, c.last_seen_at, c.error_signature, c.misfired_count,
+                (SELECT MAX(i.injected_at) FROM prior_injections i
+                 WHERE i.cluster_id = c.id AND (i.outcome IS NULL OR i.outcome != 'refuted'))
          FROM prior_clusters c
          JOIN memory_entries m ON m.id = c.promoted_memory_id
          WHERE c.state = 'promoted'
@@ -1099,6 +1134,8 @@ pub fn list_promoted_clusters(conn: &Connection, now: i64) -> Result<Vec<PriorCl
             created_at: row.get(13)?,
             last_seen_at: row.get(14)?,
             error_signature: row.get(15)?,
+            misfired_count: row.get(16)?,
+            last_unrefuted_injection_at: row.get(17)?,
         })
     })?;
     let mut out = Vec::new();
@@ -1220,26 +1257,46 @@ fn set_cluster_error_signature(conn: &Connection, cluster_id: &str, signature: &
 /// an error recurring after injection #1 refutes the prior regardless of how
 /// many times it was repeated afterwards.
 ///
-/// It deliberately does **not** touch `last_seen_at`. That field feeds the
-/// freshness term of [`cluster_injection_score`], so a prior that stamped it on
-/// every injection held its own score up without any new evidence — injected
-/// because it was fresh, fresh because it was injected. Only mining moves it,
-/// and mining moves it because it saw the pattern happen again.
+/// It deliberately does **not** touch `last_seen_at`: that remains the last
+/// observed failure. A separate read of injections that were not refuted
+/// supplies the score's effective-use timestamp. A new session also renews
+/// the active prior projection's expiry so its 30-day TTL cannot preempt a
+/// still-firing prior; an already-expired projection never reaches this path.
 pub fn record_injection(
     conn: &Connection,
     cluster_id: &str,
     session: &str,
     now: i64,
 ) -> Result<()> {
-    conn.execute(
+    let tx = conn.unchecked_transaction()?;
+    tx.execute(
         "UPDATE prior_clusters SET injected_count = injected_count + 1 WHERE id = ?1",
         params![cluster_id],
     )?;
-    conn.execute(
+    let inserted = tx.execute(
         "INSERT INTO prior_injections (cluster_id, session, injected_at)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(cluster_id, session) DO NOTHING",
         params![cluster_id, session, now],
+    )?;
+    if inserted == 1 {
+        renew_injected_projection(&tx, cluster_id, now)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// A genuinely new session keeps an active prior projection alive as long as
+/// the prior is still in use. Preserve a deliberate longer TTL or no expiry.
+fn renew_injected_projection(conn: &Connection, cluster_id: &str, now: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE memory_entries SET expires_at = MAX(expires_at, ?2)
+         WHERE id = (SELECT promoted_memory_id FROM prior_clusters WHERE id = ?1)
+           AND entry_type = 'prior' AND status = 'active' AND expires_at IS NOT NULL",
+        params![
+            cluster_id,
+            now.saturating_add(crate::store::memory::PRIOR_TTL_SECS)
+        ],
     )?;
     Ok(())
 }
@@ -1264,6 +1321,7 @@ pub fn record_tool_injection_once(
             "UPDATE prior_clusters SET injected_count = injected_count + 1 WHERE id = ?1",
             params![cluster_id],
         )?;
+        renew_injected_projection(&tx, cluster_id, now)?;
     }
     tx.commit()?;
     Ok(inserted == 1)
@@ -1361,8 +1419,8 @@ const MIN_SETTLEMENTS_BEFORE_REFUTED: i64 = 3;
 ///   evidence about it. 61 of the 66 clusters in the live store are here.
 /// * **unrefuted** — the signature existed and did not recur.
 ///
-/// **A session never confirms a prior.** Only a person does, through
-/// [`apply_belief_from_memory`]. The tempting automated rule — "the operation
+/// **Stop never confirms a prior from silence.** A model or person must give
+/// an explicit verdict through [`apply_belief_from_memory`]. The tempting automated rule — "the operation
 /// ran and the failure did not follow, so the lesson worked" — is not weak
 /// evidence but inverted evidence, for a reason the hook shape makes plain: the
 /// PreToolUse hook returns `additionalContext` and never a deny, so the command
@@ -1547,6 +1605,95 @@ pub fn apply_belief_from_memory(
     Ok(Some(cluster_id))
 }
 
+/// Judge one injected prior in the session that saw it. `None` means `id` is
+/// not a cluster id, so the caller may use ordinary memory confirmation.
+/// The injection row is the unique verdict ledger; Stop cannot count a second
+/// verdict after the model has claimed it, nor can a repeated tool call do so.
+pub fn record_model_verdict(
+    conn: &Connection,
+    id: &str,
+    outcome: &str,
+    session: Option<&str>,
+    now: i64,
+) -> Result<Option<String>> {
+    let memory_id: Option<Option<String>> = conn
+        .query_row(
+            "SELECT promoted_memory_id FROM prior_clusters WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(memory_id) = memory_id else {
+        return Ok(None);
+    };
+    let Some(memory_id) = memory_id else {
+        return Err(
+            ErrorKind::InvalidQuery(format!("Prior '{id}' has no promoted memory entry.")).into(),
+        );
+    };
+    if !matches!(outcome, "confirmed" | "refuted" | "misfired") {
+        return Err(ErrorKind::InvalidQuery(format!(
+            "Invalid prior outcome '{outcome}'. Expected confirmed, refuted or misfired."
+        ))
+        .into());
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let chosen = if let Some(session) = session {
+        if session.trim().is_empty() {
+            return Err(ErrorKind::InvalidQuery("Prior session cannot be blank.".into()).into());
+        }
+        session.to_string()
+    } else {
+        let mut stmt = tx.prepare(
+            "SELECT session FROM prior_injections WHERE cluster_id = ?1 AND outcome IS NULL",
+        )?;
+        let open: Vec<String> = stmt
+            .query_map(params![id], |row| row.get(0))?
+            .collect::<std::result::Result<_, _>>()?;
+        match open.as_slice() {
+            [only] => only.clone(),
+            [] => {
+                return Err(ErrorKind::InvalidQuery(format!(
+                    "Prior '{id}' has no open injection to judge."
+                ))
+                .into());
+            }
+            _ => {
+                return Err(ErrorKind::InvalidQuery(format!(
+                    "Prior '{id}' has multiple open sessions; pass session."
+                ))
+                .into());
+            }
+        }
+    };
+    let claimed = tx.execute(
+        "UPDATE prior_injections SET outcome = ?3, settled_at = ?4
+         WHERE cluster_id = ?1 AND session = ?2 AND outcome IS NULL",
+        params![id, chosen, outcome, now],
+    )?;
+    if claimed == 0 {
+        return Err(ErrorKind::InvalidQuery(format!(
+            "Prior '{id}' already has a verdict or was not injected in session '{chosen}'."
+        ))
+        .into());
+    }
+    if outcome == "misfired" {
+        tx.execute(
+            "UPDATE prior_clusters SET misfired_count = misfired_count + 1 WHERE id = ?1",
+            params![id],
+        )?;
+    } else {
+        let delta = if outcome == "confirmed" { 1 } else { -1 };
+        crate::store::memory::confirm_entry(&tx, &memory_id, delta)?;
+        apply_belief_from_memory(&tx, &memory_id, delta)?;
+    }
+    tx.commit()?;
+    Ok(Some(format!(
+        "Prior '{id}' {outcome} in session '{chosen}'."
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1571,10 +1718,12 @@ mod tests {
             injected_count: 0,
             confirmed_count: 0,
             refuted_count: 0,
+            misfired_count: 0,
             state: "candidate".into(),
             promoted_memory_id: None,
             created_at: 100,
             last_seen_at: 200,
+            last_unrefuted_injection_at: None,
             error_signature: None,
         }
     }
@@ -1666,6 +1815,61 @@ mod tests {
         let now = c.last_seen_at + 400 * 86_400; // ~400 days later
         assert!(is_injectable(&c, c.last_seen_at), "fresh: injectable");
         assert!(!is_injectable(&c, now), "stale: no longer injectable");
+    }
+
+    #[test]
+    fn a_recent_unrefuted_injection_keeps_an_old_lesson_injectable() {
+        let conn = conn();
+        let now = 200 + 60 * 86_400;
+        let mut c = sample_cluster();
+        c.state = "promoted".into();
+        upsert_cluster(&conn, &c).unwrap();
+        record_injection(&conn, &c.id, "working-session", now - 86_400).unwrap();
+
+        let observed = get_cluster(&conn, &c.id).unwrap().unwrap();
+        assert!(
+            is_injectable(&observed, now),
+            "a successful recent use renews freshness"
+        );
+    }
+
+    #[test]
+    fn a_refuted_injection_does_not_renew_freshness() {
+        let conn = conn();
+        let now = 200 + 400 * 86_400;
+        let mut c = sample_cluster();
+        c.state = "promoted".into();
+        upsert_cluster(&conn, &c).unwrap();
+        record_injection(&conn, &c.id, "failed-session", now - 86_400).unwrap();
+        conn.execute(
+            "UPDATE prior_injections SET outcome = 'refuted' WHERE cluster_id = ?1",
+            params![c.id],
+        )
+        .unwrap();
+
+        let observed = get_cluster(&conn, &c.id).unwrap().unwrap();
+        assert!(
+            !is_injectable(&observed, now),
+            "a failed use is no freshness signal"
+        );
+    }
+
+    #[test]
+    fn confirmations_balance_refutations_but_a_negative_majority_stops_injection() {
+        let mut c = sample_cluster();
+        c.state = "promoted".into();
+        c.distinct_sessions = 7;
+        c.confirmed_count = 1;
+        c.refuted_count = 1;
+        assert!(
+            is_injectable(&c, c.last_seen_at),
+            "one success balances one failure"
+        );
+        c.refuted_count = 2;
+        assert!(
+            !is_injectable(&c, c.last_seen_at),
+            "two failures outvote one success"
+        );
     }
 
     #[test]
@@ -1963,10 +2167,12 @@ mod tests {
                 injected_count: 0,
                 confirmed_count: 0,
                 refuted_count: 0,
+                misfired_count: 0,
                 state: "candidate".into(),
                 promoted_memory_id: None,
                 created_at: 1000,
                 last_seen_at: 1000,
+                last_unrefuted_injection_at: None,
                 error_signature: None,
             },
         )
@@ -2487,12 +2693,14 @@ mod tests {
             injected_count: 0,
             confirmed_count: 0,
             refuted_count: 0,
+            misfired_count: 0,
             state: "promoted".into(),
             // Linked by `with_live_projection` in the tests that need the
             // injection path; left unset in the ones that only move counters.
             promoted_memory_id: None,
             created_at: 100,
             last_seen_at: 200,
+            last_unrefuted_injection_at: None,
             error_signature: None,
         }
     }
@@ -2513,6 +2721,59 @@ mod tests {
         .unwrap();
         c.promoted_memory_id = Some(memory_id);
         upsert_cluster(conn, &c).unwrap();
+    }
+
+    #[test]
+    fn a_new_session_injection_renews_a_working_priors_projection() {
+        let conn = conn();
+        let expires = 100 + crate::store::memory::PRIOR_TTL_SECS;
+        let now = expires - 60;
+        seed_with_projection(
+            &conn,
+            promoted_cluster("clu-a", r#"{"path_glob":"src/generated/**"}"#, 2),
+            Some(expires),
+        );
+        record_injection(&conn, "clu-a", "earlier", expires - 15 * 86_400).unwrap();
+        let ctx = TriggerContext::PreTool {
+            tool: "Edit",
+            path: Some("src/generated/api.rs"),
+            command: None,
+        };
+        assert_eq!(match_injectable(&conn, &ctx, now, 1).unwrap().len(), 1);
+
+        record_injection(&conn, "clu-a", "new-session", now).unwrap();
+        let renewed: i64 = conn
+            .query_row(
+                "SELECT expires_at FROM memory_entries WHERE id = 'prior-clu-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(renewed >= now + crate::store::memory::PRIOR_TTL_SECS);
+
+        record_injection(&conn, "clu-a", "new-session", now + 100).unwrap();
+        let repeated: i64 = conn
+            .query_row(
+                "SELECT expires_at FROM memory_entries WHERE id = 'prior-clu-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(repeated, renewed, "one session extends the projection once");
+
+        assert!(record_tool_injection_once(&conn, "clu-a", "tool-session", now + 200).unwrap());
+        assert!(!record_tool_injection_once(&conn, "clu-a", "tool-session", now + 300).unwrap());
+        let tool_renewed: i64 = conn
+            .query_row(
+                "SELECT expires_at FROM memory_entries WHERE id = 'prior-clu-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            tool_renewed,
+            now + 200 + crate::store::memory::PRIOR_TTL_SECS
+        );
     }
 
     #[test]
@@ -3273,6 +3534,71 @@ mod tests {
         let after = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(after.confirmed_count, 1);
         assert_eq!(after.refuted_count, 1);
+    }
+
+    #[test]
+    fn model_verdict_is_once_per_cluster_and_session() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('prior-a', 'l', 'l', 'prior', '[]', 100, 100)",
+            [],
+        ).unwrap();
+        let mut c = sample_cluster();
+        c.state = "promoted".into();
+        c.promoted_memory_id = Some("prior-a".into());
+        upsert_cluster(&conn, &c).unwrap();
+        record_injection(&conn, &c.id, "session-a", 200).unwrap();
+
+        record_model_verdict(&conn, &c.id, "confirmed", Some("session-a"), 201).unwrap();
+        let repeat =
+            record_model_verdict(&conn, &c.id, "refuted", Some("session-a"), 202).unwrap_err();
+        assert!(
+            repeat.to_string().contains("already has a verdict"),
+            "{repeat}"
+        );
+        let after = get_cluster(&conn, &c.id).unwrap().unwrap();
+        assert_eq!((after.confirmed_count, after.refuted_count), (1, 0));
+        let score_before_misfire = cluster_injection_score(&after, 204);
+
+        record_injection(&conn, &c.id, "session-b", 203).unwrap();
+        record_model_verdict(&conn, &c.id, "misfired", Some("session-b"), 204).unwrap();
+        let after = get_cluster(&conn, &c.id).unwrap().unwrap();
+        assert_eq!(
+            (
+                after.confirmed_count,
+                after.refuted_count,
+                after.misfired_count
+            ),
+            (1, 0, 1)
+        );
+        assert!(cluster_injection_score(&after, 204) < score_before_misfire);
+    }
+
+    #[test]
+    fn model_verdict_requires_session_when_two_injections_are_open() {
+        let conn = conn();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+             VALUES ('prior-a', 'l', 'l', 'prior', '[]', 100, 100)",
+            [],
+        ).unwrap();
+        let mut c = sample_cluster();
+        c.state = "promoted".into();
+        c.promoted_memory_id = Some("prior-a".into());
+        upsert_cluster(&conn, &c).unwrap();
+        record_injection(&conn, &c.id, "session-a", 200).unwrap();
+        record_injection(&conn, &c.id, "session-b", 201).unwrap();
+
+        let ambiguous = record_model_verdict(&conn, &c.id, "confirmed", None, 202).unwrap_err();
+        assert!(
+            ambiguous.to_string().contains("multiple open sessions"),
+            "{ambiguous}"
+        );
+        record_model_verdict(&conn, &c.id, "confirmed", Some("session-b"), 203).unwrap();
+        let after = get_cluster(&conn, &c.id).unwrap().unwrap();
+        assert_eq!(after.confirmed_count, 1);
+        assert_eq!(after.refuted_count, 0);
     }
 
     /// Vouching for a prior must not be what kills it.

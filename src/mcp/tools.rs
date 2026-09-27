@@ -547,8 +547,12 @@ pub struct MemoryConfirmParams {
     #[serde(default)]
     pub root: Option<String>,
 
-    /// Outcome signal: "confirmed" increments confirmations; "refuted" decrements (floor 0).
+    /// confirmed = true and relevant; refuted = lesson wrong; misfired = true lesson, wrong context.
     pub outcome: String,
+
+    /// Session printed with an injected prior; required when several sessions are open.
+    #[serde(default)]
+    pub session: Option<String>,
 }
 
 /// Parameters for the memory_list tool.

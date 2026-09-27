@@ -855,8 +855,13 @@ impl McpServer {
         Parameters(params): Parameters<MemoryConfirmParams>,
     ) -> Result<CallToolResult, McpError> {
         let handle = self.resolve_handle(params.root.as_deref()).await?;
-        let output =
-            super::dispatch::memory_confirm_impl(&handle, &params.id, &params.outcome).await?;
+        let output = super::dispatch::memory_confirm_impl_for_session(
+            &handle,
+            &params.id,
+            &params.outcome,
+            params.session.as_deref(),
+        )
+        .await?;
 
         let tokens = count_tokens(&output);
         self.record_persistent_call("memory_confirm", tokens, 1, false)
@@ -1977,7 +1982,8 @@ mdkb is a **semantic** search engine (fuzzy, concept-based). It does NOT match l
 
 - `search(query, scope=\"memory\")` — check before writing duplicates.
 - `memory_write` / `memory_write_batch` — persist after solving problems.
-- `memory_confirm(id, outcome=\"confirmed\"|\"refuted\")` — adjust belief (+/-1, floor 0) instead of rewriting.
+- Judge an injected `mdkb prior [id]`: call `memory_confirm(id, outcome, session)` once. `confirmed` = true and relevant here; `refuted` = lesson wrong; `misfired` = true lesson, trigger out of context. Use the `mdkb prior session` value.
+- `memory_confirm` also verifies or refutes ordinary memory entries instead of rewriting them.
 - `memory_delete` — remove stale entries.
 
 `search` returns IDs → `get(id)` for full content. For a result from another repo, call `get` with the exact `repo` shown on it.

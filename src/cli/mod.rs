@@ -464,7 +464,7 @@ pub enum HookCommand {
         #[arg(long)]
         id: String,
 
-        /// Outcome (confirmed, rejected, …).
+        /// confirmed, refuted, or misfired for an injected prior.
         #[arg(long)]
         outcome: String,
 
@@ -812,7 +812,7 @@ pub enum MemoryCommand {
         /// Entry ID (slug)
         id: String,
 
-        /// confirmed (+1) or refuted (-1, floor 0)
+        /// confirmed or refuted; misfired means a true injected prior fired out of context.
         #[arg(long)]
         outcome: String,
     },

@@ -218,10 +218,12 @@ fn an_expired_prior_stops_injecting_when_its_projection_is_archived() {
             injected_count: 0,
             confirmed_count: 0,
             refuted_count: 0,
+            misfired_count: 0,
             state: "promoted".into(),
             promoted_memory_id: Some(MEMORY_ID.into()),
             created_at: now,
             last_seen_at: now,
+            last_unrefuted_injection_at: None,
             error_signature: None,
         },
     )

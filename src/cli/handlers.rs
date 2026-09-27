@@ -162,6 +162,34 @@ mod tests {
         (temp, ctx)
     }
 
+    fn seed_confirm_prior_cluster(ctx: &Context) {
+        use crate::store::priors::{PriorCluster, upsert_cluster};
+        upsert_cluster(
+            &ctx.conn,
+            &PriorCluster {
+                id: "clu-x".into(),
+                canonical_trigger_key: "pre_tool|{}".into(),
+                trigger_kind: "pre_tool".into(),
+                trigger_matcher: "{}".into(),
+                lesson: "Title".into(),
+                scope: "{}".into(),
+                evidence_count: 2,
+                distinct_sessions: 2,
+                injected_count: 0,
+                confirmed_count: 0,
+                refuted_count: 0,
+                misfired_count: 0,
+                state: "promoted".into(),
+                promoted_memory_id: Some("c1".into()),
+                created_at: 100,
+                last_seen_at: 100,
+                last_unrefuted_injection_at: None,
+                error_signature: None,
+            },
+        )
+        .expect("seed cluster");
+    }
+
     #[test]
     fn handle_get_resolves_path_memory_and_errors_once_on_missing() {
         // BUG-E2 correctness: after gating the collection scan to run once, a
@@ -289,31 +317,10 @@ mod tests {
     /// a human verdict that only touched the entry changed nothing at all.
     #[test]
     fn confirming_a_prior_projection_moves_the_cluster_belief() {
-        use crate::store::priors::{PriorCluster, get_cluster, upsert_cluster};
+        use crate::store::priors::get_cluster;
 
         let (_t, ctx) = confirm_test_ctx();
-        upsert_cluster(
-            &ctx.conn,
-            &PriorCluster {
-                id: "clu-x".into(),
-                canonical_trigger_key: "pre_tool|{}".into(),
-                trigger_kind: "pre_tool".into(),
-                trigger_matcher: "{}".into(),
-                lesson: "Title".into(),
-                scope: "{}".into(),
-                evidence_count: 2,
-                distinct_sessions: 2,
-                injected_count: 0,
-                confirmed_count: 0,
-                refuted_count: 0,
-                state: "promoted".into(),
-                promoted_memory_id: Some("c1".into()),
-                created_at: 100,
-                last_seen_at: 100,
-                error_signature: None,
-            },
-        )
-        .expect("seed cluster");
+        seed_confirm_prior_cluster(&ctx);
 
         handle_memory_confirm(&ctx, "c1", "confirmed").expect("confirm");
         handle_memory_confirm(&ctx, "c1", "refuted").expect("refute");
@@ -321,6 +328,20 @@ mod tests {
         let c = get_cluster(&ctx.conn, "clu-x").unwrap().expect("cluster");
         assert_eq!(c.confirmed_count, 1);
         assert_eq!(c.refuted_count, 1);
+    }
+
+    #[test]
+    fn cli_confirm_accepts_misfired_for_an_injected_cluster() {
+        use crate::store::priors::{get_cluster, record_injection};
+
+        let (_t, ctx) = confirm_test_ctx();
+        seed_confirm_prior_cluster(&ctx);
+        record_injection(&ctx.conn, "clu-x", "cli-session", 200).unwrap();
+
+        let result = handle_memory_confirm(&ctx, "clu-x", "misfired").expect("misfire verdict");
+        assert!(result.message.contains("misfired"));
+        let cluster = get_cluster(&ctx.conn, "clu-x").unwrap().unwrap();
+        assert_eq!((cluster.misfired_count, cluster.refuted_count), (1, 0));
     }
 
     #[test]

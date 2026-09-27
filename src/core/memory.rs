@@ -398,13 +398,38 @@ pub fn handle_memory_add(
 pub fn handle_memory_show(ctx: &Context, id: &str) -> Result<Option<MemoryEntry>> {
     memory::get_entry_without_tracking(&ctx.conn, id)
 }
-/// Handle `mdkb memory confirm <id> --outcome confirmed|refuted`.
+/// Handle `mdkb memory confirm <id> --outcome confirmed|refuted|misfired`.
 ///
 /// Runs fully in-process against the local DB — no daemon required — so the
 /// confirm loop is reachable on every transport (this is what the UPS recall
 /// nudge points at). Confirmations live in the DB (source of truth for the
 /// confidence signal); the markdown projection is refreshed on the next write.
 pub fn handle_memory_confirm(ctx: &Context, id: &str, outcome: &str) -> Result<ConfirmResult> {
+    if let Some(message) = crate::store::priors::record_model_verdict(
+        &ctx.conn,
+        id,
+        outcome,
+        None,
+        chrono::Utc::now().timestamp(),
+    )? {
+        let cluster = crate::store::priors::get_cluster(&ctx.conn, id)?
+            .expect("verdict requires an existing cluster");
+        let counters = cluster
+            .promoted_memory_id
+            .as_deref()
+            .map(|memory_id| memory::get_entry_without_tracking(&ctx.conn, memory_id))
+            .transpose()?
+            .flatten()
+            .map(|entry| (entry.confirmations, entry.corrections))
+            .unwrap_or((0, 0));
+        return Ok(ConfirmResult {
+            id: id.to_string(),
+            outcome: outcome.to_string(),
+            confirmations: counters.0,
+            corrections: counters.1,
+            message,
+        });
+    }
     let delta = memory::outcome_to_delta(outcome)?;
     let message = memory::confirm_entry(&ctx.conn, id, delta)?;
     // A promoted prior has two representations: the memory entry a person reads

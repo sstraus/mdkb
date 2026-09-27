@@ -6,6 +6,13 @@
 
 ### Added
 
+- **Injected priors can receive an explicit model verdict.** Hook context now
+  includes the cluster ID and session. `memory_confirm` accepts `confirmed`
+  when the lesson is true and relevant, `refuted` when it is wrong, and
+  `misfired` when a true lesson was triggered out of context. Each cluster can
+  receive at most one verdict per session. Found by the maintainer's
+  2026-09-23 prior audit.
+
 - **Hook telemetry now records the bytes sent to the host and the blocks that
   produced them.** `hook-events.jsonl` records the size of the actual
   `additionalContext` and attributes bytes to SessionStart, search redirects,
@@ -15,6 +22,12 @@
   text. Measured need from the maintainer's 2026-09-23 hook audit.
 
 ### Changed
+
+- **Working priors stay fresh through use.** Injection scoring now considers
+  the latest injection that was not refuted as well as the last observed
+  failure, and a new session renews the prior projection's expiry. A negative
+  majority still suppresses injection; misfires lower reach without refuting
+  the lesson. Found by the maintainer's 2026-09-23 prior audit.
 
 - **PreToolUse and PostToolUse hooks now register for every tool.** A prior
   naming Edit, Agent, Bash, or an MCP tool can reach the handler that already

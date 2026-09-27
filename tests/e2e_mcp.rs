@@ -2064,6 +2064,7 @@ async fn test_memory_confirm_counts_confirmations_and_refutations_separately() {
                 id: "confirm-target".to_string(),
                 root: None,
                 outcome: "confirmed".to_string(),
+                session: None,
             }))
             .await
             .expect("memory_confirm confirmed");
@@ -2091,6 +2092,7 @@ async fn test_memory_confirm_counts_confirmations_and_refutations_separately() {
                 id: "confirm-target".to_string(),
                 root: None,
                 outcome: "refuted".to_string(),
+                session: None,
             }))
             .await
             .expect("memory_confirm refuted");

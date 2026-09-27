@@ -955,22 +955,50 @@ pub async fn memory_delete_impl(
     })
 }
 
-/// `memory_confirm` — record a Bayesian confirmation signal against an entry.
-/// `outcome` must be "confirmed" (raises `confirmations`) or "refuted" (raises
-/// `corrections` and suppresses automatic injection).
+/// `memory_confirm` — judge an injected prior or verify an ordinary entry.
+/// A prior also accepts `misfired` when its lesson is true but its trigger was
+/// out of context; ordinary entries accept `confirmed` or `refuted`.
 pub async fn memory_confirm_impl(
     handle: &RepoHandle,
     id: &str,
     outcome: &str,
 ) -> Result<String, McpError> {
-    let delta = memory::outcome_to_delta(outcome).map_err(|e| mcp_error(e.to_string()))?;
+    memory_confirm_impl_for_session(handle, id, outcome, None).await
+}
 
+pub async fn memory_confirm_impl_for_session(
+    handle: &RepoHandle,
+    id: &str,
+    outcome: &str,
+    session: Option<&str>,
+) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
     let mut ctx_guard = handle.ctx.lock().await;
     run_handle_memory_mutation(&mut ctx_guard, "memory confirm", |ctx| {
-        memory::confirm_entry(&ctx.conn, id, delta)
-            .map_err(|e| mcp_store_error("Failed to confirm memory entry", e))
+        if let Some(message) = crate::store::priors::record_model_verdict(
+            &ctx.conn,
+            id,
+            outcome,
+            session,
+            chrono::Utc::now().timestamp(),
+        )
+        .map_err(|e| mcp_store_error("Failed to judge prior", e))?
+        {
+            return Ok(message);
+        }
+        let delta = memory::outcome_to_delta(outcome).map_err(|e| mcp_error(e.to_string()))?;
+        let tx = ctx
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| mcp_store_error("Failed to confirm memory entry", e))?;
+        let message = memory::confirm_entry(&tx, id, delta)
+            .map_err(|e| mcp_store_error("Failed to confirm memory entry", e))?;
+        crate::store::priors::apply_belief_from_memory(&tx, id, delta)
+            .map_err(|e| mcp_store_error("Failed to confirm prior belief", e))?;
+        tx.commit()
+            .map_err(|e| mcp_store_error("Failed to confirm memory entry", e))?;
+        Ok(message)
     })
 }
 
@@ -5134,7 +5162,7 @@ fn prompt_prior_response(
 }
 
 /// Promoted priors whose `prompt`-kind trigger matches the submitted prompt,
-/// formatted as `mdkb prior: <lesson>` lines (and recorded as injected). `None`
+/// formatted as `mdkb prior [<id>]: <lesson>` lines (and recorded as injected). `None`
 /// when injection is disabled, the store is unavailable, or nothing matches.
 async fn prompt_prior_block(
     handle: &RepoHandle,
@@ -5181,11 +5209,12 @@ async fn prompt_prior_block(
         if let Some((dctx, key)) = dedup {
             dctx.record_hook_prior(key, &c.id);
         }
-        lines.push(format!("mdkb prior: {}", c.lesson));
+        lines.push(format!("mdkb prior [{}]: {}", c.id, c.lesson));
     }
     if lines.is_empty() {
         return None;
     }
+    lines.push(format!("mdkb prior session: {session}"));
     Some(lines.join("\n"))
 }
 
@@ -5872,7 +5901,7 @@ async fn tool_prior_block(
         match crate::core::run_guarded_write(&mut ctx_guard, "tool prior telemetry", |ctx| {
             record_tool_injection_once(&ctx.conn, &prior_id, session, now)
         }) {
-            Some(Ok(true)) => lines.push(format!("mdkb prior: {}", c.lesson)),
+            Some(Ok(true)) => lines.push(format!("mdkb prior [{}]: {}", c.id, c.lesson)),
             Some(Ok(false)) | None => {}
             Some(Err(error)) => tracing::warn!("record {label} prior injection: {error}"),
         }
@@ -5883,6 +5912,7 @@ async fn tool_prior_block(
     if lines.is_empty() {
         None
     } else {
+        lines.push(format!("mdkb prior session: {session}"));
         Some(lines.join("\n"))
     }
 }
@@ -9375,6 +9405,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_confirm_impl_updates_a_promoted_prior_cluster() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "prior-a").await;
+        {
+            let guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            ctx.conn.execute(
+                "INSERT INTO prior_clusters (id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
+                 evidence_count, distinct_sessions, state, promoted_memory_id, created_at, last_seen_at)
+                 VALUES ('clu-a', 'tool:a', 'pre_tool', '{}', 'Check the fix', '{}', 2, 2,
+                         'promoted', 'prior-a', 100, 100)",
+                [],
+            ).unwrap();
+        }
+
+        memory_confirm_impl(&handle, "prior-a", "confirmed")
+            .await
+            .expect("model confirmation");
+        let guard = handle.ctx.lock().await;
+        let ctx = guard.as_ref().unwrap();
+        let count: i64 = ctx
+            .conn
+            .query_row(
+                "SELECT confirmed_count FROM prior_clusters WHERE id = 'clu-a'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "the injector scores the cluster, not its projection"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_confirm_impl_records_a_misfire_without_refuting_the_lesson() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "prior-a").await;
+        {
+            let guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            ctx.conn.execute(
+                "INSERT INTO prior_clusters (id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
+                 evidence_count, distinct_sessions, state, promoted_memory_id, created_at, last_seen_at)
+                 VALUES ('clu-a', 'tool:a', 'pre_tool', '{}', 'Check the fix', '{}', 2, 2,
+                         'promoted', 'prior-a', 100, 100)",
+                [],
+            ).unwrap();
+            crate::store::priors::record_injection(&ctx.conn, "clu-a", "sess-a", 200).unwrap();
+        }
+
+        memory_confirm_impl(&handle, "clu-a", "misfired")
+            .await
+            .expect("misfire verdict");
+        let guard = handle.ctx.lock().await;
+        let ctx = guard.as_ref().unwrap();
+        let (misfired, refuted): (i64, i64) = ctx
+            .conn
+            .query_row(
+                "SELECT misfired_count, refuted_count FROM prior_clusters WHERE id = 'clu-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((misfired, refuted), (1, 0));
+    }
+
+    #[tokio::test]
+    async fn memory_confirm_impl_uses_the_selected_session_for_a_cluster_verdict() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "prior-a").await;
+        {
+            let guard = handle.ctx.lock().await;
+            let ctx = guard.as_ref().unwrap();
+            ctx.conn.execute(
+                "INSERT INTO prior_clusters (id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
+                 evidence_count, distinct_sessions, state, promoted_memory_id, created_at, last_seen_at)
+                 VALUES ('clu-a', 'tool:a', 'pre_tool', '{}', 'Check the fix', '{}', 2, 2,
+                         'promoted', 'prior-a', 100, 100)",
+                [],
+            ).unwrap();
+            crate::store::priors::record_injection(&ctx.conn, "clu-a", "sess-a", 200).unwrap();
+            crate::store::priors::record_injection(&ctx.conn, "clu-a", "sess-b", 201).unwrap();
+        }
+
+        let ambiguous = memory_confirm_impl(&handle, "clu-a", "confirmed")
+            .await
+            .expect_err("the model must identify its session");
+        assert!(ambiguous.message.contains("multiple open sessions"));
+        memory_confirm_impl_for_session(&handle, "clu-a", "confirmed", Some("sess-b"))
+            .await
+            .expect("verdict for the selected session");
+        let guard = handle.ctx.lock().await;
+        let ctx = guard.as_ref().unwrap();
+        let counts: (i64, i64) = ctx
+            .conn
+            .query_row(
+                "SELECT confirmed_count, refuted_count FROM prior_clusters WHERE id = 'clu-a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let still_open: i64 = ctx.conn.query_row(
+            "SELECT COUNT(*) FROM prior_injections WHERE cluster_id = 'clu-a' AND session = 'sess-a' AND outcome IS NULL",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(counts, (1, 0));
+        assert_eq!(still_open, 1);
+    }
+
+    #[tokio::test]
     async fn memory_list_impl_returns_placeholder_when_empty() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
@@ -11049,10 +11193,12 @@ mod tests {
                 injected_count: 0,
                 confirmed_count: 0,
                 refuted_count: 0,
+                misfired_count: 0,
                 state: "promoted".into(),
                 promoted_memory_id: Some(memory_id),
                 created_at: now,
                 last_seen_at: now, // maximally fresh
+                last_unrefuted_injection_at: None,
                 error_signature: signature.map(str::to_string),
             },
         )
@@ -11082,7 +11228,10 @@ mod tests {
         let ctx = result["hookSpecificOutput"]["additionalContext"]
             .as_str()
             .unwrap_or("");
-        assert!(ctx.contains("mdkb prior:"), "expected prior, got: {result}");
+        assert!(
+            ctx.contains("mdkb prior ["),
+            "expected prior, got: {result}"
+        );
         assert!(ctx.contains("Do not edit generated files"));
     }
 
@@ -11135,11 +11284,12 @@ mod tests {
     async fn hook_user_prompt_submit_injects_prompt_matched_prior() {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
-        seed_promoted_prior(
+        let cluster_id = seed_promoted_prior_with_signature(
             &handle,
             "prompt",
             r#"{"prompt_contains":"ripgrep"}"#,
             "Prefer ripgrep over grep for repository search.",
+            None,
         )
         .await;
 
@@ -11149,7 +11299,12 @@ mod tests {
             .as_str()
             .unwrap_or("");
         assert!(ctx.contains("## mdkb: priors"), "got: {result}");
-        assert!(ctx.contains("Prefer ripgrep over grep"));
+        assert!(
+            ctx.contains(&format!(
+                "mdkb prior [{cluster_id}]: Prefer ripgrep over grep for repository search."
+            )),
+            "{ctx}"
+        );
     }
 
     #[tokio::test]
@@ -11950,8 +12105,10 @@ mod tests {
         .await
         .expect("promoted prior must inject on a matching PreToolUse");
         assert!(
-            hit.contains("mdkb prior: Do not edit generated files"),
-            "injected block must carry the lesson: {hit}"
+            hit.contains(&format!(
+                "mdkb prior [{cluster_id}]: Do not edit generated files"
+            )),
+            "injected block must carry the verdict id and lesson: {hit}"
         );
 
         let repeated = pretool_prior_block(
@@ -12000,10 +12157,12 @@ mod tests {
                     injected_count: 0,
                     confirmed_count: 0,
                     refuted_count: 0,
+                    misfired_count: 0,
                     state: "candidate".into(),
                     promoted_memory_id: None,
                     created_at: chrono::Utc::now().timestamp(),
                     last_seen_at: chrono::Utc::now().timestamp(),
+                    last_unrefuted_injection_at: None,
                     error_signature: None,
                 },
             )
@@ -12021,7 +12180,9 @@ mod tests {
         .expect("a newly matching prior must still inject");
         assert_eq!(
             second_call,
-            "mdkb prior: Check the schema generator output."
+            format!(
+                "mdkb prior [{second_id}]: Check the schema generator output.\nmdkb prior session: sess-inject"
+            )
         );
 
         let next_session = pretool_prior_block(
@@ -12031,7 +12192,10 @@ mod tests {
             "sess-next",
         )
         .await;
-        assert_eq!(next_session.as_deref(), Some(hit.as_str()));
+        let expected_next = format!(
+            "mdkb prior [{cluster_id}]: Do not edit generated files; edit the generator template instead.\nmdkb prior session: sess-next"
+        );
+        assert_eq!(next_session.as_deref(), Some(expected_next.as_str()));
 
         // A path outside the glob surfaces nothing — injection is trigger-scoped,
         // never global.
@@ -12087,10 +12251,12 @@ mod tests {
                     injected_count: 0,
                     confirmed_count: 0,
                     refuted_count: 0,
+                    misfired_count: 0,
                     state: "candidate".into(),
                     promoted_memory_id: None,
                     created_at: chrono::Utc::now().timestamp(),
                     last_seen_at: chrono::Utc::now().timestamp(),
+                    last_unrefuted_injection_at: None,
                     error_signature: None,
                 },
             )
@@ -12108,9 +12274,12 @@ mod tests {
             .as_str()
             .unwrap_or_default();
         assert!(
-            injected.contains("Run the generator after editing the template."),
+            injected.contains(&format!(
+                "mdkb prior [{cluster_id}]: Run the generator after editing the template."
+            )),
             "a matching post_tool prior must be injected, got: {result}"
         );
+        assert!(injected.contains("mdkb prior session: post-once"));
         assert_eq!(
             result["hookSpecificOutput"]["hookEventName"], "PostToolUse",
             "the block must be labelled for the event it answers: {result}"
@@ -12186,10 +12355,12 @@ mod tests {
                     injected_count: 0,
                     confirmed_count: 0,
                     refuted_count: 0,
+                    misfired_count: 0,
                     state: "candidate".into(),
                     promoted_memory_id: None,
                     created_at: chrono::Utc::now().timestamp(),
                     last_seen_at: chrono::Utc::now().timestamp(),
+                    last_unrefuted_injection_at: None,
                     error_signature: None,
                 },
             )
@@ -12273,10 +12444,12 @@ mod tests {
                     injected_count: 0,
                     confirmed_count: 0,
                     refuted_count: 0,
+                    misfired_count: 0,
                     state: "candidate".into(),
                     promoted_memory_id: None,
                     created_at: chrono::Utc::now().timestamp(),
                     last_seen_at: chrono::Utc::now().timestamp(),
+                    last_unrefuted_injection_at: None,
                     error_signature: None,
                 },
             )
