@@ -8,6 +8,117 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::store::documents;
+use crate::store::priors::{TriggerContext, TriggerMatcher};
+
+/// A durable rule whose explicit trigger matched the current hook.
+#[derive(Debug)]
+pub struct TriggeredMemory {
+    pub id: String,
+    pub content: String,
+}
+
+/// Match durable entries by OR across matchers; each matcher retains its AND
+/// semantics. Telemetry is separate from behavioral prior scores and TTLs.
+pub fn matching_triggered_entries(
+    conn: &Connection,
+    ctx: &TriggerContext<'_>,
+    session: &str,
+    now: i64,
+) -> Result<Vec<TriggeredMemory>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.id, e.content, e.triggers FROM memory_entries e
+         WHERE e.status = 'active' AND e.entry_type IN ('topic', 'problem', 'decision')
+           AND (e.expires_at IS NULL OR e.expires_at > ?1)
+           AND NOT (e.corrections > 0 AND e.last_refuted_at > COALESCE(e.last_confirmed_at, -1))
+           AND e.triggers <> '[]'
+           AND NOT EXISTS (SELECT 1 FROM memory_trigger_injections i
+                           WHERE i.memory_id = e.id AND i.session = ?2)
+         ORDER BY e.id",
+    )?;
+    let rows = stmt.query_map(params![now, session], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut hits = Vec::new();
+    for row in rows {
+        let (id, content, json) = row?;
+        let Ok(matchers) = serde_json::from_str::<Vec<TriggerMatcher>>(&json) else {
+            tracing::warn!("invalid triggers for memory entry {id}");
+            continue;
+        };
+        if matchers.iter().any(|matcher| matcher.matches(ctx)) {
+            hits.push(TriggeredMemory { id, content });
+        }
+    }
+    Ok(hits)
+}
+
+/// Reserve one injection for an entry and session across all hook types.
+pub fn record_trigger_injection_once(
+    conn: &Connection,
+    id: &str,
+    session: &str,
+    now: i64,
+) -> Result<bool> {
+    Ok(conn.execute(
+        "INSERT INTO memory_trigger_injections (memory_id, session, injected_at)
+         VALUES (?1, ?2, ?3) ON CONFLICT(memory_id, session) DO NOTHING",
+        params![id, session, now],
+    )? == 1)
+}
+
+/// Validate authored matchers before a write. Stored legacy rows are matched
+/// defensively at read time, but new rules must never persist inert selectors.
+pub fn validate_trigger_matchers(triggers: &[TriggerMatcher]) -> Result<()> {
+    for (index, matcher) in triggers.iter().enumerate() {
+        if !matcher.has_selector() {
+            return Err(invalid_field(
+                "triggers",
+                format!("matcher {} needs a selector", index + 1),
+            ));
+        }
+        for (name, value) in [
+            ("tool", matcher.tool.as_deref()),
+            ("path_glob", matcher.path_glob.as_deref()),
+            ("command_contains", matcher.command_contains.as_deref()),
+            ("error_contains", matcher.error_contains.as_deref()),
+            ("prompt_contains", matcher.prompt_contains.as_deref()),
+        ] {
+            if value.is_some_and(|v| v.trim().is_empty()) {
+                return Err(invalid_field(
+                    "triggers",
+                    format!("matcher {} has an empty {name} selector", index + 1),
+                ));
+            }
+        }
+        if let Some(glob) = &matcher.path_glob {
+            globset::Glob::new(glob).map_err(|e| {
+                invalid_field(
+                    "triggers",
+                    format!("matcher {} has invalid path_glob: {e}", index + 1),
+                )
+            })?;
+        }
+        if matcher.prompt_contains.is_some()
+            && (matcher.tool.is_some()
+                || matcher.path_glob.is_some()
+                || matcher.command_contains.is_some()
+                || matcher.error_contains.is_some())
+        {
+            return Err(invalid_field(
+                "triggers",
+                format!(
+                    "matcher {} combines a prompt selector with tool selectors",
+                    index + 1
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// Maximum ID length (slug format).
 pub const MAX_ID_LEN: usize = 100;
@@ -189,6 +300,8 @@ pub struct MemoryEntry {
     pub content: String,
     pub entry_type: EntryType,
     pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub triggers: Vec<TriggerMatcher>,
     pub status: EntryStatus,
     pub created_at: i64,
     pub updated_at: i64,
@@ -494,7 +607,7 @@ pub fn list_entries_sorted(
 
     let sql = if status_filter.is_some() {
         format!(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers
             FROM memory_entries WHERE status = ?1
             AND (expires_at IS NULL OR expires_at > ?2)
             AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?2))
@@ -502,7 +615,7 @@ pub fn list_entries_sorted(
         )
     } else {
         format!(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers
             FROM memory_entries WHERE (expires_at IS NULL OR expires_at > ?1)
             AND NOT (entry_type = 'reminder' AND (due_at IS NULL OR due_at > ?1))
             AND entry_type != 'prior' {order_clause} LIMIT ?2"
@@ -527,11 +640,13 @@ pub fn list_entries_sorted(
 
 /// Add a new memory entry.
 pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
+    validate_trigger_matchers(&entry.triggers)?;
     let tags_json = serde_json::to_string(&entry.tags)?;
+    let triggers_json = serde_json::to_string(&entry.triggers)?;
 
     conn.execute(
-        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        "INSERT INTO memory_entries (id, title, content, entry_type, tags, status, created_at, updated_at, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             entry.id,
             entry.title,
@@ -551,6 +666,7 @@ pub fn add_entry(conn: &Connection, entry: &MemoryEntry) -> Result<()> {
             entry.source_type.to_string(),
             entry.expires_at,
             entry.due_at,
+            triggers_json,
         ],
     )?;
 
@@ -749,12 +865,14 @@ pub fn correct_entry(conn: &Connection, id: &str, correction: Option<&str>) -> R
 /// rule compares on. Overwriting it with local wall-clock would make every
 /// imported entry win the next conflict simply for having been imported.
 pub fn update_entry_at(conn: &Connection, entry: &MemoryEntry, updated_at: i64) -> Result<()> {
+    validate_trigger_matchers(&entry.triggers)?;
     let tags_json = serde_json::to_string(&entry.tags)?;
+    let triggers_json = serde_json::to_string(&entry.triggers)?;
 
     conn.execute(
         "UPDATE memory_entries
-         SET title = ?1, content = ?2, entry_type = ?3, tags = ?4, status = ?5, updated_at = ?6, superseded_by = ?7, expires_at = ?8, due_at = ?9, source_type = ?10
-         WHERE id = ?11",
+         SET title = ?1, content = ?2, entry_type = ?3, tags = ?4, status = ?5, updated_at = ?6, superseded_by = ?7, expires_at = ?8, due_at = ?9, source_type = ?10, triggers = ?11
+         WHERE id = ?12",
         params![
             entry.title,
             entry.content,
@@ -766,6 +884,7 @@ pub fn update_entry_at(conn: &Connection, entry: &MemoryEntry, updated_at: i64) 
             entry.expires_at,
             entry.due_at,
             entry.source_type.to_string(),
+            triggers_json,
             entry.id,
         ],
     )?;
@@ -936,7 +1055,7 @@ pub fn get_entry(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
 /// Get a memory entry by ID without incrementing access count.
 pub fn get_entry_without_tracking(conn: &Connection, id: &str) -> Result<Option<MemoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers
         FROM memory_entries WHERE id = ?1"
     )?;
 
@@ -991,7 +1110,7 @@ pub fn list_entries_all(conn: &Connection) -> Result<Vec<MemoryEntry>> {
     let mut stmt = conn.prepare(
         "SELECT id, title, content, entry_type, tags, status, created_at, updated_at,
                 superseded_by, access_count, last_accessed, source_path, confirmations,
-                corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+                corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers
          FROM memory_entries ORDER BY id",
     )?;
     let rows = stmt.query_map([], row_to_entry)?;
@@ -1024,7 +1143,7 @@ pub fn search_entries_fts(
     }
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
-        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.last_refuted_at, m.source_type, m.expires_at, m.due_at
+        "SELECT m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.last_refuted_at, m.source_type, m.expires_at, m.due_at, m.triggers
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -1063,7 +1182,7 @@ fn bm25_search_with_rowid(
     // `?4 IS NULL` makes the filter a no-op for an untyped search, so both
     // shapes share one prepared statement and one cache slot.
     let mut stmt = conn.prepare(
-        "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.last_refuted_at, m.source_type, m.expires_at, m.due_at
+        "SELECT m.rowid, m.id, m.title, m.content, m.entry_type, m.tags, m.status, m.created_at, m.updated_at, m.superseded_by, m.access_count, m.last_accessed, m.source_path, m.confirmations, m.corrections, m.last_confirmed_at, m.last_refuted_at, m.source_type, m.expires_at, m.due_at, m.triggers
          FROM memory_entries m
          JOIN memory_fts f ON m.rowid = f.rowid
          WHERE memory_fts MATCH ?1
@@ -1242,7 +1361,7 @@ fn find_by_exact_title(
     exclude_id: &str,
 ) -> Result<Option<MemoryEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers
          FROM memory_entries
          WHERE title = ?1 AND id <> ?2 AND status = 'active'
          LIMIT 1",
@@ -1283,7 +1402,7 @@ pub fn find_similar_entries(
 pub fn get_entry_by_rowid(conn: &Connection, rowid: i64) -> Result<Option<MemoryEntry>> {
     let entry = conn
         .query_row(
-            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+            "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers
             FROM memory_entries WHERE rowid = ?1",
             params![rowid],
             row_to_entry,
@@ -1299,7 +1418,7 @@ fn get_entries_by_rowids(conn: &Connection, rowids: &[i64]) -> Result<HashMap<i6
     }
     let placeholders: Vec<String> = (1..=rowids.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
-        "SELECT rowid, id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+        "SELECT rowid, id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers
         FROM memory_entries WHERE rowid IN ({})",
         placeholders.join(", ")
     );
@@ -1760,15 +1879,15 @@ pub struct ProjectionRow {
 /// Reads here must not be tracked — reconciliation is not a use of the memory.
 pub fn list_projection_state(conn: &Connection) -> Result<Vec<ProjectionRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, projected_at, projected_hash
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers, projected_at, projected_hash
          FROM memory_entries ORDER BY id",
     )?;
     let rows = stmt
         .query_map([], |r| {
             Ok(ProjectionRow {
                 entry: row_to_entry(r)?,
-                projected_at: r.get(19)?,
-                projected_hash: r.get(20)?,
+                projected_at: r.get(20)?,
+                projected_hash: r.get(21)?,
             })
         })?
         .collect::<std::result::Result<_, _>>()?;
@@ -2024,7 +2143,7 @@ pub fn newest_handoff_for_scope(
 ) -> Result<Option<MemoryEntry>> {
     let now = Utc::now().timestamp();
     let mut stmt = conn.prepare(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers
          FROM memory_entries
          WHERE status = 'active'
            AND entry_type = 'handoff'
@@ -2064,7 +2183,7 @@ pub fn get_warmup_entries(
     // says is wrong (net-refuted) is not taught as if it were right.
     let eligible = EntryType::sql_list(|t| t.is_durable() || *t == EntryType::Prior);
     let mut stmt = conn.prepare(&format!(
-        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at
+        "SELECT id, title, content, entry_type, tags, status, created_at, updated_at, superseded_by, access_count, last_accessed, source_path, confirmations, corrections, last_confirmed_at, last_refuted_at, source_type, expires_at, due_at, triggers
          FROM memory_entries
          WHERE status = 'active'
          AND entry_type IN ({eligible})
@@ -2268,6 +2387,11 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
     let entry_type_str: String = row.get(off + 3)?;
     let status_str: String = row.get(off + 5)?;
     let source_type_str: String = row.get::<_, Option<String>>(off + 16)?.unwrap_or_default();
+    let triggers_json: String = row.get(off + 19)?;
+    let triggers = serde_json::from_str(&triggers_json).unwrap_or_else(|error| {
+        tracing::warn!("Failed to deserialize memory triggers, defaulting to empty: {error}");
+        Vec::new()
+    });
 
     Ok(MemoryEntry {
         id: row.get(off)?,
@@ -2281,6 +2405,7 @@ fn row_to_entry_offset(row: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<
             EntryType::Topic
         }),
         tags,
+        triggers,
         status: status_str.parse().unwrap_or_else(|_| {
             tracing::warn!("Unknown status '{}', defaulting to Active", status_str);
             EntryStatus::Active
@@ -2432,11 +2557,91 @@ mod tests {
     }
 
     #[test]
+    fn durable_trigger_matching_respects_or_and_status_expiry_and_session() {
+        let conn = setup_db();
+        let now = 90 * 24 * 3600; // 90 days after creation; prior TTL would have elapsed.
+        for (id, kind, status, expires, triggers) in [
+            (
+                "rule",
+                "decision",
+                "active",
+                None,
+                r#"[{"tool":"Agent","path_glob":"src/**"},{"prompt_contains":"agent"}]"#,
+            ),
+            ("plain", "decision", "active", None, "[]"),
+            (
+                "expired",
+                "topic",
+                "active",
+                Some(99),
+                r#"[{"tool":"Agent"}]"#,
+            ),
+            (
+                "archived",
+                "topic",
+                "archived",
+                None,
+                r#"[{"tool":"Agent"}]"#,
+            ),
+            ("prior", "prior", "active", None, r#"[{"tool":"Agent"}]"#),
+            ("malformed", "decision", "active", None, "not-json"),
+        ] {
+            conn.execute(
+                "INSERT INTO memory_entries (id,title,content,entry_type,status,created_at,updated_at,expires_at,triggers)
+                 VALUES (?1,'Rule','Follow the rule',?2,?3,1,1,?4,?5)",
+                params![id, kind, status, expires, triggers],
+            ).unwrap();
+        }
+        let wrong_path = TriggerContext::PreTool {
+            tool: "Agent",
+            path: Some("tests/a.rs"),
+            command: None,
+        };
+        assert!(
+            matching_triggered_entries(&conn, &wrong_path, "s1", now)
+                .unwrap()
+                .is_empty()
+        );
+        let right_path = TriggerContext::PreTool {
+            tool: "agent",
+            path: Some("src/lib.rs"),
+            command: None,
+        };
+        let first = matching_triggered_entries(&conn, &right_path, "s1", now).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rule"]
+        );
+        assert!(record_trigger_injection_once(&conn, "rule", "s1", now).unwrap());
+        assert!(!record_trigger_injection_once(&conn, "rule", "s1", now + 1).unwrap());
+        let prompt = TriggerContext::Prompt {
+            text: "start a subagent",
+        };
+        assert!(
+            matching_triggered_entries(&conn, &prompt, "s1", now + 1)
+                .unwrap()
+                .is_empty()
+        );
+        let second = matching_triggered_entries(&conn, &prompt, "s2", now + 1).unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rule"]
+        );
+    }
+
+    #[test]
     fn test_add_and_get_entry() {
         let conn = setup_db();
         let now = Utc::now().timestamp();
 
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "auth-oauth2".to_string(),
             title: "OAuth2 PKCE implementation".to_string(),
             content: "# OAuth2 PKCE\n\nDetails here...".to_string(),
@@ -2480,6 +2685,7 @@ mod tests {
         add_entry(
             &conn,
             &MemoryEntry {
+                triggers: Vec::new(),
                 id: "findable".to_string(),
                 title: "Findable entry".to_string(),
                 content: "content that a real query would match".to_string(),
@@ -2564,6 +2770,7 @@ mod tests {
         let conn = setup_db();
         let now = Utc::now().timestamp();
         let mut entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "fts-churn".to_string(),
             title: "Original title".to_string(),
             content: "original body about pelicans".to_string(),
@@ -2662,6 +2869,7 @@ mod tests {
         let due = now + 3600;
 
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "remind-me".to_string(),
             title: "Reminder note".to_string(),
             content: "Ping user later".to_string(),
@@ -2707,6 +2915,7 @@ mod tests {
         now: i64,
     ) -> MemoryEntry {
         MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: title.to_string(),
             content: content.to_string(),
@@ -2814,6 +3023,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let topic = MemoryEntry {
+            triggers: Vec::new(),
             id: "topic-one".to_string(),
             title: "Regular topic".to_string(),
             content: "body".to_string(),
@@ -2933,6 +3143,7 @@ mod tests {
         let expires = now + 3600; // 1 hour from now
 
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "temp-note".to_string(),
             title: "Temporary note".to_string(),
             content: "This will expire".to_string(),
@@ -2977,6 +3188,7 @@ mod tests {
 
         // Active entry (no TTL)
         let active = MemoryEntry {
+            triggers: Vec::new(),
             id: "active-entry".to_string(),
             title: "Active searchable entry".to_string(),
             content: "This is searchable content".to_string(),
@@ -3000,6 +3212,7 @@ mod tests {
 
         // Expired entry
         let expired = MemoryEntry {
+            triggers: Vec::new(),
             id: "expired-entry".to_string(),
             title: "Expired searchable entry".to_string(),
             content: "This is also searchable content".to_string(),
@@ -3077,6 +3290,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let mut entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "bug-fix".to_string(),
             title: "Null pointer bug".to_string(),
             content: "Original content".to_string(),
@@ -3117,6 +3331,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "to-delete".to_string(),
             title: "Will be deleted".to_string(),
             content: "Content".to_string(),
@@ -3162,6 +3377,7 @@ mod tests {
         // Add entries with different access counts
         for (id, count) in [("low", 1), ("high", 100), ("medium", 50)] {
             let entry = MemoryEntry {
+                triggers: Vec::new(),
                 id: id.to_string(),
                 title: format!("{id} access"),
                 content: "Content".to_string(),
@@ -3198,6 +3414,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let entry1 = MemoryEntry {
+            triggers: Vec::new(),
             id: "auth-jwt".to_string(),
             title: "JWT authentication".to_string(),
             content: "JWT tokens for authentication".to_string(),
@@ -3220,6 +3437,7 @@ mod tests {
         };
 
         let entry2 = MemoryEntry {
+            triggers: Vec::new(),
             id: "db-postgres".to_string(),
             title: "PostgreSQL setup".to_string(),
             content: "Database configuration for postgres".to_string(),
@@ -3255,6 +3473,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "tagged-entry".to_string(),
             title: "Some title".to_string(),
             content: "Unrelated content".to_string(),
@@ -3289,6 +3508,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "test-entry".to_string(),
             title: "Test entry title".to_string(),
             content: "Content".to_string(),
@@ -3334,6 +3554,7 @@ mod tests {
 
         for i in 0..3 {
             let entry = MemoryEntry {
+                triggers: Vec::new(),
                 id: format!("entry-{i}"),
                 title: format!("Entry {i}"),
                 content: "Content".to_string(),
@@ -3379,6 +3600,7 @@ mod tests {
             add_entry(
                 &conn,
                 &MemoryEntry {
+                    triggers: Vec::new(),
                     id: id.to_string(),
                     title: id.to_string(),
                     content: "c".to_string(),
@@ -3440,6 +3662,7 @@ mod tests {
 
         // Entry accessed recently
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "recent".to_string(),
             title: "Recent entry".to_string(),
             content: "Content".to_string(),
@@ -3482,6 +3705,7 @@ mod tests {
 
         // Entry last accessed 100 days ago
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "stale".to_string(),
             title: "Stale entry".to_string(),
             content: "Content".to_string(),
@@ -3523,6 +3747,7 @@ mod tests {
 
         // Entry created 100 days ago, never accessed
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "never-used".to_string(),
             title: "Never used entry".to_string(),
             content: "Content".to_string(),
@@ -3559,6 +3784,7 @@ mod tests {
         let old_time = now - (100 * 24 * 60 * 60); // 100 days ago
 
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "stale-dry".to_string(),
             title: "Stale entry dry run".to_string(),
             content: "Content".to_string(),
@@ -3601,6 +3827,7 @@ mod tests {
 
         // Already archived entry
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "already-archived".to_string(),
             title: "Already archived".to_string(),
             content: "Content".to_string(),
@@ -3638,6 +3865,7 @@ mod tests {
 
         // Recent entry
         let recent = MemoryEntry {
+            triggers: Vec::new(),
             id: "recent".to_string(),
             title: "Recent".to_string(),
             content: "Content".to_string(),
@@ -3662,6 +3890,7 @@ mod tests {
 
         // Stale entry
         let stale = MemoryEntry {
+            triggers: Vec::new(),
             id: "stale".to_string(),
             title: "Stale".to_string(),
             content: "Content".to_string(),
@@ -3721,6 +3950,7 @@ mod tests {
         add_entry(
             conn,
             &MemoryEntry {
+                triggers: Vec::new(),
                 id: id.to_string(),
                 title: id.to_string(),
                 content: "Content".to_string(),
@@ -3974,6 +4204,7 @@ mod tests {
 
         // Recently created but expired entry (should be pruned by TTL, not by age)
         let expired = MemoryEntry {
+            triggers: Vec::new(),
             id: "ttl-expired".to_string(),
             title: "TTL expired".to_string(),
             content: "Content".to_string(),
@@ -3997,6 +4228,7 @@ mod tests {
 
         // Active entry with no TTL (should NOT be pruned)
         let active = MemoryEntry {
+            triggers: Vec::new(),
             id: "still-active".to_string(),
             title: "Still active".to_string(),
             content: "Content".to_string(),
@@ -4050,6 +4282,7 @@ mod tests {
 
         // Pre-existing stale entry — should be pruned
         let stale = MemoryEntry {
+            triggers: Vec::new(),
             id: "stale-toctou".to_string(),
             title: "Stale".to_string(),
             content: "Content".to_string(),
@@ -4078,6 +4311,7 @@ mod tests {
         // Insert a new entry with an old timestamp AFTER prune ran.
         // Without a transaction, a racy UPDATE could archive this entry too.
         let late = MemoryEntry {
+            triggers: Vec::new(),
             id: "late-insert".to_string(),
             title: "Late insert".to_string(),
             content: "Content".to_string(),
@@ -4117,6 +4351,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let high = MemoryEntry {
+            triggers: Vec::new(),
             id: "high".to_string(),
             title: "High".to_string(),
             content: "Content".to_string(),
@@ -4138,6 +4373,7 @@ mod tests {
             due_at: None,
         };
         let low = MemoryEntry {
+            triggers: Vec::new(),
             id: "low".to_string(),
             title: "Low".to_string(),
             content: "Content".to_string(),
@@ -4182,6 +4418,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let old_accessed = MemoryEntry {
+            triggers: Vec::new(),
             id: "old".to_string(),
             title: "Old".to_string(),
             content: "Content".to_string(),
@@ -4203,6 +4440,7 @@ mod tests {
             due_at: None,
         };
         let recent = MemoryEntry {
+            triggers: Vec::new(),
             id: "recent".to_string(),
             title: "Recent".to_string(),
             content: "Content".to_string(),
@@ -4247,6 +4485,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let older = MemoryEntry {
+            triggers: Vec::new(),
             id: "older".to_string(),
             title: "Older".to_string(),
             content: "Content".to_string(),
@@ -4268,6 +4507,7 @@ mod tests {
             due_at: None,
         };
         let newer = MemoryEntry {
+            triggers: Vec::new(),
             id: "newer".to_string(),
             title: "Newer".to_string(),
             content: "Content".to_string(),
@@ -4449,6 +4689,7 @@ mod tests {
         let conn = setup_db_with_vectors();
 
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "test-entry".to_string(),
             title: "OAuth PKCE Flow".to_string(),
             content: "How we handle authentication with PKCE protocol".to_string(),
@@ -4486,6 +4727,7 @@ mod tests {
     /// Build one active entry with only the fields a search test cares about.
     fn typed_entry(id: &str, title: &str, content: &str, entry_type: EntryType) -> MemoryEntry {
         MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: title.to_string(),
             content: content.to_string(),
@@ -4752,6 +4994,7 @@ mod tests {
 
         // Entry 1: keyword match for "authentication"
         let e1 = MemoryEntry {
+            triggers: Vec::new(),
             id: "auth-basic".to_string(),
             title: "Basic Authentication Setup".to_string(),
             content: "How to configure basic authentication".to_string(),
@@ -4778,6 +5021,7 @@ mod tests {
 
         // Entry 2: different keywords but semantically similar embedding
         let e2 = MemoryEntry {
+            triggers: Vec::new(),
             id: "jwt-refresh".to_string(),
             title: "JWT Token Refresh Strategy".to_string(),
             content: "Design for token expiration and refresh flow".to_string(),
@@ -4805,6 +5049,7 @@ mod tests {
 
         // Entry 3: unrelated
         let e3 = MemoryEntry {
+            triggers: Vec::new(),
             id: "db-tuning".to_string(),
             title: "Database Tuning Notes".to_string(),
             content: "SQLite WAL mode and pragma settings".to_string(),
@@ -4862,6 +5107,7 @@ mod tests {
 
         for i in 1..=10 {
             let entry = MemoryEntry {
+                triggers: Vec::new(),
                 id: format!("entry-{i}"),
                 title: format!("Test Entry {i}"),
                 content: format!("Content for searchable entry number {i}"),
@@ -4905,6 +5151,7 @@ mod tests {
     fn test_get_rowid() {
         let conn = setup_db_with_vectors();
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "my-entry".to_string(),
             title: "My Entry".to_string(),
             content: "Content".to_string(),
@@ -4944,6 +5191,7 @@ mod tests {
         source: SourceType,
     ) -> MemoryEntry {
         MemoryEntry {
+            triggers: Vec::new(),
             id: "test".to_string(),
             title: "Test".to_string(),
             content: "Content".to_string(),
@@ -5679,6 +5927,7 @@ mod tests {
         // Only the get path mutates access_count / last_accessed.
         let conn = setup_db();
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "invariant".to_string(),
             title: "Invariant Test".to_string(),
             content: "searchable invariant content".to_string(),
@@ -5729,6 +5978,7 @@ mod tests {
         let now = Utc::now().timestamp();
 
         let hot = MemoryEntry {
+            triggers: Vec::new(),
             id: "hot".to_string(),
             title: "Hot popular topic".to_string(),
             content: "popular topic about shared-content signal".to_string(),
@@ -5750,6 +6000,7 @@ mod tests {
             due_at: None,
         };
         let cold = MemoryEntry {
+            triggers: Vec::new(),
             id: "cold".to_string(),
             title: "Cold popular topic".to_string(),
             content: "popular topic about shared-content signal".to_string(),
@@ -5795,6 +6046,7 @@ mod tests {
 
         for i in 0..5 {
             let entry = MemoryEntry {
+                triggers: Vec::new(),
                 id: format!("e{i}"),
                 title: format!("Entry {i}"),
                 content: format!("deterministic shared content {i}"),
@@ -5853,6 +6105,7 @@ mod tests {
 
     fn warmup_line_entry(id: &str, entry_type: EntryType, tags: &[&str]) -> MemoryEntry {
         MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: "A concise title".to_string(),
             content: "body".to_string(),

@@ -416,6 +416,7 @@ async fn a_pulled_memory_entry_is_reconciled_by_the_watcher() {
     // what a real clone would carry, not a hand-rolled approximation.
     let now = chrono::Utc::now().timestamp();
     let pulled = mdkb::store::memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "pulled-from-a-colleague".to_string(),
         title: "Arrived in a checkout".to_string(),
         content: "Written on another machine and pulled into this one.".to_string(),
@@ -539,6 +540,7 @@ async fn watcher_deletions_still_go_through_the_set_level_breaker() {
     // pass ran over the very set the deletions belong to.
     let now = chrono::Utc::now().timestamp();
     let canary = mdkb::store::memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "sweep-canary".to_string(),
         title: "Proof the sweep ran".to_string(),
         content: "Imported in the same pass that saw the deletions.".to_string(),

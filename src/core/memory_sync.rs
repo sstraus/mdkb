@@ -849,6 +849,7 @@ mod tests {
 
     fn entry(id: &str) -> MemoryEntry {
         MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             content: "# body".to_string(),

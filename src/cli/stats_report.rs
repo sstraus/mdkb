@@ -731,6 +731,7 @@ mod tests {
             add_entry(
                 &self.ctx.conn,
                 &MemoryEntry {
+                    triggers: Vec::new(),
                     id: id.to_string(),
                     title: id.to_string(),
                     content: "test".to_string(),
@@ -1263,6 +1264,7 @@ mod tests {
     fn make_entry(id: &str, entry_type: EntryType) -> MemoryEntry {
         let now = chrono::Utc::now().timestamp();
         MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             content: "test".to_string(),

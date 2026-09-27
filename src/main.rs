@@ -25,8 +25,8 @@ use mdkb::cli::handlers::{
     handle_experiment_cancel, handle_experiment_create, handle_experiment_end,
     handle_experiment_list, handle_experiment_status, handle_get, handle_graph_backlinks,
     handle_graph_dangling, handle_graph_hubs, handle_graph_links, handle_graph_neighbors,
-    handle_graph_path, handle_graph_relations, handle_history, handle_init, handle_memory_add,
-    handle_memory_confirm, handle_memory_export, handle_memory_import, handle_memory_import_dir,
+    handle_graph_path, handle_graph_relations, handle_history, handle_init, handle_memory_confirm,
+    handle_memory_export, handle_memory_import, handle_memory_import_dir,
     handle_memory_import_file, handle_memory_link, handle_memory_list, handle_memory_prune,
     handle_memory_rm, handle_memory_search, handle_memory_show, handle_memory_warmup,
     handle_metrics_export, handle_metrics_latency, handle_metrics_purge, handle_metrics_show,
@@ -1046,6 +1046,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                     file,
                     ttl,
                     due_in,
+                    trigger,
                     source_type,
                     relates,
                     agent,
@@ -1074,7 +1075,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         });
                         (text, None)
                     };
-                    handle_memory_add(
+                    mdkb::core::memory::handle_memory_add_with_triggers(
                         &ctx,
                         &id,
                         &title,
@@ -1085,6 +1086,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                         ttl,
                         due_in,
                         source_type.as_deref(),
+                        (!trigger.is_empty()).then_some(trigger.as_slice()),
                         &relates,
                         agent.as_deref(),
                         on_conflict.as_deref(),

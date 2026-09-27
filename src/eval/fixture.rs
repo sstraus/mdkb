@@ -97,6 +97,7 @@ impl Fixture {
             add_entry(
                 conn,
                 &MemoryEntry {
+                    triggers: Vec::new(),
                     id: m.id.clone(),
                     title: m.title.clone(),
                     content: m.content.clone(),

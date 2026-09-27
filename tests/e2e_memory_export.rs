@@ -36,6 +36,7 @@ impl Env {
 fn make_entry(id: &str, title: &str, entry_type: EntryType) -> MemoryEntry {
     let now = chrono::Utc::now().timestamp();
     MemoryEntry {
+        triggers: Vec::new(),
         id: id.to_string(),
         title: title.to_string(),
         content: format!("Content for {id}."),
@@ -179,6 +180,7 @@ fn round_trip_export_import_dir_restores_authored_fields() {
     let env = Env::new();
     let now = chrono::Utc::now().timestamp();
     let orig = MemoryEntry {
+        triggers: Vec::new(),
         id: "rt-entry".to_string(),
         title: "Round-trip".to_string(),
         content: "Some content here.".to_string(),

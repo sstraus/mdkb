@@ -395,17 +395,22 @@ pub struct MemoryWriteParams {
     #[serde(default)]
     pub content: String,
 
-    /// Read content from this file path instead of content field. Mutually exclusive with content.
+    /// Use a file instead of content.
     #[serde(default)]
     pub source_file: Option<String>,
 
-    /// Entry type: topic, problem, decision, reminder (time-bound; pair with due_in), prior (behavioral; 30d TTL default), or handoff (session handover).
+    /// Type: topic, problem, decision, reminder, prior, or handoff. Use decision/topic for durable rules.
     #[serde(default = "default_entry_type")]
     pub entry_type: String,
 
     /// Tags for categorization.
     #[serde(default)]
     pub tags: Vec<String>,
+
+    /// OR matchers for durable rules. Each matcher ANDs tool, path_glob, command_contains, prompt_contains.
+    #[serde(default)]
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub triggers: Option<Vec<crate::store::priors::TriggerMatcher>>,
 
     /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
     #[serde(default)]
@@ -419,15 +424,15 @@ pub struct MemoryWriteParams {
     #[serde(default)]
     pub due_in: Option<u64>,
 
-    /// Typed edges from this entry (max 10): [{relation, target, target_kind}].
+    /// Typed edges (max 10).
     #[serde(default)]
     pub relates: Vec<RelatesInput>,
 
-    /// Authoring agent recorded as provenance (e.g. "claude", "codex").
+    /// Authoring agent.
     #[serde(default)]
     pub agent: Option<String>,
 
-    /// On near-duplicate conflict: omitted rejects (default); "contradicts" writes the entry and links it to the similar one with a contradicts edge.
+    /// Use "contradicts" to link near duplicates.
     #[serde(default)]
     pub on_conflict: Option<String>,
 
@@ -473,17 +478,22 @@ pub struct MemoryWriteBatchEntry {
     #[serde(default)]
     pub content: String,
 
-    /// Read content from this file path instead of content field. Mutually exclusive with content.
+    /// Use a file instead of content.
     #[serde(default)]
     pub source_file: Option<String>,
 
-    /// Entry type: topic, problem, decision, reminder (time-bound; pair with due_in), prior (behavioral; 30d TTL default), or handoff (session handover).
+    /// Type: topic, problem, decision, reminder, prior, or handoff. Use decision/topic for durable rules.
     #[serde(default = "default_entry_type")]
     pub entry_type: String,
 
     /// Tags for categorization.
     #[serde(default)]
     pub tags: Vec<String>,
+
+    /// OR matchers for durable rules. Each matcher ANDs tool, path_glob, command_contains, prompt_contains.
+    #[serde(default)]
+    #[schemars(with = "Vec<serde_json::Value>")]
+    pub triggers: Option<Vec<crate::store::priors::TriggerMatcher>>,
 
     /// Source type: official_docs, user_statement (default), auto_extracted, or inference.
     #[serde(default)]
@@ -497,15 +507,15 @@ pub struct MemoryWriteBatchEntry {
     #[serde(default)]
     pub due_in: Option<u64>,
 
-    /// Typed edges from this entry (max 10): [{relation, target, target_kind}].
+    /// Typed edges (max 10).
     #[serde(default)]
     pub relates: Vec<RelatesInput>,
 
-    /// Authoring agent recorded as provenance (e.g. "claude", "codex").
+    /// Authoring agent.
     #[serde(default)]
     pub agent: Option<String>,
 
-    /// On near-duplicate conflict: omitted rejects (default); "contradicts" writes the entry and links it to the similar one with a contradicts edge.
+    /// Use "contradicts" to link near duplicates.
     #[serde(default)]
     pub on_conflict: Option<String>,
 }
@@ -949,6 +959,21 @@ mod tests {
         let json = r#"{"id": "test", "title": "t", "content": "c", "root": "/foo"}"#;
         let params: MemoryWriteParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.root.as_deref(), Some("/foo"));
+    }
+
+    #[test]
+    fn memory_write_schema_exposes_trigger_arrays_on_single_and_batch_entries() {
+        for schema in [
+            serde_json::to_value(schemars::schema_for!(MemoryWriteParams)).unwrap(),
+            serde_json::to_value(schemars::schema_for!(MemoryWriteBatchEntry)).unwrap(),
+        ] {
+            let trigger = &schema["properties"]["triggers"];
+            assert_eq!(trigger["type"], "array", "{trigger}");
+            let description = trigger["description"].as_str().unwrap();
+            for selector in ["tool", "path_glob", "command_contains", "prompt_contains"] {
+                assert!(description.contains(selector), "{description}");
+            }
+        }
     }
 
     #[test]

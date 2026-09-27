@@ -393,6 +393,7 @@ mod tests {
 
     fn insert_memory(conn: &Connection, id: &str) {
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: format!("Title {id}"),
             content: "content".to_string(),

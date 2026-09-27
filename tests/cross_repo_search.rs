@@ -45,6 +45,7 @@ fn repo_with_entry(parent: &Path, name: &str, needle: &str) -> PathBuf {
     add_entry(
         &ctx.conn,
         &MemoryEntry {
+            triggers: Vec::new(),
             id: format!("{needle}-entry"),
             title: format!("The {needle} decision"),
             content: format!("Body mentioning {needle} so the lexical leg has something to match."),

@@ -1134,6 +1134,7 @@ pub async fn memory_write_impl(
         entry_type: &entry.entry_type,
         source_type: entry.source_type.as_deref(),
         tags: &entry.tags,
+        triggers: entry.triggers.as_deref(),
         ttl: entry.ttl,
         due_in: entry.due_in,
         embedding: embedding.as_deref(),
@@ -1253,6 +1254,7 @@ pub async fn memory_write_batch_impl(
                     entry_type: &entry.entry_type,
                     source_type: entry.source_type.as_deref(),
                     tags: &entry.tags,
+                    triggers: entry.triggers.as_deref(),
                     ttl: entry.ttl,
                     due_in: entry.due_in,
                     embedding: embedding.as_deref(),
@@ -5172,9 +5174,6 @@ async fn prompt_prior_block(
 ) -> Option<String> {
     use crate::store::priors::{TriggerContext, match_injectable, record_injection};
 
-    if !handle.config.priors.injection_enabled {
-        return None;
-    }
     let now = chrono::Utc::now().timestamp();
     let max = handle.config.priors.max_injected_per_hook;
 
@@ -5184,14 +5183,32 @@ async fn prompt_prior_block(
     let mut ctx_guard = handle.ctx.lock().await;
 
     let tctx = TriggerContext::Prompt { text: prompt };
-    let hits = crate::core::run_guarded_read(&mut ctx_guard, "prompt prior lookup", |ctx| {
-        match_injectable(&ctx.conn, &tctx, now, max)
-    })?
-    .ok()?;
-    if hits.is_empty() {
-        return None;
+    let memory_hits =
+        crate::core::run_guarded_read(&mut ctx_guard, "prompt memory trigger lookup", |ctx| {
+            crate::store::memory::matching_triggered_entries(&ctx.conn, &tctx, session, now)
+        })?
+        .ok()?;
+    let hits = if handle.config.priors.injection_enabled {
+        crate::core::run_guarded_read(&mut ctx_guard, "prompt prior lookup", |ctx| {
+            match_injectable(&ctx.conn, &tctx, now, max)
+        })?
+        .ok()?
+    } else {
+        Vec::new()
+    };
+    let mut lines = Vec::with_capacity(hits.len() + memory_hits.len());
+    for entry in memory_hits.into_iter().take(max) {
+        let id = entry.id;
+        match crate::core::run_guarded_write(
+            &mut ctx_guard,
+            "prompt memory trigger telemetry",
+            |ctx| crate::store::memory::record_trigger_injection_once(&ctx.conn, &id, session, now),
+        ) {
+            Some(Ok(true)) => lines.push(format!("mdkb memory [{id}]: {}", entry.content)),
+            Some(Ok(false)) | None => {}
+            Some(Err(error)) => tracing::warn!("record prompt memory trigger injection: {error}"),
+        }
     }
-    let mut lines = Vec::with_capacity(hits.len());
     for c in &hits {
         if let Some((dctx, key)) = dedup {
             if dctx.hook_prior_seen(key, &c.id) {
@@ -5214,7 +5231,9 @@ async fn prompt_prior_block(
     if lines.is_empty() {
         return None;
     }
-    lines.push(format!("mdkb prior session: {session}"));
+    if !hits.is_empty() {
+        lines.push(format!("mdkb prior session: {session}"));
+    }
     Some(lines.join("\n"))
 }
 
@@ -5843,9 +5862,6 @@ async fn tool_prior_block(
 ) -> Option<String> {
     use crate::store::priors::{TriggerContext, match_injectable, record_tool_injection_once};
 
-    if !handle.config.priors.injection_enabled {
-        return None;
-    }
     // Repo-relative path gives clean `src/generated/**`-style glob matching.
     let path = tool_input
         .get("file_path")
@@ -5886,16 +5902,33 @@ async fn tool_prior_block(
             command,
         }
     };
-    let hits = crate::core::run_guarded_read(&mut ctx_guard, "tool prior lookup", |ctx| {
-        // The cap applies to fresh injections, not to already-seen matches.
-        // The matcher already loads and sorts all candidates before truncating.
-        match_injectable(&ctx.conn, &tctx, now, usize::MAX)
-    })?
-    .ok()?;
-    if hits.is_empty() {
-        return None;
+    let memory_hits =
+        crate::core::run_guarded_read(&mut ctx_guard, "tool memory trigger lookup", |ctx| {
+            crate::store::memory::matching_triggered_entries(&ctx.conn, &tctx, session, now)
+        })?
+        .ok()?;
+    let hits = if handle.config.priors.injection_enabled {
+        crate::core::run_guarded_read(&mut ctx_guard, "tool prior lookup", |ctx| {
+            // The cap applies to fresh injections, not to already-seen matches.
+            match_injectable(&ctx.conn, &tctx, now, usize::MAX)
+        })?
+        .ok()?
+    } else {
+        Vec::new()
+    };
+    let mut lines = Vec::with_capacity(hits.len() + memory_hits.len());
+    for entry in memory_hits.into_iter().take(max) {
+        let id = entry.id;
+        match crate::core::run_guarded_write(
+            &mut ctx_guard,
+            "tool memory trigger telemetry",
+            |ctx| crate::store::memory::record_trigger_injection_once(&ctx.conn, &id, session, now),
+        ) {
+            Some(Ok(true)) => lines.push(format!("mdkb memory [{id}]: {}", entry.content)),
+            Some(Ok(false)) | None => {}
+            Some(Err(error)) => tracing::warn!("record {label} memory trigger injection: {error}"),
+        }
     }
-    let mut lines = Vec::with_capacity(hits.len());
     for c in &hits {
         let prior_id = c.id.clone();
         match crate::core::run_guarded_write(&mut ctx_guard, "tool prior telemetry", |ctx| {
@@ -5912,7 +5945,9 @@ async fn tool_prior_block(
     if lines.is_empty() {
         None
     } else {
-        lines.push(format!("mdkb prior session: {session}"));
+        if !hits.is_empty() {
+            lines.push(format!("mdkb prior session: {session}"));
+        }
         Some(lines.join("\n"))
     }
 }
@@ -6826,6 +6861,7 @@ mod tests {
     ) -> crate::store::memory::MemoryEntry {
         let ts = now - age_days * 86_400;
         crate::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: format!("Title {id}"),
             content: content.to_string(),
@@ -7209,6 +7245,7 @@ mod tests {
         let ctx = ctx_guard.as_ref().unwrap();
         let now = chrono::Utc::now().timestamp();
         let entry = crate::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: format!("Title for {id}"),
             // The identifier is load-bearing, not decoration: memory recall
@@ -7242,6 +7279,7 @@ mod tests {
         let ctx = ctx_guard.as_ref().unwrap();
         let now = chrono::Utc::now().timestamp();
         let entry = crate::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: format!("Title for {id}"),
             content: content.to_string(),
@@ -7294,6 +7332,7 @@ mod tests {
         let history =
             |id: &str, confirmations: u32, corrections: u32, confirmed_ago: Option<i64>| {
                 crate::store::memory::MemoryEntry {
+                    triggers: Vec::new(),
                     id: id.to_string(),
                     title: id.to_string(),
                     content: "Refutation table fixture".to_string(),
@@ -7373,6 +7412,7 @@ mod tests {
     fn confidence_does_not_decide_injection() {
         let now = chrono::Utc::now().timestamp();
         let stale = crate::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: "stale-but-relevant".to_string(),
             title: "Stale but relevant".to_string(),
             content: "Recall gate test entry".to_string(),
@@ -7398,6 +7438,7 @@ mod tests {
             "control: entry confidence should be about 0.06"
         );
         let fresh = crate::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: "fresh".to_string(),
             created_at: now,
             updated_at: now,
@@ -8024,6 +8065,7 @@ mod tests {
         let ctx = ctx_guard.as_ref().unwrap();
         let now = chrono::Utc::now().timestamp();
         let entry = crate::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: format!("Prior {id}"),
             content: "Prefer ripgrep over grep for codebase searches.".to_string(),
@@ -8767,6 +8809,7 @@ mod tests {
             let conn = &guard.as_ref().unwrap().conn;
             let now = chrono::Utc::now().timestamp();
             let handoff = crate::store::memory::MemoryEntry {
+                triggers: Vec::new(),
                 id: "handoff-2026-07-07-deadbeef".into(),
                 // A deliberately truncated title (as journal-cli.js writes it) —
                 // it must NOT surface; the full body must.
@@ -8827,6 +8870,7 @@ mod tests {
         let conn = &guard.as_ref().unwrap().conn;
         let ts = chrono::Utc::now().timestamp() - age_days * 86_400;
         let entry = crate::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: format!("handoff-{project}"),
             title: format!("Session handoff for {project}"),
             content: format!(
@@ -9012,6 +9056,7 @@ mod tests {
         let ctx = ctx_guard.as_ref().unwrap();
         let now = chrono::Utc::now().timestamp();
         let entry = crate::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: format!("Title for {id}"),
             content: content.to_string(),
@@ -9647,6 +9692,7 @@ mod tests {
 
     fn entry_input(id: &str) -> MemoryWriteBatchEntry {
         MemoryWriteBatchEntry {
+            triggers: None,
             id: id.to_string(),
             title: format!("Title {id}"),
             content: format!("Content for {id}"),
@@ -9660,6 +9706,64 @@ mod tests {
             agent: None,
             on_conflict: None,
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_single_and_batch_writes_keep_authored_triggers() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let dctx = make_dctx();
+        dispatch_call(
+            "memory_write",
+            json!({"id":"agent-rule","title":"Agent rule","content":"Use the agent tool.",
+                   "entry_type":"decision","triggers":[{"tool":"Agent"},{"prompt_contains":"agent"}]}),
+            Arc::clone(&handle), &dctx,
+        ).await.unwrap();
+        dispatch_call(
+            "memory_write_batch",
+            json!({"entries":[{"id":"bash-rule","title":"Bash rule","content":"Check the command.",
+                   "entry_type":"topic","triggers":[{"tool":"Bash","command_contains":"rm "}]}]}),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .unwrap();
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let single = crate::store::memory::get_entry_without_tracking(conn, "agent-rule")
+            .unwrap()
+            .unwrap();
+        assert_eq!(single.triggers.len(), 2);
+        assert_eq!(single.triggers[0].tool.as_deref(), Some("Agent"));
+        assert_eq!(single.triggers[1].prompt_contains.as_deref(), Some("agent"));
+        let batch = crate::store::memory::get_entry_without_tracking(conn, "bash-rule")
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.triggers.len(), 1);
+        assert_eq!(batch.triggers[0].command_contains.as_deref(), Some("rm "));
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_selectorless_trigger_before_persisting() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let err = dispatch_call(
+            "memory_write",
+            json!({"id":"bad-rule","title":"Bad rule","content":"No selector",
+                   "entry_type":"decision","triggers":[{"when":"whenever"}]}),
+            Arc::clone(&handle),
+            &make_dctx(),
+        )
+        .await
+        .expect_err("matcher with no selector must fail");
+        assert!(err.message.contains("selector"), "{}", err.message);
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        assert!(
+            crate::store::memory::get_entry_without_tracking(conn, "bad-rule")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -9899,6 +10003,7 @@ mod tests {
         crate::core::memory::write_memory(
             conn,
             crate::core::memory::WriteMemoryInput {
+                triggers: None,
                 id: "orig-dup",
                 title: "Orig",
                 content: "Auth notes",
@@ -9924,6 +10029,7 @@ mod tests {
         let out = crate::core::memory::write_memory(
             conn,
             crate::core::memory::WriteMemoryInput {
+                triggers: None,
                 id: "new-dup",
                 title: "New",
                 content: "Auth notes v2",
@@ -9955,6 +10061,7 @@ mod tests {
         let err = crate::core::memory::write_memory(
             conn,
             crate::core::memory::WriteMemoryInput {
+                triggers: None,
                 id: "third-dup",
                 title: "Third",
                 content: "Auth notes v3",
@@ -11144,6 +11251,93 @@ mod tests {
     }
 
     // ── Phase 7: trigger-matched prior injection ──────────────────────────────
+
+    #[tokio::test]
+    async fn durable_rule_fires_for_either_trigger_once_per_session() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at, triggers)
+                 VALUES ('agent-rule', 'Use TUIC agent', 'Use the TUICommander agent tool for subagents.', 'decision', '[]', 1, 1,
+                 '[{\"tool\":\"Agent\"},{\"prompt_contains\":\"agent\"}]')",
+                [],
+            ).unwrap();
+        }
+        let dctx = make_dctx();
+        let pre = dispatch_call(
+            "hook.pre_tool_use",
+            json!({"tool_name":"Agent","tool_input":{},"session_id":"rule-session"}),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            additional_context(&pre).contains(
+                "mdkb memory [agent-rule]: Use the TUICommander agent tool for subagents."
+            ),
+            "{pre}"
+        );
+
+        let repeated = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt":"start a subagent","session_id":"rule-session"}),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !additional_context(&repeated).contains("agent-rule"),
+            "{repeated}"
+        );
+
+        let fresh = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt":"start a subagent","session_id":"fresh-session"}),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .unwrap();
+        assert!(
+            additional_context(&fresh).contains(
+                "mdkb memory [agent-rule]: Use the TUICommander agent tool for subagents."
+            ),
+            "{fresh}"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_rule_fires_after_a_matching_tool_without_reindexing() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let guard = handle.ctx.lock().await;
+            guard.as_ref().unwrap().conn.execute(
+                "INSERT INTO memory_entries (id,title,content,entry_type,created_at,updated_at,triggers)
+                 VALUES ('build-rule','Build rule','Check the build output.','decision',1,1,
+                 '[{\"tool\":\"Bash\",\"command_contains\":\"cargo test\"}]')", [],
+            ).unwrap();
+        }
+        let event = json!({"tool_name":"Bash","tool_input":{"command":"cargo test --lib"},"session_id":"post-rule"});
+        let first = hook_post_tool_use_impl(&handle, &event).await;
+        assert!(
+            additional_context(&first)
+                .contains("mdkb memory [build-rule]: Check the build output."),
+            "{first}"
+        );
+        let repeated = hook_post_tool_use_impl(&handle, &event).await;
+        assert!(
+            !additional_context(&repeated).contains("build-rule"),
+            "{repeated}"
+        );
+    }
 
     /// Seed a promoted, injectable cluster directly into the handle's store.
     async fn seed_promoted_prior(handle: &RepoHandle, kind: &str, matcher: &str, lesson: &str) {

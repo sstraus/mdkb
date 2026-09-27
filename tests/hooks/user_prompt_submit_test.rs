@@ -131,6 +131,7 @@ fn seed_project_with_memory(id: &str, title: &str, content: &str, tags: &[&str])
     let now = chrono::Utc::now().timestamp();
 
     let entry = MemoryEntry {
+        triggers: Vec::new(),
         id: id.to_string(),
         title: title.to_string(),
         content: content.to_string(),
@@ -341,6 +342,7 @@ fn seed_two_entries_with_access_counts(
 
     // Low-access entry: accessed once, 30 days ago.
     let low = MemoryEntry {
+        triggers: Vec::new(),
         id: low_id.to_string(),
         title: format!("{shared_keyword} low-access entry"),
         content: format!("{shared_keyword} implementation detail rarely accessed by anyone"),
@@ -364,6 +366,7 @@ fn seed_two_entries_with_access_counts(
 
     // High-access entry: accessed 50 times, 1 hour ago — should rank first.
     let high = MemoryEntry {
+        triggers: Vec::new(),
         id: high_id.to_string(),
         title: format!("{shared_keyword} high-access entry"),
         content: format!("{shared_keyword} implementation detail frequently accessed by the team"),
@@ -604,6 +607,7 @@ fn user_prompt_submit_dedups_neighbor_against_memory_id() {
     let ctx = Context::open(tmp.path()).expect("open ctx");
     let now = chrono::Utc::now().timestamp();
     let entry = MemoryEntry {
+        triggers: Vec::new(),
         id: "b.md".to_string(),
         title: "Frobnicator memory".to_string(),
         content: "frobnicatorxyz design decision for the system".to_string(),
@@ -649,6 +653,7 @@ fn user_prompt_submit_dedups_neighbor_against_memory_id() {
 fn topic_entry(id: &str, title: &str, content: &str) -> MemoryEntry {
     let now = chrono::Utc::now().timestamp();
     MemoryEntry {
+        triggers: Vec::new(),
         id: id.to_string(),
         title: title.to_string(),
         content: content.to_string(),

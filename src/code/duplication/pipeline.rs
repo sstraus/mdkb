@@ -582,6 +582,7 @@ mod tests {
         add_entry(
             memory,
             &MemoryEntry {
+                triggers: Vec::new(),
                 id: super::super::report::ignore_entry_id(cluster_hash),
                 title: "Accepted".to_string(),
                 content: "Deliberate.".to_string(),

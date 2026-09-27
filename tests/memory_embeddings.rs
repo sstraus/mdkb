@@ -46,6 +46,7 @@ impl Env {
 fn raw_entry(id: &str) -> MemoryEntry {
     let now = chrono::Utc::now().timestamp();
     MemoryEntry {
+        triggers: Vec::new(),
         id: id.to_string(),
         title: format!("Title {id}"),
         content: format!("Content for {id}."),

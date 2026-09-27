@@ -43,6 +43,7 @@ fn seed_repo() -> TempDir {
     add_entry(
         &ctx.conn,
         &MemoryEntry {
+            triggers: Vec::new(),
             id: "jwt-rotation".to_string(),
             title: "JWT refresh rotation".to_string(),
             content: "sliding expiry refresh token rotation handles jwt expiration".to_string(),

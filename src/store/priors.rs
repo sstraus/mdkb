@@ -849,6 +849,7 @@ pub fn promote_cluster(conn: &Connection, cluster_id: &str, now: i64) -> Result<
         .unwrap_or_default();
 
     let entry = MemoryEntry {
+        triggers: Vec::new(),
         id: memory_id.clone(),
         title: cluster.lesson.clone(),
         content: format!("{}{}", cluster.lesson, evidence),
@@ -936,7 +937,10 @@ fn glob_matches(pattern: &str, path: &str) -> bool {
 /// Deliberately no regex selector. The pattern is untrusted model output; a
 /// backtracking regex is neither easy for a model to generate correctly nor for
 /// a person to reason about, and its failure mode is a stall, not a miss.
-#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Default, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
+#[serde(deny_unknown_fields)]
 pub struct TriggerMatcher {
     /// The tool's name. Compared case-insensitively: models write `bash` and
     /// `Bash` interchangeably and the distinction carries no meaning.
@@ -985,7 +989,7 @@ impl TriggerMatcher {
     /// call with no command is a condition that was not met, not one that does
     /// not apply — the alternative is a matcher that widens as the context gets
     /// thinner, which is how the untyped matcher fired everywhere.
-    fn matches(&self, ctx: &TriggerContext) -> bool {
+    pub fn matches(&self, ctx: &TriggerContext) -> bool {
         if !self.has_selector() {
             return false;
         }

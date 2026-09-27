@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 31;
+pub const SCHEMA_VERSION: i32 = 32;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -183,7 +183,8 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     created_session TEXT,                      -- session id that authored this entry (provenance)
     created_agent TEXT,                        -- agent/tool that authored this entry (provenance)
     projected_at INTEGER,                      -- when the markdown projection was last written; NULL = never
-    projected_hash TEXT                        -- SHA-256 of the bytes last projected; NULL = predates the column
+    projected_hash TEXT,                       -- SHA-256 of the bytes last projected; NULL = predates the column
+    triggers TEXT NOT NULL DEFAULT '[]'        -- JSON array of durable trigger matchers
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_type ON memory_entries(entry_type);
@@ -338,6 +339,15 @@ CREATE TABLE IF NOT EXISTS prior_injections (
     FOREIGN KEY(cluster_id) REFERENCES prior_clusters(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_prior_injections_open ON prior_injections(session, outcome);
+
+-- A durable entry is surfaced once per session, independent of prior verdicts.
+CREATE TABLE IF NOT EXISTS memory_trigger_injections (
+    memory_id TEXT NOT NULL,
+    session TEXT NOT NULL,
+    injected_at INTEGER NOT NULL,
+    PRIMARY KEY (memory_id, session),
+    FOREIGN KEY(memory_id) REFERENCES memory_entries(id) ON DELETE CASCADE
+);
 
 -- Individual observed episodes (one per session) feeding a cluster. Never
 -- injected directly; they accumulate into a cluster which may be promoted.
@@ -1172,6 +1182,25 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
         }
     }
 
+    if from_version < 32 {
+        let has_triggers: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('memory_entries') WHERE name = 'triggers')",
+            [], |row| row.get(0),
+        )?;
+        if !has_triggers {
+            conn.execute(
+                "ALTER TABLE memory_entries ADD COLUMN triggers TEXT NOT NULL DEFAULT '[]'",
+                [],
+            )?;
+        }
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_trigger_injections (\
+                memory_id TEXT NOT NULL, session TEXT NOT NULL, injected_at INTEGER NOT NULL, \
+                PRIMARY KEY (memory_id, session), \
+                FOREIGN KEY(memory_id) REFERENCES memory_entries(id) ON DELETE CASCADE);",
+        )?;
+    }
+
     // Update schema version
     conn.execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION])?;
 
@@ -1204,6 +1233,36 @@ pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn migration_adds_durable_trigger_storage_without_changing_existing_entries() {
+        let conn = setup_db();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (31)", [])
+            .unwrap();
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at) VALUES ('old-rule', 'Rule', 'Use Agent', 'decision', 1, 1)",
+            [],
+        ).unwrap();
+        conn.execute_batch(
+            "DROP TABLE memory_trigger_injections; ALTER TABLE memory_entries DROP COLUMN triggers;"
+        ).unwrap();
+
+        init_schema(&conn).unwrap();
+
+        let triggers: String = conn
+            .query_row(
+                "SELECT triggers FROM memory_entries WHERE id = 'old-rule'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggers, "[]");
+        let injection_table: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_trigger_injections'",
+            [], |r| r.get(0)
+        ).unwrap();
+        assert_eq!(injection_table, 1);
+    }
     use super::*;
 
     fn setup_db() -> Connection {
@@ -1263,7 +1322,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 0);
-        assert_eq!(get_schema_version(&conn).unwrap(), Some(31));
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
     }
 
     #[test]

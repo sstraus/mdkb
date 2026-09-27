@@ -34,6 +34,7 @@ impl Env {
         memory::add_entry(
             &self.ctx.conn,
             &MemoryEntry {
+                triggers: Vec::new(),
                 id: id.to_string(),
                 title: format!("Title {id}"),
                 content: format!("Body for {id}"),

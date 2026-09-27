@@ -120,6 +120,7 @@ impl Repo {
 
 fn entry(id: &str, content: &str) -> MemoryEntry {
     MemoryEntry {
+        triggers: Vec::new(),
         id: id.to_string(),
         title: id.to_string(),
         content: content.to_string(),

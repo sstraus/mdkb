@@ -56,6 +56,8 @@ pub struct WriteMemoryInput<'a> {
     pub entry_type: &'a str,
     pub source_type: Option<&'a str>,
     pub tags: &'a [String],
+    /// None preserves existing triggers on update; Some(empty) clears them.
+    pub triggers: Option<&'a [crate::store::priors::TriggerMatcher]>,
     pub ttl: Option<u64>,
     pub due_in: Option<u64>,
     pub embedding: Option<&'a [f32]>,
@@ -125,11 +127,20 @@ pub fn embed_for_write(title: &str, content: &str) -> Option<Vec<f32>> {
 /// step because it needs the complete [`Context`], not only the transaction.
 pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) -> Result<String> {
     memory::validate_entry_input(input.id, input.title, input.tags, input.content)?;
+    if let Some(triggers) = input.triggers {
+        memory::validate_trigger_matchers(triggers)?;
+    }
 
     let entry_type: EntryType = input
         .entry_type
         .parse()
         .map_err(|e: String| Error::from(ErrorKind::InvalidQuery(e)))?;
+    if input.triggers.is_some_and(|triggers| !triggers.is_empty()) && !entry_type.is_durable() {
+        return Err(ErrorKind::InvalidQuery(
+            "triggers require a durable topic, problem, or decision entry".to_string(),
+        )
+        .into());
+    }
     let source_type = input
         .source_type
         .map(str::parse::<memory::SourceType>)
@@ -245,6 +256,9 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
         entry.content = input.content.to_string();
         entry.entry_type = entry_type;
         entry.tags = input.tags.to_vec();
+        if let Some(triggers) = input.triggers {
+            entry.triggers = triggers.to_vec();
+        }
         entry.expires_at = expires_at;
         if input.due_in.is_some() {
             entry.due_at = due_at;
@@ -265,6 +279,7 @@ pub fn write_memory(conn: &rusqlite::Connection, input: WriteMemoryInput<'_>) ->
         format!("Updated memory entry: {}{suffix}", input.id)
     } else {
         let entry = MemoryEntry {
+            triggers: input.triggers.unwrap_or_default().to_vec(),
             id: input.id.to_string(),
             title: input.title.to_string(),
             content: input.content.to_string(),
@@ -352,6 +367,43 @@ pub fn handle_memory_add(
     on_conflict: Option<&str>,
     dry_run: bool,
 ) -> Result<()> {
+    handle_memory_add_with_triggers(
+        ctx,
+        id,
+        title,
+        entry_type,
+        tags,
+        content,
+        source_path,
+        ttl,
+        due_in,
+        source_type,
+        None,
+        relates,
+        agent,
+        on_conflict,
+        dry_run,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn handle_memory_add_with_triggers(
+    ctx: &Context,
+    id: &str,
+    title: &str,
+    entry_type: &str,
+    tags: Option<&str>,
+    content: &str,
+    source_path: Option<&str>,
+    ttl: Option<u64>,
+    due_in: Option<u64>,
+    source_type: Option<&str>,
+    triggers: Option<&[crate::store::priors::TriggerMatcher]>,
+    relates: &[WriteRelation],
+    agent: Option<&str>,
+    on_conflict: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
     let tags: Vec<String> = tags
         .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
         .unwrap_or_default();
@@ -366,6 +418,7 @@ pub fn handle_memory_add(
             entry_type,
             source_type,
             tags: &tags,
+            triggers,
             ttl,
             due_in,
             embedding: None,
@@ -939,6 +992,7 @@ pub fn handle_memory_import(
         }
 
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: raw.id.clone(),
             title: raw.title.clone(),
             content: raw.content.clone(),
@@ -1038,6 +1092,7 @@ pub fn handle_memory_condense(
 
             // Create the merged entry
             let merged_entry = memory::MemoryEntry {
+                triggers: Vec::new(),
                 id: group.proposed_id.clone(),
                 title,
                 content,

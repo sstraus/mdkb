@@ -1329,6 +1329,7 @@ fn test_memory_complete_workflow() {
 
     // 1. Add memory entries
     let entry1 = memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "auth-oauth2-pkce".to_string(),
         title: "OAuth2 PKCE implementation".to_string(),
         content: "# OAuth2 PKCE\n\nImplemented PKCE flow for mobile clients.\n\n## Steps\n1. Generate code verifier\n2. Create code challenge\n3. Include in auth request".to_string(),
@@ -1351,6 +1352,7 @@ fn test_memory_complete_workflow() {
     };
 
     let entry2 = memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "bug-null-email".to_string(),
         title: "Null email causes panic".to_string(),
         content: "# Bug Fix: Null Email\n\n## Symptom\nPanic when user has null email.\n\n## Root Cause\nUnwrap on Option<String>.\n\n## Fix\nUse unwrap_or_default().".to_string(),
@@ -1468,6 +1470,7 @@ fn test_memory_stats_integration() {
 
     // Add a memory entry
     let entry = memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "test-stats".to_string(),
         title: "Test entry for stats".to_string(),
         content: "Content".to_string(),
@@ -1532,6 +1535,7 @@ fn test_memory_index_persistence() {
     // Add entries
     for i in 0..3 {
         let entry = memory::MemoryEntry {
+            triggers: Vec::new(),
             id: format!("entry-{}", i),
             title: format!("Entry {}", i),
             content: format!("Content for entry {}", i),
@@ -1599,6 +1603,7 @@ fn test_memory_condense_finds_related() {
 
     // Entry 1: auth + jwt
     let e1 = mdkb::store::memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "auth-jwt-basics".to_string(),
         title: "JWT Basics".to_string(),
         content: "JWT authentication basics".to_string(),
@@ -1622,6 +1627,7 @@ fn test_memory_condense_finds_related() {
 
     // Entry 2: auth + jwt
     let e2 = mdkb::store::memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "auth-jwt-refresh".to_string(),
         title: "JWT Refresh".to_string(),
         content: "How to refresh JWT tokens".to_string(),
@@ -1645,6 +1651,7 @@ fn test_memory_condense_finds_related() {
 
     // Entry 3: auth + jwt
     let e3 = mdkb::store::memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "auth-jwt-expiry".to_string(),
         title: "JWT Expiry".to_string(),
         content: "Handling JWT expiry".to_string(),
@@ -1668,6 +1675,7 @@ fn test_memory_condense_finds_related() {
 
     // Entry 4: different tags (should not be grouped)
     let e4 = mdkb::store::memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "database-setup".to_string(),
         title: "Database Setup".to_string(),
         content: "How to set up database".to_string(),
@@ -1724,6 +1732,7 @@ fn test_memory_condense_dry_run() {
     let now = chrono::Utc::now().timestamp();
     for i in 1..=4 {
         let entry = mdkb::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: format!("api-entry-{}", i),
             title: format!("API Entry {}", i),
             content: format!("API content {}", i),
@@ -1788,6 +1797,7 @@ fn test_memory_condense_creates_merged_entry() {
     let now = chrono::Utc::now().timestamp();
     for i in 1..=3 {
         let entry = mdkb::store::memory::MemoryEntry {
+            triggers: Vec::new(),
             id: format!("config-entry-{}", i),
             title: format!("Config Entry {}", i),
             content: format!("Config content {}", i),
@@ -2034,6 +2044,7 @@ async fn test_memory_confirm_counts_confirmations_and_refutations_separately() {
     let now = chrono::Utc::now().timestamp();
 
     let entry = memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "confirm-target".to_string(),
         title: "Entry to confirm/refute".to_string(),
         content: "Bayesian signal target.".to_string(),
@@ -2136,6 +2147,7 @@ async fn test_memory_search_repeated_get_ranks_above_untouched() {
     let now = chrono::Utc::now().timestamp();
 
     let mut a = memory::MemoryEntry {
+        triggers: Vec::new(),
         id: "rank-a".to_string(),
         title: "Ranking A".to_string(),
         content: "identical ranking signal content".to_string(),

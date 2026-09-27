@@ -67,6 +67,91 @@ fn memory_confirm_help_describes_misfired_prior_verdict() {
     assert!(stdout(&out).contains("misfired"), "{}", stdout(&out));
 }
 
+#[test]
+fn memory_add_accepts_repeatable_triggers_and_rejects_empty_matchers() {
+    let repo = Repo::new();
+    let added = run(
+        &[
+            "memory",
+            "add",
+            "agent-rule",
+            "--title",
+            "Agent rule",
+            "--entry-type",
+            "decision",
+            "--content",
+            "Use the TUICommander agent tool.",
+            "--trigger",
+            r#"{"tool":"Agent"}"#,
+            "--trigger",
+            r#"{"prompt_contains":"agent"}"#,
+        ],
+        &repo.root,
+    );
+    assert_ok(&added, "add a rule with alternative triggers");
+    let shown = run(
+        &["--format", "json", "memory", "show", "agent-rule"],
+        &repo.root,
+    );
+    assert_ok(&shown, "show a rule with triggers");
+    let json: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(
+        json["triggers"],
+        serde_json::json!([
+            {"tool":"Agent"}, {"prompt_contains":"agent"}
+        ])
+    );
+    let projected =
+        std::fs::read_to_string(repo.root.join(".mdkb/memory/entries/agent-rule.md")).unwrap();
+    assert!(
+        projected.contains("triggers: [{\"tool\":\"Agent\"},{\"prompt_contains\":\"agent\"}]"),
+        "{projected}"
+    );
+
+    let rejected = run(
+        &[
+            "memory",
+            "add",
+            "bad-rule",
+            "--title",
+            "Bad rule",
+            "--entry-type",
+            "decision",
+            "--content",
+            "No selector",
+            "--trigger",
+            r#"{"when":"whenever"}"#,
+        ],
+        &repo.root,
+    );
+    assert!(!rejected.status.success(), "empty matcher was accepted");
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("selector"));
+    for invalid in [r#"{"path_glob":"["}"#, r#"{"unknown":"Agent"}"#, "not-json"] {
+        let out = run(
+            &[
+                "memory",
+                "add",
+                "bad-rule",
+                "--title",
+                "Bad rule",
+                "--entry-type",
+                "decision",
+                "--content",
+                "No selector",
+                "--trigger",
+                invalid,
+            ],
+            &repo.root,
+        );
+        assert!(!out.status.success(), "accepted {invalid}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("trigger"),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 fn assert_hook_output_valid(out: &Output, label: &str) {
     let s = stdout(out);
     let trimmed = s.trim();
@@ -1164,6 +1249,10 @@ fn smoke_memory_add_routed_through_a_daemon_renders_like_the_direct_path() {
             "Routed",
             "-c",
             "body",
+            "--entry-type",
+            "decision",
+            "--trigger",
+            r#"{"tool":"Agent"}"#,
         ])
         .current_dir(&repo.root)
         .output()
@@ -1179,13 +1268,14 @@ fn smoke_memory_add_routed_through_a_daemon_renders_like_the_direct_path() {
         "Added memory entry 'routed-entry'\n",
         "the routed renderer must print the same line as the direct one"
     );
-    let shown = run(&["memory", "show", "routed-entry"], &repo.root);
-    assert_ok(&shown, "memory show after routed add");
-    assert!(
-        stdout(&shown).contains("Routed"),
-        "the daemon's write must be visible to a direct reader: {}",
-        stdout(&shown)
+    let shown = run(
+        &["--format", "json", "memory", "show", "routed-entry"],
+        &repo.root,
     );
+    assert_ok(&shown, "memory show after routed add");
+    let entry: serde_json::Value = serde_json::from_str(&stdout(&shown)).unwrap();
+    assert_eq!(entry["title"], "Routed");
+    assert_eq!(entry["triggers"], serde_json::json!([{"tool":"Agent"}]));
 
     // Control: same command, daemon gone, spawning forbidden.
     let home = daemon.home.path().to_path_buf();

@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::error::{ErrorKind, Result};
 use crate::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType};
+use crate::store::priors::TriggerMatcher;
 
 /// Parsed + typed frontmatter for a memory entry file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +30,8 @@ pub struct MemoryFileMeta {
     pub status: EntryStatus,
     #[serde(default)]
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub triggers: Vec<TriggerMatcher>,
     #[serde(default)]
     pub created_at: Option<i64>,
     #[serde(default)]
@@ -74,6 +77,7 @@ impl MemoryFile {
             content,
             entry_type: meta.entry_type,
             tags: meta.tags,
+            triggers: meta.triggers,
             status: meta.status,
             created_at: meta.created_at.unwrap_or(now),
             updated_at: meta.updated_at.unwrap_or(now),
@@ -100,6 +104,7 @@ impl MemoryFile {
     /// `access_count = 0`, no `last_accessed`, `confirmations = 0`.
     pub fn into_fresh_entry(self) -> MemoryEntry {
         MemoryEntry {
+            triggers: Vec::new(),
             access_count: 0,
             last_accessed: None,
             confirmations: 0,
@@ -233,6 +238,11 @@ pub fn to_markdown(entry: &MemoryEntry) -> String {
     write_scalar(&mut out, "source_type", &entry.source_type.to_string());
     write_scalar(&mut out, "status", &entry.status.to_string());
     write_string_array(&mut out, "tags", &entry.tags);
+    if !entry.triggers.is_empty() {
+        out.push_str("triggers: ");
+        out.push_str(&serde_json::to_string(&entry.triggers).expect("trigger matcher serializes"));
+        out.push('\n');
+    }
     write_i64(&mut out, "created_at", entry.created_at);
     write_i64(&mut out, "updated_at", entry.updated_at);
     write_opt_scalar(&mut out, "source_path", entry.source_path.as_deref());
@@ -402,8 +412,20 @@ fn quote_double(value: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn durable_trigger_list_survives_markdown_round_trip() {
+        let authored = "---\nid: agent-rule\ntitle: Agent rule\nentry_type: decision\ntriggers: [{\"tool\":\"Agent\"},{\"prompt_contains\":\"agent\"}]\n---\n\nUse the TUICommander agent tool.\n";
+        let entry = from_markdown(authored).unwrap().into_entry();
+        let projected = to_markdown(&entry);
+        assert!(
+            projected.contains("triggers: [{\"tool\":\"Agent\"},{\"prompt_contains\":\"agent\"}]"),
+            "{projected}"
+        );
+    }
+
     fn sample_entry() -> MemoryEntry {
         MemoryEntry {
+            triggers: Vec::new(),
             id: "auth-oauth2".to_string(),
             title: "OAuth2 PKCE Flow".to_string(),
             content: "Always use PKCE for public clients.".to_string(),

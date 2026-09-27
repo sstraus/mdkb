@@ -52,6 +52,7 @@ fn setup_project_with_entries() -> TempDir {
     let now = chrono::Utc::now().timestamp();
 
     let entry = MemoryEntry {
+        triggers: Vec::new(),
         id: "auth-flow-decision".to_string(),
         title: "OAuth2 refresh token rotation".to_string(),
         content: "use refresh tokens with sliding expiry".to_string(),
@@ -90,6 +91,7 @@ fn seed(
     let now = chrono::Utc::now().timestamp();
     let ts = now - age_days * 86_400;
     let entry = MemoryEntry {
+        triggers: Vec::new(),
         id: id.to_string(),
         title: format!("Title {id}"),
         content: content.to_string(),

@@ -40,6 +40,16 @@ fn source_type_values() -> PossibleValuesParser {
     PossibleValuesParser::new(SourceType::ALL.map(|t| t.as_str()))
 }
 
+fn parse_memory_trigger(
+    raw: &str,
+) -> std::result::Result<crate::store::priors::TriggerMatcher, String> {
+    let matcher: crate::store::priors::TriggerMatcher =
+        serde_json::from_str(raw).map_err(|error| format!("invalid trigger JSON: {error}"))?;
+    crate::store::memory::validate_trigger_matchers(std::slice::from_ref(&matcher))
+        .map_err(|error| error.to_string())?;
+    Ok(matcher)
+}
+
 fn memory_relation_values() -> PossibleValuesParser {
     PossibleValuesParser::new(MemoryRelation::ALL.map(|r| r.as_str()))
 }
@@ -775,6 +785,10 @@ pub enum MemoryCommand {
         /// Reminder due time in seconds from now. Use with --entry-type reminder.
         #[arg(long)]
         due_in: Option<u64>,
+
+        /// JSON trigger matcher; repeat for OR alternatives. For example: {"tool":"Agent"}.
+        #[arg(long, value_parser = parse_memory_trigger)]
+        trigger: Vec<crate::store::priors::TriggerMatcher>,
 
         /// Provenance/trust of this entry (default: user_statement on insert;
         /// preserved on re-write unless given). Drives the confidence authority

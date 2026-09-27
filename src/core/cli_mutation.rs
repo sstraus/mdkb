@@ -56,6 +56,8 @@ pub enum CliMutation {
         source_path: Option<String>,
         ttl: Option<u64>,
         due_in: Option<u64>,
+        #[serde(default)]
+        triggers: Vec<crate::store::priors::TriggerMatcher>,
         source_type: Option<String>,
         #[serde(default)]
         relates: Vec<WriteRelation>,
@@ -313,13 +315,14 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
             source_path,
             ttl,
             due_in,
+            triggers,
             source_type,
             relates,
             agent,
             on_conflict,
             dry_run,
         } => {
-            crate::core::memory::handle_memory_add(
+            crate::core::memory::handle_memory_add_with_triggers(
                 ctx,
                 &id,
                 &title,
@@ -330,6 +333,7 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
                 ttl,
                 due_in,
                 source_type.as_deref(),
+                (!triggers.is_empty()).then_some(triggers.as_slice()),
                 &relates,
                 agent.as_deref(),
                 on_conflict.as_deref(),

@@ -93,6 +93,7 @@ impl Env {
 
 fn entry(id: &str, content: &str, source_type: SourceType, updated_at: i64) -> MemoryEntry {
     MemoryEntry {
+        triggers: Vec::new(),
         id: id.to_string(),
         title: format!("Title {id}"),
         content: content.to_string(),

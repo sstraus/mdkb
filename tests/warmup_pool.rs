@@ -35,6 +35,7 @@ fn seed(
     updated_at: i64,
 ) {
     let e = MemoryEntry {
+        triggers: Vec::new(),
         id: id.to_string(),
         title: format!("Title for {id}"),
         content: format!("Body of {id}, long enough to be a real entry body."),

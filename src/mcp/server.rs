@@ -742,7 +742,7 @@ impl McpServer {
 
     /// Write or update a memory entry.
     #[tool(
-        description = "Create or update a memory entry. Types: topic, problem, decision, reminder, prior, handoff. Slug ID, title max 50 chars.",
+        description = "Write memory: topic, problem, decision, reminder, prior, or handoff.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -762,6 +762,7 @@ impl McpServer {
             source_file: params.source_file,
             entry_type: params.entry_type,
             tags: params.tags,
+            triggers: params.triggers,
             source_type: params.source_type,
             ttl: params.ttl,
             due_in: params.due_in,
@@ -784,7 +785,7 @@ impl McpServer {
 
     /// Write multiple memory entries in one call.
     #[tool(
-        description = "Create or update multiple memory entries at once. Same semantics as memory_write, batched. Max 20 entries.",
+        description = "Write up to 20 memory entries.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1982,6 +1983,7 @@ mdkb is a **semantic** search engine (fuzzy, concept-based). It does NOT match l
 
 - `search(query, scope=\"memory\")` — check before writing duplicates.
 - `memory_write` / `memory_write_batch` — persist after solving problems.
+- A rule with a when belongs in a durable decision or topic with `triggers`. Prefer a `tool` trigger for the tool about to be misused; use `prompt_contains` when the user's wording is the event. Matchers are OR alternatives.
 - Judge an injected `mdkb prior [id]`: call `memory_confirm(id, outcome, session)` once. `confirmed` = true and relevant here; `refuted` = lesson wrong; `misfired` = true lesson, trigger out of context. Use the `mdkb prior session` value.
 - `memory_confirm` also verifies or refutes ordinary memory entries instead of rewriting them.
 - `memory_delete` — remove stale entries.
@@ -2792,6 +2794,7 @@ mod tests {
         // First write a memory entry
         server
             .memory_write(Parameters(MemoryWriteParams {
+                triggers: None,
                 id: "test-delete-me".to_string(),
                 title: "Deletable entry".to_string(),
                 content: "This will be deleted.".to_string(),
@@ -2883,6 +2886,7 @@ mod tests {
         tokio::time::timeout(
             timeout,
             server.memory_write(Parameters(MemoryWriteParams {
+                triggers: None,
                 id: "deadlock-test".to_string(),
                 title: "Test".to_string(),
                 content: "Content".to_string(),
@@ -3128,6 +3132,7 @@ mod tests {
         // Write two entries
         server
             .memory_write(Parameters(MemoryWriteParams {
+                triggers: None,
                 id: "test-a".to_string(),
                 title: "Test A".to_string(),
                 content: "Content A".to_string(),
@@ -3148,6 +3153,7 @@ mod tests {
 
         server
             .memory_write(Parameters(MemoryWriteParams {
+                triggers: None,
                 id: "test-b".to_string(),
                 title: "Test B".to_string(),
                 content: "Content B".to_string(),
@@ -3206,6 +3212,7 @@ mod tests {
             let now = chrono::Utc::now().timestamp();
             for i in 0..201 {
                 let entry = memory::MemoryEntry {
+                    triggers: Vec::new(),
                     id: format!("bulk-{i}"),
                     title: format!("Bulk {i}"),
                     content: format!("Entry number {i}."),
@@ -4175,6 +4182,7 @@ if (require.main === module) {
         // Create an entry
         server
             .memory_write(Parameters(MemoryWriteParams {
+                triggers: None,
                 id: "test-entry".to_string(),
                 title: "Test Entry".to_string(),
                 content: "Initial content".to_string(),
@@ -4206,6 +4214,7 @@ if (require.main === module) {
         // Update the entry (this should NOT increment access_count)
         server
             .memory_write(Parameters(MemoryWriteParams {
+                triggers: None,
                 id: "test-entry".to_string(),
                 title: "Test Entry".to_string(),
                 content: "Updated content".to_string(),
@@ -4827,6 +4836,7 @@ if (require.main === module) {
             .memory_write_batch(Parameters(MemoryWriteBatchParams {
                 entries: vec![
                     MemoryWriteBatchEntry {
+                        triggers: None,
                         id: "batch-a".to_string(),
                         title: "Batch A".to_string(),
                         content: "Content A".to_string(),
@@ -4841,6 +4851,7 @@ if (require.main === module) {
                         on_conflict: None,
                     },
                     MemoryWriteBatchEntry {
+                        triggers: None,
                         id: "batch-b".to_string(),
                         title: "Batch B".to_string(),
                         content: "Content B".to_string(),
@@ -4914,6 +4925,7 @@ if (require.main === module) {
 
         let entries: Vec<MemoryWriteBatchEntry> = (0..21)
             .map(|i| MemoryWriteBatchEntry {
+                triggers: None,
                 id: format!("over-{i}"),
                 title: format!("Over {i}"),
                 content: format!("Content {i}"),

@@ -36,6 +36,7 @@ async fn memory_search_payload_exposes_confidence_and_counters() {
     {
         let ctx = Context::open(&root).expect("open ctx");
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "payload-signals".to_string(),
             title: "Payload signals for wiz priors".to_string(),
             content: "Signals: confidence, access, confirmations, last_confirmed_at.".to_string(),
@@ -112,6 +113,7 @@ async fn memory_search_payload_marks_never_confirmed_entries() {
     {
         let ctx = Context::open(&root).expect("open ctx");
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: "never-confirmed".to_string(),
             title: "Freshly written, not yet confirmed".to_string(),
             content: "A brand-new entry with zero confirmations.".to_string(),
@@ -184,6 +186,7 @@ fn seed_three_priors(root: &std::path::Path) {
         ("high-prior", 20u32, Some(now)),
     ] {
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: format!("Prior {id}"),
             // The identifier is load-bearing: memory recall is gated on an

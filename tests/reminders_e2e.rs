@@ -18,6 +18,7 @@ fn setup() -> (TempDir, Context) {
 fn make_reminder(id: &str, due_at: Option<i64>) -> MemoryEntry {
     let now = chrono::Utc::now().timestamp();
     MemoryEntry {
+        triggers: Vec::new(),
         id: id.to_string(),
         title: format!("Reminder {id}"),
         content: "reminder body".to_string(),

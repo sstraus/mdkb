@@ -32,6 +32,7 @@ async fn server_with_activity() -> (tempfile::TempDir, McpServer) {
 
     server
         .memory_write(Parameters(MemoryWriteParams {
+            triggers: None,
             id: "usage-test-memory".to_string(),
             root: None,
             title: "usage test".to_string(),

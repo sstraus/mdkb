@@ -173,6 +173,7 @@ pub(crate) mod testkit {
     pub fn add(conn: &Connection, id: &str, title: &str, content: &str, tags: &[&str]) {
         let now = Utc::now().timestamp();
         let entry = MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: title.to_string(),
             content: content.to_string(),

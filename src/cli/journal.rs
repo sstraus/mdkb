@@ -217,6 +217,7 @@ pub fn journal_to_memory_entries(
 
         if !content.trim().is_empty() {
             entries.push(MemoryEntry {
+                triggers: Vec::new(),
                 id: format!("{}-insights", base_id),
                 title: format!("{} - Insights", journal.title),
                 content: content.trim().to_string(),
@@ -251,6 +252,7 @@ pub fn journal_to_memory_entries(
         }
 
         entries.push(MemoryEntry {
+            triggers: Vec::new(),
             id: format!("{}-decisions", base_id),
             title: format!("{} - Decisions", journal.title),
             content: content.trim().to_string(),
@@ -283,6 +285,7 @@ pub fn journal_to_memory_entries(
         }
 
         entries.push(MemoryEntry {
+            triggers: Vec::new(),
             id: format!("{}-problems", base_id),
             title: format!("{} - Problems & Solutions", journal.title),
             content: content.trim().to_string(),
@@ -326,6 +329,7 @@ pub fn journal_to_memory_entries(
         let slug: String = raw_slug.chars().take(max_slug_len).collect();
 
         entries.push(MemoryEntry {
+            triggers: Vec::new(),
             id: format!("{}-{}", base_id, slug),
             title: format!("{} - {}", journal.title, section_name),
             content: content.clone(),

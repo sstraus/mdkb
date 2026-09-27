@@ -420,6 +420,7 @@ impl MemoryInput {
     /// MCP schema can express.
     fn as_mcp(&self, relates: Vec<RelatesInput>, agent: Option<&str>) -> MemoryWriteBatchEntry {
         MemoryWriteBatchEntry {
+            triggers: None,
             id: self.id.to_string(),
             title: self.title.to_string(),
             content: self.content.to_string(),
@@ -934,6 +935,7 @@ fn every_memory_write_input_has_a_cli_spelling() {
     let help = text(&run(&["memory", "add", "--help"], dir.path()));
     let missing: Vec<&str> = [
         ("agent", "--agent"),
+        ("triggers", "--trigger"),
         ("relates", "--relates"),
         ("on_conflict", "--on-conflict"),
         ("dry_run", "--dry-run"),

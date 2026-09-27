@@ -6,6 +6,13 @@
 
 ### Added
 
+- **Durable memories can surface on explicit triggers.** Decisions, topics and
+  problems accept alternative tool, path, command or prompt matchers through
+  `memory_write`, `memory_write_batch` and repeatable `mdkb memory add --trigger`
+  JSON. Hooks inject a matching entry once per session, while Markdown
+  projection preserves its triggers across sync. Found by the maintainer's
+  2026-09-23 audit of rules that never surfaced.
+
 - **Injected priors can receive an explicit model verdict.** Hook context now
   includes the cluster ID and session. `memory_confirm` accepts `confirmed`
   when the lesson is true and relevant, `refuted` when it is wrong, and

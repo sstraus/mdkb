@@ -1871,6 +1871,7 @@ mod tests {
     fn decision(id: &str, tags: Vec<String>, entry_type: EntryType) -> MemoryEntry {
         let now = chrono::Utc::now().timestamp();
         MemoryEntry {
+            triggers: Vec::new(),
             id: id.to_string(),
             title: "Accepted duplication".to_string(),
             content: "Two adapters, deliberately not shared.".to_string(),
