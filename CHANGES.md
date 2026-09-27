@@ -27,6 +27,12 @@
 
 ### Fixed
 
+- **Daemon socket E2E readiness tolerates delayed startup.** The fixture waits
+  up to 15 seconds for both sockets, reports an exited daemon immediately with
+  its stderr, and records startup timing. The CI failure on 2026-09-25 occurred
+  under high CPU contention; a deterministic delayed-socket test reproduces
+  the old five-second deadline.
+
 - **Error lessons now fire on the failed tool result.** Distilled error lessons
   use a `post_tool` trigger with an `error_contains` selector. Claude's
   `PostToolUseFailure` hook supplies the error text; successful commands and

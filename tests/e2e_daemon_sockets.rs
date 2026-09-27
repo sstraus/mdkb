@@ -55,17 +55,30 @@ impl DaemonProc {
     }
 
     fn wait_for_sockets(&mut self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(15);
+        loop {
             if self.mcp_socket().exists() && self.hook_socket().exists() {
+                eprintln!("daemon sockets ready after {:?}", started.elapsed());
                 return;
+            }
+            match self.child.try_wait() {
+                Ok(Some(_)) => panic!(
+                    "daemon exited before sockets became ready after {:?}\n{}",
+                    started.elapsed(),
+                    self.diagnose()
+                ),
+                Err(error) => panic!("daemon status probe failed: {error}"),
+                Ok(None) => {}
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "daemon did not create sockets within 15s\n{}",
+                    self.diagnose()
+                );
             }
             sleep(Duration::from_millis(50));
         }
-        panic!(
-            "daemon did not create sockets within 5s\n{}",
-            self.diagnose()
-        );
     }
 
     /// Report why the daemon never became ready: exit status, what landed in
@@ -169,6 +182,67 @@ impl Drop for DaemonProc {
 
 fn file_mode(p: &Path) -> u32 {
     std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+}
+
+#[test]
+fn readiness_accepts_sockets_published_after_the_old_five_second_deadline() {
+    let home = TempDir::new().unwrap();
+    let child = Command::new("python3")
+        .args([
+            "-B",
+            "-c",
+            concat!(
+                "import pathlib,socket,sys,time\n",
+                "base=pathlib.Path(sys.argv[1])/'.mdkb'\n",
+                "time.sleep(5.5)\n",
+                "base.mkdir()\n",
+                "a=socket.socket(socket.AF_UNIX); a.bind(str(base/'daemon.sock'))\n",
+                "b=socket.socket(socket.AF_UNIX); b.bind(str(base/'daemon-hook.sock'))\n",
+                "time.sleep(2)\n",
+            ),
+        ])
+        .arg(home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut fixture = DaemonProc { child, home };
+    fixture.wait_for_sockets();
+    assert!(fixture.mcp_socket().exists() && fixture.hook_socket().exists());
+}
+
+#[test]
+fn readiness_reports_an_exited_daemon_without_waiting_for_the_deadline() {
+    let home = TempDir::new().unwrap();
+    let child = Command::new("python3")
+        .args([
+            "-B",
+            "-c",
+            "import sys; print('bind refused', file=sys.stderr); sys.exit(42)",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut fixture = DaemonProc { child, home };
+    let started = Instant::now();
+    let failure =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fixture.wait_for_sockets()))
+            .expect_err("a dead daemon cannot become ready");
+    let text = failure
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or_default();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "late failure: {text}"
+    );
+    assert!(
+        text.contains("exit status: 42") && text.contains("bind refused"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -311,6 +385,52 @@ fn hook_symbol_at_position_reads_its_line_as_1_based() {
     assert_eq!(at(1)["name"], "greet", "line 1 is `pub fn greet`");
     assert_eq!(at(3)["name"], "greet", "line 3 is greet's closing brace");
     assert_eq!(at(4)["name"], "farewell", "line 4 is `pub fn farewell`");
+}
+
+/// Opt-in host probe: run the two wire contracts that failed in the 2026-09-25
+/// baseline while local CPU workers compete with daemon startup.
+#[test]
+#[ignore = "manual CPU contention probe"]
+fn symbol_socket_contracts_under_cpu_contention() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Burners {
+        stop: Arc<AtomicBool>,
+        threads: Vec<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for Burners {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            for thread in self.threads.drain(..) {
+                thread.join().unwrap();
+            }
+        }
+    }
+    let workers = std::thread::available_parallelism().unwrap().get().min(16);
+    let stop = Arc::new(AtomicBool::new(false));
+    let threads = (0..workers)
+        .map(|_| {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut value = 1_u64;
+                while !stop.load(Ordering::Relaxed) {
+                    value = std::hint::black_box(
+                        value.wrapping_mul(6364136223846793005).wrapping_add(1),
+                    );
+                }
+            })
+        })
+        .collect();
+    let _burners = Burners { stop, threads };
+    let mut load = [0_f64; 1];
+    let measured = unsafe { libc::getloadavg(load.as_mut_ptr(), 1) };
+    eprintln!(
+        "CPU contention probe: {workers} busy workers, load1={:?}",
+        (measured == 1).then_some(load[0])
+    );
+    hook_symbols_in_file_returns_a_bare_symbol_array();
+    hook_symbol_at_position_reads_its_line_as_1_based();
 }
 
 #[test]
