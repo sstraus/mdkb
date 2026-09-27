@@ -84,6 +84,7 @@ fn replay_stored_candidates_against_recorded_tool_events() {
                     tool: &e.tool,
                     path: path.as_deref(),
                     command: e.command.as_deref(),
+                    error: None,
                 },
                 // `stop`, `repo` and `prompt` have no tool-call arm; they are
                 // reported as match-zero, which is the honest reading.
@@ -104,6 +105,7 @@ fn replay_stored_candidates_against_recorded_tool_events() {
                         tool: &e.tool,
                         path: None,
                         command: None,
+                        error: None,
                     },
                 };
                 if trigger_matches(&c.trigger_kind, &c.trigger_matcher, &stripped) {

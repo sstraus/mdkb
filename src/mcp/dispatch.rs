@@ -5602,18 +5602,27 @@ pub async fn hook_post_tool_use_impl(handle: &RepoHandle, event: &Value) -> Valu
     let Some(tool_name) = event.get("tool_name").and_then(|v| v.as_str()) else {
         return json!({});
     };
+    let failed =
+        event.get("hook_event_name").and_then(|v| v.as_str()) == Some("PostToolUseFailure");
+    let error = if failed {
+        event.get("error").and_then(|v| v.as_str())
+    } else {
+        None
+    };
 
     // Priors are matched for EVERY tool, not only the ones that trigger a
     // reindex: "run the generator after editing the template" is a lesson about
     // Bash, which this hook otherwise ignores entirely.
     let prior_block = match event.get("tool_input") {
-        Some(input) => posttool_prior_block(handle, tool_name, input, &event_session(event)).await,
+        Some(input) => {
+            posttool_prior_block(handle, tool_name, input, error, &event_session(event)).await
+        }
         None => None,
     };
     let mut result = match &prior_block {
         Some(text) => json!({
             "hookSpecificOutput": {
-                "hookEventName": "PostToolUse",
+                "hookEventName": if failed { "PostToolUseFailure" } else { "PostToolUse" },
                 "additionalContext": text,
             }
         }),
@@ -5773,7 +5782,7 @@ async fn pretool_prior_block(
     tool_input: &Value,
     session: &str,
 ) -> Option<String> {
-    tool_prior_block(handle, tool, tool_input, false, session).await
+    tool_prior_block(handle, tool, tool_input, false, None, session).await
 }
 
 /// Promoted priors whose trigger matches this PostToolUse call.
@@ -5781,9 +5790,10 @@ async fn posttool_prior_block(
     handle: &RepoHandle,
     tool: &str,
     tool_input: &Value,
+    error: Option<&str>,
     session: &str,
 ) -> Option<String> {
-    tool_prior_block(handle, tool, tool_input, true, session).await
+    tool_prior_block(handle, tool, tool_input, true, error, session).await
 }
 
 /// Promoted priors whose trigger matches a tool call, formatted as a context
@@ -5799,6 +5809,7 @@ async fn tool_prior_block(
     tool: &str,
     tool_input: &Value,
     after: bool,
+    error: Option<&str>,
     session: &str,
 ) -> Option<String> {
     use crate::store::priors::{TriggerContext, match_injectable, record_tool_injection_once};
@@ -5837,6 +5848,7 @@ async fn tool_prior_block(
             tool,
             path: path.as_deref(),
             command,
+            error,
         }
     } else {
         TriggerContext::PreTool {
@@ -12232,6 +12244,83 @@ mod tests {
                 "only the two actual emissions count"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn failed_git_call_injects_only_the_matching_error_lesson() {
+        use crate::store::priors::{canonical_trigger_key, cluster_id_for_key, promote_cluster};
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let matcher = r#"{"tool":"Bash","error_contains":"index.lock"}"#;
+        let key = canonical_trigger_key("post_tool", matcher);
+        let cluster_id = cluster_id_for_key(&key);
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let mut guard = handle.ctx.lock().await;
+            let ctx = guard.as_mut().unwrap();
+            crate::store::priors::upsert_cluster(
+                &ctx.conn,
+                &crate::store::priors::PriorCluster {
+                    id: cluster_id.clone(),
+                    canonical_trigger_key: key,
+                    trigger_kind: "post_tool".into(),
+                    trigger_matcher: matcher.into(),
+                    lesson: "Inspect the existing index.lock before retrying Git.".into(),
+                    scope: r#"{"repo":"current"}"#.into(),
+                    evidence_count: 2,
+                    distinct_sessions: 2,
+                    injected_count: 0,
+                    confirmed_count: 0,
+                    refuted_count: 0,
+                    state: "candidate".into(),
+                    promoted_memory_id: None,
+                    created_at: chrono::Utc::now().timestamp(),
+                    last_seen_at: chrono::Utc::now().timestamp(),
+                    error_signature: None,
+                },
+            )
+            .unwrap();
+            promote_cluster(&ctx.conn, &cluster_id, chrono::Utc::now().timestamp()).unwrap();
+        }
+
+        let success = json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash", "tool_input": {"command": "git status"},
+            "tool_response": {"stdout": "clean", "stderr": ""},
+            "session_id": "successful-git"
+        });
+        assert_eq!(hook_post_tool_use_impl(&handle, &success).await, json!({}));
+
+        let unrelated_failure = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash", "tool_input": {"command": "git status"},
+            "error": "Exit code 128\nfatal: not a git repository",
+            "session_id": "unrelated-failure"
+        });
+        assert_eq!(
+            hook_post_tool_use_impl(&handle, &unrelated_failure).await,
+            json!({})
+        );
+
+        let lock_failure = json!({
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash", "tool_input": {"command": "git status"},
+            "error": "Exit code 128\nUnable to create .git/index.lock: File exists",
+            "session_id": "lock-failure"
+        });
+        let result = hook_post_tool_use_impl(&handle, &lock_failure).await;
+        assert_eq!(
+            result["hookSpecificOutput"]["hookEventName"],
+            "PostToolUseFailure"
+        );
+        assert!(
+            result["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Inspect the existing index.lock"),
+            "a matching tool failure must deliver the lesson: {result}"
+        );
     }
 
     #[tokio::test]

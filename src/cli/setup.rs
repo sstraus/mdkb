@@ -504,6 +504,7 @@ pub const HOOK_EVENTS: &[(&str, &str, Option<&str>)] = &[
     ("SessionStart", "session-start", None),
     ("UserPromptSubmit", "user-prompt-submit", None),
     ("PostToolUse", "post-tool-use", None),
+    ("PostToolUseFailure", "post-tool-use", None),
     ("PreToolUse", "pre-tool-use", None),
     ("Stop", "stop", None),
 ];
@@ -599,6 +600,7 @@ pub fn parse_disabled_events(raw: &str) -> std::collections::HashSet<String> {
             "sessionstart" | "session-start" => "SessionStart".to_string(),
             "userpromptsubmit" | "user-prompt-submit" => "UserPromptSubmit".to_string(),
             "posttooluse" | "post-tool-use" => "PostToolUse".to_string(),
+            "posttoolusefailure" | "post-tool-use-failure" => "PostToolUseFailure".to_string(),
             // DEFERRED (2026-04-20) — "pretooluse"/"pre-tool-use" not in HOOK_EVENTS yet;
             // alias kept so --disable pre-tool-use is silently accepted without error.
             "pretooluse" | "pre-tool-use" => "PreToolUse".to_string(),

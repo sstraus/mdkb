@@ -861,14 +861,16 @@ pub enum TriggerContext<'a> {
         path: Option<&'a str>,
         command: Option<&'a str>,
     },
-    /// A tool has just run. Same fields as [`TriggerContext::PreTool`]: the
-    /// difference is when the lesson is useful, not what identifies the call.
+    /// A tool has just run. `error` is present only for PostToolUseFailure.
     /// "Do not edit generated files" belongs before the edit; "run the generator
     /// after touching the template" belongs after it.
     PostTool {
         tool: &'a str,
         path: Option<&'a str>,
         command: Option<&'a str>,
+        /// Present only for a failed tool call. Successful results never
+        /// satisfy an error selector, regardless of their output text.
+        error: Option<&'a str>,
     },
     /// The user just submitted a prompt.
     Prompt { text: &'a str },
@@ -916,6 +918,10 @@ pub struct TriggerMatcher {
     /// (`-R` against `-r`, `Cargo.toml`) carry meaning in their case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_contains: Option<String>,
+    /// A literal substring of a failed tool call's error text. Only available
+    /// to `post_tool` triggers from PostToolUseFailure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_contains: Option<String>,
     /// A literal substring of the user's prompt. Case-insensitive: prose
     /// capitalisation is noise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -936,6 +942,7 @@ impl TriggerMatcher {
         non_empty(self.tool.as_ref()).is_some()
             || non_empty(self.path_glob.as_ref()).is_some()
             || non_empty(self.command_contains.as_ref()).is_some()
+            || non_empty(self.error_contains.as_ref()).is_some()
             || non_empty(self.prompt_contains.as_ref()).is_some()
     }
 
@@ -949,18 +956,19 @@ impl TriggerMatcher {
         if !self.has_selector() {
             return false;
         }
-        let (tool, path, command, prompt) = match ctx {
+        let (tool, path, command, error, prompt) = match ctx {
             TriggerContext::PreTool {
                 tool,
                 path,
                 command,
-            }
-            | TriggerContext::PostTool {
+            } => (Some(*tool), *path, *command, None, None),
+            TriggerContext::PostTool {
                 tool,
                 path,
                 command,
-            } => (Some(*tool), *path, *command, None),
-            TriggerContext::Prompt { text } => (None, None, None, Some(*text)),
+                error,
+            } => (Some(*tool), *path, *command, *error, None),
+            TriggerContext::Prompt { text } => (None, None, None, None, Some(*text)),
         };
 
         if let Some(want) = non_empty(self.tool.as_ref())
@@ -975,6 +983,11 @@ impl TriggerMatcher {
         }
         if let Some(want) = non_empty(self.command_contains.as_ref())
             && !command.is_some_and(|c| c.contains(want))
+        {
+            return false;
+        }
+        if let Some(want) = non_empty(self.error_contains.as_ref())
+            && !error.is_some_and(|e| e.contains(want))
         {
             return false;
         }
@@ -2363,6 +2376,7 @@ mod tests {
                     tool: "Edit",
                     path: Some("src/generated/api.rs"),
                     command: None,
+                    error: None,
                 },
             ),
         ];
@@ -2402,6 +2416,41 @@ mod tests {
             matcher,
             &TriggerContext::Prompt {
                 text: "unrelated question"
+            }
+        ));
+    }
+
+    #[test]
+    fn error_selector_never_matches_a_successful_git_command() {
+        let matcher = r#"{"tool":"Bash","error_contains":"index.lock"}"#;
+        assert!(!trigger_matches(
+            "post_tool",
+            matcher,
+            &TriggerContext::PostTool {
+                tool: "Bash",
+                path: None,
+                command: Some("git status"),
+                error: None,
+            }
+        ));
+        assert!(trigger_matches(
+            "post_tool",
+            matcher,
+            &TriggerContext::PostTool {
+                tool: "Bash",
+                path: None,
+                command: Some("git status"),
+                error: Some("Exit code 128\nUnable to create .git/index.lock: File exists"),
+            }
+        ));
+        assert!(!trigger_matches(
+            "post_tool",
+            matcher,
+            &TriggerContext::PostTool {
+                tool: "Bash",
+                path: None,
+                command: Some("git status"),
+                error: Some("Exit code 128\nfatal: not a git repository"),
             }
         ));
     }

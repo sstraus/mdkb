@@ -91,6 +91,17 @@ fn fresh_settings_gets_three_managed_hook_entries() {
 }
 
 #[test]
+fn failure_hook_is_registered_for_error_triggered_priors() {
+    let (_guard, project, _home) = isolated_project();
+    handle_setup_hooks_claude(project.path(), "local", "", false, None).unwrap();
+    let settings = read_json(&local_settings_path(project.path()));
+    let hooks = mdkb_entries(&settings, "PostToolUseFailure");
+    assert_eq!(hooks.len(), 1, "failed tools must reach the prior matcher");
+    let command = hooks[0]["hooks"][0]["command"].as_str().unwrap_or_default();
+    assert!(command.contains("hook post-tool-use"), "{command}");
+}
+
+#[test]
 fn http_registration_uses_native_handlers_except_for_session_start() {
     let (_guard, project, _home) = isolated_project();
 
@@ -163,13 +174,18 @@ fn disable_skips_named_events() {
         None,
     )
     .expect("setup hooks ok");
-    assert_eq!(result.events_registered.len(), 3);
+    assert_eq!(result.events_registered.len(), 4);
     assert!(
         result
             .events_registered
             .contains(&"UserPromptSubmit".to_string())
     );
     assert!(result.events_registered.contains(&"PreToolUse".to_string()));
+    assert!(
+        result
+            .events_registered
+            .contains(&"PostToolUseFailure".to_string())
+    );
     assert!(result.events_registered.contains(&"Stop".to_string()));
     assert_eq!(result.events_skipped.len(), 2);
     assert!(result.events_skipped.contains(&"SessionStart".to_string()));
@@ -180,6 +196,7 @@ fn disable_skips_named_events() {
     assert!(mdkb_entries(&v, "PostToolUse").is_empty());
     assert_eq!(mdkb_entries(&v, "UserPromptSubmit").len(), 1);
     assert_eq!(mdkb_entries(&v, "PreToolUse").len(), 1);
+    assert_eq!(mdkb_entries(&v, "PostToolUseFailure").len(), 1);
     assert_eq!(mdkb_entries(&v, "Stop").len(), 1);
 }
 
@@ -367,7 +384,7 @@ fn live_shape_dedupes_to_one_per_event_and_registers_stop() {
         before.duplicated,
         vec!["SessionStart", "UserPromptSubmit", "PostToolUse"]
     );
-    assert_eq!(before.missing, vec!["Stop"]);
+    assert_eq!(before.missing, vec!["PostToolUseFailure", "Stop"]);
 
     handle_setup_hooks_claude(project.path(), "local", "", false, None).expect("setup hooks ok");
 
@@ -596,7 +613,7 @@ fn check_hooks_reports_the_missing_stop_entry() {
     let check = check_hooks(project.path()).expect("check runs");
     assert_eq!(check.user_path, private.join("settings.json"));
     assert_eq!(check.local_path, local_settings_path(project.path()));
-    assert_eq!(check.drift.missing, vec!["Stop"]);
+    assert_eq!(check.drift.missing, vec!["PostToolUseFailure", "Stop"]);
     assert!(check.drift.duplicated.is_empty());
     assert!(!check.drift.is_clean());
 
