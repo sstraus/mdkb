@@ -2,8 +2,6 @@
 
 ## Unreleased
 
-## 3.11.1 (2026-09-27)
-
 ### Added
 
 - **Durable memories can surface on explicit triggers.** Decisions, topics and
@@ -20,14 +18,6 @@
   receive at most one verdict per session. Found by the maintainer's
   2026-09-23 prior audit.
 
-- **Hook telemetry now records the bytes sent to the host and the blocks that
-  produced them.** `hook-events.jsonl` records the size of the actual
-  `additionalContext` and attributes bytes to SessionStart, search redirects,
-  code hits, priors, memory and document recall, related documents, and call
-  graph hints. `mdkb stats` aggregates these totals over its seven-day hook
-  window. The log contains sizes and block names, never the prompt or lesson
-  text. Measured need from the maintainer's 2026-09-23 hook audit.
-
 ### Changed
 
 - **Working priors stay fresh through use.** Injection scoring now considers
@@ -35,15 +25,6 @@
   failure, and a new session renews the prior projection's expiry. A negative
   majority still suppresses injection; misfires lower reach without refuting
   the lesson. Found by the maintainer's 2026-09-23 prior audit.
-
-- **PreToolUse and PostToolUse hooks now register for every tool.** A prior
-  naming Edit, Agent, Bash, or an MCP tool can reach the handler that already
-  checks its trigger; an unmatched call remains silent. Existing Claude hook
-  registrations keep their old matcher until setup is run again with the
-  original scope, for example `mdkb setup hooks claude --scope local`. The
-  isolated warm-daemon baseline for unmatched calls was 17.171 ms p95 before
-  dispatch and under 1 ms at the daemon handler's log resolution. Found by the
-  maintainer's 2026-09-23 hook audit.
 
 ### Fixed
 
@@ -75,6 +56,31 @@
   cap; cold-model recall keeps deterministic newest-edge order. A read-only
   2026-09-27 census found 19 TUICommander documents with more than three
   eligible frontmatter neighbors, exposing the old truncation order.
+
+## 3.11.1 (2026-09-27)
+
+### Added
+
+- **Hook telemetry now records the bytes sent to the host and the blocks that
+  produced them.** `hook-events.jsonl` records the size of the actual
+  `additionalContext` and attributes bytes to SessionStart, search redirects,
+  code hits, priors, memory and document recall, related documents, and call
+  graph hints. `mdkb stats` aggregates these totals over its seven-day hook
+  window. The log contains sizes and block names, never the prompt or lesson
+  text. Measured need from the maintainer's 2026-09-23 hook audit.
+
+### Changed
+
+- **PreToolUse and PostToolUse hooks now register for every tool.** A prior
+  naming Edit, Agent, Bash, or an MCP tool can reach the handler that already
+  checks its trigger; an unmatched call remains silent. Existing Claude hook
+  registrations keep their old matcher until setup is run again with the
+  original scope, for example `mdkb setup hooks claude --scope local`. The
+  isolated warm-daemon baseline for unmatched calls was 17.171 ms p95 before
+  dispatch and under 1 ms at the daemon handler's log resolution. Found by the
+  maintainer's 2026-09-23 hook audit.
+
+### Fixed
 
 - **Expired, successfully salvaged quarantines with older report names are
   retired again.** A report naming `index.sqlite` authorizes only its matching
