@@ -855,9 +855,7 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
             // unsuffixed copy, never a same-second collision sibling.
             let report_names_copy = report.corrupt_file == copy_name
                 || format!("{}.corrupt-{timestamp}", report.corrupt_file) == copy_name;
-            (report.salvage_succeeded
-                && report_names_copy
-                && report.quarantined_at == timestamp)
+            (report.salvage_succeeded && report_names_copy && report.quarantined_at == timestamp)
                 .then(|| copy_name.to_string())
         })
         .collect();
@@ -1571,7 +1569,10 @@ mod tests {
         sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
 
         assert!(!original.exists(), "the reported original was recovered");
-        assert!(collision.exists(), "a sibling without a report remains forensic evidence");
+        assert!(
+            collision.exists(),
+            "a sibling without a report remains forensic evidence"
+        );
     }
 
     #[test]

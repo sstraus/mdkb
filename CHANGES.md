@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 3.11.1 (2026-09-27)
+
 ### Added
 
 - **Hook telemetry now records the bytes sent to the host and the blocks that
