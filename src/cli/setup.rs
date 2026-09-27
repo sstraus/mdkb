@@ -1683,7 +1683,7 @@ mod tests {
     }
 
     /// The live audit shape: SessionStart/UPS/PostToolUse each registered twice
-    /// (tagged + legacy untagged absolute path), Stop entirely missing.
+    /// (tagged + legacy untagged absolute path), Stop and the failure hook missing.
     #[test]
     fn test_detect_drift_live_shape_duplicates_and_missing_stop() {
         let settings = serde_json::json!({
@@ -1711,7 +1711,7 @@ mod tests {
             drift.duplicated,
             vec!["SessionStart", "UserPromptSubmit", "PostToolUse"],
         );
-        assert_eq!(drift.missing, vec!["Stop"]);
+        assert_eq!(drift.missing, vec!["PostToolUseFailure", "Stop"]);
         let warning = drift.warning().expect("warning present");
         assert!(warning.contains("3 duplicated"));
         assert!(warning.contains("Stop"));
