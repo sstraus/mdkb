@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::domain::prior_detect::CandidateSignal;
+use crate::domain::prior_detect::{CandidateReason, CandidateSignal};
 use crate::domain::prior_episode::Episode;
 
 /// A validated, distilled behavioral prior ready to become a candidate row.
@@ -46,6 +46,7 @@ pub enum DistillReject {
     HookGeneratedTrigger,
     ErrorSelectorWrongKind,
     ErrorSelectorEmpty,
+    ErrorSignalMismatch,
     TriggerUntyped,
     ScopeEmpty,
     EvidenceIncomplete,
@@ -74,6 +75,12 @@ impl std::fmt::Display for DistillReject {
                 write!(f, "error_contains requires a post_tool trigger")
             }
             DistillReject::ErrorSelectorEmpty => write!(f, "error_contains is empty"),
+            DistillReject::ErrorSignalMismatch => {
+                write!(
+                    f,
+                    "error-derived lesson must match the observed failed tool and error"
+                )
+            }
             DistillReject::TriggerUntyped => write!(
                 f,
                 "trigger uses the removed untyped \"pattern\": name the selector \
@@ -409,6 +416,34 @@ pub fn parse_distilled(json: &str) -> Result<DistilledPrior, DistillReject> {
     })
 }
 
+/// The model may ignore the prompt's trigger rule. An ErrorFixed episode has
+/// one observed failed call, so only that call's failure is a safe condition
+/// for the resulting lesson. A user correction has no such restriction.
+pub fn validate_against_signal(
+    prior: &DistilledPrior,
+    signal: &CandidateSignal,
+) -> Result<(), DistillReject> {
+    if signal.reason != CandidateReason::ErrorFixed {
+        return Ok(());
+    }
+    let matcher: crate::store::priors::TriggerMatcher =
+        serde_json::from_str(&prior.trigger_matcher).map_err(|_| DistillReject::NotJson)?;
+    let matches_tool = matcher
+        .tool
+        .as_deref()
+        .zip(signal.error_tool.as_deref())
+        .is_some_and(|(actual, observed)| actual.eq_ignore_ascii_case(observed));
+    let matches_error = matcher
+        .error_contains
+        .as_deref()
+        .zip(signal.error_signature.as_deref())
+        .is_some_and(|(actual, observed)| observed.contains(actual));
+    if prior.trigger_kind != "post_tool" || !matches_tool || !matches_error {
+        return Err(DistillReject::ErrorSignalMismatch);
+    }
+    Ok(())
+}
+
 // ============================================================================
 // CLI spawn (thin impure edge — integration-tested, not unit-tested)
 // ============================================================================
@@ -573,7 +608,6 @@ pub fn run_distiller_cli(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::prior_detect::CandidateReason;
     use crate::domain::prior_episode::ToolUse;
     use crate::test_support::{Stub, StubArgv, StubStdin};
     use tempfile::TempDir;
@@ -820,6 +854,57 @@ mod tests {
             parse_distilled(&j).is_err(),
             "blank error signature must not mean every Bash call"
         );
+    }
+
+    #[test]
+    fn error_fixed_lesson_must_target_the_observed_failed_call() {
+        let signal = CandidateSignal {
+            reason: CandidateReason::ErrorFixed,
+            error_tool: Some("Bash".into()),
+            error_signature: Some("fatal: Unable to create .git/index.lock: File exists".into()),
+            corrective_tools: vec!["Bash".into()],
+            correction_text: None,
+        };
+        let output = |kind: &str, matcher: &str| {
+            valid_json()
+                .replace("\"kind\":\"pre_tool\"", &format!("\"kind\":\"{kind}\""))
+                .replace("\"path_glob\":\"src/generated/**\"", matcher)
+        };
+        let precise = parse_distilled(&output(
+            "post_tool",
+            r#""tool":"Bash","error_contains":"index.lock""#,
+        ))
+        .unwrap();
+        assert_eq!(validate_against_signal(&precise, &signal), Ok(()));
+        for (kind, matcher) in [
+            ("pre_tool", r#""tool":"Bash","command_contains":"git ""#),
+            (
+                "post_tool",
+                r#""tool":"Bash","error_contains":"permission denied""#,
+            ),
+            (
+                "post_tool",
+                r#""tool":"Edit","error_contains":"index.lock""#,
+            ),
+            ("post_tool", r#""tool":"Bash","command_contains":"git ""#),
+        ] {
+            let prior = parse_distilled(&output(kind, matcher)).unwrap();
+            assert_eq!(
+                validate_against_signal(&prior, &signal),
+                Err(DistillReject::ErrorSignalMismatch),
+                "kind={kind}, matcher={matcher}"
+            );
+        }
+        let correction = CandidateSignal {
+            reason: CandidateReason::UserCorrection,
+            error_tool: None,
+            error_signature: None,
+            corrective_tools: Vec::new(),
+            correction_text: Some("No, edit the generator instead".into()),
+        };
+        let preventive =
+            parse_distilled(&output("pre_tool", r#""path_glob":"src/generated/**""#)).unwrap();
+        assert_eq!(validate_against_signal(&preventive, &correction), Ok(()));
     }
 
     #[test]

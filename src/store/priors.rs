@@ -436,6 +436,15 @@ fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+fn error_match_key(matcher: &TriggerMatcher) -> Option<(String, String)> {
+    matcher.error_contains.clone().map(|error| {
+        (
+            matcher.tool.as_deref().unwrap_or("").to_ascii_lowercase(),
+            error,
+        )
+    })
+}
+
 /// Persist a cluster's lesson embedding for later semantic merge. Kept off the
 /// [`PriorCluster`] struct (and its round-trip) since it is only ever read by
 /// [`find_cluster_by_embedding`], never surfaced.
@@ -456,23 +465,34 @@ fn find_cluster_by_embedding(
     conn: &Connection,
     embedding: &[f32],
     threshold: f32,
+    matcher: &TriggerMatcher,
 ) -> Result<Option<String>> {
     let mut stmt = conn.prepare(
         // `archived` belongs in this list as much as the other two: a cluster
         // retired because its trigger can never fire must not quietly absorb
         // the evidence of a lesson that still can.
-        "SELECT id, embedding FROM prior_clusters
+        "SELECT id, embedding, trigger_matcher FROM prior_clusters
          WHERE embedding IS NOT NULL AND state NOT IN ('refuted', 'expired', 'archived')",
     )?;
     let rows = stmt.query_map([], |row| {
         let id: String = row.get(0)?;
         let blob: Vec<u8> = row.get(1)?;
-        Ok((id, blob))
+        let trigger_matcher: String = row.get(2)?;
+        Ok((id, blob, trigger_matcher))
     })?;
 
     let mut best: Option<(String, f32)> = None;
     for row in rows {
-        let (id, blob) = row?;
+        let (id, blob, stored_matcher) = row?;
+        let Ok(stored_matcher) = serde_json::from_str::<TriggerMatcher>(&stored_matcher) else {
+            continue;
+        };
+        // A lesson about a failed call cannot inherit a cluster's broader
+        // trigger just because the lesson text embeds similarly. Its tool and
+        // literal failure condition must survive semantic clustering.
+        if error_match_key(matcher) != error_match_key(&stored_matcher) {
+            continue;
+        }
         let sim = cosine_similarity(embedding, &decode_embedding(&blob));
         if sim >= threshold && best.as_ref().map(|(_, b)| sim > *b).unwrap_or(true) {
             best = Some((id, sim));
@@ -523,7 +543,10 @@ pub fn integrate_candidate_with_embedding(
     // on a machine without the embedding model degrades to the old behaviour
     // rather than failing.
     let by_lesson = match embedding {
-        Some(e) => find_cluster_by_embedding(conn, e, PRIOR_MERGE_SIMILARITY)?,
+        Some(e) => {
+            let matcher: TriggerMatcher = serde_json::from_str(&cand.trigger_matcher)?;
+            find_cluster_by_embedding(conn, e, PRIOR_MERGE_SIMILARITY, &matcher)?
+        }
         None => None,
     };
     let cluster_id = if let Some(sim_id) = by_lesson {
@@ -641,6 +664,7 @@ pub fn recluster(conn: &Connection, now: i64) -> Result<ReclusterReport> {
     struct Group {
         seed: PriorCandidate,
         seed_cluster: Option<String>,
+        error_key: Option<(String, String)>,
         embeddings: Vec<Vec<f32>>,
         keys: Vec<String>,
         members: Vec<PriorCandidate>,
@@ -678,6 +702,9 @@ pub fn recluster(conn: &Connection, now: i64) -> Result<ReclusterReport> {
         };
         let embedding = blob.as_ref().map(|b| decode_embedding(b));
         let key = canonical_trigger_key(&cand.trigger_kind, &cand.trigger_matcher);
+        let error_key = serde_json::from_str::<TriggerMatcher>(&cand.trigger_matcher)
+            .ok()
+            .and_then(|matcher| error_match_key(&matcher));
 
         // Lesson first, trigger key second — the same order mining uses.
         let mut hits: Vec<usize> = embedding
@@ -686,7 +713,10 @@ pub fn recluster(conn: &Connection, now: i64) -> Result<ReclusterReport> {
                 groups
                     .iter()
                     .enumerate()
-                    .filter(|(_, g)| g.similarity(e).is_some_and(|s| s >= PRIOR_MERGE_SIMILARITY))
+                    .filter(|(_, g)| {
+                        g.error_key == error_key
+                            && g.similarity(e).is_some_and(|s| s >= PRIOR_MERGE_SIMILARITY)
+                    })
                     .map(|(i, _)| i)
                     .collect()
             })
@@ -698,6 +728,7 @@ pub fn recluster(conn: &Connection, now: i64) -> Result<ReclusterReport> {
         let Some(&survivor) = hits.first() else {
             groups.push(Group {
                 seed_cluster: old_cluster.clone(),
+                error_key,
                 embeddings: embedding.into_iter().collect(),
                 keys: vec![key],
                 members: vec![cand.clone()],
@@ -3000,6 +3031,42 @@ mod tests {
         use crate::store::memory::{EntryType, get_entry_without_tracking};
         let entry = get_entry_without_tracking(&conn, &mem).unwrap().unwrap();
         assert_eq!(entry.entry_type, EntryType::Prior);
+    }
+
+    #[test]
+    fn error_matched_lesson_does_not_inherit_a_broad_pre_tool_trigger() {
+        let conn = conn();
+        let broad = DistilledPrior {
+            trigger_kind: "pre_tool".into(),
+            trigger_matcher: r#"{"tool":"Bash","command_contains":"git "}"#.into(),
+            lesson: "If Git reports index.lock, inspect the lock before retrying.".into(),
+            scope: r#"{"repo":"current"}"#.into(),
+            evidence_failure: "Git failed with index.lock already present".into(),
+            evidence_fix: "Waited for the lock to clear".into(),
+            ttl_days: Some(30),
+        };
+        let precise = DistilledPrior {
+            trigger_kind: "post_tool".into(),
+            trigger_matcher: r#"{"tool":"Bash","error_contains":"index.lock"}"#.into(),
+            ..broad.clone()
+        };
+        integrate_distilled(&conn, &broad, "old-session", 1000, Some(&[1.0, 0.0]), None).unwrap();
+        integrate_distilled(
+            &conn,
+            &precise,
+            "new-session",
+            2000,
+            Some(&[1.0, 0.0]),
+            Some("index.lock"),
+        )
+        .unwrap();
+        assert_eq!(
+            cluster_count(&conn),
+            2,
+            "a precise error rule must keep its failure-only trigger"
+        );
+        let report = recluster(&conn, 3000).unwrap();
+        assert_eq!(report.moved, 0, "recluster must preserve the same boundary");
     }
 
     #[test]

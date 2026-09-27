@@ -5530,6 +5530,7 @@ async fn mine_episode_inner(
     use crate::domain::prior_detect::detect_candidate;
     use crate::domain::prior_distill::{
         build_distill_prompt, distiller_failure, parse_distilled, run_distiller_cli,
+        validate_against_signal,
     };
     use crate::domain::prior_episode::parse_episode;
     use crate::store::priors::integrate_distilled;
@@ -5593,6 +5594,10 @@ async fn mine_episode_inner(
             return MiningOutcome::Rejected(e.to_string());
         }
     };
+    if let Err(e) = validate_against_signal(&distilled, &sig) {
+        tracing::debug!("prior mining: distiller output rejected: {e}");
+        return MiningOutcome::Rejected(e.to_string());
+    }
 
     // Embed the lesson (off the async runtime — ONNX inference is blocking) so
     // integrate_distilled can merge semantically-equivalent clusters. Best-effort:
@@ -11873,6 +11878,89 @@ mod tests {
         r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
     );
 
+    /// A user correction can teach a preventive rule before the next edit.
+    const MINE_CORRECTION_TRANSCRIPT: &str = concat!(
+        r#"{"type":"user","message":{"role":"user","content":"No, edit the generator template instead of generated code."}}"#,
+        "\n",
+        r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Edit","input":{"file_path":"src/generator.rs"}}]}}"#,
+        "\n",
+        r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"ok"}]}}"#,
+    );
+
+    /// An error lesson from a real failed Git call must be triggered by that
+    /// failure, even when the external distiller suggests a broad pre-tool rule.
+    #[tokio::test]
+    async fn mine_episode_rejects_a_pre_tool_rule_for_a_failed_git_call() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let transcript = tmp.path().join("git-error.jsonl");
+        std::fs::write(
+            &transcript,
+            concat!(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"g1","name":"Bash","input":{"command":"git status"}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"g1","is_error":true,"content":"fatal: Unable to create .git/index.lock: File exists"}]}}"#,
+                "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","id":"g2","name":"Bash","input":{"command":"git status"}}]}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"g2","content":"clean"}]}}"#,
+            ),
+        )
+        .unwrap();
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","tool":"Bash","command_contains":"git ","when":"Before any Git call"},"lesson":"If Git reports index.lock, inspect the lock before retrying.","scope":{"repo":"current"},"evidence":{"failure":"Git failed with index.lock already present","fix":"Waited for the lock to clear"},"ttl_days":30}"#;
+        let (program, args) = Stub {
+            stdout: distilled,
+            ..Default::default()
+        }
+        .build(tmp.path());
+
+        let result = mine_episode_inner(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "git-error-session".into(),
+            program,
+            args,
+        )
+        .await;
+        assert!(matches!(result, MiningOutcome::Rejected(_)));
+        ensure_handle_context(&handle).await.unwrap();
+        let guard = handle.ctx.lock().await;
+        let count: i64 = guard
+            .as_ref()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM prior_candidates", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "invalid error lesson must not be mined");
+        drop(guard);
+
+        let precise = r#"{"is_reusable":true,"trigger":{"kind":"post_tool","tool":"Bash","error_contains":"index.lock","when":"After a failed Git call reports the lock"},"lesson":"If Git reports index.lock, inspect the lock before retrying.","scope":{"repo":"current"},"evidence":{"failure":"Git failed with index.lock already present","fix":"Waited for the lock to clear"},"ttl_days":30}"#;
+        let (program, args) = Stub {
+            stdout: precise,
+            ..Default::default()
+        }
+        .build(tmp.path());
+        let result = mine_episode_inner(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "precise-error-session".into(),
+            program,
+            args,
+        )
+        .await;
+        assert!(matches!(result, MiningOutcome::Distilled));
+        let guard = handle.ctx.lock().await;
+        let matcher: String = guard
+            .as_ref()
+            .unwrap()
+            .conn
+            .query_row("SELECT trigger_matcher FROM prior_clusters", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(matcher.contains("\"error_contains\":\"index.lock\""));
+    }
+
     /// Every `prior_mining` event written to `hook-events.jsonl` under `root`.
     fn mining_events(root: &std::path::Path) -> Vec<Value> {
         let dir = crate::store::namespace::store_dir(root).unwrap_or_else(|_| root.join(".mdkb"));
@@ -11896,7 +11984,7 @@ mod tests {
     /// error text is what made the six-week outage invisible.
     #[tokio::test]
     async fn mine_episode_records_the_outcome_it_reached() {
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"Direct edit ignored the user correction","fix":"edited the generator"},"ttl_days":30}"#;
         let not_reusable = distilled.replace(r#""is_reusable":true"#, r#""is_reusable":false"#);
 
         // (transcript, distiller stub, expected outcome, a substring the reason
@@ -11912,7 +12000,7 @@ mod tests {
                 "",
             ),
             (
-                MINE_FIX_TRANSCRIPT,
+                MINE_CORRECTION_TRANSCRIPT,
                 Stub {
                     stdout: distilled,
                     ..Default::default()
@@ -11921,7 +12009,7 @@ mod tests {
                 "",
             ),
             (
-                MINE_FIX_TRANSCRIPT,
+                MINE_CORRECTION_TRANSCRIPT,
                 Stub {
                     stdout: &not_reusable,
                     ..Default::default()
@@ -11930,7 +12018,7 @@ mod tests {
                 "reusable",
             ),
             (
-                MINE_FIX_TRANSCRIPT,
+                MINE_CORRECTION_TRANSCRIPT,
                 Stub {
                     stderr: "model overloaded\n",
                     exit: 1,
@@ -12031,12 +12119,12 @@ mod tests {
     /// something", which is the whole question `mdkb stats` is asked.
     #[tokio::test]
     async fn mine_episode_records_promotion_separately_from_distillation() {
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"Direct edit ignored the user correction","fix":"edited the generator"},"ttl_days":30}"#;
 
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let transcript = tmp.path().join("transcript.jsonl");
-        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+        std::fs::write(&transcript, MINE_CORRECTION_TRANSCRIPT).unwrap();
 
         // The same lesson from two distinct sessions: the recurrence gate.
         let (program, args) = Stub {
@@ -12074,10 +12162,10 @@ mod tests {
         let handle = make_handle(&tmp);
 
         let transcript = tmp.path().join("transcript.jsonl");
-        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+        std::fs::write(&transcript, MINE_CORRECTION_TRANSCRIPT).unwrap();
 
         // Fake distiller: consume stdin (the prompt), emit a valid distilled prior.
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"Direct edit ignored the user correction","fix":"edited the generator"},"ttl_days":30}"#;
         let (program, args) = Stub {
             stdout: distilled,
             ..Default::default()
@@ -12120,9 +12208,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let transcript = tmp.path().join("transcript.jsonl");
-        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+        std::fs::write(&transcript, MINE_CORRECTION_TRANSCRIPT).unwrap();
 
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"Direct edit ignored the user correction","fix":"edited the generator"},"ttl_days":30}"#;
         let fenced = format!("Here you go:\n```json\n{distilled}\n```\n");
         let (program, args) = Stub {
             stdout: &fenced,
@@ -12162,7 +12250,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let transcript = tmp.path().join("transcript.jsonl");
-        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+        std::fs::write(&transcript, MINE_CORRECTION_TRANSCRIPT).unwrap();
         let key = canonical_trigger_key(
             "pre_tool",
             r#"{"path_glob":"src/generated/**","when":"editing generated code"}"#,
@@ -12199,7 +12287,7 @@ mod tests {
 
         // The prompt arrives in argv: the stub answers only when it got an
         // argument, so a cluster appears only if substitution happened.
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"Direct edit ignored the user correction","fix":"edited the generator"},"ttl_days":30}"#;
         let argv_dir = tmp.path().join("argv");
         std::fs::create_dir(&argv_dir).unwrap();
         let (program, args) = Stub {
@@ -12239,13 +12327,13 @@ mod tests {
         let handle = make_handle(&tmp);
 
         let transcript = tmp.path().join("transcript.jsonl");
-        std::fs::write(&transcript, MINE_FIX_TRANSCRIPT).unwrap();
+        std::fs::write(&transcript, MINE_CORRECTION_TRANSCRIPT).unwrap();
 
         // Fake distiller: consume the prompt on stdin, emit a valid pre_tool prior
         // whose glob targets generated files. Identical output both sessions → one
         // trigger key → one cluster whose distinct_sessions climbs to the promotion
         // gate (PROMOTION_MIN_SESSIONS = 2).
-        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template instead.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#;
+        let distilled = r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template instead.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"Direct edit ignored the user correction","fix":"edited the generator"},"ttl_days":30}"#;
         let (program, args) = Stub {
             stdout: distilled,
             ..Default::default()

@@ -56,10 +56,13 @@
 - **Error lessons now fire on the failed tool result.** Distilled error lessons
   use a `post_tool` trigger with an `error_contains` selector. Claude's
   `PostToolUseFailure` hook supplies the error text; successful commands and
-  unrelated failures do not match. The maintainer's prior audit found an
-  `index.lock` lesson attached to every Git command (1,557 recorded injections
-  in the TUICommander store). Its broad cluster and memory projection were
-  archived after an online backup; run `mdkb setup hooks claude` to register
+  unrelated failures do not match. Mining rejects a model answer that turns an
+  observed tool error into a before-call rule, and semantic clustering cannot
+  make an error-matched lesson inherit a broader trigger. The maintainer's
+  prior audit found an `index.lock` lesson attached to every Git command
+  (1,557 recorded injections in the TUICommander store). Its broad cluster
+  and memory projection were archived after an online backup; run
+  `mdkb setup hooks claude` to register
   the new failure hook before new error lessons can fire.
 
 - **Prior mining ignores hook-generated corrections.** Stop-hook feedback and
