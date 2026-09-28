@@ -608,7 +608,7 @@ pub fn integrate_candidate_with_embedding(
 }
 
 /// What one [`recluster`] pass did.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReclusterReport {
     /// Candidates whose `cluster_id` changed.
     pub moved: usize,

@@ -95,6 +95,9 @@ pub enum CliMutation {
     MemoryAudit {
         dry_run: bool,
     },
+    MemoryCuratePriors {
+        cluster_ids: Vec<String>,
+    },
     #[cfg(feature = "llm")]
     MemoryCondense {
         tag: Option<String>,
@@ -210,6 +213,9 @@ pub enum CliMutationResult {
     },
     MemoryAudited {
         outcome: crate::core::memory_audit::AuditOutcome,
+    },
+    MemoryPriorsCurated {
+        report: crate::store::priors::ReclusterReport,
     },
     #[cfg(feature = "llm")]
     MemoryCondensed {
@@ -405,6 +411,13 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
         },
         MemoryAudit { dry_run } => R::MemoryAudited {
             outcome: crate::core::memory_audit::handle_memory_audit(ctx, dry_run)?,
+        },
+        MemoryCuratePriors { cluster_ids } => R::MemoryPriorsCurated {
+            report: crate::store::priors::curate_cluster_family(
+                &ctx.conn,
+                &cluster_ids.iter().map(String::as_str).collect::<Vec<_>>(),
+                chrono::Utc::now().timestamp(),
+            )?,
         },
         #[cfg(feature = "llm")]
         MemoryCondense {

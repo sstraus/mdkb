@@ -1037,6 +1037,15 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 open_writer(&cwd)?
             };
             match cmd {
+                MemoryCommand::CuratePriors { cluster_ids } => {
+                    let ids: Vec<&str> = cluster_ids.iter().map(String::as_str).collect();
+                    let report = mdkb::store::priors::curate_cluster_family(
+                        &ctx.conn,
+                        &ids,
+                        chrono::Utc::now().timestamp(),
+                    )?;
+                    print_prior_curation_report(&report, cli.format)?;
+                }
                 MemoryCommand::Add {
                     id,
                     title,
@@ -1477,6 +1486,7 @@ mdkb memory show <id>                                   # one entry in full
 mdkb memory search <query>                              # memory only, same as search --scope memory
 mdkb memory warmup                                      # compact index to load at session start
 mdkb memory history <id>                                # revisions, including versions a conflict superseded
+mdkb memory curate-priors <cluster-id> <cluster-id>...   # merge reviewed prior clusters
 
 # Memory projection (entries live in the database; .mdkb/memory/entries/*.md is
 # the git-tracked copy, and the only copy that survives losing the database)
@@ -2347,6 +2357,12 @@ fn print_routed_result(
         (Command::Memory(MemoryCommand::Audit { dry_run }), R::MemoryAudited { outcome }) => {
             format_audit_result(outcome, *dry_run, format);
         }
+        (
+            Command::Memory(MemoryCommand::CuratePriors { .. }),
+            R::MemoryPriorsCurated { report },
+        ) => {
+            print_prior_curation_report(report, format)?;
+        }
         #[cfg(feature = "llm")]
         (
             Command::Memory(MemoryCommand::Condense { dry_run, .. }),
@@ -2654,6 +2670,23 @@ fn format_embed_result(result: &EmbedResult, format: OutputFormat) {
             }
         }
     }
+}
+
+fn print_prior_curation_report(
+    report: &mdkb::store::priors::ReclusterReport,
+    format: OutputFormat,
+) -> Result<()> {
+    if matches!(format, OutputFormat::Json) {
+        println!("{}", serde_json::to_string(report)?);
+    } else {
+        println!("Moved candidates: {}", report.moved);
+        println!("Emptied clusters: {}", report.emptied.join(", "));
+        println!(
+            "Newly promotable clusters: {}",
+            report.newly_promotable.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn format_memory_entry(entry: &MemoryEntry, format: OutputFormat) {

@@ -40,6 +40,7 @@ fn mutating_commands_are_classified_as_mutations() {
         &["memory", "link", "a", "supports", "b"],
         &["memory", "confirm", "x", "--outcome", "worked"],
         &["memory", "sync"],
+        &["memory", "curate-priors", "cluster-a", "cluster-b"],
         &["memory", "prune"],
         &["memory", "import", "f.json"],
         &["collection", "add", "n", "p"],
@@ -444,6 +445,13 @@ fn routed_mutations_resolve_to_the_typed_daemon_request() {
     assert!(matches!(
         mutation_request(&mut command, &cwd, &cwd).unwrap(),
         Some(CliMutation::Update { .. })
+    ));
+
+    let mut command = parse(&["memory", "curate-priors", "cluster-a", "cluster-b"]);
+    assert!(matches!(
+        mutation_request(&mut command, &cwd, &cwd).unwrap(),
+        Some(CliMutation::MemoryCuratePriors { cluster_ids })
+            if cluster_ids == ["cluster-a", "cluster-b"]
     ));
 
     let mut command = parse(&["search", "q"]);
