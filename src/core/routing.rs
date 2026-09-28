@@ -63,6 +63,7 @@ pub fn routing_for(command: &Command) -> Routing {
         Command::Memory(c) => match c {
             MemoryCommand::Show { .. }
             | MemoryCommand::List { .. }
+            | MemoryCommand::Propose
             | MemoryCommand::Search { .. }
             | MemoryCommand::Warmup { .. }
             | MemoryCommand::History { .. }
@@ -328,6 +329,7 @@ pub fn mutation_request(
             },
             MemoryCommand::Show { .. }
             | MemoryCommand::List { .. }
+            | MemoryCommand::Propose
             | MemoryCommand::Search { .. }
             | MemoryCommand::Warmup { .. }
             | MemoryCommand::History { .. }

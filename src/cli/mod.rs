@@ -9,6 +9,7 @@ pub mod hook_logic;
 pub mod journal;
 #[cfg(unix)]
 pub mod mcp_proxy;
+pub mod memory;
 pub mod priority;
 pub mod setup;
 pub mod stats_render;
@@ -862,6 +863,9 @@ pub enum MemoryCommand {
         #[arg(short, long)]
         status: Option<String>,
     },
+
+    /// List cluster-less user priors with conservative migration proposals
+    Propose,
 
     /// Search memory entries
     Search {

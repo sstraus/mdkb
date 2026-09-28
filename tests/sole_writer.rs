@@ -84,6 +84,7 @@ fn read_commands_are_not_classified_as_mutations() {
         &["stats"],
         &["graph", "hubs"],
         &["memory", "list"],
+        &["memory", "propose"],
         &["memory", "show", "x"],
         &["code", "find", "sym"],
         &["surface"],

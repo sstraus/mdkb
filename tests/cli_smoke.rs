@@ -60,6 +60,98 @@ fn stdout(out: &Output) -> String {
 }
 
 #[test]
+fn memory_propose_lists_clusterless_user_priors_without_changing_them() {
+    let repo = Repo::new();
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/index.sqlite")).unwrap();
+    for (id, source_type, status) in [
+        ("retained-lesson", "user_statement", "active"),
+        ("uncatalogued-lesson", "user_statement", "archived"),
+        ("official-lesson", "official_docs", "active"),
+        ("clustered-lesson", "user_statement", "active"),
+        ("converted-lesson", "user_statement", "active"),
+    ] {
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, source_type, status, created_at, updated_at)
+             VALUES (?1, ?1, 'Review the lesson.', 'prior', ?2, ?3, 1, 1)",
+            rusqlite::params![id, source_type, status],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "UPDATE memory_entries SET entry_type = 'decision' WHERE id = 'converted-lesson'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO prior_clusters (id, canonical_trigger_key, trigger_kind, trigger_matcher,
+         lesson, scope, promoted_memory_id, created_at, last_seen_at)
+         VALUES ('cluster-one', 'key', 'prompt', '{}', 'lesson', '{}', 'clustered-lesson', 1, 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = run(&["--format", "json", "memory", "propose"], &repo.root);
+    assert_ok(&out, "memory propose");
+    let rows: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    let rows = rows.as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0]["id"], "retained-lesson");
+    assert_eq!(rows[1]["id"], "uncatalogued-lesson");
+    for row in rows {
+        assert_eq!(row["proposed_type"], "prior");
+        assert_eq!(row["proposed_triggers"], serde_json::json!([]));
+    }
+
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/index.sqlite")).unwrap();
+    let unchanged: (String, String, i64) = conn
+        .query_row(
+            "SELECT entry_type, status, access_count FROM memory_entries WHERE id = 'uncatalogued-lesson'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(unchanged, ("prior".into(), "archived".into(), 0));
+}
+
+#[test]
+fn memory_propose_keeps_a_prior_with_missing_status_in_the_inventory() {
+    let repo = Repo::new();
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/index.sqlite")).unwrap();
+    conn.execute(
+        "INSERT INTO memory_entries (id, title, content, entry_type, source_type, status, created_at, updated_at)
+         VALUES ('legacy-prior', 'Legacy prior', 'Review this.', 'prior', 'user_statement', NULL, 1, 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = run(&["--format", "json", "memory", "propose"], &repo.root);
+    assert_ok(&out, "memory propose on nullable legacy status");
+    let rows: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(rows[0]["id"], "legacy-prior");
+    assert_eq!(rows[0]["status"], "unknown");
+}
+
+#[test]
+fn memory_propose_refuses_stale_schema_without_migrating_it() {
+    let repo = Repo::new();
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/index.sqlite")).unwrap();
+    conn.execute("UPDATE schema_version SET version = 1", [])
+        .unwrap();
+    drop(conn);
+
+    let out = run(&["memory", "propose"], &repo.root);
+    assert!(!out.status.success(), "stale schema must be refused");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("schema"));
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/index.sqlite")).unwrap();
+    let version: i64 = conn
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1, "a reporting command must not migrate a store");
+}
+
+#[test]
 fn memory_confirm_help_describes_misfired_prior_verdict() {
     let dir = tempfile::tempdir().unwrap();
     let out = run(&["memory", "confirm", "--help"], dir.path());
