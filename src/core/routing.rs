@@ -222,6 +222,9 @@ pub fn mutation_request(
             CollectionCommand::List => return Ok(None),
         },
         Command::Memory(c) => match c {
+            MemoryCommand::CuratePriors { cluster_ids } => M::MemoryCuratePriors {
+                cluster_ids: cluster_ids.clone(),
+            },
             MemoryCommand::Add {
                 id,
                 title,

@@ -1021,6 +1021,119 @@ fn smoke_collection_add_remove() {
 
 // ── Memory ──────────────────────────────────────────────────────────
 
+fn seed_curatable_prior_clusters(repo: &Repo, second_state: &str) {
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/index.sqlite")).unwrap();
+    for (name, state, created) in [("a", "candidate", 100), ("b", second_state, 200)] {
+        let id = format!("clu-curate-{name}");
+        let cand_id = format!("cand-curate-{name}");
+        let matcher = format!(r#"{{"prompt_contains":"{name}"}}"#);
+        conn.execute(
+            "INSERT INTO prior_clusters
+             (id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
+              state, created_at, last_seen_at, evidence_count, distinct_sessions)
+             VALUES (?1, ?2, 'prompt', ?3, ?4, '{}', ?5, ?6, ?6, 1, 1)",
+            rusqlite::params![
+                id,
+                format!("prompt|{name}"),
+                matcher,
+                "Ask only when blocked.",
+                state,
+                created
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO prior_candidates
+             (id, cluster_id, trigger_kind, trigger_matcher, lesson, scope,
+              source_session, created_at)
+             VALUES (?1, ?2, 'prompt', ?3, 'Ask only when blocked.', '{}', ?4, ?5)",
+            rusqlite::params![cand_id, id, matcher, format!("session-{name}"), created],
+        )
+        .unwrap();
+    }
+}
+
+// Catches: a CLI that reports success but leaves curated candidate rows split.
+#[test]
+fn memory_curate_priors_moves_candidate_evidence_and_reports_json() {
+    let repo = Repo::new();
+    seed_curatable_prior_clusters(&repo, "candidate");
+    let out = run(
+        &[
+            "--format",
+            "json",
+            "memory",
+            "curate-priors",
+            "clu-curate-a",
+            "clu-curate-b",
+        ],
+        &repo.root,
+    );
+    assert_ok(&out, "memory curate-priors");
+    let report: serde_json::Value = serde_json::from_str(&stdout(&out)).unwrap();
+    assert_eq!(
+        report,
+        serde_json::json!({
+            "moved": 1,
+            "emptied": ["clu-curate-b"],
+            "newly_promotable": ["clu-curate-a"]
+        })
+    );
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/index.sqlite")).unwrap();
+    let cluster: String = conn
+        .query_row(
+            "SELECT cluster_id FROM prior_candidates WHERE id='cand-curate-b'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cluster, "clu-curate-a");
+}
+
+// Catches: an unknown ID silently succeeding or moving the first valid cluster.
+#[test]
+fn memory_curate_priors_rejects_unknown_cluster_without_mutation() {
+    let repo = Repo::new();
+    seed_curatable_prior_clusters(&repo, "candidate");
+    let out = run(
+        &["memory", "curate-priors", "clu-curate-a", "clu-missing"],
+        &repo.root,
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("does not exist"));
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/index.sqlite")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT cluster_id) FROM prior_candidates",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+// Catches: absorbing refuted or archived prior evidence through the CLI.
+#[test]
+fn memory_curate_priors_rejects_inactive_cluster_without_mutation() {
+    let repo = Repo::new();
+    seed_curatable_prior_clusters(&repo, "archived");
+    let out = run(
+        &["memory", "curate-priors", "clu-curate-a", "clu-curate-b"],
+        &repo.root,
+    );
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not active"));
+    let conn = rusqlite::Connection::open(repo.root.join(".mdkb/index.sqlite")).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT cluster_id) FROM prior_candidates",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
 /// `memory audit` is an on-demand gardening command: nothing else may run it.
 ///
 /// Proved by the stamp it is the only writer of. Index, hook and open all run

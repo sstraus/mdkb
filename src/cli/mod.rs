@@ -753,6 +753,13 @@ pub enum MetricsCommand {
 /// Memory management subcommands.
 #[derive(Subcommand, Debug)]
 pub enum MemoryCommand {
+    /// Merge curator-reviewed prior clusters into the oldest cluster
+    CuratePriors {
+        /// At least two distinct active cluster IDs
+        #[arg(required = true, num_args = 2..)]
+        cluster_ids: Vec<String>,
+    },
+
     /// Add a new memory entry
     #[command(alias = "write", alias = "create")]
     Add {

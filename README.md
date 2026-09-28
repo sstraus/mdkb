@@ -740,6 +740,7 @@ mdkb memory add pay-bill -t "Pay electricity bill" -T reminder --due-in 86400 \
 mdkb memory list
 mdkb memory search "authentication"
 mdkb memory history auth-patterns
+mdkb memory curate-priors <cluster-id> <cluster-id>...  # merge reviewed prior clusters
 
 # Which stored entries deserve a fresh look. Selects from signals the store
 # already holds and decides nothing; --dry-run does not even stamp them.
