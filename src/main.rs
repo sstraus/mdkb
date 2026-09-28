@@ -1027,12 +1027,17 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 &cmd,
                 MemoryCommand::Show { .. }
                     | MemoryCommand::List { .. }
+                    | MemoryCommand::Propose
                     | MemoryCommand::Search { .. }
                     | MemoryCommand::Warmup { .. }
                     | MemoryCommand::History { .. }
                     | MemoryCommand::Export { .. }
             ) {
-                open_reader(&cwd)?
+                if matches!(&cmd, MemoryCommand::Propose) {
+                    Context::open_read_only(&cwd)?
+                } else {
+                    open_reader(&cwd)?
+                }
             } else {
                 open_writer(&cwd)?
             };
@@ -1132,6 +1137,13 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 MemoryCommand::List { limit, status } => {
                     let entries = handle_memory_list(&ctx, limit, status.as_deref())?;
                     format_memory_list(&entries, cli.format);
+                }
+                MemoryCommand::Propose => {
+                    let rows = mdkb::cli::memory::prior_migration_proposals(&ctx.conn)?;
+                    println!(
+                        "{}",
+                        mdkb::cli::memory::format_proposals(&rows, cli.format)?
+                    );
                 }
                 MemoryCommand::Search { query, limit } => {
                     let entries = handle_memory_search(&ctx, &query, limit, None)?;
