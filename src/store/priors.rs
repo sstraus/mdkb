@@ -828,6 +828,70 @@ pub fn recluster(conn: &Connection, now: i64) -> Result<ReclusterReport> {
     Ok(report)
 }
 
+/// Consolidate a curator-confirmed family that embedding reclustering left split.
+///
+/// The caller supplies cluster ids after reviewing their lessons and triggers.
+/// Candidate evidence moves to the oldest cluster. Empty clusters and their
+/// promoted memory links remain intact, so their history and trigger-specific
+/// projections can still be inspected and used.
+pub fn curate_cluster_family(
+    conn: &Connection,
+    cluster_ids: &[&str],
+    now: i64,
+) -> Result<ReclusterReport> {
+    if cluster_ids.len() < 2
+        || cluster_ids
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != cluster_ids.len()
+    {
+        return Err(
+            ErrorKind::InvalidQuery("Curate at least two distinct clusters.".into()).into(),
+        );
+    }
+
+    let tx = conn.unchecked_transaction()?;
+    let mut clusters = Vec::with_capacity(cluster_ids.len());
+    for id in cluster_ids {
+        let cluster = get_cluster(&tx, id)?.ok_or_else(|| {
+            ErrorKind::InvalidQuery(format!("Prior cluster '{id}' does not exist."))
+        })?;
+        if matches!(cluster.state.as_str(), "refuted" | "expired" | "archived") {
+            return Err(
+                ErrorKind::InvalidQuery(format!("Prior cluster '{id}' is not active.")).into(),
+            );
+        }
+        clusters.push(cluster);
+    }
+    clusters.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+    let mut survivor = clusters.remove(0);
+    let was_promotable = should_promote(&survivor);
+    let mut report = ReclusterReport::default();
+    for source in clusters {
+        report.moved += tx.execute(
+            "UPDATE prior_candidates SET cluster_id = ?1 WHERE cluster_id = ?2",
+            params![survivor.id, source.id],
+        )?;
+        report.emptied.push(source.id);
+    }
+
+    let candidates = list_candidates_for_cluster(&tx, &survivor.id)?;
+    survivor.evidence_count = candidates.len() as i64;
+    survivor.distinct_sessions = candidates
+        .iter()
+        .filter_map(|c| c.source_session.as_deref())
+        .collect::<std::collections::HashSet<_>>()
+        .len() as i64;
+    survivor.last_seen_at = now;
+    upsert_cluster(&tx, &survivor)?;
+    if !was_promotable && should_promote(&survivor) {
+        report.newly_promotable.push(survivor.id);
+    }
+    tx.commit()?;
+    Ok(report)
+}
+
 /// Whether a cluster has recurred across enough distinct sessions to promote.
 pub fn should_promote(c: &PriorCluster) -> bool {
     c.state == "candidate" && c.distinct_sessions >= PROMOTION_MIN_SESSIONS
@@ -2356,6 +2420,200 @@ mod tests {
         );
         assert_eq!(report.moved, 2);
         assert_eq!(report.emptied.len(), 2);
+    }
+
+    // Catches: leaving curated paraphrases split when every pair is below 0.70.
+    #[test]
+    fn curation_joins_six_differently_worded_lessons_below_the_embedding_threshold() {
+        let conn = conn();
+        let lessons = [
+            "Ask only when a genuine user choice blocks progress; otherwise execute settled work.",
+            "Act on settled scope and ask one precise question only for a user-only choice.",
+            "Classify the stop condition, then continue work unless a user decision blocks it.",
+            "Finish agreed work without pausing for permission when no choice remains.",
+            "Stop when finished; ask only when an unresolved choice belongs to the user.",
+            "After a tool failure, continue the agreed work unless a real choice blocks progress.",
+        ];
+        let mut ids = Vec::new();
+        for (n, lesson) in lessons.iter().enumerate() {
+            let mut cand = sample_candidate(None);
+            cand.id = format!("ask-cand-{n}");
+            cand.lesson = (*lesson).into();
+            cand.trigger_matcher = format!(r#"{{"prompt_contains":"case-{n}"}}"#);
+            cand.trigger_kind = "prompt".into();
+            cand.source_session = Some(format!("ask-session-{n}"));
+            cand.created_at = 1000 + n as i64;
+            let mut embedding = vec![0.0_f32; 8];
+            embedding[0] = 0.8;
+            embedding[n + 1] = 0.6;
+            seed_own_cluster(&conn, &cand, &embedding);
+            ids.push(cluster_id_for_key(&canonical_trigger_key(
+                &cand.trigger_kind,
+                &cand.trigger_matcher,
+            )));
+        }
+
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT cluster_id) FROM prior_candidates",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 6);
+        recluster(&conn, 9000).unwrap();
+        let automatic: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT cluster_id) FROM prior_candidates",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(automatic, 6, "the model-free pass leaves this family split");
+
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let report = curate_cluster_family(&conn, &refs, 9100).unwrap();
+        let after: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT cluster_id) FROM prior_candidates",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1, "one lesson must have one evidence cluster");
+        assert_eq!(report.moved, 5);
+        let survivor: String = conn
+            .query_row(
+                "SELECT DISTINCT cluster_id FROM prior_candidates",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cluster = get_cluster(&conn, &survivor).unwrap().unwrap();
+        assert_eq!(cluster.evidence_count, 6);
+        assert_eq!(cluster.distinct_sessions, 6);
+        assert_eq!(curate_cluster_family(&conn, &refs, 9200).unwrap().moved, 0);
+        assert_eq!(recluster(&conn, 9300).unwrap().moved, 0);
+    }
+
+    // Catches: applying a curated family merge to every nearby prior.
+    #[test]
+    fn curation_leaves_unlisted_lessons_in_their_own_cluster() {
+        let conn = conn();
+        let mut ids = Vec::new();
+        for (n, lesson) in [
+            "Ask only when a user choice blocks agreed work.",
+            "Continue settled work until a genuine user decision is needed.",
+            "Never force-push to a shared branch.",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut cand = sample_candidate(None);
+            cand.id = format!("curation-boundary-{n}");
+            cand.lesson = (*lesson).into();
+            cand.trigger_kind = "prompt".into();
+            cand.trigger_matcher = format!(r#"{{"prompt_contains":"boundary-{n}"}}"#);
+            cand.source_session = Some(format!("boundary-session-{n}"));
+            let embedding = if n == 2 {
+                vec![0.0, 0.0, 1.0]
+            } else {
+                vec![1.0, 0.0, 0.0]
+            };
+            seed_own_cluster(&conn, &cand, &embedding);
+            ids.push(cluster_id_for_key(&canonical_trigger_key(
+                &cand.trigger_kind,
+                &cand.trigger_matcher,
+            )));
+        }
+        curate_cluster_family(&conn, &[&ids[0], &ids[1]], 9000).unwrap();
+        let unrelated = get_candidate(&conn, "curation-boundary-2")
+            .unwrap()
+            .unwrap();
+        assert_eq!(unrelated.cluster_id.as_deref(), Some(ids[2].as_str()));
+        assert_eq!(
+            list_candidates_for_cluster(&conn, &ids[2]).unwrap().len(),
+            1
+        );
+    }
+
+    // Catches: deleting source rows or replacing their promoted memory links.
+    #[test]
+    fn curation_preserves_candidate_evidence_and_promoted_links() {
+        let conn = conn();
+        let mut ids = Vec::new();
+        for n in 0..2 {
+            let mut cand = sample_candidate(None);
+            cand.id = format!("curation-evidence-{n}");
+            cand.trigger_matcher = format!(r#"{{"tool":"Edit","path_glob":"src/{n}/**"}}"#);
+            cand.lesson = format!("Ask only when a user decision blocks work ({n}).");
+            cand.source_session = Some(format!("evidence-session-{n}"));
+            cand.evidence_failure = Some(format!("failure-{n}"));
+            cand.evidence_fix = Some(format!("fix-{n}"));
+            seed_own_cluster(&conn, &cand, &[1.0, 0.0]);
+            let id = cluster_id_for_key(&canonical_trigger_key(
+                &cand.trigger_kind,
+                &cand.trigger_matcher,
+            ));
+            let memory_id = format!("prior-{n}");
+            conn.execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at)
+                 VALUES (?1, ?1, ?1, 'prior', '[]', 100, 100)",
+                [&memory_id],
+            )
+            .unwrap();
+            let mut cluster = get_cluster(&conn, &id).unwrap().unwrap();
+            cluster.state = "promoted".into();
+            cluster.promoted_memory_id = Some(memory_id);
+            upsert_cluster(&conn, &cluster).unwrap();
+            ids.push(id);
+        }
+        curate_cluster_family(&conn, &[&ids[0], &ids[1]], 9000).unwrap();
+        for n in 0..2 {
+            let cand = get_candidate(&conn, &format!("curation-evidence-{n}"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                cand.evidence_failure.as_deref(),
+                Some(format!("failure-{n}").as_str())
+            );
+            assert_eq!(
+                cand.evidence_fix.as_deref(),
+                Some(format!("fix-{n}").as_str())
+            );
+            let cluster = get_cluster(&conn, &ids[n]).unwrap().unwrap();
+            assert_eq!(
+                cluster.promoted_memory_id.as_deref(),
+                Some(format!("prior-{n}").as_str())
+            );
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_entries WHERE id=?1 AND status='active'",
+                    [format!("prior-{n}")],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+    }
+
+    // Catches: moving evidence before validating every supplied cluster id.
+    #[test]
+    fn curation_rejects_an_unknown_cluster_without_moving_evidence() {
+        let conn = conn();
+        let mut cand = sample_candidate(None);
+        cand.id = "curation-known-candidate".into();
+        seed_own_cluster(&conn, &cand, &[1.0, 0.0]);
+        let known = cluster_id_for_key(&canonical_trigger_key(
+            &cand.trigger_kind,
+            &cand.trigger_matcher,
+        ));
+        let result = curate_cluster_family(&conn, &[&known, "clu-missing"], 9000);
+        assert!(result.is_err());
+        assert_eq!(
+            get_candidate(&conn, &cand.id).unwrap().unwrap().cluster_id,
+            Some(known)
+        );
     }
 
     // --- Phase 7: trigger matching + injection selection ---
