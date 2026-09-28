@@ -1842,6 +1842,57 @@ fn format_cross_repo_coverage(
     out
 }
 
+/// Compare candidates from different stores using the same query evidence.
+/// A store's normalized score only breaks ties after lexical coverage and
+/// contiguous phrase matches; its own best hit cannot win just by being best.
+fn cross_repo_score(query: &str, title: Option<&str>, body: &str, local_score: f64) -> f64 {
+    let terms = search::content_tokens(query);
+    if terms.is_empty() {
+        return local_score.clamp(0.0, 1.0);
+    }
+    let unique: HashSet<&str> = terms.iter().map(String::as_str).collect();
+    let title_terms = search::content_tokens(title.unwrap_or_default());
+    let body_terms = search::content_tokens(body);
+    let present: HashSet<&str> = title_terms
+        .iter()
+        .chain(body_terms.iter())
+        .map(String::as_str)
+        .collect();
+    let coverage = unique.intersection(&present).count() as f64 / unique.len() as f64;
+    let in_body = body_terms
+        .windows(terms.len())
+        .any(|window| window == terms);
+    let in_title = title_terms
+        .windows(terms.len())
+        .any(|window| window == terms);
+    0.60 * coverage
+        + 0.25 * f64::from(in_body)
+        + 0.10 * f64::from(in_title)
+        + 0.05 * local_score.clamp(0.0, 1.0)
+}
+
+fn rank_cross_repo_documents(
+    conn: &rusqlite::Connection,
+    query: &str,
+    results: &mut [SearchResult],
+) -> crate::error::Result<()> {
+    let ids: Vec<i64> = results.iter().map(|result| result.id).collect();
+    let docs = documents::get_documents_batch(conn, &ids)?;
+    let hashes: Vec<&str> = docs.iter().map(|doc| doc.hash.as_str()).collect();
+    let bodies = documents::get_content_batch(conn, &hashes)?;
+    let docs_by_id: HashMap<i64, &crate::domain::Document> =
+        docs.iter().map(|doc| (doc.id, doc)).collect();
+    for result in results {
+        let body = docs_by_id
+            .get(&result.id)
+            .and_then(|doc| bodies.get(&doc.hash))
+            .map(String::as_str)
+            .unwrap_or_default();
+        result.score = cross_repo_score(query, result.title.as_deref(), body, result.score);
+    }
+    Ok(())
+}
+
 /// Search one repo and say what happened, opening its store and closing it
 /// again. Synchronous on purpose: every call below is blocking SQLite work,
 /// and wrapping it in an `async` block bought nothing but a false name.
@@ -1918,6 +1969,15 @@ fn search_one_repo(
                 params.include_superseded,
             ) {
                 Ok(mut results) => {
+                    if let Err(e) =
+                        rank_cross_repo_documents(&ctx.conn, &params.query, &mut results)
+                    {
+                        return RepoOutcome {
+                            root,
+                            results: Err(format!("document ranking failed: {e}")),
+                            no_collections,
+                        };
+                    }
                     for r in &mut results {
                         r.repo_root = Some(repo_tag.clone());
                     }
@@ -1950,13 +2010,16 @@ fn search_one_repo(
                         entries.into_iter().map(|result| result.entry).collect();
                     let entries = apply_min_confidence(entries, params.min_confidence);
                     if !entries.is_empty() {
+                        let best = &entries[0];
+                        let score =
+                            cross_repo_score(&params.query, Some(&best.title), &best.content, 1.0);
                         let text = format_memory_search_results(&entries);
                         let mut pseudo = SearchResult {
                             id: 0,
                             collection: "memory".to_string(),
                             path: String::new(),
                             title: None,
-                            score: 1.0,
+                            score,
                             snippets: vec![text],
                             status: None,
                             superseded_by: None,

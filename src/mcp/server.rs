@@ -4688,6 +4688,155 @@ if (require.main === module) {
         );
     }
 
+    #[tokio::test]
+    async fn cross_repo_exact_phrase_outranks_weak_best_hit_in_larger_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let weak = temp.path().join("a-weak");
+        let exact = temp.path().join("z-exact");
+        for (root, file, body, fillers) in [
+            (
+                &weak,
+                "weak.md",
+                "# Unrelated audit\n\nJev event logs describe a wake timer and an unrelated judge report.",
+                20,
+            ),
+            (
+                &exact,
+                "exact.md",
+                "# Jev wake judge\n\nJev wake judge is the named process.",
+                0,
+            ),
+        ] {
+            std::fs::create_dir_all(root).unwrap();
+            crate::cli::handlers::handle_init(root).unwrap();
+            let docs_dir = root.join("docs");
+            std::fs::create_dir_all(&docs_dir).unwrap();
+            std::fs::write(docs_dir.join(file), body).unwrap();
+            for i in 0..fillers {
+                std::fs::write(
+                    docs_dir.join(format!("filler-{i}.md")),
+                    "# Other\n\nNo matching terms.",
+                )
+                .unwrap();
+            }
+            let ctx = crate::core::Context::open(root).unwrap();
+            let now = chrono::Utc::now().timestamp();
+            crate::store::collections::add_collection(
+                &ctx.conn,
+                &crate::domain::Collection {
+                    name: "docs".to_string(),
+                    path: "docs".to_string(),
+                    pattern: "**/*.md".to_string(),
+                    source: "manual".to_string(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+            crate::core::indexing::handle_update(&ctx, root).unwrap();
+        }
+        let registry = Arc::new(RepoRegistry::new(global_test_config()));
+        registry.get_or_open(&weak).unwrap();
+        registry.get_or_open(&exact).unwrap();
+        let server = McpServer::global(registry);
+        for query in ["Jev wake judge", "jev wake", "wake judge"] {
+            let result = server
+                .search(Parameters(SearchParams {
+                    query: query.to_string(),
+                    root: Some("*".to_string()),
+                    scope: Some("docs".to_string()),
+                    limit: 2,
+                    collection: None,
+                    include_superseded: false,
+                    kind: None,
+                    threshold: None,
+                    file: None,
+                    min_confidence: None,
+                    since: None,
+                }))
+                .await
+                .unwrap();
+            let output = extract_text(&result);
+            assert!(
+                output.find("exact.md").unwrap() < output.find("weak.md").unwrap(),
+                "query={query}: {output}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cross_repo_exact_memory_outranks_weak_best_memory() {
+        let temp = tempfile::tempdir().unwrap();
+        let weak = temp.path().join("a-weak-memory");
+        let exact = temp.path().join("z-exact-memory");
+        for (root, id, title, body) in [
+            (
+                &weak,
+                "weak-memory",
+                "Unrelated audit",
+                "Jev event logs describe a wake timer and an unrelated judge report.",
+            ),
+            (
+                &exact,
+                "exact-memory",
+                "Jev wake judge",
+                "Jev wake judge is the named process.",
+            ),
+        ] {
+            std::fs::create_dir_all(root).unwrap();
+            crate::cli::handlers::handle_init(root).unwrap();
+            let mut config = crate::Config::default();
+            config.search.auto_embed_memory = false;
+            config.search.memory.min_recall_cosine = 0.0;
+            config.save(root.join(".mdkb/config.toml")).unwrap();
+            let ctx = crate::core::Context::open(root).unwrap();
+            crate::core::memory::handle_memory_add(
+                &ctx,
+                id,
+                title,
+                "decision",
+                None,
+                body,
+                None,
+                None,
+                None,
+                None,
+                &[],
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        }
+        let registry = Arc::new(RepoRegistry::new(global_test_config()));
+        registry.get_or_open(&weak).unwrap();
+        registry.get_or_open(&exact).unwrap();
+        let server = McpServer::global(registry);
+        for query in ["Jev wake judge", "jev wake", "wake judge"] {
+            let result = server
+                .search(Parameters(SearchParams {
+                    query: query.to_string(),
+                    root: Some("*".to_string()),
+                    scope: Some("memory".to_string()),
+                    limit: 2,
+                    collection: None,
+                    include_superseded: false,
+                    kind: None,
+                    threshold: None,
+                    file: None,
+                    min_confidence: None,
+                    since: None,
+                }))
+                .await
+                .unwrap();
+            let output = extract_text(&result);
+            assert!(
+                output.find("exact-memory").unwrap() < output.find("weak-memory").unwrap(),
+                "query={query}: {output}"
+            );
+        }
+    }
+
     /// Backward compatibility: standalone mode (no --global) works exactly as before.
     #[tokio::test]
     async fn test_backward_compat_standalone_search() {
