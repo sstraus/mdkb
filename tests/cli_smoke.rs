@@ -2293,6 +2293,40 @@ fn priors_failing(message: &str) -> String {
     )
 }
 
+/// Story 186-446e. `mdkb doctor` names each problem with the command that
+/// fixes it, and exits non-zero only when something is broken: unregistered
+/// hooks are broken (the events never fire), a required sigil is not.
+#[test]
+fn smoke_doctor_lists_problems_with_fixes_and_exits_on_errors() {
+    let repo = Repo::new();
+
+    let out = run(&["doctor"], &repo.root);
+    assert!(!out.status.success(), "unregistered hooks are an error");
+    assert!(
+        stdout(&out).contains("hooks.drift") && stdout(&out).contains("mdkb setup hooks claude"),
+        "got: {}",
+        stdout(&out)
+    );
+
+    assert_ok(&run(&["setup", "hooks", "claude"], &repo.root), "register hooks");
+    let out = run(&["doctor"], &repo.root);
+    assert_ok(&out, "doctor after registering hooks");
+    assert!(!stdout(&out).contains("hooks.drift"), "got: {}", stdout(&out));
+    assert!(stdout(&out).contains("recall.sigil_only"), "info is shown on the CLI");
+
+    let out = run(&["--format", "json", "doctor"], &repo.root);
+    assert_ok(&out, "doctor --format json");
+    let json: serde_json::Value = serde_json::from_str(&stdout(&out)).expect("json");
+    let ids: Vec<&str> = json["findings"]
+        .as_array()
+        .expect("findings array")
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["recall.sigil_only"]);
+    assert_eq!(json["findings"][0]["severity"], "info");
+}
+
 /// `setup check` is the answer to "is the distiller actually working?", which
 /// until now could only be answered by reading the daemon log that never
 /// recorded it. It runs the configured CLI once and reports what it said.

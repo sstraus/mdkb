@@ -190,6 +190,15 @@ pub fn band_counts(conn: &Connection) -> Result<Vec<BandCounts>> {
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
+/// Prompts recorded at or after `since`.
+pub fn prompts_since(conn: &Connection, since: i64) -> Result<u32> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM recall_prompts WHERE created_at >= ?1",
+        [since],
+        |r| r.get(0),
+    )?)
+}
+
 /// Recorded prompts per recall mode.
 pub fn prompts_by_mode(conn: &Connection) -> Result<std::collections::BTreeMap<String, u32>> {
     let mut stmt = conn.prepare_cached("SELECT mode, COUNT(*) FROM recall_prompts GROUP BY mode")?;
