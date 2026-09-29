@@ -47,6 +47,13 @@
   can then be observed as used rather than only as missed. It never applies
   to `*` prompts or to shadow mode.
 
+- **`mdkb stats` reports recall by cosine band.** A new Recall section (and a
+  `recall` object in `--format json`) shows the prompts recorded per mode,
+  and a table per band (`0.40-0.45` … `0.65+`, `fts`) and entry type:
+  offered, injected, labelled, positive, negative, missed and precision.
+  Precision is withheld until 30 candidates are labelled. Holdout rows are
+  reported in their own table.
+
 ### Changed
 
 - **Working priors stay fresh through use.** Injection scoring now considers

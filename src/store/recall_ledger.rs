@@ -136,6 +136,67 @@ pub fn set_outcomes(
     Ok(written)
 }
 
+/// Ledger counts for one cosine band, entry type and holdout flag.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct BandCounts {
+    /// `<0.40`, `0.40-0.45` … `0.65+`, or `fts` for a hit with no cosine.
+    pub band: String,
+    pub entry_type: String,
+    pub holdout: bool,
+    pub offered: u32,
+    pub injected: u32,
+    /// Candidates with any outcome.
+    pub labelled: u32,
+    /// Injected and `used` or `confirmed`.
+    pub positive: u32,
+    /// Injected and `refuted` or `corrected`.
+    pub negative: u32,
+    /// Not injected, and reached anyway.
+    pub missed: u32,
+}
+
+/// Every ledger row, counted by band, entry type and holdout.
+pub fn band_counts(conn: &Connection) -> Result<Vec<BandCounts>> {
+    // Rounded before comparing: the column holds an `f32` widened to REAL, so
+    // an entry at exactly 0.45 reads 0.4499999 and would land a band low.
+    let mut stmt = conn.prepare_cached(
+        "WITH c AS (SELECT *, ROUND(cosine, 4) AS cos FROM recall_candidates) \
+         SELECT CASE WHEN cos IS NULL THEN 7 WHEN cos < 0.40 THEN 0 WHEN cos < 0.45 THEN 1 \
+                     WHEN cos < 0.50 THEN 2 WHEN cos < 0.55 THEN 3 WHEN cos < 0.60 THEN 4 \
+                     WHEN cos < 0.65 THEN 5 ELSE 6 END AS band, \
+                entry_type, holdout, COUNT(*), SUM(injected), SUM(outcome IS NOT NULL), \
+                SUM(injected AND COALESCE(outcome, '') IN ('used', 'confirmed')), \
+                SUM(injected AND COALESCE(outcome, '') IN ('refuted', 'corrected')), \
+                SUM(NOT injected AND outcome IS 'missed') \
+         FROM c GROUP BY band, entry_type, holdout ORDER BY band, entry_type, holdout",
+    )?;
+    const BANDS: [&str; 8] = [
+        "<0.40", "0.40-0.45", "0.45-0.50", "0.50-0.55", "0.55-0.60", "0.60-0.65", "0.65+", "fts",
+    ];
+    let rows = stmt.query_map([], |r| {
+        let band: usize = r.get(0)?;
+        Ok(BandCounts {
+            band: BANDS[band].to_string(),
+            entry_type: r.get(1)?,
+            holdout: r.get(2)?,
+            offered: r.get(3)?,
+            injected: r.get(4)?,
+            labelled: r.get(5)?,
+            positive: r.get(6)?,
+            negative: r.get(7)?,
+            missed: r.get(8)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Recorded prompts per recall mode.
+pub fn prompts_by_mode(conn: &Connection) -> Result<std::collections::BTreeMap<String, u32>> {
+    let mut stmt = conn.prepare_cached("SELECT mode, COUNT(*) FROM recall_prompts GROUP BY mode")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +326,52 @@ mod tests {
         let still_open: Vec<String> =
             open_candidates(&conn, "s1").unwrap().into_iter().map(|c| c.entry_id).collect();
         assert_eq!(still_open, vec!["b"]);
+    }
+
+    #[test]
+    fn counts_fall_in_the_band_of_their_cosine() {
+        use crate::domain::recall_outcome::RecallOutcome;
+        let conn = db();
+        let p = record_prompt(
+            &conn,
+            &prompt(),
+            &[
+                cand("a", 0, Some(0.42), false),
+                cand("b", 1, Some(0.47), false),
+                cand("c", 2, Some(0.52), true),
+                cand("d", 3, Some(0.91), true),
+                cand("e", 4, None, false),
+            ],
+            30,
+            100,
+        )
+        .unwrap();
+        set_outcomes(
+            &conn,
+            &[
+                (p, "b".into(), RecallOutcome::Missed),
+                (p, "c".into(), RecallOutcome::Used),
+                (p, "d".into(), RecallOutcome::Refuted),
+            ],
+            200,
+        )
+        .unwrap();
+        let rows: Vec<(String, u32, u32, u32, u32, u32)> = band_counts(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|b| (b.band, b.offered, b.injected, b.positive, b.negative, b.missed))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("0.40-0.45".into(), 1, 0, 0, 0, 0),
+                ("0.45-0.50".into(), 1, 0, 0, 0, 1),
+                ("0.50-0.55".into(), 1, 1, 1, 0, 0),
+                ("0.65+".into(), 1, 1, 0, 1, 0),
+                ("fts".into(), 1, 0, 0, 0, 0),
+            ]
+        );
+        assert_eq!(prompts_by_mode(&conn).unwrap().get("shadow"), Some(&1));
     }
 
     /// The ledger must never become a place prompt text can land. A new column
