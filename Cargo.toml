@@ -140,6 +140,12 @@ rmcp = { version = "3.3", features = ["server", "transport-io", "client"] }
 # (the daemon's shutdown drain) can be asserted without waiting for one.
 tokio = { version = "1", features = ["full", "test-util"] }
 
+# Line tables keep file:line in panic backtraces and drop only the variable and
+# type data a debugger uses. Cold `cargo test --no-run` on the box: 973 s and
+# 20 GiB of target/ with full DWARF, 286 s and 9.7 GiB with line tables.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = true
 codegen-units = 1
