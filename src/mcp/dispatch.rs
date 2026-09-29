@@ -3860,6 +3860,119 @@ const PRIOR_CONFIDENCE_GATE: f64 = 0.7;
 /// is wrong is a different fact, and unasked injection is the one surface where
 /// it has to win. The entry stays searchable: an explicit `memory search` still
 /// returns it, so a refutation hides nothing from someone who asks.
+/// Identifiers and paths in a prompt: tokens a memory can share with it
+/// that are specific enough to mean the same thing.
+fn recall_identifier_tokens(prompt: &str) -> Vec<String> {
+    let mut out = crate::cli::hook_logic::path_like_tokens(prompt);
+    for raw in prompt.split_whitespace() {
+        let token = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
+        let camel = token.chars().skip(1).any(char::is_uppercase)
+            && token.chars().any(char::is_lowercase);
+        let specific =
+            token.len() >= 3 && (token.contains(['_', '/']) || token.contains("::") || camel);
+        if specific && !out.iter().any(|seen| seen == token) {
+            out.push(token.to_string());
+        }
+    }
+    out
+}
+
+/// One ledger row per entry the observation query returned, plus any
+/// injected entry it did not return, in rank order.
+fn ledger_candidates(
+    observed: &[memory::ScoredMemoryEntry],
+    injected: &[memory::MemoryEntry],
+    tokens: &[String],
+    now: i64,
+) -> Vec<crate::store::recall_ledger::RecallCandidate> {
+    use crate::store::recall_ledger::RecallCandidate;
+    let injected_ids: HashSet<&str> = injected.iter().map(|e| e.id.as_str()).collect();
+    let overlap = |entry: &memory::MemoryEntry| {
+        let found = tokens
+            .iter()
+            .filter(|t| {
+                entry.title.contains(t.as_str())
+                    || entry.content.contains(t.as_str())
+                    || entry.tags.iter().any(|tag| tag.contains(t.as_str()))
+            })
+            .count();
+        u8::try_from(found).unwrap_or(u8::MAX)
+    };
+    let mut seen: HashSet<&str> = HashSet::new();
+    let offered = observed
+        .iter()
+        .map(|e| (&e.entry, e.distance))
+        .chain(injected.iter().map(|e| (e, None)));
+    let mut rows = Vec::new();
+    for (entry, distance) in offered {
+        if !seen.insert(entry.id.as_str()) {
+            continue;
+        }
+        rows.push(RecallCandidate {
+            entry_id: entry.id.clone(),
+            rank: u16::try_from(rows.len()).unwrap_or(u16::MAX),
+            cosine: distance.map(|d| crate::store::hybrid::cosine_from_distance(d) as f32),
+            entry_type: entry.entry_type.to_string(),
+            age_days: u32::try_from((now - entry.created_at).max(0) / 86_400).unwrap_or(u32::MAX),
+            overlap: overlap(entry),
+            injected: injected_ids.contains(entry.id.as_str()),
+            holdout: false,
+        });
+    }
+    rows
+}
+
+/// Recall records every candidate at or above this cosine, injected or not.
+/// It is the sigil floor's default, and so the lowest floor any recall mode
+/// ships with: below it there is nothing a floor change could turn into an
+/// injection.
+const RECALL_CANDIDATE_FLOOR: f32 = crate::config::MIN_RECALL_COSINE_DEFAULT;
+
+/// The search config the ledger's observation query runs with: the recall
+/// config at the candidate floor. A disabled floor (`0.0`) stays disabled.
+fn candidate_search_cfg(
+    recall: &crate::config::SearchMemoryConfig,
+) -> crate::config::SearchMemoryConfig {
+    crate::config::SearchMemoryConfig {
+        min_recall_cosine: RECALL_CANDIDATE_FLOOR.min(recall.min_recall_cosine),
+        ..recall.clone()
+    }
+}
+
+/// Append one prompt and its candidates to the recall ledger. Best effort:
+/// a hook must not fail because its telemetry did.
+async fn record_recall(
+    handle: &RepoHandle,
+    session: &str,
+    mode: RecallMode,
+    floor: f32,
+    candidates: Vec<crate::store::recall_ledger::RecallCandidate>,
+) {
+    if ensure_handle_context(handle).await.is_err() {
+        return;
+    }
+    let prompt = crate::store::recall_ledger::RecallPrompt {
+        session: session.to_string(),
+        mode: mode.as_str(),
+        floor,
+        candidate_floor: RECALL_CANDIDATE_FLOOR.min(floor),
+    };
+    let retention_days = handle.config.telemetry.retention_days;
+    let now = chrono::Utc::now().timestamp();
+    let mut guard = handle.ctx.lock().await;
+    if let Some(Err(error)) = crate::core::run_guarded_write(&mut guard, "recall ledger", |ctx| {
+        crate::store::recall_ledger::record_prompt(
+            &ctx.conn,
+            &prompt,
+            &candidates,
+            retention_days,
+            now,
+        )
+    }) {
+        tracing::warn!("recall ledger write failed: {error}");
+    }
+}
+
 fn injectable(entries: Vec<memory::ScoredMemoryEntry>) -> Vec<memory::MemoryEntry> {
     entries
         .into_iter()
@@ -4726,6 +4839,16 @@ enum RecallMode {
 }
 
 impl RecallMode {
+    /// The name the recall ledger stores. `Off` never reaches it.
+    fn as_str(self) -> &'static str {
+        match self {
+            RecallMode::Sigil => "sigil",
+            RecallMode::Automatic => "automatic",
+            RecallMode::Shadow => "shadow",
+            RecallMode::Off => "off",
+        }
+    }
+
     /// The cosine floor this mode retrieves at, given the sigil floor
     /// (`search.memory.min_recall_cosine`) the store is configured with.
     fn floor(self, cfg: &crate::config::HooksConfig, sigil_floor: f32) -> f32 {
@@ -4857,6 +4980,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     };
 
     if fts_query.is_none() && !wants_cg && path_tokens.is_empty() {
+        record_recall(handle, session, mode, search_cfg.min_recall_cosine, Vec::new()).await;
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
             payload_parts,
@@ -4864,6 +4988,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     }
 
     let mut results: Vec<memory::MemoryEntry> = Vec::new();
+    let mut observed: Vec<memory::ScoredMemoryEntry> = Vec::new();
     let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
     let mut top_cosine: Option<f64> = None;
     let mut query_embedding: Option<Vec<f32>> = None;
@@ -4902,6 +5027,28 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             }
             None => return json!({}),
         };
+
+        // The ledger's view of the same prompt: a second query at the
+        // candidate floor with a wider limit, rather than the injection query
+        // run lower. One query cannot serve both — `limit` sizes the BM25 and
+        // vector pools and the access-recency bonus ranks within the admitted
+        // set, so admitting more would reorder, and change, what is injected.
+        let candidate_cfg = candidate_search_cfg(&search_cfg);
+        match crate::core::run_guarded_read(&mut ctx_guard, "hook recall observation", |ctx| {
+            memory::search_entries_hybrid_fts(
+                &ctx.conn,
+                q,
+                prompt,
+                query_embedding.as_deref(),
+                limit * 3,
+                None,
+                &candidate_cfg,
+            )
+        }) {
+            Some(Ok(entries)) => observed = entries,
+            Some(Err(error)) => tracing::debug!("recall observation failed: {error}"),
+            None => {}
+        }
 
         // Opt-in, privacy-minimized telemetry: record the recall's shape (HMAC +
         // latency + count) but NEVER the prompt text. Off by default.
@@ -5006,6 +5153,13 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             dctx.retain_new_hook_memories(key, &mut results);
         }
     }
+    let candidates = ledger_candidates(
+        &observed,
+        &results,
+        &recall_identifier_tokens(prompt),
+        chrono::Utc::now().timestamp(),
+    );
+    record_recall(handle, session, mode, search_cfg.min_recall_cosine, candidates).await;
 
     // Post-recall enrichment in a single re-lock (both read-only, capped):
     //  · 1-hop memory-edge expansion — surface active neighbors of the top seeds.
@@ -8123,6 +8277,221 @@ mod tests {
             body.contains("dedup-mem"),
             "the shadow run consumed the entry the sigil prompt needed: {body}"
         );
+    }
+
+    /// Every recall ledger row for this handle: `(mode, entry_id, injected)`,
+    /// with `entry_id` `None` for a prompt that had no candidates.
+    async fn ledger_rows(handle: &RepoHandle) -> Vec<(String, Option<String>, Option<bool>)> {
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.mode, c.entry_id, c.injected FROM recall_prompts p \
+                 LEFT JOIN recall_candidates c ON c.prompt_id = p.id ORDER BY p.id, c.rank",
+            )
+            .unwrap();
+        stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+    }
+
+    /// Story 182-6329. The ledger's `injected` must name exactly what the
+    /// model was shown, or every precision figure built on it is wrong.
+    #[tokio::test]
+    async fn a_sigil_prompt_records_what_it_injected() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "led-mem").await;
+
+        let out = hook_user_prompt_submit_impl(
+            &handle,
+            "* what do we know about the recall_gate_fixture topic content",
+        )
+        .await;
+        assert!(additional_context(&out).contains("led-mem"));
+        assert_eq!(
+            ledger_rows(&handle).await,
+            vec![("sigil".into(), Some("led-mem".into()), Some(true))]
+        );
+    }
+
+    /// Shadow shows nothing, so its `injected` is what automatic recall would
+    /// have injected — the figure the shadow run exists to measure.
+    #[tokio::test]
+    async fn a_shadow_prompt_records_the_injection_it_would_make() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+            config.hooks.user_prompt_submit_shadow = true;
+        });
+        seed_memory_entry(&handle, "would-mem").await;
+        let mut shadow = None;
+        let out = hook_user_prompt_submit_impl_with_dedup(
+            &handle,
+            "what do we know about the recall_gate_fixture topic content",
+            "s-shadow",
+            None,
+            &mut shadow,
+            &mut Vec::new(),
+        )
+        .await;
+        assert_eq!(out, json!({}));
+        assert_eq!(
+            ledger_rows(&handle).await,
+            vec![("shadow".into(), Some("would-mem".into()), Some(true))]
+        );
+    }
+
+    /// A prompt recall ran on but found nothing to query is the denominator
+    /// of every rate: without its row, a store that answers nothing looks
+    /// like one that is never asked.
+    #[tokio::test]
+    async fn a_prompt_with_no_query_terms_still_records_its_prompt_row() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "unasked").await;
+        hook_user_prompt_submit_impl(&handle, "* ?").await;
+        ensure_handle_context(&handle).await.unwrap();
+        assert_eq!(ledger_rows(&handle).await, vec![("sigil".into(), None, None)]);
+    }
+
+    /// An entry the session already saw is offered again but not shown. It
+    /// must be recorded as not injected, or settlement credits an injection
+    /// that never happened.
+    #[tokio::test]
+    async fn a_deduplicated_entry_is_recorded_with_injected_false() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "seen-mem").await;
+        let dctx = make_dctx();
+        for prompt in [
+            "* what do we know about the recall_gate_fixture topic content",
+            "* and again the recall_gate_fixture topic content please",
+        ] {
+            hook_user_prompt_submit_impl_with_dedup(
+                &handle,
+                prompt,
+                "s-dedup",
+                Some((&dctx, "s-dedup".to_string())),
+                &mut None,
+                &mut Vec::new(),
+            )
+            .await;
+        }
+        assert_eq!(
+            ledger_rows(&handle).await,
+            vec![
+                ("sigil".into(), Some("seen-mem".into()), Some(true)),
+                ("sigil".into(), Some("seen-mem".into()), Some(false)),
+            ]
+        );
+    }
+
+    fn scored(id: &str, cosine: Option<f64>) -> memory::ScoredMemoryEntry {
+        let entry = crate::store::memory::MemoryEntry {
+            triggers: Vec::new(),
+            id: id.to_string(),
+            title: format!("Title for {id}"),
+            content: "touches src/store/hybrid.rs and recall_limit".to_string(),
+            entry_type: crate::store::memory::EntryType::Decision,
+            tags: Vec::new(),
+            status: crate::store::memory::EntryStatus::Active,
+            created_at: 1_000_000,
+            updated_at: 1_000_000,
+            superseded_by: None,
+            access_count: 0,
+            last_accessed: None,
+            source_path: None,
+            confirmations: 0,
+            corrections: 0,
+            last_confirmed_at: None,
+            last_refuted_at: None,
+            source_type: crate::store::memory::SourceType::UserStatement,
+            expires_at: None,
+            due_at: None,
+        };
+        memory::ScoredMemoryEntry {
+            entry,
+            score: 1.0,
+            // The inverse of `cosine_from_distance`: cos = 1 − d²/2.
+            distance: cosine.map(|c| (2.0 * (1.0 - c)).sqrt() as f32),
+            strong_lexical: false,
+        }
+    }
+
+    /// The candidate floor sits below the injection floor on purpose: an entry
+    /// at 0.45 is recorded, with its score, as offered and not injected.
+    #[test]
+    fn candidates_below_the_injection_floor_are_recorded_uninjected() {
+        let observed = [scored("high", Some(0.72)), scored("low", Some(0.45)), scored("fts", None)];
+        let injected = vec![observed[0].entry.clone()];
+        let tokens = recall_identifier_tokens("why does recall_limit change src/store/hybrid.rs");
+        let rows = ledger_candidates(&observed, &injected, &tokens, observed[0].entry.created_at);
+
+        let summary: Vec<(&str, Option<i32>, bool, u8)> = rows
+            .iter()
+            .map(|c| {
+                (
+                    c.entry_id.as_str(),
+                    c.cosine.map(|v| (v * 100.0).round() as i32),
+                    c.injected,
+                    c.overlap,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![("high", Some(72), true, 2), ("low", Some(45), false, 2), ("fts", None, false, 2)]
+        );
+    }
+
+    /// The observation query must run below the injection floor, or the
+    /// 0.40–0.50 band the ledger exists to measure is never fetched.
+    #[test]
+    fn the_observation_query_runs_at_the_candidate_floor() {
+        let at = |floor: f32| {
+            let recall = crate::config::SearchMemoryConfig {
+                min_recall_cosine: floor,
+                ..Default::default()
+            };
+            candidate_search_cfg(&recall).min_recall_cosine
+        };
+        assert_eq!(at(0.50), RECALL_CANDIDATE_FLOOR, "automatic and shadow");
+        assert_eq!(at(0.40), 0.40, "sigil");
+        assert_eq!(at(0.0), 0.0, "a disabled floor stays disabled");
+        assert!(RECALL_CANDIDATE_FLOOR <= crate::config::MIN_RECALL_COSINE_DEFAULT);
+    }
+
+    /// Entries past `recall_limit` were offered by the store and cut by the
+    /// limit; they are recorded, not injected. Without the observation query
+    /// the ledger would hold only what was shown.
+    #[tokio::test]
+    async fn candidates_beyond_the_recall_limit_are_recorded_uninjected() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| config.hooks.recall_limit = 2);
+        for i in 0..4 {
+            seed_memory_entry(&handle, &format!("many-{i}")).await;
+        }
+        hook_user_prompt_submit_impl(
+            &handle,
+            "* what do we know about the recall_gate_fixture topic content",
+        )
+        .await;
+        let rows = ledger_rows(&handle).await;
+        let injected = rows.iter().filter(|r| r.2 == Some(true)).count();
+        let offered = rows.iter().filter(|r| r.2 == Some(false)).count();
+        assert_eq!((injected, offered), (2, 2), "{rows:?}");
+    }
+
+    /// An entry injected but not returned by the observation query (it can
+    /// fall off the end of the wider limit) is still recorded as injected.
+    #[test]
+    fn an_injected_entry_missing_from_the_observation_is_still_recorded() {
+        let injected = vec![scored("only-injected", None).entry];
+        let rows = ledger_candidates(&[], &injected, &[], 0);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].injected);
     }
 
     /// Seed a `Prior` memory entry with explicit confirmations so the test can

@@ -18,6 +18,17 @@
   receive at most one verdict per session. Found by the maintainer's
   2026-09-23 prior audit.
 
+- **Recall records every candidate it was offered.** Each prompt that runs
+  memory recall (`*`, automatic or shadow) writes one row to a new recall
+  ledger, and one row per memory entry scoring at least 0.40, whether or not
+  it was injected: cosine, type, age, identifier overlap with the prompt, and
+  whether it was shown. For shadow prompts, "injected" means that automatic
+  recall would have shown it. The ledger holds no prompt text, and old rows
+  are pruned after `telemetry.retention_days`. A second query at the lower
+  floor feeds it, so what gets injected is unchanged. Found by the
+  maintainer on 2026-09-29: shadow recall kept only the top cosine above
+  0.50, so false negatives could not be measured.
+
 ### Changed
 
 - **Working priors stay fresh through use.** Injection scoring now considers

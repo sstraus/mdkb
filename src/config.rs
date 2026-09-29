@@ -763,10 +763,16 @@ pub struct HooksConfig {
     /// *would* have been injected, and inject nothing.
     ///
     /// The only way to answer "what happens if the sigil stops being required"
-    /// without answering it in production. Each skipped prompt appends a
-    /// `recall_shadow` row to `.mdkb/hook-events.jsonl`: how many entries
-    /// cleared each floor, the top cosine, whether the session had already seen
-    /// them, and the latency.
+    /// without answering it in production. Each skipped prompt that reaches
+    /// the search appends a `user_prompt_submit` row with `outcome: "shadow"`
+    /// to `.mdkb/hook-events.jsonl` (the entry ids it would inject, the top
+    /// cosine and the floor), and writes the prompt and every candidate down
+    /// to the 0.40 candidate floor to the recall ledger (`recall_prompts`,
+    /// `recall_candidates`), where `injected` means "automatic recall would
+    /// have injected it".
+    ///
+    /// The daemon reloads `config.toml` when it changes on disk, so turning
+    /// this on takes effect on the next prompt.
     ///
     /// Off by default: it makes every prompt pay an embedding and a hybrid
     /// search for an answer that is thrown away. Turn it on for a week when you
