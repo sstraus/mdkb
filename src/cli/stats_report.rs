@@ -661,18 +661,17 @@ fn collect_mining(ctx: &Context) -> MiningStatus {
     }
 }
 
+/// Per entry: (fired, converted, elapsed_ms, payload_bytes, block_bytes).
+type HookEventEntry = (
+    bool,
+    bool,
+    u64,
+    u64,
+    serde_json::Map<String, serde_json::Value>,
+);
+
 fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats> {
-    // Per entry: (fired, converted, elapsed_ms, payload_bytes, block_bytes).
-    let mut buckets: HashMap<
-        String,
-        Vec<(
-            bool,
-            bool,
-            u64,
-            u64,
-            serde_json::Map<String, serde_json::Value>,
-        )>,
-    > = HashMap::new();
+    let mut buckets: HashMap<String, Vec<HookEventEntry>> = HashMap::new();
 
     for v in events {
         let event = v

@@ -1345,7 +1345,7 @@ pub fn find_duplicate(
         }
         fetch_limit = fetch_limit
             .checked_mul(2)
-            .filter(|limit| *limit <= i64::MAX as usize)
+            .filter(|limit| i64::try_from(*limit).is_ok())
             .ok_or_else(|| Error::other("memory duplicate search exceeded its result limit"))?;
     }
 }
@@ -4906,7 +4906,7 @@ mod tests {
         );
         add_entry(&conn, &live).unwrap();
         let rowid = get_rowid(&conn, "writer-lock").unwrap().unwrap();
-        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.3010), "test").unwrap();
+        vectors::store_memory_embedding(&conn, rowid, &test_embedding(0.302), "test").unwrap();
 
         let found = find_duplicate(
             &conn,

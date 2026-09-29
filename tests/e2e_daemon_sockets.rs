@@ -71,12 +71,11 @@ impl DaemonProc {
                 Err(error) => panic!("daemon status probe failed: {error}"),
                 Ok(None) => {}
             }
-            if Instant::now() >= deadline {
-                panic!(
-                    "daemon did not create sockets within 15s\n{}",
-                    self.diagnose()
-                );
-            }
+            assert!(
+                Instant::now() < deadline,
+                "daemon did not create sockets within 15s\n{}",
+                self.diagnose()
+            );
             sleep(Duration::from_millis(50));
         }
     }
@@ -411,7 +410,9 @@ fn symbol_socket_contracts_under_cpu_contention() {
                 let mut value = 1_u64;
                 while !stop.load(Ordering::Relaxed) {
                     value = std::hint::black_box(
-                        value.wrapping_mul(6364136223846793005).wrapping_add(1),
+                        value
+                            .wrapping_mul(6_364_136_223_846_793_005)
+                            .wrapping_add(1),
                     );
                 }
             })
