@@ -1,6 +1,7 @@
 //! CLI layer - command parsing and execution with clap.
 
 pub mod daemon;
+pub mod doctor;
 pub mod handlers;
 // Portable: only the daemon socket transport inside is unix-gated. Hooks run
 // their work in-process everywhere else (issue #7).
@@ -261,6 +262,13 @@ pub enum Command {
         /// MCP serves in-process is an error rather than a silent no-op.
         #[arg(long)]
         socket: Option<PathBuf>,
+    },
+
+    /// List problems with this installation and the fix for each
+    Doctor {
+        /// Also run the slow checks (the live prior-distiller probe)
+        #[arg(long)]
+        full: bool,
     },
 
     /// Show diagnostic statistics (index health, memory, code, sessions, hooks)

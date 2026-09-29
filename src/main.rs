@@ -816,6 +816,21 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Doctor { full } => {
+            // No store is a fact, not a failure: doctor still reports on hooks
+            // and config for a repo that was never indexed.
+            let ctx = open_reader(&cwd).ok();
+            let facts = mdkb::cli::doctor::collect(&cwd, ctx.as_ref(), full);
+            let findings = mdkb::domain::doctor::findings(&facts);
+            if let mdkb::cli::OutputFormat::Json = cli.format {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "findings": findings }))?);
+            } else {
+                print!("{}", mdkb::cli::doctor::render(&findings));
+            }
+            if mdkb::cli::doctor::has_errors(&findings) {
+                std::process::exit(1);
+            }
+        }
         Command::Stats { no_color } => {
             let ctx = open_reader(&cwd)?;
             announce_no_collections(&ctx)?;

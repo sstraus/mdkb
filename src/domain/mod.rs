@@ -4,6 +4,7 @@
 //! All domain types are storage-agnostic and can be tested with mocks.
 
 pub mod conventions;
+pub mod doctor;
 pub mod frontmatter;
 pub mod links;
 pub mod prior_detect;

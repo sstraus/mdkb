@@ -99,6 +99,7 @@ pub fn routing_for(command: &Command) -> Routing {
         | Command::Get { .. }
         | Command::Mget { .. }
         | Command::Stats { .. }
+        | Command::Doctor { .. }
         | Command::Graph(_)
         | Command::History { .. }
         | Command::Current { .. }
@@ -459,6 +460,7 @@ pub fn mutation_request(
         | Command::Daemon(_)
         | Command::Mcp { .. }
         | Command::Stats { .. }
+        | Command::Doctor { .. }
         | Command::Metrics(
             crate::cli::MetricsCommand::Status
             | crate::cli::MetricsCommand::Show { .. }

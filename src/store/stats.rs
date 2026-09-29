@@ -441,6 +441,16 @@ pub fn record_query_event(
     Ok(conn.last_insert_rowid())
 }
 
+/// Calls of `tool` logged at or after `since`. Hook events are logged under
+/// their event name (`user_prompt_submit`, …).
+pub fn count_calls_since(conn: &Connection, tool: &str, since: i64) -> Result<u32> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM call_log WHERE tool_name = ?1 AND called_at >= ?2",
+        params![tool, since],
+        |r| r.get(0),
+    )?)
+}
+
 /// Delete every query event older than the configured retention window.
 pub fn prune_query_events(conn: &Connection, retention_days: u32, now: i64) -> Result<usize> {
     let cutoff = now - i64::from(retention_days) * 24 * 60 * 60;
