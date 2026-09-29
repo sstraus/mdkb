@@ -28,6 +28,58 @@ pub struct StatsReport {
     /// until `store::heal::sweep_expired_quarantines` retires the `*.corrupt-*`
     /// copy — a persistent, loud data-loss warning for as long as it lives.
     pub quarantine: Vec<crate::store::heal::QuarantineReport>,
+    /// What recall offered and what became of it (the recall ledger).
+    pub recall: RecallReport,
+}
+
+/// Labelled candidates needed before a ratio is reported. Below it, one
+/// session's luck reads as a property of the floor.
+pub const RECALL_MIN_LABELLED: u32 = 30;
+
+#[derive(Debug, Default, Serialize)]
+pub struct RecallReport {
+    pub prompts_by_mode: std::collections::BTreeMap<String, u32>,
+    /// Non-holdout candidates by cosine band and entry type.
+    pub bands: Vec<RecallBand>,
+    /// Holdout candidates, kept out of `bands`: they were injected on
+    /// purpose, and pooling them would bias precision toward the floor.
+    pub holdout: Vec<RecallBand>,
+    /// Labelled non-holdout candidates.
+    pub labelled: u32,
+    /// `labelled` is below [`RECALL_MIN_LABELLED`]; no `precision` is given.
+    pub insufficient_data: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecallBand {
+    #[serde(flatten)]
+    pub counts: crate::store::recall_ledger::BandCounts,
+    /// `positive / (positive + negative)` over injected labelled candidates.
+    pub precision: Option<f64>,
+}
+
+/// Group ledger counts into the report. Unlabelled candidates count as
+/// offered and never as negatives.
+pub fn build_recall_report(
+    counts: Vec<crate::store::recall_ledger::BandCounts>,
+    prompts_by_mode: std::collections::BTreeMap<String, u32>,
+) -> RecallReport {
+    let labelled: u32 = counts.iter().filter(|c| !c.holdout).map(|c| c.labelled).sum();
+    let insufficient_data = labelled < RECALL_MIN_LABELLED;
+    let band = |counts: crate::store::recall_ledger::BandCounts| {
+        let judged = counts.positive + counts.negative;
+        let precision = (!insufficient_data && judged > 0)
+            .then(|| f64::from(counts.positive) / f64::from(judged));
+        RecallBand { counts, precision }
+    };
+    let (holdout, bands): (Vec<_>, Vec<_>) = counts.into_iter().partition(|c| c.holdout);
+    RecallReport {
+        prompts_by_mode,
+        bands: bands.into_iter().map(band).collect(),
+        holdout: holdout.into_iter().map(band).collect(),
+        labelled,
+        insufficient_data,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -211,7 +263,21 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
         sessions: collect_sessions(ctx)?,
         hooks: collect_hooks(mdkb_dir, root, collect_mining(ctx)),
         quarantine: crate::store::heal::quarantine_reports(mdkb_dir),
+        recall: collect_recall(ctx),
     })
+}
+
+/// The recall section. A store that cannot answer (an old read-only copy
+/// without the ledger) reports an empty section rather than failing `stats`.
+fn collect_recall(ctx: &Context) -> RecallReport {
+    use crate::store::recall_ledger::{band_counts, prompts_by_mode};
+    match (band_counts(&ctx.conn), prompts_by_mode(&ctx.conn)) {
+        (Ok(counts), Ok(prompts)) => build_recall_report(counts, prompts),
+        (Err(error), _) | (_, Err(error)) => {
+            tracing::debug!("recall ledger unavailable: {error}");
+            RecallReport::default()
+        }
+    }
 }
 
 fn collect_header(ctx: &Context, root: &Path, status: &IndexStatus) -> HeaderInfo {
@@ -978,6 +1044,58 @@ mod tests {
         let _v: serde_json::Value = serde_json::from_str(&json).expect("parse json");
     }
 
+    fn counts(band: &str, holdout: bool, positive: u32, negative: u32, missed: u32) -> crate::store::recall_ledger::BandCounts {
+        crate::store::recall_ledger::BandCounts {
+            band: band.into(),
+            entry_type: "decision".into(),
+            holdout,
+            offered: positive + negative + missed + 5,
+            injected: positive + negative,
+            labelled: positive + negative + missed,
+            positive,
+            negative,
+            missed,
+        }
+    }
+
+    #[test]
+    fn recall_precision_is_reported_per_band_once_enough_is_labelled() {
+        let report = build_recall_report(
+            vec![counts("0.45-0.50", false, 3, 9, 4), counts("0.65+", false, 18, 2, 0)],
+            Default::default(),
+        );
+        assert_eq!(report.labelled, 36);
+        assert!(!report.insufficient_data);
+        let precision: Vec<(&str, Option<f64>)> = report
+            .bands
+            .iter()
+            .map(|b| (b.counts.band.as_str(), b.precision))
+            .collect();
+        assert_eq!(precision, vec![("0.45-0.50", Some(0.25)), ("0.65+", Some(0.9))]);
+    }
+
+    #[test]
+    fn too_few_labels_give_no_ratio_at_all() {
+        let report = build_recall_report(vec![counts("0.65+", false, 20, 5, 0)], Default::default());
+        assert_eq!(report.labelled, 25);
+        assert!(report.insufficient_data);
+        assert!(report.bands.iter().all(|b| b.precision.is_none()));
+    }
+
+    /// Holdouts were injected on purpose; pooling them would report the
+    /// precision of the experiment, not of the floor.
+    #[test]
+    fn holdout_candidates_stay_out_of_the_headline() {
+        let report = build_recall_report(
+            vec![counts("0.65+", false, 30, 10, 0), counts("0.40-0.45", true, 0, 9, 0)],
+            Default::default(),
+        );
+        assert_eq!(report.labelled, 40, "holdout labels are not counted");
+        assert_eq!(report.bands.len(), 1);
+        assert_eq!(report.holdout.len(), 1);
+        assert_eq!(report.bands[0].precision, Some(0.75));
+    }
+
     fn make_empty_report() -> StatsReport {
         StatsReport {
             header: HeaderInfo {
@@ -1021,6 +1139,7 @@ mod tests {
                 },
             },
             quarantine: vec![],
+            recall: RecallReport::default(),
         }
     }
 

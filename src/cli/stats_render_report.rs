@@ -8,7 +8,7 @@ use std::fmt::Write as FmtWrite;
 use crate::cli::stats_render::{bar, frame};
 use crate::cli::stats_report::{
     CodeSummary, CollectionsSummary, HeaderInfo, HooksSummary, IndexHealth, MemorySummary,
-    SessionsSummary, StatsReport,
+    RECALL_MIN_LABELLED, RecallBand, RecallReport, SessionsSummary, StatsReport,
 };
 
 const WIDTH: usize = 72;
@@ -27,6 +27,7 @@ pub fn render(report: &StatsReport, _color: bool) -> String {
     render_code(&mut out, &report.code);
     render_sessions(&mut out, &report.sessions);
     render_hooks(&mut out, &report.hooks);
+    render_recall(&mut out, &report.recall);
     out
 }
 
@@ -363,6 +364,54 @@ fn render_hooks(out: &mut String, h: &HooksSummary) {
     out.push_str(&frame("Hooks", &body, WIDTH));
 }
 
+fn render_recall(out: &mut String, r: &RecallReport) {
+    if r.prompts_by_mode.is_empty() {
+        return;
+    }
+    let modes: Vec<String> = r
+        .prompts_by_mode
+        .iter()
+        .map(|(mode, n)| format!("{mode} {n}"))
+        .collect();
+    let mut body = format!("  prompts          {}", modes.join(" · "));
+    if r.insufficient_data {
+        let _ = write!(
+            body,
+            "\n  labelled         {} — insufficient data (need {RECALL_MIN_LABELLED})",
+            r.labelled
+        );
+    } else {
+        let _ = write!(body, "\n  labelled         {}", r.labelled);
+    }
+    let table = |body: &mut String, title: &str, bands: &[RecallBand]| {
+        if bands.is_empty() {
+            return;
+        }
+        let _ = write!(body, "\n\n  {title:<10} {:<8}  Offer  Inj  Lab   +    −  Miss  Prec", "Type");
+        for b in bands {
+            let c = &b.counts;
+            let precision = b
+                .precision
+                .map_or_else(|| "   –".to_string(), |p| format!("{:>3.0}%", p * 100.0));
+            let _ = write!(
+                body,
+                "\n  {:<10} {:<8}  {:>5}  {:>3}  {:>3}  {:>3}  {:>3}  {:>4}  {precision}",
+                c.band,
+                truncate(&c.entry_type, 8),
+                c.offered,
+                c.injected,
+                c.labelled,
+                c.positive,
+                c.negative,
+                c.missed
+            );
+        }
+    };
+    table(&mut body, "Band", &r.bands);
+    table(&mut body, "Holdout", &r.holdout);
+    out.push_str(&frame("Recall", &body, WIDTH));
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -475,6 +524,7 @@ mod tests {
                 },
             },
             quarantine: vec![],
+            recall: RecallReport::default(),
         }
     }
 
@@ -523,6 +573,33 @@ mod tests {
             out.contains("run `mdkb update`"),
             "docs still empty must surface the actionable next step: {out}"
         );
+    }
+
+    #[test]
+    fn render_recall_says_when_there_is_too_little_to_judge() {
+        let mut report = fixture_report();
+        report.recall = build_recall_report(
+            vec![crate::store::recall_ledger::BandCounts {
+                band: "0.45-0.50".into(),
+                entry_type: "decision".into(),
+                offered: 12,
+                labelled: 3,
+                missed: 3,
+                ..Default::default()
+            }],
+            [("shadow".to_string(), 9)].into_iter().collect(),
+        );
+        let out = render(&report, false);
+        assert!(out.contains("shadow 9"), "{out}");
+        assert!(out.contains("insufficient data (need 30)"), "{out}");
+        assert!(out.contains("0.45-0.50"), "{out}");
+        let recall = &out[out.find("Recall").expect("recall section")..];
+        assert!(!recall.contains('%'), "no ratio on 3 labels: {recall}");
+    }
+
+    #[test]
+    fn render_omits_recall_when_nothing_was_recorded() {
+        assert!(!render(&fixture_report(), false).contains("Recall"));
     }
 
     #[test]

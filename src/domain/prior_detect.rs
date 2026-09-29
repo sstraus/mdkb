@@ -44,7 +44,7 @@ const CORRECTION_WORDS: &[&str] = &[
 const CORRECTION_PHRASES: &[&str] = &["next time", "remember", "should have", "do not"];
 
 /// Whether a user message reads as an explicit correction.
-fn is_correction(text: &str) -> bool {
+pub(crate) fn is_correction(text: &str) -> bool {
     let lower = text.to_lowercase();
     if CORRECTION_PHRASES.iter().any(|p| lower.contains(p)) {
         return true;

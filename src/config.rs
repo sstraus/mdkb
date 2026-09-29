@@ -763,15 +763,33 @@ pub struct HooksConfig {
     /// *would* have been injected, and inject nothing.
     ///
     /// The only way to answer "what happens if the sigil stops being required"
-    /// without answering it in production. Each skipped prompt appends a
-    /// `recall_shadow` row to `.mdkb/hook-events.jsonl`: how many entries
-    /// cleared each floor, the top cosine, whether the session had already seen
-    /// them, and the latency.
+    /// without answering it in production. Each skipped prompt that reaches
+    /// the search appends a `user_prompt_submit` row with `outcome: "shadow"`
+    /// to `.mdkb/hook-events.jsonl` (the entry ids it would inject, the top
+    /// cosine and the floor), and writes the prompt and every candidate down
+    /// to the 0.40 candidate floor to the recall ledger (`recall_prompts`,
+    /// `recall_candidates`), where `injected` means "automatic recall would
+    /// have injected it".
+    ///
+    /// The daemon reloads `config.toml` when it changes on disk, so turning
+    /// this on takes effect on the next prompt.
     ///
     /// Off by default: it makes every prompt pay an embedding and a hybrid
     /// search for an answer that is thrown away. Turn it on for a week when you
     /// want the data.
     pub user_prompt_submit_shadow: bool,
+
+    /// Fraction of automatic-recall prompts that also inject one candidate
+    /// recall did not select, tagged `holdout` in the recall ledger.
+    ///
+    /// The ledger can only see a false negative when the model reaches the
+    /// missing entry some other way. A holdout shows one on purpose, so its
+    /// use can be observed at all. It is noise in a real session, which is
+    /// why it defaults to `0.0`, applies only to automatic recall (never to a
+    /// `*` prompt, which asked for its own answer, and never to shadow, which
+    /// shows nothing), injects at most one entry per prompt, and is reported
+    /// apart from the headline precision.
+    pub recall_holdout_rate: f32,
 }
 
 impl Default for HooksConfig {
@@ -793,6 +811,7 @@ impl Default for HooksConfig {
             user_prompt_submit_require_sigil: true,
             recall_auto_min_cosine: RECALL_AUTO_MIN_COSINE_DEFAULT,
             user_prompt_submit_shadow: false,
+            recall_holdout_rate: 0.0,
         }
     }
 }

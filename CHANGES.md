@@ -18,6 +18,42 @@
   receive at most one verdict per session. Found by the maintainer's
   2026-09-23 prior audit.
 
+- **Recall records every candidate it was offered.** Each prompt that runs
+  memory recall (`*`, automatic or shadow) writes one row to a new recall
+  ledger, and one row per memory entry scoring at least 0.40, whether or not
+  it was injected: cosine, type, age, identifier overlap with the prompt, and
+  whether it was shown. For shadow prompts, "injected" means that automatic
+  recall would have shown it. The ledger holds no prompt text, and old rows
+  are pruned after `telemetry.retention_days`. A second query at the lower
+  floor feeds it, so what gets injected is unchanged. Found by the
+  maintainer on 2026-09-29: shadow recall kept only the top cosine above
+  0.50, so false negatives could not be measured.
+
+- **Stop labels recall candidates from what the session did with them.**
+  Settlement reads the transcript window it already reads for priors:
+  - a `get` of an injected entry labels it `used`;
+  - a `get` or a later memory search that reaches an entry recall did not
+    inject labels it `missed`;
+  - `memory_confirm` labels it `confirmed` or `refuted`;
+  - a user correction sharing two distinctive words with an injected
+    entry's title labels it `corrected`.
+
+  Each event is credited to the latest prompt before it. A candidate with no
+  signal stays unlabelled; it is never counted as a negative.
+
+- **`hooks.recall_holdout_rate` (default `0.0`).** It injects, on that
+  fraction of automatic-recall prompts, one extra candidate that recall did
+  not select, and tags it `holdout` in the recall ledger. A false negative
+  can then be observed as used rather than only as missed. It never applies
+  to `*` prompts or to shadow mode.
+
+- **`mdkb stats` reports recall by cosine band.** A new Recall section (and a
+  `recall` object in `--format json`) shows the prompts recorded per mode,
+  and a table per band (`0.40-0.45` … `0.65+`, `fts`) and entry type:
+  offered, injected, labelled, positive, negative, missed and precision.
+  Precision is withheld until 30 candidates are labelled. Holdout rows are
+  reported in their own table.
+
 ### Changed
 
 - **Working priors stay fresh through use.** Injection scoring now considers
@@ -27,6 +63,15 @@
   the lesson. Found by the maintainer's 2026-09-23 prior audit.
 
 ### Fixed
+
+- **A `config.toml` edit now applies on the next request.** The daemon read
+  a repository's config once, when it opened the repository, and ignored
+  every later edit until LRU eviction or a restart. It now checks the file's
+  size and modification time on each access and reloads over the same open
+  store. A file that does not parse keeps the previous config and reports the
+  error; it does not reset the repository to defaults. Found by the
+  maintainer on 2026-09-29: with shadow recall turned on after the handle
+  opened, three prompts over 12 seconds were all logged as `skipped`.
 
 - **Daemon socket E2E readiness tolerates delayed startup.** The fixture waits
   up to 15 seconds for both sockets, reports an exited daemon immediately with
