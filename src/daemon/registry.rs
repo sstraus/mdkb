@@ -28,6 +28,10 @@ pub struct RepoHandle {
     pub config: Config,
     /// Glob patterns to exclude from code indexing.
     pub code_ignore_patterns: Vec<String>,
+    /// How `config.toml` looked when `config` was read from it.
+    config_identity: ConfigIdentity,
+    /// Why the last reload was refused; `config` is then the last good one.
+    config_error: std::sync::Mutex<Option<String>>,
     /// Unix timestamp of last access (for LRU eviction).
     pub last_access: AtomicI64,
     /// True while startup doc/session reindex holds ctx.
@@ -69,42 +73,83 @@ impl RepoHandle {
     /// tests stay deterministic.
     pub fn open(root: &Path, global_priors: &toml::Table) -> Result<Self> {
         let root = canonicalize_root(root)?;
-        let config_path = root.join(".mdkb/config.toml");
-        let mut config = if config_path.exists() {
-            match Config::load(&config_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to load config for {}, using defaults: {e}",
-                        root.display()
-                    );
-                    Config::default()
-                }
-            }
-        } else {
-            Config::default()
-        };
-        // Layer the global [priors] base under any per-repo override.
-        let repo_priors = crate::config::raw_priors_layer(&config_path);
-        config.priors = crate::config::merge_priors(global_priors, repo_priors.as_ref());
-        let code_ignore_patterns = config.code.indexing.ignore_patterns.clone();
-
-        let (reindex_tx, reindex_rx) = mpsc::channel(64);
-        Ok(Self {
+        let config_path = config_path(&root);
+        let identity = ConfigIdentity::of(&config_path);
+        let config = load_config(&config_path, global_priors).unwrap_or_else(|e| {
+            tracing::warn!(
+                "Failed to load config for {}, using defaults: {e}",
+                root.display()
+            );
+            let mut config = Config::default();
+            config.priors = crate::config::merge_priors(global_priors, None);
+            config
+        });
+        Ok(Self::with_state(
             root,
-            ctx: Arc::new(Mutex::new(None)),
-            code_index: Arc::new(Mutex::new(None)),
+            config,
+            identity,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        ))
+    }
+
+    /// A handle serving what `config.toml` says now, over this handle's store.
+    ///
+    /// The store, code index and reindex flags are shared, not reopened: a
+    /// reload must not open a second SQLite connection or rerun startup
+    /// indexing. The caller spawns the new handle's watcher; the old watcher
+    /// stops when the last request holding the old handle drops it.
+    ///
+    /// Unlike [`open`](Self::open), a file that does not parse is an error, not
+    /// a fall back to defaults: cold start has nothing better, a reload has the
+    /// config it is replacing.
+    fn reopen(&self, global_priors: &toml::Table) -> Result<Self> {
+        let config_path = config_path(&self.root);
+        // Identity first: an edit landing during the read is then seen as a
+        // change on the next access instead of being recorded as already read.
+        let identity = ConfigIdentity::of(&config_path);
+        let config = load_config(&config_path, global_priors)?;
+        Ok(Self::with_state(
+            self.root.clone(),
+            config,
+            identity,
+            Arc::clone(&self.ctx),
+            Arc::clone(&self.code_index),
+            Arc::clone(&self.doc_reindex_active),
+            Arc::clone(&self.code_reindex_active),
+        ))
+    }
+
+    fn with_state(
+        root: PathBuf,
+        config: Config,
+        config_identity: ConfigIdentity,
+        ctx: Arc<Mutex<Option<Context>>>,
+        code_index: Arc<Mutex<Option<IndexFacade>>>,
+        doc_reindex_active: Arc<AtomicBool>,
+        code_reindex_active: Arc<AtomicBool>,
+    ) -> Self {
+        let code_ignore_patterns = config.code.indexing.ignore_patterns.clone();
+        let (reindex_tx, reindex_rx) = mpsc::channel(64);
+        Self {
+            root,
+            ctx,
+            code_index,
             config,
             code_ignore_patterns,
+            config_identity,
+            config_error: std::sync::Mutex::new(None),
             last_access: AtomicI64::new(now_unix()),
-            doc_reindex_active: Arc::new(AtomicBool::new(false)),
-            code_reindex_active: Arc::new(AtomicBool::new(false)),
+            doc_reindex_active,
+            code_reindex_active,
             reindex_tx,
             reindex_rx: std::sync::Mutex::new(Some(reindex_rx)),
             reindex_send_warned: AtomicBool::new(false),
             backfill_in_flight: AtomicBool::new(false),
             watcher_handle: std::sync::Mutex::new(None),
-        })
+        }
     }
 
     /// Create a handle from pre-existing shared state (for standalone mode).
@@ -119,12 +164,15 @@ impl RepoHandle {
         code_reindex_active: Arc<AtomicBool>,
     ) -> Self {
         let (reindex_tx, reindex_rx) = mpsc::channel(64);
+        let config_identity = ConfigIdentity::of(&config_path(&root));
         Self {
             root,
             ctx,
             code_index,
             config,
             code_ignore_patterns,
+            config_identity,
+            config_error: std::sync::Mutex::new(None),
             last_access: AtomicI64::new(now_unix()),
             doc_reindex_active,
             code_reindex_active,
@@ -145,6 +193,23 @@ impl RepoHandle {
     pub fn last_access_time(&self) -> i64 {
         self.last_access.load(Ordering::Relaxed)
     }
+
+    /// Why the last reload of `config.toml` was refused, while it still is.
+    pub fn config_error(&self) -> Option<String> {
+        self.config_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Record a refused reload. True when the reason is new, so the caller
+    /// logs a broken file once rather than on every request against it.
+    fn set_config_error(&self, why: String) -> bool {
+        let mut slot = self.config_error.lock().unwrap_or_else(|e| e.into_inner());
+        let new = slot.as_deref() != Some(why.as_str());
+        *slot = Some(why);
+        new
+    }
 }
 
 impl Drop for RepoHandle {
@@ -158,6 +223,53 @@ impl Drop for RepoHandle {
             handle.abort();
             tracing::debug!(root = %self.root.display(), "Aborted file watcher task");
         }
+    }
+}
+
+fn config_path(root: &Path) -> PathBuf {
+    root.join(".mdkb/config.toml")
+}
+
+/// `config.toml` read strictly, with the daemon's global `[priors]` layered
+/// under the repo's own. A missing file is the defaults, not an error.
+fn load_config(path: &Path, global_priors: &toml::Table) -> Result<Config> {
+    let mut config = if path.exists() {
+        Config::load(path)?
+    } else {
+        Config::default()
+    };
+    let repo_priors = crate::config::raw_priors_layer(path);
+    config.priors = crate::config::merge_priors(global_priors, repo_priors.as_ref());
+    Ok(config)
+}
+
+/// How a config file looked when it was read: `(len, mtime)`, or absent.
+///
+/// The same trade as [`super::ExeIdentity`]: a `stat` per request instead of
+/// a content hash. A `touch` costs one needless reload; a missed edit costs a
+/// config that silently does not apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConfigIdentity {
+    path: PathBuf,
+    stamp: Option<(u64, Option<std::time::SystemTime>)>,
+}
+
+impl ConfigIdentity {
+    fn of(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            stamp: Self::stamp(path),
+        }
+    }
+
+    fn stamp(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| (m.len(), m.modified().ok()))
+    }
+
+    fn changed(&self) -> bool {
+        Self::stamp(&self.path) != self.stamp
     }
 }
 
@@ -235,9 +347,8 @@ impl RepoRegistry {
         let canonical = canonicalize_root(root)?;
 
         // Fast path: already open
-        if let Some(handle) = self.handles.get(&canonical) {
-            handle.touch();
-            return Ok(Arc::clone(&handle));
+        if let Some(handle) = self.open_handle(&canonical) {
+            return Ok(handle);
         }
 
         // Whitelist check before opening
@@ -294,10 +405,7 @@ impl RepoRegistry {
     /// Get an existing handle without opening (returns None if not registered).
     pub fn get(&self, root: &Path) -> Option<Arc<RepoHandle>> {
         let canonical = canonicalize_root(root).ok()?;
-        self.handles.get(&canonical).map(|h| {
-            h.touch();
-            Arc::clone(&h)
-        })
+        self.open_handle(&canonical)
     }
 
     /// List all registered repo roots with their last access time.
@@ -445,6 +553,45 @@ impl RepoRegistry {
             absent => return Err(absent.reason().to_string()),
         }
         Context::open_read_only(root).map_err(|e| e.to_string())
+    }
+
+    /// The open handle for `canonical`, reloaded first when `config.toml`
+    /// changed on disk since that handle read it.
+    ///
+    /// Story 180-b051: the config used to be read once per handle, so an edit
+    /// was silently ignored until LRU eviction or a daemon restart.
+    fn open_handle(&self, canonical: &Path) -> Option<Arc<RepoHandle>> {
+        let handle = Arc::clone(&*self.handles.get(canonical)?);
+        handle.touch();
+        if !handle.config_identity.changed() {
+            return Some(handle);
+        }
+        let _gate = self.open_gate.lock().unwrap_or_else(|e| e.into_inner());
+        // Another caller may have reloaded it while this one waited.
+        let current = Arc::clone(&*self.handles.get(canonical)?);
+        if !current.config_identity.changed() {
+            return Some(current);
+        }
+        match current.reopen(&self.daemon_config.priors) {
+            Ok(fresh) => {
+                let fresh = Arc::new(fresh);
+                self.handles
+                    .insert(canonical.to_path_buf(), Arc::clone(&fresh));
+                drop(_gate);
+                tracing::info!("Reloaded config: {}", canonical.display());
+                spawn_watcher_for_handle(&fresh);
+                Some(fresh)
+            }
+            Err(e) => {
+                if current.set_config_error(e.to_string()) {
+                    tracing::warn!(
+                        root = %canonical.display(),
+                        "config.toml changed but does not load ({e}); still serving the previous config"
+                    );
+                }
+                Some(current)
+            }
+        }
     }
 
     /// Evict the least recently used repo handle.
@@ -1308,5 +1455,77 @@ mod tests {
         assert_eq!(Arc::as_ptr(&ha), Arc::as_ptr(&hb));
         assert_eq!(Arc::as_ptr(&hb), Arc::as_ptr(&hm));
         assert_eq!(registry.active_count(), 1);
+    }
+
+    /// Story 180-b051. Measured 2026-09-29: with the handle open, turning
+    /// `user_prompt_submit_shadow` on was ignored for 12 s across three prompts,
+    /// because the config was read once at open and never again.
+    #[test]
+    fn a_config_edit_is_served_on_the_next_access() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        let registry = RepoRegistry::new(allow_temp_config());
+
+        let before = registry.get_or_open(&root).unwrap();
+        assert!(!before.config.hooks.user_prompt_submit_shadow);
+
+        std::fs::write(
+            root.join(".mdkb/config.toml"),
+            "[hooks]\nuser_prompt_submit_shadow = true\n",
+        )
+        .unwrap();
+
+        let after = registry.get_or_open(&root).unwrap();
+        assert!(
+            after.config.hooks.user_prompt_submit_shadow,
+            "the edit must be served without a restart"
+        );
+        assert!(
+            Arc::ptr_eq(&before.ctx, &after.ctx),
+            "a reload must share the open store, not open a second connection"
+        );
+        assert!(Arc::ptr_eq(&before.code_index, &after.code_index));
+        assert_eq!(registry.active_count(), 1);
+    }
+
+    /// A typo in the file must not reset a tuned repo to factory defaults
+    /// mid-session: cold open falls back to defaults, a reload keeps the last
+    /// good config and says why.
+    #[test]
+    fn an_invalid_config_keeps_the_handle_it_replaces() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        let path = root.join(".mdkb/config.toml");
+        std::fs::write(&path, "[hooks]\nuser_prompt_submit_shadow = true\n").unwrap();
+        let registry = RepoRegistry::new(allow_temp_config());
+        let good = registry.get_or_open(&root).unwrap();
+        assert!(good.config_error().is_none());
+
+        std::fs::write(&path, "[hooks\nuser_prompt_submit_shadow = tru\n").unwrap();
+        let kept = registry.get_or_open(&root).unwrap();
+        assert!(Arc::ptr_eq(&good, &kept));
+        assert!(kept.config.hooks.user_prompt_submit_shadow);
+        assert!(kept.config_error().is_some(), "the parse error is kept for doctor");
+
+        // The failed parse did not advance the identity: fixing the file is
+        // picked up on the next access, and the error clears with it.
+        std::fs::write(&path, "[hooks]\nuser_prompt_submit_shadow = false\n").unwrap();
+        let fixed = registry.get_or_open(&root).unwrap();
+        assert!(!Arc::ptr_eq(&good, &fixed));
+        assert!(!fixed.config.hooks.user_prompt_submit_shadow);
+        assert!(fixed.config_error().is_none());
+    }
+
+    #[test]
+    fn an_unchanged_config_reuses_the_handle() {
+        let tmp = TempDir::new().unwrap();
+        let root = make_repo(&tmp);
+        std::fs::write(root.join(".mdkb/config.toml"), "[hooks]\nrecall_limit = 3\n").unwrap();
+        let registry = RepoRegistry::new(allow_temp_config());
+        let a = registry.get_or_open(&root).unwrap();
+        let b = registry.get_or_open(&root).unwrap();
+        let c = registry.get(&root).unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&a, &c));
     }
 }

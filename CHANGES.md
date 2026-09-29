@@ -28,6 +28,15 @@
 
 ### Fixed
 
+- **A `config.toml` edit now applies on the next request.** The daemon read
+  a repository's config once, when it opened the repository, and ignored
+  every later edit until LRU eviction or a restart. It now checks the file's
+  size and modification time on each access and reloads over the same open
+  store. A file that does not parse keeps the previous config and reports the
+  error; it does not reset the repository to defaults. Found by the
+  maintainer on 2026-09-29: with shadow recall turned on after the handle
+  opened, three prompts over 12 seconds were all logged as `skipped`.
+
 - **Daemon socket E2E readiness tolerates delayed startup.** The fixture waits
   up to 15 seconds for both sockets, reports an exited daemon immediately with
   its stderr, and records startup timing. The CI failure on 2026-09-25 occurred
