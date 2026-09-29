@@ -529,6 +529,7 @@ mod tests {
             },
             quarantine: vec![],
             recall: RecallReport::default(),
+            doctor: Vec::new(),
         }
     }
 

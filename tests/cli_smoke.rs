@@ -977,6 +977,23 @@ fn smoke_stats() {
 #[test]
 fn smoke_stats_json() {
     let repo = Repo::new();
+    // Story 188-a540: the dashboard reads doctor findings from `stats`,
+    // because TUICommander's execCli drops stdout on a non-zero exit and
+    // `mdkb doctor` exits 1 exactly when there is something to show.
+    let out = run(&["--format", "json", "stats"], &repo.root);
+    assert_ok(&out, "stats --format json with doctor findings");
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("stats json");
+    let ids: Vec<&str> = v["doctor"]
+        .as_array()
+        .expect("doctor findings array")
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"hooks.drift"),
+        "unregistered hooks in a fresh repo: {ids:?}"
+    );
+
     let out = run(&["--format", "json", "stats", "--no-color"], &repo.root);
     assert_ok(&out, "stats --format json");
     let s = stdout(&out);

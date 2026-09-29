@@ -12,6 +12,12 @@
   on 2026-09-29: shadow recall, a missing `PostToolUseFailure` hook and an
   ignored config edit all failed without the model being told.
 
+- **`mdkb stats --format json` includes the cheap doctor findings** as a
+  `doctor` array. `stats` always exits 0, so a consumer that discards the
+  output of a failing command still sees error findings. TUICommander's
+  plugin runner does exactly that, and `mdkb doctor` exits 1 on errors. The
+  mdkb dashboard plugin (1.3.0) shows the findings and the recall bands.
+
 - **Durable memories can surface on explicit triggers.** Decisions, topics and
   problems accept alternative tool, path, command or prompt matchers through
   `memory_write`, `memory_write_batch` and repeatable `mdkb memory add --trigger`

@@ -30,6 +30,10 @@ pub struct StatsReport {
     pub quarantine: Vec<crate::store::heal::QuarantineReport>,
     /// What recall offered and what became of it (the recall ledger).
     pub recall: RecallReport,
+    /// The cheap `mdkb doctor` findings. Here as well as in `mdkb doctor`
+    /// because `stats` always exits 0, and a consumer that discards the
+    /// output of a failing command would never see an error finding.
+    pub doctor: Vec<crate::domain::doctor::Finding>,
 }
 
 /// Labelled candidates needed before a ratio is reported. Below it, one
@@ -268,6 +272,11 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
         hooks: collect_hooks(mdkb_dir, root, collect_mining(ctx)),
         quarantine: crate::store::heal::quarantine_reports(mdkb_dir),
         recall: collect_recall(ctx),
+        doctor: crate::domain::doctor::findings(&crate::cli::doctor::collect(
+            root,
+            Some(ctx),
+            false,
+        )),
     })
 }
 
@@ -1160,6 +1169,7 @@ mod tests {
             },
             quarantine: vec![],
             recall: RecallReport::default(),
+            doctor: Vec::new(),
         }
     }
 
