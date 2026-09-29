@@ -16,6 +16,7 @@ pub mod memory_graph;
 pub mod mutation_lock;
 pub mod namespace;
 pub mod priors;
+pub mod recall_ledger;
 pub mod schema;
 pub mod search;
 pub mod stats;

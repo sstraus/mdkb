@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 32;
+pub const SCHEMA_VERSION: i32 = 33;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -411,6 +411,39 @@ CREATE INDEX IF NOT EXISTS idx_document_aliases_alias ON document_aliases(alias)
 /// The `relation_candidates` table. Separate from `SCHEMA_SQL` for the same
 /// reason as `DOCUMENT_ALIASES_SQL`: the v30 migration must create it on a
 /// store that never ran `SCHEMA_SQL`.
+/// What memory recall offered on each prompt, and what became of it.
+/// See `store::recall_ledger`. No column holds prompt text.
+///
+/// `entry_id` is not a foreign key: an entry deleted after it was offered
+/// must not erase the evidence of what was offered.
+pub(crate) const RECALL_LEDGER_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS recall_prompts (
+    id              INTEGER PRIMARY KEY,
+    session         TEXT NOT NULL,
+    mode            TEXT NOT NULL,     -- sigil | automatic | shadow
+    floor           REAL NOT NULL,     -- injection floor
+    candidate_floor REAL NOT NULL,     -- recording floor
+    created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recall_prompts_session ON recall_prompts(session);
+CREATE INDEX IF NOT EXISTS idx_recall_prompts_created ON recall_prompts(created_at);
+CREATE TABLE IF NOT EXISTS recall_candidates (
+    prompt_id  INTEGER NOT NULL REFERENCES recall_prompts(id) ON DELETE CASCADE,
+    entry_id   TEXT NOT NULL,
+    rank       INTEGER NOT NULL,
+    cosine     REAL,                   -- NULL for an FTS-only hit
+    entry_type TEXT NOT NULL,
+    age_days   INTEGER NOT NULL,
+    overlap    INTEGER NOT NULL,
+    injected   INTEGER NOT NULL,
+    holdout    INTEGER NOT NULL,
+    outcome    TEXT,                   -- NULL until settled with a strong signal
+    outcome_at INTEGER,
+    PRIMARY KEY (prompt_id, entry_id)
+);
+CREATE INDEX IF NOT EXISTS idx_recall_candidates_entry ON recall_candidates(entry_id);
+"#;
+
 const RELATION_CANDIDATES_SQL: &str = r#"
 -- What the relation-key detector last measured, so a latency-bounded reader
 -- (SessionStart, 200 ms) can report it without scanning the corpus.
@@ -445,6 +478,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)?;
     conn.execute_batch(DOCUMENT_ALIASES_SQL)?;
     conn.execute_batch(RELATION_CANDIDATES_SQL)?;
+    conn.execute_batch(RECALL_LEDGER_SQL)?;
 
     // Set BM25 weights
     conn.execute_batch(BM25_WEIGHTS_SQL)?;
@@ -1201,6 +1235,12 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
         )?;
     }
 
+    // Migration from v32 to v33: the recall ledger (story 181-63ba). Created
+    // empty; recall fills it from the next prompt on.
+    if from_version < 33 {
+        conn.execute_batch(RECALL_LEDGER_SQL)?;
+    }
+
     // Update schema version
     conn.execute("UPDATE schema_version SET version = ?", [SCHEMA_VERSION])?;
 
@@ -1233,6 +1273,22 @@ pub fn get_schema_version(conn: &Connection) -> Result<Option<i32>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn migration_to_v33_adds_an_empty_recall_ledger() {
+        let conn = setup_db();
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+        conn.execute("INSERT INTO schema_version (version) VALUES (32)", [])
+            .unwrap();
+        init_schema(&conn).unwrap();
+        for table in ["recall_prompts", "recall_candidates"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(rows, 0, "{table} exists and starts empty");
+        }
+        assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
+    }
+
     #[test]
     fn migration_adds_durable_trigger_storage_without_changing_existing_entries() {
         let conn = setup_db();
