@@ -2569,7 +2569,7 @@ mod tests {
             ids.push(id);
         }
         curate_cluster_family(&conn, &[&ids[0], &ids[1]], 9000).unwrap();
-        for n in 0..2 {
+        for (n, id) in ids.iter().enumerate().take(2) {
             let cand = get_candidate(&conn, &format!("curation-evidence-{n}"))
                 .unwrap()
                 .unwrap();
@@ -2581,7 +2581,7 @@ mod tests {
                 cand.evidence_fix.as_deref(),
                 Some(format!("fix-{n}").as_str())
             );
-            let cluster = get_cluster(&conn, &ids[n]).unwrap().unwrap();
+            let cluster = get_cluster(&conn, id).unwrap().unwrap();
             assert_eq!(
                 cluster.promoted_memory_id.as_deref(),
                 Some(format!("prior-{n}").as_str())

@@ -3708,6 +3708,7 @@ fn log_hook_event_with_reason(
 /// responsible. Answering that from the outside means re-running the hook under
 /// a profiler on a store that reproduces the problem — the store is the input,
 /// so it usually does not.
+#[allow(clippy::too_many_arguments)] // thin pass-through to log_hook_event_full's row shape
 fn log_hook_event_with_phases(
     root: std::path::PathBuf,
     event: &str,
@@ -3763,6 +3764,7 @@ fn log_hook_event_with_shadow(
 /// caller: `("phases", …)` for SessionStart, `("shadow", …)` for a shadow-mode
 /// UserPromptSubmit. Naming it at the call site keeps a reader of the log able
 /// to tell which event a field belongs to.
+#[allow(clippy::too_many_arguments)] // one field per element of the common hook-log row
 fn log_hook_event_full(
     root: std::path::PathBuf,
     event: &str,
@@ -4682,8 +4684,10 @@ fn graph_neighbor_cosine(blob: &[u8], query: &[f32]) -> Option<f32> {
         return None;
     }
     let vector: Vec<f32> = blob
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect();
     if vector.iter().all(|value| *value == 0.0) || query.iter().all(|value| *value == 0.0) {
         return None;
@@ -10984,11 +10988,8 @@ mod tests {
         let (row, result) = session_start_row(&handle).await;
         let host_context = additional_context(&result);
         assert!(!host_context.is_empty(), "fixture must emit context");
-        assert_eq!(row["payload_bytes"], host_context.as_bytes().len());
-        assert_eq!(
-            row["payload_blocks"]["session_start"],
-            host_context.as_bytes().len()
-        );
+        assert_eq!(row["payload_bytes"], host_context.len());
+        assert_eq!(row["payload_blocks"]["session_start"], host_context.len());
         assert!(
             row.to_string().find("payload-fixture").is_none(),
             "log must not copy context text"
