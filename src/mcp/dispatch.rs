@@ -5606,7 +5606,9 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
     // The same window the miner reads. A prior injected earlier than this window
     // is settled against what the window shows, which can only ever miss a
     // recurrence — it never invents one.
-    let episode = parse_episode(&tail_lines(&jsonl, STOP_EPISODE_WINDOW_LINES));
+    let window = tail_lines(&jsonl, STOP_EPISODE_WINDOW_LINES);
+    let episode = parse_episode(&window);
+    let recall_events = crate::domain::recall_outcome::parse_events(&window);
     let errors: Vec<ObservedError> = episode
         .errors
         .iter()
@@ -5646,6 +5648,20 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
             }
         }
         Some(Err(error)) => tracing::debug!("prior settling failed: {error}"),
+        _ => {}
+    }
+
+    // Recall candidates offered in this session, labelled from the same
+    // window. Only strong signals label; the rest stay open, not negative.
+    match crate::core::run_mutation(&mut guard, "recall settling", |ctx| {
+        let open = crate::store::recall_ledger::open_candidates(&ctx.conn, &session)?;
+        let labels = crate::domain::recall_outcome::label(&open, &recall_events);
+        crate::store::recall_ledger::set_outcomes(&ctx.conn, &labels, now)
+    }) {
+        Some(Ok(labelled)) if labelled > 0 => {
+            tracing::info!("recall settling: labelled {labelled} candidate(s) in session {session}");
+        }
+        Some(Err(error)) => tracing::debug!("recall settling failed: {error}"),
         _ => {}
     }
 }
@@ -8444,6 +8460,54 @@ mod tests {
             summary,
             vec![("high", Some(72), true, 2), ("low", Some(45), false, 2), ("fts", None, false, 2)]
         );
+    }
+
+    /// Story 183-1f3a end to end: a prompt injects an entry, the transcript
+    /// shows the model fetching it, and Stop labels the ledger row `used`.
+    #[tokio::test]
+    async fn stop_labels_an_injected_entry_the_model_fetched() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "fetched-mem").await;
+        hook_user_prompt_submit_impl_with_dedup(
+            &handle,
+            "* what do we know about the recall_gate_fixture topic content",
+            "s-settle",
+            None,
+            &mut None,
+            &mut Vec::new(),
+        )
+        .await;
+
+        let later = chrono::Utc::now() + chrono::Duration::seconds(60);
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(
+            &transcript,
+            format!(
+                r#"{{"type":"assistant","timestamp":"{}","message":{{"content":[{{"type":"tool_use","id":"t1","name":"mcp__mdkb__get","input":{{"id":"fetched-mem"}}}}]}}}}"#,
+                later.to_rfc3339()
+            ),
+        )
+        .unwrap();
+        settle_session(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "s-settle".into(),
+        )
+        .await;
+
+        let guard = handle.ctx.lock().await;
+        let outcome: Option<String> = guard
+            .as_ref()
+            .unwrap()
+            .conn
+            .query_row(
+                "SELECT outcome FROM recall_candidates WHERE entry_id = 'fetched-mem'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcome.as_deref(), Some("used"));
     }
 
     /// The observation query must run below the injection floor, or the

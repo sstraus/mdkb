@@ -29,6 +29,18 @@
   maintainer on 2026-09-29: shadow recall kept only the top cosine above
   0.50, so false negatives could not be measured.
 
+- **Stop labels recall candidates from what the session did with them.**
+  Settlement reads the transcript window it already reads for priors:
+  - a `get` of an injected entry labels it `used`;
+  - a `get` or a later memory search that reaches an entry recall did not
+    inject labels it `missed`;
+  - `memory_confirm` labels it `confirmed` or `refuted`;
+  - a user correction sharing two distinctive words with an injected
+    entry's title labels it `corrected`.
+
+  Each event is credited to the latest prompt before it. A candidate with no
+  signal stays unlabelled; it is never counted as a negative.
+
 ### Changed
 
 - **Working priors stay fresh through use.** Injection scoring now considers

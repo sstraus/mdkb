@@ -89,6 +89,53 @@ pub fn prune(conn: &Connection, retention_days: u32, now: i64) -> Result<usize> 
     )?)
 }
 
+/// Every candidate offered in `session` that has no outcome yet, with the
+/// title of the entry it names (empty if the entry was deleted since).
+pub fn open_candidates(
+    conn: &Connection,
+    session: &str,
+) -> Result<Vec<crate::domain::recall_outcome::LedgerCandidate>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT c.prompt_id, p.created_at, c.entry_id, COALESCE(m.title, ''), c.injected \
+         FROM recall_candidates c \
+         JOIN recall_prompts p ON p.id = c.prompt_id \
+         LEFT JOIN memory_entries m ON m.id = c.entry_id \
+         WHERE p.session = ?1 AND c.outcome IS NULL \
+         ORDER BY p.created_at, c.rank",
+    )?;
+    let rows = stmt.query_map([session], |r| {
+        Ok(crate::domain::recall_outcome::LedgerCandidate {
+            prompt_id: r.get(0)?,
+            prompt_at: r.get(1)?,
+            entry_id: r.get(2)?,
+            title: r.get(3)?,
+            injected: r.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// Write settlement labels. A candidate that already has an outcome keeps it.
+pub fn set_outcomes(
+    conn: &Connection,
+    labels: &[(i64, String, crate::domain::recall_outcome::RecallOutcome)],
+    now: i64,
+) -> Result<usize> {
+    let tx = conn.unchecked_transaction()?;
+    let mut written = 0;
+    {
+        let mut update = tx.prepare_cached(
+            "UPDATE recall_candidates SET outcome = ?3, outcome_at = ?4 \
+             WHERE prompt_id = ?1 AND entry_id = ?2 AND outcome IS NULL",
+        )?;
+        for (prompt_id, entry_id, outcome) in labels {
+            written += update.execute(params![prompt_id, entry_id, outcome.as_str(), now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +235,36 @@ mod tests {
         assert_eq!(left, "new", "the old prompt's candidate went with it");
         assert_eq!(prune(&conn, 30, 80 * day).unwrap(), 1);
         assert_eq!(count(&conn, "recall_candidates"), 0);
+    }
+
+    #[test]
+    fn settlement_reads_open_candidates_and_writes_each_label_once() {
+        use crate::domain::recall_outcome::RecallOutcome;
+        let conn = db();
+        let a = record_prompt(&conn, &prompt(), &[cand("a", 0, None, true), cand("b", 1, None, false)], 30, 100).unwrap();
+        let mut other = prompt();
+        other.session = "s2".into();
+        record_prompt(&conn, &other, &[cand("c", 0, None, true)], 30, 100).unwrap();
+
+        let open = open_candidates(&conn, "s1").unwrap();
+        let ids: Vec<(&str, bool, i64)> =
+            open.iter().map(|c| (c.entry_id.as_str(), c.injected, c.prompt_at)).collect();
+        assert_eq!(ids, vec![("a", true, 100), ("b", false, 100)], "only this session's rows");
+
+        assert_eq!(set_outcomes(&conn, &[(a, "a".into(), RecallOutcome::Used)], 200).unwrap(), 1);
+        // A second settlement of the same session must not overwrite the first.
+        assert_eq!(set_outcomes(&conn, &[(a, "a".into(), RecallOutcome::Refuted)], 300).unwrap(), 0);
+        let (outcome, at): (String, i64) = conn
+            .query_row(
+                "SELECT outcome, outcome_at FROM recall_candidates WHERE entry_id = 'a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((outcome.as_str(), at), ("used", 200));
+        let still_open: Vec<String> =
+            open_candidates(&conn, "s1").unwrap().into_iter().map(|c| c.entry_id).collect();
+        assert_eq!(still_open, vec!["b"]);
     }
 
     /// The ledger must never become a place prompt text can land. A new column

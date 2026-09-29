@@ -9,6 +9,7 @@ pub mod links;
 pub mod prior_detect;
 pub mod prior_distill;
 pub mod prior_episode;
+pub mod recall_outcome;
 pub mod sessions;
 
 use serde::{Deserialize, Serialize};
