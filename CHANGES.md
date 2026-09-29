@@ -4,6 +4,20 @@
 
 ### Added
 
+- **SessionStart tells the model what is broken.** The quarantine and
+  projection-drift banners are replaced by one `## mdkb doctor` block from
+  the cheap doctor checks. Each error or warning is one line with its fix
+  command, capped at 5 lines plus a pointer to `mdkb doctor`. Healthy stores
+  add nothing, and `info` findings stay on the CLI. Found by the maintainer
+  on 2026-09-29: shadow recall, a missing `PostToolUseFailure` hook and an
+  ignored config edit all failed without the model being told.
+
+- **`mdkb stats --format json` includes the cheap doctor findings** as a
+  `doctor` array. `stats` always exits 0, so a consumer that discards the
+  output of a failing command still sees error findings. TUICommander's
+  plugin runner does exactly that, and `mdkb doctor` exits 1 on errors. The
+  mdkb dashboard plugin (1.3.0) shows the findings and the recall bands.
+
 - **Durable memories can surface on explicit triggers.** Decisions, topics and
   problems accept alternative tool, path, command or prompt matchers through
   `memory_write`, `memory_write_batch` and repeatable `mdkb memory add --trigger`

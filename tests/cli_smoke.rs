@@ -412,6 +412,54 @@ fn smoke_namespaced_hook_logs_telemetry_into_its_own_store() {
     );
 }
 
+/// Story 187-d7c8. SessionStart tells the model what is broken and how to
+/// fix it, in one block, and says nothing when nothing is.
+#[test]
+fn smoke_session_start_reports_doctor_findings_and_is_silent_when_healthy() {
+    let repo = Repo::new();
+    let env = [("MDKB_NO_DAEMON", "1")];
+    assert_ok(
+        &run(&["setup", "hooks", "claude"], &repo.root),
+        "register hooks",
+    );
+
+    let out = run_env(&["hook", "session-start"], &repo.root, &env);
+    assert_ok(&out, "healthy session-start");
+    assert!(
+        !stdout(&out).contains("mdkb doctor"),
+        "healthy: {}",
+        stdout(&out)
+    );
+    assert!(
+        !stdout(&out).contains("recall.sigil_only"),
+        "info findings stay on the CLI: {}",
+        stdout(&out)
+    );
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    std::fs::write(
+        repo.root.join(format!(".mdkb/index.sqlite.corrupt-{now}")),
+        b"",
+    )
+    .unwrap();
+    let out = run_env(&["hook", "session-start"], &repo.root, &env);
+    assert_ok(&out, "session-start with a quarantine");
+    let text = stdout(&out);
+    assert!(text.contains("## mdkb doctor"), "{text}");
+    assert_eq!(
+        text.matches("[warning] index.quarantine").count(),
+        1,
+        "{text}"
+    );
+    assert!(
+        !text.contains("CORRUPT and quarantined"),
+        "the old banner is gone: {text}"
+    );
+}
+
 /// The quarantine banner reports the store the session actually opened. A
 /// namespaced session announcing the DEFAULT store's corruption is worse than
 /// saying nothing: the operator would go looking in the wrong place.
@@ -446,7 +494,7 @@ fn smoke_quarantine_banner_reports_the_active_store_only() {
     );
     assert_ok(&out, "default hook session-start");
     assert!(
-        stdout(&out).contains("CORRUPT"),
+        stdout(&out).contains("index.quarantine"),
         "control: the default store must report its quarantine: {}",
         stdout(&out)
     );
@@ -455,7 +503,7 @@ fn smoke_quarantine_banner_reports_the_active_store_only() {
     let out = run_env(&["hook", "session-start"], &repo.root, &ns_env);
     assert_ok(&out, "namespaced hook session-start");
     assert!(
-        !stdout(&out).contains("CORRUPT"),
+        !stdout(&out).contains("index.quarantine"),
         "a namespaced session must not report the default store's quarantine: {}",
         stdout(&out)
     );
@@ -470,7 +518,7 @@ fn smoke_quarantine_banner_reports_the_active_store_only() {
     let out = run_env(&["hook", "session-start"], &repo.root, &ns_env);
     assert_ok(&out, "namespaced hook session-start with own quarantine");
     assert!(
-        stdout(&out).contains("CORRUPT"),
+        stdout(&out).contains("index.quarantine"),
         "a namespaced session must report its own quarantine: {}",
         stdout(&out)
     );
@@ -929,6 +977,23 @@ fn smoke_stats() {
 #[test]
 fn smoke_stats_json() {
     let repo = Repo::new();
+    // Story 188-a540: the dashboard reads doctor findings from `stats`,
+    // because TUICommander's execCli drops stdout on a non-zero exit and
+    // `mdkb doctor` exits 1 exactly when there is something to show.
+    let out = run(&["--format", "json", "stats"], &repo.root);
+    assert_ok(&out, "stats --format json with doctor findings");
+    let v: serde_json::Value = serde_json::from_str(stdout(&out).trim()).expect("stats json");
+    let ids: Vec<&str> = v["doctor"]
+        .as_array()
+        .expect("doctor findings array")
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"hooks.drift"),
+        "unregistered hooks in a fresh repo: {ids:?}"
+    );
+
     let out = run(&["--format", "json", "stats", "--no-color"], &repo.root);
     assert_ok(&out, "stats --format json");
     let s = stdout(&out);

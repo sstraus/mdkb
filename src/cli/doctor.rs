@@ -88,6 +88,36 @@ pub fn render(findings: &[Finding]) -> String {
     out
 }
 
+/// The most findings SessionStart lists before pointing at `mdkb doctor`.
+pub const SESSION_START_MAX_FINDINGS: usize = 5;
+
+/// The SessionStart block: errors and warnings only, at most
+/// [`SESSION_START_MAX_FINDINGS`] lines, and nothing at all when healthy.
+/// `info` findings describe settings, not problems, and are paid for on every
+/// session — they stay on the CLI.
+pub fn session_block(findings: &[Finding]) -> Option<String> {
+    let problems: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| f.severity != Severity::Info)
+        .collect();
+    if problems.is_empty() {
+        return None;
+    }
+    let mut out = String::from("## mdkb doctor\n\n");
+    for f in problems.iter().take(SESSION_START_MAX_FINDINGS) {
+        out.push_str(&render_line(f));
+        out.push('\n');
+    }
+    if let Some(more) = problems
+        .len()
+        .checked_sub(SESSION_START_MAX_FINDINGS)
+        .filter(|n| *n > 0)
+    {
+        out.push_str(&format!("- … {more} more: run `mdkb doctor`\n"));
+    }
+    Some(out)
+}
+
 /// Whether the findings should fail a script: any error.
 pub fn has_errors(findings: &[Finding]) -> bool {
     findings.iter().any(|f| f.severity == Severity::Error)
@@ -115,6 +145,50 @@ mod tests {
             elapsed < std::time::Duration::from_millis(20),
             "cheap doctor checks took {elapsed:?}"
         );
+    }
+
+    fn warning(id: &'static str) -> Finding {
+        Finding {
+            id,
+            severity: Severity::Warning,
+            message: format!("{id} is off"),
+            fix: None,
+        }
+    }
+
+    #[test]
+    fn a_healthy_or_info_only_store_adds_nothing_to_session_start() {
+        assert_eq!(session_block(&[]), None);
+        let info = Finding {
+            severity: Severity::Info,
+            ..warning("recall.sigil_only")
+        };
+        assert_eq!(
+            session_block(&[info]),
+            None,
+            "info is charged on every session"
+        );
+    }
+
+    #[test]
+    fn session_start_lists_problems_one_line_each() {
+        let block = session_block(&[warning("index.quarantine")]).unwrap();
+        assert_eq!(
+            block,
+            "## mdkb doctor\n\n- [warning] index.quarantine: index.quarantine is off\n"
+        );
+    }
+
+    #[test]
+    fn session_start_caps_the_list_and_points_at_the_command() {
+        let many: Vec<Finding> = ["a", "b", "c", "d", "e", "f", "g"]
+            .into_iter()
+            .map(warning)
+            .collect();
+        let block = session_block(&many).unwrap();
+        let findings = block.lines().filter(|l| l.starts_with("- [")).count();
+        assert_eq!(findings, SESSION_START_MAX_FINDINGS);
+        assert!(block.contains("2 more: run `mdkb doctor`"), "{block}");
     }
 
     #[test]

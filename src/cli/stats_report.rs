@@ -30,6 +30,10 @@ pub struct StatsReport {
     pub quarantine: Vec<crate::store::heal::QuarantineReport>,
     /// What recall offered and what became of it (the recall ledger).
     pub recall: RecallReport,
+    /// The cheap `mdkb doctor` findings. Here as well as in `mdkb doctor`
+    /// because `stats` always exits 0, and a consumer that discards the
+    /// output of a failing command would never see an error finding.
+    pub doctor: Vec<crate::domain::doctor::Finding>,
 }
 
 /// Labelled candidates needed before a ratio is reported. Below it, one
@@ -64,7 +68,11 @@ pub fn build_recall_report(
     counts: Vec<crate::store::recall_ledger::BandCounts>,
     prompts_by_mode: std::collections::BTreeMap<String, u32>,
 ) -> RecallReport {
-    let labelled: u32 = counts.iter().filter(|c| !c.holdout).map(|c| c.labelled).sum();
+    let labelled: u32 = counts
+        .iter()
+        .filter(|c| !c.holdout)
+        .map(|c| c.labelled)
+        .sum();
     let insufficient_data = labelled < RECALL_MIN_LABELLED;
     let band = |counts: crate::store::recall_ledger::BandCounts| {
         let judged = counts.positive + counts.negative;
@@ -264,6 +272,11 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
         hooks: collect_hooks(mdkb_dir, root, collect_mining(ctx)),
         quarantine: crate::store::heal::quarantine_reports(mdkb_dir),
         recall: collect_recall(ctx),
+        doctor: crate::domain::doctor::findings(&crate::cli::doctor::collect(
+            root,
+            Some(ctx),
+            false,
+        )),
     })
 }
 
@@ -1044,7 +1057,13 @@ mod tests {
         let _v: serde_json::Value = serde_json::from_str(&json).expect("parse json");
     }
 
-    fn counts(band: &str, holdout: bool, positive: u32, negative: u32, missed: u32) -> crate::store::recall_ledger::BandCounts {
+    fn counts(
+        band: &str,
+        holdout: bool,
+        positive: u32,
+        negative: u32,
+        missed: u32,
+    ) -> crate::store::recall_ledger::BandCounts {
         crate::store::recall_ledger::BandCounts {
             band: band.into(),
             entry_type: "decision".into(),
@@ -1061,7 +1080,10 @@ mod tests {
     #[test]
     fn recall_precision_is_reported_per_band_once_enough_is_labelled() {
         let report = build_recall_report(
-            vec![counts("0.45-0.50", false, 3, 9, 4), counts("0.65+", false, 18, 2, 0)],
+            vec![
+                counts("0.45-0.50", false, 3, 9, 4),
+                counts("0.65+", false, 18, 2, 0),
+            ],
             Default::default(),
         );
         assert_eq!(report.labelled, 36);
@@ -1071,12 +1093,16 @@ mod tests {
             .iter()
             .map(|b| (b.counts.band.as_str(), b.precision))
             .collect();
-        assert_eq!(precision, vec![("0.45-0.50", Some(0.25)), ("0.65+", Some(0.9))]);
+        assert_eq!(
+            precision,
+            vec![("0.45-0.50", Some(0.25)), ("0.65+", Some(0.9))]
+        );
     }
 
     #[test]
     fn too_few_labels_give_no_ratio_at_all() {
-        let report = build_recall_report(vec![counts("0.65+", false, 20, 5, 0)], Default::default());
+        let report =
+            build_recall_report(vec![counts("0.65+", false, 20, 5, 0)], Default::default());
         assert_eq!(report.labelled, 25);
         assert!(report.insufficient_data);
         assert!(report.bands.iter().all(|b| b.precision.is_none()));
@@ -1087,7 +1113,10 @@ mod tests {
     #[test]
     fn holdout_candidates_stay_out_of_the_headline() {
         let report = build_recall_report(
-            vec![counts("0.65+", false, 30, 10, 0), counts("0.40-0.45", true, 0, 9, 0)],
+            vec![
+                counts("0.65+", false, 30, 10, 0),
+                counts("0.40-0.45", true, 0, 9, 0),
+            ],
             Default::default(),
         );
         assert_eq!(report.labelled, 40, "holdout labels are not counted");
@@ -1140,6 +1169,7 @@ mod tests {
             },
             quarantine: vec![],
             recall: RecallReport::default(),
+            doctor: Vec::new(),
         }
     }
 
