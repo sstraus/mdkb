@@ -334,11 +334,14 @@ fn in_process_stop_waits_for_the_mining_it_started() {
     // The distilled answer lives in a file the stub `cat`s: inlining it would
     // put its double quotes inside a TOML basic string and the whole config
     // would fail to parse. `sleep 1` makes the run long enough that a dropped
-    // task could not have completed it.
+    // task could not have completed it. The trigger targets the observed
+    // failed call (Bash, "cannot find value") because an ErrorFixed episode's
+    // lesson must match the failure it was distilled from
+    // (`validate_against_signal`); a broader pre_tool trigger is rejected.
     let answer = root.join("answer.json");
     std::fs::write(
         &answer,
-        r#"{"is_reusable":true,"trigger":{"kind":"pre_tool","when":"editing generated code","path_glob":"src/generated/**"},"lesson":"Do not edit generated files; edit the generator template.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#,
+        r#"{"is_reusable":true,"trigger":{"kind":"post_tool","when":"a Bash build fails with an unresolved value","tool":"Bash","error_contains":"cannot find value"},"lesson":"When cargo build fails with an unresolved value, check the generated file's fields before editing.","scope":{"repo":"current","languages":["rust"]},"evidence":{"failure":"build error after direct edit","fix":"edited the generator"},"ttl_days":30}"#,
     )
     .expect("write distiller answer");
     let config = root.join(".mdkb/config.toml");
