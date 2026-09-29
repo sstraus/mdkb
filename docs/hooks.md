@@ -90,11 +90,22 @@ setup remains command-based.
 Input: any JSON (ignored).
 
 Output always includes a compact power-feature hint in an initialized
-repository. The payload can contain, in order: an outstanding quarantine or
-projection-drift warning, the latest project-scoped handoff in full, due
+repository. The payload can contain, in order: a `## mdkb doctor` block, the
+latest project-scoped handoff in full, due
 reminders, ranked memory, an unextracted-relation notice, and the one-line
 feature map. The map is present even when the memory index is empty; disabled
 hooks and uninitialized repositories remain silent.
+
+**Doctor block.** SessionStart runs the cheap `mdkb doctor` checks against the
+store the session opened: hook registrations, a `config.toml` that does not
+load, index quarantines, memory projection drift, shadow recall that records
+nothing, and prior mining without a distiller. Each error or warning is one
+line with its fix, for example
+``- [error] hooks.drift: … → fix: `mdkb setup hooks claude` ``. The block lists
+at most 5 findings and then points at `mdkb doctor`. It is absent when nothing
+is wrong. `info` findings, such as "recall runs only on `*` prompts", appear
+only in `mdkb doctor`. The live distiller probe runs only with
+`mdkb doctor --full`.
 
 **Unextracted relations.** Under `graph.relations = "semi"` only, and only when
 the detector found frontmatter keys that point at indexed documents and are not

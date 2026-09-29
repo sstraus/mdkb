@@ -49,11 +49,24 @@ pub struct LedgerCandidate {
 /// A transcript event that can label a candidate. `at` is Unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecallEvent {
-    Fetched { id: String, at: i64 },
-    Verdict { id: String, confirmed: bool, at: i64 },
+    Fetched {
+        id: String,
+        at: i64,
+    },
+    Verdict {
+        id: String,
+        confirmed: bool,
+        at: i64,
+    },
     /// The text of a memory search result.
-    Found { text: String, at: i64 },
-    Correction { text: String, at: i64 },
+    Found {
+        text: String,
+        at: i64,
+    },
+    Correction {
+        text: String,
+        at: i64,
+    },
 }
 
 /// The events in a transcript window.
@@ -82,9 +95,15 @@ pub fn parse_events(jsonl: &str) -> Vec<RecallEvent> {
                         continue;
                     };
                     match memory_call(&name, &input) {
-                        Some(Call::Get(entry)) => events.push(RecallEvent::Fetched { id: entry, at }),
+                        Some(Call::Get(entry)) => {
+                            events.push(RecallEvent::Fetched { id: entry, at });
+                        }
                         Some(Call::Confirm(entry, confirmed)) => {
-                            events.push(RecallEvent::Verdict { id: entry, confirmed, at });
+                            events.push(RecallEvent::Verdict {
+                                id: entry,
+                                confirmed,
+                                at,
+                            });
                         }
                         Some(Call::Search) => {
                             searches.insert(id);
@@ -97,9 +116,15 @@ pub fn parse_events(jsonl: &str) -> Vec<RecallEvent> {
             ("user", Content::Blocks(blocks)) => {
                 for block in blocks {
                     match block {
-                        Block::ToolResult { tool_use_id, content } => {
+                        Block::ToolResult {
+                            tool_use_id,
+                            content,
+                        } => {
                             if searches.contains(&tool_use_id) {
-                                events.push(RecallEvent::Found { text: content.to_text(), at });
+                                events.push(RecallEvent::Found {
+                                    text: content.to_text(),
+                                    at,
+                                });
                             }
                         }
                         Block::Text { text } => push_correction(&mut events, text, at),
@@ -134,7 +159,10 @@ fn memory_call(name: &str, input: &ToolInput) -> Option<Call> {
             "get" => input.id.clone().map(Call::Get),
             "memory_confirm" => {
                 let id = input.id.clone()?;
-                Some(Call::Confirm(id, input.outcome.as_deref() == Some("confirmed")))
+                Some(Call::Confirm(
+                    id,
+                    input.outcome.as_deref() == Some("confirmed"),
+                ))
             }
             "search" => Some(Call::Search),
             _ => None,
@@ -285,12 +313,26 @@ pub fn label(
         match event {
             RecallEvent::Fetched { id, at } => {
                 if let Some(c) = latest(id, *at) {
-                    credit(c, if c.injected { RecallOutcome::Used } else { RecallOutcome::Missed });
+                    credit(
+                        c,
+                        if c.injected {
+                            RecallOutcome::Used
+                        } else {
+                            RecallOutcome::Missed
+                        },
+                    );
                 }
             }
             RecallEvent::Verdict { id, confirmed, at } => {
                 if let Some(c) = latest(id, *at) {
-                    credit(c, if *confirmed { RecallOutcome::Confirmed } else { RecallOutcome::Refuted });
+                    credit(
+                        c,
+                        if *confirmed {
+                            RecallOutcome::Confirmed
+                        } else {
+                            RecallOutcome::Refuted
+                        },
+                    );
                 }
             }
             RecallEvent::Found { text, at } => {
@@ -312,7 +354,10 @@ pub fn label(
                     continue;
                 };
                 let said = words(text);
-                for c in candidates.iter().filter(|c| c.injected && c.prompt_at == prompt_at) {
+                for c in candidates
+                    .iter()
+                    .filter(|c| c.injected && c.prompt_at == prompt_at)
+                {
                     let shared = words(&c.title).iter().filter(|w| said.contains(*w)).count();
                     if shared >= 2 {
                         credit(c, RecallOutcome::Corrected);
@@ -370,7 +415,10 @@ mod tests {
     #[test]
     fn fetching_an_injected_entry_after_the_prompt_labels_it_used() {
         let c = [cand(1, 100, "wal", true)];
-        let e = [RecallEvent::Fetched { id: "wal".into(), at: 150 }];
+        let e = [RecallEvent::Fetched {
+            id: "wal".into(),
+            at: 150,
+        }];
         assert_eq!(outcomes(&c, &e), vec![(1, "wal".into(), "used")]);
     }
 
@@ -379,7 +427,10 @@ mod tests {
     #[test]
     fn a_fetch_before_the_prompt_labels_nothing() {
         let c = [cand(1, 100, "wal", true)];
-        let e = [RecallEvent::Fetched { id: "wal".into(), at: 50 }];
+        let e = [RecallEvent::Fetched {
+            id: "wal".into(),
+            at: 50,
+        }];
         assert!(outcomes(&c, &e).is_empty());
     }
 
@@ -398,7 +449,10 @@ mod tests {
     #[test]
     fn a_search_hit_matches_whole_ids_only() {
         let c = [cand(1, 100, "wal", false)];
-        let e = [RecallEvent::Found { text: "[wal-archive] Old".into(), at: 200 }];
+        let e = [RecallEvent::Found {
+            text: "[wal-archive] Old".into(),
+            at: 200,
+        }];
         assert!(outcomes(&c, &e).is_empty());
     }
 
@@ -406,8 +460,16 @@ mod tests {
     fn memory_confirm_verdicts_label_confirmed_and_refuted() {
         let c = [cand(1, 100, "yes", true), cand(1, 100, "no", true)];
         let e = [
-            RecallEvent::Verdict { id: "yes".into(), confirmed: true, at: 150 },
-            RecallEvent::Verdict { id: "no".into(), confirmed: false, at: 150 },
+            RecallEvent::Verdict {
+                id: "yes".into(),
+                confirmed: true,
+                at: 150,
+            },
+            RecallEvent::Verdict {
+                id: "no".into(),
+                confirmed: false,
+                at: 150,
+            },
         ];
         assert_eq!(
             outcomes(&c, &e),
@@ -430,7 +492,10 @@ mod tests {
     #[test]
     fn a_correction_sharing_one_word_labels_nothing() {
         let c = [cand(1, 100, "wal", true)];
-        let e = [RecallEvent::Correction { text: "no, use the other checkpoint".into(), at: 150 }];
+        let e = [RecallEvent::Correction {
+            text: "no, use the other checkpoint".into(),
+            at: 150,
+        }];
         assert!(outcomes(&c, &e).is_empty());
     }
 
@@ -443,7 +508,10 @@ mod tests {
     #[test]
     fn two_injected_entries_credit_only_the_one_fetched() {
         let c = [cand(1, 100, "a", true), cand(1, 100, "b", true)];
-        let e = [RecallEvent::Fetched { id: "b".into(), at: 150 }];
+        let e = [RecallEvent::Fetched {
+            id: "b".into(),
+            at: 150,
+        }];
         assert_eq!(outcomes(&c, &e), vec![(1, "b".into(), "used")]);
     }
 
@@ -452,7 +520,10 @@ mod tests {
     #[test]
     fn a_fetch_credits_the_latest_prompt_before_it() {
         let c = [cand(1, 100, "wal", true), cand(2, 300, "wal", true)];
-        let e = [RecallEvent::Fetched { id: "wal".into(), at: 200 }];
+        let e = [RecallEvent::Fetched {
+            id: "wal".into(),
+            at: 200,
+        }];
         assert_eq!(outcomes(&c, &e), vec![(1, "wal".into(), "used")]);
     }
 
@@ -461,8 +532,15 @@ mod tests {
     fn a_verdict_outranks_a_fetch() {
         let c = [cand(1, 100, "wal", true)];
         let e = [
-            RecallEvent::Fetched { id: "wal".into(), at: 150 },
-            RecallEvent::Verdict { id: "wal".into(), confirmed: false, at: 160 },
+            RecallEvent::Fetched {
+                id: "wal".into(),
+                at: 150,
+            },
+            RecallEvent::Verdict {
+                id: "wal".into(),
+                confirmed: false,
+                at: 160,
+            },
         ];
         assert_eq!(outcomes(&c, &e), vec![(1, "wal".into(), "refuted")]);
     }
@@ -470,7 +548,10 @@ mod tests {
     #[test]
     fn a_fetched_entry_that_was_not_injected_is_missed() {
         let c = [cand(1, 100, "wal", false)];
-        let e = [RecallEvent::Fetched { id: "wal".into(), at: 150 }];
+        let e = [RecallEvent::Fetched {
+            id: "wal".into(),
+            at: 150,
+        }];
         assert_eq!(outcomes(&c, &e), vec![(1, "wal".into(), "missed")]);
     }
 
@@ -489,11 +570,27 @@ mod tests {
         assert_eq!(
             parse_events(&jsonl),
             vec![
-                RecallEvent::Fetched { id: "wal".into(), at: t0 },
-                RecallEvent::Verdict { id: "other".into(), confirmed: false, at: t0 + 1 },
-                RecallEvent::Found { text: "[wal] SQLite WAL".into(), at: t0 + 3 },
-                RecallEvent::Correction { text: "no, that note is wrong".into(), at: t0 + 4 },
-                RecallEvent::Fetched { id: "wal-two".into(), at: t0 + 5 },
+                RecallEvent::Fetched {
+                    id: "wal".into(),
+                    at: t0
+                },
+                RecallEvent::Verdict {
+                    id: "other".into(),
+                    confirmed: false,
+                    at: t0 + 1
+                },
+                RecallEvent::Found {
+                    text: "[wal] SQLite WAL".into(),
+                    at: t0 + 3
+                },
+                RecallEvent::Correction {
+                    text: "no, that note is wrong".into(),
+                    at: t0 + 4
+                },
+                RecallEvent::Fetched {
+                    id: "wal-two".into(),
+                    at: t0 + 5
+                },
             ]
         );
     }

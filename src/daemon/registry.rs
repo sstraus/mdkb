@@ -1505,7 +1505,10 @@ mod tests {
         let kept = registry.get_or_open(&root).unwrap();
         assert!(Arc::ptr_eq(&good, &kept));
         assert!(kept.config.hooks.user_prompt_submit_shadow);
-        assert!(kept.config_error().is_some(), "the parse error is kept for doctor");
+        assert!(
+            kept.config_error().is_some(),
+            "the parse error is kept for doctor"
+        );
 
         // The failed parse did not advance the identity: fixing the file is
         // picked up on the next access, and the error clears with it.
@@ -1520,7 +1523,11 @@ mod tests {
     fn an_unchanged_config_reuses_the_handle() {
         let tmp = TempDir::new().unwrap();
         let root = make_repo(&tmp);
-        std::fs::write(root.join(".mdkb/config.toml"), "[hooks]\nrecall_limit = 3\n").unwrap();
+        std::fs::write(
+            root.join(".mdkb/config.toml"),
+            "[hooks]\nrecall_limit = 3\n",
+        )
+        .unwrap();
         let registry = RepoRegistry::new(allow_temp_config());
         let a = registry.get_or_open(&root).unwrap();
         let b = registry.get_or_open(&root).unwrap();

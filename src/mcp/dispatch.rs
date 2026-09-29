@@ -3868,8 +3868,8 @@ fn recall_identifier_tokens(prompt: &str) -> Vec<String> {
     let mut out = crate::cli::hook_logic::path_like_tokens(prompt);
     for raw in prompt.split_whitespace() {
         let token = raw.trim_matches(|c: char| !c.is_alphanumeric() && c != '_');
-        let camel = token.chars().skip(1).any(char::is_uppercase)
-            && token.chars().any(char::is_lowercase);
+        let camel =
+            token.chars().skip(1).any(char::is_uppercase) && token.chars().any(char::is_lowercase);
         let specific =
             token.len() >= 3 && (token.contains(['_', '/']) || token.contains("::") || camel);
         if specific && !out.iter().any(|seen| seen == token) {
@@ -4264,68 +4264,6 @@ fn fit_warmup_lines(lines: &[String], budget: usize) -> Vec<String> {
     out
 }
 
-/// A loud, non-silent SessionStart banner for any outstanding autoheal
-/// quarantine — one line per corrupt file still on disk. `None` when the store
-/// is healthy (the common case), so it costs nothing on a clean warmup.
-///
-/// `doc_count` is the CURRENT `documents` row count, checked so the banner
-/// doesn't keep telling the operator to run `mdkb update` after the daemon's
-/// own post-heal `full_rebuild_from_heal` has already repopulated it —
-/// otherwise the instruction reads as stale/wrong the moment recovery
-/// actually succeeds automatically.
-fn format_quarantine_banner(mdkb_dir: &std::path::Path, doc_count: i64) -> Option<String> {
-    let reports = crate::store::heal::quarantine_reports(mdkb_dir);
-    if reports.is_empty() {
-        return None;
-    }
-    let docs_status = if doc_count > 0 {
-        format!(
-            "Docs already re-indexed automatically ({doc_count} currently indexed) — no action needed."
-        )
-    } else {
-        "Docs not yet re-indexed — run `mdkb update`.".to_string()
-    };
-    let mut out = String::new();
-    for r in reports {
-        let date = chrono::DateTime::from_timestamp(r.quarantined_at, 0)
-            .map(|d| d.format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "unknown date".to_string());
-        out.push_str(&format!(
-            "⚠️ mdkb index was CORRUPT and quarantined ({date}): salvaged {} memory entries, {} edges. {docs_status} The copy `.mdkb/{}` is deleted automatically {} days after quarantine, and this warning goes with it.\n",
-            r.memory_entries_salvaged,
-            r.memory_edges_salvaged,
-            r.corrupt_file,
-            crate::store::heal::QUARANTINE_RETENTION_DAYS
-        ));
-    }
-    Some(out)
-}
-
-/// A one-line warning when the entry projection and the database disagree on
-/// how many entries exist.
-///
-/// Story 015-2dc2: 387 files drifted from the database for weeks, 265 of them
-/// carrying unique knowledge, and were found by accident. The only place the
-/// number had ever appeared was the output of an `mdkb update` nobody re-read.
-/// Session start is where an agent actually looks.
-///
-/// Deliberately a smoke signal, not a diagnosis: it counts, it does not parse.
-/// Classifying each file (unreadable vs importable vs orphaned) means reading
-/// all of them, which belongs in `mdkb stats` — a command someone chose to run
-/// — not on a hook that fires every session against thousands of files. Equal
-/// counts can still hide offsetting drift, which is exactly why this points at
-/// the command that checks properly instead of claiming the store is healthy.
-fn format_projection_drift_banner(ctx: &crate::core::Context) -> crate::Result<Option<String>> {
-    let (files, rows) = crate::core::memory_sync::projection_file_and_row_counts(ctx)?;
-    if files == rows {
-        return Ok(None);
-    }
-    Ok(Some(format!(
-        "⚠️ mdkb memory projection out of sync: {files} entry file(s) on disk vs {rows} \
-         active database row(s). Run `mdkb stats` for the breakdown, then `mdkb memory sync`.\n"
-    )))
-}
-
 /// The wall-clock split of one hook run, phase by phase, in the order they ran.
 ///
 /// Sequential by construction: [`mark`](PhaseTimings::mark) closes the segment
@@ -4492,52 +4430,35 @@ async fn hook_session_start_inner(
     let startup_data =
         crate::core::run_guarded_read(&mut ctx_guard, "hook session warmup", |ctx| {
             let (due_lines, entries) = get_warmup_entries(&ctx.conn, limit)?;
-            let doc_count = crate::store::documents::count_documents(&ctx.conn)?;
             let collection_names: Vec<String> = collections::list_collections(&ctx.conn)?
                 .into_iter()
                 .map(|c| c.name)
                 .collect();
-            let drift_banner = format_projection_drift_banner(ctx)?;
-            // The store this session opened — in a namespace, not `.mdkb/`.
-            // The quarantine banner must describe it, not the default store.
-            let store_dir = ctx
-                .db_path
-                .parent()
-                .map_or_else(|| handle.root.join(".mdkb"), std::path::Path::to_path_buf);
-            Ok((
-                due_lines,
-                entries,
-                doc_count,
-                collection_names,
-                drift_banner,
-                store_dir,
-            ))
+            // The cheap doctor checks, read against the store this session
+            // opened — in a namespace, not `.mdkb/` — so a quarantine or a
+            // drift is reported for the store the model will actually use.
+            let doctor = crate::cli::doctor::session_block(&crate::domain::doctor::findings(
+                &crate::cli::doctor::collect(&handle.root, Some(ctx), false),
+            ));
+            Ok((due_lines, entries, collection_names, doctor))
         });
-    let (due_lines, entries, doc_count, collection_names, drift_banner, store_dir) =
-        match startup_data {
-            Some(Ok(data)) => data,
-            Some(Err(error)) => {
-                tracing::warn!("hook.session_start warmup failed: {error}");
-                return SessionStartOutcome::Failed(format!("warmup read failed: {error}"));
-            }
-            None => {
-                tracing::warn!(
-                    "hook.session_start: the context was released before the warmup ran"
-                );
-                return SessionStartOutcome::Failed("context closed before warmup".to_string());
-            }
-        };
+    let (due_lines, entries, collection_names, doctor_block) = match startup_data {
+        Some(Ok(data)) => data,
+        Some(Err(error)) => {
+            tracing::warn!("hook.session_start warmup failed: {error}");
+            return SessionStartOutcome::Failed(format!("warmup read failed: {error}"));
+        }
+        None => {
+            tracing::warn!("hook.session_start: the context was released before the warmup ran");
+            return SessionStartOutcome::Failed("context closed before warmup".to_string());
+        }
+    };
     drop(ctx_guard);
-    // Ranked warmup pool, document count, collection list and the projection
-    // drift count — four queries under one lock.
+    // Ranked warmup pool, collection list and the cheap doctor checks under
+    // one lock.
     phases.mark("warmup");
 
     let scope = project_scope_token(&handle.root, session_cwd, &collection_names);
-
-    // Data-loss banner: surface any outstanding autoheal quarantine loudly,
-    // computed before the empty-warmup early return so a freshly-rebuilt (empty)
-    // store still gets the warning instead of silence.
-    let quarantine_banner = format_quarantine_banner(&store_dir, doc_count);
 
     // mdkb owns handoff injection: pull the newest handoff's full body out for a
     // dedicated block and drop ALL handoffs from the ranked compact list — a
@@ -4672,12 +4593,8 @@ async fn hook_session_start_inner(
     // The newest handoff body is injected in full — it IS the session-restoration
     // anchor — exempt from the compact-list token budget.
     let mut body = String::new();
-    if let Some(banner) = &quarantine_banner {
-        body.push_str(banner);
-        body.push('\n');
-    }
-    if let Some(banner) = &drift_banner {
-        body.push_str(banner);
+    if let Some(block) = &doctor_block {
+        body.push_str(block);
         body.push('\n');
     }
     if let Some(hb) = &handoff_body {
@@ -4996,7 +4913,14 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     };
 
     if fts_query.is_none() && !wants_cg && path_tokens.is_empty() {
-        record_recall(handle, session, mode, search_cfg.min_recall_cosine, Vec::new()).await;
+        record_recall(
+            handle,
+            session,
+            mode,
+            search_cfg.min_recall_cosine,
+            Vec::new(),
+        )
+        .await;
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
             payload_parts,
@@ -5182,8 +5106,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             .collect();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         (session, prompt).hash(&mut hasher);
-        if let Some(pick) = holdout_pick(cfg.recall_holdout_rate, hasher.finish(), eligible.len())
-        {
+        if let Some(pick) = holdout_pick(cfg.recall_holdout_rate, hasher.finish(), eligible.len()) {
             let held = &mut candidates[eligible[pick]];
             held.injected = true;
             held.holdout = true;
@@ -5192,7 +5115,14 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             }
         }
     }
-    record_recall(handle, session, mode, search_cfg.min_recall_cosine, candidates).await;
+    record_recall(
+        handle,
+        session,
+        mode,
+        search_cfg.min_recall_cosine,
+        candidates,
+    )
+    .await;
 
     // Post-recall enrichment in a single re-lock (both read-only, capped):
     //  · 1-hop memory-edge expansion — surface active neighbors of the top seeds.
@@ -5692,7 +5622,9 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
         crate::store::recall_ledger::set_outcomes(&ctx.conn, &labels, now)
     }) {
         Some(Ok(labelled)) if labelled > 0 => {
-            tracing::info!("recall settling: labelled {labelled} candidate(s) in session {session}");
+            tracing::info!(
+                "recall settling: labelled {labelled} candidate(s) in session {session}"
+            );
         }
         Some(Err(error)) => tracing::debug!("recall settling failed: {error}"),
         _ => {}
@@ -6988,48 +6920,6 @@ mod tests {
 
         entry.tags = vec![];
         assert!(!entry_in_scope(&entry, "lattice"));
-    }
-
-    fn write_quarantine_report(dir: &std::path::Path) {
-        let corrupt = dir.join("index.sqlite.corrupt-1700000000");
-        std::fs::write(&corrupt, b"corrupt").unwrap();
-        crate::store::heal::write_report(
-            &corrupt,
-            crate::store::heal::Salvage {
-                entries: 673,
-                edges: 12,
-                ..Default::default()
-            },
-        );
-    }
-
-    #[test]
-    fn quarantine_banner_tells_operator_to_update_when_docs_still_empty() {
-        let tmp = TempDir::new().unwrap();
-        write_quarantine_report(tmp.path());
-
-        let banner = format_quarantine_banner(tmp.path(), 0).unwrap();
-        assert!(banner.contains("CORRUPT"));
-        assert!(banner.contains("run `mdkb update`"));
-    }
-
-    #[test]
-    fn quarantine_banner_omits_update_instruction_once_docs_are_back() {
-        let tmp = TempDir::new().unwrap();
-        write_quarantine_report(tmp.path());
-
-        // A post-heal auto-rebuild (or a prior manual `mdkb update`) already
-        // repopulated the documents table — the banner must not re-ask for it.
-        let banner = format_quarantine_banner(tmp.path(), 2405).unwrap();
-        assert!(banner.contains("already re-indexed automatically"));
-        assert!(banner.contains("2405"));
-        assert!(!banner.contains("run `mdkb update`"));
-    }
-
-    #[test]
-    fn quarantine_banner_is_none_on_healthy_store() {
-        let tmp = TempDir::new().unwrap();
-        assert!(format_quarantine_banner(tmp.path(), 0).is_none());
     }
 
     /// The one `RepoHandle::from_shared` in these tests.
@@ -8402,7 +8292,10 @@ mod tests {
         seed_memory_entry(&handle, "unasked").await;
         hook_user_prompt_submit_impl(&handle, "* ?").await;
         ensure_handle_context(&handle).await.unwrap();
-        assert_eq!(ledger_rows(&handle).await, vec![("sigil".into(), None, None)]);
+        assert_eq!(
+            ledger_rows(&handle).await,
+            vec![("sigil".into(), None, None)]
+        );
     }
 
     /// An entry the session already saw is offered again but not shown. It
@@ -8473,7 +8366,11 @@ mod tests {
     /// at 0.45 is recorded, with its score, as offered and not injected.
     #[test]
     fn candidates_below_the_injection_floor_are_recorded_uninjected() {
-        let observed = [scored("high", Some(0.72)), scored("low", Some(0.45)), scored("fts", None)];
+        let observed = [
+            scored("high", Some(0.72)),
+            scored("low", Some(0.45)),
+            scored("fts", None),
+        ];
         let injected = vec![observed[0].entry.clone()];
         let tokens = recall_identifier_tokens("why does recall_limit change src/store/hybrid.rs");
         let rows = ledger_candidates(&observed, &injected, &tokens, observed[0].entry.created_at);
@@ -8491,7 +8388,11 @@ mod tests {
             .collect();
         assert_eq!(
             summary,
-            vec![("high", Some(72), true, 2), ("low", Some(45), false, 2), ("fts", None, false, 2)]
+            vec![
+                ("high", Some(72), true, 2),
+                ("low", Some(45), false, 2),
+                ("fts", None, false, 2)
+            ]
         );
     }
 
@@ -8557,7 +8458,11 @@ mod tests {
             let pick = holdout_pick(1.0, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), 3);
             assert!(matches!(pick, Some(0..=2)), "seed {seed}: {pick:?}");
         }
-        assert_eq!(holdout_pick(1.0, 7, 0), None, "nothing eligible, nothing picked");
+        assert_eq!(
+            holdout_pick(1.0, 7, 0),
+            None,
+            "nothing eligible, nothing picked"
+        );
     }
 
     /// A holdout is shown to the model and tagged, so its outcome is
@@ -8594,13 +8499,18 @@ mod tests {
             .unwrap();
         let holdouts = |mode: &str| rows.iter().filter(|r| r.0 == mode && r.2).count();
         assert_eq!(holdouts("automatic"), 1, "{rows:?}");
-        assert!(rows.iter().filter(|r| r.2).all(|r| r.1), "a holdout is injected");
+        assert!(
+            rows.iter().filter(|r| r.2).all(|r| r.1),
+            "a holdout is injected"
+        );
         assert_eq!(holdouts("sigil"), 0, "{rows:?}");
     }
 
     /// The observation query must run below the injection floor, or the
     /// 0.40–0.50 band the ledger exists to measure is never fetched.
     #[test]
+    // The floors are constants copied through `min`, not computed.
+    #[allow(clippy::float_cmp)]
     fn the_observation_query_runs_at_the_candidate_floor() {
         let at = |floor: f32| {
             let recall = crate::config::SearchMemoryConfig {
@@ -8612,7 +8522,6 @@ mod tests {
         assert_eq!(at(0.50), RECALL_CANDIDATE_FLOOR, "automatic and shadow");
         assert_eq!(at(0.40), 0.40, "sigil");
         assert_eq!(at(0.0), 0.0, "a disabled floor stays disabled");
-        assert!(RECALL_CANDIDATE_FLOOR <= crate::config::MIN_RECALL_COSINE_DEFAULT);
     }
 
     /// Entries past `recall_limit` were offered by the store and cut by the

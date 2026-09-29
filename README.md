@@ -262,7 +262,10 @@ later real injection does and corrupt the counters above.
 SessionStart keeps discovery compact and operational:
 
 - restores the latest project-scoped handoff;
-- surfaces due reminders, ranked memory, quarantine, and projection drift;
+- surfaces due reminders and ranked memory;
+- lists what `mdkb doctor` finds broken (hooks, config, quarantine,
+  projection drift, silent shadow recall), one line per problem with its
+  fix, and nothing when the store is healthy;
 - emits `* query = recall` and the executable `mdkb cheatsheet` command even
   when the memory index is empty.
 

@@ -387,7 +387,11 @@ fn render_recall(out: &mut String, r: &RecallReport) {
         if bands.is_empty() {
             return;
         }
-        let _ = write!(body, "\n\n  {title:<10} {:<8}  Offer  Inj  Lab   +    −  Miss  Prec", "Type");
+        let _ = write!(
+            body,
+            "\n\n  {title:<10} {:<8}  Offer  Inj  Lab   +    −  Miss  Prec",
+            "Type"
+        );
         for b in bands {
             let c = &b.counts;
             let precision = b
