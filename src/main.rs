@@ -1803,9 +1803,6 @@ root=\"*\"                                                # every known repo (`m
             },
             SetupCommand::Check => {
                 use mdkb::cli::setup::DistillerCheck;
-                // Both halves are reported before exiting, so one failure never
-                // hides the other.
-                let mut failed = false;
 
                 let hooks = mdkb::cli::setup::check_hooks(&cwd)?;
                 println!("Claude hooks: user {}", hooks.user_path.display());
@@ -1825,28 +1822,38 @@ root=\"*\"                                                # every known repo (`m
                             hooks.drift.duplicated.join(", ")
                         );
                     }
-                    failed = true;
                 }
 
-                match mdkb::cli::setup::check_distiller(&cwd) {
+                let distiller_failure = match mdkb::cli::setup::check_distiller(&cwd) {
                     DistillerCheck::NotConfigured(reason) => {
                         println!("Prior distiller: not configured ({reason})");
+                        None
                     }
                     DistillerCheck::Pass { program, lesson } => {
                         println!("Prior distiller: OK ({program})");
                         println!("  distilled: {lesson}");
+                        None
                     }
                     DistillerCheck::Fail { program, detail } => {
                         eprintln!("Prior distiller: FAILED ({program})");
                         eprintln!("  {detail}");
-                        failed = true;
+                        Some(format!("{program}: {detail}"))
                     }
-                }
+                };
 
-                // Non-zero exit: this command exists to be run from a script
-                // or a setup checklist, and a check that reports failure on
-                // stdout while exiting 0 is a check nobody notices.
-                if failed {
+                // The doctor registry is the one place that decides what counts
+                // as an error; this command reuses that judgment instead of a
+                // second, parallel notion of "failed" so the two never drift
+                // apart. Non-zero exit: this command exists to be run from a
+                // script or a setup checklist, and a check that reports failure
+                // on stdout while exiting 0 is a check nobody notices.
+                let facts = mdkb::domain::doctor::Facts {
+                    hooks_missing: hooks.drift.missing,
+                    hooks_duplicated: hooks.drift.duplicated,
+                    distiller_failure,
+                    ..mdkb::domain::doctor::Facts::default()
+                };
+                if mdkb::cli::doctor::has_errors(&mdkb::domain::doctor::findings(&facts)) {
                     std::process::exit(1);
                 }
             }
