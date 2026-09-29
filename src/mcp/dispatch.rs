@@ -3922,6 +3922,18 @@ fn ledger_candidates(
     rows
 }
 
+/// Which eligible candidate, if any, a prompt injects as a holdout.
+///
+/// `seed` comes from the session and the prompt, so a replayed prompt makes
+/// the same choice and a test can pin it.
+fn holdout_pick(rate: f32, seed: u64, eligible: usize) -> Option<usize> {
+    if eligible == 0 || rate <= 0.0 {
+        return None;
+    }
+    let roll = (seed % 1_000_000) as f32 / 1_000_000.0;
+    (roll < rate).then(|| (seed / 1_000_000) as usize % eligible)
+}
+
 /// Recall records every candidate at or above this cosine, injected or not.
 /// It is the sigil floor's default, and so the lowest floor any recall mode
 /// ships with: below it there is nothing a floor change could turn into an
@@ -5153,12 +5165,29 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             dctx.retain_new_hook_memories(key, &mut results);
         }
     }
-    let candidates = ledger_candidates(
+    let mut candidates = ledger_candidates(
         &observed,
         &results,
         &recall_identifier_tokens(prompt),
         chrono::Utc::now().timestamp(),
     );
+    if mode == RecallMode::Automatic && cfg.recall_holdout_rate > 0.0 {
+        use std::hash::{Hash, Hasher};
+        let eligible: Vec<usize> = (0..candidates.len())
+            .filter(|&i| !candidates[i].injected)
+            .collect();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (session, prompt).hash(&mut hasher);
+        if let Some(pick) = holdout_pick(cfg.recall_holdout_rate, hasher.finish(), eligible.len())
+        {
+            let held = &mut candidates[eligible[pick]];
+            held.injected = true;
+            held.holdout = true;
+            if let Some(entry) = observed.iter().find(|e| e.id == held.entry_id) {
+                results.push(entry.entry.clone());
+            }
+        }
+    }
     record_recall(handle, session, mode, search_cfg.min_recall_cosine, candidates).await;
 
     // Post-recall enrichment in a single re-lock (both read-only, capped):
@@ -8508,6 +8537,61 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.as_deref(), Some("used"));
+    }
+
+    #[test]
+    fn a_zero_holdout_rate_never_injects() {
+        let picks = (0..1000u64)
+            .filter(|seed| holdout_pick(0.0, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), 5).is_some())
+            .count();
+        assert_eq!(picks, 0);
+    }
+
+    #[test]
+    fn a_full_holdout_rate_picks_one_eligible_candidate() {
+        for seed in 0..1000u64 {
+            let pick = holdout_pick(1.0, seed.wrapping_mul(0x9E37_79B9_7F4A_7C15), 3);
+            assert!(matches!(pick, Some(0..=2)), "seed {seed}: {pick:?}");
+        }
+        assert_eq!(holdout_pick(1.0, 7, 0), None, "nothing eligible, nothing picked");
+    }
+
+    /// A holdout is shown to the model and tagged, so its outcome is
+    /// analysed apart; a `*` prompt never gets one.
+    #[tokio::test]
+    async fn automatic_recall_injects_one_tagged_holdout_and_sigil_none() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_limit = 1;
+            config.hooks.recall_holdout_rate = 1.0;
+        });
+        seed_memory_entry(&handle, "hold-a").await;
+        seed_memory_entry(&handle, "hold-b").await;
+        const PROMPT: &str = "what do we know about the recall_gate_fixture topic content";
+
+        let out = hook_user_prompt_submit_impl(&handle, PROMPT).await;
+        let body = additional_context(&out);
+        assert!(body.contains("hold-a") && body.contains("hold-b"), "{body}");
+        hook_user_prompt_submit_impl(&handle, &format!("* {PROMPT}")).await;
+
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let mut stmt = conn
+            .prepare(
+                "SELECT p.mode, c.injected, c.holdout FROM recall_candidates c \
+                 JOIN recall_prompts p ON p.id = c.prompt_id ORDER BY p.id, c.rank",
+            )
+            .unwrap();
+        let rows: Vec<(String, bool, bool)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let holdouts = |mode: &str| rows.iter().filter(|r| r.0 == mode && r.2).count();
+        assert_eq!(holdouts("automatic"), 1, "{rows:?}");
+        assert!(rows.iter().filter(|r| r.2).all(|r| r.1), "a holdout is injected");
+        assert_eq!(holdouts("sigil"), 0, "{rows:?}");
     }
 
     /// The observation query must run below the injection floor, or the

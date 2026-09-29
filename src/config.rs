@@ -778,6 +778,18 @@ pub struct HooksConfig {
     /// search for an answer that is thrown away. Turn it on for a week when you
     /// want the data.
     pub user_prompt_submit_shadow: bool,
+
+    /// Fraction of automatic-recall prompts that also inject one candidate
+    /// recall did not select, tagged `holdout` in the recall ledger.
+    ///
+    /// The ledger can only see a false negative when the model reaches the
+    /// missing entry some other way. A holdout shows one on purpose, so its
+    /// use can be observed at all. It is noise in a real session, which is
+    /// why it defaults to `0.0`, applies only to automatic recall (never to a
+    /// `*` prompt, which asked for its own answer, and never to shadow, which
+    /// shows nothing), injects at most one entry per prompt, and is reported
+    /// apart from the headline precision.
+    pub recall_holdout_rate: f32,
 }
 
 impl Default for HooksConfig {
@@ -799,6 +811,7 @@ impl Default for HooksConfig {
             user_prompt_submit_require_sigil: true,
             recall_auto_min_cosine: RECALL_AUTO_MIN_COSINE_DEFAULT,
             user_prompt_submit_shadow: false,
+            recall_holdout_rate: 0.0,
         }
     }
 }

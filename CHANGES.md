@@ -41,6 +41,12 @@
   Each event is credited to the latest prompt before it. A candidate with no
   signal stays unlabelled; it is never counted as a negative.
 
+- **`hooks.recall_holdout_rate` (default `0.0`).** It injects, on that
+  fraction of automatic-recall prompts, one extra candidate that recall did
+  not select, and tags it `holdout` in the recall ledger. A false negative
+  can then be observed as used rather than only as missed. It never applies
+  to `*` prompts or to shadow mode.
+
 ### Changed
 
 - **Working priors stay fresh through use.** Injection scoring now considers
