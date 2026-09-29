@@ -52,7 +52,13 @@ pub fn record_prompt(
     tx.execute(
         "INSERT INTO recall_prompts (session, mode, floor, candidate_floor, created_at) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![prompt.session, prompt.mode, prompt.floor, prompt.candidate_floor, now],
+        params![
+            prompt.session,
+            prompt.mode,
+            prompt.floor,
+            prompt.candidate_floor,
+            now
+        ],
     )?;
     let prompt_id = tx.last_insert_rowid();
     {
@@ -171,7 +177,14 @@ pub fn band_counts(conn: &Connection) -> Result<Vec<BandCounts>> {
          FROM c GROUP BY band, entry_type, holdout ORDER BY band, entry_type, holdout",
     )?;
     const BANDS: [&str; 8] = [
-        "<0.40", "0.40-0.45", "0.45-0.50", "0.50-0.55", "0.55-0.60", "0.60-0.65", "0.65+", "fts",
+        "<0.40",
+        "0.40-0.45",
+        "0.45-0.50",
+        "0.50-0.55",
+        "0.55-0.60",
+        "0.60-0.65",
+        "0.65+",
+        "fts",
     ];
     let rows = stmt.query_map([], |r| {
         let band: usize = r.get(0)?;
@@ -201,7 +214,8 @@ pub fn prompts_since(conn: &Connection, since: i64) -> Result<u32> {
 
 /// Recorded prompts per recall mode.
 pub fn prompts_by_mode(conn: &Connection) -> Result<std::collections::BTreeMap<String, u32>> {
-    let mut stmt = conn.prepare_cached("SELECT mode, COUNT(*) FROM recall_prompts GROUP BY mode")?;
+    let mut stmt =
+        conn.prepare_cached("SELECT mode, COUNT(*) FROM recall_prompts GROUP BY mode")?;
     let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
@@ -296,7 +310,14 @@ mod tests {
         let conn = db();
         let day = 86_400;
         record_prompt(&conn, &prompt(), &[cand("old", 0, None, true)], 30, 0).unwrap();
-        record_prompt(&conn, &prompt(), &[cand("new", 0, None, true)], 30, 40 * day).unwrap();
+        record_prompt(
+            &conn,
+            &prompt(),
+            &[cand("new", 0, None, true)],
+            30,
+            40 * day,
+        )
+        .unwrap();
 
         assert_eq!(count(&conn, "recall_prompts"), 1, "recording prunes first");
         let left: String = conn
@@ -311,19 +332,38 @@ mod tests {
     fn settlement_reads_open_candidates_and_writes_each_label_once() {
         use crate::domain::recall_outcome::RecallOutcome;
         let conn = db();
-        let a = record_prompt(&conn, &prompt(), &[cand("a", 0, None, true), cand("b", 1, None, false)], 30, 100).unwrap();
+        let a = record_prompt(
+            &conn,
+            &prompt(),
+            &[cand("a", 0, None, true), cand("b", 1, None, false)],
+            30,
+            100,
+        )
+        .unwrap();
         let mut other = prompt();
         other.session = "s2".into();
         record_prompt(&conn, &other, &[cand("c", 0, None, true)], 30, 100).unwrap();
 
         let open = open_candidates(&conn, "s1").unwrap();
-        let ids: Vec<(&str, bool, i64)> =
-            open.iter().map(|c| (c.entry_id.as_str(), c.injected, c.prompt_at)).collect();
-        assert_eq!(ids, vec![("a", true, 100), ("b", false, 100)], "only this session's rows");
+        let ids: Vec<(&str, bool, i64)> = open
+            .iter()
+            .map(|c| (c.entry_id.as_str(), c.injected, c.prompt_at))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![("a", true, 100), ("b", false, 100)],
+            "only this session's rows"
+        );
 
-        assert_eq!(set_outcomes(&conn, &[(a, "a".into(), RecallOutcome::Used)], 200).unwrap(), 1);
+        assert_eq!(
+            set_outcomes(&conn, &[(a, "a".into(), RecallOutcome::Used)], 200).unwrap(),
+            1
+        );
         // A second settlement of the same session must not overwrite the first.
-        assert_eq!(set_outcomes(&conn, &[(a, "a".into(), RecallOutcome::Refuted)], 300).unwrap(), 0);
+        assert_eq!(
+            set_outcomes(&conn, &[(a, "a".into(), RecallOutcome::Refuted)], 300).unwrap(),
+            0
+        );
         let (outcome, at): (String, i64) = conn
             .query_row(
                 "SELECT outcome, outcome_at FROM recall_candidates WHERE entry_id = 'a'",
@@ -332,8 +372,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!((outcome.as_str(), at), ("used", 200));
-        let still_open: Vec<String> =
-            open_candidates(&conn, "s1").unwrap().into_iter().map(|c| c.entry_id).collect();
+        let still_open: Vec<String> = open_candidates(&conn, "s1")
+            .unwrap()
+            .into_iter()
+            .map(|c| c.entry_id)
+            .collect();
         assert_eq!(still_open, vec!["b"]);
     }
 
@@ -368,7 +411,11 @@ mod tests {
         let rows: Vec<(String, u32, u32, u32, u32, u32)> = band_counts(&conn)
             .unwrap()
             .into_iter()
-            .map(|b| (b.band, b.offered, b.injected, b.positive, b.negative, b.missed))
+            .map(|b| {
+                (
+                    b.band, b.offered, b.injected, b.positive, b.negative, b.missed,
+                )
+            })
             .collect();
         assert_eq!(
             rows,
@@ -390,7 +437,9 @@ mod tests {
         let conn = db();
         let cols = |t: &str| -> Vec<String> {
             let mut s = conn
-                .prepare(&format!("SELECT name FROM pragma_table_info('{t}') ORDER BY cid"))
+                .prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{t}') ORDER BY cid"
+                ))
                 .unwrap();
             s.query_map([], |r| r.get(0))
                 .unwrap()
@@ -399,13 +448,29 @@ mod tests {
         };
         assert_eq!(
             cols("recall_prompts"),
-            ["id", "session", "mode", "floor", "candidate_floor", "created_at"]
+            [
+                "id",
+                "session",
+                "mode",
+                "floor",
+                "candidate_floor",
+                "created_at"
+            ]
         );
         assert_eq!(
             cols("recall_candidates"),
             [
-                "prompt_id", "entry_id", "rank", "cosine", "entry_type", "age_days",
-                "overlap", "injected", "holdout", "outcome", "outcome_at"
+                "prompt_id",
+                "entry_id",
+                "rank",
+                "cosine",
+                "entry_type",
+                "age_days",
+                "overlap",
+                "injected",
+                "holdout",
+                "outcome",
+                "outcome_at"
             ]
         );
     }

@@ -34,8 +34,10 @@ pub fn collect(root: &Path, ctx: Option<&Context>, full: bool) -> Facts {
         facts.quarantine = crate::store::heal::quarantine_reports(dir)
             .into_iter()
             .map(|r| Quarantine {
-                date: chrono::DateTime::from_timestamp(r.quarantined_at, 0)
-                    .map_or_else(|| "an unknown date".to_string(), |d| d.format("%Y-%m-%d").to_string()),
+                date: chrono::DateTime::from_timestamp(r.quarantined_at, 0).map_or_else(
+                    || "an unknown date".to_string(),
+                    |d| d.format("%Y-%m-%d").to_string(),
+                ),
                 memory_entries_salvaged: r.memory_entries_salvaged as u64,
                 file: r.corrupt_file,
             })
@@ -128,6 +130,9 @@ mod tests {
             "- [error] hooks.drift: Stop is not registered → fix: `mdkb setup hooks claude`"
         );
         let without = Finding { fix: None, ..with };
-        assert_eq!(render_line(&without), "- [error] hooks.drift: Stop is not registered");
+        assert_eq!(
+            render_line(&without),
+            "- [error] hooks.drift: Stop is not registered"
+        );
     }
 }

@@ -2308,11 +2308,21 @@ fn smoke_doctor_lists_problems_with_fixes_and_exits_on_errors() {
         stdout(&out)
     );
 
-    assert_ok(&run(&["setup", "hooks", "claude"], &repo.root), "register hooks");
+    assert_ok(
+        &run(&["setup", "hooks", "claude"], &repo.root),
+        "register hooks",
+    );
     let out = run(&["doctor"], &repo.root);
     assert_ok(&out, "doctor after registering hooks");
-    assert!(!stdout(&out).contains("hooks.drift"), "got: {}", stdout(&out));
-    assert!(stdout(&out).contains("recall.sigil_only"), "info is shown on the CLI");
+    assert!(
+        !stdout(&out).contains("hooks.drift"),
+        "got: {}",
+        stdout(&out)
+    );
+    assert!(
+        stdout(&out).contains("recall.sigil_only"),
+        "info is shown on the CLI"
+    );
 
     let out = run(&["--format", "json", "doctor"], &repo.root);
     assert_ok(&out, "doctor --format json");

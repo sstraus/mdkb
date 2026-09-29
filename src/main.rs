@@ -823,7 +823,10 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             let facts = mdkb::cli::doctor::collect(&cwd, ctx.as_ref(), full);
             let findings = mdkb::domain::doctor::findings(&facts);
             if let mdkb::cli::OutputFormat::Json = cli.format {
-                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "findings": findings }))?);
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({ "findings": findings }))?
+                );
             } else {
                 print!("{}", mdkb::cli::doctor::render(&findings));
             }

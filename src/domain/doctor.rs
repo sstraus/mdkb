@@ -64,14 +64,22 @@ pub const SHADOW_SILENT_MIN_PROMPTS: u32 = 20;
 pub fn findings(facts: &Facts) -> Vec<Finding> {
     let mut out = Vec::new();
     let mut push = |id, severity, message: String, fix: Option<&str>| {
-        out.push(Finding { id, severity, message, fix: fix.map(str::to_string) });
+        out.push(Finding {
+            id,
+            severity,
+            message,
+            fix: fix.map(str::to_string),
+        });
     };
 
     if !facts.hooks_missing.is_empty() {
         push(
             "hooks.drift",
             Severity::Error,
-            format!("hook events not registered, so they never fire: {}", facts.hooks_missing.join(", ")),
+            format!(
+                "hook events not registered, so they never fire: {}",
+                facts.hooks_missing.join(", ")
+            ),
             Some("mdkb setup hooks claude"),
         );
     }
@@ -79,7 +87,10 @@ pub fn findings(facts: &Facts) -> Vec<Finding> {
         push(
             "hooks.drift",
             Severity::Error,
-            format!("hook events registered twice, so they fire twice per turn: {}", facts.hooks_duplicated.join(", ")),
+            format!(
+                "hook events registered twice, so they fire twice per turn: {}",
+                facts.hooks_duplicated.join(", ")
+            ),
             Some("mdkb setup hooks claude"),
         );
     }
@@ -87,7 +98,9 @@ pub fn findings(facts: &Facts) -> Vec<Finding> {
         push(
             "config.invalid",
             Severity::Error,
-            format!(".mdkb/config.toml does not load ({error}); the last config that did is still in use"),
+            format!(
+                ".mdkb/config.toml does not load ({error}); the last config that did is still in use"
+            ),
             None,
         );
     }
@@ -183,7 +196,10 @@ mod tests {
     #[test]
     fn a_missing_hook_is_an_error_with_the_registration_command() {
         let f = one(
-            &Facts { hooks_missing: vec!["PostToolUseFailure".into()], ..Facts::default() },
+            &Facts {
+                hooks_missing: vec!["PostToolUseFailure".into()],
+                ..Facts::default()
+            },
             "hooks.drift",
         );
         assert_eq!(f.severity, Severity::Error);
@@ -194,28 +210,63 @@ mod tests {
     #[test]
     fn an_unreadable_config_is_an_error_that_quotes_the_parser() {
         let f = one(
-            &Facts { config_error: Some("expected `]` at line 1".into()), ..Facts::default() },
+            &Facts {
+                config_error: Some("expected `]` at line 1".into()),
+                ..Facts::default()
+            },
             "config.invalid",
         );
         assert_eq!(f.severity, Severity::Error);
-        assert!(f.message.contains("expected `]` at line 1"), "{}", f.message);
+        assert!(
+            f.message.contains("expected `]` at line 1"),
+            "{}",
+            f.message
+        );
     }
 
     #[test]
     fn a_quarantine_asks_for_an_update_only_while_docs_are_missing() {
-        let q = Quarantine { date: "2026-09-20".into(), memory_entries_salvaged: 113, file: "index.sqlite.corrupt-1".into() };
-        let empty = one(&Facts { quarantine: vec![q.clone()], doc_count: 0, ..Facts::default() }, "index.quarantine");
+        let q = Quarantine {
+            date: "2026-09-20".into(),
+            memory_entries_salvaged: 113,
+            file: "index.sqlite.corrupt-1".into(),
+        };
+        let empty = one(
+            &Facts {
+                quarantine: vec![q.clone()],
+                doc_count: 0,
+                ..Facts::default()
+            },
+            "index.quarantine",
+        );
         assert_eq!(empty.fix.as_deref(), Some("mdkb update"));
-        let reindexed = one(&Facts { quarantine: vec![q], doc_count: 726, ..Facts::default() }, "index.quarantine");
+        let reindexed = one(
+            &Facts {
+                quarantine: vec![q],
+                doc_count: 726,
+                ..Facts::default()
+            },
+            "index.quarantine",
+        );
         assert_eq!(reindexed.fix, None, "nothing to do once docs are back");
         assert!(reindexed.message.contains("113"), "{}", reindexed.message);
     }
 
     #[test]
     fn projection_drift_points_at_memory_sync() {
-        let f = one(&Facts { projection: Some((10, 7)), ..Facts::default() }, "memory.projection_drift");
+        let f = one(
+            &Facts {
+                projection: Some((10, 7)),
+                ..Facts::default()
+            },
+            "memory.projection_drift",
+        );
         assert_eq!(f.severity, Severity::Warning);
-        assert!(f.message.contains("10") && f.message.contains('7'), "{}", f.message);
+        assert!(
+            f.message.contains("10") && f.message.contains('7'),
+            "{}",
+            f.message
+        );
         assert_eq!(f.fix.as_deref(), Some("mdkb memory sync"));
     }
 
@@ -230,24 +281,46 @@ mod tests {
         };
         let f = one(&busy, "recall.shadow_silent");
         assert_eq!(f.fix.as_deref(), Some("mdkb daemon restart"));
-        let quiet = Facts { prompts_7d: SHADOW_SILENT_MIN_PROMPTS - 1, ..busy.clone() };
-        assert!(!ids(&quiet).contains(&"recall.shadow_silent"), "a quiet week proves nothing");
-        let recording = Facts { ledger_prompts_7d: 1, ..busy };
+        let quiet = Facts {
+            prompts_7d: SHADOW_SILENT_MIN_PROMPTS - 1,
+            ..busy.clone()
+        };
+        assert!(
+            !ids(&quiet).contains(&"recall.shadow_silent"),
+            "a quiet week proves nothing"
+        );
+        let recording = Facts {
+            ledger_prompts_7d: 1,
+            ..busy
+        };
         assert!(!ids(&recording).contains(&"recall.shadow_silent"));
     }
 
     #[test]
     fn mining_without_a_distiller_is_a_warning() {
-        let f = one(&Facts { mining_enabled: true, ..Facts::default() }, "priors.distiller_unset");
+        let f = one(
+            &Facts {
+                mining_enabled: true,
+                ..Facts::default()
+            },
+            "priors.distiller_unset",
+        );
         assert_eq!(f.severity, Severity::Warning);
-        let set = Facts { mining_enabled: true, distiller_program: Some("codex".into()), ..Facts::default() };
+        let set = Facts {
+            mining_enabled: true,
+            distiller_program: Some("codex".into()),
+            ..Facts::default()
+        };
         assert!(!ids(&set).contains(&"priors.distiller_unset"));
     }
 
     #[test]
     fn a_failed_distiller_probe_is_an_error_quoting_its_output() {
         let f = one(
-            &Facts { distiller_failure: Some("unexpected status 400".into()), ..Facts::default() },
+            &Facts {
+                distiller_failure: Some("unexpected status 400".into()),
+                ..Facts::default()
+            },
             "priors.distiller_failed",
         );
         assert_eq!(f.severity, Severity::Error);
@@ -257,10 +330,23 @@ mod tests {
     /// Boss read recall as automatic on 2026-09-29; the default says otherwise.
     #[test]
     fn a_required_sigil_is_explained_as_info() {
-        let f = one(&Facts { require_sigil: true, ..Facts::default() }, "recall.sigil_only");
+        let f = one(
+            &Facts {
+                require_sigil: true,
+                ..Facts::default()
+            },
+            "recall.sigil_only",
+        );
         assert_eq!(f.severity, Severity::Info);
-        let shadowing = Facts { require_sigil: true, shadow_enabled: true, ..Facts::default() };
-        assert_eq!(one(&shadowing, "recall.sigil_only").severity, Severity::Info);
+        let shadowing = Facts {
+            require_sigil: true,
+            shadow_enabled: true,
+            ..Facts::default()
+        };
+        assert_eq!(
+            one(&shadowing, "recall.sigil_only").severity,
+            Severity::Info
+        );
     }
 
     #[test]
