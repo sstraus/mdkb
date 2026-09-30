@@ -36,8 +36,8 @@ pub enum Language {
     En,
 }
 
-/// Function words of each language. A word that sits in both lists (`in`, `me`)
-/// votes for neither; words that are a function word in one language and a
+/// Function words of each language. A word that sits in both lists (`in`, `me`,
+/// `i`: the Italian plural article and the English pronoun) votes for neither; words that are a function word in one language and a
 /// content word in the other (`come`, `so`) are listed only where they are
 /// function words.
 const IT_WORDS: &[&str] = &[
@@ -47,7 +47,7 @@ const IT_WORDS: &[&str] = &[
     "questa", "quello", "puoi", "posso", "devo", "dobbiamo", "vorrei", "fare", "hai", "ho", "ha",
     "abbiamo", "tutto", "tutti", "più", "già", "dimmi", "ricordi", "adesso", "ora", "qui",
     "sempre", "cioè", "però", "allora", "quindi", "poi", "se", "mio", "tuo", "nostro", "suo", "le",
-    "la", "in", "me",
+    "la", "in", "me", "i",
 ];
 
 const EN_WORDS: &[&str] = &[
@@ -78,6 +78,14 @@ pub fn prompt_language(prompt: &str) -> Language {
         }
     }
     if en > it { Language::En } else { Language::It }
+}
+
+/// Whether `prompt`'s language has the reranker switched on.
+pub fn enabled_for(cfg: &HooksConfig, prompt: &str) -> bool {
+    match prompt_language(prompt) {
+        Language::It => cfg.recall_rerank_it,
+        Language::En => cfg.recall_rerank_en,
+    }
 }
 
 /// The top score `prompt` must reach to inject recall.
@@ -111,6 +119,7 @@ pub fn rerank_budget(cfg: &HooksConfig, elapsed_ms: u64) -> Option<Duration> {
 }
 
 /// What the rerank step decided.
+#[derive(Debug)]
 pub struct RerankStage {
     /// The `rerank_outcome` for `hook-events.jsonl`.
     pub outcome: &'static str,
@@ -143,6 +152,11 @@ pub async fn rerank_stage(
     pool: Vec<MemoryEntry>,
     budget: Option<Duration>,
 ) -> RerankStage {
+    // Before anything else: an empty pool must not wake the model, whose first
+    // call starts a 1 GB load.
+    if pool.is_empty() {
+        return RerankStage::fallback("no_candidates");
+    }
     let Some(budget) = budget else {
         return RerankStage::fallback("no_budget");
     };
@@ -158,7 +172,9 @@ pub async fn rerank_stage(
         Ok(Ok(Err(error))) => return RerankStage::fallback(error.outcome()),
         Ok(Ok(Ok(scores))) => scores,
     };
-    if scores.len() != pool.len() {
+    // A wrong-length or NaN answer is a broken model, not a verdict: `below_gate`
+    // would replace MiniLM's result with nothing for every prompt.
+    if scores.len() != pool.len() || scores.iter().any(|score| !score.is_finite()) {
         return RerankStage::fallback("failed");
     }
     let floor = min_score_for(cfg, prompt);

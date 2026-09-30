@@ -27,9 +27,11 @@ use walkdir::WalkDir;
 /// index flush, and a 280 MB download has no place there. Best effort — recall
 /// falls back to the MiniLM gate without the weights, so a failed fetch is a
 /// warning, not an error.
-pub fn fetch_reranker_weights(ctx: &Context) {
-    let config = crate::config::Config::load_or_default(&ctx.config_path);
-    if !config.hooks.recall_rerank {
+///
+/// Takes no store: the download is slow, so a caller holding the store lock must
+/// not be the one running it.
+pub fn fetch_reranker_weights(hooks: &crate::config::HooksConfig) {
+    if !hooks.recall_rerank_any() {
         return;
     }
     if let Err(error) = crate::llm::rerank::download() {

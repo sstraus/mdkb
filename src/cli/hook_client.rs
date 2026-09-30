@@ -373,6 +373,8 @@ fn in_process_config(root: &Path) -> Result<DaemonConfig> {
 /// a source snippet, so it is folded onto one line: a host shows hook stderr
 /// as-is.
 async fn dispatch_in_process(method: &str, params: Value, root: &Path, emit: impl FnOnce(&Value)) {
+    // This process ends with the hook: a reranker loaded here is never ready.
+    crate::llm::rerank::forbid_load();
     let config = match in_process_config(root) {
         Ok(config) => config,
         Err(e) => {

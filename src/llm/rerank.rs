@@ -15,8 +15,9 @@
 //! ([`download`]), the command whose job is to fetch models.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use fastembed::{
     RerankInitOptionsUserDefined, TextRerank, TokenizerFiles, UserDefinedRerankingModel,
@@ -67,6 +68,10 @@ pub enum RerankError {
     /// The model ran and errored or panicked.
     #[error("rerank failed: {0}")]
     Failed(String),
+    /// This process ends with the hook that started it, so a model loaded here
+    /// could never be ready in time. See [`forbid_load`].
+    #[error("one-shot process: no resident model")]
+    OneShot,
 }
 
 impl RerankError {
@@ -78,6 +83,7 @@ impl RerankError {
             RerankError::LoadFailed(_) => "load_failed",
             RerankError::Busy => "busy",
             RerankError::Failed(_) => "failed",
+            RerankError::OneShot => "one_shot",
         }
     }
 }
@@ -96,8 +102,22 @@ pub fn shared() -> Arc<dyn Reranker> {
     Arc::new(SharedReranker)
 }
 
+/// Declare this process short-lived: from now on [`shared`] never starts the
+/// model load. An in-process hook (the daemon-unreachable fallback) exits as
+/// soon as it answers, so the load thread would burn CPU and IO for a model that
+/// cannot be ready before the process is gone.
+pub fn forbid_load() {
+    ENGINE.one_shot.store(true, Ordering::Release);
+}
+
 #[derive(Debug)]
 struct SharedReranker;
+
+impl Reranker for SharedReranker {
+    fn score(&self, query: &str, docs: &[String]) -> std::result::Result<Vec<f32>, RerankError> {
+        ENGINE.score(query, docs)
+    }
+}
 
 enum Load {
     Idle,
@@ -106,27 +126,63 @@ enum Load {
     Failed(String),
 }
 
-static LOAD: Mutex<Load> = Mutex::new(Load::Idle);
+/// How long one rerank may hold the [`RunGate`]. A call the hook abandoned keeps
+/// its thread, so a hung ONNX call must not keep every later prompt `Busy`:
+/// past this the gate admits the next one. Well above the slowest measured
+/// rerank (2.4 s under host load 36).
+const RUN_LEASE: Duration = Duration::from_secs(5);
 
-/// Set while a rerank runs. See [`RerankError::Busy`].
-static RUNNING: AtomicBool = AtomicBool::new(false);
+/// Admits one rerank at a time, for at most a lease.
+struct RunGate {
+    holder: Mutex<Option<(u64, Instant)>>,
+    issued: AtomicU64,
+}
 
-struct RunGuard;
+/// Held for the duration of a rerank. Releases the gate on drop, unless the
+/// lease expired and the gate now belongs to a later run.
+struct RunGuard<'a> {
+    gate: &'a RunGate,
+    token: u64,
+}
 
-impl RunGuard {
-    fn acquire() -> Option<Self> {
-        RUNNING
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .ok()
-            .map(|_| RunGuard)
+impl RunGate {
+    const fn new() -> Self {
+        Self {
+            holder: Mutex::new(None),
+            issued: AtomicU64::new(0),
+        }
+    }
+
+    fn acquire(&self, lease: Duration) -> Option<RunGuard<'_>> {
+        let mut holder = self.holder.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        if holder.is_some_and(|(_, until)| now < until) {
+            return None;
+        }
+        let token = self.issued.fetch_add(1, Ordering::Relaxed) + 1;
+        *holder = Some((token, now + lease));
+        Some(RunGuard { gate: self, token })
     }
 }
 
-impl Drop for RunGuard {
+impl Drop for RunGuard<'_> {
     fn drop(&mut self) {
-        RUNNING.store(false, Ordering::Release);
+        let mut holder = self.gate.holder.lock().unwrap_or_else(|e| e.into_inner());
+        if holder.is_some_and(|(token, _)| token == self.token) {
+            *holder = None;
+        }
     }
 }
+
+/// The load state, the run gate and the one-shot flag of one process. A struct so
+/// tests can own one; production has [`ENGINE`].
+struct Engine {
+    load: Mutex<Load>,
+    gate: RunGate,
+    one_shot: AtomicBool,
+}
+
+static ENGINE: Engine = Engine::new();
 
 /// `<cache>/models--<org>--<name>/snapshots/<revision>`, where hf-hub links the
 /// files of [`MODEL_REVISION`].
@@ -167,53 +223,68 @@ fn load_model(dir: &Path) -> Result<TextRerank> {
     .map_err(|e| Error::other(format!("loading the reranker: {e}")))
 }
 
-fn set_load(state: Load) {
-    let mut guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
-    *guard = state;
-}
-
-/// The loaded model, or the reason there is none. Starts the background load on
-/// the first call that finds the weights on disk.
-fn ready_model() -> std::result::Result<Arc<TextRerank>, RerankError> {
-    let mut guard = LOAD.lock().unwrap_or_else(|e| e.into_inner());
-    match &*guard {
-        Load::Ready(model) => return Ok(Arc::clone(model)),
-        Load::Loading => return Err(RerankError::Loading),
-        Load::Failed(why) => return Err(RerankError::LoadFailed(why.clone())),
-        Load::Idle => {}
+impl Engine {
+    const fn new() -> Self {
+        Self {
+            load: Mutex::new(Load::Idle),
+            gate: RunGate::new(),
+            one_shot: AtomicBool::new(false),
+        }
     }
-    let dir = snapshot_dir();
-    if !weights_cached(&dir) {
-        // Not a failure state: `mdkb embed` may fetch them while we run.
-        return Err(RerankError::NotCached(dir));
-    }
-    *guard = Load::Loading;
-    drop(guard);
 
-    let spawned = std::thread::Builder::new()
-        .name("mdkb-rerank-load".into())
-        .spawn(move || {
-            let loaded = std::panic::catch_unwind(|| load_model(&dir))
-                .unwrap_or_else(|_| Err(Error::other("the reranker load panicked")));
-            match loaded {
-                Ok(model) => set_load(Load::Ready(Arc::new(model))),
-                Err(e) => {
-                    tracing::warn!("recall reranker unavailable: {e}");
-                    set_load(Load::Failed(e.to_string()));
+    fn set_load(&self, state: Load) {
+        *self.load.lock().unwrap_or_else(|e| e.into_inner()) = state;
+    }
+
+    /// The loaded model, or the reason there is none. Starts the background load
+    /// on the first call that finds the weights on disk, unless the process is
+    /// one-shot.
+    fn ready_model(&'static self) -> std::result::Result<Arc<TextRerank>, RerankError> {
+        let mut guard = self.load.lock().unwrap_or_else(|e| e.into_inner());
+        match &*guard {
+            Load::Ready(model) => return Ok(Arc::clone(model)),
+            Load::Loading => return Err(RerankError::Loading),
+            Load::Failed(why) => return Err(RerankError::LoadFailed(why.clone())),
+            Load::Idle => {}
+        }
+        if self.one_shot.load(Ordering::Acquire) {
+            return Err(RerankError::OneShot);
+        }
+        let dir = snapshot_dir();
+        if !weights_cached(&dir) {
+            // Not a failure state: `mdkb embed` may fetch them while we run.
+            return Err(RerankError::NotCached(dir));
+        }
+        *guard = Load::Loading;
+        drop(guard);
+
+        let spawned = std::thread::Builder::new()
+            .name("mdkb-rerank-load".into())
+            .spawn(move || {
+                let loaded = std::panic::catch_unwind(|| load_model(&dir))
+                    .unwrap_or_else(|_| Err(Error::other("the reranker load panicked")));
+                match loaded {
+                    Ok(model) => self.set_load(Load::Ready(Arc::new(model))),
+                    Err(e) => {
+                        tracing::warn!("recall reranker unavailable: {e}");
+                        self.set_load(Load::Failed(e.to_string()));
+                    }
                 }
-            }
-        });
-    if let Err(e) = spawned {
-        set_load(Load::Failed(e.to_string()));
-        return Err(RerankError::LoadFailed(e.to_string()));
+            });
+        if let Err(e) = spawned {
+            self.set_load(Load::Failed(e.to_string()));
+            return Err(RerankError::LoadFailed(e.to_string()));
+        }
+        Err(RerankError::Loading)
     }
-    Err(RerankError::Loading)
-}
 
-impl Reranker for SharedReranker {
-    fn score(&self, query: &str, docs: &[String]) -> std::result::Result<Vec<f32>, RerankError> {
-        let model = ready_model()?;
-        let _running = RunGuard::acquire().ok_or(RerankError::Busy)?;
+    fn score(
+        &'static self,
+        query: &str,
+        docs: &[String],
+    ) -> std::result::Result<Vec<f32>, RerankError> {
+        let model = self.ready_model()?;
+        let _running = self.gate.acquire(RUN_LEASE).ok_or(RerankError::Busy)?;
         let documents: Vec<&str> = docs.iter().map(String::as_str).collect();
         let ranked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             model.rerank(query, documents, false, Some(RERANK_BATCH))
@@ -275,12 +346,44 @@ mod tests {
     }
 
     #[test]
-    fn run_guard_admits_one_rerank_at_a_time() {
+    fn the_gate_admits_one_rerank_at_a_time() {
         // Catches: an abandoned rerank and the next prompt's running together,
         // each at full thread count, which is what doubles the latency of both.
-        let first = RunGuard::acquire().expect("idle");
-        assert!(RunGuard::acquire().is_none());
+        let gate = RunGate::new();
+        let first = gate.acquire(RUN_LEASE).expect("idle");
+        assert!(gate.acquire(RUN_LEASE).is_none());
         drop(first);
-        assert!(RunGuard::acquire().is_some());
+        assert!(gate.acquire(RUN_LEASE).is_some());
+    }
+
+    #[test]
+    fn a_rerank_that_never_returns_frees_the_gate_when_its_lease_ends() {
+        // Catches: a hung ONNX call keeping the gate shut for ever, so every
+        // later prompt answers `busy` until the daemon restarts.
+        let gate = RunGate::new();
+        let hung = gate.acquire(Duration::from_millis(40)).expect("idle");
+        assert!(gate.acquire(RUN_LEASE).is_none());
+        std::thread::sleep(Duration::from_millis(60));
+        let next = gate.acquire(RUN_LEASE).expect("the lease ended");
+
+        // The hung call finally returns. It must not open the gate under `next`.
+        drop(hung);
+        assert!(gate.acquire(RUN_LEASE).is_none());
+        drop(next);
+        assert!(gate.acquire(RUN_LEASE).is_some());
+    }
+
+    #[test]
+    fn a_one_shot_process_never_starts_the_model_load() {
+        // Catches: the in-process hook fallback spawning the 1 GB load thread for
+        // a process that exits with the hook.
+        let engine: &'static Engine = Box::leak(Box::new(Engine::new()));
+        engine.one_shot.store(true, Ordering::Release);
+        let error = engine.score("q", &["d".to_string()]).unwrap_err();
+        assert_eq!(error.outcome(), "one_shot");
+        assert!(matches!(
+            *engine.load.lock().unwrap(),
+            Load::Idle
+        ));
     }
 }

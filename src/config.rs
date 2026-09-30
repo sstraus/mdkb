@@ -862,18 +862,24 @@ pub struct HooksConfig {
     /// apart from the headline precision.
     pub recall_holdout_rate: f32,
 
-    /// Rerank the top five memories of an automatic recall with a cross-encoder
-    /// (jina-reranker-v2 int8) and gate on its top score, instead of MiniLM's
-    /// cosine. MiniLM alone admits no Italian prompt over an English store at
-    /// its gate; the reranker admits a third of them with no negative
-    /// admitted in the fit set.
+    /// Rerank the top five memories of an automatic Italian prompt with a
+    /// cross-encoder (jina-reranker-v2 int8) and gate on its top score, instead
+    /// of MiniLM's cosine. MiniLM alone admits no Italian prompt over an English
+    /// store at its gate; the reranker admits about half of them with no held-out
+    /// negative admitted (0/24).
     ///
     /// On by default. Until the weights are cached (`mdkb embed` fetches them)
     /// and loaded, and whenever the reranker times out or fails, recall falls
     /// back to the MiniLM gate and the `user_prompt_submit` row says why
     /// (`phases.rerank_outcome`). A `*` prompt never reranks. Costs about 1 GB
     /// of resident memory in the daemon once loaded.
-    pub recall_rerank: bool,
+    pub recall_rerank_it: bool,
+
+    /// The same for English prompts. Off by default: the English floor was fitted
+    /// on a 12-memory synthetic store and admitted 3 of 24 held-out negatives, so
+    /// English prompts keep the MiniLM result until a floor is fitted on a real
+    /// English store.
+    pub recall_rerank_en: bool,
 
     /// How long the hook waits for the reranker, in milliseconds, before it
     /// falls back to MiniLM's result. Clamped to what is left of
@@ -888,6 +894,13 @@ pub struct HooksConfig {
     /// Top reranker score an English prompt needs to inject recall. See
     /// [`RECALL_RERANK_MIN_SCORE_EN_DEFAULT`].
     pub recall_rerank_min_score_en: f32,
+}
+
+impl HooksConfig {
+    /// True when any language reranks, which is when the weights are worth fetching.
+    pub fn recall_rerank_any(&self) -> bool {
+        self.recall_rerank_it || self.recall_rerank_en
+    }
 }
 
 impl Default for HooksConfig {
@@ -912,7 +925,8 @@ impl Default for HooksConfig {
             recall_auto_min_cosine: RECALL_AUTO_MIN_COSINE_DEFAULT,
             user_prompt_submit_shadow: false,
             recall_holdout_rate: 0.0,
-            recall_rerank: true,
+            recall_rerank_it: true,
+            recall_rerank_en: false,
             recall_rerank_deadline_ms: RECALL_RERANK_DEADLINE_MS_DEFAULT,
             recall_rerank_min_score_it: RECALL_RERANK_MIN_SCORE_IT_DEFAULT,
             recall_rerank_min_score_en: RECALL_RERANK_MIN_SCORE_EN_DEFAULT,

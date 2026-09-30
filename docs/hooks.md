@@ -359,11 +359,14 @@ latency_budget_ms = 200
 # outcome = "deadline". 0 disables the deadline.
 user_prompt_submit_deadline_ms = 1500
 
-# Rerank MiniLM's top five with jina-reranker-v2 (int8) before injecting.
+# Rerank MiniLM's top five with jina-reranker-v2 (int8) before injecting, one
+# switch per prompt language (function-word vote; unknown = Italian).
 # Weights come from `mdkb embed`; without them, or while they load, or past
 # the rerank deadline, the MiniLM result is used and the row logs
-# `rerank_outcome`. Not applied to `*` prompts.
-recall_rerank = true
+# `rerank_outcome`. Not applied to `*` prompts. English is off: its floor was
+# fitted on a 12-memory synthetic store and admitted 3 of 24 held-out negatives.
+recall_rerank_it = true
+recall_rerank_en = false
 recall_rerank_deadline_ms = 700       # own deadline, clamped to what is left of the 1 s hook-client wait (or the hook deadline, if shorter)
 recall_rerank_min_score_it = -1.05    # floor on the reranker logit, Italian prompts
 recall_rerank_min_score_en = -1.95    # floor, English prompts
@@ -507,9 +510,10 @@ Its rows carry a `phases` object (`context`, `embed`, `lock_wait`, `search`,
 `enrich`, `prior`, `rerank`, in ms) naming the phases the run reached, so a
 deadline row shows where the time went. With the reranker in play the same
 object carries `rerank_outcome`: `ok`, `below_gate`, `timeout`, `no_budget`,
-`loading`, `not_cached`, `load_failed`, `busy`, `failed`, `no_candidates` or
-`off`. Anything but `ok`/`below_gate`/`no_candidates`/`off` means the MiniLM
-result was used.
+`loading`, `not_cached`, `load_failed`, `busy`, `failed`, `one_shot`,
+`no_candidates`, `off` or `cut` (the hook deadline fired while the reranker ran).
+Anything but `ok`, `below_gate`, `no_candidates` and `off` means the MiniLM
+result was used (`cut` answers nothing, like any deadline row).
 
 SessionStart rows carry the split of `elapsed_ms` across the six phases, in the
 order they run:

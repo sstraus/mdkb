@@ -268,7 +268,8 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `user_prompt_submit_deadline_ms` | u64 | `1500` | Hard deadline for UserPromptSubmit; past it the hook answers `{}` with `outcome = "deadline"`. `0` disables |
 | `user_prompt_submit_require_sigil` | bool | `false` | `true` opts out of automatic recall and requires a leading `*` |
 | `recall_auto_min_cosine` | f32 | `0.50` | Cosine floor for a prompt with no sigil; a sigil prompt uses `search.memory.min_recall_cosine` (`0.40`) |
-| `recall_rerank` | bool | `true` | Rerank MiniLM's top five with jina-reranker-v2 int8 on non-sigil prompts; falls back to the MiniLM result on any failure |
+| `recall_rerank_it` | bool | `true` | Rerank MiniLM's top five with jina-reranker-v2 int8 on non-sigil Italian prompts; falls back to the MiniLM result on any failure |
+| `recall_rerank_en` | bool | `false` | The same for English prompts; off until a floor is fitted on a real English store |
 | `recall_rerank_deadline_ms` | u64 | `700` | Reranker's own deadline, clamped to the nearer of the hook deadline and the 1 s hook-client socket timeout, minus the time already spent and 150 ms |
 | `recall_rerank_min_score_it` | f32 | `-1.05` | Reranker logit an entry needs for an Italian prompt |
 | `recall_rerank_min_score_en` | f32 | `-1.95` | Same for an English prompt (language by function-word vote; unknown = Italian) |

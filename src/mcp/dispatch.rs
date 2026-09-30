@@ -5082,7 +5082,7 @@ async fn hook_user_prompt_submit_impl_timed(
     let mut query_embedding: Option<Vec<f32>> = None;
     // A `*` prompt asked for its answer and keeps the lower cosine floor; the
     // reranker is for the prompts nobody asked to enrich.
-    let rerank_wanted = cfg.recall_rerank && mode != RecallMode::Sigil;
+    let rerank_wanted = mode != RecallMode::Sigil && recall_rerank::enabled_for(cfg, prompt);
     if let Some(ref q) = fts_query {
         if ensure_handle_context(handle).await.is_err() {
             return json!({});
@@ -6700,6 +6700,16 @@ async fn cli_mutate_impl(
             })
         }
         mutation => {
+            // The reranker weights are 280 MB: fetch them before the store lock
+            // is taken, or every hook for this repo waits at `lock_wait` for the
+            // download.
+            if matches!(mutation, CliMutation::Embed { .. }) {
+                let hooks = handle.config.hooks.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::core::ops::fetch_reranker_weights(&hooks)
+                })
+                .await;
+            }
             ensure_handle_context(handle).await?;
             let mut slot = handle.ctx.lock().await;
             // No outer wrap: `run_handle_memory_mutation` already returns an
@@ -7382,6 +7392,8 @@ mod tests {
     ) -> Arc<RepoHandle> {
         let mut handle = handle_at(tmp.path().to_path_buf(), |config| {
             config.hooks.user_prompt_submit_require_sigil = false;
+            // English is off by default; these tests exercise the stage.
+            config.hooks.recall_rerank_en = true;
             tweak(config);
         });
         Arc::get_mut(&mut handle)
@@ -12793,7 +12805,7 @@ mod tests {
         );
         assert!(
             additional_context(&result).contains("slow-rerank"),
-            "the MiniLM result must survive a rerank that did not finish: {result}"
+            "the MiniLM result must survive a rerank that did not finish: {result} / {row}"
         );
         assert_eq!(row["outcome"], "fired", "{row}");
         assert!(
@@ -12899,6 +12911,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn english_prompts_keep_the_minilm_result_by_default() {
+        // Catches: the unfit English floor gating English prompts: a score of
+        // -9 would drop what MiniLM admitted.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_reranked_handle(
+            &tmp,
+            |config| config.hooks.recall_rerank_en = false,
+            StubReranker::Scores {
+                delay: ms(0),
+                score: -9.0,
+            },
+        );
+        seed_memory_entry(&handle, "english-minilm").await;
+
+        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "en-off").await;
+
+        assert!(
+            additional_context(&result).contains("english-minilm"),
+            "{result}"
+        );
+        assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
+    }
+
+    #[tokio::test]
     async fn a_sigil_prompt_is_not_reranked() {
         // Catches: the reranker gating a prompt that asked for its answer. `*`
         // keeps the lower MiniLM floor, and a low rerank score must not undo it.
@@ -12927,7 +12963,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_reranked_handle(
             &tmp,
-            |config| config.hooks.recall_rerank = false,
+            |config| {
+                config.hooks.recall_rerank_it = false;
+                config.hooks.recall_rerank_en = false;
+            },
             StubReranker::Scores {
                 delay: ms(0),
                 score: -9.0,
@@ -12942,8 +12981,12 @@ mod tests {
     }
 
     #[test]
-    fn the_reranker_is_on_by_default() {
-        assert!(Config::default().hooks.recall_rerank);
+    fn the_reranker_is_on_for_italian_and_off_for_english_by_default() {
+        // Catches: the English floor (3/24 held-out negatives admitted) going
+        // live because the default flipped.
+        let hooks = Config::default().hooks;
+        assert!(hooks.recall_rerank_it);
+        assert!(!hooks.recall_rerank_en);
     }
 
     #[tokio::test]

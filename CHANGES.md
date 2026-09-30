@@ -24,7 +24,7 @@
   (`hooks.recall_rerank_deadline_ms`, 700, clamped to what is left of the hook
   budget) and on timeout, load failure or missing weights the hook keeps the
   MiniLM result and logs `phases.rerank` plus `rerank_outcome` in
-  `hook-events.jsonl`. `hooks.recall_rerank = false` turns it off. `mdkb embed`
+  `hook-events.jsonl`. `hooks.recall_rerank_it` (default on) and `hooks.recall_rerank_en` (default off: its floor is unfit) switch it per language. `mdkb embed`
   fetches the weights (280 MB, revision pinned); the daemon holds about 1 GB
   more resident once loaded, and the first prompt after a daemon start falls
   back while it loads. Sigil prompts are not reranked. Story 202-4c67.
