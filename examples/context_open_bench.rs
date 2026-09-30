@@ -31,15 +31,18 @@ fn main() {
     timed_open("marker fresh", &root);
     let conn = rusqlite::Connection::open(dir.join("index.sqlite")).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    conn.execute_batch("CREATE TABLE IF NOT EXISTS bench_touch(x); INSERT INTO bench_touch VALUES (1);")
-        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bench_touch(x); INSERT INTO bench_touch VALUES (1);",
+    )
+    .unwrap();
     drop(conn);
     timed_open("marker stale (db written)", &root);
     timed_open("marker fresh again", &root);
     // The daemon reopening a repo its LRU evicted, after a write made the marker stale.
     let conn = rusqlite::Connection::open(dir.join("index.sqlite")).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(1100));
-    conn.execute_batch("INSERT INTO bench_touch VALUES (2);").unwrap();
+    conn.execute_batch("INSERT INTO bench_touch VALUES (2);")
+        .unwrap();
     drop(conn);
     timed_open("reuse: first (probes)", &root);
     timed_open("reuse: second (trusts)", &root);

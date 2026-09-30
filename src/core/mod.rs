@@ -309,21 +309,22 @@ impl Context {
         // Autoheal: quarantine a structurally-corrupt index before we build on
         // it, so the `Connection::open` below lands on a clean file. Throttled,
         // so this is cheap on the hot open path.
-        let quarantined = match crate::store::heal::ensure_sound_locked(&db_path, trust_process_probe)? {
-            crate::store::heal::Heal::Sound => None,
-            crate::store::heal::Heal::Quarantined { corrupt_path } => Some(corrupt_path),
-            crate::store::heal::Heal::CorruptInUse => {
-                // Do not turn a read command into another holder of a database
-                // already known to be corrupt. `Context::open` initializes
-                // schemas and ordinary reads update access statistics, so
-                // continuing here both writes into the malformed generation
-                // and extends the live-lock veto that prevents recovery.
-                return Err(ErrorKind::IndexCorruptInUse {
-                    path: db_path.clone(),
+        let quarantined =
+            match crate::store::heal::ensure_sound_locked(&db_path, trust_process_probe)? {
+                crate::store::heal::Heal::Sound => None,
+                crate::store::heal::Heal::Quarantined { corrupt_path } => Some(corrupt_path),
+                crate::store::heal::Heal::CorruptInUse => {
+                    // Do not turn a read command into another holder of a database
+                    // already known to be corrupt. `Context::open` initializes
+                    // schemas and ordinary reads update access statistics, so
+                    // continuing here both writes into the malformed generation
+                    // and extends the live-lock veto that prevents recovery.
+                    return Err(ErrorKind::IndexCorruptInUse {
+                        path: db_path.clone(),
+                    }
+                    .into());
                 }
-                .into());
-            }
-        };
+            };
 
         // Announce this connection before opening it, so any concurrent heal
         // sees a live holder and leaves the files alone. Taken after the probe
