@@ -47,7 +47,7 @@ fn spec(key: &str) -> Spec {
 fn rusage() -> (f64, u64) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    let tv = |t: libc::timeval| t.tv_sec as f64 + f64::from(t.tv_usec) / 1e6;
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
     // macOS reports ru_maxrss in bytes.
     (tv(ru.ru_utime) + tv(ru.ru_stime), ru.ru_maxrss as u64)
 }
