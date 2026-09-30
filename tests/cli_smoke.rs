@@ -423,6 +423,12 @@ fn smoke_session_start_reports_doctor_findings_and_is_silent_when_healthy() {
         "register hooks",
     );
 
+    // Sigil-only recall is the info finding; it must stay off SessionStart.
+    let config = repo.root.join(".mdkb/config.toml");
+    let mut body = std::fs::read_to_string(&config).unwrap_or_default();
+    body.push_str("\n[hooks]\nuser_prompt_submit_require_sigil = true\n");
+    std::fs::write(&config, body).unwrap();
+
     let out = run_env(&["hook", "session-start"], &repo.root, &env);
     assert_ok(&out, "healthy session-start");
     assert!(
@@ -2384,6 +2390,19 @@ fn smoke_doctor_lists_problems_with_fixes_and_exits_on_errors() {
         "got: {}",
         stdout(&out)
     );
+    assert!(
+        !stdout(&out).contains("recall.sigil_only"),
+        "automatic recall is the default, so nothing to explain: {}",
+        stdout(&out)
+    );
+
+    // The explicit opt-out is what the info finding explains.
+    let config = repo.root.join(".mdkb/config.toml");
+    let mut body = std::fs::read_to_string(&config).unwrap_or_default();
+    body.push_str("\n[hooks]\nuser_prompt_submit_require_sigil = true\n");
+    std::fs::write(&config, body).unwrap();
+    let out = run(&["doctor"], &repo.root);
+    assert_ok(&out, "doctor with sigil-only recall");
     assert!(
         stdout(&out).contains("recall.sigil_only"),
         "info is shown on the CLI"

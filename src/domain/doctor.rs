@@ -327,7 +327,7 @@ mod tests {
         assert!(f.message.contains("400"), "{}", f.message);
     }
 
-    /// Boss read recall as automatic on 2026-09-29; the default says otherwise.
+    /// Sigil-only recall is an explicit opt-out since 2026-09-30; say so.
     #[test]
     fn a_required_sigil_is_explained_as_info() {
         let f = one(

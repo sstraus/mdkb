@@ -264,7 +264,7 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `recall_limit` | usize | `5` | Max hybrid memory results in UserPromptSubmit |
 | `recall_docs_limit` | usize | `3` | Max matching documents in UserPromptSubmit; `0` = memory only |
 | `latency_budget_ms` | u64 | `200` | Overrun threshold; logs to `hook-slow.jsonl` |
-| `user_prompt_submit_require_sigil` | bool | `true` | Require a leading `*` before prompt recall |
+| `user_prompt_submit_require_sigil` | bool | `false` | `true` opts out of automatic recall and requires a leading `*` |
 | `recall_auto_min_cosine` | f32 | `0.50` | Cosine floor for a prompt with no sigil; a sigil prompt uses `search.memory.min_recall_cosine` (`0.40`) |
 | `user_prompt_submit_shadow` | bool | `false` | Run the always-on path on skipped prompts, record it, inject nothing |
 | `daemon_required` | bool | `false` | Disable the in-process command-hook fallback |

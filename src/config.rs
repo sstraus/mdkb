@@ -716,26 +716,22 @@ pub struct HooksConfig {
     /// frontmatter graph neighbors (paths + relation labels) in UserPromptSubmit.
     pub doc_graph_in_recall: bool,
 
-    /// Gate for UserPromptSubmit injection. When true (default), context (recall,
+    /// Gate for UserPromptSubmit injection. When true, context (recall,
     /// related docs, priors, call-graph hint) is injected ONLY for prompts that
-    /// begin with `*`; every other prompt is left untouched — mdkb stays quiet
-    /// unless you explicitly ask. The leading `*` is stripped before recall so it
-    /// never reaches FTS or the model (and stopwords are already dropped from the
-    /// recall query). Set `false` for the always-on behavior.
+    /// begin with `*`; every other prompt is left untouched. The leading `*` is
+    /// stripped before recall so it never reaches FTS or the model (and
+    /// stopwords are already dropped from the recall query). When false
+    /// (default), every prompt is searched.
     ///
     /// With it `false` the sigil does not stop meaning anything: it selects the
     /// lower floor (`search.memory.min_recall_cosine`) instead of enabling the
     /// feature, and a prompt without it is admitted at
     /// [`recall_auto_min_cosine`](Self::recall_auto_min_cosine).
     ///
-    /// **Still `true`, deliberately.** This repo's `.mdkb/hook-events.jsonl`
-    /// holds 1716 UserPromptSubmit calls over 72 days (2026-07-07 to
-    /// 2026-09-17) of which 8 injected — 0.47%. Flipping this turns those 1708
-    /// silent prompts into retrieval attempts, and nothing measured so far says
-    /// what fraction of them would inject something worth the turn. The fixture
-    /// cannot answer it either: every floor from 0.40 up scores precision 1.000
-    /// on it, so it cannot rank them. Turn on [`user_prompt_submit_shadow`],
-    /// let it run a week, then decide on that data.
+    /// **Defaults to `false`: automatic recall.** Decided by the maintainer on
+    /// 2026-09-30 without a shadow week. Set `true` to opt out, so a prompt
+    /// without the sigil retrieves nothing. [`user_prompt_submit_shadow`]
+    /// measures the always-on path for a repo that opts out.
     ///
     /// [`user_prompt_submit_shadow`]: Self::user_prompt_submit_shadow
     pub user_prompt_submit_require_sigil: bool,
@@ -808,7 +804,7 @@ impl Default for HooksConfig {
             daemon_required: false,
             code_hits_in_pretooluse: true,
             doc_graph_in_recall: true,
-            user_prompt_submit_require_sigil: true,
+            user_prompt_submit_require_sigil: false,
             recall_auto_min_cosine: RECALL_AUTO_MIN_COSINE_DEFAULT,
             user_prompt_submit_shadow: false,
             recall_holdout_rate: 0.0,
@@ -1322,6 +1318,28 @@ mod tests {
         assert_eq!(cfg.recall_docs_limit, 3);
         // Confidence floor on by default so low-signal entries stay out of warmup.
         assert!((cfg.warmup_min_confidence - 0.25).abs() < f64::EPSILON);
+    }
+
+    /// Story 192-dfe3: automatic recall is the default. A config that does not
+    /// name the key follows the code, and naming `true` is the opt-out.
+    #[test]
+    fn automatic_recall_is_the_default_and_the_sigil_requirement_an_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(&path, "[hooks]\nrecall_limit = 7\n").unwrap();
+        let unset = Config::load(&path).unwrap();
+        assert!(!unset.hooks.user_prompt_submit_require_sigil);
+
+        std::fs::write(&path, "[hooks]\nuser_prompt_submit_require_sigil = true\n").unwrap();
+        let opted_out = Config::load(&path).unwrap();
+        assert!(opted_out.hooks.user_prompt_submit_require_sigil);
+
+        let template = Config::commented_default_toml().unwrap();
+        assert!(
+            template.contains("# user_prompt_submit_require_sigil = false"),
+            "the init template must state the shipped default"
+        );
     }
 
     #[test]

@@ -28,9 +28,9 @@ use and then runs on-device.
   (reminders, priors, and handoffs) still decay with age. Typed entries also
   carry provenance, revisions, confirmation signals, and explicit relations.
 - **Recall is not dependent on a lucky tool call** — hooks inject a compact
-  session warmup, provide opt-in prompt recall with a leading `*` by default,
-  redirect code searches to indexed symbols, and reindex after edits. Always-on
-  prompt recall is configurable.
+  session warmup, recall matching memory on every prompt (a leading `*` selects
+  a lower floor; `user_prompt_submit_require_sigil = true` restores sigil-only
+  recall), redirect code searches to indexed symbols, and reindex after edits.
 - **It learns from its own sessions** — an opt-in Stop hook distils the
   episode that just ended into a behavioral prior, promotes lessons that recur
   across sessions, injects them where their trigger fires, and settles each
@@ -211,11 +211,13 @@ entries are replaced and unrelated settings are preserved. Events:
 and opt-out behavior are in [docs/hooks.md](docs/hooks.md).
 
 Session start includes a compact power-feature reminder and points to
-`mdkb cheatsheet`. Per-prompt recall is quiet by default: prefix a prompt with
-`*` to inject matching memory, documents, and graph hints. MDKB removes the
-asterisk before search and before telemetry; it is an activation signal, not
-part of the query. Without it, the prompt passes through unchanged. Session
-warmup and the other enabled hooks do not require the sigil.
+`mdkb cheatsheet`. Per-prompt recall is automatic: every prompt is searched and
+matching memory, documents, and graph hints are injected when they clear the
+`0.50` floor. Prefix a prompt with `*` to search at the lower `0.40` floor. MDKB
+removes the asterisk before search and before telemetry; it is not part of the
+query. Set `user_prompt_submit_require_sigil = true` under `[hooks]` to opt out:
+a prompt without `*` then passes through unchanged. Session warmup and the
+other enabled hooks do not require the sigil.
 
 #### The two recall floors
 
@@ -228,16 +230,19 @@ it while a miss on a sigil prompt costs one search.
 | --- | --- | --- |
 | `search.memory.min_recall_cosine` | `0.40` | The floor for a `*`-prefixed prompt. Lowest floor admitting no labelled negative on the eval fixture. |
 | `hooks.recall_auto_min_cosine` | `0.50` | The floor for a prompt with no sigil. The recall plateau above `0.40` — see [docs/retrieval-eval.md](docs/retrieval-eval.md). |
-| `hooks.user_prompt_submit_require_sigil` | `true` | When `true`, a prompt without `*` retrieves nothing at all. Set `false` for always-on recall at the `0.50` floor. |
+| `hooks.user_prompt_submit_require_sigil` | `false` | Automatic recall: a prompt without `*` is searched at the `0.50` floor. Set `true` to opt out, so a prompt without `*` retrieves nothing at all. |
 | `hooks.user_prompt_submit_shadow` | `false` | Runs the always-on path on the skipped prompts, records the result, injects nothing. |
 
-**`require_sigil` is still `true`, and the way to change that is to measure
-first.** This repo logged 1716 UserPromptSubmit calls over 72 days and injected
-on 8 of them (0.47%); flipping the default turns the other 1708 into retrieval
-attempts, and the eval fixture cannot say how many of those are worth the turn —
-it scores precision 1.000 at every floor from 0.40 up, so it cannot rank them.
+**`require_sigil` defaults to `false`: automatic recall is on.** The maintainer
+chose it on 2026-09-30 without a shadow week. The measurement that would have
+gated it is still available: this repo logged 1716 UserPromptSubmit calls over
+72 days before the flip and injected on 8 of them (0.47%), and the eval fixture
+cannot say how many of the newly searched prompts are worth the turn — it
+scores precision 1.000 at every floor from 0.40 up, so it cannot rank them.
 
-Set `user_prompt_submit_shadow = true`, leave it for a week, then read
+To measure the always-on path while keeping sigil-only recall, set
+`user_prompt_submit_require_sigil = true` and `user_prompt_submit_shadow = true`,
+leave it for a week, then read
 `.mdkb/hook-events.jsonl`. Shadow rows carry `"outcome": "shadow"` and a
 `shadow` object:
 
@@ -577,11 +582,12 @@ Every recorded recall deletes events older than the configured retention window.
 `setup developer` preserves unrelated TOML settings and comments and supports
 `--dry-run`. Restart the daemon after enabling the profile so its cached
 repository configuration is reloaded. This profile does not make prompt recall
-always-on: the `*` opt-in sigil remains a separate content-selection choice.
+always-on: recall is already automatic by default, and the `*` sigil only selects
+the lower floor.
 
 The two reports answer different questions:
 
-- `mdkb metrics quality/latency` measures recalls after `*` activated them:
+- `mdkb metrics quality/latency` measures recalls:
   result count, score bands, repeated-query rate, and latency.
 - `mdkb stats` measures engagement. In the Hooks table, `user_prompt_submit`
   `Calls` is the denominator, `Fired` is successful activation, and `Hit%` is
