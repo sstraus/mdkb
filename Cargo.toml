@@ -132,6 +132,8 @@ https-server = ["http-server", "dep:rcgen", "dep:axum-server", "dep:rustls"]
 
 [dev-dependencies]
 assert_cmd = "2"
+# `hooks` gives tests `progress_handler`, which blocks a real query mid-run.
+rusqlite = { version = "0.40", features = ["bundled", "fallible_uint", "hooks"] }
 predicates = "3"
 # Enable the rmcp client only for tests so we can drive the daemon's
 # rmcp-over-unix endpoint with a real handshake.
