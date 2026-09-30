@@ -28,9 +28,10 @@ const TOP_N: usize = 50;
 fn rusage() -> (f64, u64) {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
-    let tv = |t: libc::timeval| t.tv_sec as f64 + f64::from(t.tv_usec) / 1e6;
-    // macOS reports ru_maxrss in bytes.
-    (tv(ru.ru_utime) + tv(ru.ru_stime), ru.ru_maxrss as u64)
+    let tv = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+    // macOS reports ru_maxrss in bytes, Linux in kilobytes.
+    let unit = if cfg!(target_os = "linux") { 1024 } else { 1 };
+    (tv(ru.ru_utime) + tv(ru.ru_stime), ru.ru_maxrss as u64 * unit)
 }
 
 fn quantiles(mut ms: Vec<f64>) -> Value {
