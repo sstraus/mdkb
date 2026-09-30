@@ -23,8 +23,8 @@ def both(a,b): # rrf over two legs, per-set
 def run(rows):
     for x in rows: print(fmt(x))
 dense={m:dense_rec(m)[0] for m in ('minilm-l6','e5-small','e5-large')}
-lex=lexrec('lex'); lexg=lexrec('lex-g')
-dg={m:dense_rec('g-'+m)[0] for m in ('minilm-l6','e5-small')}
+lex=lexrec('lex'); lexg=lexrec('lex-l')
+dg={m:dense_rec('l-'+m)[0] for m in ('minilm-l6','e5-small')}
 print('### GRID',lib.GRID)
 print('## baseline abs cosine'); 
 for m in dense: run([report(m+' abs',dense[m],top)])
@@ -37,12 +37,13 @@ print('## 3 hybrid RRF dense+lex (gate on fused score)')
 for m in ('minilm-l6','e5-small','e5-large'):
     H={s:rrf(dense[m][s],lex[s]) for s in NAMES+('tr_pos','tr_neg')}
     run([report(f'RRF {m}+bm25 fused top1',H,top)])
-print('## 4 local translation gemma4:e4b -> EN')
-for m in dg:
-    lib.GRID=0.01; run([report(f'gemma->{m} abs cosine',remap(dg[m],'gemma'),top)]); lib.GRID=0.0
-    H={s:rrf(dg[m][s],lexg[s]) for s in ('gemma_pos','gemma_neg','en_pos','en_neg','tr_pos','tr_neg','it_pos','it_neg')}
-    run([report(f'gemma->RRF({m}+bm25)',remap(H,'gemma'),top)])
-lib.GRID=0.1; run([report('gemma->BM25',remap(lexg,'gemma'),top)])
+for pfx,label in (('gemma','4a local gemma4:e4b'),('llm','4b OpenRouter gemini-2.5-flash-lite')):
+    print('##',label,'translation -> EN')
+    for m in dg:
+        lib.GRID=0.01; run([report(f'{pfx}->{m} abs cosine',remap(dg[m],pfx),top)]); lib.GRID=0.0
+        H={s:rrf(dg[m][s],lexg[s]) for s in (pfx+'_pos',pfx+'_neg','en_pos','en_neg','tr_pos','tr_neg','it_pos','it_neg')}
+        run([report(f'{pfx}->RRF({m}+bm25)',remap(H,pfx),top)])
+    lib.GRID=0.1; run([report(f'{pfx}->BM25',remap(lexg,pfx),top)])
 print('## 3b hybrid: RRF order, gate on dense cosine of the fused top-1 (absent from dense top-50 = -inf)')
 def hyb(dn,lx,mode):
     out=[]
