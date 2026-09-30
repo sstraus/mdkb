@@ -94,6 +94,9 @@ fn close_context_on_reported_corruption<T>(
             operation,
             "database statement reported index corruption — closing the connection for automatic recovery"
         );
+        if let Some(ctx) = slot.as_ref() {
+            crate::store::heal::forget_process_probe(&ctx.db_path);
+        }
         *slot = None;
     }
     result
@@ -704,7 +707,7 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
         if handle.doc_reindex_active.load(Ordering::Relaxed) {
             return Err(mcp_error("Repo initializing, retry shortly"));
         }
-        let ctx = match Context::open(&handle.root) {
+        let ctx = match Context::open_reusing_process_probe(&handle.root) {
             Ok(ctx) => ctx,
             Err(e) if e.is_not_found() => {
                 tracing::info!("Auto-initializing mdkb at {}", handle.root.display());
@@ -765,6 +768,9 @@ fn run_handle_memory_mutation<T>(
             error = %error,
             "index is corrupt after memory mutation — closing this connection so the next open can quarantine, salvage memory and rebuild"
         );
+        if let Some(ctx) = slot.as_ref() {
+            crate::store::heal::forget_process_probe(&ctx.db_path);
+        }
         *slot = None;
         return Err(mcp_error(format!(
             "Index is corrupt after {what}; the connection was closed for automatic recovery: {error}"

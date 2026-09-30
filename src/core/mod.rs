@@ -110,6 +110,7 @@ pub fn run_mutation<T>(
                 error = %e,
                 "index is corrupt — closing this connection so the next open can quarantine, salvage memory and rebuild"
             );
+            crate::store::heal::forget_process_probe(&db_path);
             *slot = None;
         }
     }
@@ -142,6 +143,7 @@ pub fn run_guarded_write<T>(
             operation = what,
             "index corruption observed during write — closing the context for automatic recovery"
         );
+        crate::store::heal::forget_process_probe(&db_path);
         *slot = None;
     }
     Some(result)
@@ -154,12 +156,14 @@ pub fn run_guarded_read<T>(
     what: &str,
     f: impl FnOnce(&Context) -> Result<T>,
 ) -> Option<Result<T>> {
+    let db_path = slot.as_ref()?.db_path.clone();
     let result = f(slot.as_ref()?);
     if result.as_ref().is_err_and(Error::is_index_corrupt) {
         tracing::error!(
             operation = what,
             "index corruption observed during read — closing the context for automatic recovery"
         );
+        crate::store::heal::forget_process_probe(&db_path);
         *slot = None;
     }
     Some(result)
@@ -195,7 +199,16 @@ impl Context {
 
     /// Open or create context at the given root.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        Self::open_impl(root.as_ref(), false)
+        Self::open_impl(root.as_ref(), false, false)
+    }
+
+    /// [`Self::open`] for a long-lived holder that reopens a store it already
+    /// served: skips the full-file integrity scan when this process probed the
+    /// file sound within [`crate::store::heal::CHECK_INTERVAL`]. Such a holder
+    /// must call [`crate::store::heal::forget_process_probe`] when it closes a
+    /// context over corruption; the `run_guarded_*` helpers do.
+    pub fn open_reusing_process_probe(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_impl(root.as_ref(), false, true)
     }
 
     /// Open while the caller already holds the project writer-admission lock.
@@ -204,10 +217,10 @@ impl Context {
     /// the same non-reentrant file lock again here would deadlock. All other
     /// callers must use [`Self::open`].
     pub fn open_writer_admitted(root: impl AsRef<Path>) -> Result<Self> {
-        Self::open_impl(root.as_ref(), true)
+        Self::open_impl(root.as_ref(), true, false)
     }
 
-    fn open_impl(root: &Path, writer_admitted: bool) -> Result<Self> {
+    fn open_impl(root: &Path, writer_admitted: bool, trust_process_probe: bool) -> Result<Self> {
         let mdkb_dir = namespace::store_dir(root)?;
 
         if namespace::active()?.is_some() {
@@ -296,7 +309,7 @@ impl Context {
         // Autoheal: quarantine a structurally-corrupt index before we build on
         // it, so the `Connection::open` below lands on a clean file. Throttled,
         // so this is cheap on the hot open path.
-        let quarantined = match crate::store::heal::ensure_sound_locked(&db_path)? {
+        let quarantined = match crate::store::heal::ensure_sound_locked(&db_path, trust_process_probe)? {
             crate::store::heal::Heal::Sound => None,
             crate::store::heal::Heal::Quarantined { corrupt_path } => Some(corrupt_path),
             crate::store::heal::Heal::CorruptInUse => {

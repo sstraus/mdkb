@@ -18,7 +18,9 @@
 //! and record a [`QuarantineReport`] so the loss is surfaced loudly (stderr now,
 //! `mdkb stats` + SessionStart warmup until the corrupt file is cleaned up).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
 use rusqlite::{Connection, params};
@@ -72,6 +74,30 @@ pub enum Heal {
     /// The caller must surface this: every mdkb process (daemon included) has to
     /// close before the next open can quarantine and rebuild.
     CorruptInUse,
+}
+
+/// When this process last probed each database sound, for [`ensure_sound_locked`].
+static PROCESS_VERIFIED: Mutex<Option<HashMap<PathBuf, SystemTime>>> = Mutex::new(None);
+
+fn process_verified_at(db_path: &Path) -> Option<SystemTime> {
+    let guard = PROCESS_VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref()?.get(db_path).copied()
+}
+
+fn set_process_verified(db_path: &Path, at: Option<SystemTime>) {
+    let mut guard = PROCESS_VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    match at {
+        Some(at) => map.insert(db_path.to_path_buf(), at),
+        None => map.remove(db_path),
+    };
+}
+
+/// Drop this process's "probed sound" memory of `db_path`. A long-lived holder
+/// calls it when it closes a context because it saw corruption, so the reopen
+/// that follows probes the file instead of trusting the earlier verdict.
+pub fn forget_process_probe(db_path: &Path) {
+    set_process_verified(db_path, None);
 }
 
 /// Append `suffix` to a path's file name (`index.sqlite` + `.corrupt-1` →
@@ -190,6 +216,7 @@ pub fn verify_and_mark(conn: &Connection, db_path: &Path) -> Result<()> {
         }
         Soundness::Corrupt { .. } => {
             invalidate_marker(db_path);
+            forget_process_probe(db_path);
             Err(crate::error::ErrorKind::IndexCorrupt {
                 path: db_path.to_path_buf(),
             }
@@ -910,15 +937,34 @@ fn sweep_expired_quarantines_at(mdkb_dir: &Path, retention: Duration, now_secs: 
 /// clean database in its place.
 pub fn ensure_sound(db_path: &Path) -> Result<Heal> {
     let _guard = crate::store::mutation_lock::acquire(db_path, "integrity-check")?;
-    ensure_sound_locked(db_path)
+    ensure_sound_locked(db_path, false)
 }
 
 /// Probe while the caller already holds the project mutation lock.
 ///
 /// Used by `Context::open`, which must keep the same lock through schema and
 /// virtual-table initialization so concurrent openers cannot race FTS setup.
-pub(crate) fn ensure_sound_locked(db_path: &Path) -> Result<Heal> {
-    ensure_sound_at_locked(db_path, CHECK_INTERVAL, SystemTime::now())
+///
+/// `trust_process_probe` lets a long-lived holder (the daemon reopening a repo
+/// its LRU evicted) skip the full-file `quick_check` when this same process
+/// probed the file sound within [`CHECK_INTERVAL`]. The marker cannot answer
+/// that: any write, including the daemon's own telemetry and the checkpoint on
+/// close, makes it stale, and the scan costs 0.9-3.0 s on a 733 MB index.
+pub(crate) fn ensure_sound_locked(db_path: &Path, trust_process_probe: bool) -> Result<Heal> {
+    let now = SystemTime::now();
+    if trust_process_probe
+        && process_verified_at(db_path)
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age < CHECK_INTERVAL)
+    {
+        return Ok(Heal::Sound);
+    }
+    let heal = ensure_sound_at_locked(db_path, CHECK_INTERVAL, now)?;
+    match heal {
+        Heal::Sound => set_process_verified(db_path, Some(now)),
+        _ => forget_process_probe(db_path),
+    }
+    Ok(heal)
 }
 
 /// [`ensure_sound`] with an injectable interval and clock, for tests.
@@ -1981,5 +2027,42 @@ mod tests {
         // continue the statement.
         assert_eq!(quote_ident("source_type"), "\"source_type\"");
         assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    fn tear(db: &Path) {
+        let len = std::fs::metadata(db).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(db).unwrap();
+        f.set_len(len / 2).unwrap();
+    }
+
+    /// Catches: a daemon that reopens a repo its LRU evicted re-runs the full
+    /// `quick_check` (0.9-3.0 s on a 733 MB index) inside the hook budget.
+    /// Catches the opposite bug too: a context closed over corruption that
+    /// keeps being trusted, so the next open never quarantines the torn file.
+    #[test]
+    fn a_process_probe_is_trusted_until_a_corruption_close_forgets_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        let _guard = crate::store::mutation_lock::acquire(&db, "test").unwrap();
+
+        assert!(matches!(
+            ensure_sound_locked(&db, true).unwrap(),
+            Heal::Sound
+        ));
+        tear(&db);
+        let _ = std::fs::remove_file(marker_path(&db));
+
+        // Probed sound by this process a moment ago: no second scan.
+        assert!(matches!(
+            ensure_sound_locked(&db, true).unwrap(),
+            Heal::Sound
+        ));
+        // A holder that closed over corruption says so; the next open scans.
+        forget_process_probe(&db);
+        assert!(matches!(
+            ensure_sound_locked(&db, true).unwrap(),
+            Heal::Quarantined { .. } | Heal::CorruptInUse
+        ));
     }
 }
