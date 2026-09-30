@@ -3604,6 +3604,33 @@ const CALL_GRAPH_HINT: &str = "\n💡 This looks like a call-graph query. Use `c
 const PRIOR_BLOCK_BUDGET_BYTES: usize =
     RECALL_PAYLOAD_BUDGET_BYTES - CALL_GRAPH_HINT.len() - "\n## mdkb: priors\n\n\n".len();
 
+/// Byte room for the trigger-matched lines of one injection. A line that does
+/// not fit is refused before anything records it as injected, so it stays
+/// eligible on a later call. Shared by every hook that injects trigger lines.
+struct LineBudget {
+    room: usize,
+}
+
+impl LineBudget {
+    /// `room` is what the block may take; the trailing session line is
+    /// reserved up front because it is added after the lines it follows.
+    fn new(room: usize, session_line: &str) -> Self {
+        Self {
+            room: room.saturating_sub(session_line.len() + 1),
+        }
+    }
+
+    fn admit(&mut self, line: &str) -> bool {
+        match self.room.checked_sub(line.len() + 1) {
+            Some(left) => {
+                self.room = left;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct HookPayload {
     bytes: usize,
@@ -5576,17 +5603,8 @@ async fn prompt_prior_block(
         Vec::new()
     };
     let mut lines = Vec::with_capacity(hits.len() + memory_hits.len());
-    // A line that does not fit the block budget is skipped before anything
-    // records it as injected, so it stays eligible on a later prompt.
     let session_line = format!("mdkb prior session: {session}");
-    let mut room = PRIOR_BLOCK_BUDGET_BYTES.saturating_sub(session_line.len() + 1);
-    let mut fits = |line: &str| match room.checked_sub(line.len() + 1) {
-        Some(left) => {
-            room = left;
-            true
-        }
-        None => false,
-    };
+    let mut budget = LineBudget::new(PRIOR_BLOCK_BUDGET_BYTES, &session_line);
     let mut tried = 0;
     for entry in memory_hits {
         if tried == max {
@@ -5594,7 +5612,7 @@ async fn prompt_prior_block(
         }
         let id = entry.id;
         let line = format!("mdkb memory [{id}]: {}", entry.content);
-        if !fits(&line) {
+        if !budget.admit(&line) {
             continue;
         }
         tried += 1;
@@ -5615,7 +5633,7 @@ async fn prompt_prior_block(
             }
         }
         let line = format!("mdkb prior [{}]: {}", c.id, c.lesson);
-        if !fits(&line) {
+        if !budget.admit(&line) {
             continue;
         }
         let prior_id = c.id.clone();
@@ -6208,8 +6226,17 @@ async fn hook_pre_tool_use_with_payload(
     // Trigger-matched behavioral priors are complementary to the search
     // redirect: surface any promoted prior whose trigger matches this tool call,
     // appended after the search block.
-    let prior_block =
-        pretool_prior_block(handle, tool_name, tool_input, &event_session(event)).await;
+    // The prior shares the body with the search block and the "\n\n" between.
+    let prior_room = RECALL_PAYLOAD_BUDGET_BYTES
+        .saturating_sub(search_block.as_ref().map_or(0, |search| search.len() + 2));
+    let prior_block = pretool_prior_block(
+        handle,
+        tool_name,
+        tool_input,
+        &event_session(event),
+        prior_room,
+    )
+    .await;
 
     let mut parts = Vec::new();
     if let Some(search) = &search_block {
@@ -6255,8 +6282,9 @@ async fn pretool_prior_block(
     tool: &str,
     tool_input: &Value,
     session: &str,
+    room: usize,
 ) -> Option<String> {
-    tool_prior_block(handle, tool, tool_input, false, None, session).await
+    tool_prior_block(handle, tool, tool_input, false, None, session, room).await
 }
 
 /// Promoted priors whose trigger matches this PostToolUse call.
@@ -6267,7 +6295,16 @@ async fn posttool_prior_block(
     error: Option<&str>,
     session: &str,
 ) -> Option<String> {
-    tool_prior_block(handle, tool, tool_input, true, error, session).await
+    tool_prior_block(
+        handle,
+        tool,
+        tool_input,
+        true,
+        error,
+        session,
+        RECALL_PAYLOAD_BUDGET_BYTES,
+    )
+    .await
 }
 
 /// Promoted priors whose trigger matches a tool call, formatted as a context
@@ -6285,6 +6322,7 @@ async fn tool_prior_block(
     after: bool,
     error: Option<&str>,
     session: &str,
+    room: usize,
 ) -> Option<String> {
     use crate::store::priors::{TriggerContext, match_injectable, record_tool_injection_once};
 
@@ -6343,24 +6381,39 @@ async fn tool_prior_block(
         Vec::new()
     };
     let mut lines = Vec::with_capacity(hits.len() + memory_hits.len());
-    for entry in memory_hits.into_iter().take(max) {
+    let session_line = format!("mdkb prior session: {session}");
+    let mut budget = LineBudget::new(room, &session_line);
+    let mut tried = 0;
+    for entry in memory_hits {
+        if tried == max {
+            break;
+        }
         let id = entry.id;
+        let line = format!("mdkb memory [{id}]: {}", entry.content);
+        if !budget.admit(&line) {
+            continue;
+        }
+        tried += 1;
         match crate::core::run_guarded_write(
             &mut ctx_guard,
             "tool memory trigger telemetry",
             |ctx| crate::store::memory::record_trigger_injection_once(&ctx.conn, &id, session, now),
         ) {
-            Some(Ok(true)) => lines.push(format!("mdkb memory [{id}]: {}", entry.content)),
+            Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
             Some(Err(error)) => tracing::warn!("record {label} memory trigger injection: {error}"),
         }
     }
     for c in &hits {
+        let line = format!("mdkb prior [{}]: {}", c.id, c.lesson);
+        if !budget.admit(&line) {
+            continue;
+        }
         let prior_id = c.id.clone();
         match crate::core::run_guarded_write(&mut ctx_guard, "tool prior telemetry", |ctx| {
             record_tool_injection_once(&ctx.conn, &prior_id, session, now)
         }) {
-            Some(Ok(true)) => lines.push(format!("mdkb prior [{}]: {}", c.id, c.lesson)),
+            Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
             Some(Err(error)) => tracing::warn!("record {label} prior injection: {error}"),
         }
@@ -6372,7 +6425,7 @@ async fn tool_prior_block(
         None
     } else {
         if !hits.is_empty() {
-            lines.push(format!("mdkb prior session: {session}"));
+            lines.push(session_line);
         }
         Some(lines.join("\n"))
     }
@@ -8459,6 +8512,36 @@ mod tests {
             "{} B",
             body.len()
         );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_skips_an_oversized_trigger_without_recording_it() {
+        // Catches: PostToolUse injecting a trigger memory past 2048 B, or
+        // recording the cut one as delivered so it never surfaces again.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(
+            &handle,
+            "post-big",
+            &"x".repeat(3000),
+            r#"[{"tool":"Bash"}]"#,
+        )
+        .await;
+        let out = hook_post_tool_use_impl(
+            &handle,
+            &json!({"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "post"}),
+        )
+        .await;
+        assert!(additional_context(&out).len() <= RECALL_PAYLOAD_BUDGET_BYTES);
+
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let recorded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_trigger_injections", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded, 0);
     }
 
     fn scored_hit(
@@ -14016,6 +14099,7 @@ mod tests {
             "Edit",
             &json!({"file_path": edit_path.to_string_lossy()}),
             "sess-inject",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await
         .expect("promoted prior must inject on a matching PreToolUse");
@@ -14031,6 +14115,7 @@ mod tests {
             "Edit",
             &json!({"file_path": edit_path.to_string_lossy()}),
             "sess-inject",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await;
         assert!(
@@ -14090,6 +14175,7 @@ mod tests {
             "Edit",
             &json!({"file_path": edit_path.to_string_lossy()}),
             "sess-inject",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await
         .expect("a newly matching prior must still inject");
@@ -14105,6 +14191,7 @@ mod tests {
             "Edit",
             &json!({"file_path": tmp.path().join("src/generated/other.rs").to_string_lossy()}),
             "sess-next",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await;
         let expected_next = format!(
@@ -14120,6 +14207,7 @@ mod tests {
             "Edit",
             &json!({"file_path": unrelated_path.to_string_lossy()}),
             "sess-inject",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await;
         assert!(
