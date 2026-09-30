@@ -381,9 +381,6 @@ mod tests {
         engine.one_shot.store(true, Ordering::Release);
         let error = engine.score("q", &["d".to_string()]).unwrap_err();
         assert_eq!(error.outcome(), "one_shot");
-        assert!(matches!(
-            *engine.load.lock().unwrap(),
-            Load::Idle
-        ));
+        assert!(matches!(*engine.load.lock().unwrap(), Load::Idle));
     }
 }
