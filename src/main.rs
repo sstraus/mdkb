@@ -339,7 +339,14 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
         raw_cwd.clone()
     } else {
         let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(std::path::PathBuf::from);
-        match mdkb::git::resolve_project_root(&raw_cwd, hint.as_deref()) {
+        // A lifecycle hook registers nothing nobody asked for: outside a project
+        // it ends quietly rather than anchor a store in a scratch dir.
+        let resolved = if is_lifecycle_hook(&cli.command) {
+            mdkb::git::resolve_registrable_root(&raw_cwd, hint.as_deref())
+        } else {
+            mdkb::git::resolve_project_root(&raw_cwd, hint.as_deref())
+        };
+        match resolved {
             Some(root) => root,
             // A lifecycle hook fires wherever the agent happens to be, which
             // includes directories no store may be anchored at. It has no

@@ -569,6 +569,20 @@ pub fn resolve_project_root(cwd: &Path, project_hint: Option<&Path>) -> Option<P
     }
 }
 
+/// [`resolve_project_root`] for callers that register a root nobody asked for: a
+/// lifecycle hook, or a root an MCP client declared.
+///
+/// Outside git, `resolve_project_root` falls back to `cwd`, which is right for a
+/// person running `mdkb` where they mean to work and wrong for a hook fired from
+/// an agent's scratch dir or from `~/Documents`: it anchored a store there and
+/// put the directory on the daemon's repo map for good (story 196-7e19, 14
+/// roots). Here the root must already be a project: a git repo, or a directory
+/// that holds a store. `None` means "skip", as it does for a refused anchor.
+pub fn resolve_registrable_root(cwd: &Path, project_hint: Option<&Path>) -> Option<PathBuf> {
+    let root = resolve_project_root(cwd, project_hint)?;
+    (find_git_root(&root).is_some() || root.join(".mdkb").is_dir()).then_some(root)
+}
+
 /// Discover ancestor `.mdkb/` stores **above** `primary`, for read-only
 /// layering (e.g. a nested git repo inheriting its parent repo's knowledge).
 ///
@@ -1061,6 +1075,35 @@ mod tests {
         // repo, so the guard stays out of the way — it refuses containers, not
         // ordinary non-git projects.
         assert_eq!(resolve_project_root(&drifted, None), Some(drifted));
+    }
+
+    #[test]
+    fn resolve_registrable_root_skips_a_scratch_dir_outside_git() {
+        let tmp = TempDir::new().unwrap();
+        let launch = tmp.path().join("launch");
+        let drifted = launch.join("deep/sub");
+        std::fs::create_dir_all(&drifted).unwrap();
+
+        // `resolve_project_root` anchors the bare cwd; a hook must not register it.
+        assert_eq!(resolve_project_root(&drifted, None), Some(drifted.clone()));
+        assert_eq!(resolve_registrable_root(&drifted, None), None);
+        assert_eq!(resolve_registrable_root(&drifted, Some(&launch)), None);
+    }
+
+    #[test]
+    fn resolve_registrable_root_keeps_git_repos_and_existing_stores() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let repo_sub = repo.join("src");
+        std::fs::create_dir_all(&repo_sub).unwrap();
+        assert_eq!(resolve_registrable_root(&repo_sub, None), Some(repo));
+
+        let proj = tmp.path().join("proj");
+        let proj_sub = proj.join("notes/deep");
+        std::fs::create_dir_all(&proj_sub).unwrap();
+        std::fs::create_dir_all(proj.join(".mdkb")).unwrap();
+        assert_eq!(resolve_registrable_root(&proj_sub, None), Some(proj));
     }
 
     // ── co-change history ───────────────────────────────────────────────────

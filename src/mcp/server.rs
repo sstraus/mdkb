@@ -381,10 +381,11 @@ impl McpServer {
                         // (nearest existing store → git root → launch dir) so
                         // MCP and hooks converge on one store per project even
                         // when the client launched in a sub-directory.
-                        let Some(anchor) = crate::git::resolve_project_root(&path, None) else {
+                        let Some(anchor) = crate::git::resolve_registrable_root(&path, None) else {
                             tracing::info!(
-                                "No store may be anchored at {}: it holds git repositories (or is \
-                                 $HOME). Kept as the fan-out scope; stores nested below it answer.",
+                                "No store may be anchored at {}: it is no git repo or store, holds git \
+                                 repositories, or is $HOME. Kept as the fan-out scope; stores nested \
+                                 below it answer.",
                                 path.display()
                             );
                             continue;
