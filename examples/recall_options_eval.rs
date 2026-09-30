@@ -55,7 +55,7 @@ fn read(path: &str) -> Value {
 /// against the Italian-set corpus, except `en_pos`/`en_neg` (the held-out
 /// memory fixture).
 struct Data {
-    corpus: Vec<(String, String, String)>, // id, file, text
+    corpus: Vec<(String, String, String)>,   // id, file, text
     memories: Vec<(String, String, String)>, // id, "title content", tags
     sets: BTreeMap<String, Vec<String>>,
     sample_chunks: Vec<String>,
@@ -171,7 +171,12 @@ fn embed(cmd_model: &str, d: &Data) -> Value {
             .map(|(_, _, t)| format!("{pp}{t}"))
             .collect(),
     );
-    let mems = embed_all(d.memories.iter().map(|(_, t, _)| format!("{pp}{t}")).collect());
+    let mems = embed_all(
+        d.memories
+            .iter()
+            .map(|(_, t, _)| format!("{pp}{t}"))
+            .collect(),
+    );
     let mut out = Map::new();
     for (set, queries) in &d.sets {
         let (pool, ids): (&[Vec<f32>], Vec<&str>) = if is_en(set) {
@@ -288,7 +293,11 @@ fn rerank(key: &str, d: &Data, pool_path: &str) -> Value {
         .corpus
         .iter()
         .map(|(id, _, t)| (id.as_str(), t.as_str()))
-        .chain(d.memories.iter().map(|(id, t, _)| (id.as_str(), t.as_str())))
+        .chain(
+            d.memories
+                .iter()
+                .map(|(id, t, _)| (id.as_str(), t.as_str())),
+        )
         .collect();
 
     // Latency on the hook path: one prompt against k real production chunks, warm.
