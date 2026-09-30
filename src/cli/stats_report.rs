@@ -1288,9 +1288,7 @@ mod tests {
         let mdkb_dir = env.ctx.db_path.parent().unwrap();
         let now = chrono::Utc::now().timestamp();
         let row = |event: &str, outcome: &str| {
-            format!(
-                r#"{{"event":"{event}","outcome":"{outcome}","elapsed_ms":1500,"ts":{now}}}"#
-            )
+            format!(r#"{{"event":"{event}","outcome":"{outcome}","elapsed_ms":1500,"ts":{now}}}"#)
         };
         let lines = [
             row("user_prompt_submit", "deadline"),

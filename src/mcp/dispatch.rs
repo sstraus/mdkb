@@ -6707,7 +6707,13 @@ pub async fn dispatch_call(
                     budget,
                 ),
             });
-            record_hook_call(&handle, tool_name).await;
+            // Telemetry takes the same store lock the stalled recall waited
+            // on; awaiting it here would hold the answer past the deadline.
+            let telemetry_handle = Arc::clone(&handle);
+            let telemetry_method = tool_name.to_string();
+            tokio::spawn(async move {
+                record_hook_call(&telemetry_handle, &telemetry_method).await;
+            });
             Ok(result)
         }
         "hook.post_tool_use" => {
@@ -11743,11 +11749,7 @@ mod tests {
 
     const RECALL_PROMPT: &str = "what do we know about the recall_gate_fixture topic content";
 
-    async fn prompt_hook(
-        handle: &Arc<RepoHandle>,
-        dctx: &DispatchContext,
-        session: &str,
-    ) -> Value {
+    async fn prompt_hook(handle: &Arc<RepoHandle>, dctx: &DispatchContext, session: &str) -> Value {
         dispatch_call(
             "hook.user_prompt_submit",
             json!({"prompt": RECALL_PROMPT, "session_id": session}),
