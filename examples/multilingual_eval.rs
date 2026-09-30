@@ -13,7 +13,7 @@
 use std::time::Instant;
 
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const TOP_K: usize = 10;
 
