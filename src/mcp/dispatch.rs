@@ -11892,6 +11892,96 @@ mod tests {
         assert_eq!(crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT, 1500);
     }
 
+    /// Run one prompt whose search finishes but whose prior lookup cannot get
+    /// the store: another waiter queues on the (FIFO) ctx mutex right behind the
+    /// search's guard and holds it past the deadline. Returns the hook answer.
+    async fn prompt_cut_after_search(
+        handle: &Arc<RepoHandle>,
+        dctx: &DispatchContext,
+        session: &str,
+    ) -> Value {
+        let held = Arc::clone(&handle.ctx).lock_owned().await;
+        let ctx = Arc::clone(&handle.ctx);
+        let mut blocker = None;
+        let (result, ()) = tokio::join!(prompt_hook(handle, dctx, session), async {
+            // The hook is queued on the store by now; queue the blocker behind it.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            // The hook takes the store once per phase and tokio's mutex is
+            // FIFO: the first blocker takes it right after the hook's first
+            // acquisition, then queues the second behind the hook's search
+            // acquisition, so it is the prior lookup that stalls.
+            blocker = Some(tokio::spawn(async move {
+                let first = Arc::clone(&ctx).lock_owned().await;
+                // Outlast the hook's embedding, which runs off the lock, so the
+                // hook is queued for the search before the second blocker is.
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                let second = tokio::spawn(async move {
+                    let guard = ctx.lock_owned().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                    drop(guard);
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                drop(first);
+                second.await.unwrap();
+            }));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(held);
+        });
+        blocker.unwrap().await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn entries_cut_by_the_deadline_are_not_marked_as_delivered() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 1200;
+        });
+        seed_memory_entry(&handle, "cut-topic").await;
+        let dctx = make_dctx();
+
+        let cut = prompt_cut_after_search(&handle, &dctx, "cut").await;
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["outcome"], "deadline", "{row}");
+        assert!(
+            row["phases"]["search"].is_u64(),
+            "precondition: the run must be cut after the search, not before it: {row}"
+        );
+        assert_eq!(cut, json!({}));
+
+        // Nothing was delivered, so the next prompt of the session must still
+        // get the entry. Catches: dedup state marked at retrieval time, so a
+        // cut run silences the entry for the rest of the session.
+        let next = prompt_hook(&handle, &dctx, "cut").await;
+        assert!(
+            additional_context(&next).contains("cut-topic"),
+            "entry silenced by a run that never answered: {next}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_run_cut_by_the_deadline_is_logged_as_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = true;
+            config.hooks.user_prompt_submit_shadow = true;
+            config.hooks.user_prompt_submit_deadline_ms = 1200;
+        });
+        seed_memory_entry(&handle, "shadow-cut-topic").await;
+
+        prompt_cut_after_search(&handle, &make_dctx(), "shadow-cut").await;
+
+        // Catches: the shadow row arm hardcodes outcome "shadow", so a cut
+        // shadow run is invisible to `mdkb stats` deadline hits.
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert!(
+            row["phases"]["search"].is_u64(),
+            "precondition: the run must be cut after the search, not before it: {row}"
+        );
+        assert_eq!(row["outcome"], "deadline", "{row}");
+    }
+
     #[tokio::test]
     async fn pre_tool_log_attributes_a_search_redirect_and_prior_separately() {
         let tmp = TempDir::new().unwrap();
