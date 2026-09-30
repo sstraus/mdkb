@@ -219,6 +219,16 @@ pub const RECALL_AUTO_MIN_COSINE_DEFAULT: f32 = 0.50;
 /// a corpus that measures differently can move it.
 pub const RECALL_DOCS_MIN_COSINE_DEFAULT: f32 = 0.55;
 
+/// Hard deadline for a `UserPromptSubmit` hook, in milliseconds.
+///
+/// Measured 2026-09-30 from `hook-events.jsonl` in four stores (98 rows that
+/// injected recall): the warm rows cluster at 5 ms – 1.25 s (about 90 % of the
+/// mdkb, ego and orchestrator rows and 45 of 51 tuicommander rows), and the rows
+/// taken while the host ran at load 23–28 sit at 1.96 s – 32.7 s. 1500 ms clears
+/// the warm cluster's p95 and cuts the loaded tail, which is the one the user
+/// prompt waited for. Recall is a hint; the prompt is not.
+pub const USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT: u64 = 1500;
+
 /// Memory index settings (Phase 6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -731,6 +741,13 @@ pub struct HooksConfig {
     /// to decide what counts as slow enough to look at.
     pub latency_budget_ms: u64,
 
+    /// Hard deadline in milliseconds for the `UserPromptSubmit` hook. When
+    /// recall has not finished by then the hook answers with nothing and logs
+    /// `outcome = "deadline"`, so a loaded host delays the prompt by at most
+    /// this much. `0` disables the deadline. Unlike `latency_budget_ms` this one
+    /// cuts the work short. See [`USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT`].
+    pub user_prompt_submit_deadline_ms: u64,
+
     /// Minimum confidence for a warmup entry to be injected. `0.0` (default)
     /// disables the floor — every access-ranked entry is eligible.
     pub warmup_min_confidence: f64,
@@ -833,6 +850,7 @@ impl Default for HooksConfig {
             recall_docs_limit: 3,
             recall_docs_min_cosine: RECALL_DOCS_MIN_COSINE_DEFAULT,
             latency_budget_ms: 200,
+            user_prompt_submit_deadline_ms: USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT,
             warmup_min_confidence: 0.25,
             daemon_required: false,
             code_hits_in_pretooluse: true,

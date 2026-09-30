@@ -4889,6 +4889,29 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     shadow: &mut Option<ShadowRecall>,
     payload_parts: &mut Vec<(&'static str, usize)>,
 ) -> Value {
+    hook_user_prompt_submit_impl_timed(
+        handle,
+        prompt,
+        session,
+        dedup,
+        shadow,
+        payload_parts,
+        &mut PhaseTimings::new(),
+    )
+    .await
+}
+
+/// The recall run, marking `phases` as it goes. The caller owns `phases`, so a
+/// deadline that drops this future still leaves the phases it reached readable.
+async fn hook_user_prompt_submit_impl_timed(
+    handle: &RepoHandle,
+    prompt: &str,
+    session: &str,
+    dedup: Option<(&DispatchContext, String)>,
+    shadow: &mut Option<ShadowRecall>,
+    payload_parts: &mut Vec<(&'static str, usize)>,
+    phases: &mut PhaseTimings,
+) -> Value {
     use crate::cli::hook_logic::prompt_wants_call_graph;
 
     let cfg = &handle.config.hooks;
@@ -4966,13 +4989,16 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         if ensure_handle_context(handle).await.is_err() {
             return json!({});
         }
+        phases.mark("context");
         // Embed the raw prompt off the runtime BEFORE locking — this is the
         // per-turn UserPromptSubmit path, so holding the ctx mutex across
         // CPU-bound ONNX inference would stall a worker every turn. `q`
         // (build_recall_query) is a pre-built OR-expression fed to the FTS leg
         // via `_fts`; embedding the FTS operators would be noise.
         query_embedding = embed_query_off_lock(prompt).await;
+        phases.mark("embed");
         let mut ctx_guard = handle.ctx.lock().await;
+        phases.mark("lock_wait");
         let limit = cfg.recall_limit.max(1);
         let search_t0 = std::time::Instant::now();
         let search = crate::core::run_guarded_read(&mut ctx_guard, "hook memory recall", |ctx| {
@@ -5101,6 +5127,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             }
         }
         drop(ctx_guard);
+        phases.mark("search");
 
         // prior-specific gate: only high-confidence priors surface
         let now = chrono::Utc::now().timestamp();
@@ -5220,6 +5247,8 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         }
     }
 
+    phases.mark("enrich");
+
     // A doc reachable both ways is emitted once, as a graph neighbor: that block
     // carries the relation label, which the search hit cannot reconstruct.
     let neighbor_paths: std::collections::HashSet<&str> =
@@ -5261,6 +5290,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
 
     // Trigger-matched behavioral priors whose prompt pattern fires here.
     let prior_block = prompt_prior_block(handle, prompt, session, dedup.as_ref()).await;
+    phases.mark("prior");
 
     let nothing_found = results.is_empty() && doc_lines.is_empty() && related.is_empty();
     if nothing_found && prior_block.is_none() && !wants_cg {
@@ -6622,18 +6652,33 @@ pub async fn dispatch_call(
             let t0 = std::time::Instant::now();
             let mut shadow = None;
             let mut payload_parts = Vec::new();
-            let result = hook_user_prompt_submit_impl_with_dedup(
+            let mut phases = PhaseTimings::new();
+            let run = hook_user_prompt_submit_impl_timed(
                 &handle,
                 prompt,
                 &session,
                 Some((dctx, key)),
                 &mut shadow,
                 &mut payload_parts,
-            )
-            .await;
+                &mut phases,
+            );
+            // Recall is a hint and the prompt is not: past the deadline the
+            // hook answers with nothing. Dropping the future releases the
+            // store lock; `phases` keeps what the run reached.
+            let deadline = handle.config.hooks.user_prompt_submit_deadline_ms;
+            let (result, timed_out) = if deadline == 0 {
+                (run.await, false)
+            } else {
+                match tokio::time::timeout(std::time::Duration::from_millis(deadline), run).await {
+                    Ok(result) => (result, false),
+                    Err(_) => (json!({}), true),
+                }
+            };
             let payload = HookPayload::from_parts(&result, payload_parts);
             let ms = t0.elapsed().as_millis() as u64;
-            let outcome = if result == json!({}) {
+            let outcome = if timed_out {
+                "deadline"
+            } else if result == json!({}) {
                 "skipped"
             } else {
                 "fired"
@@ -6651,12 +6696,12 @@ pub async fn dispatch_call(
                         budget,
                     );
                 }
-                None => log_hook_event_full(
+                None => log_hook_event_with_phases(
                     root,
                     "user_prompt_submit",
                     outcome,
                     None,
-                    None,
+                    &phases,
                     payload.as_ref(),
                     ms,
                     budget,
@@ -11694,6 +11739,155 @@ mod tests {
         assert_eq!(row["payload_blocks"]["prior"], context.len());
         assert!(row["payload_blocks"].get("related_docs").is_none());
         assert!(row.to_string().find("fake line").is_none());
+    }
+
+    const RECALL_PROMPT: &str = "what do we know about the recall_gate_fixture topic content";
+
+    async fn prompt_hook(
+        handle: &Arc<RepoHandle>,
+        dctx: &DispatchContext,
+        session: &str,
+    ) -> Value {
+        dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt": RECALL_PROMPT, "session_id": session}),
+            Arc::clone(handle),
+            dctx,
+        )
+        .await
+        .expect("hook")
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_returns_at_the_deadline_when_recall_stalls() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 150;
+        });
+        seed_memory_entry(&handle, "stalled-topic").await;
+
+        // Another session's prompt holds the store: recall cannot finish.
+        let held = handle.ctx.lock().await;
+        let t0 = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_hook(&handle, &make_dctx(), "stalled"),
+        )
+        .await
+        .expect("the hook must not wait for the store");
+        let waited = t0.elapsed();
+        drop(held);
+
+        assert_eq!(result, json!({}), "no recall block past the deadline");
+        assert!(
+            waited < std::time::Duration::from_millis(1000),
+            "returned after {waited:?}, deadline was 150 ms"
+        );
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["outcome"], "deadline");
+    }
+
+    #[tokio::test]
+    async fn concurrent_prompts_share_one_deadline_instead_of_queueing() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 300;
+        });
+        seed_memory_entry(&handle, "queued-topic").await;
+        let dctx = make_dctx();
+
+        let held = handle.ctx.lock().await;
+        let t0 = std::time::Instant::now();
+        let (a, b) = tokio::join!(
+            prompt_hook(&handle, &dctx, "one"),
+            prompt_hook(&handle, &dctx, "two")
+        );
+        let waited = t0.elapsed();
+        drop(held);
+
+        assert_eq!((a, b), (json!({}), json!({})));
+        assert!(
+            waited < std::time::Duration::from_millis(550),
+            "two prompts took {waited:?}; each must meet its own 300 ms deadline, not add up"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_row_names_the_phases_reached_and_not_the_ones_cut() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 100;
+        });
+        seed_memory_entry(&handle, "phase-topic").await;
+
+        let held = handle.ctx.lock().await;
+        prompt_hook(&handle, &make_dctx(), "phases").await;
+        drop(held);
+
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["outcome"], "deadline");
+        let phases = row.get("phases");
+        assert!(
+            phases.is_none_or(|p| p.get("search").is_none()),
+            "recall never got the store, so no search phase: {row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fired_row_splits_elapsed_into_phases() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "split-topic").await;
+
+        let result = prompt_hook(&handle, &make_dctx(), "split").await;
+        assert!(additional_context(&result).contains("split-topic"));
+
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        for phase in ["embed", "search"] {
+            assert!(
+                row["phases"][phase].is_u64(),
+                "phase {phase} missing from {row}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_zero_disables_the_cut() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 0;
+        });
+        seed_memory_entry(&handle, "unbounded-topic").await;
+
+        let held = Arc::clone(&handle.ctx).lock_owned().await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            drop(held);
+        });
+        let result = prompt_hook(&handle, &make_dctx(), "unbounded").await;
+        release.await.unwrap();
+
+        assert!(
+            additional_context(&result).contains("unbounded-topic"),
+            "0 waits for the store: {result}"
+        );
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["outcome"], "fired");
+    }
+
+    #[test]
+    fn default_deadline_is_the_documented_constant() {
+        assert_eq!(
+            crate::config::Config::default()
+                .hooks
+                .user_prompt_submit_deadline_ms,
+            crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT
+        );
+        assert_eq!(crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT, 1500);
     }
 
     #[tokio::test]
