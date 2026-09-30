@@ -14163,4 +14163,98 @@ mod tests {
             single * (N as u32)
         );
     }
+    /// Stalls the first statement step of the next query on this store for
+    /// `ms`, from inside SQLite, on whichever thread runs it.
+    async fn stall_next_query(handle: &RepoHandle, ms: u64) {
+        let guard = handle.ctx.lock().await;
+        let slow = std::sync::atomic::AtomicBool::new(true);
+        let _ = guard.as_ref().unwrap().conn.progress_handler(
+            1,
+            Some(move || {
+                if slow.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                false
+            }),
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_behind_a_cut_search_meets_its_own_deadline() {
+        // Catches: the lock wait sits outside the timed part (or the next
+        // prompt waits for the cut search to end), so prompt 2 answers only
+        // when prompt 1's orphaned search finishes.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 150;
+        });
+        seed_memory_entry(&handle, "behind-topic").await;
+        stall_next_query(&handle, 2000).await;
+        let dctx = make_dctx();
+
+        let first = prompt_hook(&handle, &dctx, "first").await;
+        assert_eq!(first, json!({}));
+        let t0 = std::time::Instant::now();
+        let second = prompt_hook(&handle, &dctx, "second").await;
+        let waited = t0.elapsed();
+
+        assert_eq!(second, json!({}));
+        assert!(
+            waited < std::time::Duration::from_millis(700),
+            "second prompt took {waited:?} behind a cut search; its deadline was 150 ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_is_released_after_a_cut_search_ends() {
+        // Catches: the orphaned blocking search leaks the store guard (moved
+        // into a task that is never joined or panics past it), so MCP tools and
+        // indexer writes block forever on `ctx.lock()`.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 150;
+        });
+        seed_memory_entry(&handle, "release-topic").await;
+        stall_next_query(&handle, 800).await;
+
+        let result = prompt_hook(&handle, &make_dctx(), "release").await;
+        assert_eq!(result, json!({}));
+
+        let t0 = std::time::Instant::now();
+        let acquired =
+            tokio::time::timeout(std::time::Duration::from_secs(5), handle.ctx.lock()).await;
+        assert!(
+            acquired.is_ok(),
+            "store still locked {:?} after the cut search should have ended",
+            t0.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_after_a_cut_search_recalls_normally() {
+        // Catches: a cut run leaves state behind (dedup mark, repeat
+        // fingerprint, ledger row) so the same session's next prompt is
+        // silenced even though nothing was ever injected.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 400;
+        });
+        seed_memory_entry(&handle, "after-cut-topic").await;
+        stall_next_query(&handle, 1200).await;
+        let dctx = make_dctx();
+
+        let cut = prompt_hook(&handle, &dctx, "same-session").await;
+        assert_eq!(cut, json!({}));
+        // Let the orphaned search end and release the store.
+        drop(handle.ctx.lock().await);
+
+        let again = prompt_hook(&handle, &dctx, "same-session").await;
+        assert!(
+            additional_context(&again).contains("after-cut-topic"),
+            "next prompt after a cut run got nothing: {again}"
+        );
+    }
 }
