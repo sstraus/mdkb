@@ -354,6 +354,11 @@ recall_docs_min_cosine = 0.55   # a doc must score this cosine or be quoted by t
 # what gets flagged, not what gets emitted.
 latency_budget_ms = 200
 
+# Hard deadline for UserPromptSubmit in milliseconds. Unlike the budget it cuts
+# the work short: past it the hook answers with nothing and logs
+# outcome = "deadline". 0 disables the deadline.
+user_prompt_submit_deadline_ms = 1500
+
 # Require daemon delivery instead of using the in-process fallback.
 daemon_required = false
 
@@ -485,6 +490,13 @@ does, which would corrupt the counters it is there to produce.
 Every hook run appends a row to `.mdkb/hook-events.jsonl`; a run that exceeds
 `latency_budget_ms` is copied to `.mdkb/hook-slow.jsonl` as well. Exceeding the
 budget truncates nothing — the value only decides what gets flagged.
+
+`UserPromptSubmit` is the exception: `user_prompt_submit_deadline_ms` (default
+1500, `0` disables) stops recall when it has not finished, answers with nothing
+and logs `outcome = "deadline"`. `mdkb stats` counts these as deadline hits.
+Its rows carry a `phases` object (`context`, `embed`, `lock_wait`, `search`,
+`enrich`, `prior`, in ms) naming the phases the run reached, so a deadline row
+shows where the time went.
 
 SessionStart rows carry the split of `elapsed_ms` across the six phases, in the
 order they run:
