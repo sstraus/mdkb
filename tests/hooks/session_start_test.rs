@@ -17,12 +17,31 @@ fn mdkb_bin() -> Command {
 
 fn run_session_start_in(dir: &Path, stdin_json: &str) -> (i32, String) {
     let home = tempfile::tempdir().expect("isolated hook home");
+    // SessionStart appends doctor findings to the warmup. An empty home has no
+    // hook registration, so the `hooks.drift` finding would depend on whether
+    // the machine running the test happens to have hooks registered: register
+    // them in the fixture home, through the real command, and pin the profile dir.
+    let registered = mdkb_bin()
+        .args(["setup", "hooks", "claude", "--scope", "user"])
+        .current_dir(home.path())
+        .env("MDKB_NO_DAEMON", "1")
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .output()
+        .expect("register hooks in the fixture home");
+    assert!(
+        registered.status.success(),
+        "fixture hook registration failed: {}",
+        String::from_utf8_lossy(&registered.stderr)
+    );
     let mut child = mdkb_bin()
         .args(["hook", "session-start"])
         .current_dir(dir)
         .env("MDKB_NO_DAEMON", "1")
         .env("HOME", home.path())
         .env("USERPROFILE", home.path())
+        .env_remove("CLAUDE_CONFIG_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
