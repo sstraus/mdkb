@@ -2066,3 +2066,175 @@ mod tests {
         ));
     }
 }
+
+/// Attacks on the in-process "probed sound" record (story 201-481e).
+#[cfg(test)]
+mod process_probe_attacks {
+    use super::*;
+
+    fn make_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, blob TEXT);
+             PRAGMA journal_mode = DELETE;",
+        )
+        .unwrap();
+        let payload = "x".repeat(2000);
+        for i in 0..200 {
+            conn.execute("INSERT INTO t (id, blob) VALUES (?1, ?2)", (i, &payload))
+                .unwrap();
+        }
+    }
+
+    fn tear(db: &Path) {
+        let len = std::fs::metadata(db).unwrap().len();
+        let f = std::fs::OpenOptions::new().write(true).open(db).unwrap();
+        f.set_len(len / 2).unwrap();
+    }
+
+    fn probed(heal: Heal) -> bool {
+        matches!(heal, Heal::Quarantined { .. } | Heal::CorruptInUse)
+    }
+
+    /// Catches: a fresh-store open (no file, nothing probed) is recorded as
+    /// "probed sound", so a damaged file that appears at that path later (a
+    /// restore, a sync, a copy) is trusted for CHECK_INTERVAL on reopen.
+    #[test]
+    fn an_absent_database_is_not_recorded_as_probed_sound() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let _guard = crate::store::mutation_lock::acquire(&db, "test").unwrap();
+
+        assert!(matches!(
+            ensure_sound_locked(&db, true).unwrap(),
+            Heal::Sound
+        ));
+        make_db(&db);
+        tear(&db);
+        let _ = std::fs::remove_file(marker_path(&db));
+
+        assert!(probed(ensure_sound_locked(&db, true).unwrap()));
+    }
+
+    /// Catches: the record ignores `invalidate_marker`, the existing signal
+    /// "an index-wide write started and may not have finished". A write that
+    /// fails without a corruption code leaves the marker removed; the reopen
+    /// must probe, not trust the record from before the write.
+    #[test]
+    fn an_invalidated_marker_overrides_the_process_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        let _guard = crate::store::mutation_lock::acquire(&db, "test").unwrap();
+
+        assert!(matches!(
+            ensure_sound_locked(&db, true).unwrap(),
+            Heal::Sound
+        ));
+        invalidate_marker(&db);
+        tear(&db);
+
+        assert!(probed(ensure_sound_locked(&db, true).unwrap()));
+    }
+
+    /// Catches: the record is keyed by path only, so a different file put at
+    /// the same path (renamed over the store) inherits the verdict of the file
+    /// that was probed.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_replaced_under_the_record_is_probed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        let _guard = crate::store::mutation_lock::acquire(&db, "test").unwrap();
+
+        assert!(matches!(
+            ensure_sound_locked(&db, true).unwrap(),
+            Heal::Sound
+        ));
+        let other = dir.path().join("other.sqlite");
+        make_db(&other);
+        tear(&other);
+        std::fs::rename(&other, &db).unwrap();
+        let _ = std::fs::remove_file(marker_path(&db));
+
+        assert!(probed(ensure_sound_locked(&db, true).unwrap()));
+    }
+
+    /// Catches: the record is one global flag instead of one entry per store,
+    /// so forgetting (or trusting) repo A decides repo B's reopen.
+    #[test]
+    fn the_record_is_per_store_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.sqlite");
+        let b = dir.path().join("b.sqlite");
+        make_db(&a);
+        make_db(&b);
+        let _ga = crate::store::mutation_lock::acquire(&a, "test").unwrap();
+        let _gb = crate::store::mutation_lock::acquire(&b, "test").unwrap();
+        for db in [&a, &b] {
+            assert!(matches!(
+                ensure_sound_locked(db, true).unwrap(),
+                Heal::Sound
+            ));
+            tear(db);
+            let _ = std::fs::remove_file(marker_path(db));
+        }
+
+        forget_process_probe(&a);
+
+        assert!(probed(ensure_sound_locked(&a, true).unwrap()));
+        assert!(
+            matches!(ensure_sound_locked(&b, true).unwrap(), Heal::Sound),
+            "b's record must survive a's forget"
+        );
+    }
+
+    /// Catches: an expired record (older than CHECK_INTERVAL) still skips the scan.
+    #[test]
+    fn an_expired_record_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        let _guard = crate::store::mutation_lock::acquire(&db, "test").unwrap();
+        tear(&db);
+        let _ = std::fs::remove_file(marker_path(&db));
+        let stale = SystemTime::now() - CHECK_INTERVAL - Duration::from_secs(1);
+        set_process_verified(&db, Some(stale));
+
+        assert!(probed(ensure_sound_locked(&db, true).unwrap()));
+    }
+
+    /// Catches: a record stamped in the future (clock stepped back) is trusted
+    /// for an unbounded time because the age subtraction fails open.
+    #[test]
+    fn a_record_from_the_future_is_not_trusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        let _guard = crate::store::mutation_lock::acquire(&db, "test").unwrap();
+        tear(&db);
+        let _ = std::fs::remove_file(marker_path(&db));
+        set_process_verified(&db, Some(SystemTime::now() + Duration::from_secs(3600)));
+
+        assert!(probed(ensure_sound_locked(&db, true).unwrap()));
+    }
+
+    /// Catches: `trust_process_probe = false` (one-shot CLI, `ensure_sound`)
+    /// honouring a record some earlier daemon-style open left in this process.
+    #[test]
+    fn the_untrusting_open_ignores_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        let _guard = crate::store::mutation_lock::acquire(&db, "test").unwrap();
+        assert!(matches!(
+            ensure_sound_locked(&db, true).unwrap(),
+            Heal::Sound
+        ));
+        tear(&db);
+        let _ = std::fs::remove_file(marker_path(&db));
+
+        assert!(probed(ensure_sound_locked(&db, false).unwrap()));
+    }
+}
