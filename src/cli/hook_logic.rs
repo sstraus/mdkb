@@ -36,6 +36,16 @@ pub fn prompt_is_wrapup(prompt: &str) -> bool {
         .any(|m| trimmed.starts_with(m) || trimmed.eq_ignore_ascii_case(m.trim_start_matches('/')))
 }
 
+/// Openers of the text Claude Code injects as a user turn for a finished
+/// background task. It is system-generated, not a question, and its words
+/// match whatever the task was about.
+const NOTIFICATION_MARKERS: &[&str] = &["<task-notification>", "[SYSTEM NOTIFICATION"];
+
+pub fn prompt_is_system_notification(prompt: &str) -> bool {
+    let trimmed = prompt.trim_start();
+    NOTIFICATION_MARKERS.iter().any(|m| trimmed.starts_with(m))
+}
+
 // ── Path utilities ────────────────────────────────────────────────────────────
 
 /// Tool names whose output may modify on-disk files we want to reindex.
