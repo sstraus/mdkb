@@ -170,7 +170,7 @@ fn resolve_root(explicit: Option<PathBuf>) -> Option<PathBuf> {
     } else {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from);
-        crate::git::resolve_project_root(&cwd, hint.as_deref())?
+        crate::git::resolve_registrable_root(&cwd, hint.as_deref())?
     };
     Some(resolved.canonicalize().unwrap_or(resolved))
 }
@@ -198,7 +198,7 @@ pub fn resolve_hook_root(event: &Value, explicit: Option<PathBuf>) -> Option<Pat
         let cwd = PathBuf::from(cwd);
         if cwd.is_absolute() && cwd.is_dir() {
             let hint = std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from);
-            let resolved = crate::git::resolve_project_root(&cwd, hint.as_deref())?;
+            let resolved = crate::git::resolve_registrable_root(&cwd, hint.as_deref())?;
             return Some(resolved.canonicalize().unwrap_or(resolved));
         }
     }

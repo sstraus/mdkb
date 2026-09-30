@@ -306,3 +306,19 @@ fn session_start_on_uninitialized_project_returns_silence() {
         "an uninitialized project must stay silent despite an ancestor store, got: {stdout}"
     );
 }
+
+/// Story 196-7e19: a hook fired from an agent's scratch directory (no git, no
+/// store above it) used to anchor a store there and register the directory on
+/// the daemon's repo map for good.
+#[test]
+fn session_start_in_a_scratch_dir_outside_git_creates_no_store() {
+    let scratch = tempfile::tempdir().expect("scratch dir");
+    let (code, stdout) = run_session_start_in(scratch.path(), "");
+
+    assert_eq!(code, 0, "hook must never block");
+    assert!(stdout.trim().is_empty(), "nothing to say, got: {stdout}");
+    assert!(
+        !scratch.path().join(".mdkb").exists(),
+        "a scratch dir must not gain a store from a hook"
+    );
+}
