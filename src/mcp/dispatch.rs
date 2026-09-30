@@ -8233,6 +8233,234 @@ mod tests {
         assert_eq!(recorded, vec!["small-rule".to_string()]);
     }
 
+    async fn seed_trigger_memory(handle: &RepoHandle, id: &str, content: &str, trigger: &str) {
+        ensure_handle_context(handle).await.unwrap();
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at, triggers)
+             VALUES (?1, ?1, ?2, 'decision', '[]', 1, 1, ?3)",
+            rusqlite::params![id, content, trigger],
+        )
+        .unwrap();
+    }
+
+    async fn prompt_body(
+        dctx: &DispatchContext,
+        handle: &Arc<RepoHandle>,
+        prompt: &str,
+        session: &str,
+    ) -> String {
+        let out = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt": prompt, "session_id": session}),
+            Arc::clone(handle),
+            dctx,
+        )
+        .await
+        .unwrap();
+        additional_context(&out).to_string()
+    }
+
+    #[tokio::test]
+    async fn payload_budget_counts_bytes_of_multibyte_titles() {
+        // Catches: the trim measuring chars instead of bytes, so titles of
+        // 4-byte characters leave an injection several times over 2048 B.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 10;
+        });
+        for i in 0..10 {
+            seed_document(
+                &handle,
+                &format!("docs/quarantine-{i}.md"),
+                &format!("Quarantine autoheal {i} {}", "🦀".repeat(60)),
+                "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            )
+            .await;
+        }
+        let body = prompt_body(
+            &make_dctx(),
+            &handle,
+            "quarantine autoheal rebuilding",
+            "mb",
+        )
+        .await;
+        assert!(
+            body.contains("docs/quarantine-"),
+            "fixture must inject docs: {body}"
+        );
+        assert!(body.len() <= 2048, "{} B: {body}", body.len());
+    }
+
+    #[tokio::test]
+    async fn payload_never_exceeds_the_budget_for_any_trigger_memory_size() {
+        // Catches: an off-by-one in the priors-block budget (header, newlines or
+        // call-graph hint miscounted), visible only at one content length.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(&handle, "sweep", "x", r#"[{"prompt_contains":"zzsweep"}]"#).await;
+        let dctx = make_dctx();
+        for len in 1800..=2060usize {
+            {
+                let guard = handle.ctx.lock().await;
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .conn
+                    .execute(
+                        "UPDATE memory_entries SET content = ?1 WHERE id = 'sweep'",
+                        rusqlite::params!["y".repeat(len)],
+                    )
+                    .unwrap();
+            }
+            let body =
+                prompt_body(&dctx, &handle, "where is zzsweep", &format!("sweep-{len}")).await;
+            assert!(body.len() <= 2048, "content {len} B gave {} B", body.len());
+            assert!(
+                body.is_empty() || body.contains("call-graph query"),
+                "the call-graph hint must survive: content {len} B"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_block_together_stays_within_the_budget() {
+        // Catches: memory, docs, trigger memory and call-graph hint each fitting
+        // alone but not together.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 10;
+            config.hooks.recall_limit = 10;
+        });
+        for i in 0..10 {
+            seed_memory_entry_titled(&handle, &format!("all-mem-{i}"), &"é".repeat(100)).await;
+            seed_document(
+                &handle,
+                &format!("docs/everything-{i}.md"),
+                &format!(
+                    "Everything quarantine autoheal {i} {}",
+                    "long title ".repeat(10)
+                ),
+                "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            )
+            .await;
+        }
+        seed_trigger_memory(
+            &handle,
+            "all-trigger",
+            &"t".repeat(700),
+            r#"[{"prompt_contains":"quarantine"}]"#,
+        )
+        .await;
+        let body = prompt_body(
+            &make_dctx(),
+            &handle,
+            "where is the recall_gate_fixture quarantine autoheal rebuilding",
+            "all",
+        )
+        .await;
+        assert!(body.len() <= 2048, "{} B: {body}", body.len());
+        assert!(body.contains("mdkb memory [all-trigger]"), "{body}");
+        assert!(body.contains("call-graph query"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_skipped_oversized_trigger_does_not_use_up_the_injection_slot() {
+        // Catches: an oversized trigger memory that is skipped still counting
+        // against max_injected_per_hook, so the small one behind it is lost.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        assert_eq!(handle.config.priors.max_injected_per_hook, 1);
+        for id in ["big-a", "big-b"] {
+            seed_trigger_memory(
+                &handle,
+                id,
+                &"x".repeat(3000),
+                r#"[{"prompt_contains":"subagent"}]"#,
+            )
+            .await;
+        }
+        seed_trigger_memory(
+            &handle,
+            "small-z",
+            "Be brief.",
+            r#"[{"prompt_contains":"subagent"}]"#,
+        )
+        .await;
+        let body = prompt_body(&make_dctx(), &handle, "start a subagent", "slot").await;
+        assert!(body.contains("mdkb memory [small-z]: Be brief."), "{body}");
+        assert!(body.len() <= 2048, "{} B", body.len());
+    }
+
+    #[tokio::test]
+    async fn docs_cut_by_the_trim_surface_on_the_next_prompt() {
+        // Catches: the session dedup marking docs seen before the trim, so a
+        // doc that was cut is never shown in the session.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 10;
+        });
+        for i in 0..10 {
+            seed_document(
+                &handle,
+                &format!("docs/dedupcut-{i}.md"),
+                &format!("Quarantine autoheal {i} {}", "long title ".repeat(25)),
+                "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            )
+            .await;
+        }
+        let dctx = make_dctx();
+        let paths = |body: &str| -> std::collections::BTreeSet<String> {
+            (0..10)
+                .map(|i| format!("docs/dedupcut-{i}.md"))
+                .filter(|p| body.contains(p.as_str()))
+                .collect()
+        };
+        let first =
+            paths(&prompt_body(&dctx, &handle, "quarantine autoheal rebuilding", "dd").await);
+        let second =
+            paths(&prompt_body(&dctx, &handle, "quarantine autoheal rebuilding again", "dd").await);
+        assert!(
+            !first.is_empty() && first.len() < 10,
+            "the fixture must force a trim: {first:?}"
+        );
+        assert!(first.is_disjoint(&second), "{first:?} vs {second:?}");
+        assert!(
+            !second.is_empty(),
+            "the cut docs must surface on the next prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_injection_is_bounded_by_the_payload_budget() {
+        // Catches: an oversized trigger memory reaching the model unbounded on
+        // PreToolUse (hook-events rows of that hook also count against 2 KB).
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(
+            &handle,
+            "pre-big",
+            &"x".repeat(3000),
+            r#"[{"tool":"Edit"}]"#,
+        )
+        .await;
+        let out = hook_pre_tool_use_impl(
+            &handle,
+            &json!({"tool_name": "Edit", "tool_input": {"file_path": "a.rs"}, "session_id": "pre"}),
+        )
+        .await;
+        let body = additional_context(&out);
+        assert!(
+            body.len() <= RECALL_PAYLOAD_BUDGET_BYTES,
+            "{} B",
+            body.len()
+        );
+    }
+
     fn scored_hit(
         path: &str,
         title: &str,
