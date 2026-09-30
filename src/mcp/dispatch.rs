@@ -6959,7 +6959,7 @@ mod tests {
 
     fn make_handle(tmp: &TempDir) -> Arc<RepoHandle> {
         // Recall tests exercise the injection mechanics, not the sigil gate; the
-        // gate now defaults on, so disable it here to keep prompts un-prefixed.
+        // gate now defaults off; pin it so prompts stay un-prefixed regardless.
         // The gate itself is covered by `require_sigil_gates_injection_*`.
         make_handle_with(tmp, |config| {
             config.hooks.user_prompt_submit_require_sigil = false;
@@ -8031,6 +8031,36 @@ mod tests {
             !body.contains("parent-mem"),
             "ancestor recall entry leaked into hook context: {body}"
         );
+    }
+
+    /// Story 192-dfe3, through the real handler with an untouched config: a
+    /// plain prompt that names a stored identifier injects it, an unrelated
+    /// one injects nothing.
+    #[tokio::test]
+    async fn a_default_config_recalls_a_plain_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.recall_docs_limit = 0;
+        });
+        seed_stale_handoff_entry(
+            &handle,
+            "default-mem",
+            "the recall_default_target knob is read once per prompt",
+        )
+        .await;
+
+        let hit = hook_user_prompt_submit_impl(&handle, "who reads recall_default_target").await;
+        assert!(
+            additional_context(&hit).contains("default-mem"),
+            "a plain prompt must recall by default: {hit}"
+        );
+
+        let miss = hook_user_prompt_submit_impl(
+            &handle,
+            "how large should the quarterly travel budget for the team be",
+        )
+        .await;
+        assert_eq!(miss, json!({}), "an unrelated prompt injects nothing");
     }
 
     #[tokio::test]

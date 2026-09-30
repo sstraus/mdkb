@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Changed
+
+- **Automatic recall is the default.** `[hooks] user_prompt_submit_require_sigil`
+  now defaults to `false`: a prompt without `*` is searched and injected when a
+  candidate clears `hooks.recall_auto_min_cosine` (0.50); `*` still selects the
+  lower 0.40 floor. Set `user_prompt_submit_require_sigil = true` to restore
+  sigil-only recall. The floors are unchanged, `mdkb init` writes the new
+  default in its commented template, and `mdkb doctor` no longer reports
+  `recall.sigil_only` for a default config. Decided by the maintainer on
+  2026-09-30 without a shadow week.
+
 ### Added
 
 - **SessionStart tells the model what is broken.** The quarantine and

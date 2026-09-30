@@ -139,17 +139,18 @@ Input:
 ```
 
 Empty or wrap-up prompts (`/clear`, `/compact`, `/exit`, `/quit`,
-`/wrapup`) are skipped. By default, recall also requires a leading `*` opt-in
-sigil, for example `* how does writer recovery work?`. The asterisk is explicit
-consent to search the current repository's context. Without it, the prompt
+`/wrapup`) are skipped. Every other prompt is searched (automatic recall).
+A leading `*`, for example `* how does writer recovery work?`, asks for an
+answer explicitly and searches at a lower floor. Set
+`user_prompt_submit_require_sigil = true` to opt out: a prompt without `*` then
 passes through unchanged. The handler strips the sigil before search and
 telemetry, then removes stopwords and sub-3-character fragments,
 then ranks memory through hybrid BM25 and local-vector retrieval. Matching
 documents reuse the same query embedding, avoiding a second ONNX inference pass.
 
 The sigil selects a **cosine floor**, not a feature: a sigil prompt is admitted
-at `search.memory.min_recall_cosine` (0.40) and — once
-`user_prompt_submit_require_sigil` is `false` — a plain one at
+at `search.memory.min_recall_cosine` (0.40) and — while
+`user_prompt_submit_require_sigil` is `false`, the default — a plain one at
 `hooks.recall_auto_min_cosine` (0.50), because an injection nobody asked for is
 charged on every turn after it. The floor is absolute, measured against the
 query embedding; a strong lexical match (an identifier, a rare phrase) is the
@@ -320,18 +321,19 @@ user_prompt_submit_enabled = true
 pre_tool_use_enabled = true
 post_tool_use_enabled = true
 
-# Keep normal prompts untouched unless they begin with `*`.
-user_prompt_submit_require_sigil = true
+# Automatic recall is the default (false). Set true to opt out and keep
+# normal prompts untouched unless they begin with `*`.
+user_prompt_submit_require_sigil = false
 
 # The cosine floor for a prompt that carries no sigil. A `*`-prefixed
 # prompt uses the lower `search.memory.min_recall_cosine` (0.40): the
-# sigil selects a threshold, it does not switch recall on. Unused while
+# sigil selects a threshold, it does not switch recall on. Unused when
 # require_sigil is true, except in shadow mode.
 recall_auto_min_cosine = 0.50
 
 # Run the always-on path on the prompts the sigil gate skips, record
 # what it would have injected in .mdkb/hook-events.jsonl, inject
-# nothing. Turn on for a week before flipping require_sigil.
+# nothing. Only meaningful with require_sigil = true.
 user_prompt_submit_shadow = false
 
 # Warmup is bounded by both entry count and tokens.
@@ -441,9 +443,9 @@ directory.
 
 ### Recall is empty
 
-- Recall requires a leading `*` by default. Use `* your prompt`, or set
-  `user_prompt_submit_require_sigil = false` for always-on recall at the
-  stricter `recall_auto_min_cosine` floor.
+- If `user_prompt_submit_require_sigil = true` is set, recall requires a leading
+  `*`. Use `* your prompt`, or remove the key (default `false`) for automatic
+  recall at the stricter `recall_auto_min_cosine` floor.
 - Hybrid recall requires at least one indexed memory entry. Run `mdkb memory
   list` and confirm the DB is populated.
 - Conversational prompts with only stopwords (e.g. "what is this?")
@@ -456,9 +458,10 @@ directory.
 
 `user_prompt_submit_shadow = true` runs the always-on path on the prompts the
 sigil gate skips, records what it *would* have injected, and injects nothing.
-It exists so the `require_sigil` default is flipped on a week of measurement
-rather than on the eval fixture, which scores precision 1.000 at every floor
-from 0.40 up and so cannot rank them.
+It measures the always-on path for a repo that opted out with
+`require_sigil = true`. The default flipped on 2026-09-30 without that week,
+and the eval fixture cannot stand in for it: it scores precision 1.000 at every
+floor from 0.40 up and so cannot rank them.
 
 ```json
 {"ts":…,"event":"user_prompt_submit","outcome":"shadow","elapsed_ms":41,

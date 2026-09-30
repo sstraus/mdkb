@@ -17,10 +17,9 @@ fn mdkb_bin() -> Command {
 }
 
 fn run_user_prompt_submit_in(dir: &Path, stdin_json: &str) -> (i32, String) {
-    // Recall injection is gated behind the `*` sigil by default; these tests
-    // exercise recall mechanics with plain (un-prefixed) prompts, so turn the gate
-    // off in the project config when it exists. The gate itself is covered by the
-    // unit test `require_sigil_gates_injection_to_star_prefixed_prompts`.
+    // Recall is automatic by default. Pin the key to `false` so these
+    // plain (un-prefixed) prompt tests keep their intent if the default moves. The gate itself is covered by
+    // the unit test `require_sigil_gates_injection_to_star_prefixed_prompts`.
     //
     // Write the key rather than rewriting a line `init` happened to leave in
     // the file: `init` writes its defaults commented out, so there is no
