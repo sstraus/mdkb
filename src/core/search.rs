@@ -27,6 +27,30 @@ pub fn hybrid_search_fts(
     collection: Option<&str>,
     include_superseded: bool,
 ) -> Result<Vec<SearchResult>> {
+    Ok(hybrid_search_fts_scored(
+        ctx,
+        fts_query,
+        query_embedding,
+        limit,
+        collection,
+        include_superseded,
+    )?
+    .into_iter()
+    .map(|(result, _)| result)
+    .collect())
+}
+
+/// [`hybrid_search_fts`] that also reports, per document, the cosine of its
+/// closest chunk to the query — the absolute score the fused (and normalized)
+/// `score` cannot give. `None` when the vector leg did not reach the document.
+pub fn hybrid_search_fts_scored(
+    ctx: &Context,
+    fts_query: &str,
+    query_embedding: Option<&[f32]>,
+    limit: usize,
+    collection: Option<&str>,
+    include_superseded: bool,
+) -> Result<Vec<(SearchResult, Option<f64>)>> {
     // An empty expression is not a query, so neither leg runs: the vector leg
     // would otherwise rank the whole corpus against the embedding of an empty
     // string and return arbitrary documents.
@@ -72,6 +96,9 @@ pub fn hybrid_search_fts(
     // Build a map for quick lookup
     let doc_map: std::collections::HashMap<i64, _> = docs.into_iter().map(|d| (d.id, d)).collect();
 
+    // Best-chunk distance per document, for the absolute score.
+    let distance_map: HashMap<i64, f32> = vector_results.iter().copied().collect();
+
     // Convert to SearchResult format, preserving RRF order
     let mut results = Vec::new();
     for (doc_id, score) in fused {
@@ -94,17 +121,23 @@ pub fn hybrid_search_fts(
 
             // Populate superseded_by from BM25 results if available
             let bm25 = bm25_map.get(&doc_id);
-            results.push(SearchResult {
-                id: doc.id,
-                collection: doc.collection.clone(),
-                path: doc.relative_path.clone(),
-                title: doc.title.clone(),
-                score,
-                snippets: vec![],
-                status: doc.status.clone(),
-                superseded_by: bm25.and_then(|r| r.superseded_by.clone()),
-                repo_root: None,
-            });
+            let cosine = distance_map
+                .get(&doc_id)
+                .map(|d| hybrid::cosine_from_distance(*d));
+            results.push((
+                SearchResult {
+                    id: doc.id,
+                    collection: doc.collection.clone(),
+                    path: doc.relative_path.clone(),
+                    title: doc.title.clone(),
+                    score,
+                    snippets: vec![],
+                    status: doc.status.clone(),
+                    superseded_by: bm25.and_then(|r| r.superseded_by.clone()),
+                    repo_root: None,
+                },
+                cosine,
+            ));
 
             // Stop once we have enough results
             if results.len() >= limit {

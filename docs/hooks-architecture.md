@@ -263,6 +263,7 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `warmup_min_confidence` | f64 | `0.25` | Confidence floor for warmup entries; `0` disables it |
 | `recall_limit` | usize | `5` | Max hybrid memory results in UserPromptSubmit |
 | `recall_docs_limit` | usize | `3` | Max matching documents in UserPromptSubmit; `0` = memory only |
+| `recall_docs_min_cosine` | f32 | `0.55` | Absolute cosine floor for a recalled document (best chunk vs prompt), or the prompt must quote its title/path. Measured on one repo: English matches 0.585–0.716, Italian-over-English negatives up to 0.522 |
 | `latency_budget_ms` | u64 | `200` | Overrun threshold; logs to `hook-slow.jsonl` |
 | `user_prompt_submit_require_sigil` | bool | `false` | `true` opts out of automatic recall and requires a leading `*` |
 | `recall_auto_min_cosine` | f32 | `0.50` | Cosine floor for a prompt with no sigil; a sigil prompt uses `search.memory.min_recall_cosine` (`0.40`) |

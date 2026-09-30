@@ -200,6 +200,25 @@ pub const MIN_RECALL_COSINE_DEFAULT: f32 = 0.40;
 /// `eval::fixture::tests::print_the_precision_recall_curve_over_tau`.
 pub const RECALL_AUTO_MIN_COSINE_DEFAULT: f32 = 0.50;
 
+/// Default absolute cosine floor for the documents leg of recall.
+///
+/// Documents need their own number: the best chunk of a long document scores
+/// differently from a short memory entry, and the corpus is often in another
+/// language than the prompt. Measured 2026-09-30 on the tuicommander store
+/// (all-MiniLM-L6-v2, best chunk per document, story 193-33f0), 14 prompts:
+///
+/// * English prompts with a matching document: 0.585 – 0.716 (min 0.585).
+/// * Italian prompts over the English corpus: 0.354 – 0.522, and the top
+///   document is an unrelated "hub" (`regression-last-month.md`,
+///   `ideas/cross-session-search.md`) for the ones with no true answer —
+///   0.496 for a real question, 0.426 – 0.441 for a recipe and Roman history.
+/// * English off-topic prompts: 0.235 – 0.277.
+///
+/// 0.55 sits between the highest measured negative (0.522) and the lowest
+/// measured positive (0.585). The sample is one repository; the key exists so
+/// a corpus that measures differently can move it.
+pub const RECALL_DOCS_MIN_COSINE_DEFAULT: f32 = 0.55;
+
 /// Memory index settings (Phase 6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -683,6 +702,19 @@ pub struct HooksConfig {
     /// inject memory only.
     pub recall_docs_limit: usize,
 
+    /// Absolute cosine floor a document must clear to be injected by recall.
+    ///
+    /// The documents leg is ranked by RRF, and RRF normalization pins the top
+    /// hit at 1.0 for every prompt, so without an absolute floor every prompt
+    /// gets its top-N documents whatever their similarity — measured on Italian
+    /// prompts over an English corpus, where the top documents were unrelated.
+    /// A document is admitted when the cosine of its best chunk reaches this
+    /// floor, or when the prompt quotes its title or path
+    /// ([`crate::store::hybrid::strong_lexical_match`]); membership in the BM25
+    /// result set is not evidence. Applies to sigil and automatic prompts alike.
+    /// See [`RECALL_DOCS_MIN_COSINE_DEFAULT`] for the measurement.
+    pub recall_docs_min_cosine: f32,
+
     /// Overrun threshold in milliseconds. A hook that runs longer than this has
     /// its telemetry row copied to `.mdkb/hook-slow.jsonl`, alongside the
     /// `hook-events.jsonl` row every run writes.
@@ -799,6 +831,7 @@ impl Default for HooksConfig {
             warmup_token_budget: 300,
             recall_limit: 5,
             recall_docs_limit: 3,
+            recall_docs_min_cosine: RECALL_DOCS_MIN_COSINE_DEFAULT,
             latency_budget_ms: 200,
             warmup_min_confidence: 0.25,
             daemon_required: false,
@@ -1316,6 +1349,7 @@ mod tests {
         assert_eq!(cfg.recall_limit, 5);
         // Documents leg on by default; 0 would make recall memory-only.
         assert_eq!(cfg.recall_docs_limit, 3);
+        assert_eq!(cfg.recall_docs_min_cosine, RECALL_DOCS_MIN_COSINE_DEFAULT);
         // Confidence floor on by default so low-signal entries stay out of warmup.
         assert!((cfg.warmup_min_confidence - 0.25).abs() < f64::EPSILON);
     }
