@@ -280,6 +280,8 @@ pub struct HookEventStats {
     pub converted: usize,
     pub avg_ms: u64,
     pub p95_ms: u64,
+    /// Runs cut short by the hook deadline (`outcome = "deadline"`).
+    pub deadline_hits: usize,
     /// Sum of context bytes returned to the host in this log window.
     pub payload_bytes: u64,
     /// Bytes attributed to each contributing hook block.
@@ -725,6 +727,7 @@ type HookEventEntry = (
 
 fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats> {
     let mut buckets: HashMap<String, Vec<HookEventEntry>> = HashMap::new();
+    let mut deadline_hits: HashMap<String, usize> = HashMap::new();
 
     for v in events {
         let event = v
@@ -742,6 +745,9 @@ fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats>
             .get("outcome")
             .and_then(|o| o.as_str())
             .unwrap_or("skipped");
+        if outcome == "deadline" {
+            *deadline_hits.entry(event.clone()).or_default() += 1;
+        }
         let elapsed = v.get("elapsed_ms").and_then(|e| e.as_u64()).unwrap_or(0);
         let payload_bytes = v.get("payload_bytes").and_then(|b| b.as_u64()).unwrap_or(0);
         buckets.entry(event).or_default().push((
@@ -785,6 +791,7 @@ fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats>
             } else {
                 0
             };
+            let deadline_hits = deadline_hits.get(&event).copied().unwrap_or(0);
             HookEventStats {
                 event,
                 invocations,
@@ -792,6 +799,7 @@ fn collect_hook_event_stats(events: &[serde_json::Value]) -> Vec<HookEventStats>
                 converted,
                 avg_ms,
                 p95_ms,
+                deadline_hits,
                 payload_bytes,
                 payload_blocks,
             }
@@ -1275,6 +1283,35 @@ mod tests {
     }
 
     #[test]
+    fn hooks_summary_counts_deadline_hits_per_event() {
+        let env = Env::new();
+        let mdkb_dir = env.ctx.db_path.parent().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let row = |event: &str, outcome: &str| {
+            format!(r#"{{"event":"{event}","outcome":"{outcome}","elapsed_ms":1500,"ts":{now}}}"#)
+        };
+        let lines = [
+            row("user_prompt_submit", "deadline"),
+            row("user_prompt_submit", "deadline"),
+            row("user_prompt_submit", "fired"),
+            row("pre_tool_use", "fired"),
+        ];
+        std::fs::write(mdkb_dir.join("hook-events.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let report = collect_report(&env.ctx).expect("collect");
+        let hits = |name: &str| {
+            report
+                .hooks
+                .events
+                .iter()
+                .find(|e| e.event == name)
+                .map(|e| e.deadline_hits)
+        };
+        assert_eq!(hits("user_prompt_submit"), Some(2));
+        assert_eq!(hits("pre_tool_use"), Some(0));
+    }
+
+    #[test]
     fn hooks_summary_aggregates_event_stats() {
         let env = Env::new();
         let mdkb_dir = env.ctx.db_path.parent().unwrap();
@@ -1324,6 +1361,7 @@ mod tests {
         assert_eq!(pre.avg_ms, 4); // (5+2+10+1)/4 = 4
         assert_eq!(pre.p95_ms, 10); // sorted: [1,2,5,10], idx ceil(4*0.95)-1 = 3 → 10
         let pre_json = serde_json::to_value(pre).unwrap();
+        assert_eq!(pre.deadline_hits, 0);
         assert_eq!(pre_json["payload_bytes"], 32);
         assert_eq!(pre_json["payload_blocks"]["search_redirect"], 20);
         assert_eq!(pre_json["payload_blocks"]["prior"], 12);

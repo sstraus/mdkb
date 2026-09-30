@@ -15,6 +15,14 @@
 
 ### Added
 
+- **UserPromptSubmit has a hard deadline.** `[hooks] user_prompt_submit_deadline_ms`
+  (default 1500, `0` disables) stops recall that has not finished, answers with
+  nothing and logs `outcome = "deadline"`; `mdkb stats` reports the deadline
+  hits and the hook rows carry per-phase timings. The default comes from the
+  2026-09-30 hook logs: warm rows sit at 5 ms – 1.25 s, rows taken at host load
+  23–28 at 2 s – 33 s. Found by the recall watch on 2026-09-30 (tuicommander
+  prompts averaged 3.3 s, max 32.7 s), no external reporter.
+
 - **SessionStart tells the model what is broken.** The quarantine and
   projection-drift banners are replaced by one `## mdkb doctor` block from
   the cheap doctor checks. Each error or warning is one line with its fix

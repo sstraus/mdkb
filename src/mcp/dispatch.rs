@@ -381,6 +381,14 @@ impl HookSessionState {
     }
 }
 
+/// What a UserPromptSubmit run marks as seen, applied only when it delivers.
+#[derive(Debug, Default)]
+struct HookDelivery {
+    fingerprint: String,
+    memory_ids: Vec<String>,
+    related_lines: Vec<String>,
+}
+
 /// Daemon-global state shared across all dispatched tool calls.
 #[derive(Clone)]
 pub struct DispatchContext {
@@ -596,33 +604,24 @@ impl DispatchContext {
         state.sessions.remove(key);
     }
 
-    fn remember_hook_prompt(&self, key: &str, fingerprint: &str) -> bool {
-        if fingerprint.is_empty() {
-            return false;
-        }
-        self.with_hook_session(key, |session| {
-            let repeated = session
-                .prompt_fingerprints
-                .iter()
-                .any(|seen| seen == fingerprint);
-            if !repeated {
+    /// Whether this prompt was already seen in the session. Read-only: the
+    /// fingerprint is recorded by [`Self::commit_hook_delivery`] once the run
+    /// delivers.
+    fn hook_prompt_repeated(&self, key: &str, fingerprint: &str) -> bool {
+        !fingerprint.is_empty()
+            && self.with_hook_session(key, |session| {
                 session
                     .prompt_fingerprints
-                    .push_back(fingerprint.to_string());
-                while session.prompt_fingerprints.len() > MAX_HOOK_PROMPT_FINGERPRINTS {
-                    session.prompt_fingerprints.pop_front();
-                }
-            }
-            repeated
-        })
+                    .iter()
+                    .any(|seen| seen == fingerprint)
+            })
     }
 
+    /// Drop what the session already saw. Marks nothing: a run the deadline cuts
+    /// never delivers, so its entries must stay eligible for the next prompt.
     fn retain_new_hook_memories(&self, key: &str, results: &mut Vec<memory::MemoryEntry>) {
         self.with_hook_session(key, |session| {
             results.retain(|entry| !session.memory_ids.contains(&entry.id));
-            for entry in results {
-                session.memory_ids.insert(entry.id.clone());
-            }
         });
     }
 
@@ -639,8 +638,22 @@ impl DispatchContext {
     fn retain_new_hook_related_lines(&self, key: &str, related: &mut Vec<String>) {
         self.with_hook_session(key, |session| {
             related.retain(|line| !session.related_lines.contains(line));
-            for line in related {
-                session.related_lines.insert(line.clone());
+        });
+    }
+
+    /// Mark a finished run's prompt, entries and related lines as delivered.
+    fn commit_hook_delivery(&self, key: &str, delivered: HookDelivery) {
+        self.with_hook_session(key, |session| {
+            session.memory_ids.extend(delivered.memory_ids);
+            session.related_lines.extend(delivered.related_lines);
+            if delivered.fingerprint.is_empty()
+                || session.prompt_fingerprints.contains(&delivered.fingerprint)
+            {
+                return;
+            }
+            session.prompt_fingerprints.push_back(delivered.fingerprint);
+            while session.prompt_fingerprints.len() > MAX_HOOK_PROMPT_FINGERPRINTS {
+                session.prompt_fingerprints.pop_front();
             }
         });
     }
@@ -3744,6 +3757,7 @@ fn log_hook_event_with_phases(
 fn log_hook_event_with_shadow(
     root: std::path::PathBuf,
     event: &str,
+    outcome: &str,
     shadow: &ShadowRecall,
     payload: Option<&HookPayload>,
     elapsed_ms: u64,
@@ -3752,7 +3766,7 @@ fn log_hook_event_with_shadow(
     log_hook_event_full(
         root,
         event,
-        "shadow",
+        outcome,
         None,
         Some(("shadow", shadow.as_json())),
         payload,
@@ -4890,6 +4904,29 @@ async fn hook_user_prompt_submit_impl_with_dedup(
     shadow: &mut Option<ShadowRecall>,
     payload_parts: &mut Vec<(&'static str, usize)>,
 ) -> Value {
+    hook_user_prompt_submit_impl_timed(
+        handle,
+        prompt,
+        session,
+        dedup,
+        shadow,
+        payload_parts,
+        &mut PhaseTimings::new(),
+    )
+    .await
+}
+
+/// The recall run, marking `phases` as it goes. The caller owns `phases`, so a
+/// deadline that drops this future still leaves the phases it reached readable.
+async fn hook_user_prompt_submit_impl_timed(
+    handle: &RepoHandle,
+    prompt: &str,
+    session: &str,
+    dedup: Option<(&DispatchContext, String)>,
+    shadow: &mut Option<ShadowRecall>,
+    payload_parts: &mut Vec<(&'static str, usize)>,
+    phases: &mut PhaseTimings,
+) -> Value {
     use crate::cli::hook_logic::prompt_wants_call_graph;
 
     let cfg = &handle.config.hooks;
@@ -4932,8 +4969,9 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         dedup.as_ref()
     };
 
+    let fingerprint = prompt_fingerprint(prompt);
     let prompt_repeat = recall_dedup
-        .map(|(dctx, key)| dctx.remember_hook_prompt(key, &prompt_fingerprint(prompt)))
+        .map(|(dctx, key)| dctx.hook_prompt_repeated(key, &fingerprint))
         .unwrap_or(false);
     let wants_cg = prompt_wants_call_graph(prompt);
     let fts_query = crate::store::search::build_recall_query(prompt);
@@ -4971,13 +5009,16 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         if ensure_handle_context(handle).await.is_err() {
             return json!({});
         }
+        phases.mark("context");
         // Embed the raw prompt off the runtime BEFORE locking — this is the
         // per-turn UserPromptSubmit path, so holding the ctx mutex across
         // CPU-bound ONNX inference would stall a worker every turn. `q`
         // (build_recall_query) is a pre-built OR-expression fed to the FTS leg
         // via `_fts`; embedding the FTS operators would be noise.
         query_embedding = embed_query_off_lock(prompt).await;
+        phases.mark("embed");
         let mut ctx_guard = handle.ctx.lock().await;
+        phases.mark("lock_wait");
         let limit = cfg.recall_limit.max(1);
         let search_t0 = std::time::Instant::now();
         let search = crate::core::run_guarded_read(&mut ctx_guard, "hook memory recall", |ctx| {
@@ -5106,6 +5147,7 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             }
         }
         drop(ctx_guard);
+        phases.mark("search");
 
         // A handoff is session state for the next session start, not
         // knowledge, and it matches any prompt about the same work. Only an
@@ -5237,6 +5279,8 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         }
     }
 
+    phases.mark("enrich");
+
     // A doc reachable both ways is emitted once, as a graph neighbor: that block
     // carries the relation label, which the search hit cannot reconstruct.
     let neighbor_paths: std::collections::HashSet<&str> =
@@ -5257,6 +5301,12 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         dctx.retain_new_hook_related_lines(key, &mut doc_lines);
         dctx.retain_new_hook_related_lines(key, &mut related);
     }
+    // Marked once the run has no await left to be cut at, not at retrieval.
+    let delivery = HookDelivery {
+        fingerprint,
+        memory_ids: results.iter().map(|e| e.id.clone()).collect(),
+        related_lines: doc_lines.iter().chain(&related).cloned().collect(),
+    };
 
     // Shadow mode records the full recall retrieval but does not emit it.
     // Literal prompt priors are independent of that retrieval and can still
@@ -5278,6 +5328,10 @@ async fn hook_user_prompt_submit_impl_with_dedup(
 
     // Trigger-matched behavioral priors whose prompt pattern fires here.
     let prior_block = prompt_prior_block(handle, prompt, session, dedup.as_ref()).await;
+    phases.mark("prior");
+    if let Some((dctx, key)) = recall_dedup {
+        dctx.commit_hook_delivery(key, delivery);
+    }
 
     let nothing_found = results.is_empty() && doc_lines.is_empty() && related.is_empty();
     if nothing_found && prior_block.is_none() && !wants_cg {
@@ -6639,18 +6693,33 @@ pub async fn dispatch_call(
             let t0 = std::time::Instant::now();
             let mut shadow = None;
             let mut payload_parts = Vec::new();
-            let result = hook_user_prompt_submit_impl_with_dedup(
+            let mut phases = PhaseTimings::new();
+            let run = hook_user_prompt_submit_impl_timed(
                 &handle,
                 prompt,
                 &session,
                 Some((dctx, key)),
                 &mut shadow,
                 &mut payload_parts,
-            )
-            .await;
+                &mut phases,
+            );
+            // Recall is a hint and the prompt is not: past the deadline the
+            // hook answers with nothing. Dropping the future releases the
+            // store lock; `phases` keeps what the run reached.
+            let deadline = handle.config.hooks.user_prompt_submit_deadline_ms;
+            let (result, timed_out) = if deadline == 0 {
+                (run.await, false)
+            } else {
+                match tokio::time::timeout(std::time::Duration::from_millis(deadline), run).await {
+                    Ok(result) => (result, false),
+                    Err(_) => (json!({}), true),
+                }
+            };
             let payload = HookPayload::from_parts(&result, payload_parts);
             let ms = t0.elapsed().as_millis() as u64;
-            let outcome = if result == json!({}) {
+            let outcome = if timed_out {
+                "deadline"
+            } else if result == json!({}) {
                 "skipped"
             } else {
                 "fired"
@@ -6659,27 +6728,35 @@ pub async fn dispatch_call(
             let budget = handle.config.hooks.latency_budget_ms;
             tokio::task::spawn_blocking(move || match shadow {
                 Some(shadow) => {
+                    // A shadow run the deadline cut is still a deadline hit.
                     log_hook_event_with_shadow(
                         root,
                         "user_prompt_submit",
+                        if timed_out { "deadline" } else { "shadow" },
                         &shadow,
                         payload.as_ref(),
                         ms,
                         budget,
                     );
                 }
-                None => log_hook_event_full(
+                None => log_hook_event_with_phases(
                     root,
                     "user_prompt_submit",
                     outcome,
                     None,
-                    None,
+                    &phases,
                     payload.as_ref(),
                     ms,
                     budget,
                 ),
             });
-            record_hook_call(&handle, tool_name).await;
+            // Telemetry takes the same store lock the stalled recall waited
+            // on; awaiting it here would hold the answer past the deadline.
+            let telemetry_handle = Arc::clone(&handle);
+            let telemetry_method = tool_name.to_string();
+            tokio::spawn(async move {
+                record_hook_call(&telemetry_handle, &telemetry_method).await;
+            });
             Ok(result)
         }
         "hook.post_tool_use" => {
@@ -9717,7 +9794,7 @@ mod tests {
         let handle = make_handle(&tmp);
         register_collection(&handle, "lattice").await;
         register_collection(&handle, "riscosity").await;
-        seed_project_handoff(&handle, "lattice", 3).await;
+        seed_project_handoff(&handle, "lattice", 4).await;
         seed_project_handoff(&handle, "riscosity", 1).await; // newest overall
 
         let cwd = handle.root.join("lattice");
@@ -9817,7 +9894,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         register_collection(&handle, "lattice").await;
-        seed_project_handoff(&handle, "lattice", 3).await;
+        seed_project_handoff(&handle, "lattice", 4).await;
         seed_project_handoff(&handle, "riscosity", 1).await;
 
         let cwd = handle.root.join("scratch");
@@ -11806,6 +11883,260 @@ mod tests {
         assert_eq!(row["payload_blocks"]["prior"], context.len());
         assert!(row["payload_blocks"].get("related_docs").is_none());
         assert!(row.to_string().find("fake line").is_none());
+    }
+
+    const RECALL_PROMPT: &str = "what do we know about the recall_gate_fixture topic content";
+
+    async fn prompt_hook(handle: &Arc<RepoHandle>, dctx: &DispatchContext, session: &str) -> Value {
+        dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt": RECALL_PROMPT, "session_id": session}),
+            Arc::clone(handle),
+            dctx,
+        )
+        .await
+        .expect("hook")
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_returns_at_the_deadline_when_recall_stalls() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 150;
+        });
+        seed_memory_entry(&handle, "stalled-topic").await;
+
+        // Another session's prompt holds the store: recall cannot finish.
+        let held = handle.ctx.lock().await;
+        let t0 = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_hook(&handle, &make_dctx(), "stalled"),
+        )
+        .await
+        .expect("the hook must not wait for the store");
+        let waited = t0.elapsed();
+        drop(held);
+
+        assert_eq!(result, json!({}), "no recall block past the deadline");
+        assert!(
+            waited < std::time::Duration::from_millis(1000),
+            "returned after {waited:?}, deadline was 150 ms"
+        );
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["outcome"], "deadline");
+    }
+
+    #[tokio::test]
+    async fn concurrent_prompts_share_one_deadline_instead_of_queueing() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 300;
+        });
+        seed_memory_entry(&handle, "queued-topic").await;
+        let dctx = make_dctx();
+
+        let held = handle.ctx.lock().await;
+        let t0 = std::time::Instant::now();
+        let (a, b) = tokio::join!(
+            prompt_hook(&handle, &dctx, "one"),
+            prompt_hook(&handle, &dctx, "two")
+        );
+        let waited = t0.elapsed();
+        drop(held);
+
+        assert_eq!((a, b), (json!({}), json!({})));
+        assert!(
+            waited < std::time::Duration::from_millis(550),
+            "two prompts took {waited:?}; each must meet its own 300 ms deadline, not add up"
+        );
+    }
+
+    #[tokio::test]
+    async fn deadline_row_names_the_phases_reached_and_not_the_ones_cut() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 100;
+        });
+        seed_memory_entry(&handle, "phase-topic").await;
+
+        let held = handle.ctx.lock().await;
+        prompt_hook(&handle, &make_dctx(), "phases").await;
+        drop(held);
+
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["outcome"], "deadline");
+        let phases = row.get("phases");
+        assert!(
+            phases.is_none_or(|p| p.get("search").is_none()),
+            "recall never got the store, so no search phase: {row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fired_row_splits_elapsed_into_phases() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "split-topic").await;
+
+        let result = prompt_hook(&handle, &make_dctx(), "split").await;
+        assert!(additional_context(&result).contains("split-topic"));
+
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        for phase in ["embed", "search"] {
+            assert!(
+                row["phases"][phase].is_u64(),
+                "phase {phase} missing from {row}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_zero_disables_the_cut() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 0;
+        });
+        seed_memory_entry(&handle, "unbounded-topic").await;
+
+        let held = Arc::clone(&handle.ctx).lock_owned().await;
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            drop(held);
+        });
+        let result = prompt_hook(&handle, &make_dctx(), "unbounded").await;
+        release.await.unwrap();
+
+        assert!(
+            additional_context(&result).contains("unbounded-topic"),
+            "0 waits for the store: {result}"
+        );
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["outcome"], "fired");
+    }
+
+    #[test]
+    fn default_deadline_is_the_documented_constant() {
+        assert_eq!(
+            crate::config::Config::default()
+                .hooks
+                .user_prompt_submit_deadline_ms,
+            crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT
+        );
+        assert_eq!(crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT, 1500);
+    }
+
+    /// One link of a chain of store holders. tokio's mutex is FIFO and the hook
+    /// takes the store once per phase, so a holder that queues its successor
+    /// while the hook waits behind it sits between two of the hook's
+    /// acquisitions. The last link holds the store past any deadline used here.
+    fn stall_store<T: Send + 'static>(
+        ctx: Arc<tokio::sync::Mutex<T>>,
+        later: usize,
+        hold_ms: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            let guard = Arc::clone(&ctx).lock_owned().await;
+            // Let the hook queue behind this link before queueing the next.
+            tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+            if later == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                drop(guard);
+                return;
+            }
+            let next = tokio::spawn(stall_store(ctx, later - 1, 100));
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            drop(guard);
+            next.await.unwrap();
+        })
+    }
+
+    /// Run one prompt whose search finishes but whose store acquisition number
+    /// `later + 2` cannot get the store: `later` links pass it to the hook and
+    /// back before the last one keeps it past the deadline. The hook takes it
+    /// for: 1 context, 2 search, 3 recall log, 4-5 enrichment (only with
+    /// entries), then 2 for the prior lookup, so `later = 4` cuts the run in
+    /// the prior lookup, after the shadow recall is set. Returns the hook answer.
+    async fn prompt_cut_after_search(
+        handle: &Arc<RepoHandle>,
+        dctx: &DispatchContext,
+        session: &str,
+        later: usize,
+    ) -> Value {
+        let held = Arc::clone(&handle.ctx).lock_owned().await;
+        let ctx = Arc::clone(&handle.ctx);
+        let mut blocker = None;
+        let (result, ()) = tokio::join!(prompt_hook(handle, dctx, session), async {
+            // The hook is queued on the store by now; queue the first holder behind it.
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            // The first holder outlasts the hook's embedding, which runs off the
+            // lock, so the hook is queued for its search before the next link is.
+            blocker = Some(tokio::spawn(stall_store(ctx, later, 400)));
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            drop(held);
+        });
+        blocker.unwrap().await.unwrap();
+        result
+    }
+
+    #[tokio::test]
+    async fn entries_cut_by_the_deadline_are_not_marked_as_delivered() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 1200;
+        });
+        seed_memory_entry(&handle, "cut-topic").await;
+        let dctx = make_dctx();
+
+        let cut = prompt_cut_after_search(&handle, &dctx, "cut", 4).await;
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["outcome"], "deadline", "{row}");
+        assert!(
+            row["phases"]["search"].is_u64(),
+            "precondition: the run must be cut after the search, not before it: {row}"
+        );
+        assert_eq!(cut, json!({}));
+
+        // Nothing was delivered, so the next prompt of the session must still
+        // get the entry. Catches: dedup state marked at retrieval time, so a
+        // cut run silences the entry for the rest of the session.
+        let next = prompt_hook(&handle, &dctx, "cut").await;
+        assert!(
+            additional_context(&next).contains("cut-topic"),
+            "entry silenced by a run that never answered: {next}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shadow_run_cut_by_the_deadline_is_logged_as_deadline() {
+        // Catches: the shadow row arm hardcodes outcome "shadow", so a run cut
+        // after the shadow recall is set is invisible to `mdkb stats` deadline
+        // hits. The number of store acquisitions before the shadow recall is
+        // set is not something to hard-code, so stall later and later until the
+        // cut lands after it: the first row carrying a shadow object is that one.
+        for later in 1..=7 {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle_with(&tmp, |config| {
+                config.hooks.user_prompt_submit_require_sigil = true;
+                config.hooks.user_prompt_submit_shadow = true;
+                config.hooks.user_prompt_submit_deadline_ms = 1200;
+            });
+            seed_memory_entry(&handle, "shadow-cut-topic").await;
+
+            prompt_cut_after_search(&handle, &make_dctx(), "shadow-cut", later).await;
+
+            let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+            if row["shadow"].is_object() {
+                assert_eq!(row["outcome"], "deadline", "stall at link {later}: {row}");
+                return;
+            }
+        }
+        panic!("no stall position cut the run after the shadow recall was set");
     }
 
     #[tokio::test]

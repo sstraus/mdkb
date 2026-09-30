@@ -313,6 +313,9 @@ fn render_hooks(out: &mut String, h: &HooksSummary) {
                 "\n  {:<17}  {:>5}  {:>5}  {:>5}  {:>3}%  {:>4}ms {:>4}ms",
                 e.event, e.invocations, e.fired, e.converted, hit_pct, e.avg_ms, e.p95_ms
             );
+            if e.deadline_hits > 0 {
+                let _ = write!(body, "\n    deadline hits   {}", e.deadline_hits);
+            }
             if e.payload_bytes > 0 {
                 let _ = write!(body, "\n    payload         {} B", e.payload_bytes);
                 for (block, bytes) in &e.payload_blocks {
@@ -785,6 +788,31 @@ mod tests {
     }
 
     #[test]
+    fn render_hooks_shows_deadline_hits_only_when_present() {
+        let mut report = fixture_report();
+        let stats = |event: &str, deadline_hits| crate::cli::stats_report::HookEventStats {
+            event: event.to_string(),
+            invocations: 3,
+            fired: 1,
+            converted: 0,
+            avg_ms: 3,
+            p95_ms: 5,
+            deadline_hits,
+            payload_bytes: 0,
+            payload_blocks: Default::default(),
+        };
+        report.hooks.events.push(stats("user_prompt_submit", 2));
+        report.hooks.events.push(stats("pre_tool_use", 0));
+        let out = render(&report, false);
+        assert_eq!(
+            out.matches("deadline").count(),
+            1,
+            "one deadline line, for the event that hit it: {out}"
+        );
+        assert!(out.contains("deadline hits"), "{out}");
+    }
+
+    #[test]
     fn render_hooks_shows_payload_bytes_per_hook_and_block() {
         let mut report = fixture_report();
         report
@@ -797,6 +825,7 @@ mod tests {
                 converted: 0,
                 avg_ms: 3,
                 p95_ms: 5,
+                deadline_hits: 0,
                 payload_bytes: 32,
                 payload_blocks: [
                     ("search_redirect".to_string(), 20),
