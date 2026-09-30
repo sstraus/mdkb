@@ -76,28 +76,96 @@ pub enum Heal {
     CorruptInUse,
 }
 
-/// When this process last probed each database sound, for [`ensure_sound_locked`].
-static PROCESS_VERIFIED: Mutex<Option<HashMap<PathBuf, SystemTime>>> = Mutex::new(None);
+/// One "this process probed the file sound" verdict: when, and which file.
+#[derive(Clone, Copy)]
+struct ProbeRecord {
+    at: SystemTime,
+    identity: (u64, u64),
+}
 
-fn process_verified_at(db_path: &Path) -> Option<SystemTime> {
+/// What this process last probed sound, per database path, for
+/// [`ensure_sound_locked`].
+static PROCESS_VERIFIED: Mutex<Option<HashMap<PathBuf, ProbeRecord>>> = Mutex::new(None);
+
+/// Device and inode of `path`: the file itself, not its name, so a torn file
+/// renamed over the store never inherits the verdict of the one it replaced.
+/// `None` where the platform offers no such identity; nothing is then trusted.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+fn process_probe(db_path: &Path) -> Option<ProbeRecord> {
     let guard = PROCESS_VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
     guard.as_ref()?.get(db_path).copied()
 }
 
-fn set_process_verified(db_path: &Path, at: Option<SystemTime>) {
+/// The time of a verdict that still describes the file at `db_path`.
+fn process_verified_at(db_path: &Path) -> Option<SystemTime> {
+    let record = process_probe(db_path)?;
+    (file_identity(db_path)? == record.identity).then_some(record.at)
+}
+
+fn restore_process_probe(db_path: &Path, record: Option<ProbeRecord>) {
     let mut guard = PROCESS_VERIFIED.lock().unwrap_or_else(|e| e.into_inner());
     let map = guard.get_or_insert_with(HashMap::new);
-    match at {
-        Some(at) => map.insert(db_path.to_path_buf(), at),
+    match record {
+        Some(record) => map.insert(db_path.to_path_buf(), record),
         None => map.remove(db_path),
     };
+}
+
+/// Record (or, with `None`, drop) a verdict for the file at `db_path` now.
+fn set_process_verified(db_path: &Path, at: Option<SystemTime>) {
+    let record = at
+        .zip(file_identity(db_path))
+        .map(|(at, identity)| ProbeRecord { at, identity });
+    restore_process_probe(db_path, record);
+}
+
+#[cfg(test)]
+pub(crate) fn has_process_probe(db_path: &Path) -> bool {
+    process_probe(db_path).is_some()
 }
 
 /// Drop this process's "probed sound" memory of `db_path`. A long-lived holder
 /// calls it when it closes a context because it saw corruption, so the reopen
 /// that follows probes the file instead of trusting the earlier verdict.
+/// [`invalidate_marker`] calls it too: a write that may not have finished
+/// certifies nothing.
 pub fn forget_process_probe(db_path: &Path) {
-    set_process_verified(db_path, None);
+    restore_process_probe(db_path, None);
+}
+
+/// Run a small write the caller has already admitted, keeping the process's
+/// verdict across it when it succeeds.
+///
+/// [`invalidate_marker`] drops the verdict before every write, and the daemon
+/// writes telemetry on every hook: without this the verdict would never
+/// survive to the reopen it exists for. A write that fails keeps it dropped,
+/// so the reopen after a failed write probes.
+pub fn keep_process_probe_across<T>(
+    db_path: &Path,
+    write: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let held = process_probe(db_path);
+    invalidate_marker(db_path);
+    let result = write();
+    if result.is_ok()
+        && file_identity(db_path)
+            .zip(held)
+            .is_some_and(|(id, r)| id == r.identity)
+    {
+        restore_process_probe(db_path, held);
+    }
+    result
 }
 
 /// Append `suffix` to a path's file name (`index.sqlite` + `.corrupt-1` →
@@ -153,6 +221,7 @@ fn touch_marker(marker: &Path) {
 /// If the process crashes mid-mutation, the next open cannot trust an old
 /// marker and will run `quick_check` before using the index.
 pub fn invalidate_marker(db_path: &Path) {
+    forget_process_probe(db_path);
     let _ = std::fs::remove_file(marker_path(db_path));
 }
 
@@ -216,7 +285,6 @@ pub fn verify_and_mark(conn: &Connection, db_path: &Path) -> Result<()> {
         }
         Soundness::Corrupt { .. } => {
             invalidate_marker(db_path);
-            forget_process_probe(db_path);
             Err(crate::error::ErrorKind::IndexCorrupt {
                 path: db_path.to_path_buf(),
             }
@@ -959,9 +1027,17 @@ pub(crate) fn ensure_sound_locked(db_path: &Path, trust_process_probe: bool) -> 
     {
         return Ok(Heal::Sound);
     }
+    // A verdict is recorded only for a file that exists and was really probed:
+    // by this call, or by whoever wrote the fresh marker, at the marker's time.
+    let marker = marker_path(db_path);
+    let fresh_marker = checked_recently(db_path, &marker, CHECK_INTERVAL, now)
+        .then(|| std::fs::metadata(&marker).and_then(|m| m.modified()).ok())
+        .flatten();
     let heal = ensure_sound_at_locked(db_path, CHECK_INTERVAL, now)?;
     match heal {
-        Heal::Sound => set_process_verified(db_path, Some(now)),
+        Heal::Sound if db_path.exists() => {
+            set_process_verified(db_path, Some(fresh_marker.unwrap_or(now)))
+        }
         _ => forget_process_probe(db_path),
     }
     Ok(heal)
