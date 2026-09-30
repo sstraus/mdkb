@@ -3592,6 +3592,45 @@ pub async fn usage_impl(
 /// keeping the log bounded without an external logrotate.
 pub const HOOK_LOG_CAP_BYTES: u64 = 1024 * 1024; // 1 MiB
 
+/// Byte budget of one UserPromptSubmit recall injection: it is added to the
+/// context of every prompt, so the recall lines are dropped to fit it.
+const RECALL_PAYLOAD_BUDGET_BYTES: usize = 2048;
+
+const CALL_GRAPH_HINT: &str = "\n💡 This looks like a call-graph query. Use `code_graph(name)` or `code_graph(name, direction=\"callers\"|\"callees\"|\"impact\")` — one MCP call replaces multi-file Grep.\n";
+
+/// What the priors block may take so that, with its header (`## mdkb: priors`,
+/// blank line, two newlines around it) and the call-graph hint, the body still
+/// fits [`RECALL_PAYLOAD_BUDGET_BYTES`] even when nothing else is injected.
+const PRIOR_BLOCK_BUDGET_BYTES: usize =
+    RECALL_PAYLOAD_BUDGET_BYTES - CALL_GRAPH_HINT.len() - "\n## mdkb: priors\n\n\n".len();
+
+/// Byte room for the trigger-matched lines of one injection. A line that does
+/// not fit is refused before anything records it as injected, so it stays
+/// eligible on a later call. Shared by every hook that injects trigger lines.
+struct LineBudget {
+    room: usize,
+}
+
+impl LineBudget {
+    /// `room` is what the block may take; the trailing session line is
+    /// reserved up front because it is added after the lines it follows.
+    fn new(room: usize, session_line: &str) -> Self {
+        Self {
+            room: room.saturating_sub(session_line.len() + 1),
+        }
+    }
+
+    fn admit(&mut self, line: &str) -> bool {
+        match self.room.checked_sub(line.len() + 1) {
+            Some(left) => {
+                self.room = left;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct HookPayload {
     bytes: usize,
@@ -5227,15 +5266,6 @@ async fn hook_user_prompt_submit_impl_timed(
             }
         }
     }
-    record_recall(
-        handle,
-        session,
-        mode,
-        search_cfg.min_recall_cosine,
-        candidates,
-    )
-    .await;
-
     // Post-recall enrichment in a single re-lock (both read-only, capped):
     //  · 1-hop memory-edge expansion — surface active neighbors of the top seeds.
     //  · stale-dependency flags — mark entries whose basis is superseded/refuted.
@@ -5320,17 +5350,18 @@ async fn hook_user_prompt_submit_impl_timed(
         dctx.retain_new_hook_related_lines(key, &mut doc_lines);
         dctx.retain_new_hook_related_lines(key, &mut related);
     }
-    // Marked once the run has no await left to be cut at, not at retrieval.
-    let delivery = HookDelivery {
-        fingerprint,
-        memory_ids: results.iter().map(|e| e.id.clone()).collect(),
-        related_lines: doc_lines.iter().chain(&related).cloned().collect(),
-    };
-
     // Shadow mode records the full recall retrieval but does not emit it.
     // Literal prompt priors are independent of that retrieval and can still
     // inject, with their own telemetry and session deduplication.
     if mode == RecallMode::Shadow {
+        record_recall(
+            handle,
+            session,
+            mode,
+            search_cfg.min_recall_cosine,
+            candidates,
+        )
+        .await;
         *shadow = Some(ShadowRecall {
             session: session.to_string(),
             entries: results.iter().map(|e| e.id.clone()).collect(),
@@ -5348,8 +5379,68 @@ async fn hook_user_prompt_submit_impl_timed(
     // Trigger-matched behavioral priors whose prompt pattern fires here.
     let prior_block = prompt_prior_block(handle, prompt, session, dedup.as_ref()).await;
     phases.mark("prior");
+
+    // The injection is paid for on every prompt: drop the lowest-ranked lines
+    // until it fits, related docs first, memories last. Trimmed before the
+    // delivery is committed, so a dropped line is not recorded as seen and can
+    // still surface on a later prompt.
+    let (mut body, mut parts) = render_recall_body(
+        &results,
+        &expanded,
+        &stale_ids,
+        &doc_lines,
+        &related,
+        prior_block.as_deref(),
+        wants_cg,
+    );
+    while body.len() > RECALL_PAYLOAD_BUDGET_BYTES {
+        if related.pop().is_none()
+            && doc_lines.pop().is_none()
+            && expanded.pop().is_none()
+            && results.pop().is_none()
+        {
+            break;
+        }
+        (body, parts) = render_recall_body(
+            &results,
+            &expanded,
+            &stale_ids,
+            &doc_lines,
+            &related,
+            prior_block.as_deref(),
+            wants_cg,
+        );
+    }
+    payload_parts.extend(parts);
+
+    // The ledger records what the prompt received, so a memory the trim cut
+    // is a candidate that was not injected.
+    let delivered: HashSet<&str> = results.iter().map(|e| e.id.as_str()).collect();
+    for candidate in &mut candidates {
+        if !delivered.contains(candidate.entry_id.as_str()) {
+            candidate.injected = false;
+            candidate.holdout = false;
+        }
+    }
+    record_recall(
+        handle,
+        session,
+        mode,
+        search_cfg.min_recall_cosine,
+        candidates,
+    )
+    .await;
+
+    // Marked once the run has no await left to be cut at, not at retrieval.
     if let Some((dctx, key)) = recall_dedup {
-        dctx.commit_hook_delivery(key, delivery);
+        dctx.commit_hook_delivery(
+            key,
+            HookDelivery {
+                fingerprint,
+                memory_ids: results.iter().map(|e| e.id.clone()).collect(),
+                related_lines: doc_lines.iter().chain(&related).cloned().collect(),
+            },
+        );
     }
 
     let nothing_found = results.is_empty() && doc_lines.is_empty() && related.is_empty();
@@ -5359,13 +5450,35 @@ async fn hook_user_prompt_submit_impl_timed(
     if prompt_repeat && nothing_found && prior_block.is_none() {
         return json!({});
     }
+    if body.is_empty() {
+        return json!({});
+    }
 
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": body,
+        }
+    })
+}
+
+/// The UserPromptSubmit body and the byte size of each block in it.
+fn render_recall_body(
+    results: &[memory::MemoryEntry],
+    expanded: &[String],
+    stale_ids: &std::collections::HashSet<String>,
+    doc_lines: &[String],
+    related: &[String],
+    prior: Option<&str>,
+    wants_cg: bool,
+) -> (String, Vec<(&'static str, usize)>) {
     let mut body = String::new();
+    let mut parts: Vec<(&'static str, usize)> = Vec::new();
 
     if !results.is_empty() {
         let start = body.len();
         body.push_str("## mdkb: relevant context\n\n");
-        for entry in &results {
+        for entry in results {
             let snippet_raw =
                 crate::store::memory::strip_frontmatter(&entry.content).replace('\n', " ");
             let snippet: String = snippet_raw.chars().take(160).collect();
@@ -5384,12 +5497,12 @@ async fn hook_user_prompt_submit_impl_timed(
             ));
         }
         // 1-hop edge-expanded neighbors, annotated `(via <relation>)`.
-        for line in &expanded {
+        for line in expanded {
             body.push_str(line);
             body.push('\n');
         }
         body.push_str("\nIf your work corroborates any entry above, run `mdkb memory confirm <id> --outcome confirmed` instead of writing a new one.\n");
-        payload_parts.push(("recall_memory", body.len() - start));
+        parts.push(("recall_memory", body.len() - start));
     }
 
     if !doc_lines.is_empty() {
@@ -5398,11 +5511,11 @@ async fn hook_user_prompt_submit_impl_timed(
             body.push('\n');
         }
         body.push_str("## mdkb: matching docs\n\n");
-        for line in &doc_lines {
+        for line in doc_lines {
             body.push_str(line);
             body.push('\n');
         }
-        payload_parts.push(("recall_docs", body.len() - start));
+        parts.push(("recall_docs", body.len() - start));
     }
 
     if !related.is_empty() {
@@ -5411,42 +5524,31 @@ async fn hook_user_prompt_submit_impl_timed(
             body.push('\n');
         }
         body.push_str("## mdkb: related docs\n\n");
-        for line in &related {
+        for line in related {
             body.push_str(line);
             body.push('\n');
         }
-        payload_parts.push(("related_docs", body.len() - start));
+        parts.push(("related_docs", body.len() - start));
     }
 
-    if let Some(prior) = prior_block {
+    if let Some(prior) = prior {
         let start = body.len();
         if !body.is_empty() {
             body.push('\n');
         }
         body.push_str("## mdkb: priors\n\n");
-        body.push_str(&prior);
+        body.push_str(prior);
         body.push('\n');
-        payload_parts.push(("prior", body.len() - start));
+        parts.push(("prior", body.len() - start));
     }
 
     if wants_cg {
         let start = body.len();
-        body.push_str(
-            "\n💡 This looks like a call-graph query. Use `code_graph(name)` or `code_graph(name, direction=\"callers\"|\"callees\"|\"impact\")` — one MCP call replaces multi-file Grep.\n",
-        );
-        payload_parts.push(("call_graph_hint", body.len() - start));
+        body.push_str(CALL_GRAPH_HINT);
+        parts.push(("call_graph_hint", body.len() - start));
     }
 
-    if body.is_empty() {
-        return json!({});
-    }
-
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": body,
-        }
-    })
+    (body, parts)
 }
 
 /// A literal prompt trigger can answer independently of semantic recall.
@@ -5501,14 +5603,25 @@ async fn prompt_prior_block(
         Vec::new()
     };
     let mut lines = Vec::with_capacity(hits.len() + memory_hits.len());
-    for entry in memory_hits.into_iter().take(max) {
+    let session_line = format!("mdkb prior session: {session}");
+    let mut budget = LineBudget::new(PRIOR_BLOCK_BUDGET_BYTES, &session_line);
+    let mut tried = 0;
+    for entry in memory_hits {
+        if tried == max {
+            break;
+        }
         let id = entry.id;
+        let line = format!("mdkb memory [{id}]: {}", entry.content);
+        if !budget.admit(&line) {
+            continue;
+        }
+        tried += 1;
         match crate::core::run_guarded_write(
             &mut ctx_guard,
             "prompt memory trigger telemetry",
             |ctx| crate::store::memory::record_trigger_injection_once(&ctx.conn, &id, session, now),
         ) {
-            Some(Ok(true)) => lines.push(format!("mdkb memory [{id}]: {}", entry.content)),
+            Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
             Some(Err(error)) => tracing::warn!("record prompt memory trigger injection: {error}"),
         }
@@ -5518,6 +5631,10 @@ async fn prompt_prior_block(
             if dctx.hook_prior_seen(key, &c.id) {
                 continue;
             }
+        }
+        let line = format!("mdkb prior [{}]: {}", c.id, c.lesson);
+        if !budget.admit(&line) {
+            continue;
         }
         let prior_id = c.id.clone();
         if let Some(Err(error)) =
@@ -5530,13 +5647,13 @@ async fn prompt_prior_block(
         if let Some((dctx, key)) = dedup {
             dctx.record_hook_prior(key, &c.id);
         }
-        lines.push(format!("mdkb prior [{}]: {}", c.id, c.lesson));
+        lines.push(line);
     }
     if lines.is_empty() {
         return None;
     }
     if !hits.is_empty() {
-        lines.push(format!("mdkb prior session: {session}"));
+        lines.push(session_line);
     }
     Some(lines.join("\n"))
 }
@@ -6109,8 +6226,17 @@ async fn hook_pre_tool_use_with_payload(
     // Trigger-matched behavioral priors are complementary to the search
     // redirect: surface any promoted prior whose trigger matches this tool call,
     // appended after the search block.
-    let prior_block =
-        pretool_prior_block(handle, tool_name, tool_input, &event_session(event)).await;
+    // The prior shares the body with the search block and the "\n\n" between.
+    let prior_room = RECALL_PAYLOAD_BUDGET_BYTES
+        .saturating_sub(search_block.as_ref().map_or(0, |search| search.len() + 2));
+    let prior_block = pretool_prior_block(
+        handle,
+        tool_name,
+        tool_input,
+        &event_session(event),
+        prior_room,
+    )
+    .await;
 
     let mut parts = Vec::new();
     if let Some(search) = &search_block {
@@ -6156,8 +6282,9 @@ async fn pretool_prior_block(
     tool: &str,
     tool_input: &Value,
     session: &str,
+    room: usize,
 ) -> Option<String> {
-    tool_prior_block(handle, tool, tool_input, false, None, session).await
+    tool_prior_block(handle, tool, tool_input, false, None, session, room).await
 }
 
 /// Promoted priors whose trigger matches this PostToolUse call.
@@ -6168,7 +6295,16 @@ async fn posttool_prior_block(
     error: Option<&str>,
     session: &str,
 ) -> Option<String> {
-    tool_prior_block(handle, tool, tool_input, true, error, session).await
+    tool_prior_block(
+        handle,
+        tool,
+        tool_input,
+        true,
+        error,
+        session,
+        RECALL_PAYLOAD_BUDGET_BYTES,
+    )
+    .await
 }
 
 /// Promoted priors whose trigger matches a tool call, formatted as a context
@@ -6186,6 +6322,7 @@ async fn tool_prior_block(
     after: bool,
     error: Option<&str>,
     session: &str,
+    room: usize,
 ) -> Option<String> {
     use crate::store::priors::{TriggerContext, match_injectable, record_tool_injection_once};
 
@@ -6244,24 +6381,39 @@ async fn tool_prior_block(
         Vec::new()
     };
     let mut lines = Vec::with_capacity(hits.len() + memory_hits.len());
-    for entry in memory_hits.into_iter().take(max) {
+    let session_line = format!("mdkb prior session: {session}");
+    let mut budget = LineBudget::new(room, &session_line);
+    let mut tried = 0;
+    for entry in memory_hits {
+        if tried == max {
+            break;
+        }
         let id = entry.id;
+        let line = format!("mdkb memory [{id}]: {}", entry.content);
+        if !budget.admit(&line) {
+            continue;
+        }
+        tried += 1;
         match crate::core::run_guarded_write(
             &mut ctx_guard,
             "tool memory trigger telemetry",
             |ctx| crate::store::memory::record_trigger_injection_once(&ctx.conn, &id, session, now),
         ) {
-            Some(Ok(true)) => lines.push(format!("mdkb memory [{id}]: {}", entry.content)),
+            Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
             Some(Err(error)) => tracing::warn!("record {label} memory trigger injection: {error}"),
         }
     }
     for c in &hits {
+        let line = format!("mdkb prior [{}]: {}", c.id, c.lesson);
+        if !budget.admit(&line) {
+            continue;
+        }
         let prior_id = c.id.clone();
         match crate::core::run_guarded_write(&mut ctx_guard, "tool prior telemetry", |ctx| {
             record_tool_injection_once(&ctx.conn, &prior_id, session, now)
         }) {
-            Some(Ok(true)) => lines.push(format!("mdkb prior [{}]: {}", c.id, c.lesson)),
+            Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
             Some(Err(error)) => tracing::warn!("record {label} prior injection: {error}"),
         }
@@ -6273,7 +6425,7 @@ async fn tool_prior_block(
         None
     } else {
         if !hits.is_empty() {
-            lines.push(format!("mdkb prior session: {session}"));
+            lines.push(session_line);
         }
         Some(lines.join("\n"))
     }
@@ -7548,6 +7700,10 @@ mod tests {
     }
 
     async fn seed_memory_entry(handle: &RepoHandle, id: &str) {
+        seed_memory_entry_titled(handle, id, &format!("Title for {id}")).await;
+    }
+
+    async fn seed_memory_entry_titled(handle: &RepoHandle, id: &str, title: &str) {
         ensure_handle_context(handle).await.expect("init ctx");
         let ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard.as_ref().unwrap();
@@ -7555,7 +7711,7 @@ mod tests {
         let entry = crate::store::memory::MemoryEntry {
             triggers: Vec::new(),
             id: id.to_string(),
-            title: format!("Title for {id}"),
+            title: title.to_string(),
             // The identifier is load-bearing, not decoration: memory recall
             // is gated absolutely, and with no embedding service under test
             // the only arm that can admit an entry is a strong lexical match.
@@ -7999,6 +8155,393 @@ mod tests {
             injected, 2,
             "5 matching docs must be capped at recall_docs_limit = 2: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn recall_injection_is_trimmed_to_the_payload_budget() {
+        // Catches: long matching docs pushing one injection past 2 KB (#200-9f07).
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 10;
+        });
+        seed_memory_entry(&handle, "budget-mem").await;
+        for i in 0..10 {
+            seed_document(
+                &handle,
+                &format!("docs/quarantine-{i}.md"),
+                &format!("Quarantine autoheal {i} {}", "long title ".repeat(25)),
+                "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            )
+            .await;
+        }
+
+        let out = hook_user_prompt_submit_impl(&handle, "quarantine autoheal rebuilding").await;
+        let body = additional_context(&out);
+        assert!(
+            body.len() <= RECALL_PAYLOAD_BUDGET_BYTES,
+            "injection of {} B exceeds the budget: {body}",
+            body.len()
+        );
+        assert!(
+            body.contains("docs/quarantine-0.md"),
+            "the top-ranked doc must survive the trim: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_memory_cut_by_the_payload_trim_is_not_recorded_as_injected() {
+        // Catches: the recall ledger marking a memory injected that the 2048 B
+        // trim dropped from the body (same class as #195).
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_limit = 10;
+        });
+        let ids: Vec<String> = (0..10).map(|i| format!("trim-mem-{i}")).collect();
+        for id in &ids {
+            seed_memory_entry_titled(&handle, id, &"long title ".repeat(25)).await;
+        }
+
+        let out = hook_user_prompt_submit_impl(
+            &handle,
+            "what do we know about the recall_gate_fixture topic content",
+        )
+        .await;
+        let body = additional_context(&out);
+        let delivered = ids.iter().filter(|id| body.contains(id.as_str())).count();
+        assert!(
+            0 < delivered && delivered < ids.len(),
+            "the fixture must force a trim: {body}"
+        );
+
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let mut stmt = conn
+            .prepare("SELECT entry_id, injected FROM recall_candidates")
+            .unwrap();
+        let rows: Vec<(String, bool)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows.len(), ids.len(), "{rows:?}");
+        for (id, injected) in rows {
+            assert_eq!(injected, body.contains(id.as_str()), "{id}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_memory_trigger_is_skipped_unrecorded_and_the_payload_fits() {
+        // Catches: a trigger-matched memory with a huge body pushing the
+        // injection past 2048 B, or being recorded as delivered when cut.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        {
+            let guard = handle.ctx.lock().await;
+            let conn = &guard.as_ref().unwrap().conn;
+            for (id, content) in [
+                ("big-rule", "x".repeat(3000)),
+                ("small-rule", "Be brief.".into()),
+            ] {
+                conn.execute(
+                    "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at, triggers)
+                     VALUES (?1, ?1, ?2, 'decision', '[]', 1, 1, '[{\"prompt_contains\":\"subagent\"}]')",
+                    rusqlite::params![id, content],
+                )
+                .unwrap();
+            }
+        }
+        let dctx = make_dctx();
+        let out = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt":"start a subagent","session_id":"cap-session"}),
+            Arc::clone(&handle),
+            &dctx,
+        )
+        .await
+        .unwrap();
+        let body = additional_context(&out);
+        assert!(
+            body.len() <= RECALL_PAYLOAD_BUDGET_BYTES,
+            "{} B",
+            body.len()
+        );
+        assert!(
+            body.contains("mdkb memory [small-rule]: Be brief."),
+            "{body}"
+        );
+        assert!(!body.contains("big-rule"), "{body}");
+
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let recorded: Vec<String> = conn
+            .prepare("SELECT memory_id FROM memory_trigger_injections")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(recorded, vec!["small-rule".to_string()]);
+    }
+
+    async fn seed_trigger_memory(handle: &RepoHandle, id: &str, content: &str, trigger: &str) {
+        ensure_handle_context(handle).await.unwrap();
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        conn.execute(
+            "INSERT INTO memory_entries (id, title, content, entry_type, tags, created_at, updated_at, triggers)
+             VALUES (?1, ?1, ?2, 'decision', '[]', 1, 1, ?3)",
+            rusqlite::params![id, content, trigger],
+        )
+        .unwrap();
+    }
+
+    async fn prompt_body(
+        dctx: &DispatchContext,
+        handle: &Arc<RepoHandle>,
+        prompt: &str,
+        session: &str,
+    ) -> String {
+        let out = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt": prompt, "session_id": session}),
+            Arc::clone(handle),
+            dctx,
+        )
+        .await
+        .unwrap();
+        additional_context(&out).to_string()
+    }
+
+    #[tokio::test]
+    async fn payload_budget_counts_bytes_of_multibyte_titles() {
+        // Catches: the trim measuring chars instead of bytes, so titles of
+        // 4-byte characters leave an injection several times over 2048 B.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 10;
+        });
+        for i in 0..10 {
+            seed_document(
+                &handle,
+                &format!("docs/quarantine-{i}.md"),
+                &format!("Quarantine autoheal {i} {}", "🦀".repeat(60)),
+                "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            )
+            .await;
+        }
+        let body = prompt_body(
+            &make_dctx(),
+            &handle,
+            "quarantine autoheal rebuilding",
+            "mb",
+        )
+        .await;
+        assert!(
+            body.contains("docs/quarantine-"),
+            "fixture must inject docs: {body}"
+        );
+        assert!(body.len() <= 2048, "{} B: {body}", body.len());
+    }
+
+    #[tokio::test]
+    async fn payload_never_exceeds_the_budget_for_any_trigger_memory_size() {
+        // Catches: an off-by-one in the priors-block budget (header, newlines or
+        // call-graph hint miscounted), visible only at one content length.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(&handle, "sweep", "x", r#"[{"prompt_contains":"zzsweep"}]"#).await;
+        let dctx = make_dctx();
+        for len in 1800..=2060usize {
+            {
+                let guard = handle.ctx.lock().await;
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .conn
+                    .execute(
+                        "UPDATE memory_entries SET content = ?1 WHERE id = 'sweep'",
+                        rusqlite::params!["y".repeat(len)],
+                    )
+                    .unwrap();
+            }
+            let body =
+                prompt_body(&dctx, &handle, "where is zzsweep", &format!("sweep-{len}")).await;
+            assert!(body.len() <= 2048, "content {len} B gave {} B", body.len());
+            assert!(
+                body.is_empty() || body.contains("call-graph query"),
+                "the call-graph hint must survive: content {len} B"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_block_together_stays_within_the_budget() {
+        // Catches: memory, docs, trigger memory and call-graph hint each fitting
+        // alone but not together.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 10;
+            config.hooks.recall_limit = 10;
+        });
+        for i in 0..10 {
+            seed_memory_entry_titled(&handle, &format!("all-mem-{i}"), &"é".repeat(100)).await;
+            seed_document(
+                &handle,
+                &format!("docs/everything-{i}.md"),
+                &format!(
+                    "Everything quarantine autoheal {i} {}",
+                    "long title ".repeat(10)
+                ),
+                "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            )
+            .await;
+        }
+        seed_trigger_memory(
+            &handle,
+            "all-trigger",
+            &"t".repeat(700),
+            r#"[{"prompt_contains":"quarantine"}]"#,
+        )
+        .await;
+        let body = prompt_body(
+            &make_dctx(),
+            &handle,
+            "where is the recall_gate_fixture quarantine autoheal rebuilding",
+            "all",
+        )
+        .await;
+        assert!(body.len() <= 2048, "{} B: {body}", body.len());
+        assert!(body.contains("mdkb memory [all-trigger]"), "{body}");
+        assert!(body.contains("call-graph query"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_skipped_oversized_trigger_does_not_use_up_the_injection_slot() {
+        // Catches: an oversized trigger memory that is skipped still counting
+        // against max_injected_per_hook, so the small one behind it is lost.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        assert_eq!(handle.config.priors.max_injected_per_hook, 1);
+        for id in ["big-a", "big-b"] {
+            seed_trigger_memory(
+                &handle,
+                id,
+                &"x".repeat(3000),
+                r#"[{"prompt_contains":"subagent"}]"#,
+            )
+            .await;
+        }
+        seed_trigger_memory(
+            &handle,
+            "small-z",
+            "Be brief.",
+            r#"[{"prompt_contains":"subagent"}]"#,
+        )
+        .await;
+        let body = prompt_body(&make_dctx(), &handle, "start a subagent", "slot").await;
+        assert!(body.contains("mdkb memory [small-z]: Be brief."), "{body}");
+        assert!(body.len() <= 2048, "{} B", body.len());
+    }
+
+    #[tokio::test]
+    async fn docs_cut_by_the_trim_surface_on_the_next_prompt() {
+        // Catches: the session dedup marking docs seen before the trim, so a
+        // doc that was cut is never shown in the session.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 10;
+        });
+        for i in 0..10 {
+            seed_document(
+                &handle,
+                &format!("docs/dedupcut-{i}.md"),
+                &format!("Quarantine autoheal {i} {}", "long title ".repeat(25)),
+                "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            )
+            .await;
+        }
+        let dctx = make_dctx();
+        let paths = |body: &str| -> std::collections::BTreeSet<String> {
+            (0..10)
+                .map(|i| format!("docs/dedupcut-{i}.md"))
+                .filter(|p| body.contains(p.as_str()))
+                .collect()
+        };
+        let first =
+            paths(&prompt_body(&dctx, &handle, "quarantine autoheal rebuilding", "dd").await);
+        let second =
+            paths(&prompt_body(&dctx, &handle, "quarantine autoheal rebuilding again", "dd").await);
+        assert!(
+            !first.is_empty() && first.len() < 10,
+            "the fixture must force a trim: {first:?}"
+        );
+        assert!(first.is_disjoint(&second), "{first:?} vs {second:?}");
+        assert!(
+            !second.is_empty(),
+            "the cut docs must surface on the next prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_injection_is_bounded_by_the_payload_budget() {
+        // Catches: an oversized trigger memory reaching the model unbounded on
+        // PreToolUse (hook-events rows of that hook also count against 2 KB).
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(
+            &handle,
+            "pre-big",
+            &"x".repeat(3000),
+            r#"[{"tool":"Edit"}]"#,
+        )
+        .await;
+        let out = hook_pre_tool_use_impl(
+            &handle,
+            &json!({"tool_name": "Edit", "tool_input": {"file_path": "a.rs"}, "session_id": "pre"}),
+        )
+        .await;
+        let body = additional_context(&out);
+        assert!(
+            body.len() <= RECALL_PAYLOAD_BUDGET_BYTES,
+            "{} B",
+            body.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_skips_an_oversized_trigger_without_recording_it() {
+        // Catches: PostToolUse injecting a trigger memory past 2048 B, or
+        // recording the cut one as delivered so it never surfaces again.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(
+            &handle,
+            "post-big",
+            &"x".repeat(3000),
+            r#"[{"tool":"Bash"}]"#,
+        )
+        .await;
+        let out = hook_post_tool_use_impl(
+            &handle,
+            &json!({"tool_name": "Bash", "tool_input": {"command": "ls"}, "session_id": "post"}),
+        )
+        .await;
+        assert!(additional_context(&out).len() <= RECALL_PAYLOAD_BUDGET_BYTES);
+
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let recorded: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_trigger_injections", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(recorded, 0);
     }
 
     fn scored_hit(
@@ -13556,6 +14099,7 @@ mod tests {
             "Edit",
             &json!({"file_path": edit_path.to_string_lossy()}),
             "sess-inject",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await
         .expect("promoted prior must inject on a matching PreToolUse");
@@ -13571,6 +14115,7 @@ mod tests {
             "Edit",
             &json!({"file_path": edit_path.to_string_lossy()}),
             "sess-inject",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await;
         assert!(
@@ -13630,6 +14175,7 @@ mod tests {
             "Edit",
             &json!({"file_path": edit_path.to_string_lossy()}),
             "sess-inject",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await
         .expect("a newly matching prior must still inject");
@@ -13645,6 +14191,7 @@ mod tests {
             "Edit",
             &json!({"file_path": tmp.path().join("src/generated/other.rs").to_string_lossy()}),
             "sess-next",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await;
         let expected_next = format!(
@@ -13660,6 +14207,7 @@ mod tests {
             "Edit",
             &json!({"file_path": unrelated_path.to_string_lossy()}),
             "sess-inject",
+            RECALL_PAYLOAD_BUDGET_BYTES,
         )
         .await;
         assert!(
