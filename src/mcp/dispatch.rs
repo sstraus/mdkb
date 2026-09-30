@@ -5017,136 +5017,155 @@ async fn hook_user_prompt_submit_impl_timed(
         // via `_fts`; embedding the FTS operators would be noise.
         query_embedding = embed_query_off_lock(prompt).await;
         phases.mark("embed");
-        let mut ctx_guard = handle.ctx.lock().await;
-        phases.mark("lock_wait");
         let limit = cfg.recall_limit.max(1);
-        let search_t0 = std::time::Instant::now();
-        let search = crate::core::run_guarded_read(&mut ctx_guard, "hook memory recall", |ctx| {
-            memory::search_entries_hybrid_fts(
-                &ctx.conn,
-                q,
-                // The raw prompt, not `q`: `q` is the OR-expanded FTS
-                // expression, and the lexical admission arm needs the words
-                // as written. It is also what `query_embedding` embedded.
-                prompt,
-                query_embedding.as_deref(),
-                limit,
-                None,
-                &search_cfg,
-            )
-        });
-        let mut scored_results = match search {
-            Some(Ok(entries)) => entries,
-            Some(Err(error)) => {
-                tracing::warn!("hook memory recall failed: {error}");
-                return json!({});
-            }
-            None => return json!({}),
-        };
-
-        // The ledger's view of the same prompt: a second query at the
-        // candidate floor with a wider limit, rather than the injection query
-        // run lower. One query cannot serve both — `limit` sizes the BM25 and
-        // vector pools and the access-recency bonus ranks within the admitted
-        // set, so admitting more would reorder, and change, what is injected.
-        let candidate_cfg = candidate_search_cfg(&search_cfg);
-        match crate::core::run_guarded_read(&mut ctx_guard, "hook recall observation", |ctx| {
-            memory::search_entries_hybrid_fts(
-                &ctx.conn,
-                q,
-                prompt,
-                query_embedding.as_deref(),
-                limit * 3,
-                None,
-                &candidate_cfg,
-            )
-        }) {
-            Some(Ok(entries)) => observed = entries,
-            Some(Err(error)) => tracing::debug!("recall observation failed: {error}"),
-            None => {}
-        }
-
-        // Opt-in, privacy-minimized telemetry: record the recall's shape (HMAC +
-        // latency + count) but NEVER the prompt text. Off by default.
-        if handle.config.telemetry.query_events {
-            let telemetry_now = chrono::Utc::now().timestamp();
-            let mut eligible_scores = scored_results
-                .iter()
-                .filter(|entry| {
-                    // Admission already happened in the store, so the only
-                    // filter left is the prior-confidence gate applied below.
-                    entry.entry_type != crate::store::memory::EntryType::Prior
-                        || entry.confidence_at(telemetry_now) >= PRIOR_CONFIDENCE_GATE
-                })
-                .map(|entry| entry.score);
-            let top_score = eligible_scores.next();
-            let result_count = i64::try_from(1 + eligible_scores.count()).unwrap_or(i64::MAX);
-            let result_count = if top_score.is_some() { result_count } else { 0 };
-            let query_hash = match crate::metrics::privacy::hash_query(&handle.root, prompt) {
-                Ok(hash) => hash,
-                Err(error) => {
-                    tracing::warn!("query telemetry key unavailable: {error}");
-                    String::new()
-                }
-            };
-            let ev = stats::QueryEvent {
-                query_hash,
-                query_text: String::new(),
-                search_type: "recall".to_string(),
-                result_count,
-                latency_ms: search_t0.elapsed().as_millis() as i64,
-                top_score,
-                session_id: None,
-            };
-            if !ev.query_hash.is_empty()
-                && let Some(Err(error)) =
-                    crate::core::run_guarded_write(&mut ctx_guard, "query event telemetry", |ctx| {
-                        stats::record_query_event(
-                            &ctx.conn,
-                            &ev,
-                            handle.config.telemetry.retention_days,
-                        )
-                    })
-            {
-                tracing::warn!("record_query_event failed: {error}");
-            }
-        }
-
-        // Documents leg — same hybrid engine as `search --scope docs`, reusing
-        // the OR-expanded recall query and the embedding already computed above
-        // (a second embed would double the per-turn CPU cost). RRF
-        // normalization pins the top hit at 1.0 for every prompt, so rank alone
-        // admits nothing worth trusting: each hit must clear
-        // `recall_docs_min_cosine` or be quoted by the prompt
-        // ([`admit_doc_hits`]). `recall_docs_limit` caps what is left
-        // (0 = memory only). The pool is wider than the cap because sub-floor
-        // hits are dropped after ranking, and must not crowd out a later one.
         let docs_limit = cfg.recall_docs_limit;
-        if docs_limit > 0 && ctx_guard.is_some() {
-            match crate::core::run_guarded_read(&mut ctx_guard, "hook document recall", |ctx| {
-                crate::core::search::hybrid_search_fts_scored(
-                    ctx,
-                    q,
+        let docs_min_cosine = cfg.recall_docs_min_cosine;
+        // The search leg is synchronous SQLite and vector work; run inline it
+        // would hold this task past the deadline, which only preempts at an
+        // await. It runs on the blocking pool instead, owning the store guard,
+        // so the deadline can drop the wait. A cut search still finishes there
+        // and releases the store; it has no side effect the deadline must undo.
+        let ctx_arc = Arc::clone(&handle.ctx);
+        let (q, prompt_owned, embedding) = (q.clone(), prompt.to_string(), query_embedding.clone());
+        let root = handle.root.clone();
+        let telemetry = handle.config.telemetry.clone();
+        let search_cfg_owned = search_cfg.clone();
+        let mut ctx_guard = ctx_arc.lock_owned().await;
+        phases.mark("lock_wait");
+        let leg = tokio::task::spawn_blocking(move || {
+            let (prompt, query_embedding, search_cfg) = (prompt_owned, embedding, search_cfg_owned);
+            let mut observed: Vec<memory::ScoredMemoryEntry> = Vec::new();
+            let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
+            let search_t0 = std::time::Instant::now();
+            let search =
+                crate::core::run_guarded_read(&mut ctx_guard, "hook memory recall", |ctx| {
+                    memory::search_entries_hybrid_fts(
+                        &ctx.conn,
+                        &q,
+                        // The raw prompt, not `q`: `q` is the OR-expanded FTS
+                        // expression, and the lexical admission arm needs the words
+                        // as written. It is also what `query_embedding` embedded.
+                        &prompt,
+                        query_embedding.as_deref(),
+                        limit,
+                        None,
+                        &search_cfg,
+                    )
+                });
+            let scored_results = match search {
+                Some(Ok(entries)) => entries,
+                Some(Err(error)) => {
+                    tracing::warn!("hook memory recall failed: {error}");
+                    return None;
+                }
+                None => return None,
+            };
+
+            // The ledger's view of the same prompt: a second query at the
+            // candidate floor with a wider limit, rather than the injection query
+            // run lower. One query cannot serve both — `limit` sizes the BM25 and
+            // vector pools and the access-recency bonus ranks within the admitted
+            // set, so admitting more would reorder, and change, what is injected.
+            let candidate_cfg = candidate_search_cfg(&search_cfg);
+            match crate::core::run_guarded_read(&mut ctx_guard, "hook recall observation", |ctx| {
+                memory::search_entries_hybrid_fts(
+                    &ctx.conn,
+                    &q,
+                    &prompt,
                     query_embedding.as_deref(),
-                    docs_limit * DOC_RECALL_POOL_FACTOR,
+                    limit * 3,
                     None,
-                    false,
+                    &candidate_cfg,
                 )
             }) {
-                Some(Ok(hits)) => {
-                    doc_hits = admit_doc_hits(hits, prompt, cfg.recall_docs_min_cosine)
-                        .into_iter()
-                        .take(docs_limit)
-                        .collect();
-                }
-                Some(Err(error)) => {
-                    // Degrade silently (hooks must not block) but stay observable.
-                    tracing::debug!("recall doc search failed: {error}");
-                }
+                Some(Ok(entries)) => observed = entries,
+                Some(Err(error)) => tracing::debug!("recall observation failed: {error}"),
                 None => {}
             }
-        }
-        drop(ctx_guard);
+
+            // Opt-in, privacy-minimized telemetry: record the recall's shape (HMAC +
+            // latency + count) but NEVER the prompt text. Off by default.
+            if telemetry.query_events {
+                let telemetry_now = chrono::Utc::now().timestamp();
+                let mut eligible_scores = scored_results
+                    .iter()
+                    .filter(|entry| {
+                        // Admission already happened in the store, so the only
+                        // filter left is the prior-confidence gate applied below.
+                        entry.entry_type != crate::store::memory::EntryType::Prior
+                            || entry.confidence_at(telemetry_now) >= PRIOR_CONFIDENCE_GATE
+                    })
+                    .map(|entry| entry.score);
+                let top_score = eligible_scores.next();
+                let result_count = i64::try_from(1 + eligible_scores.count()).unwrap_or(i64::MAX);
+                let result_count = if top_score.is_some() { result_count } else { 0 };
+                let query_hash = match crate::metrics::privacy::hash_query(&root, &prompt) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        tracing::warn!("query telemetry key unavailable: {error}");
+                        String::new()
+                    }
+                };
+                let ev = stats::QueryEvent {
+                    query_hash,
+                    query_text: String::new(),
+                    search_type: "recall".to_string(),
+                    result_count,
+                    latency_ms: search_t0.elapsed().as_millis() as i64,
+                    top_score,
+                    session_id: None,
+                };
+                if !ev.query_hash.is_empty()
+                    && let Some(Err(error)) = crate::core::run_guarded_write(
+                        &mut ctx_guard,
+                        "query event telemetry",
+                        |ctx| stats::record_query_event(&ctx.conn, &ev, telemetry.retention_days),
+                    )
+                {
+                    tracing::warn!("record_query_event failed: {error}");
+                }
+            }
+
+            // Documents leg — same hybrid engine as `search --scope docs`, reusing
+            // the OR-expanded recall query and the embedding already computed above
+            // (a second embed would double the per-turn CPU cost). RRF
+            // normalization pins the top hit at 1.0 for every prompt, so rank alone
+            // admits nothing worth trusting: each hit must clear
+            // `recall_docs_min_cosine` or be quoted by the prompt
+            // ([`admit_doc_hits`]). `recall_docs_limit` caps what is left
+            // (0 = memory only). The pool is wider than the cap because sub-floor
+            // hits are dropped after ranking, and must not crowd out a later one.
+            if docs_limit > 0 && ctx_guard.is_some() {
+                match crate::core::run_guarded_read(&mut ctx_guard, "hook document recall", |ctx| {
+                    crate::core::search::hybrid_search_fts_scored(
+                        ctx,
+                        &q,
+                        query_embedding.as_deref(),
+                        docs_limit * DOC_RECALL_POOL_FACTOR,
+                        None,
+                        false,
+                    )
+                }) {
+                    Some(Ok(hits)) => {
+                        doc_hits = admit_doc_hits(hits, &prompt, docs_min_cosine)
+                            .into_iter()
+                            .take(docs_limit)
+                            .collect();
+                    }
+                    Some(Err(error)) => {
+                        // Degrade silently (hooks must not block) but stay observable.
+                        tracing::debug!("recall doc search failed: {error}");
+                    }
+                    None => {}
+                }
+            }
+            Some((scored_results, observed, doc_hits))
+        });
+        let Ok(Some((mut scored_results, observed_hits, doc_hits_found))) = leg.await else {
+            return json!({});
+        };
+        observed = observed_hits;
+        doc_hits = doc_hits_found;
         phases.mark("search");
 
         // A handoff is session state for the next session start, not
@@ -11926,6 +11945,46 @@ mod tests {
         );
         let row = hook_event_row(&handle.root, "user_prompt_submit").await;
         assert_eq!(row["outcome"], "deadline");
+    }
+
+    #[tokio::test]
+    async fn user_prompt_submit_returns_at_the_deadline_when_the_search_blocks() {
+        // Catches: the search leg runs synchronously inside the timed future, so
+        // the deadline cannot preempt it and a cut run answers only when the
+        // search returns (story 198: outcome=deadline, elapsed 28574 ms).
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 150;
+        });
+        seed_memory_entry(&handle, "blocked-topic").await;
+        {
+            // Block the real query, not an await point: SQLite calls this from
+            // inside the statement, on whichever thread runs the search.
+            let guard = handle.ctx.lock().await;
+            let slow = std::sync::atomic::AtomicBool::new(true);
+            let _ = guard.as_ref().unwrap().conn.progress_handler(
+                1,
+                Some(move || {
+                    if slow.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                    }
+                    false
+                }),
+            );
+        }
+
+        let t0 = std::time::Instant::now();
+        let result = prompt_hook(&handle, &make_dctx(), "blocked").await;
+        let waited = t0.elapsed();
+
+        assert_eq!(result, json!({}), "no recall block past the deadline");
+        assert!(
+            waited < std::time::Duration::from_millis(700),
+            "returned after {waited:?}, deadline was 150 ms"
+        );
+        let row = hook_event_row(&handle.root, "user_prompt_submit").await;
+        assert_eq!(row["outcome"], "deadline", "{row}");
     }
 
     #[tokio::test]
