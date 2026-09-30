@@ -12795,6 +12795,12 @@ mod tests {
         );
         seed_memory_entry(&handle, "slow-rerank").await;
 
+        // The first embed of a process loads the model, which takes 230-490 ms
+        // on the rb box and would eat the 500 ms hook deadline
+        // before the reranker starts. Pay it here so the deadline measures the
+        // reranker.
+        let _ = embed_query_off_lock(RECALL_PROMPT).await;
+
         let t0 = std::time::Instant::now();
         let (result, row) = prompt_row(&handle, RECALL_PROMPT, "slow").await;
 
