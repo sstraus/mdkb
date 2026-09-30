@@ -347,6 +347,7 @@ recall_limit = 5
 # Max matching documents injected alongside the memory recall, from
 # the same hybrid engine as `mdkb search --scope docs`. 0 = memory only.
 recall_docs_limit = 3
+recall_docs_min_cosine = 0.55   # a doc must score this cosine or be quoted by the prompt
 
 # Latency budget in milliseconds. A run over budget is copied to
 # .mdkb/hook-slow.jsonl. Nothing is truncated: the value decides
