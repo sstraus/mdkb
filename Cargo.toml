@@ -90,6 +90,9 @@ regex = "1"
 
 # Embedding - semantic search with local ONNX models
 fastembed = { version = "4", default-features = false, features = ["ort-download-binaries", "hf-hub-rustls-tls"] }
+# Same hf-hub fastembed resolves, named here to fetch the recall reranker's
+# pinned revision (fastembed cannot: its reranker downloader has no int8 file).
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "rustls-tls"] }
 
 # Token counting for usage metrics
 tiktoken-rs = "0.6"

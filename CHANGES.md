@@ -15,6 +15,20 @@
 
 ### Added
 
+- **Automatic recall reranks MiniLM's top five with jina-reranker-v2 (int8).**
+  The cosine gate rejects an Italian prompt over an English store; a
+  cross-encoder on MiniLM's top five recovers a third of those. Entries whose
+  reranker score reaches the prompt language's floor
+  (`hooks.recall_rerank_min_score_it` -1.05, `..._en` -1.95) are injected.
+  The model loads once per daemon on a background thread, has its own deadline
+  (`hooks.recall_rerank_deadline_ms`, 700, clamped to what is left of the hook
+  budget) and on timeout, load failure or missing weights the hook keeps the
+  MiniLM result and logs `phases.rerank` plus `rerank_outcome` in
+  `hook-events.jsonl`. `hooks.recall_rerank = false` turns it off. `mdkb embed`
+  fetches the weights (280 MB, revision pinned); the daemon holds about 1 GB
+  more resident once loaded, and the first prompt after a daemon start falls
+  back while it loads. Sigil prompts are not reranked. Story 202-4c67.
+
 - **UserPromptSubmit has a hard deadline.** `[hooks] user_prompt_submit_deadline_ms`
   (default 1500, `0` disables) stops recall that has not finished, answers with
   nothing and logs `outcome = "deadline"`; `mdkb stats` reports the deadline

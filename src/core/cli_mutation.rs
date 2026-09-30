@@ -274,6 +274,7 @@ pub fn execute_context_mutation(ctx: &Context, mutation: CliMutation) -> Result<
             return Err(Error::other("mutation requires daemon-owned resources"));
         }
         Embed { collection } => {
+            crate::core::ops::fetch_reranker_weights(ctx);
             let r = crate::core::ops::handle_embed(ctx, collection.as_deref())?;
             CliMutationResult::Embed {
                 generated: r.generated,

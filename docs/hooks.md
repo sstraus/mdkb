@@ -359,6 +359,15 @@ latency_budget_ms = 200
 # outcome = "deadline". 0 disables the deadline.
 user_prompt_submit_deadline_ms = 1500
 
+# Rerank MiniLM's top five with jina-reranker-v2 (int8) before injecting.
+# Weights come from `mdkb embed`; without them, or while they load, or past
+# the rerank deadline, the MiniLM result is used and the row logs
+# `rerank_outcome`. Not applied to `*` prompts.
+recall_rerank = true
+recall_rerank_deadline_ms = 700       # own deadline, clamped to what is left of the 1 s hook-client wait (or the hook deadline, if shorter)
+recall_rerank_min_score_it = -1.05    # floor on the reranker logit, Italian prompts
+recall_rerank_min_score_en = -1.95    # floor, English prompts
+
 # Require daemon delivery instead of using the in-process fallback.
 daemon_required = false
 
@@ -495,8 +504,12 @@ budget truncates nothing — the value only decides what gets flagged.
 1500, `0` disables) stops recall when it has not finished, answers with nothing
 and logs `outcome = "deadline"`. `mdkb stats` counts these as deadline hits.
 Its rows carry a `phases` object (`context`, `embed`, `lock_wait`, `search`,
-`enrich`, `prior`, in ms) naming the phases the run reached, so a deadline row
-shows where the time went.
+`enrich`, `prior`, `rerank`, in ms) naming the phases the run reached, so a
+deadline row shows where the time went. With the reranker in play the same
+object carries `rerank_outcome`: `ok`, `below_gate`, `timeout`, `no_budget`,
+`loading`, `not_cached`, `load_failed`, `busy`, `failed`, `no_candidates` or
+`off`. Anything but `ok`/`below_gate`/`no_candidates`/`off` means the MiniLM
+result was used.
 
 SessionStart rows carry the split of `elapsed_ms` across the six phases, in the
 order they run:

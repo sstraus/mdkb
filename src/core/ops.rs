@@ -22,6 +22,21 @@ use crate::store::{collections, documents, evolution, memory, search, stats, vec
 use std::collections::HashSet;
 use walkdir::WalkDir;
 
+/// Fetch the recall reranker's weights, for the two callers that are the user
+/// running `mdkb embed`. Not part of [`handle_embed`]: that also runs on every
+/// index flush, and a 280 MB download has no place there. Best effort — recall
+/// falls back to the MiniLM gate without the weights, so a failed fetch is a
+/// warning, not an error.
+pub fn fetch_reranker_weights(ctx: &Context) {
+    let config = crate::config::Config::load_or_default(&ctx.config_path);
+    if !config.hooks.recall_rerank {
+        return;
+    }
+    if let Err(error) = crate::llm::rerank::download() {
+        tracing::warn!("recall reranker weights not fetched: {error}");
+    }
+}
+
 /// Generate embeddings for documents that don't have them (the `has_embedding`
 /// gate is the hash gate: content changes invalidate the old embedding, so only
 /// new/changed docs are re-embedded; unchanged docs are skipped).
