@@ -3592,6 +3592,10 @@ pub async fn usage_impl(
 /// keeping the log bounded without an external logrotate.
 pub const HOOK_LOG_CAP_BYTES: u64 = 1024 * 1024; // 1 MiB
 
+/// Byte budget of one UserPromptSubmit recall injection: it is added to the
+/// context of every prompt, so the recall lines are dropped to fit it.
+const RECALL_PAYLOAD_BUDGET_BYTES: usize = 2048;
+
 #[derive(Debug)]
 struct HookPayload {
     bytes: usize,
@@ -5320,13 +5324,6 @@ async fn hook_user_prompt_submit_impl_timed(
         dctx.retain_new_hook_related_lines(key, &mut doc_lines);
         dctx.retain_new_hook_related_lines(key, &mut related);
     }
-    // Marked once the run has no await left to be cut at, not at retrieval.
-    let delivery = HookDelivery {
-        fingerprint,
-        memory_ids: results.iter().map(|e| e.id.clone()).collect(),
-        related_lines: doc_lines.iter().chain(&related).cloned().collect(),
-    };
-
     // Shadow mode records the full recall retrieval but does not emit it.
     // Literal prompt priors are independent of that retrieval and can still
     // inject, with their own telemetry and session deduplication.
@@ -5348,8 +5345,50 @@ async fn hook_user_prompt_submit_impl_timed(
     // Trigger-matched behavioral priors whose prompt pattern fires here.
     let prior_block = prompt_prior_block(handle, prompt, session, dedup.as_ref()).await;
     phases.mark("prior");
+
+    // The injection is paid for on every prompt: drop the lowest-ranked lines
+    // until it fits, related docs first, memories last. Trimmed before the
+    // delivery is committed, so a dropped line is not recorded as seen and can
+    // still surface on a later prompt.
+    let (mut body, mut parts) = render_recall_body(
+        &results,
+        &expanded,
+        &stale_ids,
+        &doc_lines,
+        &related,
+        prior_block.as_deref(),
+        wants_cg,
+    );
+    while body.len() > RECALL_PAYLOAD_BUDGET_BYTES {
+        if related.pop().is_none()
+            && doc_lines.pop().is_none()
+            && expanded.pop().is_none()
+            && results.pop().is_none()
+        {
+            break;
+        }
+        (body, parts) = render_recall_body(
+            &results,
+            &expanded,
+            &stale_ids,
+            &doc_lines,
+            &related,
+            prior_block.as_deref(),
+            wants_cg,
+        );
+    }
+    payload_parts.extend(parts);
+
+    // Marked once the run has no await left to be cut at, not at retrieval.
     if let Some((dctx, key)) = recall_dedup {
-        dctx.commit_hook_delivery(key, delivery);
+        dctx.commit_hook_delivery(
+            key,
+            HookDelivery {
+                fingerprint,
+                memory_ids: results.iter().map(|e| e.id.clone()).collect(),
+                related_lines: doc_lines.iter().chain(&related).cloned().collect(),
+            },
+        );
     }
 
     let nothing_found = results.is_empty() && doc_lines.is_empty() && related.is_empty();
@@ -5359,13 +5398,35 @@ async fn hook_user_prompt_submit_impl_timed(
     if prompt_repeat && nothing_found && prior_block.is_none() {
         return json!({});
     }
+    if body.is_empty() {
+        return json!({});
+    }
 
+    json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": body,
+        }
+    })
+}
+
+/// The UserPromptSubmit body and the byte size of each block in it.
+fn render_recall_body(
+    results: &[memory::MemoryEntry],
+    expanded: &[String],
+    stale_ids: &std::collections::HashSet<String>,
+    doc_lines: &[String],
+    related: &[String],
+    prior: Option<&str>,
+    wants_cg: bool,
+) -> (String, Vec<(&'static str, usize)>) {
     let mut body = String::new();
+    let mut parts: Vec<(&'static str, usize)> = Vec::new();
 
     if !results.is_empty() {
         let start = body.len();
         body.push_str("## mdkb: relevant context\n\n");
-        for entry in &results {
+        for entry in results {
             let snippet_raw =
                 crate::store::memory::strip_frontmatter(&entry.content).replace('\n', " ");
             let snippet: String = snippet_raw.chars().take(160).collect();
@@ -5384,12 +5445,12 @@ async fn hook_user_prompt_submit_impl_timed(
             ));
         }
         // 1-hop edge-expanded neighbors, annotated `(via <relation>)`.
-        for line in &expanded {
+        for line in expanded {
             body.push_str(line);
             body.push('\n');
         }
         body.push_str("\nIf your work corroborates any entry above, run `mdkb memory confirm <id> --outcome confirmed` instead of writing a new one.\n");
-        payload_parts.push(("recall_memory", body.len() - start));
+        parts.push(("recall_memory", body.len() - start));
     }
 
     if !doc_lines.is_empty() {
@@ -5398,11 +5459,11 @@ async fn hook_user_prompt_submit_impl_timed(
             body.push('\n');
         }
         body.push_str("## mdkb: matching docs\n\n");
-        for line in &doc_lines {
+        for line in doc_lines {
             body.push_str(line);
             body.push('\n');
         }
-        payload_parts.push(("recall_docs", body.len() - start));
+        parts.push(("recall_docs", body.len() - start));
     }
 
     if !related.is_empty() {
@@ -5411,22 +5472,22 @@ async fn hook_user_prompt_submit_impl_timed(
             body.push('\n');
         }
         body.push_str("## mdkb: related docs\n\n");
-        for line in &related {
+        for line in related {
             body.push_str(line);
             body.push('\n');
         }
-        payload_parts.push(("related_docs", body.len() - start));
+        parts.push(("related_docs", body.len() - start));
     }
 
-    if let Some(prior) = prior_block {
+    if let Some(prior) = prior {
         let start = body.len();
         if !body.is_empty() {
             body.push('\n');
         }
         body.push_str("## mdkb: priors\n\n");
-        body.push_str(&prior);
+        body.push_str(prior);
         body.push('\n');
-        payload_parts.push(("prior", body.len() - start));
+        parts.push(("prior", body.len() - start));
     }
 
     if wants_cg {
@@ -5434,19 +5495,10 @@ async fn hook_user_prompt_submit_impl_timed(
         body.push_str(
             "\n💡 This looks like a call-graph query. Use `code_graph(name)` or `code_graph(name, direction=\"callers\"|\"callees\"|\"impact\")` — one MCP call replaces multi-file Grep.\n",
         );
-        payload_parts.push(("call_graph_hint", body.len() - start));
+        parts.push(("call_graph_hint", body.len() - start));
     }
 
-    if body.is_empty() {
-        return json!({});
-    }
-
-    json!({
-        "hookSpecificOutput": {
-            "hookEventName": "UserPromptSubmit",
-            "additionalContext": body,
-        }
-    })
+    (body, parts)
 }
 
 /// A literal prompt trigger can answer independently of semantic recall.
@@ -7998,6 +8050,38 @@ mod tests {
         assert_eq!(
             injected, 2,
             "5 matching docs must be capped at recall_docs_limit = 2: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_injection_is_trimmed_to_the_payload_budget() {
+        // Catches: long matching docs pushing one injection past 2 KB (#200-9f07).
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 10;
+        });
+        seed_memory_entry(&handle, "budget-mem").await;
+        for i in 0..10 {
+            seed_document(
+                &handle,
+                &format!("docs/quarantine-{i}.md"),
+                &format!("Quarantine autoheal {i} {}", "long title ".repeat(25)),
+                "The autoheal routine quarantines a corrupt index before rebuilding it.",
+            )
+            .await;
+        }
+
+        let out = hook_user_prompt_submit_impl(&handle, "quarantine autoheal rebuilding").await;
+        let body = additional_context(&out);
+        assert!(
+            body.len() <= RECALL_PAYLOAD_BUDGET_BYTES,
+            "injection of {} B exceeds the budget: {body}",
+            body.len()
+        );
+        assert!(
+            body.contains("docs/quarantine-0.md"),
+            "the top-ranked doc must survive the trim: {body}"
         );
     }
 
