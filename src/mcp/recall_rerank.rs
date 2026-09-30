@@ -45,9 +45,9 @@ const IT_WORDS: &[&str] = &[
     "con", "non", "sono", "come", "perche", "perché", "cosa", "dove", "quando", "anche", "ma",
     "mi", "ti", "ci", "si", "è", "e", "nel", "nella", "sul", "sulla", "alla", "alle", "questo",
     "questa", "quello", "puoi", "posso", "devo", "dobbiamo", "vorrei", "fare", "hai", "ho", "ha",
-    "abbiamo", "tutto", "tutti", "più", "già", "dimmi", "ricordi", "adesso", "ora", "qui", "sempre",
-    "cioè", "però", "allora", "quindi", "poi", "se", "mio", "tuo", "nostro", "suo", "le", "la", "in",
-    "me",
+    "abbiamo", "tutto", "tutti", "più", "già", "dimmi", "ricordi", "adesso", "ora", "qui",
+    "sempre", "cioè", "però", "allora", "quindi", "poi", "se", "mio", "tuo", "nostro", "suo", "le",
+    "la", "in", "me",
 ];
 
 const EN_WORDS: &[&str] = &[

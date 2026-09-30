@@ -7400,7 +7400,10 @@ mod tests {
         )
         .await
         .expect("hook");
-        (result, hook_event_row(&handle.root, "user_prompt_submit").await)
+        (
+            result,
+            hook_event_row(&handle.root, "user_prompt_submit").await,
+        )
     }
 
     /// A handle rooted at `tmp`, with the config the caller asks for.
@@ -12912,7 +12915,10 @@ mod tests {
 
         let (result, row) = prompt_row(&handle, &format!("* {RECALL_PROMPT}"), "sigil").await;
 
-        assert!(additional_context(&result).contains("asked-for"), "{result}");
+        assert!(
+            additional_context(&result).contains("asked-for"),
+            "{result}"
+        );
         assert!(row["phases"].get("rerank_outcome").is_none(), "{row}");
     }
 
