@@ -2,7 +2,7 @@
 
 Question: which option lets automatic injection recall English documents for Italian prompts while still injecting nothing when nothing is relevant? Follows `multilingual-embedding-eval.md`; same data directory, same 40 IT->EN prompts, 38 IT negatives, English held-out fixture. Raw scores come from `examples/recall_options_eval.rs`; every gate is computed offline by `scripts/eval-recall-options/*.py`. No production code changed, no live store read.
 
-**Status: complete for the options in scope** (second run, 2026-09-30, on the rb box). Added: `bge-reranker-v2-m3`, unloaded reranker latency, LLM translation (option 4b). Not measured: `bge-m3` embeddings (not in fastembed 4.9.1) and a larger IT set (see "Sample size").
+**Status: complete for the options in scope** (third run: lighter rerankers, see "Lighter rerankers"; second run, 2026-09-30, on the rb box). Added: `bge-reranker-v2-m3`, unloaded reranker latency, LLM translation (option 4b). Not measured: `bge-m3` embeddings (not in fastembed 4.9.1) and a larger IT set (see "Sample size").
 
 ## Method
 
@@ -81,6 +81,59 @@ Branch `fix/195-recall-deadline`: `user_prompt_submit_deadline_ms = 1500` bounds
 | 4b LLM translation | 0.56 s p50, 3.5 s p95 (network) | p50 yes, p95 no |
 | 4a gemma local | 3.3 s | no |
 
+## Lighter rerankers (2026-09-30, third run, rb box)
+
+Question: is there a reranker lighter than jina-v2 fp32 (1.1 GB, 2.2 s at 8 cores, 2.1 GB RSS) that keeps IT recall within noise of 0.525 and fits the 1500 ms hook at 8 cores? Same protocol, pool and gates as above (gate fit on the 38 IT negatives, 0 negatives admitted in-sample unless noted). Files loaded through fastembed `UserDefinedRerankingModel` at pinned revisions (`examples/recall_options_eval.rs`); prefetch by curl. No quantized file failed to load under the bundled ORT, except that fp16 loads but gains nothing on CPU (below).
+
+**Control reproduced**: jina-v2 fp32 on e5-small top-10 gives IT 0.525 (0.37-0.67), EN 0.333, same scores as the first run (rerun on the box, 2026-09-30).
+
+### Recall (IT at the IT-fit gate, 95% Wilson; EN in brackets)
+
+| Reranker (file) | e5-small top-10 | e5-small top-5 | MiniLM top-10 | MiniLM top-5 | e5-small top-10 vs retriever alone (sign test) | vs jina fp32 |
+|---|---|---|---|---|---|---|
+| jina-v2 fp32 (control) | **0.525** (0.37-0.67) [0.333] | 0.350 [0.333] | 0.325 [0.333] | 0.350 [0.417] | +12/-1, p = 0.003 | - |
+| jina-v2 **int8** | **0.475** (0.33-0.63) [0.333] | 0.325 [0.333] | 0.325 [0.361] | 0.350 [0.417] | +11/-2, p = 0.022 | +0/-2, p = 0.50 |
+| jina-v2 fp16 | 0.525 [0.333] | 0.350 [0.333] | 0.325 [0.333] | 0.350 [0.417] | +12/-1, p = 0.003 | identical |
+| mmarco-mMiniLMv2-L12 fp32 | 0.150 (0.07-0.29) [0.278] | 0.125 [0.278] | 0.200 [0.306] | 0.200 [0.306] | +1/-5, p = 0.22 | +0/-15, p < 0.001 |
+| mmarco-mMiniLMv2-L12 qint8_arm64 | 0.150 [0.250] | 0.125 [0.250] | 0.200 [0.306] | 0.200 [0.306] | same as fp32 | same |
+| mmarco-mMiniLMv2-L6 fp32 (own export) | 0.100 (0.04-0.23) [0.194] | 0.075 [0.194] | 0.100 [0.250] | 0.100 [0.250] | +1/-7, p = 0.07 | +0/-17, p < 0.001 |
+| mmarco-mMiniLMv2-L6 int8 (own quantization) | 0.025 [0.333] | 0.025 [0.306] | 0.000 [0.333] | 0.000 [0.361] | +1/-10, p = 0.012 (worse); admits 2 EN negatives | +0/-20 |
+| jina-v1-turbo-en int8 (EN only) | IT out of scope | | | | | |
+
+jina-v1-turbo-en int8, EN recall only (36 EN positives, IT-fit gate): 0.222 (0.12-0.38) on e5-small top-10 and on MiniLM top-10, 0.250 / 0.222 at top-5; below jina-v2 (0.333-0.417) and below MiniLM alone (0.472). Its IT numbers (0.175-0.225) are not meaningful for an English model.
+
+### Cost (8-core column: `taskset -c 0-7`, p50 of the reranker call alone, top-5 / top-10)
+
+| Reranker (file) | 8 cores | 32 cores | RSS loaded / peak | Disk |
+|---|---|---|---|---|
+| jina-v2 fp32 | 1.12 s / 2.26 s | 0.44 s / 0.88 s (idle box, first run) | 2.08 / 4.71 GB | 1.11 GB |
+| jina-v2 int8 | **0.45 s / 0.91 s** | 0.22 s / 0.44 s | 0.95 / 3.91 GB | 280 MB |
+| jina-v2 fp16 | 1.47 s / 2.92 s | not clean | 1.15 / 4.52 GB | 557 MB |
+| mmarco L12 fp32 | 0.34 s / 0.68 s | 0.12 s / 0.24 s | 1.14 / 2.43 GB | 471 MB |
+| mmarco L12 qint8_arm64 | 0.17 s / 0.32 s | 0.07 s / 0.13 s | 0.72 / 2.10 GB | 119 MB |
+| mmarco L6 fp32 | 0.28 s / 0.57 s | 0.18 s / 0.35 s | 1.06 / 3.97 GB | 428 MB |
+| mmarco L6 int8 | 0.20 s / 0.40 s | not clean | 0.70 / 3.79 GB | 107 MB |
+| jina-v1-turbo int8 | 0.12 s / 0.23 s | 0.06 s / 0.11 s | 0.12 / 1.34 GB | 38 MB |
+
+Peak RSS is the pool-scoring pass (batch 16, all 78 prompts); the 8-core latency-only run peaks lower (jina int8 2.0 GB, L12 q8 1.3 GB, turbo 0.6 GB). The box was not idle during this run (loadavg 5-22 from other jobs, unlike the first run): 32-core figures taken under load were rerun where they decided something (jina int8, L6 fp32, L12 q8, turbo) and "not clean" means the contaminated value (top-5 slower than top-10) was dropped. The 8-core figures are pinned and consistent across runs (jina fp32 2.23 s in the first run, 2.26 s here).
+
+### Findings
+
+1. **jina-v2 int8 is the only light option that keeps recall.** 0.475 against 0.525: one-sided loss of 2 of 40 positives (+0/-2, p = 0.50), inside the +/-0.14 interval; still significant against e5-small alone (p = 0.022). It runs 2.5x faster than fp32 (0.91 s top-10 at 8 cores, 0.44 s at 32), with 0.95 GB loaded RSS instead of 2.08 and 280 MB of disk instead of 1.1 GB.
+2. **fp16 is pointless on CPU.** Every recall cell equals fp32, but it is 30% slower at 8 cores (cause not diagnosed) and saves only half the disk.
+3. **The mmarco cross-encoders do not carry the task.** L12 gives 0.15-0.20 IT (not significantly better than the retriever alone, significantly worse than jina, p < 0.001 at top-10) even at fp32; arm64 int8 changes nothing in recall and cuts latency 2x (0.32 s top-10 at 8 cores, 119 MB), so it is cheap but recall-useless. The 6-layer L6 is worse still (0.10): 6 layers lose too much on this task (cause not diagnosed).
+4. **L6 int8 broke.** My own `quantize_dynamic` (QInt8 weights, default op set, including the 250k x 384 Gather) shifts logits by about -4 and collapses IT recall to 0.025 with 2 EN negatives admitted; fp32 of the same export matches torch to 3e-6. This is the export script's quantization, not the official arm64 recipe of the L12 file; since L6 fp32 is already at 0.10, no quantization variant was tried.
+5. **jina-v1-turbo is English only and weaker on EN too** (0.222 against 0.333 for jina-v2 and 0.472 for MiniLM alone), at 0.23 s top-10 on 8 cores and 38 MB. Only usable if recall is restricted to English; then MiniLM alone is better.
+6. **No light option changes the conclusion on the hook.** jina-v2 int8 top-10 at 8 cores costs 0.91 s, which leaves 0.59 s for the rest of a hook that already spends up to 1.25 s warm; top-5 costs 0.45 s but falls to 0.325 (not significant against the retriever, p = 0.45). It fits at 32 cores (0.44 s), and on an 8-core host only if the rest of the hook stays under about 0.6 s.
+
+### Recommendation
+
+Replace jina-v2 fp32 by **jina-v2 int8 on e5-small top-10** (`onnx/model_int8.onnx`, revision 9cfeff2df7d40d1b78e75e5e9cebec92a99813c9): IT 0.475, within noise of 0.525, 0.91 s at 8 cores, 0.95 GB RAM, 280 MB. It is the lightest option that keeps IT recall; nothing lighter does (mmarco L12 0.15, L6 0.10, turbo EN only). It fits the 1500 ms hook at 8 cores only marginally (0.59 s left), so the earlier advice stands: give the reranker its own deadline with fallback to e5-small absolute cosine, or run it outside the critical path. The total footprint with e5-small becomes about 2.4 GB loaded (1.4 + 0.95). A larger labelled set (>= 70 prompts) would be needed to tell 0.475 from 0.525 with any power: the difference observed is 2 queries.
+
+### Export of mmarco-L6
+
+`nreimers/mmarco-mMiniLMv2-L6-H384-v1` (the `cross-encoder/` L6 does not exist) is PyTorch only. `scripts/eval-recall-options/export-mmarco-l6.sh` (run on the box) exports it with `torch.onnx.export` (opset 17, torch 2.14.1, transformers 5.18.0, onnx 1.23.1, onnxruntime 1.30.0, revision 4ceabf2d1e212e16da0d1fb94d5dea66a9a1cca0) and quantizes with `quantize_dynamic`. The Slite O4 fp16 export was not needed. The box has no `python3-venv`; dependencies are installed with `pip --target` under `~/Gits/.tmp` (removed afterwards).
+
 ## Not measured, and why
 
 - `bge-m3` embeddings: not in fastembed 4.9.1; a user-defined ONNX (~2 GB) was not tried.
@@ -94,6 +147,7 @@ FASTEMBED_CACHE_DIR=<dir> cargo run --release --example recall_options_eval -- e
 ... -- lex <data-dir> assets/eval/memory-recall.json > lex.json
 ... -- rerank <bge-base|jina-v2-ml|bge-v2-m3> <data-dir> assets/eval/memory-recall.json pool.json > rerank-<model>.json
 python3 scripts/eval-recall-options/translate_openrouter.py <data-dir> google/gemini-2.5-flash-lite assets/eval/recall-options/translations-openrouter.json   # OPENROUTER_API_KEY read from the jevclassifier .env
+rb <worktree> -- bash scripts/eval-recall-options/box-run-light.sh control   # then `cands [keys...]`: lighter rerankers; python3 scripts/eval-recall-options/a5.py <keys> builds that table
 rb <worktree> -- bash scripts/eval-recall-options/box-run.sh   # every measurement on the rb box; raw JSON between @@BEGIN/@@END markers on stdout
 python3 scripts/eval-recall-options/a3.py 0.01   # relative/RRF/lexical/translation rows
 python3 scripts/eval-recall-options/a4.py jina-v2-ml bge-base  # paired test + split-half

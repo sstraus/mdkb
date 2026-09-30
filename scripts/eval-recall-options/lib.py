@@ -1,11 +1,11 @@
 import json, math, os, random
-M=os.path.expanduser('~/Gits/.tmp/mdkb-ml/')
+M=os.path.expanduser(os.environ.get('EVAL_DATA','~/Gits/.tmp/mdkb-ml/'))
 O=M+'opt/'
 K=5
 GRID=0.0
 it=json.load(open(M+'it_set.json'))
 IT_EXP=[p['expected'] for p in it['pairs']]
-fix=json.load(open(os.path.expanduser('~/Gits/personal/mdkb__wt/eval-recall-options/assets/eval/memory-recall.json')))
+fix=json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),'../../assets/eval/memory-recall.json')))
 EN_EXP=[r['expected_ids'] for r in fix['recall']]
 EXP={'it_pos':IT_EXP,'tr_pos':IT_EXP,'en_pos':EN_EXP}
 def load(name): return json.load(open(O+name+'.json'))

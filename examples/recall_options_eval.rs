@@ -15,10 +15,12 @@
 //! (optional) adds machine-translated query sets: `{name: {"pos": [..], "neg": [..]}}`.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use fastembed::{
-    EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank,
+    EmbeddingModel, InitOptions, RerankInitOptions, RerankInitOptionsUserDefined, RerankerModel,
+    TextEmbedding, TextRerank, TokenizerFiles, UserDefinedRerankingModel,
 };
 use mdkb::store::search::build_recall_query;
 use serde_json::{Map, Value, json};
@@ -272,12 +274,76 @@ fn lex(d: &Data) -> Value {
     json!({"model": "bm25", "latency": quantiles(ms), "sets": out})
 }
 
-fn reranker(key: &str) -> RerankerModel {
+enum Reranker {
+    Builtin(RerankerModel),
+    /// (HF repo, pinned revision, ONNX file inside the snapshot): a quantized or
+    /// otherwise non-default file, loaded from the hf-hub cache layout that
+    /// `box-run-light.sh` prefetches with curl.
+    Custom(&'static str, &'static str, &'static str),
+}
+
+fn reranker(key: &str) -> Reranker {
+    const JINA_V2: (&str, &str) = (
+        "jinaai/jina-reranker-v2-base-multilingual",
+        "9cfeff2df7d40d1b78e75e5e9cebec92a99813c9",
+    );
+    const MMARCO: (&str, &str) = (
+        "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        "1427fd652930e4ba29e8149678df786c240d8825",
+    );
+    const MMARCO_L6: (&str, &str) = (
+        "nreimers/mmarco-mMiniLMv2-L6-H384-v1",
+        "4ceabf2d1e212e16da0d1fb94d5dea66a9a1cca0",
+    );
+    const JINA_V1_TURBO: (&str, &str) = (
+        "jinaai/jina-reranker-v1-turbo-en",
+        "b8c14f4e723d9e0aab4732a7b7b93741eeeb77c2",
+    );
     match key {
-        "jina-v2-ml" => RerankerModel::JINARerankerV2BaseMultiligual,
-        "bge-v2-m3" => RerankerModel::BGERerankerV2M3,
-        "bge-base" => RerankerModel::BGERerankerBase,
+        "jina-v2-ml" => Reranker::Builtin(RerankerModel::JINARerankerV2BaseMultiligual),
+        "bge-v2-m3" => Reranker::Builtin(RerankerModel::BGERerankerV2M3),
+        "bge-base" => Reranker::Builtin(RerankerModel::BGERerankerBase),
+        "jina-v2-int8" => Reranker::Custom(JINA_V2.0, JINA_V2.1, "onnx/model_int8.onnx"),
+        "jina-v2-fp16" => Reranker::Custom(JINA_V2.0, JINA_V2.1, "onnx/model_fp16.onnx"),
+        "mmarco-fp32" => Reranker::Custom(MMARCO.0, MMARCO.1, "onnx/model.onnx"),
+        "mmarco-q8arm" => Reranker::Custom(MMARCO.0, MMARCO.1, "onnx/model_qint8_arm64.onnx"),
+        "mmarco-l6-fp32" => Reranker::Custom(MMARCO_L6.0, MMARCO_L6.1, "onnx/model.onnx"),
+        "mmarco-l6-q8arm" => {
+            Reranker::Custom(MMARCO_L6.0, MMARCO_L6.1, "onnx/model_qint8_arm64.onnx")
+        }
+        "jina-v1-turbo-int8" => {
+            Reranker::Custom(JINA_V1_TURBO.0, JINA_V1_TURBO.1, "onnx/model_int8.onnx")
+        }
         other => panic!("unknown reranker key {other}"),
+    }
+}
+
+fn load_reranker(key: &str, cache: &str) -> TextRerank {
+    match reranker(key) {
+        Reranker::Builtin(model) => TextRerank::try_new(
+            RerankInitOptions::new(model)
+                .with_cache_dir(cache.into())
+                .with_show_download_progress(false),
+        )
+        .unwrap(),
+        Reranker::Custom(repo, revision, onnx) => {
+            let dir = PathBuf::from(cache)
+                .join(format!("models--{}", repo.replace('/', "--")))
+                .join("snapshots")
+                .join(revision);
+            let file = |name: &str| std::fs::read(dir.join(name)).unwrap();
+            let tokenizer_files = TokenizerFiles {
+                tokenizer_file: file("tokenizer.json"),
+                config_file: file("config.json"),
+                special_tokens_map_file: file("special_tokens_map.json"),
+                tokenizer_config_file: file("tokenizer_config.json"),
+            };
+            TextRerank::try_new_from_user_defined(
+                UserDefinedRerankingModel::new(dir.join(onnx), tokenizer_files),
+                RerankInitOptionsUserDefined::default(),
+            )
+            .unwrap()
+        }
     }
 }
 
@@ -285,12 +351,7 @@ fn reranker(key: &str) -> RerankerModel {
 fn rerank(key: &str, d: &Data, pool_path: &str) -> Value {
     let cache = std::env::var("FASTEMBED_CACHE_DIR").expect("set FASTEMBED_CACHE_DIR");
     let t = Instant::now();
-    let model = TextRerank::try_new(
-        RerankInitOptions::new(reranker(key))
-            .with_cache_dir(cache.into())
-            .with_show_download_progress(false),
-    )
-    .unwrap();
+    let model = load_reranker(key, &cache);
     let load_ms = t.elapsed().as_secs_f64() * 1e3;
     let (_, rss_loaded) = rusage();
     let text: BTreeMap<&str, &str> = d
