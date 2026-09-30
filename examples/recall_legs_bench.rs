@@ -50,13 +50,25 @@ fn main() {
 
             let t = Instant::now();
             memory::search_entries_hybrid_fts(
-                &ctx.conn, &q, prompt, Some(&emb), limit, None, &cfg.search.memory,
+                &ctx.conn,
+                &q,
+                prompt,
+                Some(&emb),
+                limit,
+                None,
+                &cfg.search.memory,
             )
             .unwrap();
             let mem = ms(t);
             let t = Instant::now();
             memory::search_entries_hybrid_fts(
-                &ctx.conn, &q, prompt, Some(&emb), limit * 3, None, &cfg.search.memory,
+                &ctx.conn,
+                &q,
+                prompt,
+                Some(&emb),
+                limit * 3,
+                None,
+                &cfg.search.memory,
             )
             .unwrap();
             let mem3 = ms(t);
@@ -103,7 +115,12 @@ fn main() {
 
             let t = Instant::now();
             mdkb::core::search::hybrid_search_fts_scored(
-                &ctx, &q, Some(&emb), docs_pool, None, false,
+                &ctx,
+                &q,
+                Some(&emb),
+                docs_pool,
+                None,
+                false,
             )
             .unwrap();
             let docs = ms(t);

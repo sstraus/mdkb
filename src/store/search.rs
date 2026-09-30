@@ -82,9 +82,32 @@ pub fn content_tokens(text: &str) -> Vec<String> {
 /// does not decide relevance. Widening it without that gate is how an
 /// unrelated prompt used to inject its best BM25 hit.
 pub fn build_recall_query(text: &str) -> Option<String> {
-    let tokens = content_tokens(text);
+    let mut tokens = content_tokens(text);
     if tokens.is_empty() {
         return None;
+    }
+    // A pasted brief or a long agent prompt carries hundreds of content words,
+    // and every OR term adds a posting list BM25 must score in full. Measured
+    // on the tuicommander store (733 MB, story 199-77a9): docs BM25 took 26 ms
+    // for 200 prompt characters, 433 ms for 1500, 9.8 s for 7600, which is
+    // what pushed recall past its deadline on nearly every orchestrated prompt.
+    // Repeats add nothing to an OR, so drop them; past the cap keep the longest
+    // words, the cheapest stand-in for "rare" available without a vocabulary
+    // lookup, in prompt order.
+    let mut seen = std::collections::HashSet::new();
+    tokens.retain(|t| seen.insert(t.clone()));
+    if tokens.len() > MAX_RECALL_TERMS {
+        let mut by_length: Vec<usize> = (0..tokens.len()).collect();
+        by_length.sort_by_key(|&i| std::cmp::Reverse(tokens[i].len()));
+        let mut keep = vec![false; tokens.len()];
+        for &i in &by_length[..MAX_RECALL_TERMS] {
+            keep[i] = true;
+        }
+        let mut position = 0;
+        tokens.retain(|_| {
+            position += 1;
+            keep[position - 1]
+        });
     }
     Some(
         tokens
@@ -94,6 +117,11 @@ pub fn build_recall_query(text: &str) -> Option<String> {
             .join(" OR "),
     )
 }
+
+/// Most distinct terms [`build_recall_query`] ORs together. BM25 cost grows
+/// with the term count (see the measurement there); 32 keeps the docs leg of a
+/// 733 MB store near 35 ms and is well above any conversational prompt.
+pub const MAX_RECALL_TERMS: usize = 32;
 
 /// True when an escaped FTS5 expression carries no term to match.
 ///
@@ -320,6 +348,56 @@ mod tests {
     use crate::store::documents::index_document;
     use crate::store::schema::init_schema;
     use chrono::Utc;
+
+    // ==================== Recall query ====================
+
+    fn recall_terms(text: &str) -> Vec<String> {
+        build_recall_query(text)
+            .unwrap()
+            .split(" OR ")
+            .map(|t| t.trim_matches('"').to_string())
+            .collect()
+    }
+
+    /// Story 199-77a9: the expression grew with the prompt, so a long agent
+    /// brief ORed hundreds of terms and docs BM25 ran for seconds.
+    #[test]
+    fn a_long_prompt_yields_a_bounded_expression() {
+        let prompt: String = (0..500).map(|i| format!("term{i:03}x ")).collect();
+        assert_eq!(recall_terms(&prompt).len(), MAX_RECALL_TERMS);
+    }
+
+    /// Plausible bug: repeated words counted against the cap, or were ORed twice.
+    #[test]
+    fn repeated_words_are_one_term() {
+        assert_eq!(
+            recall_terms("deploy deploy deploy pipeline"),
+            ["deploy", "pipeline"]
+        );
+    }
+
+    /// Plausible bug: the cap cut by position, dropping an identifier that sits
+    /// at the end of a long prompt.
+    #[test]
+    fn the_cap_keeps_long_words_and_prompt_order() {
+        let filler: String = (0..100).map(|i| format!("ab{i:02}c ")).collect();
+        let prompt = format!("{filler} reindex_watcher_debouncer {filler}");
+        let terms = recall_terms(&prompt);
+        assert_eq!(terms.len(), MAX_RECALL_TERMS);
+        assert_eq!(
+            terms.iter().filter(|t| t.len() > 5).collect::<Vec<_>>(),
+            ["reindex", "watcher", "debouncer"]
+        );
+    }
+
+    /// Plausible bug: the cap reordered or trimmed ordinary prompts.
+    #[test]
+    fn a_short_prompt_is_unchanged() {
+        assert_eq!(
+            build_recall_query("how does the watcher debounce events").unwrap(),
+            "\"watcher\" OR \"debounce\" OR \"events\""
+        );
+    }
 
     // ==================== FTS5 Escape Tests ====================
 
