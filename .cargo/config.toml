@@ -29,12 +29,15 @@ rustflags = ["-C", "target-cpu=ivybridge"]
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "target-cpu=ivybridge"]
 
-# ARM64: Use native features (required for ring crate on Apple Silicon)
+# ARM64 Linux: generic ARMv8-A baseline, so the release binary runs on any
+# aarch64 host (Graviton2/Neoverse N1 and older). `native` would tune it to the
+# CI runner CPU. Enforced by tests/release_cpu_targets.rs.
 [target.aarch64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=generic"]
 
 [target.aarch64-unknown-linux-musl]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=generic"]
 
+# ARM64 macOS: native features (required for ring crate on Apple Silicon)
 [target.aarch64-apple-darwin]
 rustflags = ["-C", "target-cpu=native"]
