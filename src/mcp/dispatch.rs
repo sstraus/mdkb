@@ -3987,6 +3987,36 @@ async fn record_recall(
     }
 }
 
+/// How many times `recall_docs_limit` documents the docs leg retrieves before
+/// the absolute floor drops some.
+const DOC_RECALL_POOL_FACTOR: usize = 4;
+
+/// The documents recall may inject: those with absolute evidence of relevance,
+/// in rank order, as `(path, title)`.
+///
+/// A hit is admitted when the cosine of its closest chunk reaches `min_cosine`,
+/// or when the prompt quotes its title or path
+/// ([`crate::store::hybrid::strong_lexical_match`]) — the arm that keeps a
+/// store without embeddings, or an identifier-shaped query, from losing the
+/// leg. Being in the BM25 result set is not evidence: recall OR-expands the
+/// prompt, so one common word puts a document there.
+fn admit_doc_hits(
+    hits: Vec<(crate::domain::SearchResult, Option<f64>)>,
+    prompt: &str,
+    min_cosine: f32,
+) -> Vec<(String, Option<String>)> {
+    hits.into_iter()
+        .filter(|(hit, cosine)| {
+            cosine.is_some_and(|c| c >= f64::from(min_cosine))
+                || crate::store::hybrid::strong_lexical_match(
+                    prompt,
+                    &format!("{} {}", hit.path, hit.title.as_deref().unwrap_or_default()),
+                )
+        })
+        .map(|(hit, _)| (hit.path, hit.title.filter(|t| !t.is_empty())))
+        .collect()
+}
+
 fn injectable(entries: Vec<memory::ScoredMemoryEntry>) -> Vec<memory::MemoryEntry> {
     entries
         .into_iter()
@@ -5038,25 +5068,29 @@ async fn hook_user_prompt_submit_impl_with_dedup(
 
         // Documents leg — same hybrid engine as `search --scope docs`, reusing
         // the OR-expanded recall query and the embedding already computed above
-        // (a second embed would double the per-turn CPU cost). No score floor:
-        // RRF normalization pins the top hit at 1.0, so a threshold would filter
-        // nothing — `recall_docs_limit` is the control (0 = memory only).
+        // (a second embed would double the per-turn CPU cost). RRF
+        // normalization pins the top hit at 1.0 for every prompt, so rank alone
+        // admits nothing worth trusting: each hit must clear
+        // `recall_docs_min_cosine` or be quoted by the prompt
+        // ([`admit_doc_hits`]). `recall_docs_limit` caps what is left
+        // (0 = memory only). The pool is wider than the cap because sub-floor
+        // hits are dropped after ranking, and must not crowd out a later one.
         let docs_limit = cfg.recall_docs_limit;
         if docs_limit > 0 && ctx_guard.is_some() {
             match crate::core::run_guarded_read(&mut ctx_guard, "hook document recall", |ctx| {
-                crate::core::search::hybrid_search_fts(
+                crate::core::search::hybrid_search_fts_scored(
                     ctx,
                     q,
                     query_embedding.as_deref(),
-                    docs_limit,
+                    docs_limit * DOC_RECALL_POOL_FACTOR,
                     None,
                     false,
                 )
             }) {
                 Some(Ok(hits)) => {
-                    doc_hits = hits
+                    doc_hits = admit_doc_hits(hits, prompt, cfg.recall_docs_min_cosine)
                         .into_iter()
-                        .map(|hit| (hit.path, hit.title.filter(|t| !t.is_empty())))
+                        .take(docs_limit)
                         .collect();
                 }
                 Some(Err(error)) => {
@@ -7762,7 +7796,7 @@ mod tests {
         seed_document(
             &handle,
             "docs/quarantine.md",
-            "Quarantine handling",
+            "Quarantine autoheal handling",
             "The autoheal routine quarantines a corrupt index before rebuilding it.",
         )
         .await;
@@ -7778,7 +7812,7 @@ mod tests {
             "matching doc path must be injected: {body}"
         );
         assert!(
-            body.contains("Quarantine handling"),
+            body.contains("Quarantine autoheal handling"),
             "doc title carries the signal that makes the path worth opening: {body}"
         );
     }
@@ -7826,7 +7860,7 @@ mod tests {
             seed_document(
                 &handle,
                 &format!("docs/quarantine-{i}.md"),
-                &format!("Quarantine {i}"),
+                &format!("Quarantine autoheal {i}"),
                 "The autoheal routine quarantines a corrupt index before rebuilding it.",
             )
             .await;
@@ -7841,6 +7875,123 @@ mod tests {
         );
     }
 
+    fn scored_hit(
+        path: &str,
+        title: &str,
+        cosine: Option<f64>,
+    ) -> (crate::domain::SearchResult, Option<f64>) {
+        (
+            crate::domain::SearchResult {
+                id: 1,
+                collection: "default".into(),
+                path: path.into(),
+                title: Some(title.into()),
+                score: 1.0,
+                snippets: vec![],
+                status: None,
+                superseded_by: None,
+                repo_root: None,
+            },
+            cosine,
+        )
+    }
+
+    /// The oracle is the measurement in `RECALL_DOCS_MIN_COSINE_DEFAULT`, not
+    /// the constant: the lowest English match measured 0.585, the highest
+    /// Italian-over-English negative 0.522 (0.496 for an unrelated hub doc).
+    #[test]
+    fn the_default_docs_floor_separates_the_measured_populations() {
+        let floor = crate::config::RECALL_DOCS_MIN_COSINE_DEFAULT;
+        let admitted = |c: f64| {
+            !admit_doc_hits(
+                vec![scored_hit("archive/x.md", "Unrelated title", Some(c))],
+                "perche la dettatura resta bloccata",
+                floor,
+            )
+            .is_empty()
+        };
+        assert!(admitted(0.585), "lowest measured English match");
+        assert!(admitted(0.716), "highest measured English match");
+        assert!(!admitted(0.522), "highest measured Italian negative");
+        assert!(!admitted(0.496), "unrelated hub document");
+    }
+
+    #[test]
+    fn a_hit_without_a_cosine_needs_the_prompt_to_quote_it() {
+        let hits = || {
+            vec![
+                scored_hit("ideas/agent-sandbox.md", "Agent sandbox", None),
+                scored_hit("docs/quarantine.md", "Quarantine autoheal handling", None),
+            ]
+        };
+        assert!(admit_doc_hits(hits(), "how does the sandbox work today", 0.55).is_empty());
+        let by_identifier = admit_doc_hits(hits(), "where is quarantine.md described", 0.55);
+        assert_eq!(by_identifier.len(), 1);
+        assert_eq!(by_identifier[0].0, "docs/quarantine.md");
+    }
+
+    /// Story 193: the docs leg had no absolute floor. RRF normalization pins
+    /// the best document at 1.0 for every prompt, so an Italian prompt over an
+    /// English corpus — whose only overlap is a few common words in unrelated
+    /// documents — still injected its top-N. The seeded documents here carry no
+    /// vector, so none has a cosine, and their titles and paths share nothing
+    /// with the prompt: there is no evidence of relevance but BM25 membership.
+    #[tokio::test]
+    async fn a_prompt_whose_docs_have_no_absolute_evidence_injects_no_docs() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 3;
+        });
+        seed_document(
+            &handle,
+            "ideas/agent-sandbox.md",
+            "Agent sandbox",
+            "Notes where the words resta and bloccata appear next to nothing about dictation.",
+        )
+        .await;
+        seed_document(
+            &handle,
+            "archive/inbox-cursor.md",
+            "Inbox cursor",
+            "Un elenco: la dettatura non c'entra, ma resta una parola comune.",
+        )
+        .await;
+
+        let out = hook_user_prompt_submit_impl(&handle, "perche la dettatura resta bloccata").await;
+        assert_eq!(
+            out,
+            json!({}),
+            "BM25 membership and a normalized 1.0 are not evidence of relevance: {out}"
+        );
+    }
+
+    /// The other side of the floor: a document the prompt names in its title is
+    /// admitted with no vector at all, so a lexical-only store (model not
+    /// cached) does not lose its docs leg.
+    #[tokio::test]
+    async fn a_doc_whose_title_the_prompt_quotes_is_still_injected() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 3;
+        });
+        seed_document(
+            &handle,
+            "docs/dictation.md",
+            "Dictation stuck recovery procedure",
+            "What to do when push to talk stays armed.",
+        )
+        .await;
+
+        let out =
+            hook_user_prompt_submit_impl(&handle, "dictation stuck recovery procedure?").await;
+        assert!(
+            additional_context(&out).contains("docs/dictation.md"),
+            "a strongly matching doc must survive the floor: {out}"
+        );
+    }
+
     #[tokio::test]
     async fn recall_docs_leg_is_gated_by_the_sigil() {
         let tmp = TempDir::new().unwrap();
@@ -7850,7 +8001,7 @@ mod tests {
         seed_document(
             &handle,
             "docs/quarantine.md",
-            "Quarantine handling",
+            "Quarantine autoheal handling",
             "The autoheal routine quarantines a corrupt index before rebuilding it.",
         )
         .await;
@@ -11587,7 +11738,7 @@ mod tests {
         seed_document(
             &handle,
             "docs/quarantine.md",
-            "Quarantine handling",
+            "Quarantine autoheal handling",
             "The autoheal routine quarantines a corrupt index before rebuilding it.",
         )
         .await;

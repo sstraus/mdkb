@@ -411,6 +411,13 @@ fn render_recall(out: &mut String, r: &RecallReport) {
             );
         }
     };
+    if r.docs.prompts > 0 {
+        let _ = write!(
+            body,
+            "\n  docs injected    {} of {} prompts (7d)",
+            r.docs.with_docs, r.docs.prompts
+        );
+    }
     table(&mut body, "Band", &r.bands);
     table(&mut body, "Holdout", &r.holdout);
     out.push_str(&frame("Recall", &body, WIDTH));
@@ -600,6 +607,19 @@ mod tests {
         assert!(out.contains("0.45-0.50"), "{out}");
         let recall = &out[out.find("Recall").expect("recall section")..];
         assert!(!recall.contains('%'), "no ratio on 3 labels: {recall}");
+    }
+
+    #[test]
+    fn render_recall_reports_docs_admissions_on_their_own_line() {
+        let mut report = fixture_report();
+        report.recall =
+            build_recall_report(vec![], [("automatic".to_string(), 9)].into_iter().collect());
+        report.recall.docs = DocsAdmissions {
+            prompts: 9,
+            with_docs: 2,
+        };
+        let out = render(&report, false);
+        assert!(out.contains("docs injected    2 of 9 prompts"), "{out}");
     }
 
     #[test]

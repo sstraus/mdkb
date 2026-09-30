@@ -52,6 +52,36 @@ pub struct RecallReport {
     pub labelled: u32,
     /// `labelled` is below [`RECALL_MIN_LABELLED`]; no `precision` is given.
     pub insufficient_data: bool,
+    /// The documents leg, counted apart from the memory ledger: documents are
+    /// admitted by their own floor (`hooks.recall_docs_min_cosine`) and carry
+    /// no outcome labels.
+    pub docs: DocsAdmissions,
+}
+
+/// Prompts over the hook-log window, and how many of them injected documents.
+#[derive(Debug, Default, Clone, Copy, Serialize)]
+pub struct DocsAdmissions {
+    pub prompts: u32,
+    pub with_docs: u32,
+}
+
+/// Read the documents leg off the hook log: a `user_prompt_submit` row whose
+/// `payload_blocks` names `recall_docs` injected at least one document.
+pub fn docs_admissions(events: &[serde_json::Value]) -> DocsAdmissions {
+    let mut docs = DocsAdmissions::default();
+    for v in events
+        .iter()
+        .filter(|v| v.get("event").and_then(|e| e.as_str()) == Some("user_prompt_submit"))
+    {
+        docs.prompts += 1;
+        if v.pointer("/payload_blocks/recall_docs")
+            .and_then(|b| b.as_u64())
+            .is_some_and(|bytes| bytes > 0)
+        {
+            docs.with_docs += 1;
+        }
+    }
+    docs
 }
 
 #[derive(Debug, Serialize)]
@@ -87,6 +117,7 @@ pub fn build_recall_report(
         holdout: holdout.into_iter().map(band).collect(),
         labelled,
         insufficient_data,
+        docs: DocsAdmissions::default(),
     }
 }
 
@@ -271,7 +302,7 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
         sessions: collect_sessions(ctx)?,
         hooks: collect_hooks(mdkb_dir, root, collect_mining(ctx)),
         quarantine: crate::store::heal::quarantine_reports(mdkb_dir),
-        recall: collect_recall(ctx),
+        recall: collect_recall(ctx, mdkb_dir),
         doctor: crate::domain::doctor::findings(&crate::cli::doctor::collect(
             root,
             Some(ctx),
@@ -282,10 +313,14 @@ pub fn collect_report(ctx: &Context) -> Result<StatsReport> {
 
 /// The recall section. A store that cannot answer (an old read-only copy
 /// without the ledger) reports an empty section rather than failing `stats`.
-fn collect_recall(ctx: &Context) -> RecallReport {
+fn collect_recall(ctx: &Context, mdkb_dir: &Path) -> RecallReport {
     use crate::store::recall_ledger::{band_counts, prompts_by_mode};
     match (band_counts(&ctx.conn), prompts_by_mode(&ctx.conn)) {
-        (Ok(counts), Ok(prompts)) => build_recall_report(counts, prompts),
+        (Ok(counts), Ok(prompts)) => {
+            let mut report = build_recall_report(counts, prompts);
+            report.docs = docs_admissions(&read_hook_events(mdkb_dir, hook_window_start()));
+            report
+        }
         (Err(error), _) | (_, Err(error)) => {
             tracing::debug!("recall ledger unavailable: {error}");
             RecallReport::default()
@@ -572,7 +607,7 @@ fn collect_sessions(ctx: &Context) -> Result<SessionsSummary> {
 }
 
 fn collect_hooks(mdkb_dir: &Path, repo_root: &Path, mut mining: MiningStatus) -> HooksSummary {
-    let cutoff = chrono::Utc::now().timestamp() - 7 * 86_400;
+    let cutoff = hook_window_start();
 
     let slow_events_7d = count_slow_events(mdkb_dir, cutoff);
     let recent = read_hook_events(mdkb_dir, cutoff);
@@ -586,6 +621,11 @@ fn collect_hooks(mdkb_dir: &Path, repo_root: &Path, mut mining: MiningStatus) ->
         drift,
         mining,
     }
+}
+
+/// Start of the 7-day window the hook statistics cover.
+fn hook_window_start() -> i64 {
+    chrono::Utc::now().timestamp() - 7 * 86_400
 }
 
 /// Every parseable `hook-events.jsonl` line at or after `since_ts`.
@@ -1106,6 +1146,23 @@ mod tests {
         assert_eq!(report.labelled, 25);
         assert!(report.insufficient_data);
         assert!(report.bands.iter().all(|b| b.precision.is_none()));
+    }
+
+    /// Docs are admitted by their own gate, so the Recall section counts them
+    /// on their own: a prompt that injected memory only is a prompt without docs.
+    #[test]
+    fn docs_admissions_count_prompts_whose_block_carried_docs() {
+        let events: Vec<serde_json::Value> = [
+            r#"{"event":"user_prompt_submit","outcome":"fired","payload_blocks":{"recall_memory":90,"recall_docs":40}}"#,
+            r#"{"event":"user_prompt_submit","outcome":"fired","payload_blocks":{"recall_memory":90}}"#,
+            r#"{"event":"user_prompt_submit","outcome":"skipped"}"#,
+            r#"{"event":"pre_tool_use","outcome":"fired","payload_blocks":{"recall_docs":7}}"#,
+        ]
+        .iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+        let docs = docs_admissions(&events);
+        assert_eq!((docs.prompts, docs.with_docs), (3, 1));
     }
 
     /// Holdouts were injected on purpose; pooling them would report the
