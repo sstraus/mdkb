@@ -94,7 +94,7 @@ fn close_context_on_reported_corruption<T>(
             operation,
             "database statement reported index corruption — closing the connection for automatic recovery"
         );
-        *slot = None;
+        crate::core::close_over_corruption(slot);
     }
     result
 }
@@ -704,7 +704,7 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
         if handle.doc_reindex_active.load(Ordering::Relaxed) {
             return Err(mcp_error("Repo initializing, retry shortly"));
         }
-        let ctx = match Context::open(&handle.root) {
+        let ctx = match Context::open_reusing_process_probe(&handle.root) {
             Ok(ctx) => ctx,
             Err(e) if e.is_not_found() => {
                 tracing::info!("Auto-initializing mdkb at {}", handle.root.display());
@@ -765,7 +765,7 @@ fn run_handle_memory_mutation<T>(
             error = %error,
             "index is corrupt after memory mutation — closing this connection so the next open can quarantine, salvage memory and rebuild"
         );
-        *slot = None;
+        crate::core::close_over_corruption(slot);
         return Err(mcp_error(format!(
             "Index is corrupt after {what}; the connection was closed for automatic recovery: {error}"
         )));
@@ -14804,5 +14804,28 @@ mod tests {
             additional_context(&again).contains("after-cut-topic"),
             "next prompt after a cut run got nothing: {again}"
         );
+    }
+
+    /// Catches: the statement-level corruption close dropping the context but
+    /// not the process's probed-sound record.
+    #[test]
+    fn a_reported_corruption_close_forgets_the_process_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::init(dir.path()).unwrap();
+        let db_path = ctx.db_path.clone();
+        {
+            let _guard = crate::store::mutation_lock::acquire(&db_path, "test").unwrap();
+            crate::store::heal::ensure_sound_locked(&db_path, false).unwrap();
+        }
+        assert!(crate::store::heal::has_process_probe(&db_path));
+        let mut slot = Some(ctx);
+        let error = mcp_store_error(
+            "statement",
+            crate::Error::from(crate::error::ErrorKind::IndexCorrupt {
+                path: db_path.clone(),
+            }),
+        );
+        let _ = close_context_on_reported_corruption::<()>(&mut slot, "test", Err(error));
+        assert!(slot.is_none() && !crate::store::heal::has_process_probe(&db_path));
     }
 }

@@ -110,10 +110,18 @@ pub fn run_mutation<T>(
                 error = %e,
                 "index is corrupt — closing this connection so the next open can quarantine, salvage memory and rebuild"
             );
-            *slot = None;
+            close_over_corruption(slot);
         }
     }
     Some(result)
+}
+
+/// Drop a long-lived context that saw corruption, and with it the process's
+/// memory of having probed the file sound, so the next open probes.
+pub(crate) fn close_over_corruption(slot: &mut Option<Context>) {
+    if let Some(ctx) = slot.take() {
+        crate::store::heal::forget_process_probe(&ctx.db_path);
+    }
 }
 
 /// Run a small write under universal writer admission and close a long-lived
@@ -135,14 +143,15 @@ pub fn run_guarded_write<T>(
     // Even tiny writes change bytes certified by the marker. Remove it before
     // the statement so coarse filesystem timestamp granularity cannot make a
     // pre-write marker appear current on the next open.
-    crate::store::heal::invalidate_marker(&db_path);
-    let result = f(slot.as_ref().expect("slot was checked above"));
+    let result = crate::store::heal::keep_process_probe_across(&db_path, || {
+        f(slot.as_ref().expect("slot was checked above"))
+    });
     if result.as_ref().is_err_and(Error::is_index_corrupt) {
         tracing::error!(
             operation = what,
             "index corruption observed during write — closing the context for automatic recovery"
         );
-        *slot = None;
+        close_over_corruption(slot);
     }
     Some(result)
 }
@@ -160,7 +169,7 @@ pub fn run_guarded_read<T>(
             operation = what,
             "index corruption observed during read — closing the context for automatic recovery"
         );
-        *slot = None;
+        close_over_corruption(slot);
     }
     Some(result)
 }
@@ -195,7 +204,16 @@ impl Context {
 
     /// Open or create context at the given root.
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
-        Self::open_impl(root.as_ref(), false)
+        Self::open_impl(root.as_ref(), false, false)
+    }
+
+    /// [`Self::open`] for a long-lived holder that reopens a store it already
+    /// served: skips the full-file integrity scan when this process probed the
+    /// file sound within [`crate::store::heal::CHECK_INTERVAL`]. Such a holder
+    /// must call [`crate::store::heal::forget_process_probe`] when it closes a
+    /// context over corruption; the `run_guarded_*` helpers do.
+    pub fn open_reusing_process_probe(root: impl AsRef<Path>) -> Result<Self> {
+        Self::open_impl(root.as_ref(), false, true)
     }
 
     /// Open while the caller already holds the project writer-admission lock.
@@ -204,10 +222,10 @@ impl Context {
     /// the same non-reentrant file lock again here would deadlock. All other
     /// callers must use [`Self::open`].
     pub fn open_writer_admitted(root: impl AsRef<Path>) -> Result<Self> {
-        Self::open_impl(root.as_ref(), true)
+        Self::open_impl(root.as_ref(), true, false)
     }
 
-    fn open_impl(root: &Path, writer_admitted: bool) -> Result<Self> {
+    fn open_impl(root: &Path, writer_admitted: bool, trust_process_probe: bool) -> Result<Self> {
         let mdkb_dir = namespace::store_dir(root)?;
 
         if namespace::active()?.is_some() {
@@ -296,21 +314,22 @@ impl Context {
         // Autoheal: quarantine a structurally-corrupt index before we build on
         // it, so the `Connection::open` below lands on a clean file. Throttled,
         // so this is cheap on the hot open path.
-        let quarantined = match crate::store::heal::ensure_sound_locked(&db_path)? {
-            crate::store::heal::Heal::Sound => None,
-            crate::store::heal::Heal::Quarantined { corrupt_path } => Some(corrupt_path),
-            crate::store::heal::Heal::CorruptInUse => {
-                // Do not turn a read command into another holder of a database
-                // already known to be corrupt. `Context::open` initializes
-                // schemas and ordinary reads update access statistics, so
-                // continuing here both writes into the malformed generation
-                // and extends the live-lock veto that prevents recovery.
-                return Err(ErrorKind::IndexCorruptInUse {
-                    path: db_path.clone(),
+        let quarantined =
+            match crate::store::heal::ensure_sound_locked(&db_path, trust_process_probe)? {
+                crate::store::heal::Heal::Sound => None,
+                crate::store::heal::Heal::Quarantined { corrupt_path } => Some(corrupt_path),
+                crate::store::heal::Heal::CorruptInUse => {
+                    // Do not turn a read command into another holder of a database
+                    // already known to be corrupt. `Context::open` initializes
+                    // schemas and ordinary reads update access statistics, so
+                    // continuing here both writes into the malformed generation
+                    // and extends the live-lock veto that prevents recovery.
+                    return Err(ErrorKind::IndexCorruptInUse {
+                        path: db_path.clone(),
+                    }
+                    .into());
                 }
-                .into());
-            }
-        };
+            };
 
         // Announce this connection before opening it, so any concurrent heal
         // sees a live holder and leaves the files alone. Taken after the probe
@@ -622,3 +641,70 @@ pub mod routing;
 pub mod search;
 pub mod sessions;
 pub mod surface;
+
+#[cfg(test)]
+mod close_over_corruption_tests {
+    use super::*;
+    use crate::store::heal;
+
+    fn corrupt_error(ctx: &Context) -> Error {
+        ErrorKind::IndexCorrupt {
+            path: ctx.db_path.clone(),
+        }
+        .into()
+    }
+
+    /// A slot holding a context whose store this process has probed sound.
+    fn probed_slot(dir: &Path) -> Option<Context> {
+        let ctx = Context::init(dir).unwrap();
+        let _guard = crate::store::mutation_lock::acquire(&ctx.db_path, "test").unwrap();
+        heal::ensure_sound_locked(&ctx.db_path, false).unwrap();
+        assert!(heal::has_process_probe(&ctx.db_path));
+        Some(ctx)
+    }
+
+    /// Catches: a corruption-close path that drops the context but keeps the
+    /// "probed sound" record, so the reopen that must quarantine is skipped.
+    #[test]
+    fn every_corruption_close_forgets_the_process_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = probed_slot(dir.path());
+        let db_path = slot.as_ref().unwrap().db_path.clone();
+        run_guarded_read(&mut slot, "test read", |ctx| -> Result<()> {
+            Err(corrupt_error(ctx))
+        });
+        assert!(slot.is_none() && !heal::has_process_probe(&db_path));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = probed_slot(dir.path());
+        let db_path = slot.as_ref().unwrap().db_path.clone();
+        run_guarded_write(&mut slot, "test write", |ctx| -> Result<()> {
+            Err(corrupt_error(ctx))
+        });
+        assert!(slot.is_none() && !heal::has_process_probe(&db_path));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = probed_slot(dir.path());
+        let db_path = slot.as_ref().unwrap().db_path.clone();
+        run_mutation(&mut slot, "test mutation", |ctx| -> Result<()> {
+            Err(corrupt_error(ctx))
+        });
+        assert!(slot.is_none() && !heal::has_process_probe(&db_path));
+    }
+
+    /// Catches: the telemetry write that runs on every hook voiding the record
+    /// (invalidate_marker forgets), which would leave the daemon's reopen
+    /// re-scanning after all; and a FAILED write keeping it.
+    #[test]
+    fn a_successful_guarded_write_keeps_the_probe_and_a_failed_one_drops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut slot = probed_slot(dir.path());
+        let db_path = slot.as_ref().unwrap().db_path.clone();
+        run_guarded_write(&mut slot, "ok write", |_| -> Result<()> { Ok(()) });
+        assert!(heal::has_process_probe(&db_path));
+        run_guarded_write(&mut slot, "failed write", |_| -> Result<()> {
+            Err(Error::other("disk full"))
+        });
+        assert!(slot.is_some() && !heal::has_process_probe(&db_path));
+    }
+}
