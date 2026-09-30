@@ -19,7 +19,8 @@ use serde_json::{Value, json};
 
 use crate::cli::hook_logic::{
     REINDEX_TOOLS, canonicalize_under_cwd, classify_bash_search, classify_definition_search,
-    classify_grep_pattern, is_mdkb_invocation, prompt_is_wrapup, tool_input_path,
+    classify_grep_pattern, is_mdkb_invocation, prompt_is_system_notification, prompt_is_wrapup,
+    tool_input_path,
 };
 use crate::code::indexing::IndexFacade;
 use crate::core::Context;
@@ -4905,6 +4906,10 @@ async fn hook_user_prompt_submit_impl_with_dedup(
         return json!({});
     }
 
+    if prompt_is_system_notification(prompt) {
+        return json!({});
+    }
+
     let (mode, prompt) = recall_mode(cfg, prompt);
     if mode == RecallMode::Off {
         return prompt_prior_response(
@@ -5101,6 +5106,18 @@ async fn hook_user_prompt_submit_impl_with_dedup(
             }
         }
         drop(ctx_guard);
+
+        // A handoff is session state for the next session start, not
+        // knowledge, and it matches any prompt about the same work. Only an
+        // explicit `*` recall reaches it. Dropped from the observation too, or
+        // the holdout below could still inject one.
+        if mode != RecallMode::Sigil {
+            let not_handoff = |e: &memory::ScoredMemoryEntry| {
+                e.entry.entry_type != crate::store::memory::EntryType::Handoff
+            };
+            scored_results.retain(not_handoff);
+            observed.retain(not_handoff);
+        }
 
         // prior-specific gate: only high-confidence priors surface
         let now = chrono::Utc::now().timestamp();
@@ -7468,7 +7485,12 @@ mod tests {
         crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed entry");
     }
 
-    async fn seed_stale_handoff_entry(handle: &RepoHandle, id: &str, content: &str) {
+    async fn seed_stale_entry(
+        handle: &RepoHandle,
+        id: &str,
+        content: &str,
+        entry_type: crate::store::memory::EntryType,
+    ) {
         ensure_handle_context(handle).await.expect("init ctx");
         let ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard.as_ref().unwrap();
@@ -7478,7 +7500,7 @@ mod tests {
             id: id.to_string(),
             title: format!("Title for {id}"),
             content: content.to_string(),
-            entry_type: crate::store::memory::EntryType::Handoff,
+            entry_type,
             tags: vec!["recall".to_string()],
             status: crate::store::memory::EntryStatus::Active,
             created_at: now - 175 * 86_400,
@@ -7496,10 +7518,10 @@ mod tests {
             due_at: None,
         };
         assert!(
-            entry.confidence() < 0.07,
-            "control: stale handoff confidence should be about 0.06"
+            entry_type.is_durable() || entry.confidence() < 0.07,
+            "control: stale entry confidence should be about 0.06"
         );
-        crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed stale handoff");
+        crate::store::memory::add_entry(&ctx.conn, &entry).expect("seed stale entry");
     }
 
     /// Story 087, criterion 6. The table was written down before the code.
@@ -7686,15 +7708,22 @@ mod tests {
         });
         // Shares the identifier `recall_gate_target` with the prompt: admitted
         // on the lexical arm, which exists because embeddings are weak here.
-        seed_stale_handoff_entry(
+        seed_stale_entry(
             &handle,
             "identifier-match",
             "the recall_gate_target knob is read once per prompt",
+            crate::store::memory::EntryType::Topic,
         )
         .await;
         // Shares only the ordinary word "knob": in the BM25 result set, and
         // rejected anyway.
-        seed_stale_handoff_entry(&handle, "common-word-only", "another knob entirely").await;
+        seed_stale_entry(
+            &handle,
+            "common-word-only",
+            "another knob entirely",
+            crate::store::memory::EntryType::Topic,
+        )
+        .await;
 
         let output = hook_user_prompt_submit_impl(&handle, "who reads recall_gate_target").await;
         let context = additional_context(&output);
@@ -7733,10 +7762,11 @@ mod tests {
             });
             // Shares exactly one ordinary word with the prompt ("budget"), so
             // the OR-expanded recall query matches it on the BM25 leg.
-            seed_stale_handoff_entry(
+            seed_stale_entry(
                 &handle,
                 "shares-one-word",
                 "requests retry with an exponential backoff budget",
+                crate::store::memory::EntryType::Topic,
             )
             .await;
             let output = hook_user_prompt_submit_impl(&handle, PROMPT).await;
@@ -8193,10 +8223,11 @@ mod tests {
         let handle = make_handle_with(&tmp, |config| {
             config.hooks.recall_docs_limit = 0;
         });
-        seed_stale_handoff_entry(
+        seed_stale_entry(
             &handle,
             "default-mem",
             "the recall_default_target knob is read once per prompt",
+            crate::store::memory::EntryType::Topic,
         )
         .await;
 
@@ -8212,6 +8243,87 @@ mod tests {
         )
         .await;
         assert_eq!(miss, json!({}), "an unrelated prompt injects nothing");
+    }
+
+    /// Story 194-f82f. A handoff is session state for the next session start,
+    /// not knowledge: the identical entry stored as a topic is injected, stored
+    /// as a handoff it is not, and the sigil prompt (somebody asked) still
+    /// reaches it.
+    #[tokio::test]
+    async fn automatic_recall_skips_handoffs_but_not_knowledge_or_the_sigil() {
+        const CONTENT: &str = "the recall_handoff_target knob is read once per prompt";
+        const PROMPT: &str = "who reads recall_handoff_target";
+        async fn handle_with(
+            tmp: &TempDir,
+            entry_type: crate::store::memory::EntryType,
+        ) -> Arc<RepoHandle> {
+            let handle = make_handle_with(tmp, |config| {
+                config.hooks.recall_docs_limit = 0;
+            });
+            seed_stale_entry(&handle, "seeded-entry", CONTENT, entry_type).await;
+            handle
+        }
+        use crate::store::memory::EntryType;
+
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_with(&tmp, EntryType::Handoff).await;
+        let plain = hook_user_prompt_submit_impl(&handle, PROMPT).await;
+        assert_eq!(plain, json!({}), "a handoff must not be injected unasked");
+        let asked = hook_user_prompt_submit_impl(&handle, &format!("* {PROMPT}")).await;
+        assert!(
+            additional_context(&asked).contains("seeded-entry"),
+            "an explicit * recall still reaches handoffs: {asked}"
+        );
+
+        let tmp = TempDir::new().unwrap();
+        let handle = handle_with(&tmp, EntryType::Topic).await;
+        let control = hook_user_prompt_submit_impl(&handle, PROMPT).await;
+        assert!(
+            additional_context(&control).contains("seeded-entry"),
+            "control: the same entry that is not a handoff is injected: {control}"
+        );
+    }
+
+    /// Story 194-f82f. A task-notification turn is system text, not a question.
+    #[tokio::test]
+    async fn a_task_notification_prompt_injects_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.recall_docs_limit = 0;
+        });
+        seed_stale_entry(
+            &handle,
+            "notified-entry",
+            "the recall_notice_target knob is read once per prompt",
+            crate::store::memory::EntryType::Topic,
+        )
+        .await;
+
+        let question = "who reads recall_notice_target";
+        let control = hook_user_prompt_submit_impl(&handle, question).await;
+        assert!(
+            additional_context(&control).contains("notified-entry"),
+            "control: the bare question recalls the entry: {control}"
+        );
+
+        for wrapper in [
+            format!("<task-notification>\n<summary>{question}</summary>\n</task-notification>"),
+            format!("  [SYSTEM NOTIFICATION] {question}"),
+        ] {
+            let tmp = TempDir::new().unwrap();
+            let handle = make_handle_with(&tmp, |config| {
+                config.hooks.recall_docs_limit = 0;
+            });
+            seed_stale_entry(
+                &handle,
+                "notified-entry",
+                "the recall_notice_target knob is read once per prompt",
+                crate::store::memory::EntryType::Topic,
+            )
+            .await;
+            let output = hook_user_prompt_submit_impl(&handle, &wrapper).await;
+            assert_eq!(output, json!({}), "system text must not recall: {wrapper}");
+        }
     }
 
     #[tokio::test]
