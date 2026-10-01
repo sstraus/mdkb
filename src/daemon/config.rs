@@ -300,7 +300,9 @@ impl DaemonConfig {
 
 /// Expand ~ at the start of a path to the user's home directory.
 fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
+    if path == "~" {
+        home_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+    } else if let Some(rest) = path.strip_prefix("~/") {
         home_dir()
             .map(|h| h.join(rest))
             .unwrap_or_else(|_| PathBuf::from("/tmp").join(rest))
@@ -418,6 +420,24 @@ whitelist_dirs = ["~/Code"]
         assert_eq!(config.whitelist_dirs, vec!["~/Code"]);
         assert!(config.repos.is_empty());
         assert!(config.socket_path.is_none());
+    }
+
+    /// Catches: an `ignore` key that parses nowhere, so the operator's list
+    /// never reaches discovery; and a bare `~` left unexpanded.
+    #[test]
+    fn ignore_in_toml_text_reaches_the_config_and_expands_a_bare_tilde() {
+        let config: DaemonConfig =
+            toml::from_str("ignore = [\"/a/.tmp\", \"~\", \"~/x\"]").unwrap();
+        assert_eq!(config.ignore, vec!["/a/.tmp", "~", "~/x"]);
+        let home = home_dir().unwrap();
+        assert_eq!(
+            config.ignored_paths(),
+            vec![
+                PathBuf::from("/a/.tmp"),
+                crate::domain::canonicalize_plain(&home).unwrap_or(home.clone()),
+                home.join("x"),
+            ]
+        );
     }
 
     #[test]

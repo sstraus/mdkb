@@ -1912,6 +1912,12 @@ pub fn resolve_root_selector(
         .iter()
         .map(|handle| handle.root.clone())
         .collect();
+    // An ignored root is ignored everywhere, including as the open fallback.
+    let open = {
+        let mut set: std::collections::BTreeSet<_> = open.into_iter().collect();
+        registry.retain_unignored(&mut set);
+        set.into_iter().collect::<Vec<_>>()
+    };
     // Discovery is a recursive walk of every known root. Pay it only for the
     // selectors whose answer it can change: an explicit path is itself, and
     // walking 9355 directories to confirm that is latency charged to every

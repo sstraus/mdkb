@@ -101,8 +101,15 @@ mod platform {
             println!("mdkb daemon: not running");
         }
         println!("  base:       {}", s.base_dir.display());
-        let ignore =
-            crate::DaemonConfig::load_or_default(&s.base_dir.join("daemon.toml"))?.ignored_paths();
+        // Status is the command run when something is wrong: an unparsable
+        // daemon.toml is reported, never a reason to print nothing.
+        let ignore = match crate::DaemonConfig::load_or_default(&s.base_dir.join("daemon.toml")) {
+            Ok(config) => config.ignored_paths(),
+            Err(e) => {
+                println!("  warning:    daemon.toml not applied, ignore list empty: {e}");
+                Vec::new()
+            }
+        };
         let mut known = crate::daemon::repo_map::read_known_roots(&s.base_dir.join("repos.json"));
         known.retain(|root| !crate::daemon::repo_map::is_ignored(root, &ignore));
         let discoverable = crate::daemon::repo_map::discover_nested_stores(&known, &ignore);
