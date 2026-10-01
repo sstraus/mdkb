@@ -2819,4 +2819,118 @@ export function snapshot(id: string) {
             "lua call: {rows:?}"
         );
     }
+
+    /// Three indexed files with a vector on every symbol; `bad.rs` cannot be
+    /// deleted from the database (a trigger aborts the symbol delete).
+    fn batch_with_an_undeletable_file() -> (tempfile::TempDir, tempfile::TempDir, IndexFacade) {
+        let src = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "bad.rs", "c.rs"] {
+            fs::write(
+                src.path().join(name),
+                format!("pub fn f_{}() {{}}\n", &name[..1]),
+            )
+            .unwrap();
+        }
+        let db = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src.path()).unwrap();
+        seed_recognisable_vectors(&facade, &["a.rs", "bad.rs", "c.rs"]);
+        facade
+            .db
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER refuse_bad BEFORE DELETE ON code_symbols \
+                 WHEN (SELECT path FROM code_files WHERE id = OLD.file_id) = 'bad.rs' \
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        for name in ["a.rs", "bad.rs", "c.rs"] {
+            fs::remove_file(src.path().join(name)).unwrap();
+        }
+        (src, db, facade)
+    }
+
+    /// The store holds a vector for exactly the symbols the database still has.
+    fn assert_vectors_match_live_symbols(facade: &IndexFacade) {
+        let live: HashSet<u32> = facade.db.all_symbol_ids().unwrap().into_iter().collect();
+        assert_eq!(stored_vector_ids(facade), live);
+    }
+
+    /// Catches: a delete that fails still queues the file's vectors for removal,
+    /// so the rows stay in the database while their vectors are gone (the file's
+    /// hash is unchanged, so nothing ever re-embeds it).
+    #[test]
+    fn a_failed_delete_keeps_the_vectors_of_the_file_that_stayed() {
+        let (src, _db, mut facade) = batch_with_an_undeletable_file();
+
+        let result = facade.prune_missing_files(src.path(), &[]);
+
+        assert!(result.is_err(), "the refused delete must surface");
+        assert!(
+            !facade.db.symbols_for_files(&["bad.rs"]).unwrap().is_empty(),
+            "bad.rs is still indexed"
+        );
+        assert_vectors_match_live_symbols(&facade);
+    }
+
+    /// Catches: an error mid-batch abandons the vector removal, orphaning the
+    /// vectors of the files already deleted before it.
+    #[test]
+    fn files_deleted_before_a_failure_lose_their_vectors_too() {
+        let (src, _db, mut facade) = batch_with_an_undeletable_file();
+
+        let _ = facade.prune_vanished_files(src.path());
+
+        assert_vectors_match_live_symbols(&facade);
+    }
+
+    /// Catches: the batch applied only to prune; `reindex_files` (the watcher
+    /// path) still rewrote the store once per deleted file.
+    #[test]
+    fn reindex_files_rewrites_the_vector_store_once_for_many_deletions() {
+        let src = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..5).map(|i| format!("f{i}.rs")).collect();
+        for (i, name) in names.iter().enumerate() {
+            fs::write(src.path().join(name), format!("pub fn func_{i}() {{}}\n")).unwrap();
+        }
+        let db = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src.path()).unwrap();
+        let all: Vec<&str> = names.iter().map(String::as_str).collect();
+        seed_recognisable_vectors(&facade, &all);
+        let paths: Vec<PathBuf> = names.iter().map(|n| src.path().join(n)).collect();
+        for p in &paths {
+            fs::remove_file(p).unwrap();
+        }
+
+        let before = crate::code::semantic::STORE_REWRITES.with(|n| n.get());
+        facade.reindex_files(src.path(), &paths).unwrap();
+        let rewrites = crate::code::semantic::STORE_REWRITES.with(|n| n.get()) - before;
+
+        assert_eq!(rewrites, 1);
+        assert!(stored_vector_ids(&facade).is_empty());
+    }
+
+    /// Catches: the batch opens or rewrites the vector store when nothing was
+    /// deleted (an empty id set must not cost a rewrite).
+    #[test]
+    fn pruning_nothing_does_not_rewrite_the_vector_store() {
+        let index = seeded_two_file_index();
+        let mut facade = index.facade;
+        let walk = vec![
+            index.src.path().join("lib.rs"),
+            index.src.path().join("other.rs"),
+        ];
+
+        let before = crate::code::semantic::STORE_REWRITES.with(|n| n.get());
+        assert_eq!(
+            facade.prune_missing_files(index.src.path(), &walk).unwrap(),
+            0
+        );
+
+        assert_eq!(
+            crate::code::semantic::STORE_REWRITES.with(|n| n.get()),
+            before
+        );
+    }
 }
