@@ -186,14 +186,38 @@ impl DaemonConfig {
 
     /// [`ignore`](Self::ignore) as the canonical paths discovery compares
     /// against. A path that does not resolve is kept as written.
+    ///
+    /// An entry that cannot name one directory is dropped, with one warning
+    /// naming them all: an empty entry would match every path
+    /// (`Path::starts_with("")`), a relative one depends on the working
+    /// directory, and a `~` whose home is unknown has no meaning.
     pub fn ignored_paths(&self) -> Vec<PathBuf> {
-        self.ignore
+        let mut dropped = Vec::new();
+        let paths = self
+            .ignore
             .iter()
-            .map(|entry| {
-                let path = expand_tilde(entry);
-                crate::domain::canonicalize_plain(&path).unwrap_or(path)
+            .filter_map(|entry| {
+                let expanded = match entry.as_str() {
+                    "~" => home_dir().ok(),
+                    e if e.starts_with("~/") => home_dir().ok().map(|h| h.join(&e[2..])),
+                    e if e.trim().is_empty() => None,
+                    e => Some(PathBuf::from(e)),
+                };
+                match expanded.filter(|p| p.is_absolute()) {
+                    Some(path) => Some(crate::domain::canonicalize_plain(&path).unwrap_or(path)),
+                    None => {
+                        dropped.push(entry.as_str());
+                        None
+                    }
+                }
             })
-            .collect()
+            .collect();
+        if !dropped.is_empty() {
+            tracing::warn!(
+                "Ignoring daemon.toml ignore entries that are not absolute paths: {dropped:?}"
+            );
+        }
+        paths
     }
 
     /// Save config to a TOML file.
