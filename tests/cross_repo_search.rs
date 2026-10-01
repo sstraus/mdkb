@@ -425,7 +425,10 @@ async fn a_nested_store_is_discovered_without_being_opened_first() {
         .expect("mtime");
 
     assert!(count >= 1 && output.contains("nested_signal"), "{output}");
-    assert!(output.contains("Searched 2 of 2 known repos"), "{output}");
+    assert!(
+        output.contains("Searched 2 of 2 repos (1 known, 1 discovered)"),
+        "{output}"
+    );
     assert_eq!(
         before, after,
         "discovery and read-only search must not mutate the store"
@@ -591,4 +594,88 @@ async fn an_omitted_scope_searches_documents_and_memory() {
         output.contains("zonk_harvest"),
         "the memory entry is the half the document leg cannot supply: {output}"
     );
+}
+
+/// Roll a store's recorded schema back without opening it through `Context`,
+/// which would migrate it straight away.
+fn roll_back_schema(root: &Path, version: i32) {
+    rusqlite::Connection::open(root.join(".mdkb/index.sqlite"))
+        .expect("open store")
+        .execute("UPDATE schema_version SET version = ?1", [version])
+        .expect("roll back");
+}
+
+/// Story 219-9d67: `root="*"` skipped 24 of 38 stores and said so with a
+/// paragraph each, while counting the stores it had merely found on disk as
+/// "known".
+///
+/// Catches: discovered roots counted as known, and one paragraph per
+/// outdated store instead of one line.
+#[tokio::test]
+async fn the_footer_counts_discovered_apart_and_names_outdated_stores_in_one_line() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let parent = repo_with_entry(repos.path(), "parent", "zonk_harvest");
+    let _discovered = repo_with_entry(&parent, "nested", "unrelated");
+    let outdated_a = repo_with_entry(repos.path(), "old_a", "unrelated");
+    let outdated_b = repo_with_entry(repos.path(), "old_b", "unrelated");
+
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
+    for root in [&parent, &outdated_a, &outdated_b] {
+        registry.get_or_open(root).expect("open");
+    }
+    roll_back_schema(&outdated_a, 30);
+    roll_back_schema(&outdated_b, 17);
+
+    let (output, _) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"), &[])
+        .await
+        .expect("search");
+
+    assert!(
+        output.contains("_Searched 2 of 4 repos (3 known, 1 discovered)._"),
+        "{output}"
+    );
+    assert!(
+        output.contains("**Schema outdated, not searched (2):** old_a, old_b."),
+        "{output}"
+    );
+    assert!(
+        output.contains("mdkb repos refresh --only outdated"),
+        "the line carries the fix: {output}"
+    );
+    assert!(
+        !output.contains("Not searched") && !output.contains("A read-only command"),
+        "no paragraph per store: {output}"
+    );
+}
+
+/// Criterion 2 of story 219-9d67: after the refresh, `root="*"` reads the store
+/// it used to skip.
+///
+/// Catches: a store that stays unreadable to the fan-out after it was migrated.
+#[tokio::test]
+async fn a_refreshed_store_is_read_by_the_next_cross_repo_search() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let old = repo_with_entry(repos.path(), "old", "zonk_harvest");
+    let registry = std::sync::Arc::new(RepoRegistry::new(one_slot_config(state.path())));
+    registry.get_or_open(&old).expect("open");
+    roll_back_schema(&old, 30);
+
+    let (before, found) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"), &[])
+        .await
+        .expect("search");
+    assert_eq!(found, 0, "{before}");
+    assert!(
+        before.contains("Schema outdated, not searched (1)"),
+        "{before}"
+    );
+
+    mdkb::core::refresh::refresh_store(&old, "t1").expect("refresh");
+
+    let (after, found) = cross_repo_search_impl(&registry, &memory_search("zonk_harvest"), &[])
+        .await
+        .expect("search");
+    assert!(found >= 1, "{after}");
+    assert!(!after.contains("Schema outdated"), "{after}");
 }

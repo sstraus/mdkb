@@ -38,8 +38,8 @@ use mdkb::cli::journal::JournalImportResult;
 use mdkb::cli::{
     Cli, CollectionCommand, Command, DaemonCommand, EvalCommand, EvolveCommand, ExperimentCommand,
     GraphCommand, HookCommand, JournalCommand, MemoryCommand, MetricsCommand, OutputFormat,
-    RemoveHooksCommand, RemoveMcpCommand, SessionCommand, SetupCommand, SetupHooksCommand,
-    SetupMcpCommand, SetupRemoveCommand, parse_eval_modes,
+    RemoveHooksCommand, RemoveMcpCommand, ReposCommand, SessionCommand, SetupCommand,
+    SetupHooksCommand, SetupMcpCommand, SetupRemoveCommand, parse_eval_modes,
 };
 use mdkb::core::Context;
 use mdkb::core::indexing::{UpdateOutcome, UpdateRequest, report_code_stats, update_documents};
@@ -1579,6 +1579,7 @@ mdkb memory audit                                       # entries worth re-readi
 # Daemon (the daemon owns every write; the CLI routes mutations to it)
 mdkb daemon status                                      # is it running, and against which store
 mdkb daemon restart                                     # after upgrading the binary
+mdkb repos refresh --only outdated                      # migrate every store older than this binary, each after a verified backup copy
 MDKB_NO_DAEMON=1 mdkb <cmd>                             # run in-process instead, for debugging
 MDKB_NAMESPACE=<name> mdkb <cmd>                        # use .mdkb/namespaces/<name>/ instead; test runners get `test` unasked
 
@@ -1600,6 +1601,8 @@ root=\"*\"                                                # every known repo (`m
 # every command refuses rather than touch it. When the store is OLDER, a read
 # command migrates it and says so on stderr — that migration also rewrites
 # memory entries and prior clusters, so back the store up first if it matters.
+# `root=\"*\"` does not migrate: it names the stores it skipped, and `mdkb repos refresh
+# --only outdated` migrates them all, each after a verified backup copy.
 "
             );
             if let Some(exe) = std::env::current_exe()
@@ -1888,6 +1891,9 @@ root=\"*\"                                                # every known repo (`m
             DaemonCommand::Status => daemon_cli::handle_status()?,
             DaemonCommand::Stop => daemon_cli::handle_stop().await?,
             DaemonCommand::Restart => daemon_cli::handle_restart().await?,
+        },
+        Command::Repos(cmd) => match cmd {
+            ReposCommand::Refresh { only } => mdkb::cli::repos::handle_refresh(only)?,
         },
         Command::Hook(hook_cmd) => match hook_cmd {
             HookCommand::SessionStart => dispatch_hook("hook.session_start").await?,

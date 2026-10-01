@@ -1887,14 +1887,18 @@ pub async fn search_impl(
 /// unchanged.
 /// What a `root` selector resolved to, and what it resolved against.
 ///
-/// `known` is the denominator: `roots` is only what the selector picked, and
-/// reporting "2 of 2" for a two-item list is the same false confidence the
-/// coverage footer exists to destroy.
+/// `known + discovered` is the denominator: `roots` is only what the selector
+/// picked, and reporting "2 of 2" for a two-item list is the same false
+/// confidence the coverage footer exists to destroy. The two are kept apart
+/// because they are not the same claim: a known repo is one the daemon has
+/// opened or been told about, a discovered one is a store found on disk under
+/// a known root.
 #[derive(Debug)]
 pub struct ResolvedRoots {
     pub selector: RootSelector,
     pub roots: Vec<std::path::PathBuf>,
     pub known: usize,
+    pub discovered: usize,
 }
 
 pub fn resolve_root_selector(
@@ -1933,10 +1937,17 @@ pub fn resolve_root_selector(
         open
     };
     let roots = selector.resolve(&known, &open).map_err(mcp_error)?;
+    let mapped: std::collections::BTreeSet<std::path::PathBuf> = registry
+        .known_roots()
+        .into_iter()
+        .chain(registry.all_handles().iter().map(|h| h.root.clone()))
+        .collect();
+    let discovered = known.iter().filter(|r| !mapped.contains(*r)).count();
     Ok(ResolvedRoots {
         selector,
         roots,
-        known: known.len(),
+        known: known.len() - discovered,
+        discovered,
     })
 }
 
@@ -2014,6 +2025,22 @@ pub fn single_root(
     }
 }
 
+/// Why a repo was not searched.
+///
+/// A store older than this binary is not a fault, and every one of them has the
+/// same remedy, so the footer reports them in one line instead of a paragraph
+/// each. Everything else carries the store's own words.
+enum Skip {
+    SchemaOutdated,
+    Other(String),
+}
+
+impl From<String> for Skip {
+    fn from(why: String) -> Self {
+        Self::Other(why)
+    }
+}
+
 /// What the fan-out learned about one repo.
 ///
 /// `Err` is "not searched, and here is why". A repo that could not be read is
@@ -2022,7 +2049,7 @@ pub fn single_root(
 /// that found nothing and for a store this binary refused to open.
 struct RepoOutcome {
     root: std::path::PathBuf,
-    results: std::result::Result<Vec<SearchResult>, String>,
+    results: std::result::Result<Vec<SearchResult>, Skip>,
     no_collections: bool,
 }
 
@@ -2046,6 +2073,34 @@ fn format_coverage_list(header: &str, lines: &[String]) -> String {
     out
 }
 
+/// The one line that names every store skipped for being older than this
+/// binary, and the command that fixes all of them. Names, not paths: the path
+/// is one `mdkb daemon status` away, and this line is charged on every
+/// fan-out until the stores are migrated.
+fn format_outdated_line(outdated: &[std::path::PathBuf]) -> String {
+    let names: Vec<String> = outdated
+        .iter()
+        .take(COVERAGE_SHOWN)
+        .map(|root| {
+            root.file_name().map_or_else(
+                || root.display().to_string(),
+                |n| n.to_string_lossy().into(),
+            )
+        })
+        .collect();
+    let more = outdated.len().saturating_sub(names.len());
+    let tail = if more > 0 {
+        format!(", …and {more} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "**Schema outdated, not searched ({}):** {}{tail}. Run `mdkb repos refresh --only outdated`.\n",
+        outdated.len(),
+        names.join(", ")
+    )
+}
+
 /// The coverage footer: what was read, out of what, and what was not.
 ///
 /// Always emitted, including when every repo was searched. The denominator is
@@ -2061,20 +2116,37 @@ fn format_cross_repo_coverage(
     searched: usize,
     resolution: &ResolvedRoots,
     skipped: &[(std::path::PathBuf, String)],
+    outdated: &[std::path::PathBuf],
     no_collections: &[std::path::PathBuf],
 ) -> String {
     let selected = resolution.roots.len();
-    let known = resolution.known;
+    let (known, discovered) = (resolution.known, resolution.discovered);
+    let counted = if discovered == 0 {
+        format!("{known} known")
+    } else {
+        format!("{known} known, {discovered} discovered")
+    };
     let headline = match resolution.selector {
-        RootSelector::All => format!("_Searched {searched} of {known} known repos._"),
+        RootSelector::All if discovered == 0 => {
+            format!("_Searched {searched} of {known} known repos._")
+        }
+        RootSelector::All => {
+            format!(
+                "_Searched {searched} of {} repos ({counted})._",
+                known + discovered
+            )
+        }
         RootSelector::Default => {
-            format!("_Searched {searched} of {selected} repos in this workspace ({known} known)._")
+            format!("_Searched {searched} of {selected} repos in this workspace ({counted})._")
         }
         RootSelector::List(_) => {
-            format!("_Searched {searched} of {selected} repos named ({known} known)._")
+            format!("_Searched {searched} of {selected} repos named ({counted})._")
         }
     };
     let mut out = format!("\n{headline}\n");
+    if !outdated.is_empty() {
+        out.push_str(&format_outdated_line(outdated));
+    }
     if !skipped.is_empty() {
         let lines: Vec<String> = skipped
             .iter()
@@ -2170,11 +2242,15 @@ fn search_one_repo(
     // one declared workspace on the maintainer's machine.
     let ctx = match registry.read_only_context(&root) {
         Ok(ctx) => ctx,
-        Err(why) => {
-            tracing::warn!(root = %root.display(), "cross_repo_search: not searched ({why})");
+        Err(refusal) => {
+            tracing::warn!(root = %root.display(), "cross_repo_search: not searched ({refusal})");
+            let skip = match refusal {
+                crate::daemon::registry::ReadRefusal::SchemaOutdated { .. } => Skip::SchemaOutdated,
+                crate::daemon::registry::ReadRefusal::Other(why) => Skip::Other(why),
+            };
             return RepoOutcome {
                 root,
-                results: Err(why),
+                results: Err(skip),
                 no_collections: false,
             };
         }
@@ -2195,7 +2271,7 @@ fn search_one_repo(
                 let why = format!("collection registry could not be read: {e}");
                 return RepoOutcome {
                     root,
-                    results: Err(why),
+                    results: Err(why.into()),
                     no_collections: false,
                 };
             }
@@ -2233,7 +2309,7 @@ fn search_one_repo(
                     {
                         return RepoOutcome {
                             root,
-                            results: Err(format!("document ranking failed: {e}")),
+                            results: Err(format!("document ranking failed: {e}").into()),
                             no_collections,
                         };
                     }
@@ -2247,7 +2323,7 @@ fn search_one_repo(
                     tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
                     return RepoOutcome {
                         root,
-                        results: Err(why),
+                        results: Err(why.into()),
                         no_collections,
                     };
                 }
@@ -2296,7 +2372,7 @@ fn search_one_repo(
                     tracing::warn!(root = %repo_tag, "cross_repo_search: not searched ({why})");
                     return RepoOutcome {
                         root,
-                        results: Err(why),
+                        results: Err(why.into()),
                         no_collections,
                     };
                 }
@@ -2432,6 +2508,7 @@ pub async fn cross_repo_search_impl(
 
     let mut searched = 0_usize;
     let mut skipped: Vec<(std::path::PathBuf, String)> = Vec::new();
+    let mut outdated: Vec<std::path::PathBuf> = Vec::new();
     let mut all_results: Vec<SearchResult> = Vec::new();
     let mut no_collections = Vec::new();
     for outcome in outcomes {
@@ -2443,7 +2520,8 @@ pub async fn cross_repo_search_impl(
                 searched += 1;
                 all_results.extend(results);
             }
-            Err(why) => skipped.push((outcome.root, why)),
+            Err(Skip::SchemaOutdated) => outdated.push(outcome.root),
+            Err(Skip::Other(why)) => skipped.push((outcome.root, why)),
         }
     }
 
@@ -2463,6 +2541,7 @@ pub async fn cross_repo_search_impl(
         searched,
         &resolution,
         &skipped,
+        &outdated,
         &no_collections,
     ));
 

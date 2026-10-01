@@ -12,6 +12,7 @@ pub mod journal;
 pub mod mcp_proxy;
 pub mod memory;
 pub mod priority;
+pub mod repos;
 pub mod setup;
 pub mod stats_render;
 pub mod stats_render_report;
@@ -252,6 +253,10 @@ pub enum Command {
     #[command(subcommand)]
     Daemon(DaemonCommand),
 
+    /// Operate on every repository the daemon knows: `refresh`.
+    #[command(subcommand)]
+    Repos(ReposCommand),
+
     /// Connect Claude's stdio MCP transport to the mdkb daemon over its unix
     /// socket. Auto-spawns the daemon if it isn't running. On platforms
     /// without the daemon (Windows), serves MCP in-process instead. Set
@@ -393,6 +398,28 @@ pub enum DaemonCommand {
 
     /// Stop (if running) and re-spawn the daemon detached.
     Restart,
+}
+
+/// `mdkb repos <cmd>` subcommands. See `cli::repos` for behavior.
+#[derive(Subcommand, Debug)]
+pub enum ReposCommand {
+    /// Migrate stores older than this binary to its schema, one at a time.
+    ///
+    /// Each store is copied to `index.sqlite.pre-migrate-v<N>-<time>` beside it
+    /// and the copy is verified before anything is written. A store whose copy
+    /// fails is left untouched. Exits non-zero when any store failed.
+    Refresh {
+        /// Which stores to refresh.
+        #[arg(long, value_enum)]
+        only: RefreshFilter,
+    },
+}
+
+/// Which stores `mdkb repos refresh` acts on.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefreshFilter {
+    /// Every store whose schema is older than this binary's.
+    Outdated,
 }
 
 /// `mdkb hook <cmd>` subcommands.
