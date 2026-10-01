@@ -16802,4 +16802,218 @@ mod tests {
         let body = additional_context(&out);
         assert!(body.contains("sub/locked.md"), "{body}");
     }
+
+    // ---- critic 226-d09e round 2: the neighbor leg and the stat errors ----
+
+    /// Seeds `notes/seed.md` plus one frontmatter edge from it to each of
+    /// `targets` (path, collection), registering the collections and documents.
+    async fn seed_neighbor_graph(handle: &RepoHandle, targets: &[(&str, &str)]) {
+        seed_document(handle, "notes/seed.md", "seed", "alpha beta").await;
+        let guard = handle.ctx.lock().await;
+        let conn = &guard.as_ref().unwrap().conn;
+        let now = chrono::Utc::now().timestamp();
+        let seed_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE relative_path='notes/seed.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (path, collection) in targets {
+            if *collection != "default" {
+                let _ = crate::store::collections::add_collection(
+                    conn,
+                    &crate::domain::Collection {
+                        name: collection.to_string(),
+                        path: format!("./{collection}"),
+                        pattern: "**/*.md".into(),
+                        source: "manual".into(),
+                        created_at: now,
+                        updated_at: now,
+                    },
+                );
+            }
+            let doc = crate::domain::Document {
+                id: 0,
+                collection: collection.to_string(),
+                relative_path: path.to_string(),
+                hash: crate::store::documents::compute_hash("alpha beta"),
+                title: Some(path.to_string()),
+                metadata: None,
+                file_modified_at: now,
+                indexed_at: now,
+                status: Some("current".into()),
+            };
+            crate::store::documents::index_document(conn, &doc, "alpha beta").unwrap();
+            crate::store::graph::add_edge(
+                conn,
+                seed_id,
+                path,
+                "related",
+                crate::store::graph::KIND_FRONTMATTER,
+                None,
+            )
+            .unwrap();
+        }
+    }
+
+    /// Catches: the neighbor leg resolving every neighbor against the default
+    /// collection directory, so a neighbor in another collection is judged by
+    /// the wrong path: its present file is dropped.
+    #[tokio::test]
+    async fn critic_226r2_neighbor_is_checked_in_its_own_collection_directory() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_neighbor_graph(
+            &handle,
+            &[("guide.md", "elsewhere"), ("gone.md", "elsewhere")],
+        )
+        .await;
+        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
+        std::fs::write(tmp.path().join("elsewhere/guide.md"), "x").unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(body.contains("guide.md (related)"), "{body}");
+        assert!(!body.contains("gone.md"), "{body}");
+    }
+
+    /// Catches: `is_file` applied to documents but not to neighbors (a plain
+    /// `exists`): a neighbor whose path is now a directory is listed.
+    #[tokio::test]
+    async fn critic_226r2_neighbor_replaced_by_a_directory_is_not_listed() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_neighbor_graph(
+            &handle,
+            &[
+                ("notes/now_dir.md", "default"),
+                ("notes/file.md", "default"),
+            ],
+        )
+        .await;
+        let p = tmp.path().join("docs/notes/now_dir.md");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir(&p).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(body.contains("notes/file.md (related)"), "{body}");
+        assert!(!body.contains("now_dir.md"), "{body}");
+    }
+
+    /// Catches: ENOTDIR (a parent of the file is now a regular file) counting as
+    /// "some other stat error" and keeping the document. The file is gone as
+    /// surely as with ENOENT, and `update` would prune the row.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn critic_226r2_parent_replaced_by_a_file_counts_as_gone() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "sub/lost.md", "Quarantine autoheal lost", content).await;
+        seed_document(&handle, "docs/kept.md", "Quarantine autoheal kept", content).await;
+        let sub = tmp.path().join("docs/sub");
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::write(&sub, "now a file").unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(body.contains("docs/kept.md"), "{body}");
+        assert!(!body.contains("sub/lost.md"), "{body}");
+    }
+
+    /// Catches: a stat error other than absence dropping a graph neighbor (the
+    /// docs leg has its own test): same rule on both legs.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn critic_226r2_unreadable_directory_keeps_the_neighbor() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_neighbor_graph(&handle, &[("locked/n.md", "default")]).await;
+        let dir = tmp.path().join("docs/locked");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let body = additional_context(&out);
+        assert!(body.contains("locked/n.md (related)"), "{body}");
+    }
+
+    /// Catches: `present` run per edge, before dedupe and before the cap, so a
+    /// hub document with many edges costs one stat per edge; or a rejected
+    /// neighbor eating a cap slot. 6 targets, one of them `seen`, one reached
+    /// by two relations, cap 2, the first two asked rejected.
+    #[test]
+    fn critic_226r2_neighbor_presence_is_lazy_deduped_and_does_not_eat_the_cap() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO collections (name, path, pattern, created_at, updated_at)
+             VALUES ('docs', '.', '**/*.md', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO content (hash, body, created_at) VALUES ('h', 'body', 1)",
+            [],
+        )
+        .unwrap();
+        for id in ["seed", "n0", "n1", "n2", "n3", "n4", "n5"] {
+            conn.execute(
+                "INSERT INTO documents (collection, relative_path, hash, file_modified_at, indexed_at)
+                 VALUES ('docs', ?1, 'h', 1, 1)",
+                [format!("{id}.md")],
+            )
+            .unwrap();
+        }
+        let seed_id: i64 = conn
+            .query_row(
+                "SELECT id FROM documents WHERE relative_path='seed.md'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        for (target, relation) in [
+            ("n0.md", "related"),
+            ("n1.md", "related"),
+            ("n1.md", "supersedes"),
+            ("n2.md", "related"),
+            ("n3.md", "related"),
+            ("n4.md", "related"),
+            ("n5.md", "related"),
+        ] {
+            crate::store::graph::add_edge(
+                &conn,
+                seed_id,
+                target,
+                relation,
+                crate::store::graph::KIND_FRONTMATTER,
+                None,
+            )
+            .unwrap();
+        }
+        let seen: std::collections::HashSet<String> = ["n0.md".to_string()].into();
+        let mut asked: Vec<String> = Vec::new();
+        let got = doc_graph_neighbors(&conn, &["seed.md".into()], &seen, 2, None, |_, path| {
+            asked.push(path.to_string());
+            asked.len() > 2
+        })
+        .unwrap();
+        assert_eq!(got.len(), 2, "two rejected neighbors must not eat the cap");
+        assert_eq!(asked.len(), 4, "stops at the cap: {asked:?}");
+        let mut distinct = asked.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            asked.len(),
+            "one stat per neighbor: {asked:?}"
+        );
+        assert!(
+            !asked.contains(&"n0.md".to_string()),
+            "a seen path is not stat-ed"
+        );
+        assert!(
+            got.iter().all(|(p, _)| !asked[..2].contains(p)),
+            "a rejected neighbor was returned: {got:?} vs {asked:?}"
+        );
+    }
 }
