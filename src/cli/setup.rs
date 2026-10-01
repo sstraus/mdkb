@@ -828,23 +828,80 @@ pub fn detect_hook_drift(settings: &[&serde_json::Value]) -> HookDrift {
     drift
 }
 
+/// A settings file as JSON. Missing or unparseable files read as `{}` so drift
+/// detection never fails a caller — it degrades to "no mdkb hooks seen".
+fn read_settings_lenient(path: Result<PathBuf>) -> serde_json::Value {
+    path.ok()
+        .filter(|p| p.exists())
+        .and_then(|p| std::fs::read_to_string(&p).ok())
+        .filter(|raw| !raw.trim().is_empty())
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}))
+}
+
 /// Detect hook drift for a repo by reading both the user-scope
 /// (`~/.claude/settings.json`) and local-scope (`<cwd>/.claude/settings.local.json`)
-/// settings. Missing or unparseable files contribute nothing (treated as `{}`)
-/// so drift detection never fails a caller — it degrades to "no mdkb hooks seen".
+/// settings.
 pub fn detect_hook_drift_for_repo(cwd: &Path, profile_dir: Option<&Path>) -> HookDrift {
-    let read = |path: Result<PathBuf>| -> serde_json::Value {
-        path.ok()
-            .filter(|p| p.exists())
-            .and_then(|p| std::fs::read_to_string(&p).ok())
-            .filter(|raw| !raw.trim().is_empty())
-            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-            .filter(|v| v.is_object())
-            .unwrap_or_else(|| serde_json::json!({}))
-    };
-    let user = read(claude_settings_path(cwd, "user", profile_dir));
-    let local = read(claude_settings_path(cwd, "local", None));
+    let user = read_settings_lenient(claude_settings_path(cwd, "user", profile_dir));
+    let local = read_settings_lenient(claude_settings_path(cwd, "local", None));
     detect_hook_drift(&[&user, &local])
+}
+
+/// The commands that repair a [`HookDrift`], chosen from where the mdkb hooks
+/// already live. `mdkb setup hooks claude` alone writes the local scope, so
+/// suggesting it for a user-profile install adds a second copy of every event
+/// and the next diagnosis asks for the same command again (story 191-6b10).
+#[derive(Debug, PartialEq, Eq)]
+pub struct HookFixes {
+    pub missing: String,
+    pub duplicated: String,
+}
+
+/// Choose the repair commands for `cwd`. Setup targets the scope that already
+/// carries mdkb hooks (user first); when both do, the duplicates are removed
+/// from the local scope and the next run reports whatever is then missing.
+pub fn hook_fix_commands(cwd: &Path, profile_dir: Option<&Path>) -> HookFixes {
+    let has_mdkb_hooks = |settings: &serde_json::Value| {
+        HOOK_EVENTS
+            .iter()
+            .any(|(event, cli_event, _)| count_mdkb_entries(settings, event, cli_event) > 0)
+    };
+    let user = has_mdkb_hooks(&read_settings_lenient(claude_settings_path(
+        cwd,
+        "user",
+        profile_dir,
+    )));
+    let local = has_mdkb_hooks(&read_settings_lenient(claude_settings_path(
+        cwd, "local", None,
+    )));
+    let setup_user = || {
+        let dir = profile_dir
+            .map(Path::to_path_buf)
+            .or_else(|| claude_profile_dir().ok());
+        match dir {
+            Some(dir) => format!(
+                "mdkb setup hooks claude --scope user --profile-dir {}",
+                shell_quote(&dir.to_string_lossy())
+            ),
+            None => "mdkb setup hooks claude --scope user".to_string(),
+        }
+    };
+    let setup = if user {
+        setup_user()
+    } else {
+        "mdkb setup hooks claude".to_string()
+    };
+    let duplicated = if user && local {
+        "mdkb setup remove hooks claude --scope local".to_string()
+    } else {
+        setup.clone()
+    };
+    HookFixes {
+        missing: setup,
+        duplicated,
+    }
 }
 
 /// Hook-registration half of `mdkb setup check`: the settings files that are

@@ -39,6 +39,11 @@ pub struct Quarantine {
 pub struct Facts {
     pub hooks_missing: Vec<String>,
     pub hooks_duplicated: Vec<String>,
+    /// The command that registers the missing events in the scope that already
+    /// carries mdkb hooks; `mdkb setup hooks claude` when none is known.
+    pub hooks_missing_fix: Option<String>,
+    /// The command that clears the double registration.
+    pub hooks_duplicated_fix: Option<String>,
     /// Why `.mdkb/config.toml` does not load.
     pub config_error: Option<String>,
     pub quarantine: Vec<Quarantine>,
@@ -60,6 +65,8 @@ pub struct Facts {
 /// Prompts a week must see before a silent shadow counts as broken.
 pub const SHADOW_SILENT_MIN_PROMPTS: u32 = 20;
 
+const DEFAULT_HOOKS_FIX: &str = "mdkb setup hooks claude";
+
 /// Every finding, most severe first.
 pub fn findings(facts: &Facts) -> Vec<Finding> {
     let mut out = Vec::new();
@@ -80,7 +87,12 @@ pub fn findings(facts: &Facts) -> Vec<Finding> {
                 "hook events not registered, so they never fire: {}",
                 facts.hooks_missing.join(", ")
             ),
-            Some("mdkb setup hooks claude"),
+            Some(
+                facts
+                    .hooks_missing_fix
+                    .as_deref()
+                    .unwrap_or(DEFAULT_HOOKS_FIX),
+            ),
         );
     }
     if !facts.hooks_duplicated.is_empty() {
@@ -91,7 +103,12 @@ pub fn findings(facts: &Facts) -> Vec<Finding> {
                 "hook events registered twice, so they fire twice per turn: {}",
                 facts.hooks_duplicated.join(", ")
             ),
-            Some("mdkb setup hooks claude"),
+            Some(
+                facts
+                    .hooks_duplicated_fix
+                    .as_deref()
+                    .unwrap_or(DEFAULT_HOOKS_FIX),
+            ),
         );
     }
     if let Some(error) = &facts.config_error {
@@ -205,6 +222,25 @@ mod tests {
         assert_eq!(f.severity, Severity::Error);
         assert!(f.message.contains("PostToolUseFailure"), "{}", f.message);
         assert_eq!(f.fix.as_deref(), Some("mdkb setup hooks claude"));
+    }
+
+    #[test]
+    fn the_fix_comes_from_the_scope_that_holds_the_hooks() {
+        let facts = Facts {
+            hooks_missing: vec!["Stop".into()],
+            hooks_duplicated: vec!["PreToolUse".into()],
+            hooks_missing_fix: Some("mdkb setup hooks claude --scope user".into()),
+            hooks_duplicated_fix: Some("mdkb setup remove hooks claude --scope local".into()),
+            ..Facts::default()
+        };
+        let fixes: Vec<_> = findings(&facts).into_iter().filter_map(|f| f.fix).collect();
+        assert_eq!(
+            fixes,
+            [
+                "mdkb setup hooks claude --scope user",
+                "mdkb setup remove hooks claude --scope local"
+            ]
+        );
     }
 
     #[test]
