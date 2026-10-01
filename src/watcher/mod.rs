@@ -300,4 +300,58 @@ mod tests {
         let config = WatcherConfig::default();
         assert_eq!(config.debounce_ms, 100);
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_196_routed_burst_still_overflows_into_a_rescan_flag() {
+        // Catches: the early filter swallowing the overflow signal, so a burst of
+        // paths the consumer DOES act on is dropped without scheduling a rescan.
+        let temp = setup_temp_dir();
+        let mut watcher =
+            FileWatcher::new(WatcherConfig { debounce_ms: 50 }).expect("watcher creation");
+        watcher.set_filter(|p| p.extension().is_some_and(|e| e == "rs"));
+        watcher
+            .watch(&temp.path().to_path_buf())
+            .expect("watch should succeed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        // Consumer is "mid-flush": nothing is received while the burst lands.
+        for i in 0..2_000 {
+            fs::write(temp.path().join(format!("f{i}.rs")), "x").expect("write");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            watcher.take_missed_events(),
+            "2000 routed events against a 100-slot channel must flag a rescan"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn critic_196_rename_away_from_a_source_name_still_delivers_the_old_path() {
+        // Catches: a filter that judges only the surviving path, so renaming
+        // a.rs to a.txt never tells the consumer that a.rs left the index.
+        let temp = setup_temp_dir();
+        let old = temp.path().join("a.rs");
+        fs::write(&old, "fn a() {}").expect("write");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut watcher =
+            FileWatcher::new(WatcherConfig { debounce_ms: 50 }).expect("watcher creation");
+        watcher.set_filter(|p| p.extension().is_some_and(|e| e == "rs"));
+        watcher
+            .watch(&temp.path().to_path_buf())
+            .expect("watch should succeed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        fs::rename(&old, temp.path().join("a.txt")).expect("rename");
+        let seen = timeout(Duration::from_secs(5), async {
+            while let Some(change) = watcher.recv().await {
+                assert_eq!(change.path.extension().and_then(|e| e.to_str()), Some("rs"));
+                if change.path == old {
+                    return true;
+                }
+            }
+            false
+        })
+        .await;
+        assert!(matches!(seen, Ok(true)), "old source path must be delivered");
+    }
 }
