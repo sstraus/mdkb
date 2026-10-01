@@ -41,8 +41,12 @@ fn fetch_reranker_weights_with(
     if !hooks.recall_rerank_any() {
         return Ok(());
     }
-    download()
-        .map_err(|error| Error::other(format!("recall reranker weights not fetched: {error}")))
+    download().map_err(|error| {
+        Error::other(format!(
+            "embeddings are done, but the recall reranker weights were not fetched \
+             (recall keeps the MiniLM gate): {error}"
+        ))
+    })
 }
 
 /// Generate embeddings for documents that don't have them (the `has_embedding`
@@ -1074,6 +1078,7 @@ mod fetch_reranker_weights_tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("offline"), "{error}");
+        assert!(error.contains("embeddings are done"), "{error}");
 
         let mut off = on;
         off.recall_rerank_it = false;

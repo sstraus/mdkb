@@ -6700,18 +6700,7 @@ async fn cli_mutate_impl(
             })
         }
         mutation => {
-            // The reranker weights are 280 MB: fetch them before the store lock
-            // is taken, or every hook for this repo waits at `lock_wait` for the
-            // download.
-            if matches!(mutation, CliMutation::Embed { .. }) {
-                let hooks = handle.config.hooks.clone();
-                tokio::task::spawn_blocking(move || {
-                    crate::core::ops::fetch_reranker_weights(&hooks)
-                })
-                .await
-                .map_err(|e| mcp_error(format!("reranker weights fetch aborted: {e}")))?
-                .map_err(|e| mcp_error(e.to_string()))?;
-            }
+            let is_embed = matches!(mutation, CliMutation::Embed { .. });
             ensure_handle_context(handle).await?;
             let mut slot = handle.ctx.lock().await;
             // No outer wrap: `run_handle_memory_mutation` already returns an
@@ -6720,10 +6709,29 @@ async fn cli_mutate_impl(
             // operator needs to the end of the line. It also flattened the code
             // the inner error had earned, which is what tells the CLI whether the
             // write started.
-            run_handle_memory_mutation(&mut slot, "cli mutation", |ctx| {
+            let outcome = run_handle_memory_mutation(&mut slot, "cli mutation", |ctx| {
                 crate::core::cli_mutation::execute_context_mutation(ctx, mutation)
                     .map_err(|e| mcp_store_error("CLI mutation failed", e))
-            })
+            });
+            drop(slot);
+            // The reranker weights are 280 MB: fetch them after the embedding,
+            // so an offline machine still gets its vectors, and after the store
+            // lock is released, or every hook for this repo waits at `lock_wait`
+            // for the download.
+            if is_embed && outcome.is_ok() {
+                let hooks = handle.config.hooks.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::core::ops::fetch_reranker_weights(&hooks)
+                })
+                .await
+                .map_err(|e| {
+                    mcp_error(format!(
+                        "embeddings are done, but the reranker weights fetch aborted: {e}"
+                    ))
+                })?
+                .map_err(|e| mcp_error(e.to_string()))?;
+            }
+            outcome
         }
     }
 }
@@ -12838,7 +12846,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_score_below_the_floor_injects_nothing_even_when_minilm_admitted_it() {
+    async fn rerank_score_below_the_floor_injects_nothing_even_when_minilm_admitted_it() {
         // Catches: the reranker only ever adding entries, so a prompt whose
         // candidates it scores as unrelated still injects what the cosine gate
         // let through. The gate is the reranker's top score.
@@ -12888,7 +12896,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn italian_and_english_prompts_are_held_to_their_own_floor() {
+    async fn rerank_italian_and_english_prompts_are_held_to_their_own_floor() {
         // Catches: one threshold for both languages. -1.5 clears the English
         // floor (-1.95) and not the Italian one (-1.05), which the Italian
         // negatives of the fit set need.
@@ -12919,7 +12927,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn english_prompts_keep_the_minilm_result_by_default() {
+    async fn rerank_english_prompts_keep_the_minilm_result_by_default() {
         // Catches: the unfit English floor gating English prompts: a score of
         // -9 would drop what MiniLM admitted.
         let tmp = TempDir::new().unwrap();
