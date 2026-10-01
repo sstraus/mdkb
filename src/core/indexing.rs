@@ -288,9 +288,11 @@ fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<Update
     // collection that autoheal (or anything else) dropped.
     let before = documents_per_collection(&ctx.conn).unwrap_or_default();
 
+    let pruned = prune_vanished_convention_collections(ctx, root)?;
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult {
         pattern_upgrades,
+        collections_pruned: pruned,
         ..UpdateResult::default()
     };
 
@@ -464,7 +466,8 @@ fn report_collection_deltas(
     let names: std::collections::HashSet<&str> =
         registered.iter().map(|c| c.name.as_str()).collect();
     for (name, count) in &previous {
-        if *count > 0 && !names.contains(name.as_str()) {
+        let pruned = result.collections_pruned.contains(name);
+        if *count > 0 && !names.contains(name.as_str()) && !pruned {
             result.collections_vanished.push(name.clone());
             result.errors.push(format!(
                 "collection `{name}` held {count} document(s) before this run and is no longer \
@@ -540,6 +543,32 @@ pub(crate) fn apply_conventions(ctx: &Context, root: &Path) -> Result<Vec<String
     }
 
     Ok(upgraded)
+}
+/// Unregister auto-detected collections whose directory no longer exists, which
+/// cascades to their documents.
+///
+/// Without this, `update_collection` reports the missing path and moves on, so
+/// the documents of a deleted directory stay searchable and recall keeps
+/// injecting them (story 214-1b93). Only `source = convention` qualifies: mdkb
+/// registered those itself and `apply_conventions` re-registers one if the
+/// directory returns. A hand-registered collection may sit on an unmounted
+/// volume, so it keeps the path error instead of losing its documents.
+fn prune_vanished_convention_collections(ctx: &Context, root: &Path) -> Result<Vec<String>> {
+    let mut pruned = Vec::new();
+    for coll in collections::list_collections(&ctx.conn)? {
+        if coll.source == crate::domain::COLLECTION_SOURCE_CONVENTION
+            && !root.join(&coll.path).exists()
+            && collections::remove_collection(&ctx.conn, &coll.name)?
+        {
+            tracing::info!(
+                "Pruned collection '{}': {} no longer exists",
+                coll.name,
+                coll.path
+            );
+            pruned.push(coll.name);
+        }
+    }
+    Ok(pruned)
 }
 /// Update all collections within a transaction.
 fn update_all_collections(
