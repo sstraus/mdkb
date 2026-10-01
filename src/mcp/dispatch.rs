@@ -15728,7 +15728,9 @@ mod tests {
             config.hooks.user_prompt_submit_deadline_ms = 150;
         });
         seed_memory_entry(&handle, "behind-topic").await;
-        stall_next_query(&handle, 2000).await;
+        // A busy slot is bypassed now, so the stall is on the hook's store
+        // acquisition itself: both prompts are cut, each at its own deadline.
+        store_stall::arm_all(&handle.root, std::time::Duration::from_secs(2));
         let dctx = make_dctx();
 
         let first = prompt_hook(&handle, &dctx, "first").await;
@@ -15910,6 +15912,11 @@ mod tests {
         release.send(()).unwrap();
         held.await.unwrap();
         let during = during.expect("the session start waited for the mutation");
+
+        // The telemetry the `during` run queued behind the mutation takes the
+        // slot as soon as it is released; wait it out, or the control below
+        // would itself bypass a busy slot.
+        drop(handle.ctx.lock().await);
 
         // Control: the same file with no row IS drift once nothing is in flight,
         // so the channel under test does carry the finding.
