@@ -1386,6 +1386,17 @@ fn classify_change(
     }
 }
 
+/// The watcher's delivery filter: keep exactly the paths [`classify_change`]
+/// routes somewhere, so dropping the rest at the source loses no change the
+/// consumer would have acted on.
+fn routed_path_filter(
+    collection_paths: Vec<PathBuf>,
+    code_excludes: globset::GlobSet,
+    memory_entries_dir: PathBuf,
+) -> impl Fn(&Path) -> bool + Send + Sync + 'static {
+    move |path| classify_change(path, &collection_paths, &code_excludes, &memory_entries_dir).any()
+}
+
 /// How long the watcher waits for context initialization before giving up.
 const CTX_WAIT_SECS: u64 = 60;
 
@@ -1508,6 +1519,16 @@ pub async fn run_file_watcher_inner(
     // store `ctx` opened, which in a namespace is `.mdkb/namespaces/<name>/`.
     let memory_entries_dir =
         watched_memory_entries_dir(&root, crate::store::namespace::active()?.as_deref());
+
+    // Deliver only paths some sink would act on. The root watch is recursive, so
+    // without this a build writing `target/**` fills the watcher's bounded channel
+    // and each overflow schedules a full rescan. Same predicate as the routing
+    // below, so no change that routes is dropped here.
+    watcher.set_filter(routed_path_filter(
+        collection_paths.clone(),
+        code_excludes.clone(),
+        memory_entries_dir.clone(),
+    ));
 
     // Watch root recursively — it covers code, collections inside root, AND the
     // memory entry projection. This registration must NOT be gated on any one
@@ -4129,6 +4150,25 @@ if (require.main === module) {
         // .js outside node_modules should still be code
         let path = Path::new("/project/src/app.js");
         assert_eq!(code_doc(path, &collections, &excludes), (true, false));
+    }
+
+    #[test]
+    fn routed_path_filter_drops_target_churn_and_keeps_routed_paths() {
+        // Catches: the watcher filter forgotten, inverted, or wired to a
+        // predicate other than classify_change (target churn reaching the
+        // channel, or a routed source edit dropped before the consumer).
+        let root = Path::new("/project");
+        let excludes = build_code_excludes(root, &["**/target/**".to_string()]);
+        let keep = routed_path_filter(
+            vec![PathBuf::from("/project/docs")],
+            excludes,
+            PathBuf::from("/project/.mdkb/memory/entries"),
+        );
+        assert!(!keep(Path::new("/project/target/debug/deps/foo.rs")));
+        assert!(!keep(Path::new("/project/target/debug/foo.o")));
+        assert!(keep(Path::new("/project/src/app.rs")));
+        assert!(keep(Path::new("/project/docs/guide.md")));
+        assert!(keep(Path::new("/project/.mdkb/memory/entries/a.md")));
     }
 
     #[test]

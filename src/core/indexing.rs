@@ -227,11 +227,24 @@ fn housekeeping(root: &Path) {
     // each names the setting the user has to look at.
     let config_path = mdkb_dir.join("config.toml");
     if let Ok(raw) = std::fs::read_to_string(&config_path) {
-        for key in crate::config::unknown_keys(&raw) {
+        for key in unwarned_keys(&config_path, crate::config::unknown_keys(&raw)) {
             tracing::warn!("config.toml: unknown key `{key}` ignored");
         }
     }
 }
+
+/// Keep only the keys not yet warned about for this `config.toml` in this
+/// process. `housekeeping` runs on every update pass of a long-lived daemon,
+/// so without this the same line is logged once per pass, forever.
+fn unwarned_keys(config_path: &Path, keys: Vec<String>) -> Vec<String> {
+    static WARNED: std::sync::LazyLock<std::sync::Mutex<HashSet<(PathBuf, String)>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    keys.into_iter()
+        .filter(|key| warned.insert((config_path.to_path_buf(), key.clone())))
+        .collect()
+}
+
 /// Like [`handle_update`], but `force` reindexes every file regardless of mtime.
 pub fn handle_update_force(
     ctx: &Context,
@@ -1518,5 +1531,98 @@ pub(crate) fn process_wikilink_edges(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod housekeeping_tests {
+    use super::*;
+
+    #[test]
+    fn housekeeping_warns_once_per_key_per_process() {
+        // Catches: the unknown-key warning repeated on every update pass.
+        let path = Path::new("/nonexistent/housekeeping_warns_once/config.toml");
+        let keys = || vec!["a.b".to_string(), "c".to_string()];
+        assert_eq!(unwarned_keys(path, keys()), keys());
+        assert!(unwarned_keys(path, keys()).is_empty());
+        // A new key on the same config still warns; the same key on another repo does too.
+        assert_eq!(unwarned_keys(path, vec!["d".into()]), vec!["d".to_string()]);
+        let other = Path::new("/nonexistent/housekeeping_warns_once_other/config.toml");
+        assert_eq!(unwarned_keys(other, keys()), keys());
+    }
+}
+
+#[cfg(test)]
+mod critic_196_housekeeping_tests {
+    use super::*;
+
+    fn captured_logs(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
+            type Writer = Buf;
+            fn make_writer(&'a self) -> Buf {
+                self.clone()
+            }
+        }
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn housekeeping_logs_an_unknown_key_once_across_passes_on_a_real_config() {
+        // Catches: housekeeping logging the unknown key on every pass because the
+        // dedup is bypassed or keyed on something that changes per call.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".mdkb")).unwrap();
+        std::fs::write(
+            dir.path().join(".mdkb/config.toml"),
+            "critic196_unknown_key = 1\n",
+        )
+        .unwrap();
+        let logs = captured_logs(|| {
+            housekeeping(dir.path());
+            housekeeping(dir.path());
+            housekeeping(dir.path());
+        });
+        assert_eq!(
+            logs.matches("critic196_unknown_key").count(),
+            1,
+            "three passes must warn once; logs:\n{logs}"
+        );
+    }
+
+    #[test]
+    fn housekeeping_warns_again_for_the_same_key_in_another_repo() {
+        // Catches: a process-wide dedup keyed on the key name alone, silencing the
+        // warning for every repo after the first one the daemon sees.
+        let write = |d: &std::path::Path| {
+            std::fs::create_dir_all(d.join(".mdkb")).unwrap();
+            std::fs::write(d.join(".mdkb/config.toml"), "critic196_other_key = 1\n").unwrap();
+        };
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        write(a.path());
+        write(b.path());
+        let logs = captured_logs(|| {
+            housekeeping(a.path());
+            housekeeping(b.path());
+        });
+        assert_eq!(logs.matches("critic196_other_key").count(), 2, "{logs}");
     }
 }
