@@ -391,6 +391,11 @@ mod tests {
         }
     }
 
+    /// Nice values at or above this are clamped by the kernel. Gates run the test binary already at
+    /// 19 (build-slot --gate), where lowering by 1 changes nothing.
+    #[cfg(unix)]
+    const NICE_CEILING: i32 = 19;
+
     #[test]
     #[cfg(unix)]
     fn lowering_moves_the_process_down_by_the_requested_amount() {
@@ -398,7 +403,15 @@ mod tests {
         let before = current_nice();
         let applied = lower_process_priority(1);
         assert_eq!(applied, Some(before + 1));
-        assert_eq!(current_nice(), before + 1);
+        let after = current_nice();
+        if before < NICE_CEILING {
+            assert_eq!(after, before + 1);
+        } else {
+            // At the ceiling the kernel clamps, and where it clamps differs by
+            // platform (Linux 19, macOS reports 20): the value only stays put
+            // or moves down by at most the requested amount.
+            assert!((before..=before + 1).contains(&after), "got {after}");
+        }
     }
 
     #[test]
@@ -409,6 +422,12 @@ mod tests {
         // have silently failed to restore, leaving a daemon demoted forever.
         let _serial = PRIORITY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before = current_nice();
+        if before >= NICE_CEILING {
+            // Already at the ceiling: lowering is a clamped no-op and
+            // "raising" back to the same value succeeds, so there is no
+            // one-way step left to observe.
+            return;
+        }
         lower_process_priority(1);
         let raised = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, before) };
         assert_eq!(raised, -1, "raising priority must fail without privilege");
