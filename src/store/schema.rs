@@ -385,7 +385,7 @@ CREATE INDEX IF NOT EXISTS idx_memedges_target ON memory_edges(target_ref);
 
 /// SQL for setting BM25 column weights (title 10x, body 1x).
 /// The `document_aliases` table, kept out of `SCHEMA_SQL` because the v29
-/// migration must create it as well: `migrate_schema` is reachable without
+/// migration must create it as well: `migrate_with_tables` is reachable without
 /// `SCHEMA_SQL` having run, and the backfill has nothing to write into
 /// otherwise. One definition, executed from both places.
 const DOCUMENT_ALIASES_SQL: &str = r#"
@@ -492,7 +492,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // left the old version number on a store that had already gained tables,
     // triggers and indexes — half old, half new.
     match get_schema_version(conn)? {
-        Some(v) if v < SCHEMA_VERSION => migrate_with_tables(conn, v)?,
+        Some(v) if v < SCHEMA_VERSION => migrate_with_tables(conn)?,
         None => {
             create_tables(conn)?;
             // Fresh database
@@ -534,32 +534,32 @@ pub fn refuse_future_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Migrate schema from old version to current.
+/// Create the missing tables and migrate to the current version, in one
+/// transaction. The version is read AFTER `BEGIN IMMEDIATE` took the write
+/// lock: two openers of one stale store (`Context::open` takes only a shared
+/// lock) both see it stale, and the second must find it already migrated
+/// rather than run every step again.
 ///
-/// Wrapped in a transaction for atomicity — partial migration on crash
-/// is rolled back automatically by SQLite.
-fn migrate_schema(conn: &Connection, from_version: i32) -> Result<()> {
-    in_transaction(conn, || migrate_schema_inner(conn, from_version))
-}
-
-/// [`migrate_schema`] preceded by [`create_tables`], in the same transaction.
-fn migrate_with_tables(conn: &Connection, from_version: i32) -> Result<()> {
-    in_transaction(conn, || {
-        create_tables(conn)?;
-        migrate_schema_inner(conn, from_version)
+/// Atomic: a failure, or a crash, rolls the whole thing back.
+fn migrate_with_tables(conn: &Connection) -> Result<()> {
+    in_transaction(conn, || match get_schema_version(conn)? {
+        Some(from) if from < SCHEMA_VERSION => {
+            create_tables(conn)?;
+            migrate_schema_inner(conn, from)
+        }
+        _ => Ok(()),
     })
 }
 
+/// Run `body` between `BEGIN IMMEDIATE` and `COMMIT`. Any failure, a failed
+/// `COMMIT` included, rolls back: SQLite keeps the transaction open after some
+/// COMMIT errors (SQLITE_BUSY), and a connection left inside one holds the
+/// write lock.
 fn in_transaction(conn: &Connection, body: impl FnOnce() -> Result<()>) -> Result<()> {
     conn.execute("BEGIN IMMEDIATE", [])?;
-    let result = body();
-    match &result {
-        Ok(()) => {
-            conn.execute("COMMIT", [])?;
-        }
-        Err(_) => {
-            let _ = conn.execute("ROLLBACK", []);
-        }
+    let result = body().and_then(|()| conn.execute("COMMIT", []).map(|_| ()).map_err(Into::into));
+    if result.is_err() {
+        let _ = conn.execute("ROLLBACK", []);
     }
     result
 }
@@ -567,7 +567,7 @@ fn in_transaction(conn: &Connection, body: impl FnOnce() -> Result<()>) -> Resul
 /// True when `name` is a table in this database.
 ///
 /// On a real open SCHEMA_SQL runs before the migrations, so every table exists.
-/// The migration unit tests call `migrate_schema` directly on a database built
+/// The migration unit tests call `migrate_with_tables` directly on a database built
 /// at an older version, where a table added later is absent — a migration that
 /// touches one must ask first.
 fn table_exists(conn: &Connection, name: &str) -> bool {
@@ -1168,7 +1168,7 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // this one needs no `pragma_table_info` probe: `CREATE TABLE IF NOT EXISTS`
     // and `INSERT OR IGNORE` are both idempotent, so a probe would always be
     // true. The table is created here and not left to `SCHEMA_SQL` because
-    // `migrate_schema` is called directly on stores that never saw it.
+    // `migrate_with_tables` is called directly on stores that never saw it.
     //
     // Every JSON call is guarded. `metadata` is free text from a frontmatter
     // parser: it can be NULL, it can fail `json_valid`, `id:` can be a number,
@@ -2114,7 +2114,7 @@ mod tests {
     // ==================== Migration Tests ====================
     //
     // These tests create a genuine old schema from scratch (no init_schema),
-    // then call migrate_schema to verify migrations work correctly.
+    // then call migrate_with_tables to verify migrations work correctly.
 
     /// Create a v1 schema: no status/version columns on documents, no evolution table,
     /// no source_path on memory_entries, no source on collections.
@@ -2242,7 +2242,7 @@ mod tests {
         assert!(!has_status, "v1 should not have status column");
 
         // Run migration
-        migrate_schema(&conn, 1).unwrap();
+        migrate_with_tables(&conn).unwrap();
 
         // Should be at current version
         assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
@@ -2308,7 +2308,7 @@ mod tests {
         ).unwrap();
 
         // Migrate
-        migrate_schema(&conn, 1).unwrap();
+        migrate_with_tables(&conn).unwrap();
 
         // Data should survive
         let title: String = conn
@@ -2376,7 +2376,7 @@ mod tests {
         assert!(!has_source, "v3 should not have source column");
 
         // Migrate from v3
-        migrate_schema(&conn, 3).unwrap();
+        migrate_with_tables(&conn).unwrap();
 
         assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
 
@@ -2397,7 +2397,7 @@ mod tests {
     fn test_malformed_tags_json_returns_empty_vec() {
         let conn = Connection::open_in_memory().unwrap();
         create_v1_schema(&conn);
-        migrate_schema(&conn, 1).unwrap();
+        migrate_with_tables(&conn).unwrap();
 
         // Insert a memory entry with malformed JSON in tags
         conn.execute(
@@ -2453,7 +2453,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_schema(&conn, 22).unwrap();
+        migrate_with_tables(&conn).unwrap();
 
         let state = |id: &str| {
             conn.query_row(
@@ -2505,7 +2505,7 @@ mod tests {
         )
         .unwrap();
 
-        migrate_schema(&conn, 21).unwrap();
+        migrate_with_tables(&conn).unwrap();
 
         let dated_at = |id: &str| {
             conn.query_row(
@@ -2592,7 +2592,7 @@ mod tests {
         assert!(!has_expires_at, "v8 should not have expires_at column");
 
         // Run migration
-        migrate_schema(&conn2, 8).unwrap();
+        migrate_with_tables(&conn2).unwrap();
 
         assert_eq!(get_schema_version(&conn2).unwrap(), Some(SCHEMA_VERSION));
 
@@ -2683,7 +2683,7 @@ mod tests {
         assert!(!has_due_at, "v9 should not have due_at column");
 
         // Run migration v9 → current.
-        migrate_schema(&conn, 9).unwrap();
+        migrate_with_tables(&conn).unwrap();
 
         assert_eq!(get_schema_version(&conn).unwrap(), Some(SCHEMA_VERSION));
 

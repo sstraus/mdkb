@@ -76,10 +76,7 @@ fn render_refresh(reports: &[RefreshReport]) -> (String, usize) {
                     .map(|b| format!(" (backup kept at {})", b.display()))
                     .unwrap_or_default();
                 let state = match f.schema_after {
-                    Some(v) if v >= crate::store::schema::SCHEMA_VERSION => {
-                        format!(" — the store IS at schema v{v}: the migration committed")
-                    }
-                    Some(v) => format!(" — the store is at schema v{v}, as before"),
+                    Some(v) => format!(" — the store is at schema v{v}"),
                     None => " — the store's schema could not be read afterwards".to_string(),
                 };
                 let _ = writeln!(out, "FAILED    {root}: {}{state}{backup}", f.reason);

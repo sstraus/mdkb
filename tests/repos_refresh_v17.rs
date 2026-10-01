@@ -197,3 +197,36 @@ fn refresh_refuses_under_a_namespace_and_touches_nothing() {
         "no backup was taken"
     );
 }
+
+/// Catches: the schema version read before `BEGIN IMMEDIATE`, so two openers of
+/// one stale store both run the migration (`Context::open` takes only a shared
+/// lock), and the loser fails or repeats data-changing steps.
+#[test]
+fn two_concurrent_openers_of_a_v17_store_both_succeed_and_migrate_once() {
+    for round in 0..5 {
+        let parent = tempfile::tempdir().expect("parent");
+        let root = v17_store(parent.path(), &format!("old{round}"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let (root, barrier) = (root.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    mdkb::core::Context::open(&root).map(|_| ())
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("thread").expect("an opener must not fail");
+        }
+        let conn = Connection::open(root.join(".mdkb/index.sqlite")).expect("open");
+        let (version, memory): (i32, i64) = conn
+            .query_row(
+                "SELECT (SELECT version FROM schema_version), (SELECT COUNT(*) FROM memory_entries)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("read");
+        assert_eq!((version, memory), (SCHEMA_VERSION, 2));
+    }
+}

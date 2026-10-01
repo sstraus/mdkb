@@ -272,7 +272,7 @@ fn the_failed_line_of_a_rolled_back_store_says_it_is_still_at_its_old_schema() {
 
     assert!(!ok, "{text}");
     assert!(text.contains("FAILED"), "{text}");
-    assert!(text.contains("schema v17, as before"), "{text}");
+    assert!(text.contains("the store is at schema v17"), "{text}");
     assert!(!text.contains("migration committed"), "{text}");
     assert!(
         text.contains("pre-migrate-v17"),
