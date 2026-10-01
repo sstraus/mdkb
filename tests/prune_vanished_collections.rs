@@ -35,12 +35,20 @@ fn deleting_a_convention_directory_drops_its_collection_and_documents() {
     write_docs(&root, "archive");
     let ctx = Context::open(&root).expect("open");
     handle_update(&ctx, &root).expect("first update");
-    assert_eq!(hits(&ctx), 1, "precondition: the archive document is indexed");
+    assert_eq!(
+        hits(&ctx),
+        1,
+        "precondition: the archive document is indexed"
+    );
 
     std::fs::remove_dir_all(root.join("archive")).unwrap();
     let result = handle_update(&ctx, &root).expect("second update");
 
-    assert_eq!(hits(&ctx), 0, "documents of a deleted directory must be gone");
+    assert_eq!(
+        hits(&ctx),
+        0,
+        "documents of a deleted directory must be gone"
+    );
     assert_eq!(result.collections_pruned, vec!["archive".to_string()]);
     assert!(
         result.collections.iter().all(|c| c.name != "archive"),
@@ -82,6 +90,10 @@ fn a_manual_collection_with_a_missing_directory_keeps_its_documents() {
     std::fs::remove_dir_all(root.join("notes")).unwrap();
     let result = handle_update(&ctx, &root).expect("second update");
 
-    assert_eq!(hits(&ctx), 1, "a manual registration is the user's, not pruned");
+    assert_eq!(
+        hits(&ctx),
+        1,
+        "a manual registration is the user's, not pruned"
+    );
     assert!(result.collections_pruned.is_empty());
 }
