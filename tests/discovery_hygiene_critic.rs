@@ -379,3 +379,135 @@ fn daemon_status_lists_neither_ignored_stores_nor_tmp_copies() {
     );
     assert!(!stdout.contains(&copy.display().to_string()), "{stdout}");
 }
+
+// ── critic round 2 ──────────────────────────────────────────────────────────
+
+/// Catches: an empty `ignore` entry (`ignore = [""]`, a stray comma-space or a
+/// templated value that rendered empty) surviving as the empty path, which is a
+/// prefix of every path, so one blank entry silences every store on the machine.
+#[test]
+fn an_empty_ignore_entry_silences_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("parent");
+    let kept = plant(&parent.join("kept"));
+    let config = DaemonConfig {
+        ignore: vec![String::new()],
+        ..DaemonConfig::default()
+    };
+
+    let found = discover_nested_stores(&[parent], &config.ignored_paths());
+
+    assert_eq!(found, BTreeSet::from([kept]));
+}
+
+/// Catches: a relative `ignore` entry kept relative. It is then resolved
+/// against whatever directory the process happens to run in: `daemon status`
+/// (run from a shell) and the daemon (run from `/`) disagree, and a name that
+/// does not exist yet silently matches nothing. Every path discovery compares
+/// against must be absolute.
+#[test]
+fn every_ignored_path_is_absolute_whatever_was_written() {
+    let config = DaemonConfig {
+        ignore: ["cov-audit", ".tmp", "./x/y", "~someone", ""]
+            .map(String::from)
+            .to_vec(),
+        ..DaemonConfig::default()
+    };
+
+    for path in config.ignored_paths() {
+        assert!(path.is_absolute(), "relative ignored path {path:?}");
+    }
+}
+
+/// Catches: a root-less call with two open stores dropping the wrong one, or
+/// returning the ignored one now that the fallback list is filtered (round 1
+/// only had a single open store, which an over-eager filter that empties the
+/// list would also satisfy).
+#[test]
+fn a_root_less_call_keeps_the_open_store_that_is_not_ignored() {
+    let state = tempfile::tempdir().unwrap();
+    let repos = tempfile::tempdir().unwrap();
+    let mut made = Vec::new();
+    for name in ["kept", "silenced"] {
+        let root = repos.path().join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = mdkb::domain::canonicalize_plain(&root).unwrap();
+        mdkb::cli::handlers::handle_init(&root).expect("init");
+        made.push(root);
+    }
+    let (kept, silenced) = (made[0].clone(), made[1].clone());
+    let registry = RepoRegistry::new(config_ignoring(
+        state.path(),
+        vec![silenced.to_string_lossy().to_string()],
+    ));
+    registry.get_or_open(&kept).expect("open kept");
+    registry.get_or_open(&silenced).expect("open silenced");
+
+    let resolved = resolve_root_selector(&registry, None, &[]).expect("resolve");
+
+    assert_eq!(resolved.roots, vec![kept]);
+}
+
+/// Catches: `daemon status` swallowing the parse error (`Err(_) => Vec::new()`):
+/// the listing then silently includes the stores the operator believes are
+/// ignored, with nothing saying the config was not applied.
+#[cfg(unix)]
+#[test]
+fn daemon_status_says_when_daemon_toml_was_not_applied() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".mdkb")).unwrap();
+    std::fs::write(
+        home.path().join(".mdkb/daemon.toml"),
+        "ignore = [unterminated",
+    )
+    .unwrap();
+
+    let work = tempfile::tempdir().unwrap();
+    let out = cli::command()
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["daemon", "status"])
+        .current_dir(work.path())
+        .output()
+        .unwrap();
+
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        all.contains("daemon.toml") && all.to_lowercase().contains("warning"),
+        "no warning about the unparsed config: {all}"
+    );
+}
+
+/// Catches: `mdkb repos refresh --outdated` treating an unparsable
+/// `daemon.toml` as "no ignore list" and migrating stores the operator
+/// silenced. A mutating command refuses; only the read-only `status` degrades.
+#[cfg(unix)]
+#[test]
+fn repos_refresh_refuses_when_daemon_toml_does_not_parse() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join(".mdkb")).unwrap();
+    std::fs::write(
+        home.path().join(".mdkb/daemon.toml"),
+        "ignore = [unterminated",
+    )
+    .unwrap();
+
+    let work = tempfile::tempdir().unwrap();
+    let out = cli::command()
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .args(["repos", "refresh", "--only", "outdated"])
+        .current_dir(work.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "refreshed with an ignore list it could not read: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
