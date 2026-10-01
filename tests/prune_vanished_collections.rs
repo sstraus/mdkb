@@ -119,3 +119,22 @@ fn losing_every_convention_directory_at_once_prunes_none() {
         result.errors
     );
 }
+
+/// Catches: counting `_root` (always present when a README exists) toward the
+/// mass-loss guard, which disables it in every repo that has a README.
+#[test]
+fn losing_every_convention_directory_prunes_none_when_a_root_readme_exists() {
+    let (_dir, root) = store();
+    std::fs::write(root.join("README.md"), "# Readme\n\nreadmemarker\n").unwrap();
+    write_docs(&root, "archive");
+    write_docs(&root, "docs");
+    let ctx = Context::open(&root).expect("open");
+    handle_update(&ctx, &root).expect("first update");
+
+    std::fs::remove_dir_all(root.join("archive")).unwrap();
+    std::fs::remove_dir_all(root.join("docs")).unwrap();
+    let result = handle_update(&ctx, &root).expect("second update");
+
+    assert!(result.collections_pruned.is_empty());
+    assert_eq!(hits(&ctx), 2, "both directories' documents must survive");
+}
