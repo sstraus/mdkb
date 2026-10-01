@@ -105,6 +105,8 @@ fn dir_listing(root: &Path) -> Vec<String> {
         .expect("read store dir")
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().into_owned())
+        // A read-only open of a WAL store makes -wal/-shm; SQLite's, not a write.
+        .filter(|n| !n.ends_with("-wal") && !n.ends_with("-shm"))
         .collect();
     names.sort();
     names
