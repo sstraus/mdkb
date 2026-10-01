@@ -168,9 +168,7 @@ impl IndexFacade {
             let reusable = self.embeddings_by_text(&changed, root);
 
             // Delete stale entries for changed files
-            for path in &changed {
-                self.delete_by_file(path, root)?;
-            }
+            self.delete_by_files(&changed, root)?;
 
             let mut stats = pipeline::index_files(&changed, root, &self.db, &self.config)?;
             // `index_files` scopes the DISCOVER stage to `changed`, so the pipeline
@@ -268,9 +266,7 @@ impl IndexFacade {
             .into_keys()
             .filter(|rel| !root.join(rel).exists())
             .collect();
-        for rel in &vanished {
-            self.delete_by_rel_path(rel)?;
-        }
+        self.delete_by_rel_paths(vanished.iter().map(String::as_str))?;
         Ok(vanished.len() as u32)
     }
 
@@ -383,28 +379,62 @@ impl IndexFacade {
         self.delete_by_rel_path(&rel_key(file_path, root))
     }
 
+    /// [`Self::delete_by_file`] for several files, with one vector-store rewrite.
+    fn delete_by_files<'a>(
+        &mut self,
+        file_paths: impl IntoIterator<Item = &'a PathBuf>,
+        root: &Path,
+    ) -> anyhow::Result<()> {
+        let keys: Vec<String> = file_paths.into_iter().map(|p| rel_key(p, root)).collect();
+        self.delete_by_rel_paths(keys.iter().map(String::as_str))
+    }
+
     /// Delete an indexed file by the relative path key stored in the database.
     fn delete_by_rel_path(&mut self, rel_path: &str) -> anyhow::Result<()> {
-        // Collect symbol IDs before deleting (for embedding cleanup)
-        let symbol_ids = self.get_symbol_ids_for_path(rel_path);
+        self.delete_by_rel_paths([rel_path])
+    }
 
-        self.db.delete_by_file(rel_path)?;
+    /// Delete several indexed files, removing their vectors in one rewrite.
+    ///
+    /// Removing vectors rewrites the whole `vectors.bin`, so doing it per file
+    /// cost deleted-files x store size: 70 s for 255 files on a 938 MB store.
+    /// The vectors of every file already deleted are removed even when a later
+    /// delete fails, so an error never leaves them orphaned.
+    fn delete_by_rel_paths<'a>(
+        &mut self,
+        rel_paths: impl IntoIterator<Item = &'a str>,
+    ) -> anyhow::Result<()> {
+        let mut symbol_ids = HashSet::new();
+        let mut outcome = Ok(());
+        for rel_path in rel_paths {
+            // Collect symbol IDs before deleting (for embedding cleanup), but
+            // keep them only once the rows are gone: a failed delete leaves the
+            // file indexed, and its vectors must stay with it.
+            let ids = self.get_symbol_ids_for_path(rel_path);
+            if let Err(e) = self.db.delete_by_file(rel_path) {
+                outcome = Err(e.into());
+                break;
+            }
+            symbol_ids.extend(ids);
+        }
 
         // Opening the semantic store costs a file handle, not the embedding
         // model: the model is acquired inside `generate_*`, which a delete never
         // reaches. Skipping the open when it happened not to be warm left the
         // vectors of every deleted file behind — the watcher never warms it.
-        if let Some(semantic) = self.ensure_semantic() {
-            if let Err(e) = semantic.remove_embeddings(&symbol_ids) {
-                tracing::error!(
-                    error = %e,
-                    symbol_count = symbol_ids.len(),
-                    "Failed to remove embeddings for deleted symbols — orphaned embeddings remain in vector store"
-                );
+        if !symbol_ids.is_empty() {
+            if let Some(semantic) = self.ensure_semantic() {
+                if let Err(e) = semantic.remove_embeddings(&symbol_ids) {
+                    tracing::error!(
+                        error = %e,
+                        symbol_count = symbol_ids.len(),
+                        "Failed to remove embeddings for deleted symbols — orphaned embeddings remain in vector store"
+                    );
+                }
             }
         }
 
-        Ok(())
+        outcome
     }
 
     /// Get symbol IDs for all symbols in a file (by relative path key).
@@ -438,9 +468,7 @@ impl IndexFacade {
             .filter(|indexed| !present.contains(indexed))
             .collect();
 
-        for rel_path in &stale {
-            self.delete_by_rel_path(rel_path)?;
-        }
+        self.delete_by_rel_paths(stale.iter().map(String::as_str))?;
 
         if !stale.is_empty() {
             tracing::info!("Pruned {} file(s) deleted from disk", stale.len());
@@ -518,9 +546,7 @@ impl IndexFacade {
         let reusable = self.embeddings_by_text(&changed, root);
 
         // Delete old data for changed and deleted files
-        for path in deleted.iter().chain(changed.iter()) {
-            self.delete_by_file(path, root)?;
-        }
+        self.delete_by_files(deleted.iter().chain(changed.iter()), root)?;
 
         // Re-index changed files
         if changed.is_empty() {
@@ -2405,6 +2431,45 @@ export function snapshot(id: string) {
         );
     }
 
+    /// Pruning files deleted from disk rewrote `vectors.bin` once per file:
+    /// 70 s for 255 files on a 938 MB store. Catches a loop that calls the
+    /// per-file delete again.
+    #[test]
+    fn pruning_many_deleted_files_rewrites_the_vector_store_once() {
+        let src = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..6).map(|i| format!("f{i}.rs")).collect();
+        for (i, name) in names.iter().enumerate() {
+            fs::write(src.path().join(name), format!("pub fn func_{i}() {{}}\n")).unwrap();
+        }
+        fs::write(src.path().join("keep.rs"), "pub fn kept() {}\n").unwrap();
+
+        let db = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src.path()).unwrap();
+        let all: Vec<&str> = names
+            .iter()
+            .map(String::as_str)
+            .chain(["keep.rs"])
+            .collect();
+        let seeded = seed_recognisable_vectors(&facade, &all);
+        let kept_id = facade.db.symbols_for_files(&["keep.rs"]).unwrap()[0]
+            .id
+            .value();
+
+        for name in &names {
+            fs::remove_file(src.path().join(name)).unwrap();
+        }
+        let walk = vec![src.path().join("keep.rs")];
+
+        let before = crate::code::semantic::STORE_REWRITES.with(|n| n.get());
+        assert_eq!(facade.prune_missing_files(src.path(), &walk).unwrap(), 6);
+        let rewrites = crate::code::semantic::STORE_REWRITES.with(|n| n.get()) - before;
+
+        assert_eq!(rewrites, 1, "one rewrite per deleted file");
+        let left = stored_vector_ids(&facade);
+        assert_eq!(left, HashSet::from([kept_id]), "seeded {seeded:?}");
+    }
+
     /// The `mdkb code index` path, which decides what changed by mtime.
     ///
     /// Re-embedding is the whole cost of a reparse: on 177 files of this
@@ -2757,6 +2822,120 @@ export function snapshot(id: string) {
         assert!(
             rows.contains(&("caller".into(), "helper".into(), "Calls".into())),
             "lua call: {rows:?}"
+        );
+    }
+
+    /// Three indexed files with a vector on every symbol; `bad.rs` cannot be
+    /// deleted from the database (a trigger aborts the symbol delete).
+    fn batch_with_an_undeletable_file() -> (tempfile::TempDir, tempfile::TempDir, IndexFacade) {
+        let src = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "bad.rs", "c.rs"] {
+            fs::write(
+                src.path().join(name),
+                format!("pub fn f_{}() {{}}\n", &name[..1]),
+            )
+            .unwrap();
+        }
+        let db = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src.path()).unwrap();
+        seed_recognisable_vectors(&facade, &["a.rs", "bad.rs", "c.rs"]);
+        facade
+            .db
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER refuse_bad BEFORE DELETE ON code_symbols \
+                 WHEN (SELECT path FROM code_files WHERE id = OLD.file_id) = 'bad.rs' \
+                 BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+        for name in ["a.rs", "bad.rs", "c.rs"] {
+            fs::remove_file(src.path().join(name)).unwrap();
+        }
+        (src, db, facade)
+    }
+
+    /// The store holds a vector for exactly the symbols the database still has.
+    fn assert_vectors_match_live_symbols(facade: &IndexFacade) {
+        let live: HashSet<u32> = facade.db.all_symbol_ids().unwrap().into_iter().collect();
+        assert_eq!(stored_vector_ids(facade), live);
+    }
+
+    /// Catches: a delete that fails still queues the file's vectors for removal,
+    /// so the rows stay in the database while their vectors are gone (the file's
+    /// hash is unchanged, so nothing ever re-embeds it).
+    #[test]
+    fn a_failed_delete_keeps_the_vectors_of_the_file_that_stayed() {
+        let (src, _db, mut facade) = batch_with_an_undeletable_file();
+
+        let result = facade.prune_missing_files(src.path(), &[]);
+
+        assert!(result.is_err(), "the refused delete must surface");
+        assert!(
+            !facade.db.symbols_for_files(&["bad.rs"]).unwrap().is_empty(),
+            "bad.rs is still indexed"
+        );
+        assert_vectors_match_live_symbols(&facade);
+    }
+
+    /// Catches: an error mid-batch abandons the vector removal, orphaning the
+    /// vectors of the files already deleted before it.
+    #[test]
+    fn files_deleted_before_a_failure_lose_their_vectors_too() {
+        let (src, _db, mut facade) = batch_with_an_undeletable_file();
+
+        let _ = facade.prune_vanished_files(src.path());
+
+        assert_vectors_match_live_symbols(&facade);
+    }
+
+    /// Catches: the batch applied only to prune; `reindex_files` (the watcher
+    /// path) still rewrote the store once per deleted file.
+    #[test]
+    fn reindex_files_rewrites_the_vector_store_once_for_many_deletions() {
+        let src = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..5).map(|i| format!("f{i}.rs")).collect();
+        for (i, name) in names.iter().enumerate() {
+            fs::write(src.path().join(name), format!("pub fn func_{i}() {{}}\n")).unwrap();
+        }
+        let db = tempfile::tempdir().unwrap();
+        let mut facade = IndexFacade::create(db.path().join("code.sqlite")).unwrap();
+        facade.index_directory(src.path()).unwrap();
+        let all: Vec<&str> = names.iter().map(String::as_str).collect();
+        seed_recognisable_vectors(&facade, &all);
+        let paths: Vec<PathBuf> = names.iter().map(|n| src.path().join(n)).collect();
+        for p in &paths {
+            fs::remove_file(p).unwrap();
+        }
+
+        let before = crate::code::semantic::STORE_REWRITES.with(|n| n.get());
+        facade.reindex_files(src.path(), &paths).unwrap();
+        let rewrites = crate::code::semantic::STORE_REWRITES.with(|n| n.get()) - before;
+
+        assert_eq!(rewrites, 1);
+        assert!(stored_vector_ids(&facade).is_empty());
+    }
+
+    /// Catches: the batch opens or rewrites the vector store when nothing was
+    /// deleted (an empty id set must not cost a rewrite).
+    #[test]
+    fn pruning_nothing_does_not_rewrite_the_vector_store() {
+        let index = seeded_two_file_index();
+        let mut facade = index.facade;
+        let walk = vec![
+            index.src.path().join("lib.rs"),
+            index.src.path().join("other.rs"),
+        ];
+
+        let before = crate::code::semantic::STORE_REWRITES.with(|n| n.get());
+        assert_eq!(
+            facade.prune_missing_files(index.src.path(), &walk).unwrap(),
+            0
+        );
+
+        assert_eq!(
+            crate::code::semantic::STORE_REWRITES.with(|n| n.get()),
+            before
         );
     }
 }
