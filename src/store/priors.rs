@@ -4012,4 +4012,39 @@ mod tests {
         let c = get_cluster(&conn, "clu-a").unwrap().unwrap();
         assert_eq!(c.error_signature.as_deref(), Some("first failure"));
     }
+
+    // --- mutation survivors: score arithmetic, nearest cluster, curation report ---
+
+    fn assert_score(c: &PriorCluster, expected: f64) {
+        let got = cluster_injection_score(c, c.last_seen_at);
+        assert!(
+            (got - expected).abs() < 1e-12,
+            "score {got} != documented {expected}"
+        );
+    }
+
+    // Catches: a wrong recurrence/belief/product formula that still crosses the
+    // 0.3 threshold the same way (`/` -> `%` or `*`, `+` -> `-`, `*` -> `/`).
+    #[test]
+    fn the_score_equals_the_values_the_docstring_publishes() {
+        let mut c = promoted_cluster("clu-score", r#"{"path_glob":"src/**"}"#, 2);
+        // Zero days since last seen, no verdicts: recurrence x 1/2.
+        for (sessions, expected) in [(2, 1.0 / 3.0), (3, 3.0 / 8.0), (7, 7.0 / 16.0)] {
+            c.distinct_sessions = sessions;
+            assert_score(&c, expected);
+        }
+        // One confirmation plus one refutation leaves belief at 2/4.
+        c.confirmed_count = 1;
+        c.refuted_count = 1;
+        for (sessions, expected) in [(2, 1.0 / 3.0), (3, 3.0 / 8.0), (7, 7.0 / 16.0)] {
+            c.distinct_sessions = sessions;
+            assert_score(&c, expected);
+        }
+        // One more refutation: belief 2/5.
+        c.refuted_count = 2;
+        for (sessions, expected) in [(2, 4.0 / 15.0), (3, 3.0 / 10.0), (7, 7.0 / 20.0)] {
+            c.distinct_sessions = sessions;
+            assert_score(&c, expected);
+        }
+    }
 }
