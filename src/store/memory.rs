@@ -6201,7 +6201,10 @@ mod tests {
         assert!(!disputed(1, None, None), "no refutation stamp");
         assert!(disputed(1, Some(100), None), "one dispute, never confirmed");
         assert!(disputed(2, Some(100), None), "two disputes");
-        assert!(!disputed(1, Some(100), Some(100)), "a tie goes to the confirmation");
+        assert!(
+            !disputed(1, Some(100), Some(100)),
+            "a tie goes to the confirmation"
+        );
         assert!(disputed(1, Some(101), Some(100)), "refuted after confirmed");
         assert!(!disputed(1, Some(99), Some(100)), "confirmed after refuted");
     }
@@ -6261,7 +6264,11 @@ mod tests {
         save_conflict_snapshot(&conn, "e1", "# T\nloser body", "file").unwrap();
         let revisions = get_revisions(&conn, "e1").unwrap();
         assert_eq!(revisions.len(), 1);
-        assert!(revisions[0].diff.starts_with("# conflict "), "{}", revisions[0].diff);
+        assert!(
+            revisions[0].diff.starts_with("# conflict "),
+            "{}",
+            revisions[0].diff
+        );
         assert!(
             revisions[0]
                 .diff
@@ -6300,7 +6307,12 @@ mod tests {
         assert_eq!(ids, ["a-live", "b-old"]);
     }
 
-    fn entry_with(id: &str, status: EntryStatus, confirmations: u32, corrections: u32) -> MemoryEntry {
+    fn entry_with(
+        id: &str,
+        status: EntryStatus,
+        confirmations: u32,
+        corrections: u32,
+    ) -> MemoryEntry {
         let mut e = typed_entry(id, &format!("Title {id}"), "Content", EntryType::Topic);
         e.status = status;
         e.confirmations = confirmations;
@@ -6320,11 +6332,20 @@ mod tests {
             (e.confirmations, e.corrections)
         };
 
-        assert_eq!(confirm_entry(&conn, "e", 1).unwrap(), "Confirmed: e (3 confirmations)");
+        assert_eq!(
+            confirm_entry(&conn, "e", 1).unwrap(),
+            "Confirmed: e (3 confirmations)"
+        );
         assert_eq!(counters(&conn), (3, 2));
-        assert_eq!(confirm_entry(&conn, "e", -1).unwrap(), "Refuted: e (3 corrections)");
+        assert_eq!(
+            confirm_entry(&conn, "e", -1).unwrap(),
+            "Refuted: e (3 corrections)"
+        );
         assert_eq!(counters(&conn), (3, 3));
-        assert_eq!(confirm_entry(&conn, "e", 0).unwrap(), "Confirmed: e (3 confirmations)");
+        assert_eq!(
+            confirm_entry(&conn, "e", 0).unwrap(),
+            "Confirmed: e (3 confirmations)"
+        );
         assert_eq!(counters(&conn), (3, 3));
     }
 
@@ -6336,7 +6357,11 @@ mod tests {
     fn only_a_positive_signal_restores_an_archived_entry() {
         let conn = setup_db();
         for id in ["refuted", "neutral", "restored", "plain"] {
-            let status = if id == "plain" { EntryStatus::Active } else { EntryStatus::Archived };
+            let status = if id == "plain" {
+                EntryStatus::Active
+            } else {
+                EntryStatus::Archived
+            };
             add_entry(&conn, &entry_with(id, status, 0, 0)).unwrap();
         }
         let state = |id: &str| {
@@ -6345,14 +6370,27 @@ mod tests {
         };
         let before = Utc::now().timestamp();
 
-        assert_eq!(confirm_entry(&conn, "refuted", -1).unwrap(), "Refuted: refuted (1 corrections)");
+        assert_eq!(
+            confirm_entry(&conn, "refuted", -1).unwrap(),
+            "Refuted: refuted (1 corrections)"
+        );
         assert_eq!(state("refuted"), (EntryStatus::Archived, 1000));
 
-        assert_eq!(confirm_entry(&conn, "neutral", 0).unwrap(), "Confirmed: neutral (0 confirmations)");
+        assert_eq!(
+            confirm_entry(&conn, "neutral", 0).unwrap(),
+            "Confirmed: neutral (0 confirmations)"
+        );
         assert_eq!(state("neutral"), (EntryStatus::Archived, 1000));
 
-        assert_eq!(confirm_entry(&conn, "plain", 1).unwrap(), "Confirmed: plain (1 confirmations)");
-        assert_eq!(state("plain"), (EntryStatus::Active, 1000), "counters never move updated_at");
+        assert_eq!(
+            confirm_entry(&conn, "plain", 1).unwrap(),
+            "Confirmed: plain (1 confirmations)"
+        );
+        assert_eq!(
+            state("plain"),
+            (EntryStatus::Active, 1000),
+            "counters never move updated_at"
+        );
 
         assert_eq!(
             confirm_entry(&conn, "restored", 1).unwrap(),
@@ -6360,7 +6398,10 @@ mod tests {
         );
         let (status, updated_at) = state("restored");
         assert_eq!(status, EntryStatus::Active);
-        assert!(updated_at >= before, "a status change is a projected change: {updated_at}");
+        assert!(
+            updated_at >= before,
+            "a status change is a projected change: {updated_at}"
+        );
     }
 
     /// Catches: the correction size limit doubled (`/` as `*`) or moved by one
@@ -6372,8 +6413,13 @@ mod tests {
         let half = MAX_CONTENT_SIZE / 2;
 
         let too_long = "x".repeat(half + 1);
-        let err = correct_entry(&conn, "e", Some(&too_long)).unwrap_err().to_string();
-        assert!(err.contains(&format!("Correction text exceeds {half} bytes")), "{err}");
+        let err = correct_entry(&conn, "e", Some(&too_long))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains(&format!("Correction text exceeds {half} bytes")),
+            "{err}"
+        );
 
         let at_limit = "x".repeat(half);
         assert_eq!(
@@ -6466,11 +6512,26 @@ mod tests {
     fn access_recency_is_a_log_count_halving_per_half_life() {
         let now = 1_000_000;
         let ln4 = 4.0_f64.ln();
-        assert_eq!(access_recency_score(0, Some(now), now, 100), 0.0, "never accessed");
+        assert_eq!(
+            access_recency_score(0, Some(now), now, 100),
+            0.0,
+            "never accessed"
+        );
         assert_eq!(access_recency_score(5, None, now, 100), 0.0, "no timestamp");
-        assert_eq!(access_recency_score(5, Some(now - 100), now, -10), 0.0, "negative half-life");
-        assert_eq!(access_recency_score(5, Some(now - 100), now, 0), 0.0, "zero half-life");
-        assert!((access_recency_score(3, Some(now), now, 100) - ln4).abs() < 1e-12, "just now");
+        assert_eq!(
+            access_recency_score(5, Some(now - 100), now, -10),
+            0.0,
+            "negative half-life"
+        );
+        assert_eq!(
+            access_recency_score(5, Some(now - 100), now, 0),
+            0.0,
+            "zero half-life"
+        );
+        assert!(
+            (access_recency_score(3, Some(now), now, 100) - ln4).abs() < 1e-12,
+            "just now"
+        );
         assert!(
             (access_recency_score(3, Some(now - 100), now, 100) - ln4 * 0.5).abs() < 1e-12,
             "one half-life ago"
@@ -6485,7 +6546,12 @@ mod tests {
     /// second.
     fn alpha_pair() -> (MemoryEntry, MemoryEntry) {
         (
-            typed_entry("first", "alpha alpha alpha alpha", "alpha", EntryType::Topic),
+            typed_entry(
+                "first",
+                "alpha alpha alpha alpha",
+                "alpha",
+                EntryType::Topic,
+            ),
             typed_entry(
                 "second",
                 "Other note",
@@ -6556,7 +6622,11 @@ mod tests {
                 .map(|r| r.entry.id)
                 .collect()
         };
-        assert_eq!(order(0.2), ["second", "first"], "the bonus outweighs one rank");
+        assert_eq!(
+            order(0.2),
+            ["second", "first"],
+            "the bonus outweighs one rank"
+        );
         assert_eq!(order(0.0), ["first", "second"], "no bonus without weight");
     }
 
@@ -6573,7 +6643,12 @@ mod tests {
         .unwrap();
         add_entry(
             &conn,
-            &typed_entry("strong", "PKCE note", "the code_verifier is kept", EntryType::Topic),
+            &typed_entry(
+                "strong",
+                "PKCE note",
+                "the code_verifier is kept",
+                EntryType::Topic,
+            ),
         )
         .unwrap();
         let ids = |query: &str, floor: f32| -> Vec<String> {
@@ -6589,7 +6664,10 @@ mod tests {
         };
 
         assert_eq!(ids("alpha", 0.0), ["weak"], "floor off: every BM25 hit");
-        assert!(ids("alpha", 0.5).is_empty(), "floor on: one common word is not evidence");
+        assert!(
+            ids("alpha", 0.5).is_empty(),
+            "floor on: one common word is not evidence"
+        );
         assert_eq!(ids("code_verifier", 0.5), ["strong"], "an identifier is");
     }
 
@@ -6600,8 +6678,14 @@ mod tests {
     fn the_vector_leg_fetches_twice_the_limit() {
         let conn = setup_db_with_vectors();
         let (leader, runner_up) = alpha_pair();
-        let leader = MemoryEntry { id: "y".into(), ..leader };
-        let runner_up = MemoryEntry { id: "x".into(), ..runner_up };
+        let leader = MemoryEntry {
+            id: "y".into(),
+            ..leader
+        };
+        let runner_up = MemoryEntry {
+            id: "x".into(),
+            ..runner_up
+        };
         add_entry(&conn, &leader).unwrap();
         add_with_embedding(&conn, &runner_up, &test_embedding(0.32));
         for (id, seed) in [("z", 0.30), ("w", 0.31)] {
@@ -6612,9 +6696,15 @@ mod tests {
             );
         }
 
-        let results =
-            search_entries_recall(&conn, "alpha", Some(&test_embedding(0.30)), 1, None, &ungated(0.0))
-                .unwrap();
+        let results = search_entries_recall(
+            &conn,
+            "alpha",
+            Some(&test_embedding(0.30)),
+            1,
+            None,
+            &ungated(0.0),
+        )
+        .unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "y");
@@ -6628,12 +6718,22 @@ mod tests {
         let conn = setup_db_with_vectors();
         add_with_embedding(&conn, &alpha_pair().0, &test_embedding(0.30));
 
-        let results =
-            search_entries_recall(&conn, "alpha", Some(&test_embedding(0.30)), 1, None, &ungated(0.0))
-                .unwrap();
+        let results = search_entries_recall(
+            &conn,
+            "alpha",
+            Some(&test_embedding(0.30)),
+            1,
+            None,
+            &ungated(0.0),
+        )
+        .unwrap();
 
         assert_eq!(results.len(), 1);
-        assert!(results[0].distance.is_some_and(|d| d < 1e-3), "{:?}", results[0].distance);
+        assert!(
+            results[0].distance.is_some_and(|d| d < 1e-3),
+            "{:?}",
+            results[0].distance
+        );
     }
 
     /// Catches: a window that comes back short not ending the duplicate search

@@ -1846,7 +1846,10 @@ mod tests {
         let logs = captured_logs(|| salvage = salvage_memory(&fresh, &corrupt));
 
         assert_eq!(salvage.entries, 1, "only m1 was inserted");
-        assert!(!salvage.complete, "m0 was skipped, so the salvage is partial");
+        assert!(
+            !salvage.complete,
+            "m0 was skipped, so the salvage is partial"
+        );
         assert!(
             logs.contains("1 of 2 rows in memory_entries were NOT recovered"),
             "{logs}"
@@ -1956,7 +1959,10 @@ mod tests {
     #[test]
     fn a_quarantine_name_needs_a_nonempty_numeric_timestamp() {
         assert_eq!(quarantine_suffix("index.sqlite.corrupt-17"), Some("17"));
-        assert_eq!(quarantine_suffix("index.sqlite.corrupt-17-2-wal"), Some("17"));
+        assert_eq!(
+            quarantine_suffix("index.sqlite.corrupt-17-2-wal"),
+            Some("17")
+        );
         assert_eq!(quarantine_suffix("index.sqlite.corrupt-"), None);
         assert_eq!(quarantine_suffix("index.sqlite.corrupt--5"), None);
         assert_eq!(quarantine_suffix("index.sqlite.corrupt-abc"), None);

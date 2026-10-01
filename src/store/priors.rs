@@ -4206,7 +4206,10 @@ mod tests {
 
         integrate_distilled(&conn, &d, "sess-1", 1000, None, Some("   ")).unwrap();
         assert_eq!(
-            get_cluster(&conn, &cluster_id).unwrap().unwrap().error_signature,
+            get_cluster(&conn, &cluster_id)
+                .unwrap()
+                .unwrap()
+                .error_signature,
             None
         );
 
