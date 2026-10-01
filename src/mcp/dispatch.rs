@@ -16072,4 +16072,91 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
     }
+
+    /// Catches (#209-bc4b): the real fallback (a read-only open that fails on a
+    /// stale schema, so the hook waits for the slot) running outside the hook's
+    /// deadline: the stall seam never exercises it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn critic_prompt_whose_bypass_cannot_open_still_meets_its_deadline() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.user_prompt_submit_deadline_ms = 300;
+        });
+        seed_memory_entry(&handle, "stale-mem").await;
+        let (release, held) = critic_hold_slot(
+            &handle,
+            |ctx| {
+                ctx.conn
+                    .execute_batch("UPDATE schema_version SET version = 1;")
+                    .unwrap()
+            },
+            |ctx| {
+                ctx.conn
+                    .execute_batch(&format!(
+                        "UPDATE schema_version SET version = {};",
+                        crate::store::schema::SCHEMA_VERSION
+                    ))
+                    .unwrap()
+            },
+        )
+        .await;
+        let t0 = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_hook(&handle, &make_dctx(), "stale-schema"),
+        )
+        .await;
+        let waited = t0.elapsed();
+        release.send(()).unwrap();
+        held.await.unwrap();
+        out.expect("the prompt outlived its deadline waiting for the slot");
+        assert!(waited < std::time::Duration::from_secs(2), "{waited:?}");
+    }
+
+    /// Catches (#209-bc4b): queued telemetry coalesced or dropped when several
+    /// prompts queue behind one holder: each prompt's query event must land.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn critic_every_query_event_queued_behind_one_reindex_lands() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.telemetry.query_events = true;
+        });
+        seed_memory_entry(&handle, "multi-mem").await;
+        let (release, held) = critic_hold_slot(&handle, |_| {}, |_| {}).await;
+        for n in 0..3 {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                hook_user_prompt_submit_impl(
+                    &handle,
+                    &format!("what do we know about the recall_gate_fixture topic number{n}"),
+                ),
+            )
+            .await
+            .expect("a prompt waited for the mutation");
+        }
+        release.send(()).unwrap();
+        held.await.unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let rows: i64 = {
+                let guard = handle.ctx.lock().await;
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .conn
+                    .query_row("SELECT COUNT(*) FROM query_events", [], |r| r.get(0))
+                    .unwrap()
+            };
+            if rows == 3 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{rows} of 3 queued query events landed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 }
