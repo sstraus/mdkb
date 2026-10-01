@@ -197,7 +197,11 @@ impl DaemonConfig {
             .ignore
             .iter()
             .filter_map(|entry| {
-                let expanded = match entry.as_str() {
+                // Trailing whitespace is a typo that would silently match
+                // nothing; leading whitespace makes the entry relative, which
+                // is dropped below.
+                let entry = entry.trim_end();
+                let expanded = match entry {
                     "~" => home_dir().ok(),
                     e if e.starts_with("~/") => home_dir().ok().map(|h| h.join(&e[2..])),
                     e if e.trim().is_empty() => None,
@@ -206,7 +210,7 @@ impl DaemonConfig {
                 match expanded.filter(|p| p.is_absolute()) {
                     Some(path) => Some(crate::domain::canonicalize_plain(&path).unwrap_or(path)),
                     None => {
-                        dropped.push(entry.as_str());
+                        dropped.push(entry);
                         None
                     }
                 }

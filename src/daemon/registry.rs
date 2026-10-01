@@ -307,6 +307,9 @@ pub struct RepoRegistry {
     handles: DashMap<PathBuf, Arc<RepoHandle>>,
     max_active: usize,
     daemon_config: DaemonConfig,
+    /// `daemon_config.ignore`, validated once: a bad entry is reported when the
+    /// registry is built, not on every discovery call.
+    ignored: Vec<PathBuf>,
     /// Every repo this daemon has ever opened, persisted across restarts.
     /// Deliberately not `handles`: that one is capped at `max_active` and
     /// starts empty in every process.
@@ -348,10 +351,12 @@ impl RepoRegistry {
     pub fn new(config: DaemonConfig) -> Self {
         let max_active = config.max_active_repos;
         let repo_map = RepoMap::open(config.repo_map_path(), &config.repos);
+        let ignored = config.ignored_paths();
         Self {
             handles: DashMap::new(),
             max_active,
             daemon_config: config,
+            ignored,
             repo_map,
             open_gate: std::sync::Mutex::new(()),
             discovery: std::sync::Mutex::new(None),
@@ -492,9 +497,8 @@ impl RepoRegistry {
 
     /// Drop the roots `daemon.toml` says to ignore.
     pub fn retain_unignored(&self, roots: &mut std::collections::BTreeSet<PathBuf>) {
-        let ignore = self.daemon_config.ignored_paths();
-        if !ignore.is_empty() {
-            roots.retain(|root| !super::repo_map::is_ignored(root, &ignore));
+        if !self.ignored.is_empty() {
+            roots.retain(|root| !super::repo_map::is_ignored(root, &self.ignored));
         }
     }
 
@@ -519,9 +523,8 @@ impl RepoRegistry {
     /// twice, exactly as before; the last one to finish wins the slot.
     fn walk_for(&self, walk: &[PathBuf]) -> Vec<PathBuf> {
         let ttl = std::time::Duration::from_secs(self.daemon_config.discovery_cache_secs);
-        let ignore = self.daemon_config.ignored_paths();
         if ttl.is_zero() {
-            return super::repo_map::discover_nested_stores(walk, &ignore)
+            return super::repo_map::discover_nested_stores(walk, &self.ignored)
                 .into_iter()
                 .collect();
         }
@@ -535,7 +538,7 @@ impl RepoRegistry {
         {
             return hit.roots.clone();
         }
-        let roots: Vec<PathBuf> = super::repo_map::discover_nested_stores(walk, &ignore)
+        let roots: Vec<PathBuf> = super::repo_map::discover_nested_stores(walk, &self.ignored)
             .into_iter()
             .collect();
         *self.discovery.lock().unwrap_or_else(|e| e.into_inner()) = Some(Discovery {
