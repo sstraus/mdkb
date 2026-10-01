@@ -1691,6 +1691,355 @@ mod tests {
         assert!(quarantine_reports(dir.path()).is_empty());
     }
 
+    /// A database `quick_check` flags with a row (not an `Err`): a CHECK
+    /// constraint broken behind the constraint's back.
+    fn make_check_violating_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             CREATE TABLE t (n INTEGER CHECK (n > 0));
+             PRAGMA ignore_check_constraints = ON;
+             INSERT INTO t VALUES (-1);",
+        )
+        .unwrap();
+    }
+
+    /// A quarantined file holding every salvaged table, with counts that differ
+    /// per table so a row counted into the wrong field shows.
+    /// 2 entries, 1 edge, 3 revisions, 2 collections, 2 clusters, 1 candidate.
+    fn make_full_salvage_db(path: &Path) {
+        make_memory_db(path);
+        let conn = Connection::open(path).unwrap();
+        for i in 0..3 {
+            conn.execute(
+                "INSERT INTO memory_revisions (memory_id, diff, created_at) VALUES ('m0', ?1, 1)",
+                params![format!("diff {i}")],
+            )
+            .unwrap();
+        }
+        for name in ["docs", "notes"] {
+            conn.execute(
+                "INSERT INTO collections (name, path, created_at, updated_at)
+                 VALUES (?1, '/x', 1, 1)",
+                params![name],
+            )
+            .unwrap();
+        }
+        for id in ["c0", "c1"] {
+            conn.execute(
+                "INSERT INTO prior_clusters
+                     (id, canonical_trigger_key, trigger_kind, trigger_matcher, lesson, scope,
+                      created_at, last_seen_at)
+                 VALUES (?1, ?1, 'prompt', '{}', 'lesson', '{}', 1, 1)",
+                params![id],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO prior_candidates
+                 (id, cluster_id, trigger_kind, trigger_matcher, lesson, scope, created_at)
+             VALUES ('k0', 'c0', 'prompt', '{}', 'lesson', '{}', 1)",
+            [],
+        )
+        .unwrap();
+    }
+
+    fn fresh_store(dir: &Path) -> Connection {
+        let fresh = Connection::open(dir.join("index.sqlite")).unwrap();
+        crate::store::schema::init_schema(&fresh).unwrap();
+        fresh
+    }
+
+    /// Catches: a table's rows counted into another table's field (the
+    /// revisions or collections arm dropped into the `priors` catch-all), a
+    /// prior total that multiplies or subtracts instead of adding clusters and
+    /// candidates, and a complete salvage that logs a loss.
+    #[test]
+    fn salvage_counts_each_table_under_its_own_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-11");
+        make_full_salvage_db(&corrupt);
+        let fresh = fresh_store(dir.path());
+
+        let mut salvage = Salvage::default();
+        let logs = captured_logs(|| salvage = salvage_memory(&fresh, &corrupt));
+
+        assert_eq!(
+            salvage,
+            Salvage {
+                entries: 2,
+                edges: 1,
+                collections: 2,
+                revisions: 3,
+                priors: 3,
+                complete: true,
+            }
+        );
+        assert!(
+            logs.contains("salvaged collection registrations"),
+            "salvaged collections must be announced: {logs}"
+        );
+        assert!(
+            !logs.contains("NOT recovered"),
+            "a whole salvage must not log a loss: {logs}"
+        );
+    }
+
+    /// Catches: a salvage with no collections still telling the operator to
+    /// re-index their documents.
+    #[test]
+    fn no_collections_salvaged_means_no_reindex_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-12");
+        make_memory_db(&corrupt);
+        let fresh = fresh_store(dir.path());
+
+        let logs = captured_logs(|| {
+            salvage_memory(&fresh, &corrupt);
+        });
+        assert!(
+            !logs.contains("salvaged collection registrations"),
+            "{logs}"
+        );
+    }
+
+    /// Catches: `complete` becoming true when one table could not be read
+    /// (`&=` turned `|=`), for a table of the main loop and for the trailing
+    /// candidates table.
+    #[test]
+    fn one_unreadable_table_makes_the_whole_salvage_incomplete() {
+        for dropped in ["collections", "prior_candidates"] {
+            let dir = tempfile::tempdir().unwrap();
+            let corrupt = dir.path().join("index.sqlite.corrupt-13");
+            make_full_salvage_db(&corrupt);
+            Connection::open(&corrupt)
+                .unwrap()
+                .execute(&format!("DROP TABLE {dropped}"), [])
+                .unwrap();
+            let fresh = fresh_store(dir.path());
+
+            let mut salvage = Salvage::default();
+            captured_logs(|| salvage = salvage_memory(&fresh, &corrupt));
+
+            assert!(!salvage.complete, "{dropped} is gone: salvage is partial");
+            assert_eq!(salvage.entries, 2, "the other tables still come across");
+        }
+    }
+
+    /// Catches: a salvage that skipped rows (the destination already held the
+    /// id) reported as whole, and a loss log that miscounts the skipped rows.
+    #[test]
+    fn rows_the_destination_already_holds_are_reported_as_not_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-14");
+        make_memory_db(&corrupt);
+        let fresh = fresh_store(dir.path());
+        fresh
+            .execute(
+                "INSERT INTO memory_entries (id, title, content, entry_type, created_at, updated_at)
+                 VALUES ('m0', 'kept', 'body', 'topic', 1, 1)",
+                [],
+            )
+            .unwrap();
+
+        let mut salvage = Salvage::default();
+        let logs = captured_logs(|| salvage = salvage_memory(&fresh, &corrupt));
+
+        assert_eq!(salvage.entries, 1, "only m1 was inserted");
+        assert!(!salvage.complete, "m0 was skipped, so the salvage is partial");
+        assert!(
+            logs.contains("1 of 2 rows in memory_entries were NOT recovered"),
+            "{logs}"
+        );
+    }
+
+    /// Catches: the defaulted-column notice logged when no column is missing,
+    /// or naming the wrong columns.
+    #[test]
+    fn a_column_missing_from_the_quarantine_is_named_and_a_full_match_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-15");
+        let corrupt_conn = Connection::open(&corrupt).unwrap();
+        crate::store::schema::init_schema(&corrupt_conn).unwrap();
+        corrupt_conn
+            .execute("ALTER TABLE memory_entries DROP COLUMN confirmations", [])
+            .unwrap();
+        insert_full_entry(&corrupt_conn);
+        drop(corrupt_conn);
+        let fresh = fresh_store(dir.path());
+        let logs = captured_logs(|| {
+            salvage_memory(&fresh, &corrupt);
+        });
+        assert!(
+            logs.contains(
+                "column(s) confirmations are absent from the quarantined store — all 1 salvaged row(s) take the schema default"
+            ),
+            "{logs}"
+        );
+
+        let matching_dir = tempfile::tempdir().unwrap();
+        let matching = matching_dir.path().join("index.sqlite.corrupt-16");
+        make_memory_db(&matching);
+        let fresh = fresh_store(matching_dir.path());
+        let logs = captured_logs(|| {
+            salvage_memory(&fresh, &matching);
+        });
+        assert!(!logs.contains("schema default"), "{logs}");
+        assert!(!logs.contains("DROPPED"), "{logs}");
+    }
+
+    /// Catches: `quick_check` rows that are not `ok` classified as sound (the
+    /// guard always true), which would certify a damaged index.
+    #[test]
+    fn a_quick_check_row_other_than_ok_is_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_check_violating_db(&db);
+        let conn = Connection::open(&db).unwrap();
+
+        match is_structurally_sound(&conn) {
+            Soundness::Corrupt { reason } => {
+                assert!(reason.contains("CHECK constraint failed"), "{reason}")
+            }
+            other => panic!("a broken CHECK must be corrupt, got {other:?}"),
+        }
+    }
+
+    /// Catches: the quick_check rows dropped or inverted: a healthy file
+    /// recorded as damaged (`ok` kept), a damaged one recorded as clean.
+    #[test]
+    fn diagnose_keeps_damage_rows_and_drops_ok() {
+        let dir = tempfile::tempdir().unwrap();
+        let healthy = dir.path().join("index.sqlite.corrupt-1");
+        make_db(&healthy);
+        assert!(diagnose(&healthy).quick_check.is_empty());
+
+        let damaged = dir.path().join("index.sqlite.corrupt-2");
+        make_check_violating_db(&damaged);
+        let rows = diagnose(&damaged).quick_check;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("CHECK constraint failed"), "{rows:?}");
+    }
+
+    /// Catches: the size of the database or of its WAL left out of the report.
+    #[test]
+    fn diagnose_measures_the_database_and_its_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-1");
+        std::fs::write(&corrupt, [0u8; 10]).unwrap();
+        std::fs::write(with_suffix(&corrupt, "-wal"), [0u8; 7]).unwrap();
+        let diagnosis = diagnose(&corrupt);
+        assert_eq!(diagnosis.db_bytes, 10);
+        assert_eq!(diagnosis.wal_bytes, 7);
+    }
+
+    /// Catches: the "damaged these tables" error raised for a file that
+    /// damaged none (the emptiness test inverted).
+    #[test]
+    fn a_report_for_an_undamaged_file_logs_no_damaged_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-3");
+        make_db(&corrupt);
+        let logs = captured_logs(|| write_report(&corrupt, Salvage::default()));
+        assert!(!logs.contains("damaged these tables"), "{logs}");
+    }
+
+    /// Catches: a sidecar that cannot be parsed hiding which file it is for.
+    #[test]
+    fn an_unreadable_report_still_names_the_quarantined_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let corrupt = dir.path().join("index.sqlite.corrupt-42");
+        std::fs::write(&corrupt, b"x").unwrap();
+        std::fs::write(report_path(&corrupt), b"{ not json").unwrap();
+        let reports = quarantine_reports(dir.path());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].corrupt_file, "index.sqlite.corrupt-42");
+        assert_eq!(reports[0].quarantined_at, 42);
+    }
+
+    /// Catches: an empty or non-numeric timestamp accepted as a quarantine
+    /// name (`&&` turned `||`), which would let the sweep delete it.
+    #[test]
+    fn a_quarantine_name_needs_a_nonempty_numeric_timestamp() {
+        assert_eq!(quarantine_suffix("index.sqlite.corrupt-17"), Some("17"));
+        assert_eq!(quarantine_suffix("index.sqlite.corrupt-17-2-wal"), Some("17"));
+        assert_eq!(quarantine_suffix("index.sqlite.corrupt-"), None);
+        assert_eq!(quarantine_suffix("index.sqlite.corrupt--5"), None);
+        assert_eq!(quarantine_suffix("index.sqlite.corrupt-abc"), None);
+    }
+
+    /// Catches: a Unix file name containing `\` rewritten to `/`, which names
+    /// a different file.
+    #[cfg(unix)]
+    #[test]
+    fn a_backslash_in_a_unix_path_is_kept() {
+        assert_eq!(
+            immutable_uri(Path::new("/tmp/a\\b/index.sqlite")),
+            "file:/tmp/a\\b/index.sqlite?immutable=1"
+        );
+    }
+
+    /// Catches: a marker exactly one interval old still certifying the file
+    /// (`<` turned `<=`).
+    #[test]
+    fn a_marker_exactly_one_interval_old_no_longer_certifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let marker = marker_path(&db);
+        let file = std::fs::File::create(&marker).unwrap();
+        file.set_modified(SystemTime::now() - Duration::from_secs(100_000))
+            .unwrap();
+        drop(file);
+        let mtime = std::fs::metadata(&marker).unwrap().modified().unwrap();
+        let interval = Duration::from_secs(3600);
+
+        assert!(!checked_recently(&db, &marker, interval, mtime + interval));
+        assert!(checked_recently(
+            &db,
+            &marker,
+            interval,
+            mtime + interval - Duration::from_secs(1)
+        ));
+    }
+
+    /// Catches: `invalidate_marker` that does nothing, leaving the stale
+    /// marker to suppress the next integrity probe.
+    #[test]
+    fn invalidating_removes_the_marker_and_announces_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        touch_marker(&marker_path(&db));
+        let before = invalidations(&db);
+
+        invalidate_marker(&db);
+
+        assert!(!marker_path(&db).exists());
+        assert_eq!(invalidations(&db), before + 1);
+    }
+
+    /// The one warning per sweep names the copy itself, not its `-wal`.
+    #[test]
+    fn an_expired_unsalvaged_copy_is_warned_about_once_by_its_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (corrupt, now) =
+            quarantine_aged_with(dir.path(), QUARANTINE_RETENTION.as_secs() as i64 + 1, false);
+        let name = corrupt.file_name().unwrap().to_string_lossy().into_owned();
+
+        let logs = captured_logs(|| {
+            sweep_expired_quarantines_at(dir.path(), QUARANTINE_RETENTION, now);
+        });
+
+        assert!(
+            logs.contains(&format!("quarantine {name} is past its retention")),
+            "the copy must be named in the warning: {logs}"
+        );
+        assert_eq!(
+            logs.matches("is past its retention").count(),
+            1,
+            "the -wal sibling must not warn again: {logs}"
+        );
+    }
+
     /// Lay down a quarantined copy stamped `age` seconds ago, with the `-wal`
     /// and `.report.json` siblings a real quarantine leaves beside it. Returns
     /// the `now` the sweep must be given.
