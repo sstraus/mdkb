@@ -713,9 +713,8 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             // so a long-lived process that did it would stay demoted. See
             // `llm::lower_process_priority` and the layering test that keeps
             // it out of the daemon.
-            let nice = mdkb::config::Config::load_or_default(&ctx.config_path)
-                .search
-                .embed_nice;
+            let config = mdkb::config::Config::load_or_default(&ctx.config_path);
+            let nice = config.search.embed_nice;
             if let Some(applied) = mdkb::llm::lower_process_priority(nice) {
                 eprintln!(
                     "mdkb: embedding at nice {applied} — it takes every idle core and \
@@ -724,6 +723,8 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
             }
             let result = handle_embed(&ctx, collection.as_deref())?;
             format_embed_result(&result, cli.format);
+            // After the embedding, so an offline machine still gets its vectors.
+            mdkb::core::ops::fetch_reranker_weights(&config.hooks)?;
         }
         Command::Serve {
             http,

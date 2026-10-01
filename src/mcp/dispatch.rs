@@ -38,6 +38,7 @@ use crate::store::memory_graph::{self, MemoryRelation, TargetKind};
 use crate::store::{collections, documents, evolution, memory, search, stats};
 
 use super::mcp_error;
+use super::recall_rerank;
 /// Pick the JSON-RPC code a store error must travel under.
 ///
 /// `INTERNAL_ERROR` is the daemon's post-dispatch code: it tells the CLI that a
@@ -4362,16 +4363,42 @@ fn fit_warmup_lines(lines: &[String], budget: usize) -> Vec<String> {
 /// where it stopped.
 #[derive(Debug)]
 pub struct PhaseTimings {
+    started: std::time::Instant,
     last: std::time::Instant,
     phases: Vec<(&'static str, u64)>,
+    /// What a phase decided, where a duration alone does not say it: the
+    /// reranker's `rerank_outcome`. Written into the same object as the
+    /// durations, so a cut run keeps the last note it made.
+    notes: Vec<(&'static str, &'static str)>,
 }
 
 impl PhaseTimings {
     fn new() -> Self {
+        let now = std::time::Instant::now();
         Self {
-            last: std::time::Instant::now(),
+            started: now,
+            last: now,
             phases: Vec::new(),
+            notes: Vec::new(),
         }
+    }
+
+    /// Milliseconds since the run began: what a phase that has a budget of its
+    /// own measures that budget against.
+    fn elapsed_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Record `value` under `key`, replacing an earlier note of the same key.
+    fn note(&mut self, key: &'static str, value: &'static str) {
+        match self.notes.iter_mut().find(|(k, _)| *k == key) {
+            Some(slot) => slot.1 = value,
+            None => self.notes.push((key, value)),
+        }
+    }
+
+    fn note_of(&self, key: &str) -> Option<&'static str> {
+        self.notes.iter().find(|(k, _)| *k == key).map(|(_, v)| *v)
     }
 
     /// Close the running segment and name it.
@@ -4385,13 +4412,18 @@ impl PhaseTimings {
     /// The split as a JSON object, or `None` when nothing was marked — a hook
     /// with no phases must not write an empty object into every row.
     fn as_json(&self) -> Option<Value> {
-        if self.phases.is_empty() {
+        if self.phases.is_empty() && self.notes.is_empty() {
             return None;
         }
         Some(Value::Object(
             self.phases
                 .iter()
                 .map(|(name, ms)| ((*name).to_string(), json!(ms)))
+                .chain(
+                    self.notes
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), json!(value))),
+                )
                 .collect(),
         ))
     }
@@ -4906,6 +4938,9 @@ pub struct ShadowRecall {
     related: usize,
     top_cosine: Option<f64>,
     floor: f32,
+    /// What the rerank step did (`phases.rerank_outcome` of a fired row), which
+    /// a shadow row has no `phases` to carry.
+    rerank: Option<&'static str>,
 }
 
 impl ShadowRecall {
@@ -4917,6 +4952,7 @@ impl ShadowRecall {
             "related": self.related,
             "top_cosine": self.top_cosine,
             "floor": self.floor,
+            "rerank": self.rerank,
         })
     }
 }
@@ -5044,6 +5080,9 @@ async fn hook_user_prompt_submit_impl_timed(
     let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
     let mut top_cosine: Option<f64> = None;
     let mut query_embedding: Option<Vec<f32>> = None;
+    // A `*` prompt asked for its answer and keeps the lower cosine floor; the
+    // reranker is for the prompts nobody asked to enrich.
+    let rerank_wanted = mode != RecallMode::Sigil && recall_rerank::enabled_for(cfg, prompt);
     if let Some(ref q) = fts_query {
         if ensure_handle_context(handle).await.is_err() {
             return json!({});
@@ -5069,6 +5108,10 @@ async fn hook_user_prompt_submit_impl_timed(
         let root = handle.root.clone();
         let telemetry = handle.config.telemetry.clone();
         let search_cfg_owned = search_cfg.clone();
+        let rerank_pool_cfg = crate::config::SearchMemoryConfig {
+            min_recall_cosine: 0.0,
+            ..search_cfg.clone()
+        };
         let mut ctx_guard = ctx_arc.lock_owned().await;
         phases.mark("lock_wait");
         let leg = tokio::task::spawn_blocking(move || {
@@ -5198,9 +5241,32 @@ async fn hook_user_prompt_submit_impl_timed(
                     None => {}
                 }
             }
-            Some((scored_results, observed, doc_hits))
+            // The reranker's candidates: the top of the same hybrid search with
+            // the cosine gate off, because that gate is what it replaces. The
+            // MiniLM-gated `scored_results` stay as the fallback.
+            let mut rerank_pool: Vec<memory::ScoredMemoryEntry> = Vec::new();
+            if rerank_wanted {
+                match crate::core::run_guarded_read(&mut ctx_guard, "hook rerank pool", |ctx| {
+                    memory::search_entries_hybrid_fts(
+                        &ctx.conn,
+                        &q,
+                        &prompt,
+                        query_embedding.as_deref(),
+                        recall_rerank::RERANK_POOL_SIZE,
+                        None,
+                        &rerank_pool_cfg,
+                    )
+                }) {
+                    Some(Ok(entries)) => rerank_pool = entries,
+                    Some(Err(error)) => tracing::debug!("recall rerank pool failed: {error}"),
+                    None => {}
+                }
+            }
+            Some((scored_results, observed, doc_hits, rerank_pool))
         });
-        let Ok(Some((mut scored_results, observed_hits, doc_hits_found))) = leg.await else {
+        let Ok(Some((mut scored_results, observed_hits, doc_hits_found, mut rerank_pool))) =
+            leg.await
+        else {
             return json!({});
         };
         observed = observed_hits;
@@ -5217,14 +5283,17 @@ async fn hook_user_prompt_submit_impl_timed(
             };
             scored_results.retain(not_handoff);
             observed.retain(not_handoff);
+            rerank_pool.retain(not_handoff);
         }
 
         // prior-specific gate: only high-confidence priors surface
         let now = chrono::Utc::now().timestamp();
-        scored_results.retain(|e| {
+        let prior_gate = |e: &memory::ScoredMemoryEntry| {
             e.entry_type != crate::store::memory::EntryType::Prior
                 || e.confidence_at(now) >= PRIOR_CONFIDENCE_GATE
-        });
+        };
+        scored_results.retain(prior_gate);
+        rerank_pool.retain(prior_gate);
         // The best absolute score in the result, read before `injectable` drops
         // it. `score` cannot stand in: it is max-normalized, so the top hit is
         // 1.0 for every prompt including the ones nothing in the store answers.
@@ -5234,6 +5303,31 @@ async fn hook_user_prompt_submit_impl_timed(
             .map(crate::store::hybrid::cosine_from_distance)
             .max_by(f64::total_cmp);
         results = injectable(scored_results);
+
+        if !rerank_wanted {
+            if mode != RecallMode::Sigil {
+                phases.note("rerank_outcome", "off");
+            }
+        } else if rerank_pool.is_empty() {
+            phases.note("rerank_outcome", "no_candidates");
+        } else {
+            // Named before the await, so a run the hook deadline cuts inside
+            // the reranker says where it was.
+            phases.note("rerank_outcome", "cut");
+            let stage = recall_rerank::rerank_stage(
+                &handle.reranker,
+                cfg,
+                prompt,
+                injectable(rerank_pool),
+                recall_rerank::rerank_budget(cfg, phases.elapsed_ms()),
+            )
+            .await;
+            phases.mark("rerank");
+            phases.note("rerank_outcome", stage.outcome);
+            if let Some(entries) = stage.entries {
+                results = entries;
+            }
+        }
 
         // Global rank: float high-confidence priors to the top WITHOUT
         // scrambling the rest (stable sort on a boolean key preserves the
@@ -5369,6 +5463,7 @@ async fn hook_user_prompt_submit_impl_timed(
             related: related.len(),
             top_cosine,
             floor: search_cfg.min_recall_cosine,
+            rerank: phases.note_of("rerank_outcome"),
         });
         return prompt_prior_response(
             prompt_prior_block(handle, prompt, session, dedup.as_ref()).await,
@@ -6605,6 +6700,7 @@ async fn cli_mutate_impl(
             })
         }
         mutation => {
+            let is_embed = matches!(mutation, CliMutation::Embed { .. });
             ensure_handle_context(handle).await?;
             let mut slot = handle.ctx.lock().await;
             // No outer wrap: `run_handle_memory_mutation` already returns an
@@ -6613,10 +6709,29 @@ async fn cli_mutate_impl(
             // operator needs to the end of the line. It also flattened the code
             // the inner error had earned, which is what tells the CLI whether the
             // write started.
-            run_handle_memory_mutation(&mut slot, "cli mutation", |ctx| {
+            let outcome = run_handle_memory_mutation(&mut slot, "cli mutation", |ctx| {
                 crate::core::cli_mutation::execute_context_mutation(ctx, mutation)
                     .map_err(|e| mcp_store_error("CLI mutation failed", e))
-            })
+            });
+            drop(slot);
+            // The reranker weights are 280 MB: fetch them after the embedding,
+            // so an offline machine still gets its vectors, and after the store
+            // lock is released, or every hook for this repo waits at `lock_wait`
+            // for the download.
+            if is_embed && outcome.is_ok() {
+                let hooks = handle.config.hooks.clone();
+                tokio::task::spawn_blocking(move || {
+                    crate::core::ops::fetch_reranker_weights(&hooks)
+                })
+                .await
+                .map_err(|e| {
+                    mcp_error(format!(
+                        "embeddings are done, but the reranker weights fetch aborted: {e}"
+                    ))
+                })?
+                .map_err(|e| mcp_error(e.to_string()))?;
+            }
+            outcome
         }
     }
 }
@@ -7230,7 +7345,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".mdkb")).unwrap();
         let mut config = Config::default();
         tweak(&mut config);
-        Arc::new(RepoHandle::from_shared(
+        let mut handle = RepoHandle::from_shared(
             root,
             Arc::new(Mutex::new(None)),
             Arc::new(Mutex::new(None)),
@@ -7238,7 +7353,79 @@ mod tests {
             Vec::new(),
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicBool::new(false)),
-        ))
+        );
+        // Not the process-wide model: a developer machine that has run
+        // `mdkb embed` would otherwise load a 280 MB reranker into every test
+        // that sends a prompt, and their recall assertions would move with it.
+        handle.reranker = Arc::new(StubReranker::NotCached);
+        Arc::new(handle)
+    }
+
+    /// A reranker that answers as scripted, so the hook's budget and gate can
+    /// be tested without the model.
+    #[derive(Debug)]
+    enum StubReranker {
+        /// The weights are not on disk: no rerank happens.
+        NotCached,
+        /// Sleep `delay`, then score every document `score`.
+        Scores {
+            delay: std::time::Duration,
+            score: f32,
+        },
+        /// The model ran and errored.
+        Fails,
+    }
+
+    impl crate::llm::rerank::Reranker for StubReranker {
+        fn score(
+            &self,
+            _query: &str,
+            docs: &[String],
+        ) -> Result<Vec<f32>, crate::llm::rerank::RerankError> {
+            use crate::llm::rerank::RerankError;
+            match self {
+                StubReranker::NotCached => Err(RerankError::NotCached("stub".into())),
+                StubReranker::Scores { delay, score } => {
+                    std::thread::sleep(*delay);
+                    Ok(vec![*score; docs.len()])
+                }
+                StubReranker::Fails => Err(RerankError::Failed("stub".into())),
+            }
+        }
+    }
+
+    /// A handle whose recall reranks with `reranker`.
+    fn make_reranked_handle(
+        tmp: &TempDir,
+        tweak: impl FnOnce(&mut Config),
+        reranker: StubReranker,
+    ) -> Arc<RepoHandle> {
+        let mut handle = handle_at(tmp.path().to_path_buf(), |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            // English is off by default; these tests exercise the stage.
+            config.hooks.recall_rerank_en = true;
+            tweak(config);
+        });
+        Arc::get_mut(&mut handle)
+            .expect("a fresh handle has one owner")
+            .reranker = Arc::new(reranker);
+        handle
+    }
+
+    /// One prompt through the dispatcher, with the row it logged.
+    async fn prompt_row(handle: &Arc<RepoHandle>, prompt: &str, session: &str) -> (Value, Value) {
+        let result = dispatch_call(
+            "hook.user_prompt_submit",
+            json!({"prompt": prompt, "session_id": session}),
+            Arc::clone(handle),
+            &make_dctx(),
+        )
+        .await
+        .expect("hook");
+        (
+            result,
+            hook_event_row(&handle.root, "user_prompt_submit").await,
+        )
     }
 
     /// A handle rooted at `tmp`, with the config the caller asks for.
@@ -12594,6 +12781,228 @@ mod tests {
                 "phase {phase} missing from {row}"
             );
         }
+    }
+
+    // ── Recall reranker ──────────────────────────────────────────────────────
+
+    fn ms(millis: u64) -> std::time::Duration {
+        std::time::Duration::from_millis(millis)
+    }
+
+    #[tokio::test]
+    async fn a_reranker_slower_than_its_budget_leaves_the_minilm_result_not_a_deadline() {
+        // Catches: the reranker holding its own 700 ms while the hook deadline
+        // is shorter, so the hook is cut at the deadline and the prompt gets no
+        // recall at all instead of the MiniLM result it already had.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_reranked_handle(
+            &tmp,
+            |config| config.hooks.user_prompt_submit_deadline_ms = 500,
+            StubReranker::Scores {
+                delay: ms(2000),
+                score: -9.0,
+            },
+        );
+        seed_memory_entry(&handle, "slow-rerank").await;
+
+        // The first embed of a process loads the model, which takes 230-490 ms
+        // on the rb box and would eat the 500 ms hook deadline
+        // before the reranker starts. Pay it here so the deadline measures the
+        // reranker.
+        let _ = embed_query_off_lock(RECALL_PROMPT).await;
+
+        let t0 = std::time::Instant::now();
+        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "slow").await;
+
+        assert!(
+            t0.elapsed() < ms(1500),
+            "the hook waited {:?} for a reranker it had no budget for",
+            t0.elapsed()
+        );
+        assert!(
+            additional_context(&result).contains("slow-rerank"),
+            "the MiniLM result must survive a rerank that did not finish: {result} / {row}"
+        );
+        assert_eq!(row["outcome"], "fired", "{row}");
+        assert!(
+            ["timeout", "no_budget"].contains(&row["phases"]["rerank_outcome"].as_str().unwrap()),
+            "{row}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_reranker_leaves_the_minilm_result_and_says_so() {
+        // Catches: an error in the reranker dropping the recall the MiniLM gate
+        // had admitted, or going unlogged.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_reranked_handle(&tmp, |_| {}, StubReranker::Fails);
+        seed_memory_entry(&handle, "failing-rerank").await;
+
+        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "fails").await;
+
+        assert!(additional_context(&result).contains("failing-rerank"));
+        assert_eq!(row["phases"]["rerank_outcome"], "failed", "{row}");
+        assert!(row["phases"]["rerank"].is_u64(), "{row}");
+    }
+
+    #[tokio::test]
+    async fn rerank_score_below_the_floor_injects_nothing_even_when_minilm_admitted_it() {
+        // Catches: the reranker only ever adding entries, so a prompt whose
+        // candidates it scores as unrelated still injects what the cosine gate
+        // let through. The gate is the reranker's top score.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_reranked_handle(
+            &tmp,
+            |_| {},
+            StubReranker::Scores {
+                delay: ms(0),
+                score: -6.0,
+            },
+        );
+        seed_memory_entry(&handle, "gated-out").await;
+
+        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "below").await;
+
+        assert_eq!(result, json!({}));
+        assert_eq!(row["outcome"], "skipped", "{row}");
+        assert_eq!(row["phases"]["rerank_outcome"], "below_gate", "{row}");
+    }
+
+    #[tokio::test]
+    async fn the_reranker_admits_what_the_cosine_gate_rejected() {
+        // Catches: the reranker's candidates being drawn after the cosine gate,
+        // so the Italian prompts the gate refuses never reach it. `topic` alone
+        // is one shared word, which the store's gate does not admit.
+        let tmp = TempDir::new().unwrap();
+        let plain = make_handle(&tmp);
+        seed_memory_entry(&plain, "rescued").await;
+        let (unaided, _) = prompt_row(&plain, "tell me about the topic", "plain").await;
+        assert_eq!(unaided, json!({}), "the fixture must be below the gate");
+
+        let tmp = TempDir::new().unwrap();
+        let handle = make_reranked_handle(
+            &tmp,
+            |_| {},
+            StubReranker::Scores {
+                delay: ms(0),
+                score: 3.0,
+            },
+        );
+        seed_memory_entry(&handle, "rescued").await;
+        let (result, row) = prompt_row(&handle, "tell me about the topic", "rescue").await;
+
+        assert!(additional_context(&result).contains("rescued"), "{result}");
+        assert_eq!(row["phases"]["rerank_outcome"], "ok", "{row}");
+    }
+
+    #[tokio::test]
+    async fn rerank_italian_and_english_prompts_are_held_to_their_own_floor() {
+        // Catches: one threshold for both languages. -1.5 clears the English
+        // floor (-1.95) and not the Italian one (-1.05), which the Italian
+        // negatives of the fit set need.
+        let score = StubReranker::Scores {
+            delay: ms(0),
+            score: -1.5,
+        };
+        let tmp = TempDir::new().unwrap();
+        let en = make_reranked_handle(&tmp, |_| {}, score);
+        seed_memory_entry(&en, "floor-en").await;
+        let (result, _) = prompt_row(&en, "why does the topic not work as it should", "en").await;
+        assert!(additional_context(&result).contains("floor-en"), "{result}");
+
+        let tmp = TempDir::new().unwrap();
+        let it = make_reranked_handle(
+            &tmp,
+            |_| {},
+            StubReranker::Scores {
+                delay: ms(0),
+                score: -1.5,
+            },
+        );
+        seed_memory_entry(&it, "floor-it").await;
+        let (result, row) =
+            prompt_row(&it, "perche il topic non funziona come dovrebbe", "it").await;
+        assert_eq!(result, json!({}), "{row}");
+        assert_eq!(row["phases"]["rerank_outcome"], "below_gate", "{row}");
+    }
+
+    #[tokio::test]
+    async fn rerank_english_prompts_keep_the_minilm_result_by_default() {
+        // Catches: the unfit English floor gating English prompts: a score of
+        // -9 would drop what MiniLM admitted.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_reranked_handle(
+            &tmp,
+            |config| config.hooks.recall_rerank_en = false,
+            StubReranker::Scores {
+                delay: ms(0),
+                score: -9.0,
+            },
+        );
+        seed_memory_entry(&handle, "english-minilm").await;
+
+        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "en-off").await;
+
+        assert!(
+            additional_context(&result).contains("english-minilm"),
+            "{result}"
+        );
+        assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
+    }
+
+    #[tokio::test]
+    async fn a_sigil_prompt_is_not_reranked() {
+        // Catches: the reranker gating a prompt that asked for its answer. `*`
+        // keeps the lower MiniLM floor, and a low rerank score must not undo it.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_reranked_handle(
+            &tmp,
+            |_| {},
+            StubReranker::Scores {
+                delay: ms(0),
+                score: -9.0,
+            },
+        );
+        seed_memory_entry(&handle, "asked-for").await;
+
+        let (result, row) = prompt_row(&handle, &format!("* {RECALL_PROMPT}"), "sigil").await;
+
+        assert!(
+            additional_context(&result).contains("asked-for"),
+            "{result}"
+        );
+        assert!(row["phases"].get("rerank_outcome").is_none(), "{row}");
+    }
+
+    #[tokio::test]
+    async fn the_config_key_turns_the_reranker_off() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_reranked_handle(
+            &tmp,
+            |config| {
+                config.hooks.recall_rerank_it = false;
+                config.hooks.recall_rerank_en = false;
+            },
+            StubReranker::Scores {
+                delay: ms(0),
+                score: -9.0,
+            },
+        );
+        seed_memory_entry(&handle, "rerank-off").await;
+
+        let (result, row) = prompt_row(&handle, RECALL_PROMPT, "off").await;
+
+        assert!(additional_context(&result).contains("rerank-off"));
+        assert_eq!(row["phases"]["rerank_outcome"], "off", "{row}");
+    }
+
+    #[test]
+    fn the_reranker_is_on_for_italian_and_off_for_english_by_default() {
+        // Catches: the English floor (3/24 held-out negatives admitted) going
+        // live because the default flipped.
+        let hooks = Config::default().hooks;
+        assert!(hooks.recall_rerank_it);
+        assert!(!hooks.recall_rerank_en);
     }
 
     #[tokio::test]

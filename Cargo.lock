@@ -2004,6 +2004,7 @@ dependencies = [
  "glob",
  "globset",
  "gray_matter",
+ "hf-hub",
  "ignore",
  "libc",
  "libmimalloc-sys",

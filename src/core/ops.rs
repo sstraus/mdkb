@@ -22,6 +22,33 @@ use crate::store::{collections, documents, evolution, memory, search, stats, vec
 use std::collections::HashSet;
 use walkdir::WalkDir;
 
+/// Fetch the recall reranker's weights, for the two callers that are the user
+/// running `mdkb embed`. Not part of [`handle_embed`]: that also runs on every
+/// index flush, and a 280 MB download has no place there. Best effort — recall
+/// falls back to the MiniLM gate without the weights, but the user who ran
+/// `mdkb embed` asked for them, so a failed fetch is returned to the caller.
+///
+/// Takes no store: the download is slow, so a caller holding the store lock must
+/// not be the one running it.
+pub fn fetch_reranker_weights(hooks: &crate::config::HooksConfig) -> Result<()> {
+    fetch_reranker_weights_with(hooks, crate::llm::rerank::download)
+}
+
+fn fetch_reranker_weights_with(
+    hooks: &crate::config::HooksConfig,
+    download: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if !hooks.recall_rerank_any() {
+        return Ok(());
+    }
+    download().map_err(|error| {
+        Error::other(format!(
+            "embeddings are done, but the recall reranker weights were not fetched \
+             (recall keeps the MiniLM gate): {error}"
+        ))
+    })
+}
+
 /// Generate embeddings for documents that don't have them (the `has_embedding`
 /// gate is the hash gate: content changes invalidate the old embedding, so only
 /// new/changed docs are re-embedded; unchanged docs are skipped).
@@ -1036,3 +1063,26 @@ const MAX_NAME_LENGTH: usize = 100;
 /// Single-chunk documents are embedded in groups of this size (PERF-G2) to bound
 /// the peak result vector; `embed_documents` also batches to the model internally.
 const SINGLE_DOC_EMBED_BATCH: usize = 256;
+
+#[cfg(test)]
+mod fetch_reranker_weights_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_download_reaches_the_caller_and_off_never_downloads() {
+        // Catches: the failure logged and dropped, so `mdkb embed` exits 0
+        // with no reranker weights and the user never learns why recall is
+        // MiniLM-only.
+        let on = crate::config::HooksConfig::default();
+        let error = fetch_reranker_weights_with(&on, || Err(Error::other("offline")))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("offline"), "{error}");
+        assert!(error.contains("embeddings are done"), "{error}");
+
+        let mut off = on;
+        off.recall_rerank_it = false;
+        off.recall_rerank_en = false;
+        fetch_reranker_weights_with(&off, || panic!("downloaded with the reranker off")).unwrap();
+    }
+}

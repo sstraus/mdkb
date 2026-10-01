@@ -4,6 +4,7 @@
 //! Used by both document hybrid search and code intelligence semantic search.
 
 pub mod embeddings;
+pub mod rerank;
 
 #[doc(inline)]
 pub use embeddings::{
