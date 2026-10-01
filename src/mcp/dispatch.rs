@@ -8805,6 +8805,53 @@ mod tests {
         assert_eq!(rows, 2, "recall must not prune the index; update does");
     }
 
+    /// The doc-graph block is a recall injection too. Catches: a frontmatter
+    /// neighbor whose file is gone being listed under "related docs" because the
+    /// edge and the row outlive the file until the next `update`. On the old code
+    /// the `!body.contains("notes/gone.md")` assertion fails.
+    #[tokio::test]
+    async fn recall_drops_a_graph_neighbor_whose_file_was_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        for name in ["seed", "gone", "kept"] {
+            seed_document(&handle, &format!("notes/{name}.md"), name, "alpha beta").await;
+        }
+        {
+            let ctx_guard = handle.ctx.lock().await;
+            let conn = &ctx_guard.as_ref().unwrap().conn;
+            let seed_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM documents WHERE relative_path='notes/seed.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            for target in ["notes/gone.md", "notes/kept.md"] {
+                crate::store::graph::add_edge(
+                    conn,
+                    seed_id,
+                    target,
+                    "related",
+                    crate::store::graph::KIND_FRONTMATTER,
+                    None,
+                )
+                .unwrap();
+            }
+        }
+        std::fs::remove_file(tmp.path().join("docs/notes/gone.md")).unwrap();
+
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(
+            body.contains("notes/kept.md (related)"),
+            "a neighbor whose file exists must still be listed: {body}"
+        );
+        assert!(
+            !body.contains("notes/gone.md"),
+            "a neighbor whose file is gone must not be listed: {body}"
+        );
+    }
+
     #[tokio::test]
     async fn recall_injects_matching_docs_alongside_memory() {
         let tmp = TempDir::new().unwrap();
