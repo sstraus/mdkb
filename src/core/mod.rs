@@ -782,6 +782,10 @@ mod verify_after_release_tests {
             "test",
             |_| -> Result<()> { Ok(()) },
             |path| {
+                // The probe passes and records its verdict; the corruption
+                // arrives after, so closing must also forget that verdict.
+                crate::store::heal::verify_and_mark_unadmitted(path)?;
+                assert!(crate::store::heal::has_process_probe(path));
                 Err(ErrorKind::IndexCorrupt {
                     path: path.to_path_buf(),
                 }

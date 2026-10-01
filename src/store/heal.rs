@@ -239,6 +239,35 @@ pub enum Soundness {
     Undetermined(rusqlite::Error),
 }
 
+/// Test seam: lets a test see what the caller holds at the moment a probe
+/// starts. Keyed by database path, so parallel tests do not see each other's.
+#[cfg(test)]
+pub(crate) mod probe_observers {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Observer = Arc<dyn Fn() + Send + Sync>;
+    static OBSERVERS: Mutex<Vec<(PathBuf, Observer)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn observe(db_path: &Path, observer: Observer) {
+        let mut all = OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
+        all.push((db_path.to_path_buf(), observer));
+    }
+
+    pub(super) fn notify(db_path: &Path) {
+        let observers: Vec<Observer> = {
+            let all = OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
+            all.iter()
+                .filter(|(path, _)| path == db_path)
+                .map(|(_, o)| Arc::clone(o))
+                .collect()
+        };
+        for observer in observers {
+            observer();
+        }
+    }
+}
+
 /// Open a throwaway connection for an integrity probe.
 ///
 /// A fresh connection, because a long-lived one answers `quick_check` out of
@@ -248,6 +277,8 @@ pub enum Soundness {
 /// Waits [`PROBE_BUSY_TIMEOUT`] on a lock: a probe that gives up at once turns
 /// every concurrent writer into a `BUSY` verdict.
 fn open_probe(db_path: &Path) -> rusqlite::Result<Connection> {
+    #[cfg(test)]
+    probe_observers::notify(db_path);
     let conn = Connection::open(db_path)?;
     conn.busy_timeout(PROBE_BUSY_TIMEOUT)?;
     Ok(conn)
@@ -2403,5 +2434,24 @@ mod unadmitted_probe_tests {
         make_db(&db);
         verify_and_mark_unadmitted(&db).unwrap();
         assert!(marker_path(&db).exists());
+    }
+
+    /// Catches: the lock-free probe never certifying a quiet WAL database that
+    /// another connection holds open (the daemon's shape), which would make
+    /// every later open scan the whole file; and not recording the verdict in
+    /// this process's memory, so a daemon reopen after a watcher write rescans.
+    #[test]
+    fn a_quiet_wal_database_is_certified_and_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        verify_and_mark_unadmitted(&db).unwrap();
+        assert!(marker_path(&db).exists());
+        assert!(has_process_probe(&db));
     }
 }
