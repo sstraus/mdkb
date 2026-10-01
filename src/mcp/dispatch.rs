@@ -16946,4 +16946,134 @@ mod tests {
         paths.sort_unstable();
         assert_eq!(paths, ["n1.md", "n2.md", "n3.md", "n4.md", "n5.md"]);
     }
+
+    // ---- critic 226-d09e round 3: the cap moved into `take_present` ----
+
+    fn related_paths(body: &str) -> Vec<String> {
+        body.lines()
+            .filter_map(|l| l.strip_prefix("- "))
+            .filter_map(|l| l.strip_suffix(" (related)"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Catches: the neighbor leg losing its `doc_neighbor_cap` when the cap left
+    /// `doc_graph_neighbors` (`take_present` called with `usize::MAX`, or the cap
+    /// applied to the wrong list): three present neighbors, cap 2, all three listed.
+    #[tokio::test]
+    async fn critic_226r3_neighbor_cap_limits_present_neighbors() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.graph.doc_neighbor_cap = 2;
+        });
+        seed_neighbor_graph(
+            &handle,
+            &[
+                ("notes/a.md", "default"),
+                ("notes/b.md", "default"),
+                ("notes/c.md", "default"),
+            ],
+        )
+        .await;
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let listed = related_paths(additional_context(&out));
+        assert_eq!(listed.len(), 2, "{listed:?}");
+    }
+
+    /// Catches: the file check reordering the ranked neighbors (or filtering
+    /// before ranking): with the top-ranked neighbor deleted, the rest keep
+    /// the all-present ranking order.
+    #[tokio::test]
+    async fn critic_226r3_deleted_top_neighbor_keeps_the_rest_in_rank_order() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.graph.doc_neighbor_cap = 3;
+        });
+        seed_neighbor_graph(
+            &handle,
+            &[
+                ("notes/a.md", "default"),
+                ("notes/b.md", "default"),
+                ("notes/c.md", "default"),
+            ],
+        )
+        .await;
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let ranking = related_paths(additional_context(&out));
+        assert_eq!(ranking.len(), 3, "{ranking:?}");
+
+        std::fs::remove_file(tmp.path().join("docs").join(&ranking[0])).unwrap();
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        assert_eq!(related_paths(additional_context(&out)), ranking[1..]);
+    }
+
+    /// Catches: `take_present` dropping index-only candidates (`None`), counting
+    /// missing ones against the cap, or reordering: [missing, present, None,
+    /// present] with cap 2 keeps exactly the 2nd and 3rd, in order; cap 0 keeps none.
+    #[test]
+    fn critic_226r3_take_present_keeps_none_skips_missing_and_caps_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let present = tmp.path().join("p.md");
+        std::fs::write(&present, "x").unwrap();
+        let candidates = || {
+            vec![
+                (1, Some(tmp.path().join("gone.md"))),
+                (2, Some(present.clone())),
+                (3, None),
+                (4, Some(present.clone())),
+            ]
+        };
+        assert_eq!(take_present(candidates(), 2), [2, 3]);
+        assert_eq!(take_present(candidates(), 10), [2, 3, 4]);
+        assert!(take_present(candidates(), 0).is_empty());
+    }
+
+    /// Catches: `with_files` resolving a sessions collection or an unknown
+    /// collection to a path (every such candidate would then be stat-ed and
+    /// dropped), or using one collection's directory for another.
+    #[test]
+    fn critic_226r3_with_files_resolves_per_collection_and_skips_virtual_ones() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::store::schema::init_schema(&conn).unwrap();
+        for (name, path, source) in [
+            ("a", "./da", "manual"),
+            ("b", "./db", "manual"),
+            ("s", "./ds", crate::domain::COLLECTION_SOURCE_SESSIONS),
+        ] {
+            crate::store::collections::add_collection(
+                &conn,
+                &crate::domain::Collection {
+                    name: name.into(),
+                    path: path.into(),
+                    pattern: "**/*".into(),
+                    source: source.into(),
+                    created_at: 1,
+                    updated_at: 1,
+                },
+            )
+            .unwrap();
+        }
+        let root = std::path::Path::new("/r");
+        let items = vec![
+            ("a", "x.md"),
+            ("b", "y.md"),
+            ("s", "sid-chunk-001"),
+            ("nope", "z.md"),
+            ("a", "w.md"),
+        ];
+        let got: Vec<_> = with_files(&conn, root, items, |(c, p)| (*c, *p))
+            .into_iter()
+            .map(|(_, file)| file)
+            .collect();
+        assert_eq!(
+            got,
+            [
+                Some(root.join("./da").join("x.md")),
+                Some(root.join("./db").join("y.md")),
+                None,
+                None,
+                Some(root.join("./da").join("w.md")),
+            ]
+        );
+    }
 }
