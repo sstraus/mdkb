@@ -294,6 +294,10 @@ fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<Update
         ..UpdateResult::default()
     };
 
+    // Read BEFORE indexing: a commit landing mid-run leaves the index older
+    // than the commit recorded for it, which reads as stale, never as fresh.
+    let head = crate::git::head_commit(root);
+
     with_transaction(&ctx.conn, || {
         update_all_collections(ctx, root, &config, &collections, force, &mut result)?;
         // Frontmatter edges are rebuilt here, after every collection, rather
@@ -326,6 +330,19 @@ fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<Update
         documents::gc_orphaned_content(&ctx.conn)?;
         Ok(())
     })?;
+
+    // Whole-tree runs only: a targeted `--files` run does not make the tree
+    // match HEAD. A run that reported errors leaves the previous record, which
+    // is older and so can only understate freshness.
+    if result.errors.is_empty() {
+        if let Err(e) = crate::store::index_head::record(
+            &ctx.conn,
+            head.as_deref(),
+            chrono::Utc::now().timestamp(),
+        ) {
+            tracing::warn!("could not record the indexed commit: {e}");
+        }
+    }
 
     // Backfill embeddings for memory entries written without one (CLI cold-model
     // writes, or entries that predate embed-on-write). Runs after the index

@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use rusqlite::{Connection, OptionalExtension};
 
 /// Current schema version.
-pub const SCHEMA_VERSION: i32 = 33;
+pub const SCHEMA_VERSION: i32 = 34;
 
 /// Identifies a legacy System-B behavioural prior: `prior-` plus 16 hex digits.
 /// One spelling, used by both the v12 purge and the v20 sweep that cleans up
@@ -444,6 +444,19 @@ CREATE TABLE IF NOT EXISTS recall_candidates (
 CREATE INDEX IF NOT EXISTS idx_recall_candidates_entry ON recall_candidates(entry_id);
 "#;
 
+/// The git commit the document index was last built at (story 220-711b).
+///
+/// One row at most, written by `store::index_head`. NULL-free by construction:
+/// a store indexed outside a git repository has no row, because a missing
+/// answer is not the same as a stale one.
+pub(crate) const INDEX_HEAD_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS index_head (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    head        TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+);
+"#;
+
 const RELATION_CANDIDATES_SQL: &str = r#"
 -- What the relation-key detector last measured, so a latency-bounded reader
 -- (SessionStart, 200 ms) can report it without scanning the corpus.
@@ -479,6 +492,7 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(DOCUMENT_ALIASES_SQL)?;
     conn.execute_batch(RELATION_CANDIDATES_SQL)?;
     conn.execute_batch(RECALL_LEDGER_SQL)?;
+    conn.execute_batch(INDEX_HEAD_SQL)?;
 
     // Set BM25 weights
     conn.execute_batch(BM25_WEIGHTS_SQL)?;
@@ -1239,6 +1253,12 @@ fn migrate_schema_inner(conn: &Connection, from_version: i32) -> Result<()> {
     // empty; recall fills it from the next prompt on.
     if from_version < 33 {
         conn.execute_batch(RECALL_LEDGER_SQL)?;
+    }
+
+    // Migration from v33 to v34: the commit the index was built at. Created
+    // empty; the next whole-tree `mdkb update` records it.
+    if from_version < 34 {
+        conn.execute_batch(INDEX_HEAD_SQL)?;
     }
 
     // Update schema version

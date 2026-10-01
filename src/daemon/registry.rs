@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use crate::code::indexing::IndexFacade;
 use crate::config::Config;
 use crate::core::Context;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorKind, Result};
 
 use super::config::DaemonConfig;
 use super::repo_map::RepoMap;
@@ -275,6 +275,30 @@ impl ConfigIdentity {
 
     fn changed(&self) -> bool {
         Self::stamp(&self.path) != self.stamp
+    }
+}
+
+/// Why a store could not be opened for a cross-repo read.
+#[derive(Debug)]
+pub enum ReadRefusal {
+    /// Older than this binary. Not a fault of the store: `mdkb repos refresh
+    /// --only outdated` brings it forward, so a caller reports these together
+    /// instead of one paragraph each.
+    SchemaOutdated { found: i32 },
+    /// Anything else, in the store's own words.
+    Other(String),
+}
+
+impl std::fmt::Display for ReadRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SchemaOutdated { found } => write!(
+                f,
+                "schema v{found} is older than this binary's v{}",
+                crate::store::schema::SCHEMA_VERSION
+            ),
+            Self::Other(why) => f.write_str(why),
+        }
     }
 }
 
@@ -548,16 +572,21 @@ impl RepoRegistry {
     /// this binary, a corrupt file, a held lock — carries the store's own error
     /// text, because "cannot be read" without the reason is what leaves an
     /// operator guessing.
-    pub fn read_only_context(&self, root: &Path) -> std::result::Result<Context, String> {
+    pub fn read_only_context(&self, root: &Path) -> std::result::Result<Context, ReadRefusal> {
         if let Err(e) = self.daemon_config.check_whitelist(root) {
-            return Err(format!("outside the daemon whitelist: {e}"));
+            return Err(ReadRefusal::Other(format!(
+                "outside the daemon whitelist: {e}"
+            )));
         }
         match super::repo_map::classify(root) {
             super::repo_map::RootHealth::Healthy => {}
-            super::repo_map::RootHealth::Unreadable(why) => return Err(why),
-            absent => return Err(absent.reason().to_string()),
+            super::repo_map::RootHealth::Unreadable(why) => return Err(ReadRefusal::Other(why)),
+            absent => return Err(ReadRefusal::Other(absent.reason().to_string())),
         }
-        Context::open_read_only(root).map_err(|e| e.to_string())
+        Context::open_read_only(root).map_err(|e| match e.kind() {
+            ErrorKind::SchemaStale { found, .. } => ReadRefusal::SchemaOutdated { found: *found },
+            _ => ReadRefusal::Other(e.to_string()),
+        })
     }
 
     /// The open handle for `canonical`, reloaded first when `config.toml`

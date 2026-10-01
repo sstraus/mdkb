@@ -118,6 +118,7 @@ pub fn routing_for(command: &Command) -> Routing {
         Command::Init
         | Command::Serve { .. }
         | Command::Daemon(_)
+        | Command::Repos(_)
         | Command::Mcp { .. }
         | Command::Hook(_)
         | Command::Setup(_)
@@ -458,6 +459,7 @@ pub fn mutation_request(
         | Command::Mget { .. }
         | Command::Serve { .. }
         | Command::Daemon(_)
+        | Command::Repos(_)
         | Command::Mcp { .. }
         | Command::Stats { .. }
         | Command::Doctor { .. }
