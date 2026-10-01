@@ -294,6 +294,58 @@ pub fn verify_and_mark(conn: &Connection, db_path: &Path) -> Result<()> {
     }
 }
 
+/// Size and mtime of the database and its WAL: what a write changes.
+fn write_stamp(db_path: &Path) -> [Option<(SystemTime, u64)>; 2] {
+    [db_path.to_path_buf(), with_suffix(db_path, "-wal")].map(|path| {
+        let meta = std::fs::metadata(path).ok()?;
+        Some((meta.modified().ok()?, meta.len()))
+    })
+}
+
+/// [`verify_and_mark_throttled`] for a caller that holds neither the writer
+/// admission nor the mutation lock, so a scan of a database of hundreds of
+/// megabytes does not queue every other writer behind it.
+///
+/// The marker certifies "sound as of now", so it is touched only when neither
+/// file was written while the probe ran; a write that landed in between leaves
+/// the marker absent and the next write cycle probes again. The probe itself
+/// reads a WAL snapshot, which a concurrent writer cannot tear.
+pub fn verify_and_mark_unadmitted(db_path: &Path) -> Result<()> {
+    if checked_recently(
+        db_path,
+        &marker_path(db_path),
+        CHECK_INTERVAL,
+        SystemTime::now(),
+    ) {
+        return Ok(());
+    }
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let before = write_stamp(db_path);
+    let probe = open_probe(db_path)?;
+    match is_structurally_sound(&probe) {
+        Soundness::Sound => {
+            touch_marker_if_unwritten(db_path, &before);
+            Ok(())
+        }
+        Soundness::Corrupt { .. } => {
+            invalidate_marker(db_path);
+            Err(crate::error::ErrorKind::IndexCorrupt {
+                path: db_path.to_path_buf(),
+            }
+            .into())
+        }
+        Soundness::Undetermined(e) => Err(e.into()),
+    }
+}
+
+fn touch_marker_if_unwritten(db_path: &Path, before: &[Option<(SystemTime, u64)>; 2]) {
+    if write_stamp(db_path) == *before {
+        touch_marker(&marker_path(db_path));
+    }
+}
+
 /// [`verify_and_mark`], skipped when the last probe is younger than
 /// [`CHECK_INTERVAL`].
 ///
@@ -2312,5 +2364,44 @@ mod process_probe_attacks {
         let _ = std::fs::remove_file(marker_path(&db));
 
         assert!(probed(ensure_sound_locked(&db, false).unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod unadmitted_probe_tests {
+    use super::*;
+
+    fn make_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+            .unwrap();
+    }
+
+    /// Catches: a marker touched after a probe during which another writer
+    /// wrote, which would certify bytes the probe never read.
+    #[test]
+    fn a_write_during_the_probe_leaves_the_marker_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        let before = write_stamp(&db);
+        std::thread::sleep(Duration::from_millis(20));
+        Connection::open(&db)
+            .unwrap()
+            .execute("INSERT INTO t VALUES (2)", [])
+            .unwrap();
+        touch_marker_if_unwritten(&db, &before);
+        assert!(!marker_path(&db).exists());
+    }
+
+    /// Catches: the lock-free probe never certifying a quiet database, which
+    /// would make every later open scan the whole file.
+    #[test]
+    fn a_quiet_database_is_certified_without_any_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        make_db(&db);
+        verify_and_mark_unadmitted(&db).unwrap();
+        assert!(marker_path(&db).exists());
     }
 }

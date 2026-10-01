@@ -126,19 +126,22 @@ pub fn run_mutation_verify_after_release<T>(
     f: impl FnOnce(&mut Context) -> Result<T>,
     verify: impl FnOnce(&Path) -> Result<()>,
 ) -> Option<Result<T>> {
-    let mut guard = slot.blocking_lock();
-    let db_path = guard.as_ref()?.db_path.clone();
-    let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
-        Ok(guard) => guard,
-        Err(error) => return Some(Err(error)),
+    let (db_path, mut result) = {
+        let mut guard = slot.blocking_lock();
+        let db_path = guard.as_ref()?.db_path.clone();
+        let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
+            Ok(guard) => guard,
+            Err(error) => return Some(Err(error)),
+        };
+        crate::store::heal::invalidate_marker(&db_path);
+        let result = f(guard.as_mut().expect("slot was checked above"));
+        (db_path, result)
     };
-    crate::store::heal::invalidate_marker(&db_path);
-    let mut result = f(guard.as_mut().expect("slot was checked above"));
     if let Err(error) = verify(&db_path) {
         result = Err(error);
     }
     if result.as_ref().is_err_and(Error::is_index_corrupt) {
-        close_over_corruption(&mut guard);
+        close_over_corruption(&mut slot.blocking_lock());
     }
     Some(result)
 }

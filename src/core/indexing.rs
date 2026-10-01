@@ -224,7 +224,19 @@ pub fn handle_update_force(
     root: impl AsRef<Path>,
     force: bool,
 ) -> Result<UpdateResult> {
-    let root = root.as_ref();
+    let result = run_document_update(ctx, root.as_ref(), force)?;
+    crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
+    Ok(result)
+}
+
+/// [`handle_update`] without the closing integrity probe, for a caller that
+/// runs the probe itself once it has released the store (the daemon watcher:
+/// see [`crate::core::run_mutation_verify_after_release`]).
+pub fn handle_update_unverified(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResult> {
+    run_document_update(ctx, root.as_ref(), false)
+}
+
+fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<UpdateResult> {
     let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, "update")?;
     crate::store::heal::invalidate_marker(&ctx.db_path);
 
@@ -340,8 +352,6 @@ pub fn handle_update_force(
     }
 
     report_collection_deltas(ctx, &before, &mut result);
-
-    crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
 
     Ok(result)
 }

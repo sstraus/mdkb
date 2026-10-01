@@ -23,7 +23,7 @@ use crate::daemon::registry::{RepoHandle, RepoRegistry};
 use crate::code::indexing::IndexFacade;
 use crate::config::McpConfig;
 use crate::core::Context;
-use crate::core::indexing::handle_update;
+use crate::core::indexing::{handle_update, handle_update_unverified};
 #[cfg(test)]
 use crate::domain::SearchResult;
 use crate::metrics::{UsageMetrics, count_tokens};
@@ -1867,7 +1867,7 @@ async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, request: &mut Memo
     // blocking thread so it never stalls a tokio worker (PERF-1).
     let ctx = Arc::clone(ctx);
     let outcome = tokio::task::spawn_blocking(move || {
-        let mut guard = ctx.blocking_lock();
+        let guard = ctx.blocking_lock();
         if let Some(paths) = &changed {
             let own = guard.as_ref().is_some_and(|ctx_ref| {
                 crate::core::memory_sync::changes_are_recorded_projections(ctx_ref, paths)
@@ -1880,9 +1880,13 @@ async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, request: &mut Memo
                 return None;
             }
         }
-        crate::core::run_mutation(&mut guard, "memory sync", |ctx_ref| {
-            crate::core::memory_sync::sync_memory_files(ctx_ref)
-        })
+        drop(guard);
+        crate::core::run_mutation_verify_after_release(
+            &ctx,
+            "memory sync",
+            |ctx_ref| crate::core::memory_sync::sync_memory_files(ctx_ref),
+            crate::store::heal::verify_and_mark_unadmitted,
+        )
     })
     .await;
     match outcome {
@@ -1940,10 +1944,12 @@ async fn flush_doc_update(
     let ctx = Arc::clone(ctx);
     let root = root.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
-        let mut guard = ctx.blocking_lock();
-        crate::core::run_mutation(&mut guard, "doc reindex", |ctx_ref| {
-            handle_update(ctx_ref, &root)
-        })
+        crate::core::run_mutation_verify_after_release(
+            &ctx,
+            "doc reindex",
+            |ctx_ref| handle_update_unverified(ctx_ref, &root),
+            crate::store::heal::verify_and_mark_unadmitted,
+        )
     })
     .await;
     match outcome {
