@@ -116,6 +116,33 @@ pub fn run_mutation<T>(
     Some(result)
 }
 
+/// [`run_mutation`] for a daemon task that shares the slot with live requests:
+/// `verify` (the full-file integrity probe) runs only after the slot and the
+/// writer admission are released, so requests are not queued behind a scan of
+/// the whole database. Blocking: call from `spawn_blocking`.
+pub fn run_mutation_verify_after_release<T>(
+    slot: &tokio::sync::Mutex<Option<Context>>,
+    what: &str,
+    f: impl FnOnce(&mut Context) -> Result<T>,
+    verify: impl FnOnce(&Path) -> Result<()>,
+) -> Option<Result<T>> {
+    let mut guard = slot.blocking_lock();
+    let db_path = guard.as_ref()?.db_path.clone();
+    let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
+        Ok(guard) => guard,
+        Err(error) => return Some(Err(error)),
+    };
+    crate::store::heal::invalidate_marker(&db_path);
+    let mut result = f(guard.as_mut().expect("slot was checked above"));
+    if let Err(error) = verify(&db_path) {
+        result = Err(error);
+    }
+    if result.as_ref().is_err_and(Error::is_index_corrupt) {
+        close_over_corruption(&mut guard);
+    }
+    Some(result)
+}
+
 /// Drop a long-lived context that saw corruption, and with it the process's
 /// memory of having probed the file sound, so the next open probes.
 pub(crate) fn close_over_corruption(slot: &mut Option<Context>) {
@@ -706,5 +733,74 @@ mod close_over_corruption_tests {
             Err(Error::other("disk full"))
         });
         assert!(slot.is_some() && !heal::has_process_probe(&db_path));
+    }
+}
+
+#[cfg(test)]
+mod verify_after_release_tests {
+    use super::*;
+
+    fn slot_in(dir: &Path) -> tokio::sync::Mutex<Option<Context>> {
+        tokio::sync::Mutex::new(Some(Context::init(dir).unwrap()))
+    }
+
+    /// Catches: the integrity probe running while the daemon's store mutex is
+    /// held, so every hook that arrives during a watcher reindex waits out a
+    /// full-file `quick_check` in the context phase (#201-481e, rows of 377 to
+    /// 916 ms on a 733 MB store).
+    #[test]
+    fn the_probe_runs_after_the_store_slot_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        let mut slot_free_during_probe = false;
+        let outcome = run_mutation_verify_after_release(
+            &slot,
+            "test",
+            |_| -> Result<()> { Ok(()) },
+            |_| {
+                slot_free_during_probe = slot.try_lock().is_ok();
+                Ok(())
+            },
+        );
+        assert!(matches!(outcome, Some(Ok(()))));
+        assert!(slot_free_during_probe, "the probe held the store slot");
+    }
+
+    /// Catches: a probe that finds corruption after the slot moved out of the
+    /// lock leaving the long-lived connection (and its live lock) open, which
+    /// is what blocks the quarantine.
+    #[test]
+    fn corruption_found_by_the_probe_closes_the_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let slot = slot_in(dir.path());
+        let db_path = slot.try_lock().unwrap().as_ref().unwrap().db_path.clone();
+        let outcome = run_mutation_verify_after_release(
+            &slot,
+            "test",
+            |_| -> Result<()> { Ok(()) },
+            |path| {
+                Err(ErrorKind::IndexCorrupt {
+                    path: path.to_path_buf(),
+                }
+                .into())
+            },
+        );
+        assert!(matches!(outcome, Some(Err(ref e)) if e.is_index_corrupt()));
+        assert!(slot.try_lock().unwrap().is_none());
+        assert!(!crate::store::heal::has_process_probe(&db_path));
+    }
+
+    /// Catches: an empty slot (nothing opened yet) reported as a finished
+    /// mutation, or probed.
+    #[test]
+    fn an_empty_slot_runs_nothing() {
+        let slot = tokio::sync::Mutex::new(None);
+        let outcome = run_mutation_verify_after_release(
+            &slot,
+            "test",
+            |_| -> Result<()> { panic!("no context to mutate") },
+            |_| panic!("nothing to verify"),
+        );
+        assert!(outcome.is_none());
     }
 }
