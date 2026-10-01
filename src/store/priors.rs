@@ -4194,4 +4194,64 @@ mod tests {
         assert_eq!(promoted_content(Some("it broke"), Some("  ")), LESSON);
         assert_eq!(promoted_content(None, None), LESSON);
     }
+
+    // Catches: a blank signature stored on the cluster (the emptiness filter
+    // inverted), which later matches nothing yet counts as observable.
+    #[test]
+    fn a_blank_error_signature_leaves_the_cluster_unset_and_a_real_one_is_trimmed() {
+        let conn = conn();
+        let d = sample_distilled();
+        let key = canonical_trigger_key(&d.trigger_kind, &d.trigger_matcher);
+        let cluster_id = cluster_id_for_key(&key);
+
+        integrate_distilled(&conn, &d, "sess-1", 1000, None, Some("   ")).unwrap();
+        assert_eq!(
+            get_cluster(&conn, &cluster_id).unwrap().unwrap().error_signature,
+            None
+        );
+
+        integrate_distilled(&conn, &d, "sess-2", 2000, None, Some("  boom failed  ")).unwrap();
+        assert_eq!(
+            get_cluster(&conn, &cluster_id)
+                .unwrap()
+                .unwrap()
+                .error_signature
+                .as_deref(),
+            Some("boom failed")
+        );
+    }
+
+    // Catches: `len() > 1` -> `>= 1`, which keeps one-character tokens so two
+    // different failures sharing letters look like one.
+    #[test]
+    fn one_character_tokens_do_not_make_two_failures_look_alike() {
+        let tokens = signature_tokens("a b cd 7 x1 42");
+        let mut sorted: Vec<_> = tokens.into_iter().collect();
+        sorted.sort();
+        assert_eq!(sorted, vec!["cd".to_string(), "x1".to_string()]);
+        assert!(!signatures_match("a b c boom", "a b c other"));
+    }
+
+    // Catches: `&&` -> `||` in is_empty, which calls a report empty while one
+    // list still holds a cluster.
+    #[test]
+    fn a_settle_report_is_empty_only_when_every_list_is_empty() {
+        assert!(SettleReport::default().is_empty());
+        let one = || vec!["clu-a".to_string()];
+        let with_refuted = SettleReport {
+            refuted: one(),
+            ..Default::default()
+        };
+        let with_unobservable = SettleReport {
+            unobservable: one(),
+            ..Default::default()
+        };
+        let with_unrefuted = SettleReport {
+            unrefuted: one(),
+            ..Default::default()
+        };
+        assert!(!with_refuted.is_empty());
+        assert!(!with_unobservable.is_empty());
+        assert!(!with_unrefuted.is_empty());
+    }
 }
