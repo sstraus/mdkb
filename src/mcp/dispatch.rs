@@ -6598,16 +6598,22 @@ fn render_code_index_hits(
 /// skips. In the daemon the ctx stays warm, so all hook traffic is counted.
 /// `record_call` is three tiny local-SQLite writes (sub-millisecond).
 async fn record_hook_call(handle: &RepoHandle, method: &str) {
-    let event = method.strip_prefix("hook.").unwrap_or(method);
-    let mut ctx_guard = handle.ctx.lock().await;
+    let event = method.strip_prefix("hook.").unwrap_or(method).to_string();
+    let mut ctx_guard = Arc::clone(&handle.ctx).lock_owned().await;
     if ctx_guard.is_none() {
         return;
     }
-    let outcome = crate::core::run_guarded_write(&mut ctx_guard, "hook telemetry", |ctx| {
-        let sid = stats::find_or_create_agent_session(&ctx.conn, "hooks")?;
-        stats::record_call(&ctx.conn, sid, event, 0, 0, false)
-    });
-    if let Some(Err(error)) = outcome {
+    // The write is synchronous SQLite. Run inline it would occupy the runtime
+    // thread for as long as the store is slow, and a hook answering at its
+    // deadline needs that thread to fire the deadline's timer.
+    let written = tokio::task::spawn_blocking(move || {
+        crate::core::run_guarded_write(&mut ctx_guard, "hook telemetry", |ctx| {
+            let sid = stats::find_or_create_agent_session(&ctx.conn, "hooks")?;
+            stats::record_call(&ctx.conn, sid, &event, 0, 0, false)
+        })
+    })
+    .await;
+    if let Ok(Some(Err(error))) = written {
         tracing::warn!("record hook call: {error}");
     }
 }
@@ -15160,6 +15166,31 @@ mod tests {
         assert!(
             waited < std::time::Duration::from_millis(700),
             "second prompt took {waited:?} behind a cut search; its deadline was 150 ms"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_telemetry_behind_a_slow_store_leaves_the_runtime_free() {
+        // Catches: `record_hook_call` runs its SQLite write inline on the
+        // runtime thread, so a cut prompt's detached telemetry freezes every
+        // timer (the next prompt's deadline included) until the store answers.
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "telemetry-topic").await;
+        stall_next_query(&handle, 1000).await;
+
+        let telemetry_handle = Arc::clone(&handle);
+        let telemetry = tokio::spawn(async move {
+            record_hook_call(&telemetry_handle, "hook.user_prompt_submit").await;
+        });
+        let t0 = std::time::Instant::now();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let slept = t0.elapsed();
+        telemetry.await.unwrap();
+
+        assert!(
+            slept < std::time::Duration::from_millis(500),
+            "a 50 ms timer fired after {slept:?}: the runtime thread was held by the store write"
         );
     }
 

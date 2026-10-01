@@ -9,9 +9,13 @@ fn mdkb_bin() -> Command {
 }
 
 /// Invoke `mdkb hook <event>` with the given stdin JSON and return (exit_code, stdout).
+/// Runs in a scratch directory: the hook opens the store at its working
+/// directory, and cargo's is the crate root, whose `.mdkb` it would write into.
 fn run_hook(event: &str, stdin_json: &str) -> (i32, String) {
+    let scratch = tempfile::tempdir().expect("scratch cwd");
     let mut child = mdkb_bin()
         .args(["hook", event])
+        .current_dir(scratch.path())
         .env("MDKB_NO_DAEMON", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -19,12 +23,9 @@ fn run_hook(event: &str, stdin_json: &str) -> (i32, String) {
         .spawn()
         .expect("failed to spawn mdkb");
 
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin_json.as_bytes())
-        .expect("failed to write stdin");
+    // A hook with no store at its cwd may answer without reading stdin, which
+    // closes the pipe under the write; the exit code and stdout are the contract.
+    let _ = child.stdin.take().unwrap().write_all(stdin_json.as_bytes());
 
     let output = child.wait_with_output().expect("failed to wait");
     let code = output.status.code().unwrap_or(-1);

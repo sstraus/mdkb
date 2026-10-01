@@ -115,7 +115,9 @@ fn seed(
     add_entry(&ctx.conn, &entry).expect("seed");
 }
 
-/// Extract the warmup block and return the `- ` bullet lines (excludes header/footer).
+/// Extract the warmup block and return the memory `- ` bullet lines (excludes
+/// header/footer and the doctor findings, `- [error|warning|info] id: ...`,
+/// which describe the machine and the fixture store, not the warmup list).
 fn warmup_lines(stdout: &str) -> Vec<String> {
     let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     let ctx_block = parsed
@@ -127,6 +129,11 @@ fn warmup_lines(stdout: &str) -> Vec<String> {
     ctx_block
         .lines()
         .filter(|l| l.starts_with("- "))
+        .filter(|l| {
+            !["- [error] ", "- [warning] ", "- [info] "]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
         .map(|l| l.to_string())
         .collect()
 }
