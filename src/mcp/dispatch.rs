@@ -4379,8 +4379,8 @@ async fn record_recall(
 /// the absolute floor drops some.
 const DOC_RECALL_POOL_FACTOR: usize = 4;
 
-/// The documents recall may inject: those with absolute evidence of relevance
-/// whose file still exists, in rank order, as `(path, title)`, at most `limit`.
+/// The documents recall may inject: those with absolute evidence of relevance,
+/// in rank order.
 ///
 /// A hit is admitted when the cosine of its closest chunk reaches `min_cosine`,
 /// or when the prompt quotes its title or path
@@ -4388,16 +4388,11 @@ const DOC_RECALL_POOL_FACTOR: usize = 4;
 /// store without embeddings, or an identifier-shaped query, from losing the
 /// leg. Being in the BM25 result set is not evidence: recall OR-expands the
 /// prompt, so one common word puts a document there.
-///
-/// `present` runs on admitted hits only, lazily and until `limit` are found, so
-/// it costs one stat per candidate that could be injected, not one per hit.
 fn admit_doc_hits(
     hits: Vec<(crate::domain::SearchResult, Option<f64>)>,
     prompt: &str,
     min_cosine: f32,
-    mut present: impl FnMut(&crate::domain::SearchResult) -> bool,
-    limit: usize,
-) -> Vec<(String, Option<String>)> {
+) -> Vec<crate::domain::SearchResult> {
     hits.into_iter()
         .filter(|(hit, cosine)| {
             cosine.is_some_and(|c| c >= f64::from(min_cosine))
@@ -4406,51 +4401,66 @@ fn admit_doc_hits(
                     &format!("{} {}", hit.path, hit.title.as_deref().unwrap_or_default()),
                 )
         })
-        .filter(|(hit, _)| present(hit))
-        .map(|(hit, _)| (hit.path, hit.title.filter(|t| !t.is_empty())))
-        .take(limit)
+        .map(|(hit, _)| hit)
         .collect()
 }
 
-/// A closure for [`admit_doc_hits`] and [`doc_graph_neighbors`]: where the file
-/// behind an indexed document (`collection`, `path`) is, or `None` for a
-/// collection the index does not know or one without files on disk (sessions:
-/// their documents are virtual `{sid}-chunk-NNN` keys). Between a deletion and the next `update`
-/// the index still lists the document, and recall must not point at it. The
-/// directory is resolved once per collection; this touches the index only, so it
-/// can run under the store guard. The filesystem is asked afterwards, outside
-/// the guard, by [`file_still_there`] — a stat on a hung mount must not hold the
-/// store lock past the hook deadline.
-fn indexed_file_path<'a>(
-    conn: &'a rusqlite::Connection,
-    root: &'a std::path::Path,
-) -> impl FnMut(&str, &str) -> Option<std::path::PathBuf> + 'a {
+/// Pair each candidate with the file behind it, for [`take_present`]. The
+/// directory of a collection is resolved once; a collection the index does not
+/// know, or one without files on disk (sessions: their documents are virtual
+/// `{sid}-chunk-NNN` keys), pairs with `None`. This touches the index only, so
+/// it runs under the store guard; the filesystem is asked afterwards, outside
+/// it — a stat on a hung mount must not hold the store lock past the hook
+/// deadline.
+fn with_files<T>(
+    conn: &rusqlite::Connection,
+    root: &std::path::Path,
+    items: Vec<T>,
+    key: impl Fn(&T) -> (&str, &str),
+) -> Vec<(T, Option<std::path::PathBuf>)> {
     let mut dirs: std::collections::HashMap<String, Option<std::path::PathBuf>> =
         std::collections::HashMap::new();
-    move |collection, path| {
-        dirs.entry(collection.to_string())
-            .or_insert_with(|| {
-                crate::store::collections::get_collection(conn, collection)
-                    .ok()
-                    .flatten()
-                    .filter(|c| c.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
-                    .map(|c| root.join(c.path))
-            })
-            .as_ref()
-            .map(|dir| dir.join(path))
-    }
+    items
+        .into_iter()
+        .map(|item| {
+            let (collection, path) = key(&item);
+            let file = dirs
+                .entry(collection.to_string())
+                .or_insert_with(|| {
+                    crate::store::collections::get_collection(conn, collection)
+                        .ok()
+                        .flatten()
+                        .filter(|c| c.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
+                        .map(|c| root.join(c.path))
+                })
+                .as_ref()
+                .map(|dir| dir.join(path));
+            (item, file)
+        })
+        .collect()
 }
 
-/// Whether the file resolved by [`indexed_file_path`] is still a file. Read-only:
-/// `update` prunes the row. Absence and a directory in the file's place (`update`
-/// indexes files only) count as gone; a stat that fails for any other reason, or
-/// an unknown collection, keeps the document, as `update` does.
-fn file_still_there(file: &Option<std::path::PathBuf>) -> bool {
-    file.as_ref()
-        .is_none_or(|file| match std::fs::metadata(file) {
-            Ok(meta) => meta.is_file(),
-            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+/// The first `cap` candidates whose file is still there, in rank order, one stat
+/// per candidate visited — not one per search hit or edge. Between a deletion
+/// and the next `update` the index still lists the document, and recall must not
+/// point at it; the row stays, `update` prunes it. A missing file, a dangling
+/// symlink, a directory in the file's place (`update` indexes files only) and a
+/// parent that is no longer a directory all count as gone; a stat that fails for
+/// any other reason keeps the document, as does `None`, as `update` does.
+fn take_present<T>(candidates: Vec<(T, Option<std::path::PathBuf>)>, cap: usize) -> Vec<T> {
+    use std::io::ErrorKind::{NotADirectory, NotFound};
+    candidates
+        .into_iter()
+        .filter(|(_, file)| {
+            file.as_ref()
+                .is_none_or(|file| match std::fs::metadata(file) {
+                    Ok(meta) => meta.is_file(),
+                    Err(error) => !matches!(error.kind(), NotFound | NotADirectory),
+                })
         })
+        .take(cap)
+        .map(|(item, _)| item)
+        .collect()
 }
 
 fn injectable(entries: Vec<memory::ScoredMemoryEntry>) -> Vec<memory::MemoryEntry> {
@@ -5530,7 +5540,7 @@ async fn hook_user_prompt_submit_impl_timed(
             let (prompt, query_embedding, search_cfg) = (prompt_owned, embedding, search_cfg_owned);
             let mut observed: Vec<memory::ScoredMemoryEntry> = Vec::new();
             let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
-            let mut doc_candidates: Vec<((String, Option<String>), Option<std::path::PathBuf>)> =
+            let mut doc_candidates: Vec<(crate::domain::SearchResult, Option<std::path::PathBuf>)> =
                 Vec::new();
             let search_t0 = std::time::Instant::now();
             let search = crate::core::run_guarded_read(store.slot(), "hook memory recall", |ctx| {
@@ -5640,27 +5650,16 @@ async fn hook_user_prompt_submit_impl_timed(
                     .map(|hits| {
                         // Admission and ranking happen here, under the guard;
                         // the files are only resolved, and checked below once
-                        // the guard is gone. `files[i]` belongs to the i-th
-                        // admitted hit: `present` runs once per admitted hit,
-                        // in order, and the limit is applied after the check.
-                        let mut resolve = indexed_file_path(&ctx.conn, &root);
-                        let mut files = Vec::new();
-                        let admitted = admit_doc_hits(
-                            hits,
-                            &prompt,
-                            docs_min_cosine,
-                            |hit| {
-                                files.push(resolve(&hit.collection, &hit.path));
-                                true
-                            },
-                            usize::MAX,
-                        );
-                        (admitted, files)
+                        // the guard is gone.
+                        with_files(
+                            &ctx.conn,
+                            &root,
+                            admit_doc_hits(hits, &prompt, docs_min_cosine),
+                            |hit| (hit.collection.as_str(), hit.path.as_str()),
+                        )
                     })
                 }) {
-                    Some(Ok((admitted, files))) => {
-                        doc_candidates = admitted.into_iter().zip(files).collect()
-                    }
+                    Some(Ok(admitted)) => doc_candidates = admitted,
                     Some(Err(error)) => {
                         // Degrade silently (hooks must not block) but stay observable.
                         tracing::debug!("recall doc search failed: {error}");
@@ -5691,11 +5690,9 @@ async fn hook_user_prompt_submit_impl_timed(
             }
             drop(store);
             doc_hits.extend(
-                doc_candidates
+                take_present(doc_candidates, docs_limit)
                     .into_iter()
-                    .filter(|(_, file)| file_still_there(file))
-                    .map(|(hit, _)| hit)
-                    .take(docs_limit),
+                    .map(|hit| (hit.path, hit.title.filter(|t| !t.is_empty()))),
             );
             Some((scored_results, observed, doc_hits, rerank_pool))
         });
@@ -5831,43 +5828,46 @@ async fn hook_user_prompt_submit_impl_timed(
     // the (now finalized) memory ids about to be injected.
     let mut neighbors: Vec<(String, String)> = Vec::new();
     if !path_tokens.is_empty() {
-        // Ranked candidates with their resolved files, as in the docs leg; the
-        // cap is applied after the file check, outside the store guard.
-        let mut candidates: Vec<((String, String), Option<std::path::PathBuf>)> = Vec::new();
         if let Ok(mut store) = hook_store(handle).await {
             let seen: std::collections::HashSet<String> =
                 results.iter().map(|e| e.id.clone()).collect();
-            match crate::core::run_guarded_read(
-                store.slot(),
-                "hook document graph neighbors",
-                |ctx| {
-                    let mut resolve = indexed_file_path(&ctx.conn, &handle.root);
-                    let mut files = Vec::new();
-                    let found = doc_graph_neighbors(
-                        &ctx.conn,
-                        &path_tokens,
-                        &seen,
-                        usize::MAX,
-                        query_embedding.as_deref(),
-                        |collection, path| {
-                            files.push(resolve(collection, path));
-                            true
-                        },
-                    )?;
-                    Ok(found.into_iter().zip(files).collect::<Vec<_>>())
-                },
-            ) {
-                Some(Ok(found)) => candidates = found,
-                Some(Err(error)) => tracing::debug!("hook document neighbors failed: {error}"),
-                None => {}
-            }
+            let (tokens, embedding) = (path_tokens.clone(), query_embedding.clone());
+            let (root, cap) = (handle.root.clone(), handle.config.graph.doc_neighbor_cap);
+            // On the blocking pool, like the docs leg: the file checks run once
+            // the store guard is dropped, and a stat that hangs must not hold a
+            // runtime worker past the hook deadline.
+            let found = tokio::task::spawn_blocking(move || {
+                let candidates = crate::core::run_guarded_read(
+                    store.slot(),
+                    "hook document graph neighbors",
+                    |ctx| {
+                        let found =
+                            doc_graph_neighbors(&ctx.conn, &tokens, &seen, embedding.as_deref())?;
+                        Ok(with_files(
+                            &ctx.conn,
+                            &root,
+                            found,
+                            |(path, _, collection)| (collection.as_str(), path.as_str()),
+                        ))
+                    },
+                );
+                drop(store);
+                match candidates {
+                    Some(Ok(found)) => take_present(found, cap),
+                    Some(Err(error)) => {
+                        tracing::debug!("hook document neighbors failed: {error}");
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                }
+            })
+            .await;
+            neighbors = found
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, relation, _)| (path, relation))
+                .collect();
         }
-        neighbors = candidates
-            .into_iter()
-            .filter(|(_, file)| file_still_there(file))
-            .map(|(neighbor, _)| neighbor)
-            .take(handle.config.graph.doc_neighbor_cap)
-            .collect();
     }
 
     phases.mark("enrich");
@@ -6221,20 +6221,17 @@ async fn prompt_prior_block(
 }
 
 /// Resolve doc-path `tokens` to their 1-hop *frontmatter* graph neighbors that
-/// point at real documents, formatted as `- <path> (<relation>)` lines, capped
-/// at `cap`. Soft wikilink edges are skipped (frontmatter relations are the
+/// point at real documents, as `(path, relation, collection)` in rank order.
+/// Soft wikilink edges are skipped (frontmatter relations are the
 /// strong, curated signal) and so are non-document targets (entity tags like
 /// `themes`/`owner`). Neighbors whose canonical path is in `seen`
-/// (already-injected memory ids) or already emitted are de-duplicated, and so are
-/// those the caller's `present` rejects.
+/// (already-injected memory ids) or already emitted are de-duplicated.
 fn doc_graph_neighbors(
     conn: &rusqlite::Connection,
     tokens: &[String],
     seen: &std::collections::HashSet<String>,
-    cap: usize,
     query_embedding: Option<&[f32]>,
-    mut present: impl FnMut(&str, &str) -> bool,
-) -> crate::Result<Vec<(String, String)>> {
+) -> crate::Result<Vec<(String, String, String)>> {
     use crate::store::graph;
     let mut candidates: Vec<((String, String, String), Option<f32>)> = Vec::new();
     let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -6276,14 +6273,7 @@ fn doc_graph_neighbors(
         }
     }
     rank_graph_candidates(&mut candidates);
-    // The file check runs in rank order and stops at `cap`: one stat per
-    // neighbor that could be injected, not per edge.
-    Ok(candidates
-        .into_iter()
-        .filter(|((path, _, collection), _)| present(collection, path))
-        .take(cap)
-        .map(|((path, relation, _), _)| (path, relation))
-        .collect())
+    Ok(candidates.into_iter().map(|(item, _)| item).collect())
 }
 
 /// Number of trailing transcript lines that form the mined episode window.
@@ -9420,8 +9410,6 @@ mod tests {
                 vec![scored_hit("archive/x.md", "Unrelated title", Some(c))],
                 "perche la dettatura resta bloccata",
                 floor,
-                |_| true,
-                usize::MAX,
             )
             .is_empty()
         };
@@ -9439,18 +9427,10 @@ mod tests {
                 scored_hit("docs/quarantine.md", "Quarantine autoheal handling", None),
             ]
         };
-        assert!(
-            admit_doc_hits(hits(), "how does the sandbox work today", 0.55, |_| true, 9).is_empty()
-        );
-        let by_identifier = admit_doc_hits(
-            hits(),
-            "where is quarantine.md described",
-            0.55,
-            |_| true,
-            9,
-        );
+        assert!(admit_doc_hits(hits(), "how does the sandbox work today", 0.55).is_empty());
+        let by_identifier = admit_doc_hits(hits(), "where is quarantine.md described", 0.55);
         assert_eq!(by_identifier.len(), 1);
-        assert_eq!(by_identifier[0].0, "docs/quarantine.md");
+        assert_eq!(by_identifier[0].path, "docs/quarantine.md");
     }
 
     /// Story 193: the docs leg had no absolute floor. RRF normalization pins
@@ -11024,6 +11004,21 @@ mod tests {
         assert_eq!(graph_neighbor_cosine(&zero, &[1.0, 0.0]), None);
     }
 
+    /// The best-ranked neighbor of `seed.md`, as `(path, relation)`.
+    fn top_neighbor(conn: &rusqlite::Connection, query: Option<&[f32]>) -> Vec<(String, String)> {
+        doc_graph_neighbors(
+            conn,
+            &["seed.md".into()],
+            &std::collections::HashSet::new(),
+            query,
+        )
+        .unwrap()
+        .into_iter()
+        .take(1)
+        .map(|(path, relation, _)| (path, relation))
+        .collect()
+    }
+
     #[test]
     fn document_expansion_picks_an_older_relevant_neighbor_before_newer_edges() {
         crate::store::vectors::init_sqlite_vec();
@@ -11125,41 +11120,17 @@ mod tests {
             .unwrap();
         }
 
-        let out = doc_graph_neighbors(
-            &conn,
-            &["seed.md".into()],
-            &std::collections::HashSet::new(),
-            1,
-            Some(&[1.0, 0.0]),
-            |_, _| true,
-        )
-        .unwrap();
+        let out = top_neighbor(&conn, Some(&[1.0, 0.0]));
         assert_eq!(
             out,
             [("relevant.md".into(), "related".into())],
             "identical vector has cosine 1; both newer orthogonal vectors have cosine 0"
         );
 
-        let cold = doc_graph_neighbors(
-            &conn,
-            &["seed.md".into()],
-            &std::collections::HashSet::new(),
-            1,
-            None,
-            |_, _| true,
-        )
-        .unwrap();
+        let cold = top_neighbor(&conn, None);
         assert_eq!(cold, [("newer-b.md".into(), "related".into())]);
         assert_eq!(
-            doc_graph_neighbors(
-                &conn,
-                &["seed.md".into()],
-                &std::collections::HashSet::new(),
-                1,
-                Some(&[f32::NAN, 0.0]),
-                |_, _| true,
-            )
-            .unwrap(),
+            top_neighbor(&conn, Some(&[f32::NAN, 0.0])),
             cold,
             "non-finite query scores fall back to stable edge order"
         );
@@ -16443,65 +16414,37 @@ mod tests {
 
     // ---- critic 226-d09e: recall drops documents whose file is gone ----
 
-    fn quarantine_hits(n: usize) -> Vec<(crate::domain::SearchResult, Option<f64>)> {
-        (0..n)
-            .map(|i| scored_hit(&format!("docs/d{i}.md"), "Quarantine autoheal", None))
-            .collect()
-    }
-
-    /// Catches: the file check running on every search hit (or on hits the
-    /// admission gate already dropped) instead of lazily until `limit` are found.
-    /// 10 admitted hits, limit 2, all present: exactly 2 stats.
-    #[test]
-    fn critic_226_file_check_stops_at_the_limit() {
-        let mut calls = 0;
-        let got = admit_doc_hits(
-            quarantine_hits(10),
-            "how does quarantine autoheal work",
-            0.55,
-            |_| {
-                calls += 1;
-                true
-            },
-            2,
+    /// Catches: `.take(limit)` placed before the file check, so missing
+    /// top-ranked documents eat the slots and fewer than `limit` are injected
+    /// although later hits exist. Limit 2, five matching documents, the first
+    /// two deleted: the next two are injected, and no more.
+    #[tokio::test]
+    async fn critic_226_missing_documents_do_not_consume_the_docs_limit() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.hooks.recall_docs_limit = 2;
+        });
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        for i in 0..5 {
+            seed_document(
+                &handle,
+                &format!("docs/d{i}.md"),
+                "Quarantine autoheal",
+                content,
+            )
+            .await;
+        }
+        for i in [0, 1] {
+            std::fs::remove_file(tmp.path().join(format!("docs/docs/d{i}.md"))).unwrap();
+        }
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert_eq!(body.matches("docs/d").count(), 2, "{body}");
+        assert!(
+            !body.contains("docs/d0.md") && !body.contains("docs/d1.md"),
+            "{body}"
         );
-        assert_eq!(got.len(), 2);
-        assert_eq!(calls, 2, "one stat per injected candidate, not per hit");
-    }
-
-    /// Catches: `.take(limit)` placed before the file filter, so a missing
-    /// top-ranked document eats a slot and fewer than `limit` are injected
-    /// although later hits exist.
-    #[test]
-    fn critic_226_missing_hits_do_not_consume_the_limit() {
-        let got = admit_doc_hits(
-            quarantine_hits(5),
-            "how does quarantine autoheal work",
-            0.55,
-            |hit| !matches!(hit.path.as_str(), "docs/d0.md" | "docs/d1.md"),
-            2,
-        );
-        let paths: Vec<&str> = got.iter().map(|(p, _)| p.as_str()).collect();
-        assert_eq!(paths, ["docs/d2.md", "docs/d3.md"]);
-    }
-
-    /// Catches: the file check running before the admission gate, paying a stat
-    /// for hits that were never going to be injected.
-    #[test]
-    fn critic_226_unadmitted_hits_are_not_stat_ed() {
-        let mut calls = 0;
-        let got = admit_doc_hits(
-            vec![scored_hit("archive/x.md", "Unrelated title", Some(0.1))],
-            "how does quarantine autoheal work",
-            0.55,
-            |_| {
-                calls += 1;
-                true
-            },
-            3,
-        );
-        assert!(got.is_empty());
-        assert_eq!(calls, 0);
     }
 
     /// Catches: only the first hit being checked / limit 1 with a deleted top
@@ -16779,7 +16722,7 @@ mod tests {
 
     /// Catches: a stat error other than absence (EACCES on the parent dir)
     /// dropping the document. `update` keeps the row in that case, so recall
-    /// must too (documented in `file_still_there`).
+    /// must too (documented in `take_present`).
     #[cfg(unix)]
     #[tokio::test]
     async fn critic_226_unreadable_directory_keeps_the_document() {
@@ -16944,12 +16887,12 @@ mod tests {
         assert!(body.contains("locked/n.md (related)"), "{body}");
     }
 
-    /// Catches: `present` run per edge, before dedupe and before the cap, so a
-    /// hub document with many edges costs one stat per edge; or a rejected
-    /// neighbor eating a cap slot. 6 targets, one of them `seen`, one reached
-    /// by two relations, cap 2, the first two asked rejected.
+    /// Catches: the candidate list handed to the file check holding a seen path
+    /// or the same neighbor twice (reached by two relations), so a hub document
+    /// costs more than one stat per neighbor. 6 targets, one `seen`, one reached
+    /// by two relations: 5 distinct candidates.
     #[test]
-    fn critic_226r2_neighbor_presence_is_lazy_deduped_and_does_not_eat_the_cap() {
+    fn critic_226r2_neighbor_candidates_are_deduped_and_exclude_seen() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         crate::store::schema::init_schema(&conn).unwrap();
         conn.execute(
@@ -16998,29 +16941,9 @@ mod tests {
             .unwrap();
         }
         let seen: std::collections::HashSet<String> = ["n0.md".to_string()].into();
-        let mut asked: Vec<String> = Vec::new();
-        let got = doc_graph_neighbors(&conn, &["seed.md".into()], &seen, 2, None, |_, path| {
-            asked.push(path.to_string());
-            asked.len() > 2
-        })
-        .unwrap();
-        assert_eq!(got.len(), 2, "two rejected neighbors must not eat the cap");
-        assert_eq!(asked.len(), 4, "stops at the cap: {asked:?}");
-        let mut distinct = asked.clone();
-        distinct.sort();
-        distinct.dedup();
-        assert_eq!(
-            distinct.len(),
-            asked.len(),
-            "one stat per neighbor: {asked:?}"
-        );
-        assert!(
-            !asked.contains(&"n0.md".to_string()),
-            "a seen path is not stat-ed"
-        );
-        assert!(
-            got.iter().all(|(p, _)| !asked[..2].contains(p)),
-            "a rejected neighbor was returned: {got:?} vs {asked:?}"
-        );
+        let got = doc_graph_neighbors(&conn, &["seed.md".into()], &seen, None).unwrap();
+        let mut paths: Vec<&str> = got.iter().map(|(p, _, _)| p.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["n1.md", "n2.md", "n3.md", "n4.md", "n5.md"]);
     }
 }
