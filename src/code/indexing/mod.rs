@@ -407,25 +407,30 @@ impl IndexFacade {
         let mut symbol_ids = HashSet::new();
         let mut outcome = Ok(());
         for rel_path in rel_paths {
-            // Collect symbol IDs before deleting (for embedding cleanup)
-            symbol_ids.extend(self.get_symbol_ids_for_path(rel_path));
+            // Collect symbol IDs before deleting (for embedding cleanup), but
+            // keep them only once the rows are gone: a failed delete leaves the
+            // file indexed, and its vectors must stay with it.
+            let ids = self.get_symbol_ids_for_path(rel_path);
             if let Err(e) = self.db.delete_by_file(rel_path) {
                 outcome = Err(e.into());
                 break;
             }
+            symbol_ids.extend(ids);
         }
 
         // Opening the semantic store costs a file handle, not the embedding
         // model: the model is acquired inside `generate_*`, which a delete never
         // reaches. Skipping the open when it happened not to be warm left the
         // vectors of every deleted file behind — the watcher never warms it.
-        if let Some(semantic) = self.ensure_semantic() {
-            if let Err(e) = semantic.remove_embeddings(&symbol_ids) {
-                tracing::error!(
-                    error = %e,
-                    symbol_count = symbol_ids.len(),
-                    "Failed to remove embeddings for deleted symbols — orphaned embeddings remain in vector store"
-                );
+        if !symbol_ids.is_empty() {
+            if let Some(semantic) = self.ensure_semantic() {
+                if let Err(e) = semantic.remove_embeddings(&symbol_ids) {
+                    tracing::error!(
+                        error = %e,
+                        symbol_count = symbol_ids.len(),
+                        "Failed to remove embeddings for deleted symbols — orphaned embeddings remain in vector store"
+                    );
+                }
             }
         }
 
