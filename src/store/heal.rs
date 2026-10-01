@@ -2459,3 +2459,53 @@ mod unadmitted_probe_tests {
         assert!(has_process_probe(&db));
     }
 }
+
+#[cfg(test)]
+mod critic_201b_r4 {
+    use super::*;
+
+    /// Catches: the process-memory verdict recorded by a lock-free probe during
+    /// which a writer invalidated the marker but had not yet written: a daemon
+    /// reopen would trust "sound" for a store with an unverified write in flight.
+    #[test]
+    fn a_writer_starting_during_the_probe_leaves_no_process_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        verify_and_mark_unadmitted_with(&db, |conn| {
+            invalidate_marker(&db);
+            is_structurally_sound(conn)
+        })
+        .unwrap();
+        assert!(!has_process_probe(&db));
+    }
+
+    /// Catches: a probe verdict for the OLD file recorded after the store was
+    /// replaced (quarantine + rebuild) while the probe ran.
+    #[test]
+    fn a_replaced_database_gets_no_verdict_from_the_old_file_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        verify_and_mark_unadmitted_with(&db, |conn| {
+            let verdict = is_structurally_sound(conn);
+            let aside = dir.path().join("aside");
+            std::fs::rename(&db, &aside).unwrap();
+            std::fs::copy(&aside, &db).unwrap();
+            verdict
+        })
+        .unwrap();
+        assert!(!has_process_probe(&db));
+        assert!(!marker_path(&db).exists());
+    }
+}

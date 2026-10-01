@@ -294,3 +294,73 @@ fn the_unverified_update_releases_the_mutation_lock() {
     handle_update_unverified(&ctx, dir.path()).unwrap();
     assert!(lock_is_free(&ctx.db_path, false));
 }
+
+/// Catches: concurrent daemon mutations (watcher flush + Stop-hook settle +
+/// memory sync) whose lock-free probes overlap other writers reporting a
+/// COMMITTED write as failed (probe BUSY/corrupt verdict on a moving WAL), or
+/// deadlocking between the slot and the writer admission.
+#[test]
+fn overlapping_mutations_with_lock_free_probes_all_succeed() {
+    let dir = TempDir::new().unwrap();
+    let slot = std::sync::Arc::new(slot_in(dir.path()));
+    run_mutation_verify_after_release(&slot, "setup", |ctx| {
+        ctx.conn.execute_batch(
+            "CREATE TABLE crit (x BLOB); WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<20000) INSERT INTO crit SELECT randomblob(200) FROM n;",
+        )?;
+        Ok(())
+    }, |_| Ok(()))
+    .unwrap()
+    .unwrap();
+    let (tx, rx) = mpsc::channel();
+    for t in 0..4 {
+        let slot = std::sync::Arc::clone(&slot);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut errs = Vec::new();
+            for i in 0..6 {
+                let out = mdkb::core::run_mutation(&slot, "crit", |ctx| {
+                    ctx.conn
+                        .execute("INSERT INTO crit VALUES (randomblob(200))", [])?;
+                    Ok(())
+                });
+                match out {
+                    Some(Ok(())) => {}
+                    other => errs.push(format!("t{t} i{i}: {other:?}")),
+                }
+            }
+            let _ = tx.send(errs);
+        });
+    }
+    drop(tx);
+    let mut all = Vec::new();
+    for _ in 0..4 {
+        all.extend(rx.recv_timeout(Duration::from_secs(120)).expect("deadlock"));
+    }
+    assert!(all.is_empty(), "{all:#?}");
+    assert!(
+        slot.try_lock().unwrap().is_some(),
+        "slot closed by a false corruption verdict"
+    );
+}
+
+/// Catches: a verdict recorded for a store whose writer announced itself
+/// (`invalidate_marker`) while the probe ran but had not written yet: the
+/// marker/process memory would then certify a write in flight.
+#[test]
+fn a_writer_starting_during_the_probe_blocks_the_marker() {
+    let dir = TempDir::new().unwrap();
+    let db = dir.path().join("index.sqlite");
+    let holder = Connection::open(&db).unwrap();
+    holder
+        .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+        .unwrap();
+    heal::verify_and_mark_unadmitted_with(&db, |conn| {
+        heal::invalidate_marker(&db); // another writer admitted, bytes not yet written
+        heal::is_structurally_sound(conn)
+    })
+    .unwrap();
+    assert!(
+        !marker(&db).exists(),
+        "marker recreated after a writer invalidated it mid-probe"
+    );
+}

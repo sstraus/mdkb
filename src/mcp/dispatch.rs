@@ -9630,6 +9630,41 @@ mod tests {
         );
     }
 
+    /// Catches (critic 201b r4): a daemon memory write/delete/confirm still
+    /// running its full-file integrity probe while holding the repo's store
+    /// slot (`run_handle_memory_mutation` probes in-slot), so the next prompt
+    /// waits out the scan in its context phase.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_delete_does_not_hold_the_store_during_its_probe() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db_path = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let (ctx, probes, held) = (Arc::clone(&handle.ctx), probes.clone(), held.clone());
+            crate::store::heal::probe_observers::observe(
+                &db_path,
+                Arc::new(move || {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    if ctx.try_lock().is_err() {
+                        held.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            );
+        }
+        memory_delete_impl(&handle, "no-such-entry", false)
+            .await
+            .unwrap();
+        assert!(probes.load(Ordering::SeqCst) >= 1, "no probe ran");
+        assert_eq!(
+            held.load(Ordering::SeqCst),
+            0,
+            "a probe started while the store slot was held"
+        );
+    }
+
     #[test]
     fn a_zero_holdout_rate_never_injects() {
         let picks = (0..1000u64)
