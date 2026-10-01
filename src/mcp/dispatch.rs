@@ -8723,6 +8723,46 @@ mod tests {
             status: Some("current".to_string()),
         };
         crate::store::documents::index_document(&ctx.conn, &doc, content).expect("seed doc");
+        // The file recall checks for: where `update` found it, under the
+        // collection's directory.
+        let file = handle.root.join("./docs").join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, content).unwrap();
+    }
+
+    /// Between a deletion and the next `update` the index still lists the
+    /// document. Catches: recall trusting the index and injecting a path whose
+    /// file is gone. On the old code the `deleted` assertion fails (the path is
+    /// in the injected block); the `kept` assertion shows the check drops only
+    /// the missing file, and recall stays read-only (the row survives).
+    #[tokio::test]
+    async fn recall_drops_a_document_whose_file_was_deleted() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "docs/deleted.md", "Quarantine autoheal deleted", content).await;
+        seed_document(&handle, "docs/kept.md", "Quarantine autoheal kept", content).await;
+        std::fs::remove_file(tmp.path().join("docs/docs/deleted.md")).unwrap();
+
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(
+            !body.contains("docs/deleted.md"),
+            "a document whose file is gone must not be injected: {body}"
+        );
+        assert!(
+            body.contains("docs/kept.md"),
+            "a document whose file exists must still be injected: {body}"
+        );
+
+        let ctx_guard = handle.ctx.lock().await;
+        let rows: i64 = ctx_guard
+            .as_ref()
+            .unwrap()
+            .conn
+            .query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 2, "recall must not prune the index; update does");
     }
 
     #[tokio::test]
