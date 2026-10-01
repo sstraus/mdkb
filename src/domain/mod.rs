@@ -295,6 +295,11 @@ pub struct UpdateResult {
     #[serde(default)]
     pub collections_vanished: Vec<String>,
 
+    /// Auto-detected collections unregistered this run because their directory
+    /// no longer exists. A deliberate removal, so never reported as vanished.
+    #[serde(default)]
+    pub collections_pruned: Vec<String>,
+
     /// True when the store has no document collection registered at all. A run
     /// like that indexes nothing, and "Docs: 0 indexed" reads identically to a
     /// healthy no-op.

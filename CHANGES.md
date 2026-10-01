@@ -4,6 +4,19 @@
 
 ### Fixed
 
+- **`mdkb update` prunes the collection of a deleted directory.** An
+  auto-detected collection (`docs`, `archive`) whose directory is gone was only
+  reported as a missing path, so its documents stayed searchable and recall kept
+  injecting them. It is now unregistered and its documents removed; the
+  collection returns, re-indexed, when the directory does. A hand-registered or
+  hand-repointed collection (`collection update --path` now marks it manual)
+  keeps the path error. When a store has several convention collections and all
+  would go in one run, none is pruned and the update says so (likely an
+  unmounted volume; `mdkb collection remove <name>` for a deliberate deletion).
+  With a single convention collection the deleted directory is pruned: the data
+  is derived index data, rebuilt when the directory returns; evolution rows
+  cascade. Story 214-1b93.
+
 - **The UserPromptSubmit deadline is reachable on the daemon path.** The hook
   client gave up after a fixed 1 s, so a daemon answer between 1 s and the
   1500 ms deadline was dropped and the host got no recall. The client now waits
