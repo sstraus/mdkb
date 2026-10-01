@@ -12,9 +12,13 @@ use crate::error::{Error, Result};
 /// The stores `root="*"` can read: the known roots and the stores nested under
 /// them. Refreshing the same set is what makes the footer's outdated line go
 /// away.
-fn stores_in_scope() -> Vec<PathBuf> {
-    let known = read_known_roots(&DaemonConfig::daemon_home().join("repos.json"));
-    discover_nested_stores(&known).into_iter().collect()
+fn stores_in_scope() -> Result<Vec<PathBuf>> {
+    let home = DaemonConfig::daemon_home();
+    let known = read_known_roots(&home.join("repos.json"));
+    let ignore = DaemonConfig::load_or_default(&home.join("daemon.toml"))?.ignored_paths();
+    Ok(discover_nested_stores(&known, &ignore)
+        .into_iter()
+        .collect())
 }
 
 pub fn handle_refresh(only: RefreshFilter) -> Result<()> {
@@ -28,7 +32,7 @@ pub fn handle_refresh(only: RefreshFilter) -> Result<()> {
              stores, and a namespace redirects every store path. Unset MDKB_NAMESPACE."
         )));
     }
-    let reports = refresh_outdated(&stores_in_scope());
+    let reports = refresh_outdated(&stores_in_scope()?);
     let (text, failed) = render_refresh(&reports);
     print!("{text}");
     if failed > 0 {

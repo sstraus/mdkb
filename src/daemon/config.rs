@@ -111,6 +111,11 @@ pub struct DaemonConfig {
     /// See [`DEFAULT_DISCOVERY_CACHE_SECS`]. `0` disables the cache.
     pub discovery_cache_secs: u64,
 
+    /// Directories whose stores are never discovered and never part of
+    /// `root="*"`: a path here silences every store at or below it. Hand-owned
+    /// like the rest of this file; `~/` is expanded.
+    pub ignore: Vec<String>,
+
     /// Global `[priors]` layer applied as the base for every repo. The distiller
     /// (program/args/model) is a machine-wide choice, so it belongs here — set it
     /// once instead of per-repo. A repo's `.mdkb/config.toml` `[priors]` overrides
@@ -146,6 +151,7 @@ impl Default for DaemonConfig {
             whitelist_dirs: Vec::new(),
             repos: Vec::new(),
             discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
+            ignore: Vec::new(),
             priors: toml::Table::new(),
             state_dir: None,
         }
@@ -176,6 +182,46 @@ impl DaemonConfig {
     /// this config.
     pub fn repo_map_path(&self) -> Option<PathBuf> {
         self.state_dir.as_ref().map(|d| d.join(REPO_MAP_NAME))
+    }
+
+    /// [`ignore`](Self::ignore) as the canonical paths discovery compares
+    /// against. A path that does not resolve is kept as written.
+    ///
+    /// An entry that cannot name one directory is dropped, with one warning
+    /// naming them all: an empty entry would match every path
+    /// (`Path::starts_with("")`), a relative one depends on the working
+    /// directory, and a `~` whose home is unknown has no meaning.
+    pub fn ignored_paths(&self) -> Vec<PathBuf> {
+        let mut dropped = Vec::new();
+        let paths = self
+            .ignore
+            .iter()
+            .filter_map(|entry| {
+                // Trailing whitespace is a typo that would silently match
+                // nothing; leading whitespace makes the entry relative, which
+                // is dropped below.
+                let entry = entry.trim_end();
+                let expanded = match entry {
+                    "~" => home_dir().ok(),
+                    e if e.starts_with("~/") => home_dir().ok().map(|h| h.join(&e[2..])),
+                    e if e.trim().is_empty() => None,
+                    e => Some(PathBuf::from(e)),
+                };
+                match expanded.filter(|p| p.is_absolute()) {
+                    Some(path) => Some(crate::domain::canonicalize_plain(&path).unwrap_or(path)),
+                    None => {
+                        dropped.push(entry);
+                        None
+                    }
+                }
+            })
+            .collect();
+        if !dropped.is_empty() {
+            tracing::warn!(
+                "Ignoring daemon.toml ignore entries that are not absolute paths: {dropped:?}"
+            );
+        }
+        paths
     }
 
     /// Save config to a TOML file.
@@ -282,7 +328,9 @@ impl DaemonConfig {
 
 /// Expand ~ at the start of a path to the user's home directory.
 fn expand_tilde(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
+    if path == "~" {
+        home_dir().unwrap_or_else(|_| PathBuf::from("/tmp"))
+    } else if let Some(rest) = path.strip_prefix("~/") {
         home_dir()
             .map(|h| h.join(rest))
             .unwrap_or_else(|_| PathBuf::from("/tmp").join(rest))
@@ -362,6 +410,7 @@ mod tests {
                 },
             ],
             discovery_cache_secs: 90,
+            ignore: Vec::new(),
             priors: toml::from_str("mining_enabled = true\ndistiller_program = \"codex\"").unwrap(),
             state_dir: Some(PathBuf::from("/Users/me/.mdkb")),
         };
@@ -401,6 +450,24 @@ whitelist_dirs = ["~/Code"]
         assert!(config.socket_path.is_none());
     }
 
+    /// Catches: an `ignore` key that parses nowhere, so the operator's list
+    /// never reaches discovery; and a bare `~` left unexpanded.
+    #[test]
+    fn ignore_in_toml_text_reaches_the_config_and_expands_a_bare_tilde() {
+        let config: DaemonConfig =
+            toml::from_str("ignore = [\"/a/.tmp\", \"~\", \"~/x\"]").unwrap();
+        assert_eq!(config.ignore, vec!["/a/.tmp", "~", "~/x"]);
+        let home = home_dir().unwrap();
+        assert_eq!(
+            config.ignored_paths(),
+            vec![
+                PathBuf::from("/a/.tmp"),
+                crate::domain::canonicalize_plain(&home).unwrap_or(home.clone()),
+                home.join("x"),
+            ]
+        );
+    }
+
     #[test]
     fn test_daemon_config_deserialization_empty() {
         let config: DaemonConfig = toml::from_str("").unwrap();
@@ -427,6 +494,7 @@ whitelist_dirs = ["~/Code"]
                 root: "/foo/bar".to_string(),
             }],
             discovery_cache_secs: DEFAULT_DISCOVERY_CACHE_SECS,
+            ignore: Vec::new(),
             priors: toml::Table::new(),
             state_dir: None,
         };
