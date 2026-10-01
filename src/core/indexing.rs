@@ -161,6 +161,20 @@ pub fn update_documents(
     }
 }
 
+/// [`update_documents`] without the closing integrity probe, for a caller that
+/// probes after releasing the store ([`crate::core::run_mutation`]).
+pub fn update_documents_unverified(
+    ctx: &Context,
+    root: impl AsRef<Path>,
+    request: &UpdateRequest,
+) -> Result<UpdateResult> {
+    if request.is_targeted() {
+        run_files_update(ctx, root.as_ref(), &request.files, request.force)
+    } else {
+        run_document_update(ctx, root.as_ref(), request.force)
+    }
+}
+
 /// Handle `mdkb update` command - differential reindex.
 ///
 /// Wraps all collection updates in a single transaction to ensure atomicity.
@@ -224,7 +238,19 @@ pub fn handle_update_force(
     root: impl AsRef<Path>,
     force: bool,
 ) -> Result<UpdateResult> {
-    let root = root.as_ref();
+    let result = run_document_update(ctx, root.as_ref(), force)?;
+    crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
+    Ok(result)
+}
+
+/// [`handle_update`] without the closing integrity probe, for a caller that
+/// runs the probe itself once it has released the store (the daemon watcher:
+/// see [`crate::core::run_mutation_verify_after_release`]).
+pub fn handle_update_unverified(ctx: &Context, root: impl AsRef<Path>) -> Result<UpdateResult> {
+    run_document_update(ctx, root.as_ref(), false)
+}
+
+fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<UpdateResult> {
     let _mutation_guard = crate::store::mutation_lock::acquire(&ctx.db_path, "update")?;
     crate::store::heal::invalidate_marker(&ctx.db_path);
 
@@ -340,8 +366,6 @@ pub fn handle_update_force(
     }
 
     report_collection_deltas(ctx, &before, &mut result);
-
-    crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
 
     Ok(result)
 }
@@ -721,7 +745,17 @@ pub fn handle_update_files_force(
     files: &[String],
     force: bool,
 ) -> Result<UpdateResult> {
-    let root = root.as_ref();
+    let result = run_files_update(ctx, root.as_ref(), files, force)?;
+    crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
+    Ok(result)
+}
+
+fn run_files_update(
+    ctx: &Context,
+    root: &Path,
+    files: &[String],
+    force: bool,
+) -> Result<UpdateResult> {
     let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult::default();
 
@@ -806,7 +840,6 @@ pub fn handle_update_files_force(
         }
         Ok(())
     })?;
-    crate::store::heal::verify_and_mark_throttled(&ctx.db_path)?;
     Ok(result)
 }
 /// Build/dependency directories pruned by the document walker by default.

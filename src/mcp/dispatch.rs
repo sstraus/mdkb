@@ -25,7 +25,7 @@ use crate::cli::hook_logic::{
 use crate::code::indexing::IndexFacade;
 use crate::core::Context;
 use crate::core::cli_mutation::{CliMutation, CliMutationResult};
-use crate::core::indexing::{UpdateOutcome, UpdateRequest, update_documents};
+use crate::core::indexing::{UpdateOutcome, UpdateRequest, update_documents_unverified};
 use crate::core::search::{handle_hybrid_search, handle_mget, hybrid_search_fts};
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 use crate::domain::{SearchResult, UpdateResult};
@@ -729,22 +729,29 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
     Ok(())
 }
 
-/// Run one daemon-backed memory mutation under the cross-process mutation lock,
-/// verify the resulting database through a fresh connection, and release the
-/// long-lived context immediately if the index is corrupt.
+/// Run one daemon-backed memory mutation under the cross-process writer and
+/// mutation locks, verify the resulting database through a fresh connection, and
+/// release the long-lived context if the index is corrupt.
 ///
 /// Memory tools used to write directly through `RepoHandle::ctx`. That bypassed
 /// both the project lock and [`crate::core::run_mutation`], so a daemon
 /// could retain the live lock after detecting corruption and block its own
 /// quarantine indefinitely. The fresh-connection probe is intentional: the
 /// working connection's pager can report a file torn underneath it as healthy.
-fn run_handle_memory_mutation<T>(
-    slot: &mut Option<Context>,
+///
+/// Same contract as [`crate::core::run_mutation`] (the probe runs after the slot
+/// and the locks are released and records its verdict; a corrupt verdict closes
+/// only the context it probed), for closures that borrow from the caller and so
+/// cannot move to a blocking thread: the slot is the async mutex, the probe goes
+/// to `spawn_blocking`.
+async fn run_handle_memory_mutation<T>(
+    slot: &tokio::sync::Mutex<Option<Context>>,
     what: &str,
     f: impl FnOnce(&Context) -> Result<T, McpError>,
 ) -> Result<T, McpError> {
-    let (result, verification) = {
-        let ctx = slot
+    let (db_path, generation, result) = {
+        let guard = slot.lock().await;
+        let ctx = guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
         let _writer_guard = crate::store::mutation_lock::acquire_writer(&ctx.db_path, what)
@@ -754,24 +761,34 @@ fn run_handle_memory_mutation<T>(
 
         crate::store::heal::invalidate_marker(&ctx.db_path);
         let result = f(ctx);
-        let verification = crate::store::heal::verify_and_mark_throttled(&ctx.db_path);
-        (result, verification)
+        (ctx.db_path.clone(), ctx.generation, result)
     };
 
-    let result = close_context_on_reported_corruption(slot, what, result);
+    let probe_path = db_path.clone();
+    let verification = tokio::task::spawn_blocking(move || {
+        crate::store::heal::verify_and_mark_unadmitted(&probe_path)
+    })
+    .await
+    .map_err(|e| mcp_error(format!("integrity probe task failed after {what}: {e}")))?;
 
-    if let Err(error) = verification {
+    if result.as_ref().is_err_and(mcp_error_reports_corruption)
+        || verification.as_ref().is_err_and(|e| e.is_index_corrupt())
+    {
         tracing::error!(
             operation = what,
-            error = %error,
             "index is corrupt after memory mutation — closing this connection so the next open can quarantine, salvage memory and rebuild"
         );
-        crate::core::close_over_corruption(slot);
-        return Err(mcp_error(format!(
-            "Index is corrupt after {what}; the connection was closed for automatic recovery: {error}"
-        )));
+        crate::core::close_over_corruption_of(&mut *slot.lock().await, generation);
     }
-
+    if let Err(error) = verification {
+        return Err(mcp_error(if error.is_index_corrupt() {
+            format!(
+                "Index is corrupt after {what}; the connection was closed for automatic recovery: {error}"
+            )
+        } else {
+            format!("Integrity probe after {what} reached no verdict: {error}")
+        }));
+    }
     result
 }
 
@@ -810,14 +827,17 @@ async fn run_embedding_backfill(handle: Arc<RepoHandle>) -> usize {
     }
     let ctx = Arc::clone(&handle.ctx);
     let drained = tokio::task::spawn_blocking(move || {
-        let mut guard = ctx.blocking_lock();
         // Cheap indexed COUNT(*): only a positive count is worth loading the model.
-        match crate::core::run_guarded_read(&mut guard, "embedding backlog count", |ctx| {
-            crate::store::memory::count_pending_embeddings(&ctx.conn)
-        }) {
+        let pending = {
+            let mut guard = ctx.blocking_lock();
+            crate::core::run_guarded_read(&mut guard, "embedding backlog count", |ctx| {
+                crate::store::memory::count_pending_embeddings(&ctx.conn)
+            })
+        };
+        match pending {
             Some(Ok(0)) | None => Some(0),
             Some(Ok(_)) => {
-                match crate::core::run_mutation(&mut guard, "memory embedding backfill", |ctx| {
+                match crate::core::run_mutation(&ctx, "memory embedding backfill", |ctx| {
                     crate::store::memory::backfill_memory_embeddings(&ctx.conn)
                 }) {
                     Some(Ok(n)) => Some(n),
@@ -954,14 +974,14 @@ pub async fn memory_delete_impl(
         });
     }
 
-    let mut ctx_guard = handle.ctx.lock().await;
-    let deleted = run_handle_memory_mutation(&mut ctx_guard, "memory delete", |ctx| {
+    let deleted = run_handle_memory_mutation(&handle.ctx, "memory delete", |ctx| {
         // Literally the same door as `mdkb memory rm`, not a copy of it: the
         // archive-then-delete order that keeps a retired entry from being
         // re-imported must not exist twice.
         crate::core::memory::handle_memory_rm(ctx, id)
             .map_err(|e| mcp_store_error("Failed to delete memory entry", e))
-    })?;
+    })
+    .await?;
 
     Ok(if deleted {
         format!("Deleted memory entry '{id}'.")
@@ -989,8 +1009,7 @@ pub async fn memory_confirm_impl_for_session(
 ) -> Result<String, McpError> {
     ensure_handle_context(handle).await?;
 
-    let mut ctx_guard = handle.ctx.lock().await;
-    run_handle_memory_mutation(&mut ctx_guard, "memory confirm", |ctx| {
+    run_handle_memory_mutation(&handle.ctx, "memory confirm", |ctx| {
         if let Some(message) = crate::store::priors::record_model_verdict(
             &ctx.conn,
             id,
@@ -1015,6 +1034,7 @@ pub async fn memory_confirm_impl_for_session(
             .map_err(|e| mcp_store_error("Failed to confirm memory entry", e))?;
         Ok(message)
     })
+    .await
 }
 
 /// Generic error returned for any `source_file` rejection (missing,
@@ -1164,8 +1184,8 @@ pub async fn memory_write_impl(
         dry_run,
     };
 
-    let mut ctx_guard = handle.ctx.lock().await;
     if dry_run {
+        let mut ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -1174,7 +1194,7 @@ pub async fn memory_write_impl(
         close_context_on_reported_corruption(&mut ctx_guard, "memory write dry run", result)
     } else {
         let id = input.id;
-        run_handle_memory_mutation(&mut ctx_guard, "memory write", |ctx| {
+        run_handle_memory_mutation(&handle.ctx, "memory write", |ctx| {
             let output = crate::core::memory::write_memory(&ctx.conn, input)
                 .map_err(|error| mcp_store_error("Memory write failed", error))?;
             // Same door as `mdkb memory add`: the file exists the moment the
@@ -1182,6 +1202,7 @@ pub async fn memory_write_impl(
             crate::core::memory_sync::project_after_write(ctx, id, chrono::Utc::now().timestamp());
             Ok(output)
         })
+        .await
     }
 }
 
@@ -1298,15 +1319,15 @@ pub async fn memory_write_batch_impl(
         Ok((results.join("\n"), count))
     };
 
-    let mut ctx_guard = handle.ctx.lock().await;
     if dry_run {
+        let mut ctx_guard = handle.ctx.lock().await;
         let ctx = ctx_guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
         let result = run(ctx);
         close_context_on_reported_corruption(&mut ctx_guard, "memory write batch dry run", result)
     } else {
-        run_handle_memory_mutation(&mut ctx_guard, "memory write batch", run)
+        run_handle_memory_mutation(&handle.ctx, "memory write batch", run).await
     }
 }
 
@@ -2744,9 +2765,8 @@ pub async fn update_impl(
         let root = handle.root.clone();
         let request = request.clone();
         tokio::task::spawn_blocking(move || {
-            let mut ctx_guard = ctx.blocking_lock();
-            crate::core::run_mutation(&mut ctx_guard, "document update", |ctx| {
-                update_documents(ctx, &root, &request)
+            crate::core::run_mutation(&ctx, "document update", |ctx| {
+                update_documents_unverified(ctx, &root, &request)
             })
             .ok_or_else(|| "Database not initialized".to_string())?
             .map_err(|e| format!("Document update failed: {e}"))
@@ -2813,8 +2833,7 @@ async fn index_sessions(handle: &RepoHandle) -> Option<UpdateResult> {
     // with the lock taken on the blocking thread (PERF-1).
     let ctx = Arc::clone(&handle.ctx);
     let indexed = tokio::task::spawn_blocking(move || {
-        let mut ctx_guard = ctx.blocking_lock();
-        crate::core::run_mutation(&mut ctx_guard, "session index", |ctx| {
+        crate::core::run_mutation(&ctx, "session index", |ctx| {
             crate::core::sessions::handle_session_index(ctx, &sessions_base, &project_root)
         })
     })
@@ -5921,10 +5940,15 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let mut guard = handle.ctx.lock().await;
-    match crate::core::run_mutation(&mut guard, "prior settling", |ctx| {
-        settle_injections(&ctx.conn, &session, now, &errors)
-    }) {
+    let ctx = Arc::clone(&handle.ctx);
+    let settle_session_id = session.clone();
+    let prior_outcome = tokio::task::spawn_blocking(move || {
+        crate::core::run_mutation(&ctx, "prior settling", |ctx| {
+            settle_injections(&ctx.conn, &settle_session_id, now, &errors)
+        })
+    })
+    .await;
+    match prior_outcome.unwrap_or(None) {
         Some(Ok(report)) if !report.is_empty() => {
             // All three outcomes are logged, not just the one that moves a
             // counter: a run that settles nothing but `unobservable` is the
@@ -5952,11 +5976,17 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
 
     // Recall candidates offered in this session, labelled from the same
     // window. Only strong signals label; the rest stay open, not negative.
-    match crate::core::run_mutation(&mut guard, "recall settling", |ctx| {
-        let open = crate::store::recall_ledger::open_candidates(&ctx.conn, &session)?;
-        let labels = crate::domain::recall_outcome::label(&open, &recall_events);
-        crate::store::recall_ledger::set_outcomes(&ctx.conn, &labels, now)
-    }) {
+    let ctx = Arc::clone(&handle.ctx);
+    let ledger_session = session.clone();
+    let recall_outcome = tokio::task::spawn_blocking(move || {
+        crate::core::run_mutation(&ctx, "recall settling", |ctx| {
+            let open = crate::store::recall_ledger::open_candidates(&ctx.conn, &ledger_session)?;
+            let labels = crate::domain::recall_outcome::label(&open, &recall_events);
+            crate::store::recall_ledger::set_outcomes(&ctx.conn, &labels, now)
+        })
+    })
+    .await;
+    match recall_outcome.unwrap_or(None) {
         Some(Ok(labelled)) if labelled > 0 => {
             tracing::info!(
                 "recall settling: labelled {labelled} candidate(s) in session {session}"
@@ -6150,17 +6180,25 @@ async fn mine_episode_inner(
         return MiningOutcome::Failed(format!("open store failed: {e}"));
     }
     let now = chrono::Utc::now().timestamp();
-    let mut guard = handle.ctx.lock().await;
-    match crate::core::run_mutation(&mut guard, "prior mining", |ctx| {
-        integrate_distilled(
-            &ctx.conn,
-            &distilled,
-            &session,
-            now,
-            lesson_embedding.as_deref(),
-            error_signature.as_deref(),
-        )
-    }) {
+    let ctx = Arc::clone(&handle.ctx);
+    let integrated = tokio::task::spawn_blocking(move || {
+        crate::core::run_mutation(&ctx, "prior mining", |ctx| {
+            integrate_distilled(
+                &ctx.conn,
+                &distilled,
+                &session,
+                now,
+                lesson_embedding.as_deref(),
+                error_signature.as_deref(),
+            )
+        })
+    })
+    .await;
+    let integrated = match integrated {
+        Ok(outcome) => outcome,
+        Err(e) => return MiningOutcome::Failed(format!("integrate task failed: {e}")),
+    };
+    match integrated {
         Some(Err(error)) => {
             tracing::debug!("prior mining: integrate_distilled failed: {error}");
             MiningOutcome::Failed(format!("integrate failed: {error}"))
@@ -6662,8 +6700,7 @@ async fn cli_mutate_impl(
         } => {
             ensure_handle_context(handle).await?;
             let (prune, index_bytes) = {
-                let mut slot = handle.ctx.lock().await;
-                run_handle_memory_mutation(&mut slot, "compact", |ctx| {
+                run_handle_memory_mutation(&handle.ctx, "compact", |ctx| {
                     let prune = if prune_sessions {
                         let raw = older_than.as_deref().ok_or_else(|| mcp_error(
                             "--prune-sessions requires --older-than <e.g. 90d> to avoid deleting recent archives",
@@ -6682,6 +6719,7 @@ async fn cli_mutate_impl(
                         .map_err(|e| mcp_store_error("Failed to vacuum index.sqlite", e))?;
                     Ok((prune, ctx.db_path.metadata().map(|m| m.len()).unwrap_or(0)))
                 })
+                .await
                 .map_err(|e| mcp_error(format!("compact failed: {e}")))?
             };
 
@@ -6708,18 +6746,17 @@ async fn cli_mutate_impl(
         mutation => {
             let is_embed = matches!(mutation, CliMutation::Embed { .. });
             ensure_handle_context(handle).await?;
-            let mut slot = handle.ctx.lock().await;
             // No outer wrap: `run_handle_memory_mutation` already returns an
             // `McpError`, so re-wrapping stringified one error inside another and
             // repeated both the code and the phrase, pushing the one fact the
             // operator needs to the end of the line. It also flattened the code
             // the inner error had earned, which is what tells the CLI whether the
             // write started.
-            let outcome = run_handle_memory_mutation(&mut slot, "cli mutation", |ctx| {
+            let outcome = run_handle_memory_mutation(&handle.ctx, "cli mutation", |ctx| {
                 crate::core::cli_mutation::execute_context_mutation(ctx, mutation)
                     .map_err(|e| mcp_store_error("CLI mutation failed", e))
-            });
-            drop(slot);
+            })
+            .await;
             // The reranker weights are 280 MB: fetch them after the embedding,
             // so an offline machine still gets its vectors, and after the store
             // lock is released, or every hook for this repo waits at `lock_wait`
@@ -7467,8 +7504,7 @@ mod tests {
             .expect("initialize context");
 
         let error = {
-            let mut slot = handle.ctx.lock().await;
-            run_handle_memory_mutation(&mut slot, "corruption regression test", |ctx| {
+            run_handle_memory_mutation(&handle.ctx, "corruption regression test", |ctx| {
                 ctx.conn
                     .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                     .expect("checkpoint before truncation");
@@ -7480,6 +7516,7 @@ mod tests {
                 file.set_len(len / 2).unwrap();
                 Ok(())
             })
+            .await
             .expect_err("fresh-connection verification must detect the torn file")
         };
 
@@ -9567,6 +9604,82 @@ mod tests {
             )
             .unwrap();
         assert_eq!(outcome.as_deref(), Some("used"));
+    }
+
+    /// Catches: a Stop-hook settle running its integrity probe while holding the
+    /// repo's store slot, so the next prompt waits out a full-file scan in its
+    /// context phase (#201-481e: every Stop hook invalidates the marker).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_hook_settle_does_not_hold_the_store_during_its_probe() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db_path = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let (ctx, probes, held) = (Arc::clone(&handle.ctx), probes.clone(), held.clone());
+            crate::store::heal::probe_observers::observe(
+                &db_path,
+                Arc::new(move || {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    if ctx.try_lock().is_err() {
+                        held.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            );
+        }
+        let transcript = tmp.path().join("transcript.jsonl");
+        std::fs::write(&transcript, "{}\n").unwrap();
+        settle_session(
+            Arc::clone(&handle),
+            transcript.to_string_lossy().into_owned(),
+            "s-probe".into(),
+        )
+        .await;
+
+        assert!(probes.load(Ordering::SeqCst) >= 1, "no probe ran");
+        assert_eq!(
+            held.load(Ordering::SeqCst),
+            0,
+            "a probe started while the store slot was held"
+        );
+    }
+
+    /// Catches (critic 201b r4): a daemon memory write/delete/confirm still
+    /// running its full-file integrity probe while holding the repo's store
+    /// slot (`run_handle_memory_mutation` probes in-slot), so the next prompt
+    /// waits out the scan in its context phase.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_memory_delete_does_not_hold_the_store_during_its_probe() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let db_path = handle.ctx.lock().await.as_ref().unwrap().db_path.clone();
+        let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let (ctx, probes, held) = (Arc::clone(&handle.ctx), probes.clone(), held.clone());
+            crate::store::heal::probe_observers::observe(
+                &db_path,
+                Arc::new(move || {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    if ctx.try_lock().is_err() {
+                        held.fetch_add(1, Ordering::SeqCst);
+                    }
+                }),
+            );
+        }
+        memory_delete_impl(&handle, "no-such-entry", false)
+            .await
+            .unwrap();
+        assert!(probes.load(Ordering::SeqCst) >= 1, "no probe ran");
+        assert_eq!(
+            held.load(Ordering::SeqCst),
+            0,
+            "a probe started while the store slot was held"
+        );
     }
 
     #[test]

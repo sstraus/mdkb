@@ -216,11 +216,34 @@ fn touch_marker(marker: &Path) {
     let _ = std::fs::File::create(marker);
 }
 
+/// How many times a writer announced itself ([`invalidate_marker`]) per
+/// database, in this process. A lock-free probe compares it before and after:
+/// a writer that has announced itself but not yet written leaves the file's
+/// stamp unchanged, yet a verdict recorded then would certify a write in flight.
+static INVALIDATIONS: Mutex<Option<HashMap<PathBuf, u64>>> = Mutex::new(None);
+
+fn bump_invalidations(db_path: &Path) {
+    let mut guard = INVALIDATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard
+        .get_or_insert_with(HashMap::new)
+        .entry(db_path.to_path_buf())
+        .or_insert(0) += 1;
+}
+
+fn invalidations(db_path: &Path) -> u64 {
+    let guard = INVALIDATIONS.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|map| map.get(db_path).copied())
+        .unwrap_or(0)
+}
+
 /// Invalidate the last successful integrity probe before an index-wide write.
 ///
 /// If the process crashes mid-mutation, the next open cannot trust an old
 /// marker and will run `quick_check` before using the index.
 pub fn invalidate_marker(db_path: &Path) {
+    bump_invalidations(db_path);
     forget_process_probe(db_path);
     let _ = std::fs::remove_file(marker_path(db_path));
 }
@@ -239,6 +262,35 @@ pub enum Soundness {
     Undetermined(rusqlite::Error),
 }
 
+/// Test seam: lets a test see what the caller holds at the moment a probe
+/// starts. Keyed by database path, so parallel tests do not see each other's.
+#[cfg(test)]
+pub(crate) mod probe_observers {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    type Observer = Arc<dyn Fn() + Send + Sync>;
+    static OBSERVERS: Mutex<Vec<(PathBuf, Observer)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn observe(db_path: &Path, observer: Observer) {
+        let mut all = OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
+        all.push((db_path.to_path_buf(), observer));
+    }
+
+    pub(super) fn notify(db_path: &Path) {
+        let observers: Vec<Observer> = {
+            let all = OBSERVERS.lock().unwrap_or_else(|e| e.into_inner());
+            all.iter()
+                .filter(|(path, _)| path == db_path)
+                .map(|(_, o)| Arc::clone(o))
+                .collect()
+        };
+        for observer in observers {
+            observer();
+        }
+    }
+}
+
 /// Open a throwaway connection for an integrity probe.
 ///
 /// A fresh connection, because a long-lived one answers `quick_check` out of
@@ -248,6 +300,8 @@ pub enum Soundness {
 /// Waits [`PROBE_BUSY_TIMEOUT`] on a lock: a probe that gives up at once turns
 /// every concurrent writer into a `BUSY` verdict.
 fn open_probe(db_path: &Path) -> rusqlite::Result<Connection> {
+    #[cfg(test)]
+    probe_observers::notify(db_path);
     let conn = Connection::open(db_path)?;
     conn.busy_timeout(PROBE_BUSY_TIMEOUT)?;
     Ok(conn)
@@ -281,6 +335,71 @@ pub fn verify_and_mark(conn: &Connection, db_path: &Path) -> Result<()> {
     match is_structurally_sound(conn) {
         Soundness::Sound => {
             touch_marker(&marker_path(db_path));
+            Ok(())
+        }
+        Soundness::Corrupt { .. } => {
+            invalidate_marker(db_path);
+            Err(crate::error::ErrorKind::IndexCorrupt {
+                path: db_path.to_path_buf(),
+            }
+            .into())
+        }
+        Soundness::Undetermined(e) => Err(e.into()),
+    }
+}
+
+/// What a write or a replacement changes: size and mtime of the database and
+/// its WAL, and the identity of the database file.
+#[derive(PartialEq)]
+struct WriteStamp {
+    files: [Option<(SystemTime, u64)>; 2],
+    identity: Option<(u64, u64)>,
+}
+
+fn write_stamp(db_path: &Path) -> WriteStamp {
+    WriteStamp {
+        files: [db_path.to_path_buf(), with_suffix(db_path, "-wal")].map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        }),
+        identity: file_identity(db_path),
+    }
+}
+
+/// [`verify_and_mark_throttled`] for a caller that holds neither the writer
+/// admission nor the mutation lock, so a scan of a database of hundreds of
+/// megabytes does not queue every other writer behind it.
+///
+/// The verdict ("sound as of the probe's start") is recorded, in the marker and
+/// in this process's memory, only when neither file was written or replaced and
+/// no writer announced itself while the probe ran; a write that landed in between leaves both unset and
+/// the next write cycle probes again. The probe itself reads a WAL snapshot,
+/// which a concurrent writer cannot tear.
+pub fn verify_and_mark_unadmitted(db_path: &Path) -> Result<()> {
+    verify_and_mark_unadmitted_with(db_path, is_structurally_sound)
+}
+
+/// [`verify_and_mark_unadmitted`] with the probe injected, so a test can write
+/// to the database while it "runs".
+pub fn verify_and_mark_unadmitted_with(
+    db_path: &Path,
+    probe: impl FnOnce(&Connection) -> Soundness,
+) -> Result<()> {
+    let started = SystemTime::now();
+    if checked_recently(db_path, &marker_path(db_path), CHECK_INTERVAL, started) {
+        return Ok(());
+    }
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let before = (write_stamp(db_path), invalidations(db_path));
+    let conn = open_probe(db_path)?;
+    match probe(&conn) {
+        Soundness::Sound => {
+            if (write_stamp(db_path), invalidations(db_path)) == before {
+                touch_marker(&marker_path(db_path));
+                set_process_verified(db_path, Some(started));
+            }
             Ok(())
         }
         Soundness::Corrupt { .. } => {
@@ -2312,5 +2431,104 @@ mod process_probe_attacks {
         let _ = std::fs::remove_file(marker_path(&db));
 
         assert!(probed(ensure_sound_locked(&db, false).unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod unadmitted_probe_tests {
+    use super::*;
+
+    fn make_wal_db(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Catches: a verdict recorded (marker or process memory) after a probe
+    /// during which another writer wrote, which would certify bytes the probe
+    /// never read.
+    #[test]
+    fn a_write_during_the_probe_records_no_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let _holder = make_wal_db(&db);
+        std::thread::sleep(Duration::from_millis(20));
+        verify_and_mark_unadmitted_with(&db, |conn| {
+            Connection::open(&db)
+                .unwrap()
+                .execute("INSERT INTO t VALUES (2)", [])
+                .unwrap();
+            is_structurally_sound(conn)
+        })
+        .unwrap();
+        assert!(!marker_path(&db).exists());
+        assert!(!has_process_probe(&db));
+    }
+
+    /// Catches: the lock-free probe never certifying a quiet WAL database that
+    /// another connection holds open (the daemon's shape), which would make
+    /// every later open scan the whole file; and not recording the verdict in
+    /// this process's memory, so a daemon reopen after a watcher write rescans.
+    #[test]
+    fn a_quiet_wal_database_is_certified_and_remembered() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let _holder = make_wal_db(&db);
+        verify_and_mark_unadmitted(&db).unwrap();
+        assert!(marker_path(&db).exists());
+        assert!(has_process_probe(&db));
+    }
+}
+
+#[cfg(test)]
+mod critic_201b_r4 {
+    use super::*;
+
+    /// Catches: the process-memory verdict recorded by a lock-free probe during
+    /// which a writer invalidated the marker but had not yet written: a daemon
+    /// reopen would trust "sound" for a store with an unverified write in flight.
+    #[test]
+    fn a_writer_starting_during_the_probe_leaves_no_process_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        verify_and_mark_unadmitted_with(&db, |conn| {
+            invalidate_marker(&db);
+            is_structurally_sound(conn)
+        })
+        .unwrap();
+        assert!(!has_process_probe(&db));
+    }
+
+    /// Catches: a probe verdict for the OLD file recorded after the store was
+    /// replaced (quarantine + rebuild) while the probe ran.
+    #[test]
+    fn a_replaced_database_gets_no_verdict_from_the_old_file_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("index.sqlite");
+        let holder = Connection::open(&db).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+        verify_and_mark_unadmitted_with(&db, |conn| {
+            let verdict = is_structurally_sound(conn);
+            let aside = dir.path().join("aside");
+            std::fs::rename(&db, &aside).unwrap();
+            std::fs::copy(&aside, &db).unwrap();
+            verdict
+        })
+        .unwrap();
+        assert!(!has_process_probe(&db));
+        assert!(!marker_path(&db).exists());
     }
 }
