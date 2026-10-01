@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use mdkb::core::Context;
 use mdkb::daemon::config::DaemonConfig;
 use mdkb::daemon::registry::RepoRegistry;
-use mdkb::mcp::dispatch::cross_repo_search_impl;
+use mdkb::mcp::dispatch::{cross_repo_search_impl, resolve_root_selector};
 use mdkb::mcp::tools::SearchParams;
 use mdkb::store::memory::{EntryStatus, EntryType, MemoryEntry, SourceType, add_entry};
 use serde_json::json;
@@ -678,4 +678,83 @@ async fn a_refreshed_store_is_read_by_the_next_cross_repo_search() {
         .expect("search");
     assert!(found >= 1, "{after}");
     assert!(!after.contains("Schema outdated"), "{after}");
+}
+
+/// Catches: an operator who cannot silence a store. An `ignore` entry in
+/// `daemon.toml` removes the root from discovery AND from `root="*"`, while the
+/// stores next to it stay.
+#[test]
+fn an_ignored_root_is_absent_from_the_wildcard() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let parent = repo_with_entry(repos.path(), "parent", "unrelated");
+    let kept = repo_with_entry(&parent, "kept", "unrelated");
+    let silenced = repo_with_entry(&parent, "silenced", "unrelated");
+
+    let config = DaemonConfig {
+        ignore: vec![silenced.to_string_lossy().to_string()],
+        ..one_slot_config(state.path())
+    };
+    let registry = RepoRegistry::new(config);
+    registry.get_or_open(&parent).expect("open the parent");
+
+    let resolved = resolve_root_selector(&registry, Some("*"), &[]).expect("resolve");
+
+    let mut roots = resolved.roots;
+    roots.sort();
+    assert_eq!(roots, vec![parent, kept]);
+    assert!(!registry.discoverable_roots().contains(&silenced));
+}
+
+/// Catches: a name collision with no short disambiguator. `plugins` names two
+/// repos and is refused; `a/plugins` is the path suffix that picks one.
+#[test]
+fn a_path_suffix_resolves_a_name_that_is_ambiguous() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let first = repo_with_entry(&repos.path().join("a"), "plugins", "unrelated");
+    let second = repo_with_entry(&repos.path().join("b"), "plugins", "unrelated");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    registry.get_or_open(&first).expect("open a/plugins");
+    registry.get_or_open(&second).expect("open b/plugins");
+
+    assert!(
+        resolve_root_selector(&registry, Some("plugins"), &[]).is_err(),
+        "the bare name stays ambiguous"
+    );
+    let resolved = resolve_root_selector(&registry, Some("a/plugins"), &[]).expect("suffix");
+    assert_eq!(resolved.roots, vec![first]);
+    let resolved = resolve_root_selector(&registry, Some("b/plugins"), &[]).expect("suffix");
+    assert_eq!(resolved.roots, vec![second]);
+}
+
+/// Catches: a hygiene change that makes discovery write. Skipping `.tmp` and
+/// honouring the ignore list must still open nothing, register nothing and
+/// leave every store file untouched.
+#[test]
+fn discovery_with_hygiene_still_opens_and_registers_nothing() {
+    let state = tempfile::tempdir().expect("state");
+    let repos = tempfile::tempdir().expect("repos");
+    let parent = repo_with_entry(repos.path(), "parent", "unrelated");
+    let nested = repo_with_entry(&parent, "nested", "unrelated");
+    let copy = repo_with_entry(&parent.join(".tmp/cov-audit"), "nested", "unrelated");
+
+    let registry = RepoRegistry::new(one_slot_config(state.path()));
+    registry.get_or_open(&parent).expect("open only the parent");
+    let stamp = |root: &Path| {
+        std::fs::metadata(root.join(".mdkb/index.sqlite"))
+            .expect("index")
+            .modified()
+            .expect("mtime")
+    };
+    let (nested_before, copy_before) = (stamp(&nested), stamp(&copy));
+
+    let resolved = resolve_root_selector(&registry, Some("*"), &[]).expect("resolve");
+
+    assert!(resolved.roots.contains(&nested));
+    assert!(!resolved.roots.contains(&copy), "the .tmp copy is skipped");
+    assert_eq!(registry.known_roots(), vec![parent], "nothing registered");
+    assert_eq!(registry.active_count(), 1, "nothing opened");
+    assert_eq!((stamp(&nested), stamp(&copy)), (nested_before, copy_before));
 }

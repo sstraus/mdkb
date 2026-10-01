@@ -842,4 +842,41 @@ mod tests {
             "the persisted map holds every root, so no writer clobbered another's set"
         );
     }
+
+    /// A store the walk finds: discovery identifies one by its SQLite file.
+    fn plant_store(at: &Path) -> PathBuf {
+        std::fs::create_dir_all(at.join(".mdkb")).unwrap();
+        std::fs::write(at.join(".mdkb/index.sqlite"), b"").unwrap();
+        canonical_key(at)
+    }
+
+    /// Catches: temporary copies of a repo (`.tmp/cov-audit/plugins`) listed as
+    /// repos, which made `root=plugins` name four of them and be refused.
+    #[test]
+    fn a_store_under_a_tmp_segment_is_not_discovered() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("parent");
+        let real = plant_store(&parent.join("plugins"));
+        plant_store(&parent.join(".tmp/cov-audit/plugins"));
+        plant_store(&parent.join(".tmp/mutants-src/plugins"));
+
+        let found = discover_nested_stores(&[parent], &[]);
+
+        assert_eq!(found, BTreeSet::from([real]));
+    }
+
+    /// Catches: an operator who cannot silence a store — an ignored path is
+    /// neither listed nor walked into, and its siblings stay.
+    #[test]
+    fn an_ignored_path_is_not_discovered_and_its_siblings_are() {
+        let tmp = TempDir::new().unwrap();
+        let parent = tmp.path().join("parent");
+        let kept = plant_store(&parent.join("kept"));
+        let silenced = plant_store(&parent.join("silenced"));
+        plant_store(&parent.join("silenced/inner"));
+
+        let found = discover_nested_stores(&[parent], std::slice::from_ref(&silenced));
+
+        assert_eq!(found, BTreeSet::from([kept]));
+    }
 }
