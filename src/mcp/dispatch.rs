@@ -16845,6 +16845,14 @@ mod tests {
                 status: Some("current".into()),
             };
             crate::store::documents::index_document(conn, &doc, "alpha beta").unwrap();
+            let dir = if *collection == "default" {
+                "docs"
+            } else {
+                collection
+            };
+            let file = handle.root.join(dir).join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "x").unwrap();
             crate::store::graph::add_edge(
                 conn,
                 seed_id,
@@ -16869,8 +16877,7 @@ mod tests {
             &[("guide.md", "elsewhere"), ("gone.md", "elsewhere")],
         )
         .await;
-        std::fs::create_dir_all(tmp.path().join("elsewhere")).unwrap();
-        std::fs::write(tmp.path().join("elsewhere/guide.md"), "x").unwrap();
+        std::fs::remove_file(tmp.path().join("elsewhere/gone.md")).unwrap();
         let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
         let body = additional_context(&out);
         assert!(body.contains("guide.md (related)"), "{body}");
