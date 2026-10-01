@@ -565,7 +565,10 @@ fn prune_vanished_convention_collections(
     let convention: Vec<Collection> = collections::list_collections(&ctx.conn)?
         .into_iter()
         .filter(|c| {
-            c.source == crate::domain::COLLECTION_SOURCE_CONVENTION
+            // `_root` is the repo root itself: it never vanishes, so counting it
+            // would keep the guard below from ever firing in a repo with a README.
+            c.name != "_root"
+                && c.source == crate::domain::COLLECTION_SOURCE_CONVENTION
                 && crate::domain::conventions::is_builtin_convention_path(&c.name, &c.path)
         })
         .collect();
@@ -577,7 +580,8 @@ fn prune_vanished_convention_collections(
     if vanished.len() > 1 && vanished.len() == convention.len() {
         result.errors.push(format!(
             "every convention collection ({}) has a missing directory; none pruned — \
-             check for an unmounted volume",
+             check for an unmounted volume, or run `mdkb collection remove <name>` for a \
+             directory deleted on purpose",
             vanished
                 .iter()
                 .map(|c| c.name.as_str())
