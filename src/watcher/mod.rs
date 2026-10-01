@@ -352,6 +352,9 @@ mod tests {
             false
         })
         .await;
-        assert!(matches!(seen, Ok(true)), "old source path must be delivered");
+        assert!(
+            matches!(seen, Ok(true)),
+            "old source path must be delivered"
+        );
     }
 }
