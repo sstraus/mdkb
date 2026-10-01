@@ -4414,7 +4414,8 @@ fn admit_doc_hits(
 
 /// A closure for [`admit_doc_hits`] and [`doc_graph_neighbors`]: where the file
 /// behind an indexed document (`collection`, `path`) is, or `None` for a
-/// collection the index does not know. Between a deletion and the next `update`
+/// collection the index does not know or one without files on disk (sessions:
+/// their documents are virtual `{sid}-chunk-NNN` keys). Between a deletion and the next `update`
 /// the index still lists the document, and recall must not point at it. The
 /// directory is resolved once per collection; this touches the index only, so it
 /// can run under the store guard. The filesystem is asked afterwards, outside
@@ -4432,6 +4433,7 @@ fn indexed_file_path<'a>(
                 crate::store::collections::get_collection(conn, collection)
                     .ok()
                     .flatten()
+                    .filter(|c| c.source != crate::domain::COLLECTION_SOURCE_SESSIONS)
                     .map(|c| root.join(c.path))
             })
             .as_ref()
@@ -16713,6 +16715,71 @@ mod tests {
         let body = additional_context(&out);
         assert!(body.contains("notes/kept.md (related)"), "{body}");
         assert!(!body.contains("gone"), "{body}");
+    }
+
+    /// Catches: the file check dropping a session chunk. Its collection has no
+    /// files, its keys (`{sid}-chunk-NNN`) are virtual, so a stat would always
+    /// say "missing" and recall would never surface a session again, as a hit
+    /// or as a graph neighbor.
+    #[tokio::test]
+    async fn critic_226_sessions_documents_have_no_file_to_check() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
+        seed_document(&handle, "notes/seed.md", "seed", "alpha beta").await;
+        {
+            let ctx_guard = handle.ctx.lock().await;
+            let conn = &ctx_guard.as_ref().unwrap().conn;
+            let now = chrono::Utc::now().timestamp();
+            crate::store::collections::add_collection(
+                conn,
+                &crate::domain::Collection {
+                    name: "claude_sessions".to_string(),
+                    path: "./no-such-dir".to_string(),
+                    pattern: "**/*".to_string(),
+                    source: crate::domain::COLLECTION_SOURCE_SESSIONS.to_string(),
+                    created_at: now,
+                    updated_at: now,
+                },
+            )
+            .unwrap();
+            for key in ["sid-chunk-000", "sid-chunk-001"] {
+                let doc = crate::domain::Document {
+                    id: 0,
+                    collection: "claude_sessions".to_string(),
+                    relative_path: key.to_string(),
+                    hash: crate::store::documents::compute_hash(content),
+                    title: Some(format!("Quarantine autoheal {key}")),
+                    metadata: None,
+                    file_modified_at: now,
+                    indexed_at: now,
+                    status: Some("current".to_string()),
+                };
+                crate::store::documents::index_document(conn, &doc, content).unwrap();
+            }
+            let seed_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM documents WHERE relative_path='notes/seed.md'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            crate::store::graph::add_edge(
+                conn,
+                seed_id,
+                "sid-chunk-001",
+                "related",
+                crate::store::graph::KIND_FRONTMATTER,
+                None,
+            )
+            .unwrap();
+        }
+        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
+        let body = additional_context(&out);
+        assert!(body.contains("sid-chunk-000"), "docs leg: {body}");
+        let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
+        let body = additional_context(&out);
+        assert!(body.contains("sid-chunk-001 (related)"), "neighbor: {body}");
     }
 
     /// Catches: a stat error other than absence (EACCES on the parent dir)
