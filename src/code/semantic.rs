@@ -263,9 +263,6 @@ fn push_header(buf: &mut Vec<u8>, count: u32) {
     buf.extend_from_slice(&count.to_le_bytes());
 }
 
-/// Write data to a file atomically via write-to-temp + rename.
-///
-/// On Unix, rename is atomic so a crash during write won't corrupt the target.
 /// Rewrites of the vector store on this thread, so a test can tell one pass
 /// from one rewrite per file.
 #[cfg(test)]
@@ -273,6 +270,9 @@ thread_local! {
     pub(crate) static STORE_REWRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Write data to a file atomically via write-to-temp + rename.
+///
+/// On Unix, rename is atomic so a crash during write won't corrupt the target.
 fn atomic_write(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     #[cfg(test)]
     STORE_REWRITES.with(|n| n.set(n.get() + 1));
