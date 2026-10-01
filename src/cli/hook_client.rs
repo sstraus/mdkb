@@ -39,6 +39,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 use crate::DaemonConfig;
+use crate::config::HooksConfig;
 #[cfg(unix)]
 use crate::daemon::ipc_server::DISPATCHED_ERROR_CODE;
 use crate::daemon::registry::RepoRegistry;
@@ -219,9 +220,8 @@ fn hook_socket_path() -> PathBuf {
 
 #[cfg(unix)]
 const HOOK_TIMEOUT_SESSION_START: Duration = Duration::from_secs(2);
-/// `pub`: the recall reranker sizes its budget against it (`mcp::recall_rerank`). Past this the
-/// host gets nothing, whatever `user_prompt_submit_deadline_ms` says.
-pub const HOOK_TIMEOUT_USER_PROMPT_SUBMIT: Duration = Duration::from_secs(1);
+// UserPromptSubmit has no constant: its wait is the daemon's deadline plus a margin,
+// read from the repo config (`user_prompt_submit_timeout`).
 #[cfg(unix)]
 const HOOK_TIMEOUT_POST_TOOL_USE: Duration = Duration::from_millis(500);
 #[cfg(unix)]
@@ -231,12 +231,24 @@ const HOOK_TIMEOUT_PRE_TOOL_USE: Duration = Duration::from_millis(300);
 #[cfg(unix)]
 const HOOK_TIMEOUT_STOP: Duration = Duration::from_millis(500);
 
+/// How long the client waits for a UserPromptSubmit answer: the daemon's own
+/// deadline plus [`crate::config::USER_PROMPT_SUBMIT_CLIENT_MARGIN_MS`], so the daemon's `{}`
+/// at the deadline still arrives. A fixed wait shorter than the deadline made
+/// the configured deadline unreachable (story 203-353e).
+#[cfg(unix)]
+fn user_prompt_submit_timeout(hooks: &HooksConfig) -> Duration {
+    Duration::from_millis(
+        hooks.user_prompt_submit_effective_deadline_ms()
+            + crate::config::USER_PROMPT_SUBMIT_CLIENT_MARGIN_MS,
+    )
+}
+
 /// Return the per-event socket timeout for a hook method.
 #[cfg(unix)]
-fn hook_timeout(method: &str) -> Duration {
+fn hook_timeout(method: &str, hooks: &HooksConfig) -> Duration {
     match method {
         "hook.session_start" => HOOK_TIMEOUT_SESSION_START,
-        "hook.user_prompt_submit" => HOOK_TIMEOUT_USER_PROMPT_SUBMIT,
+        "hook.user_prompt_submit" => user_prompt_submit_timeout(hooks),
         "hook.post_tool_use" => HOOK_TIMEOUT_POST_TOOL_USE,
         "hook.pre_tool_use" => HOOK_TIMEOUT_PRE_TOOL_USE,
         "hook.stop" => HOOK_TIMEOUT_STOP,
@@ -261,7 +273,8 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
         return Ok(());
     };
     params["root"] = json!(root.display().to_string());
-    let daemon_required = hook_requires_daemon(&root);
+    let hooks = hooks_config(&root);
+    let daemon_required = hooks.daemon_required;
 
     if !daemon_is_reachable_here() {
         // No socket to reach: off Unix there is no daemon at all, and
@@ -280,8 +293,13 @@ async fn run_hook(method: &str, mut params: Value, root: Option<PathBuf>) -> Res
     // panic is the one exit code this function's contract forbids, so the shape
     // that cannot panic is the only correct one here.
     #[cfg(unix)]
-    return match call_daemon_phased(&hook_socket_path(), method, &params, hook_timeout(method))
-        .await
+    return match call_daemon_phased(
+        &hook_socket_path(),
+        method,
+        &params,
+        hook_timeout(method, &hooks),
+    )
+    .await
     {
         Ok(response) => {
             emit_hook_response(&response);
@@ -342,11 +360,9 @@ fn daemon_route_available(platform_has_daemon: bool, no_daemon_env: bool) -> boo
     platform_has_daemon && !no_daemon_env
 }
 
-/// Whether project policy forbids an in-process hook fallback.
-fn hook_requires_daemon(root: &Path) -> bool {
-    crate::Config::load_or_default(root.join(".mdkb/config.toml"))
-        .hooks
-        .daemon_required
+/// The repo's `[hooks]` policy: the daemon-required flag and the deadlines.
+fn hooks_config(root: &Path) -> HooksConfig {
+    crate::Config::load_or_default(root.join(".mdkb/config.toml")).hooks
 }
 
 /// Daemon config for the in-process (`MDKB_NO_DAEMON`) fallback. The `root` here
@@ -766,6 +782,15 @@ mod tests {
         socket_path: PathBuf,
         response: Value,
     ) -> tokio::task::JoinHandle<()> {
+        spawn_slow_hook_server(socket_path, response, Duration::ZERO)
+    }
+
+    /// A fake hook daemon that answers `delay` after it read the request.
+    fn spawn_slow_hook_server(
+        socket_path: PathBuf,
+        response: Value,
+        delay: Duration,
+    ) -> tokio::task::JoinHandle<()> {
         let listener = UnixListener::bind(&socket_path).expect("bind hook sock");
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600)).unwrap();
         tokio::spawn(async move {
@@ -782,6 +807,7 @@ mod tests {
                         return;
                     }
                     let req: Value = serde_json::from_slice(&buf).unwrap();
+                    tokio::time::sleep(delay).await;
                     let mut envelope = response.clone();
                     envelope["id"] = req.get("id").cloned().unwrap_or(Value::Null);
                     let body = serde_json::to_vec(&envelope).unwrap();
@@ -1076,7 +1102,7 @@ mod tests {
     #[test]
     fn a_mutation_is_not_held_to_a_hook_budget() {
         assert_eq!(
-            hook_timeout("update"),
+            hook_timeout("update", &HooksConfig::default()),
             CALL_TIMEOUT,
             "if `update` ever gains a hook-table entry, this test is checking the wrong thing"
         );
@@ -1093,7 +1119,7 @@ mod tests {
             "hook.stop",
         ] {
             assert!(
-                MUTATION_TIMEOUT > hook_timeout(event),
+                MUTATION_TIMEOUT > hook_timeout(event, &HooksConfig::default()),
                 "{event} must never bound a write"
             );
         }
@@ -1129,20 +1155,42 @@ mod tests {
 
     #[test]
     fn hook_timeout_returns_per_event_durations() {
+        let hooks = HooksConfig::default();
         assert_eq!(
-            hook_timeout("hook.session_start"),
+            hook_timeout("hook.session_start", &hooks),
             HOOK_TIMEOUT_SESSION_START
         );
         assert_eq!(
-            hook_timeout("hook.user_prompt_submit"),
-            HOOK_TIMEOUT_USER_PROMPT_SUBMIT
+            hook_timeout("hook.user_prompt_submit", &hooks),
+            user_prompt_submit_timeout(&hooks)
         );
         assert_eq!(
-            hook_timeout("hook.post_tool_use"),
+            hook_timeout("hook.post_tool_use", &hooks),
             HOOK_TIMEOUT_POST_TOOL_USE
         );
-        assert_eq!(hook_timeout("hook.pre_tool_use"), HOOK_TIMEOUT_PRE_TOOL_USE);
-        assert_eq!(hook_timeout("status"), CALL_TIMEOUT);
+        assert_eq!(
+            hook_timeout("hook.pre_tool_use", &hooks),
+            HOOK_TIMEOUT_PRE_TOOL_USE
+        );
+        assert_eq!(hook_timeout("status", &hooks), CALL_TIMEOUT);
+    }
+
+    #[test]
+    fn user_prompt_submit_wait_is_the_deadline_plus_the_margin() {
+        // Catches: a fixed client wait that ignores a raised deadline, and
+        // `deadline = 0` turned into a zero or unbounded wait.
+        let margin = crate::config::USER_PROMPT_SUBMIT_CLIENT_MARGIN_MS;
+        let mut hooks = HooksConfig::default();
+        hooks.user_prompt_submit_deadline_ms = 1500;
+        assert_eq!(
+            user_prompt_submit_timeout(&hooks),
+            Duration::from_millis(1500 + margin)
+        );
+        hooks.user_prompt_submit_deadline_ms = 0;
+        assert_eq!(
+            user_prompt_submit_timeout(&hooks),
+            Duration::from_millis(crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT + margin)
+        );
     }
 
     #[test]
@@ -1156,8 +1204,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(hook_requires_daemon(tmp.path()));
-        assert!(!hook_requires_daemon(&tmp.path().join("without-config")));
+        assert!(hooks_config(tmp.path()).daemon_required);
+        assert!(!hooks_config(&tmp.path().join("without-config")).daemon_required);
     }
 
     #[tokio::test]
@@ -1182,6 +1230,42 @@ mod tests {
         )
         .await
         .unwrap();
+
+        assert!(
+            result.get("hookSpecificOutput").is_some(),
+            "result: {result}"
+        );
+    }
+
+    /// Catches: the host receiving no recall while the hook deadline has not
+    /// fired — the client gave up at a fixed 1 s although the daemon, under a
+    /// 1500 ms deadline, still had 300 ms to answer (story 203-353e).
+    #[tokio::test]
+    async fn a_reply_inside_the_configured_deadline_reaches_the_host() {
+        let tmp = TempDir::new().unwrap();
+        let sock = tmp.path().join("hook.sock");
+        let envelope = json!({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "recall",
+            }
+        });
+        let _srv = spawn_slow_hook_server(
+            sock.clone(),
+            json!({"jsonrpc":"2.0","result": envelope}),
+            Duration::from_millis(1200),
+        );
+        let mut hooks = HooksConfig::default();
+        hooks.user_prompt_submit_deadline_ms = 1500;
+
+        let result = call_daemon_with_timeout(
+            &sock,
+            "hook.user_prompt_submit",
+            &json!({"root": "/tmp", "prompt": "anything"}),
+            hook_timeout("hook.user_prompt_submit", &hooks),
+        )
+        .await
+        .expect("a 1.2 s answer under a 1.5 s deadline must arrive");
 
         assert!(
             result.get("hookSpecificOutput").is_some(),

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mdkb::cli::hook_client::HOOK_TIMEOUT_USER_PROMPT_SUBMIT;
 use mdkb::config::HooksConfig;
 use mdkb::llm::rerank::{RerankError, Reranker};
 use mdkb::mcp::recall_rerank::{
@@ -102,7 +101,7 @@ fn budget_boundary_is_inclusive_at_the_minimum_and_never_underflows() {
     // Catches: `>` for `>=` at the 100 ms minimum, and an elapsed time past the
     // hook's own clock panicking on underflow instead of answering `None`.
     let cfg = HooksConfig::default();
-    let client = HOOK_TIMEOUT_USER_PROMPT_SUBMIT.as_millis() as u64;
+    let client = cfg.user_prompt_submit_deadline_ms;
     let reserve = 150; // docs/hooks.md: what the hook keeps for the work after the rerank
     let at_minimum = client - reserve - 100;
     assert_eq!(

@@ -265,7 +265,7 @@ All settings in `.mdkb/config.toml` under `[hooks]`:
 | `recall_docs_limit` | usize | `3` | Max matching documents in UserPromptSubmit; `0` = memory only |
 | `recall_docs_min_cosine` | f32 | `0.55` | Absolute cosine floor for a recalled document (best chunk vs prompt), or the prompt must quote its title/path. Measured on one repo: English matches 0.585–0.716, Italian-over-English negatives up to 0.522 |
 | `latency_budget_ms` | u64 | `200` | Overrun threshold; logs to `hook-slow.jsonl` |
-| `user_prompt_submit_deadline_ms` | u64 | `1500` | Hard deadline for UserPromptSubmit; past it the hook answers `{}` with `outcome = "deadline"`. `0` disables |
+| `user_prompt_submit_deadline_ms` | u64 | `1000` | Hard deadline for UserPromptSubmit; past it the hook answers `{}` with `outcome = "deadline"`. The hook client waits this plus 250 ms, so a raised value is honoured on the daemon path. `0` disables the daemon cut; the client then waits the default plus 250 ms |
 | `user_prompt_submit_require_sigil` | bool | `false` | `true` opts out of automatic recall and requires a leading `*` |
 | `recall_auto_min_cosine` | f32 | `0.50` | Cosine floor for a prompt with no sigil; a sigil prompt uses `search.memory.min_recall_cosine` (`0.40`) |
 | `recall_rerank_it` | bool | `true` | Rerank MiniLM's top five with jina-reranker-v2 int8 on non-sigil Italian prompts; falls back to the MiniLM result on any failure |

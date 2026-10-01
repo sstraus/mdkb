@@ -13044,7 +13044,7 @@ mod tests {
                 .user_prompt_submit_deadline_ms,
             crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT
         );
-        assert_eq!(crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT, 1500);
+        assert_eq!(crate::config::USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT, 1000);
     }
 
     /// One link of a chain of store holders. tokio's mutex is FIFO and the hook

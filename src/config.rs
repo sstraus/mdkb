@@ -224,10 +224,24 @@ pub const RECALL_DOCS_MIN_COSINE_DEFAULT: f32 = 0.55;
 /// Measured 2026-09-30 from `hook-events.jsonl` in four stores (98 rows that
 /// injected recall): the warm rows cluster at 5 ms – 1.25 s (about 90 % of the
 /// mdkb, ego and orchestrator rows and 45 of 51 tuicommander rows), and the rows
-/// taken while the host ran at load 23–28 sit at 1.96 s – 32.7 s. 1500 ms clears
-/// the warm cluster's p95 and cuts the loaded tail, which is the one the user
-/// prompt waited for. Recall is a hint; the prompt is not.
-pub const USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT: u64 = 1500;
+/// taken while the host ran at load 23–28 sit at 1.96 s – 32.7 s. The hook
+/// client used to give up at a fixed 1 s, so a prompt never waited longer than
+/// that; 1000 ms keeps that ceiling now that the client wait follows this value
+/// (story 203-353e). It cuts the slowest warm rows (1.0 – 1.25 s) as well as the
+/// loaded tail; raise it in `[hooks]` to trade prompt latency for those rows.
+/// Recall is a hint; the prompt is not.
+pub const USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT: u64 = 1000;
+
+/// How long the hook client keeps waiting past the daemon's UserPromptSubmit
+/// deadline, in milliseconds.
+///
+/// The daemon answers `{}` the moment its deadline fires; the client must still
+/// be listening then, or the host gets nothing. The margin covers that answer's
+/// trip over a local Unix socket plus the daemon task wake-up, which are
+/// single-digit milliseconds on an idle host and tens on a loaded one. 250 ms is
+/// well above that, and is only ever spent when the daemon itself stalls: a
+/// healthy hook is bounded by the deadline, not by the margin.
+pub const USER_PROMPT_SUBMIT_CLIENT_MARGIN_MS: u64 = 250;
 
 /// Rerank deadline for automatic recall, in milliseconds: how long the hook
 /// waits for the cross-encoder before it injects MiniLM's result instead.
@@ -897,6 +911,17 @@ pub struct HooksConfig {
 }
 
 impl HooksConfig {
+    /// The deadline the `UserPromptSubmit` hook really runs under, in
+    /// milliseconds: `user_prompt_submit_deadline_ms`, or the default when it is
+    /// `0`. A disabled daemon deadline still leaves the hook client with a
+    /// finite wait, so the one limit the host sees is this one.
+    pub fn user_prompt_submit_effective_deadline_ms(&self) -> u64 {
+        match self.user_prompt_submit_deadline_ms {
+            0 => USER_PROMPT_SUBMIT_DEADLINE_MS_DEFAULT,
+            ms => ms,
+        }
+    }
+
     /// True when any language reranks, which is when the weights are worth fetching.
     pub fn recall_rerank_any(&self) -> bool {
         self.recall_rerank_it || self.recall_rerank_en

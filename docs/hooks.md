@@ -356,8 +356,10 @@ latency_budget_ms = 200
 
 # Hard deadline for UserPromptSubmit in milliseconds. Unlike the budget it cuts
 # the work short: past it the hook answers with nothing and logs
-# outcome = "deadline". 0 disables the deadline.
-user_prompt_submit_deadline_ms = 1500
+# outcome = "deadline". The hook client waits this plus 250 ms, so raising it
+# raises the wait the host sees. 0 disables the daemon-side cut; the client then
+# waits the default (1000) plus 250 ms.
+user_prompt_submit_deadline_ms = 1000
 
 # Rerank MiniLM's top five with jina-reranker-v2 (int8) before injecting, one
 # switch per prompt language (function-word vote; unknown = Italian).
@@ -504,8 +506,10 @@ Every hook run appends a row to `.mdkb/hook-events.jsonl`; a run that exceeds
 budget truncates nothing — the value only decides what gets flagged.
 
 `UserPromptSubmit` is the exception: `user_prompt_submit_deadline_ms` (default
-1500, `0` disables) stops recall when it has not finished, answers with nothing
-and logs `outcome = "deadline"`. `mdkb stats` counts these as deadline hits.
+1000, `0` disables) stops recall when it has not finished, answers with nothing
+and logs `outcome = "deadline"`. The hook client waits that deadline plus a fixed
+250 ms margin, so the deadline you set is the one the host sees; the reranker's
+budget is clamped to the same value. `mdkb stats` counts these as deadline hits.
 Its rows carry a `phases` object (`context`, `embed`, `lock_wait`, `search`,
 `enrich`, `prior`, `rerank`, in ms) naming the phases the run reached, so a
 deadline row shows where the time went. With the reranker in play the same
