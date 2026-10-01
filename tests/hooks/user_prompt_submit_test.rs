@@ -39,9 +39,12 @@ fn run_user_prompt_submit_in(dir: &Path, stdin_json: &str) -> (i32, String) {
     ];
     let cfg = dir.join(".mdkb/config.toml");
     let body = fs::read_to_string(&cfg).unwrap_or_default();
+    // Whole lines, not substrings: the commented defaults hold
+    // `# user_prompt_submit_require_sigil = false` and `# ..._deadline_ms = 1000`,
+    // and a substring test took them for the key already being set.
     let missing: Vec<&String> = keys
         .iter()
-        .filter(|key| !body.contains(key.as_str()))
+        .filter(|key| !body.lines().any(|line| line.trim() == key.as_str()))
         .collect();
     if !missing.is_empty() {
         // A `[hooks]` table already put there by the caller has to receive the
