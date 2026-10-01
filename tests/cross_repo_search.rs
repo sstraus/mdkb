@@ -425,7 +425,10 @@ async fn a_nested_store_is_discovered_without_being_opened_first() {
         .expect("mtime");
 
     assert!(count >= 1 && output.contains("nested_signal"), "{output}");
-    assert!(output.contains("Searched 2 of 2 known repos"), "{output}");
+    assert!(
+        output.contains("Searched 2 of 2 repos (1 known, 1 discovered)"),
+        "{output}"
+    );
     assert_eq!(
         before, after,
         "discovery and read-only search must not mutate the store"
