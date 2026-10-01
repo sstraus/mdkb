@@ -637,6 +637,12 @@ fn smoke_update_machine_formats_emit_a_single_document() {
 #[test]
 fn smoke_embed() {
     let repo = Repo::new();
+    // `embed` fetches the 280 MB reranker weights unless the reranker is off.
+    std::fs::write(
+        repo.root.join(".mdkb/config.toml"),
+        "[hooks]\nrecall_rerank_it = false\nrecall_rerank_en = false\n",
+    )
+    .unwrap();
     run(&["update"], &repo.root);
     let out = run(&["embed"], &repo.root);
     assert_ok(&out, "embed");

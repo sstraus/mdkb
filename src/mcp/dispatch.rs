@@ -6705,10 +6705,12 @@ async fn cli_mutate_impl(
             // download.
             if matches!(mutation, CliMutation::Embed { .. }) {
                 let hooks = handle.config.hooks.clone();
-                let _ = tokio::task::spawn_blocking(move || {
+                tokio::task::spawn_blocking(move || {
                     crate::core::ops::fetch_reranker_weights(&hooks)
                 })
-                .await;
+                .await
+                .map_err(|e| mcp_error(format!("reranker weights fetch aborted: {e}")))?
+                .map_err(|e| mcp_error(e.to_string()))?;
             }
             ensure_handle_context(handle).await?;
             let mut slot = handle.ctx.lock().await;

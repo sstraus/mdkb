@@ -721,7 +721,7 @@ async fn run_cli(mut cli: Cli) -> Result<()> {
                      yields the busy ones. Set search.embed_nice = 0 to disable."
                 );
             }
-            mdkb::core::ops::fetch_reranker_weights(&config.hooks);
+            mdkb::core::ops::fetch_reranker_weights(&config.hooks)?;
             let result = handle_embed(&ctx, collection.as_deref())?;
             format_embed_result(&result, cli.format);
         }

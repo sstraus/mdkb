@@ -1237,6 +1237,25 @@ impl Config {
 
     /// Validate configuration values.
     pub fn validate(&self) -> Result<()> {
+        for (field, value) in [
+            (
+                "hooks.recall_rerank_min_score_it",
+                self.hooks.recall_rerank_min_score_it,
+            ),
+            (
+                "hooks.recall_rerank_min_score_en",
+                self.hooks.recall_rerank_min_score_en,
+            ),
+        ] {
+            if !value.is_finite() {
+                return Err(ErrorKind::ConfigInvalid {
+                    field: field.to_string(),
+                    message: format!("must be a finite number, got {value}"),
+                }
+                .into());
+            }
+        }
+
         if self.telemetry.retention_days == 0 || self.telemetry.retention_days > 365 {
             return Err(ErrorKind::ConfigInvalid {
                 field: "telemetry.retention_days".to_string(),
@@ -1559,6 +1578,19 @@ mod tests {
     fn test_validate_valid_config() {
         let config = Config::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_non_finite_rerank_floor() {
+        // Catches: a NaN floor (TOML `nan`) making `score >= floor` false for
+        // every entry, so the reranker silently injects nothing.
+        for (it, en) in [(f32::NAN, -1.95), (-1.05, f32::INFINITY)] {
+            let mut config = Config::default();
+            config.hooks.recall_rerank_min_score_it = it;
+            config.hooks.recall_rerank_min_score_en = en;
+            let message = config.validate().unwrap_err().to_string();
+            assert!(message.contains("recall_rerank_min_score"), "{message}");
+        }
     }
 
     #[test]
