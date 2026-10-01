@@ -23,12 +23,13 @@ fn run_hook(event: &str, stdin_json: &str) -> (i32, String) {
         .spawn()
         .expect("failed to spawn mdkb");
 
-    child
+    // A hook with no store at its cwd may answer without reading stdin, which
+    // closes the pipe under the write; the exit code and stdout are the contract.
+    let _ = child
         .stdin
         .take()
         .unwrap()
-        .write_all(stdin_json.as_bytes())
-        .expect("failed to write stdin");
+        .write_all(stdin_json.as_bytes());
 
     let output = child.wait_with_output().expect("failed to wait");
     let code = output.status.code().unwrap_or(-1);
