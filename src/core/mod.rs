@@ -107,6 +107,41 @@ pub fn run_mutation<T>(
     )
 }
 
+/// A mutation that keeps the store slot longer than this is named in the log:
+/// every hook read that cannot bypass the slot waits that long (#209-bc4b).
+const SLOT_HOLD_WARN: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Measures how long a mutation holds the store slot and logs it on drop, so
+/// the holders and their worst hold times come from the live daemon's log
+/// (`slot held`) rather than from reading the code.
+pub(crate) struct SlotHold {
+    what: String,
+    since: std::time::Instant,
+}
+
+impl SlotHold {
+    /// Start timing; create it right after the slot is acquired and let it drop
+    /// when the slot is released.
+    pub(crate) fn start(what: &str) -> Self {
+        Self {
+            what: what.to_string(),
+            since: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for SlotHold {
+    fn drop(&mut self) {
+        let held = self.since.elapsed();
+        let held_ms = held.as_millis() as u64;
+        if held >= SLOT_HOLD_WARN {
+            tracing::warn!(operation = %self.what, held_ms, "slot held");
+        } else {
+            tracing::debug!(operation = %self.what, held_ms, "slot held");
+        }
+    }
+}
+
 /// [`run_mutation`] with the post-write probe injected.
 pub fn run_mutation_verify_after_release<T>(
     slot: &tokio::sync::Mutex<Option<Context>>,
@@ -116,6 +151,7 @@ pub fn run_mutation_verify_after_release<T>(
 ) -> Option<Result<T>> {
     let (db_path, generation, mut result) = {
         let mut guard = slot.blocking_lock();
+        let _hold = SlotHold::start(what);
         let (db_path, generation) = {
             let ctx = guard.as_ref()?;
             (ctx.db_path.clone(), ctx.generation)

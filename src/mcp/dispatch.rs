@@ -701,6 +701,14 @@ impl DispatchContext {
 /// Ensure the repo's database context is initialized.
 pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> {
     let mut ctx_guard = handle.ctx.lock().await;
+    open_handle_context(&mut ctx_guard, handle)
+}
+
+/// Open the repo's context into an already locked slot when it is empty.
+fn open_handle_context(
+    ctx_guard: &mut Option<Context>,
+    handle: &RepoHandle,
+) -> Result<(), McpError> {
     if ctx_guard.is_none() {
         if handle.doc_reindex_active.load(Ordering::Relaxed) {
             return Err(mcp_error("Repo initializing, retry shortly"));
@@ -729,6 +737,120 @@ pub async fn ensure_handle_context(handle: &RepoHandle) -> Result<(), McpError> 
     Ok(())
 }
 
+/// How a hook reaches the store for its read legs.
+///
+/// A mutation (watcher reindex, update, session index, embedding backfill) holds
+/// the store slot for its whole closure, and a hook that locked the slot waited
+/// out all of it (#209-bc4b). The store is WAL, so a read-only connection reads
+/// the last committed state beside the writer without waiting for it: a hook
+/// that finds the slot busy reads through its own, and never queues.
+enum HookStore {
+    /// The long-lived context, locked. The slot was free.
+    Slot(tokio::sync::OwnedMutexGuard<Option<Context>>),
+    /// A private read-only context; the slot is busy and left alone.
+    ///
+    /// A corrupt read empties it, like [`crate::core::run_guarded_read`] does the
+    /// slot, but the slot is not closed from here: the mutation holding it probes
+    /// the file as soon as it finishes, and the next free-slot read closes it.
+    Bypass(Option<Context>),
+}
+
+impl HookStore {
+    /// The slot-shaped view the guarded readers take.
+    fn slot(&mut self) -> &mut Option<Context> {
+        match self {
+            Self::Slot(guard) => &mut **guard,
+            Self::Bypass(ctx) => ctx,
+        }
+    }
+
+    /// The slot itself, for a write that cannot be answered from a snapshot:
+    /// waits for it when a bypass was reading. Only the rare write paths pay.
+    async fn for_write(&mut self, handle: &RepoHandle) -> Result<&mut Option<Context>, McpError> {
+        if matches!(self, Self::Bypass(_)) {
+            ensure_handle_context(handle).await?;
+            *self = Self::Slot(Arc::clone(&handle.ctx).lock_owned().await);
+        }
+        Ok(self.slot())
+    }
+
+    /// A telemetry write nothing waits on: under the slot it runs now, on a
+    /// bypass it is queued behind whatever holds the slot, off the hook's path.
+    /// Callable from a blocking thread.
+    fn write_or_defer(
+        &mut self,
+        ctx: &Arc<tokio::sync::Mutex<Option<Context>>>,
+        what: &'static str,
+        f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
+    ) {
+        match self {
+            Self::Slot(guard) => {
+                log_slot_write(what, crate::core::run_guarded_write(&mut *guard, what, f));
+            }
+            Self::Bypass(_) => write_behind_slot(Arc::clone(ctx), what, f),
+        }
+    }
+}
+
+/// Log the outcome of a best-effort write to the slot.
+fn log_slot_write(what: &str, outcome: Option<crate::error::Result<()>>) {
+    if let Some(Err(error)) = outcome {
+        tracing::warn!("{what} failed: {error}");
+    }
+}
+
+/// Queue a small write behind whatever holds the slot, off the caller's path.
+fn write_behind_slot(
+    ctx: Arc<tokio::sync::Mutex<Option<Context>>>,
+    what: &'static str,
+    f: impl FnOnce(&Context) -> crate::error::Result<()> + Send + 'static,
+) {
+    tokio::spawn(async move {
+        let mut guard = ctx.lock_owned().await;
+        log_slot_write(what, crate::core::run_guarded_write(&mut guard, what, f));
+    });
+}
+
+/// [`ensure_handle_context`] for a hook's context phase: opens an empty slot,
+/// but a busy slot is left to the read leg, which bypasses it, instead of being
+/// waited on (#209-bc4b).
+async fn ensure_handle_context_unless_busy(handle: &RepoHandle) -> Result<(), McpError> {
+    match Arc::clone(&handle.ctx).try_lock_owned() {
+        Ok(mut guard) => open_handle_context(&mut guard, handle),
+        Err(_) => Ok(()),
+    }
+}
+
+/// [`hook_store`] for the tool hot path, which must never force an open: the
+/// slot as it is (empty reads as nothing), or a read-only context when it is
+/// busy. `None` when the slot is busy and no read-only context opens.
+fn hook_store_if_open(handle: &RepoHandle) -> Option<HookStore> {
+    match Arc::clone(&handle.ctx).try_lock_owned() {
+        Ok(guard) => Some(HookStore::Slot(guard)),
+        Err(_) => Context::open_read_only(&handle.root)
+            .ok()
+            .map(|ctx| HookStore::Bypass(Some(ctx))),
+    }
+}
+
+/// The store for a hook's read legs: the slot when it is free (opening the
+/// context if needed), otherwise a private read-only context. Falls back to
+/// waiting for the slot when no read-only context can be opened (stale schema).
+async fn hook_store(handle: &RepoHandle) -> Result<HookStore, McpError> {
+    if let Ok(mut guard) = Arc::clone(&handle.ctx).try_lock_owned() {
+        open_handle_context(&mut guard, handle)?;
+        return Ok(HookStore::Slot(guard));
+    }
+    match Context::open_read_only(&handle.root) {
+        Ok(ctx) => Ok(HookStore::Bypass(Some(ctx))),
+        Err(error) => {
+            tracing::debug!("hook read bypass unavailable, waiting for the store: {error}");
+            ensure_handle_context(handle).await?;
+            Ok(HookStore::Slot(Arc::clone(&handle.ctx).lock_owned().await))
+        }
+    }
+}
+
 /// Run one daemon-backed memory mutation under the cross-process writer and
 /// mutation locks, verify the resulting database through a fresh connection, and
 /// release the long-lived context if the index is corrupt.
@@ -751,6 +873,7 @@ async fn run_handle_memory_mutation<T>(
 ) -> Result<T, McpError> {
     let (db_path, generation, result) = {
         let guard = slot.lock().await;
+        let _hold = crate::core::SlotHold::start(what);
         let ctx = guard
             .as_ref()
             .ok_or_else(|| mcp_error("Database not initialized"))?;
@@ -4036,7 +4159,7 @@ async fn record_recall(
     floor: f32,
     candidates: Vec<crate::store::recall_ledger::RecallCandidate>,
 ) {
-    if ensure_handle_context(handle).await.is_err() {
+    if ensure_handle_context_unless_busy(handle).await.is_err() {
         return;
     }
     let prompt = crate::store::recall_ledger::RecallPrompt {
@@ -4047,8 +4170,7 @@ async fn record_recall(
     };
     let retention_days = handle.config.telemetry.retention_days;
     let now = chrono::Utc::now().timestamp();
-    let mut guard = handle.ctx.lock().await;
-    if let Some(Err(error)) = crate::core::run_guarded_write(&mut guard, "recall ledger", |ctx| {
+    let record = move |ctx: &Context| {
         crate::store::recall_ledger::record_prompt(
             &ctx.conn,
             &prompt,
@@ -4056,8 +4178,16 @@ async fn record_recall(
             retention_days,
             now,
         )
-    }) {
-        tracing::warn!("recall ledger write failed: {error}");
+        .map(|_| ())
+    };
+    // The ledger is telemetry: a slot held by a mutation must not hold the
+    // hook's answer, so the row is written behind it (#209-bc4b).
+    match Arc::clone(&handle.ctx).try_lock_owned() {
+        Ok(mut guard) => log_slot_write(
+            "recall ledger",
+            crate::core::run_guarded_write(&mut guard, "recall ledger", record),
+        ),
+        Err(_) => write_behind_slot(Arc::clone(&handle.ctx), "recall ledger", record),
     }
 }
 
@@ -4548,35 +4678,36 @@ async fn hook_session_start_inner(
     // warn!, not debug!: this is the branch a broken store lands on — a schema
     // the binary cannot serve, a held lock, a corrupt index — and an operator
     // reading default-level logs must see it without turning anything on.
-    if let Err(error) = ensure_handle_context(handle).await {
-        tracing::warn!(
-            root = %handle.root.display(),
-            "hook.session_start: the store would not open, so this session starts with no context: {}",
-            error.message
-        );
-        return SessionStartOutcome::Failed(format!("store unavailable: {}", error.message));
-    }
+    let mut store = match hook_store(handle).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::warn!(
+                root = %handle.root.display(),
+                "hook.session_start: the store would not open, so this session starts with no context: {}",
+                error.message
+            );
+            return SessionStartOutcome::Failed(format!("store unavailable: {}", error.message));
+        }
+    };
     // First open of the store in this process: it can carry a schema migration
     // and the sqlite-vec load, neither of which the warmup query should be
     // blamed for.
     phases.mark("context");
     let limit = cfg.warmup_limit.max(1);
-    let mut ctx_guard = handle.ctx.lock().await;
-    let startup_data =
-        crate::core::run_guarded_read(&mut ctx_guard, "hook session warmup", |ctx| {
-            let (due_lines, entries) = get_warmup_entries(&ctx.conn, limit)?;
-            let collection_names: Vec<String> = collections::list_collections(&ctx.conn)?
-                .into_iter()
-                .map(|c| c.name)
-                .collect();
-            // The cheap doctor checks, read against the store this session
-            // opened — in a namespace, not `.mdkb/` — so a quarantine or a
-            // drift is reported for the store the model will actually use.
-            let doctor = crate::cli::doctor::session_block(&crate::domain::doctor::findings(
-                &crate::cli::doctor::collect(&handle.root, Some(ctx), false),
-            ));
-            Ok((due_lines, entries, collection_names, doctor))
-        });
+    let startup_data = crate::core::run_guarded_read(store.slot(), "hook session warmup", |ctx| {
+        let (due_lines, entries) = get_warmup_entries(&ctx.conn, limit)?;
+        let collection_names: Vec<String> = collections::list_collections(&ctx.conn)?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        // The cheap doctor checks, read against the store this session
+        // opened — in a namespace, not `.mdkb/` — so a quarantine or a
+        // drift is reported for the store the model will actually use.
+        let doctor = crate::cli::doctor::session_block(&crate::domain::doctor::findings(
+            &crate::cli::doctor::collect(&handle.root, Some(ctx), false),
+        ));
+        Ok((due_lines, entries, collection_names, doctor))
+    });
     let (due_lines, entries, collection_names, doctor_block) = match startup_data {
         Some(Ok(data)) => data,
         Some(Err(error)) => {
@@ -4588,7 +4719,7 @@ async fn hook_session_start_inner(
             return SessionStartOutcome::Failed("context closed before warmup".to_string());
         }
     };
-    drop(ctx_guard);
+    drop(store);
     // Ranked warmup pool, collection list and the cheap doctor checks under
     // one lock.
     phases.mark("warmup");
@@ -4606,8 +4737,20 @@ async fn hook_session_start_inner(
     // it here is what stops a scoped session from correctly refusing a foreign
     // handoff and then silently getting none (story 009-686d).
     let anchor = {
-        let mut ctx_guard = handle.ctx.lock().await;
-        match crate::core::run_guarded_read(&mut ctx_guard, "hook handoff lookup", |ctx| {
+        let mut store = match hook_store(handle).await {
+            Ok(store) => store,
+            Err(error) => {
+                tracing::warn!(
+                    "hook.session_start handoff lookup failed: {}",
+                    error.message
+                );
+                return SessionStartOutcome::Failed(format!(
+                    "handoff lookup failed: {}",
+                    error.message
+                ));
+            }
+        };
+        match crate::core::run_guarded_read(store.slot(), "hook handoff lookup", |ctx| {
             crate::store::memory::newest_handoff_for_scope(&ctx.conn, scope.as_deref())
         }) {
             Some(Ok(anchor)) => anchor,
@@ -4647,23 +4790,25 @@ async fn hook_session_start_inner(
     // dependency is superseded or net-refuted in the primary store. Never mutates
     // stored confidence.
     let mut stale_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Err(error) = ensure_handle_context(handle).await {
-        // Not fatal — the warmup lines are already in hand, so the hook still
-        // fires, just without the markers. Said out loud all the same: a
-        // discarded error is how the silence this story fixes got started.
-        tracing::warn!(
-            "hook.session_start: no context for the stale-dependency markers: {}",
-            error.message
-        );
-    } else {
-        let mut ctx_guard = handle.ctx.lock().await;
-        let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
-        match crate::core::run_guarded_read(&mut ctx_guard, "hook stale dependencies", |ctx| {
-            memory_graph::stale_dependency_ids(&ctx.conn, &ids)
-        }) {
-            Some(Ok(ids)) => stale_ids = ids,
-            Some(Err(error)) => tracing::warn!("hook stale dependency lookup failed: {error}"),
-            None => {}
+    match hook_store(handle).await {
+        Err(error) => {
+            // Not fatal — the warmup lines are already in hand, so the hook still
+            // fires, just without the markers. Said out loud all the same: a
+            // discarded error is how the silence this story fixes got started.
+            tracing::warn!(
+                "hook.session_start: no context for the stale-dependency markers: {}",
+                error.message
+            );
+        }
+        Ok(mut store) => {
+            let ids: Vec<&str> = ranked.iter().map(|e| e.id.as_str()).collect();
+            match crate::core::run_guarded_read(store.slot(), "hook stale dependencies", |ctx| {
+                memory_graph::stale_dependency_ids(&ctx.conn, &ids)
+            }) {
+                Some(Ok(ids)) => stale_ids = ids,
+                Some(Err(error)) => tracing::warn!("hook stale dependency lookup failed: {error}"),
+                None => {}
+            }
         }
     }
     // Ranking plus the one graph query that marks a stale dependency.
@@ -4681,11 +4826,20 @@ async fn hook_session_start_inner(
     // out a model load against a 200 ms budget, with the time charged to
     // `code_check` because that was the next mark.
     let relation_notice = {
-        let mut ctx_guard = handle.ctx.lock().await;
-        let undetected =
-            crate::core::run_guarded_read(&mut ctx_guard, "hook relation candidates", |ctx| {
-                crate::store::graph::undetected_relation_keys(&ctx.conn)
-            });
+        let undetected = match hook_store(handle).await {
+            Ok(mut store) => {
+                crate::core::run_guarded_read(store.slot(), "hook relation candidates", |ctx| {
+                    crate::store::graph::undetected_relation_keys(&ctx.conn)
+                })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "hook.session_start relation candidates lookup failed: {}",
+                    error.message
+                );
+                None
+            }
+        };
         match undetected {
             Some(Ok(rows)) => {
                 crate::cli::hook_logic::relation_notice(handle.config.graph.relations, &rows)
@@ -5103,7 +5257,7 @@ async fn hook_user_prompt_submit_impl_timed(
     // reranker is for the prompts nobody asked to enrich.
     let rerank_wanted = mode != RecallMode::Sigil && recall_rerank::enabled_for(cfg, prompt);
     if let Some(ref q) = fts_query {
-        if ensure_handle_context(handle).await.is_err() {
+        if ensure_handle_context_unless_busy(handle).await.is_err() {
             return json!({});
         }
         phases.mark("context");
@@ -5131,28 +5285,29 @@ async fn hook_user_prompt_submit_impl_timed(
             min_recall_cosine: 0.0,
             ..search_cfg.clone()
         };
-        let mut ctx_guard = ctx_arc.lock_owned().await;
+        let Ok(mut store) = hook_store(handle).await else {
+            return json!({});
+        };
         phases.mark("lock_wait");
         let leg = tokio::task::spawn_blocking(move || {
             let (prompt, query_embedding, search_cfg) = (prompt_owned, embedding, search_cfg_owned);
             let mut observed: Vec<memory::ScoredMemoryEntry> = Vec::new();
             let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
             let search_t0 = std::time::Instant::now();
-            let search =
-                crate::core::run_guarded_read(&mut ctx_guard, "hook memory recall", |ctx| {
-                    memory::search_entries_hybrid_fts(
-                        &ctx.conn,
-                        &q,
-                        // The raw prompt, not `q`: `q` is the OR-expanded FTS
-                        // expression, and the lexical admission arm needs the words
-                        // as written. It is also what `query_embedding` embedded.
-                        &prompt,
-                        query_embedding.as_deref(),
-                        limit,
-                        None,
-                        &search_cfg,
-                    )
-                });
+            let search = crate::core::run_guarded_read(store.slot(), "hook memory recall", |ctx| {
+                memory::search_entries_hybrid_fts(
+                    &ctx.conn,
+                    &q,
+                    // The raw prompt, not `q`: `q` is the OR-expanded FTS
+                    // expression, and the lexical admission arm needs the words
+                    // as written. It is also what `query_embedding` embedded.
+                    &prompt,
+                    query_embedding.as_deref(),
+                    limit,
+                    None,
+                    &search_cfg,
+                )
+            });
             let scored_results = match search {
                 Some(Ok(entries)) => entries,
                 Some(Err(error)) => {
@@ -5168,7 +5323,7 @@ async fn hook_user_prompt_submit_impl_timed(
             // vector pools and the access-recency bonus ranks within the admitted
             // set, so admitting more would reorder, and change, what is injected.
             let candidate_cfg = candidate_search_cfg(&search_cfg);
-            match crate::core::run_guarded_read(&mut ctx_guard, "hook recall observation", |ctx| {
+            match crate::core::run_guarded_read(store.slot(), "hook recall observation", |ctx| {
                 memory::search_entries_hybrid_fts(
                     &ctx.conn,
                     &q,
@@ -5216,14 +5371,11 @@ async fn hook_user_prompt_submit_impl_timed(
                     top_score,
                     session_id: None,
                 };
-                if !ev.query_hash.is_empty()
-                    && let Some(Err(error)) = crate::core::run_guarded_write(
-                        &mut ctx_guard,
-                        "query event telemetry",
-                        |ctx| stats::record_query_event(&ctx.conn, &ev, telemetry.retention_days),
-                    )
-                {
-                    tracing::warn!("record_query_event failed: {error}");
+                if !ev.query_hash.is_empty() {
+                    let retention_days = telemetry.retention_days;
+                    store.write_or_defer(&ctx_arc, "query event telemetry", move |ctx| {
+                        stats::record_query_event(&ctx.conn, &ev, retention_days).map(|_| ())
+                    });
                 }
             }
 
@@ -5236,8 +5388,8 @@ async fn hook_user_prompt_submit_impl_timed(
             // ([`admit_doc_hits`]). `recall_docs_limit` caps what is left
             // (0 = memory only). The pool is wider than the cap because sub-floor
             // hits are dropped after ranking, and must not crowd out a later one.
-            if docs_limit > 0 && ctx_guard.is_some() {
-                match crate::core::run_guarded_read(&mut ctx_guard, "hook document recall", |ctx| {
+            if docs_limit > 0 && store.slot().is_some() {
+                match crate::core::run_guarded_read(store.slot(), "hook document recall", |ctx| {
                     crate::core::search::hybrid_search_fts_scored(
                         ctx,
                         &q,
@@ -5265,7 +5417,7 @@ async fn hook_user_prompt_submit_impl_timed(
             // MiniLM-gated `scored_results` stay as the fallback.
             let mut rerank_pool: Vec<memory::ScoredMemoryEntry> = Vec::new();
             if rerank_wanted {
-                match crate::core::run_guarded_read(&mut ctx_guard, "hook rerank pool", |ctx| {
+                match crate::core::run_guarded_read(store.slot(), "hook rerank pool", |ctx| {
                     memory::search_entries_hybrid_fts(
                         &ctx.conn,
                         &q,
@@ -5384,10 +5536,11 @@ async fn hook_user_prompt_submit_impl_timed(
     //  · stale-dependency flags — mark entries whose basis is superseded/refuted.
     let mut expanded: Vec<String> = Vec::new();
     let mut stale_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if !results.is_empty() && ensure_handle_context(handle).await.is_ok() {
-        let mut ctx_guard = handle.ctx.lock().await;
+    if !results.is_empty()
+        && let Ok(mut store) = hook_store(handle).await
+    {
         let enrichment =
-            crate::core::run_guarded_read(&mut ctx_guard, "hook recall enrichment", |ctx| {
+            crate::core::run_guarded_read(store.slot(), "hook recall enrichment", |ctx| {
                 let expanded = expand_recall_neighbors(
                     &ctx.conn,
                     &results,
@@ -5414,15 +5567,11 @@ async fn hook_user_prompt_submit_impl_timed(
     // the (now finalized) memory ids about to be injected.
     let mut neighbors: Vec<(String, String)> = Vec::new();
     if !path_tokens.is_empty() {
-        // The FTS leg already initialized the context if it ran; only ensure when
-        // it didn't (path-only prompt) so we don't re-acquire on the hot path.
-        let ctx_ready = fts_query.is_some() || ensure_handle_context(handle).await.is_ok();
-        if ctx_ready {
-            let mut ctx_guard = handle.ctx.lock().await;
+        if let Ok(mut store) = hook_store(handle).await {
             let seen: std::collections::HashSet<String> =
                 results.iter().map(|e| e.id.clone()).collect();
             match crate::core::run_guarded_read(
-                &mut ctx_guard,
+                store.slot(),
                 "hook document graph neighbors",
                 |ctx| {
                     doc_graph_neighbors(
@@ -5697,19 +5846,16 @@ async fn prompt_prior_block(
     let now = chrono::Utc::now().timestamp();
     let max = handle.config.priors.max_injected_per_hook;
 
-    if ensure_handle_context(handle).await.is_err() {
-        return None;
-    }
-    let mut ctx_guard = handle.ctx.lock().await;
+    let mut store = hook_store(handle).await.ok()?;
 
     let tctx = TriggerContext::Prompt { text: prompt };
     let memory_hits =
-        crate::core::run_guarded_read(&mut ctx_guard, "prompt memory trigger lookup", |ctx| {
+        crate::core::run_guarded_read(store.slot(), "prompt memory trigger lookup", |ctx| {
             crate::store::memory::matching_triggered_entries(&ctx.conn, &tctx, session, now)
         })?
         .ok()?;
     let hits = if handle.config.priors.injection_enabled {
-        crate::core::run_guarded_read(&mut ctx_guard, "prompt prior lookup", |ctx| {
+        crate::core::run_guarded_read(store.slot(), "prompt prior lookup", |ctx| {
             match_injectable(&ctx.conn, &tctx, now, max)
         })?
         .ok()?
@@ -5730,11 +5876,26 @@ async fn prompt_prior_block(
             continue;
         }
         tried += 1;
-        match crate::core::run_guarded_write(
-            &mut ctx_guard,
-            "prompt memory trigger telemetry",
-            |ctx| crate::store::memory::record_trigger_injection_once(&ctx.conn, &id, session, now),
-        ) {
+        // The write decides whether the line is delivered (once per session), so
+        // it cannot be answered from a snapshot: a bypassed read waits for the
+        // slot here, on the rare prompt that matches a trigger.
+        let recorded = match store.for_write(handle).await {
+            Ok(slot) => {
+                crate::core::run_guarded_write(slot, "prompt memory trigger telemetry", |ctx| {
+                    crate::store::memory::record_trigger_injection_once(
+                        &ctx.conn, &id, session, now,
+                    )
+                })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "prompt memory trigger telemetry: no store: {}",
+                    error.message
+                );
+                None
+            }
+        };
+        match recorded {
             Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
             Some(Err(error)) => tracing::warn!("record prompt memory trigger injection: {error}"),
@@ -5751,12 +5912,19 @@ async fn prompt_prior_block(
             continue;
         }
         let prior_id = c.id.clone();
-        if let Some(Err(error)) =
-            crate::core::run_guarded_write(&mut ctx_guard, "prompt prior telemetry", |ctx| {
-                record_injection(&ctx.conn, &prior_id, session, now)
-            })
-        {
-            tracing::warn!("record prompt prior injection: {error}");
+        match store.for_write(handle).await {
+            Ok(slot) => {
+                if let Some(Err(error)) =
+                    crate::core::run_guarded_write(slot, "prompt prior telemetry", |ctx| {
+                        record_injection(&ctx.conn, &prior_id, session, now)
+                    })
+                {
+                    tracing::warn!("record prompt prior injection: {error}");
+                }
+            }
+            Err(error) => {
+                tracing::warn!("record prompt prior injection: no store: {}", error.message)
+            }
         }
         if let Some((dctx, key)) = dedup {
             dctx.record_hook_prior(key, &c.id);
@@ -6483,7 +6651,7 @@ async fn tool_prior_block(
     // force a DB open (the same reason `code_index_hits` guards on `.exists()`).
     // In the daemon the context is warm after SessionStart, so priors fire; a
     // cold one-shot invocation skips them (best-effort).
-    let mut ctx_guard = handle.ctx.lock().await;
+    let mut store = hook_store_if_open(handle)?;
 
     let tctx = if after {
         TriggerContext::PostTool {
@@ -6500,12 +6668,12 @@ async fn tool_prior_block(
         }
     };
     let memory_hits =
-        crate::core::run_guarded_read(&mut ctx_guard, "tool memory trigger lookup", |ctx| {
+        crate::core::run_guarded_read(store.slot(), "tool memory trigger lookup", |ctx| {
             crate::store::memory::matching_triggered_entries(&ctx.conn, &tctx, session, now)
         })?
         .ok()?;
     let hits = if handle.config.priors.injection_enabled {
-        crate::core::run_guarded_read(&mut ctx_guard, "tool prior lookup", |ctx| {
+        crate::core::run_guarded_read(store.slot(), "tool prior lookup", |ctx| {
             // The cap applies to fresh injections, not to already-seen matches.
             match_injectable(&ctx.conn, &tctx, now, usize::MAX)
         })?
@@ -6527,11 +6695,25 @@ async fn tool_prior_block(
             continue;
         }
         tried += 1;
-        match crate::core::run_guarded_write(
-            &mut ctx_guard,
-            "tool memory trigger telemetry",
-            |ctx| crate::store::memory::record_trigger_injection_once(&ctx.conn, &id, session, now),
-        ) {
+        // The write decides whether the line is delivered (once per session), so
+        // a bypassed read waits for the slot here, on the rare call that matches.
+        let recorded = match store.for_write(handle).await {
+            Ok(slot) => {
+                crate::core::run_guarded_write(slot, "tool memory trigger telemetry", |ctx| {
+                    crate::store::memory::record_trigger_injection_once(
+                        &ctx.conn, &id, session, now,
+                    )
+                })
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "{label} memory trigger telemetry: no store: {}",
+                    error.message
+                );
+                None
+            }
+        };
+        match recorded {
             Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
             Some(Err(error)) => tracing::warn!("record {label} memory trigger injection: {error}"),
@@ -6543,9 +6725,16 @@ async fn tool_prior_block(
             continue;
         }
         let prior_id = c.id.clone();
-        match crate::core::run_guarded_write(&mut ctx_guard, "tool prior telemetry", |ctx| {
-            record_tool_injection_once(&ctx.conn, &prior_id, session, now)
-        }) {
+        let recorded = match store.for_write(handle).await {
+            Ok(slot) => crate::core::run_guarded_write(slot, "tool prior telemetry", |ctx| {
+                record_tool_injection_once(&ctx.conn, &prior_id, session, now)
+            }),
+            Err(error) => {
+                tracing::warn!("{label} prior telemetry: no store: {}", error.message);
+                None
+            }
+        };
+        match recorded {
             Some(Ok(true)) => lines.push(line),
             Some(Ok(false)) | None => {}
             Some(Err(error)) => tracing::warn!("record {label} prior injection: {error}"),
@@ -6637,7 +6826,22 @@ fn render_code_index_hits(
 /// `record_call` is three tiny local-SQLite writes (sub-millisecond).
 async fn record_hook_call(handle: &RepoHandle, method: &str) {
     let event = method.strip_prefix("hook.").unwrap_or(method).to_string();
-    let mut ctx_guard = Arc::clone(&handle.ctx).lock_owned().await;
+    // A slot held by a mutation must not hold the hook's answer: the count is
+    // taken behind it instead, off the hook's path (#209-bc4b). An in-process
+    // hook finds the slot free, so it is still written before the process exits.
+    match Arc::clone(&handle.ctx).try_lock_owned() {
+        Ok(guard) => write_hook_call(guard, event).await,
+        Err(_) => {
+            let ctx = Arc::clone(&handle.ctx);
+            tokio::spawn(async move { write_hook_call(ctx.lock_owned().await, event).await });
+        }
+    }
+}
+
+async fn write_hook_call(
+    mut ctx_guard: tokio::sync::OwnedMutexGuard<Option<Context>>,
+    event: String,
+) {
     if ctx_guard.is_none() {
         return;
     }
@@ -9711,6 +9915,163 @@ mod tests {
             0,
             "a probe started while the store slot was held"
         );
+    }
+
+    /// Holds the repo's store slot the way a long mutation closure does (the
+    /// watcher's doc reindex, an update, a session index), until released.
+    async fn hold_slot_like_a_reindex(
+        handle: &RepoHandle,
+    ) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+        ensure_handle_context(handle).await.unwrap();
+        let ctx = Arc::clone(&handle.ctx);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = tokio::task::spawn_blocking(move || {
+            crate::core::run_mutation(&ctx, "test reindex", |_| -> crate::error::Result<()> {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(std::time::Duration::from_secs(20));
+                Ok(())
+            });
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the mutation never took the slot");
+        (release_tx, held)
+    }
+
+    /// Catches (#209-bc4b): a session-start hook locking the store slot, so it
+    /// waits for the whole watcher reindex in its context phase. The reindex here
+    /// only ends when the test releases it, so a hook that waits never returns.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_start_during_a_long_reindex_does_not_wait_for_it() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_memory_entry(&handle, "warm-1").await;
+        let (release, held) = hold_slot_like_a_reindex(&handle).await;
+
+        let started = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hook_session_start_timed(&handle, None, None),
+        )
+        .await;
+        release.send(()).unwrap();
+        held.await.unwrap();
+
+        let (outcome, _phases) = started.expect("the session start waited for the reindex");
+        assert!(
+            !matches!(outcome, SessionStartOutcome::Failed(_)),
+            "the read through the bypass failed: {outcome:?}"
+        );
+    }
+
+    /// Catches (#209-bc4b): a prompt recall waiting for the slot, or a bypass
+    /// that reads nothing (or tries to write through its read-only connection):
+    /// the entry committed before the reindex began must still be recalled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_prompt_during_a_long_reindex_recalls_without_waiting() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle_with(&tmp, |config| {
+            config.hooks.user_prompt_submit_require_sigil = false;
+            config.telemetry.query_events = true;
+        });
+        seed_memory_entry(&handle, "topic-mem").await;
+        let (release, held) = hold_slot_like_a_reindex(&handle).await;
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            hook_user_prompt_submit_impl(
+                &handle,
+                "what do we know about the recall_gate_fixture topic content",
+            ),
+        )
+        .await;
+        release.send(()).unwrap();
+        held.await.unwrap();
+
+        let out = out.expect("the prompt waited for the reindex");
+        assert!(
+            additional_context(&out).contains("topic-mem"),
+            "recall through the bypass found nothing: {out}"
+        );
+    }
+
+    /// Catches (#209-bc4b): the telemetry writes a hook makes after its answer
+    /// (hook call count, query event) being dropped when the slot is busy
+    /// instead of landing once the mutation lets go, or holding the answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn hook_telemetry_written_during_a_reindex_lands_after_it() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        ensure_handle_context(&handle).await.unwrap();
+        let (release, held) = hold_slot_like_a_reindex(&handle).await;
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            record_hook_call(&handle, "hook.session_start"),
+        )
+        .await
+        .expect("the hook call count waited for the reindex");
+        release.send(()).unwrap();
+        held.await.unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let calls: i64 = {
+                let guard = handle.ctx.lock().await;
+                guard
+                    .as_ref()
+                    .unwrap()
+                    .conn
+                    .query_row(
+                        "SELECT COALESCE(SUM(total_calls), 0) FROM sessions",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap()
+            };
+            if calls == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the deferred hook call count never landed ({calls} calls)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Catches (#209-bc4b): a trigger matched on a bypassed snapshot being
+    /// injected without its once-per-session record (repeats every prompt), or
+    /// never injected because the write had no slot to go to.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trigger_matched_during_a_reindex_is_recorded_once() {
+        let tmp = TempDir::new().unwrap();
+        let handle = make_handle(&tmp);
+        seed_trigger_memory(
+            &handle,
+            "agent-rule",
+            "Use the agent tool for subagents.",
+            r#"[{"prompt_contains":"zzagent"}]"#,
+        )
+        .await;
+        let dctx = make_dctx();
+        let (release, held) = hold_slot_like_a_reindex(&handle).await;
+        // The write that records the injection has to wait for the slot, so the
+        // reindex ends shortly after the prompt starts.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            release.send(()).unwrap();
+        });
+        let first = prompt_body(&dctx, &handle, "zzagent please", "bypass-session").await;
+        releaser.join().unwrap();
+        held.await.unwrap();
+        let repeat = prompt_body(&dctx, &handle, "zzagent again", "bypass-session").await;
+
+        assert!(
+            first.contains("mdkb memory [agent-rule]: Use the agent tool for subagents."),
+            "{first}"
+        );
+        assert!(!repeat.contains("agent-rule"), "{repeat}");
     }
 
     #[test]
