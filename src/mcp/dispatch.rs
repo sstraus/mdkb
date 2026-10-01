@@ -16719,8 +16719,8 @@ mod tests {
 
     /// Catches: the file check dropping a session chunk. Its collection has no
     /// files, its keys (`{sid}-chunk-NNN`) are virtual, so a stat would always
-    /// say "missing" and recall would never surface a session again, as a hit
-    /// or as a graph neighbor.
+    /// say "missing" and recall would never list a session as a graph neighbor.
+    /// (The docs leg never returns sessions: the search leaves them out.)
     #[tokio::test]
     async fn critic_226_sessions_documents_have_no_file_to_check() {
         let tmp = TempDir::new().unwrap();
@@ -16743,20 +16743,18 @@ mod tests {
                 },
             )
             .unwrap();
-            for key in ["sid-chunk-000", "sid-chunk-001"] {
-                let doc = crate::domain::Document {
-                    id: 0,
-                    collection: "claude_sessions".to_string(),
-                    relative_path: key.to_string(),
-                    hash: crate::store::documents::compute_hash(content),
-                    title: Some(format!("Quarantine autoheal {key}")),
-                    metadata: None,
-                    file_modified_at: now,
-                    indexed_at: now,
-                    status: Some("current".to_string()),
-                };
-                crate::store::documents::index_document(conn, &doc, content).unwrap();
-            }
+            let doc = crate::domain::Document {
+                id: 0,
+                collection: "claude_sessions".to_string(),
+                relative_path: "sid-chunk-001".to_string(),
+                hash: crate::store::documents::compute_hash(content),
+                title: Some("Quarantine autoheal session chunk".to_string()),
+                metadata: None,
+                file_modified_at: now,
+                indexed_at: now,
+                status: Some("current".to_string()),
+            };
+            crate::store::documents::index_document(conn, &doc, content).unwrap();
             let seed_id: i64 = conn
                 .query_row(
                     "SELECT id FROM documents WHERE relative_path='notes/seed.md'",
@@ -16774,9 +16772,6 @@ mod tests {
             )
             .unwrap();
         }
-        let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
-        let body = additional_context(&out);
-        assert!(body.contains("sid-chunk-000"), "docs leg: {body}");
         let out = hook_user_prompt_submit_impl(&handle, "what does notes/seed.md say").await;
         let body = additional_context(&out);
         assert!(body.contains("sid-chunk-001 (related)"), "neighbor: {body}");
