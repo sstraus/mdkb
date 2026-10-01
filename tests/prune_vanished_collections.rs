@@ -97,3 +97,25 @@ fn a_manual_collection_with_a_missing_directory_keeps_its_documents() {
     );
     assert!(result.collections_pruned.is_empty());
 }
+
+/// Catches: an unmounted volume under the root makes every convention directory
+/// look deleted, and the prune wipes all of their documents in one run.
+#[test]
+fn losing_every_convention_directory_at_once_prunes_none() {
+    let (_dir, root) = store();
+    write_docs(&root, "archive");
+    write_docs(&root, "docs");
+    let ctx = Context::open(&root).expect("open");
+    handle_update(&ctx, &root).expect("first update");
+
+    std::fs::remove_dir_all(root.join("archive")).unwrap();
+    std::fs::remove_dir_all(root.join("docs")).unwrap();
+    let result = handle_update(&ctx, &root).expect("second update");
+
+    assert!(result.collections_pruned.is_empty());
+    assert!(
+        result.errors.iter().any(|e| e.contains("none pruned")),
+        "the skipped prune must be reported: {:?}",
+        result.errors
+    );
+}

@@ -66,6 +66,15 @@ pub fn detect_pattern_upgrades(existing_collections: &[Collection]) -> Vec<Patte
         .collect()
 }
 
+/// Whether `path` is where the convention that creates `name` puts it. A
+/// collection that has been pointed elsewhere is no longer mdkb's own output.
+pub fn is_builtin_convention_path(name: &str, path: &str) -> bool {
+    BUILTIN_CONVENTIONS
+        .iter()
+        .any(|&(dir, n, _)| n == name && dir == path)
+        || (name == "_root" && path == ".")
+}
+
 /// Detect collections based on directory conventions.
 ///
 /// Returns proposed collections for directories that exist at `root`

@@ -288,15 +288,17 @@ fn run_document_update(ctx: &Context, root: &Path, force: bool) -> Result<Update
     // collection that autoheal (or anything else) dropped.
     let before = documents_per_collection(&ctx.conn).unwrap_or_default();
 
-    let pruned = prune_vanished_convention_collections(ctx, root)?;
-    let collections = collections::list_collections(&ctx.conn)?;
     let mut result = UpdateResult {
         pattern_upgrades,
-        collections_pruned: pruned,
         ..UpdateResult::default()
     };
 
     with_transaction(&ctx.conn, || {
+        // Inside the transaction: the sidecar snapshot is written only after a
+        // successful run, so a prune that outlived a failed update would be
+        // reported as a vanished collection by the next one.
+        prune_vanished_convention_collections(ctx, root, &mut result)?;
+        let collections = collections::list_collections(&ctx.conn)?;
         update_all_collections(ctx, root, &config, &collections, force, &mut result)?;
         // Frontmatter edges are rebuilt here, after every collection, rather
         // than per document: the allowlist lives in config and can change with
@@ -549,26 +551,52 @@ pub(crate) fn apply_conventions(ctx: &Context, root: &Path) -> Result<Vec<String
 ///
 /// Without this, `update_collection` reports the missing path and moves on, so
 /// the documents of a deleted directory stay searchable and recall keeps
-/// injecting them (story 214-1b93). Only `source = convention` qualifies: mdkb
-/// registered those itself and `apply_conventions` re-registers one if the
-/// directory returns. A hand-registered collection may sit on an unmounted
-/// volume, so it keeps the path error instead of losing its documents.
-fn prune_vanished_convention_collections(ctx: &Context, root: &Path) -> Result<Vec<String>> {
-    let mut pruned = Vec::new();
-    for coll in collections::list_collections(&ctx.conn)? {
-        if coll.source == crate::domain::COLLECTION_SOURCE_CONVENTION
-            && !root.join(&coll.path).exists()
-            && collections::remove_collection(&ctx.conn, &coll.name)?
-        {
+/// injecting them (story 214-1b93). A collection qualifies only when mdkb
+/// registered it (`source = convention`) AND it still sits on its built-in
+/// convention path: a hand-repointed one, or one on an unmounted volume, is
+/// the user's. An unreadable path (`try_exists` error) is unknown, never
+/// absent. When every convention collection of a store with several would go
+/// at once, nothing is pruned: that looks like a missing mount, not deletions.
+fn prune_vanished_convention_collections(
+    ctx: &Context,
+    root: &Path,
+    result: &mut UpdateResult,
+) -> Result<()> {
+    let convention: Vec<Collection> = collections::list_collections(&ctx.conn)?
+        .into_iter()
+        .filter(|c| {
+            c.source == crate::domain::COLLECTION_SOURCE_CONVENTION
+                && crate::domain::conventions::is_builtin_convention_path(&c.name, &c.path)
+        })
+        .collect();
+    let vanished: Vec<Collection> = convention
+        .iter()
+        .filter(|c| matches!(root.join(&c.path).try_exists(), Ok(false)))
+        .cloned()
+        .collect();
+    if vanished.len() > 1 && vanished.len() == convention.len() {
+        result.errors.push(format!(
+            "every convention collection ({}) has a missing directory; none pruned — \
+             check for an unmounted volume",
+            vanished
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        return Ok(());
+    }
+    for coll in vanished {
+        if collections::remove_collection(&ctx.conn, &coll.name)? {
             tracing::info!(
                 "Pruned collection '{}': {} no longer exists",
                 coll.name,
                 coll.path
             );
-            pruned.push(coll.name);
+            result.collections_pruned.push(coll.name);
         }
     }
-    Ok(pruned)
+    Ok(())
 }
 /// Update all collections within a transaction.
 fn update_all_collections(

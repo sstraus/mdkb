@@ -91,7 +91,9 @@ pub fn handle_collection_update(
     // matched the superseded pair and put the old pattern back, so the revert
     // this command exists to perform was undone on every run, forever. A
     // pattern somebody typed is a choice, whatever wrote the first one.
-    let source = if pattern.is_some() {
+    // A path somebody typed is a choice as well: the prune of a deleted
+    // convention directory must not take a collection the user moved.
+    let source = if pattern.is_some() || path.is_some() {
         crate::domain::COLLECTION_SOURCE_MANUAL.to_string()
     } else {
         existing.source.clone()
