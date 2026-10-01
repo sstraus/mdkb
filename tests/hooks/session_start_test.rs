@@ -129,7 +129,11 @@ fn warmup_lines(stdout: &str) -> Vec<String> {
     ctx_block
         .lines()
         .filter(|l| l.starts_with("- "))
-        .filter(|l| !["- [error] ", "- [warning] ", "- [info] "].iter().any(|p| l.starts_with(p)))
+        .filter(|l| {
+            !["- [error] ", "- [warning] ", "- [info] "]
+                .iter()
+                .any(|p| l.starts_with(p))
+        })
         .map(|l| l.to_string())
         .collect()
 }

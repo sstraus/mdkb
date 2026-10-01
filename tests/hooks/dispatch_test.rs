@@ -25,11 +25,7 @@ fn run_hook(event: &str, stdin_json: &str) -> (i32, String) {
 
     // A hook with no store at its cwd may answer without reading stdin, which
     // closes the pipe under the write; the exit code and stdout are the contract.
-    let _ = child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(stdin_json.as_bytes());
+    let _ = child.stdin.take().unwrap().write_all(stdin_json.as_bytes());
 
     let output = child.wait_with_output().expect("failed to wait");
     let code = output.status.code().unwrap_or(-1);
