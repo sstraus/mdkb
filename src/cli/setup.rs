@@ -996,16 +996,6 @@ fn upsert_hook_entries(
         // rather than duplicates. See `is_mdkb_hook_entry` for the two cases
         // (tagged + legacy untagged). rtk's `hook claude` and other hooks don't
         // match, so they survive.
-        // A matcher on the entry being replaced is the user's narrowing of the
-        // hook (story 191-6b10); the replacement keeps it instead of widening
-        // the hook to every tool.
-        let kept_matcher = arr
-            .iter()
-            .filter(|item| is_mdkb_hook_entry(item, cli_event))
-            .find_map(|item| item.get("matcher").cloned());
-        if let Some(m) = kept_matcher {
-            mdkb_entry["matcher"] = m;
-        }
         arr.retain(|item| !is_mdkb_hook_entry(item, cli_event));
         arr.push(mdkb_entry);
         registered.push((*event_name).to_string());
@@ -1693,13 +1683,8 @@ mod tests {
         assert!(rtk_preserved, "unrelated rtk hook must be preserved");
     }
 
-    /// Story 191-6b10. Setup widened `PostToolUse Edit|Write|...` and
-    /// `PreToolUse Grep|Bash` to every tool when it merged into a settings file
-    /// that already carried them. Replaces the 162-feeb test that required the
-    /// widening: a matcher on an mdkb entry is kept, and an entry without one
-    /// still registers for every tool.
     #[test]
-    fn setup_keeps_the_matcher_of_an_existing_mdkb_entry() {
+    fn setup_replaces_scoped_tool_hooks_with_all_tool_registrations() {
         let mut settings = serde_json::json!({
             "hooks": {
                 "PreToolUse": [
@@ -1707,7 +1692,7 @@ mod tests {
                     {"matcher":"Bash","hooks":[{"type":"command","command":"rtk hook claude"}]}
                 ],
                 "PostToolUse": [
-                    {"matcher":"Edit|Write","hooks":[{"type":"command","command":"/old/mdkb hook post-tool-use"}]}
+                    {"_managedBy":"mdkb","matcher":"Edit|Write","hooks":[{"type":"command","command":"mdkb hook post-tool-use"}]}
                 ]
             }
         });
@@ -1718,31 +1703,24 @@ mod tests {
             false,
             None,
         );
-        let managed = |event: &str| -> Vec<serde_json::Value> {
-            settings["hooks"][event]
-                .as_array()
-                .unwrap()
+        for event in ["PreToolUse", "PostToolUse"] {
+            let entries = settings["hooks"][event].as_array().unwrap();
+            let managed: Vec<_> = entries
                 .iter()
                 .filter(|entry| entry["_managedBy"] == "mdkb")
-                .cloned()
-                .collect()
-        };
-        let pre = managed("PreToolUse");
-        assert_eq!(pre.len(), 1, "one mdkb registration for PreToolUse");
-        assert_eq!(pre[0]["matcher"], "Grep|Bash", "tagged matcher kept");
-        let post = managed("PostToolUse");
-        assert_eq!(post.len(), 1, "one mdkb registration for PostToolUse");
-        assert_eq!(post[0]["matcher"], "Edit|Write", "legacy matcher kept");
-        assert!(
-            managed("Stop")[0].get("matcher").is_none(),
-            "an event with no matcher to keep registers for every tool"
-        );
+                .collect();
+            assert_eq!(managed.len(), 1, "one mdkb registration for {event}");
+            assert!(
+                managed[0].get("matcher").is_none(),
+                "{event} must reach Edit, Agent and MCP tools too: {managed:?}"
+            );
+        }
         assert!(
             settings["hooks"]["PreToolUse"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|entry| entry["matcher"] == "Bash" && entry.get("_managedBy").is_none()),
+                .any(|entry| entry["matcher"] == "Bash"),
             "setup keeps another tool's hook"
         );
     }
