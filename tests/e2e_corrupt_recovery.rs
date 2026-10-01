@@ -147,9 +147,12 @@ fn entry(id: &str, content: &str) -> MemoryEntry {
 /// owns the long-lived connection.
 fn mutate(slot: &mut Option<Context>, root: &Path) -> Option<mdkb::error::Result<()>> {
     let root = root.to_path_buf();
-    run_mutation(slot, "doc update", |ctx| {
+    let owned = tokio::sync::Mutex::new(slot.take());
+    let outcome = run_mutation(&owned, "doc update", |ctx| {
         handle_update(ctx, &root).map(|_| ())
-    })
+    });
+    *slot = owned.into_inner();
+    outcome
 }
 
 #[test]

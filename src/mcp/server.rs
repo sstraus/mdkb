@@ -1797,8 +1797,7 @@ async fn full_rebuild_from_heal(
             let project_root = root.to_string_lossy().to_string();
             let ctx = Arc::clone(ctx);
             let indexed = tokio::task::spawn_blocking(move || {
-                let mut guard = ctx.blocking_lock();
-                crate::core::run_mutation(&mut guard, "post-heal session index", |c| {
+                crate::core::run_mutation(&ctx, "post-heal session index", |c| {
                     crate::core::sessions::handle_session_index(c, &sessions_base, &project_root)
                 })
             })
@@ -1881,12 +1880,9 @@ async fn flush_memory_sync(ctx: &Arc<Mutex<Option<Context>>>, request: &mut Memo
             }
         }
         drop(guard);
-        crate::core::run_mutation_verify_after_release(
-            &ctx,
-            "memory sync",
-            |ctx_ref| crate::core::memory_sync::sync_memory_files(ctx_ref),
-            crate::store::heal::verify_and_mark_unadmitted,
-        )
+        crate::core::run_mutation(&ctx, "memory sync", |ctx_ref| {
+            crate::core::memory_sync::sync_memory_files(ctx_ref)
+        })
     })
     .await;
     match outcome {
@@ -1944,12 +1940,9 @@ async fn flush_doc_update(
     let ctx = Arc::clone(ctx);
     let root = root.to_path_buf();
     let outcome = tokio::task::spawn_blocking(move || {
-        crate::core::run_mutation_verify_after_release(
-            &ctx,
-            "doc reindex",
-            |ctx_ref| handle_update_unverified(ctx_ref, &root),
-            crate::store::heal::verify_and_mark_unadmitted,
-        )
+        crate::core::run_mutation(&ctx, "doc reindex", |ctx_ref| {
+            handle_update_unverified(ctx_ref, &root)
+        })
     })
     .await;
     match outcome {

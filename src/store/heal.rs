@@ -325,39 +325,58 @@ pub fn verify_and_mark(conn: &Connection, db_path: &Path) -> Result<()> {
     }
 }
 
-/// Size and mtime of the database and its WAL: what a write changes.
-fn write_stamp(db_path: &Path) -> [Option<(SystemTime, u64)>; 2] {
-    [db_path.to_path_buf(), with_suffix(db_path, "-wal")].map(|path| {
-        let meta = std::fs::metadata(path).ok()?;
-        Some((meta.modified().ok()?, meta.len()))
-    })
+/// What a write or a replacement changes: size and mtime of the database and
+/// its WAL, and the identity of the database file.
+#[derive(PartialEq)]
+struct WriteStamp {
+    files: [Option<(SystemTime, u64)>; 2],
+    identity: Option<(u64, u64)>,
+}
+
+fn write_stamp(db_path: &Path) -> WriteStamp {
+    WriteStamp {
+        files: [db_path.to_path_buf(), with_suffix(db_path, "-wal")].map(|path| {
+            let meta = std::fs::metadata(path).ok()?;
+            Some((meta.modified().ok()?, meta.len()))
+        }),
+        identity: file_identity(db_path),
+    }
 }
 
 /// [`verify_and_mark_throttled`] for a caller that holds neither the writer
 /// admission nor the mutation lock, so a scan of a database of hundreds of
 /// megabytes does not queue every other writer behind it.
 ///
-/// The marker certifies "sound as of now", so it is touched only when neither
-/// file was written while the probe ran; a write that landed in between leaves
-/// the marker absent and the next write cycle probes again. The probe itself
-/// reads a WAL snapshot, which a concurrent writer cannot tear.
+/// The verdict ("sound as of the probe's start") is recorded, in the marker and
+/// in this process's memory, only when neither file was written or replaced
+/// while the probe ran; a write that landed in between leaves both unset and
+/// the next write cycle probes again. The probe itself reads a WAL snapshot,
+/// which a concurrent writer cannot tear.
 pub fn verify_and_mark_unadmitted(db_path: &Path) -> Result<()> {
-    if checked_recently(
-        db_path,
-        &marker_path(db_path),
-        CHECK_INTERVAL,
-        SystemTime::now(),
-    ) {
+    verify_and_mark_unadmitted_with(db_path, is_structurally_sound)
+}
+
+/// [`verify_and_mark_unadmitted`] with the probe injected, so a test can write
+/// to the database while it "runs".
+pub fn verify_and_mark_unadmitted_with(
+    db_path: &Path,
+    probe: impl FnOnce(&Connection) -> Soundness,
+) -> Result<()> {
+    let started = SystemTime::now();
+    if checked_recently(db_path, &marker_path(db_path), CHECK_INTERVAL, started) {
         return Ok(());
     }
     if !db_path.exists() {
         return Ok(());
     }
     let before = write_stamp(db_path);
-    let probe = open_probe(db_path)?;
-    match is_structurally_sound(&probe) {
+    let conn = open_probe(db_path)?;
+    match probe(&conn) {
         Soundness::Sound => {
-            touch_marker_if_unwritten(db_path, &before);
+            if write_stamp(db_path) == before {
+                touch_marker(&marker_path(db_path));
+                set_process_verified(db_path, Some(started));
+            }
             Ok(())
         }
         Soundness::Corrupt { .. } => {
@@ -368,12 +387,6 @@ pub fn verify_and_mark_unadmitted(db_path: &Path) -> Result<()> {
             .into())
         }
         Soundness::Undetermined(e) => Err(e.into()),
-    }
-}
-
-fn touch_marker_if_unwritten(db_path: &Path, before: &[Option<(SystemTime, u64)>; 2]) {
-    if write_stamp(db_path) == *before {
-        touch_marker(&marker_path(db_path));
     }
 }
 
@@ -2402,38 +2415,34 @@ mod process_probe_attacks {
 mod unadmitted_probe_tests {
     use super::*;
 
-    fn make_db(path: &Path) {
+    fn make_wal_db(path: &Path) -> Connection {
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1);")
-            .unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        conn
     }
 
-    /// Catches: a marker touched after a probe during which another writer
-    /// wrote, which would certify bytes the probe never read.
+    /// Catches: a verdict recorded (marker or process memory) after a probe
+    /// during which another writer wrote, which would certify bytes the probe
+    /// never read.
     #[test]
-    fn a_write_during_the_probe_leaves_the_marker_absent() {
+    fn a_write_during_the_probe_records_no_verdict() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.sqlite");
-        make_db(&db);
-        let before = write_stamp(&db);
+        let _holder = make_wal_db(&db);
         std::thread::sleep(Duration::from_millis(20));
-        Connection::open(&db)
-            .unwrap()
-            .execute("INSERT INTO t VALUES (2)", [])
-            .unwrap();
-        touch_marker_if_unwritten(&db, &before);
+        verify_and_mark_unadmitted_with(&db, |conn| {
+            Connection::open(&db)
+                .unwrap()
+                .execute("INSERT INTO t VALUES (2)", [])
+                .unwrap();
+            is_structurally_sound(conn)
+        })
+        .unwrap();
         assert!(!marker_path(&db).exists());
-    }
-
-    /// Catches: the lock-free probe never certifying a quiet database, which
-    /// would make every later open scan the whole file.
-    #[test]
-    fn a_quiet_database_is_certified_without_any_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("index.sqlite");
-        make_db(&db);
-        verify_and_mark_unadmitted(&db).unwrap();
-        assert!(marker_path(&db).exists());
+        assert!(!has_process_probe(&db));
     }
 
     /// Catches: the lock-free probe never certifying a quiet WAL database that
@@ -2444,12 +2453,7 @@ mod unadmitted_probe_tests {
     fn a_quiet_wal_database_is_certified_and_remembered() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("index.sqlite");
-        let holder = Connection::open(&db).unwrap();
-        holder
-            .execute_batch(
-                "PRAGMA journal_mode = WAL; CREATE TABLE t (x); INSERT INTO t VALUES (1);",
-            )
-            .unwrap();
+        let _holder = make_wal_db(&db);
         verify_and_mark_unadmitted(&db).unwrap();
         assert!(marker_path(&db).exists());
         assert!(has_process_probe(&db));

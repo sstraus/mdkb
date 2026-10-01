@@ -55,6 +55,15 @@ pub struct Context {
     /// context lives, so no other process renames the database files underneath
     /// it. Never read — its whole job is to exist until drop.
     _live_guard: Option<crate::store::mutation_lock::MutationGuard>,
+    /// Which opening of the store this is, unique per process. A slot that
+    /// released its lock for a probe uses it to tell whether the context it
+    /// probed is still the one in the slot.
+    pub(crate) generation: u64,
+}
+
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl std::fmt::Debug for Context {
@@ -80,29 +89,50 @@ impl std::fmt::Debug for Context {
 /// Dropping the context releases the connection and the live lock, so the next
 /// `Context::open` quarantines the file, salvages memory out of it, and rebuilds.
 /// Returns `None` when the slot was already empty (nothing to run).
+///
+/// The full-file integrity probe that certifies the write runs only after the
+/// slot and the writer admission are released: a scan of a store of hundreds of
+/// megabytes under the slot queues every request for that repo behind it (the
+/// hook's context phase, #201-481e). Blocking: call from `spawn_blocking`.
 pub fn run_mutation<T>(
-    slot: &mut Option<Context>,
+    slot: &tokio::sync::Mutex<Option<Context>>,
     what: &str,
     f: impl FnOnce(&mut Context) -> Result<T>,
 ) -> Option<Result<T>> {
-    let db_path = slot.as_ref()?.db_path.clone();
-    let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
-        Ok(guard) => guard,
-        Err(error) => return Some(Err(error)),
+    run_mutation_verify_after_release(
+        slot,
+        what,
+        f,
+        crate::store::heal::verify_and_mark_unadmitted,
+    )
+}
+
+/// [`run_mutation`] with the post-write probe injected.
+pub fn run_mutation_verify_after_release<T>(
+    slot: &tokio::sync::Mutex<Option<Context>>,
+    what: &str,
+    f: impl FnOnce(&mut Context) -> Result<T>,
+    verify: impl FnOnce(&Path) -> Result<()>,
+) -> Option<Result<T>> {
+    let (db_path, generation, mut result) = {
+        let mut guard = slot.blocking_lock();
+        let (db_path, generation) = {
+            let ctx = guard.as_ref()?;
+            (ctx.db_path.clone(), ctx.generation)
+        };
+        let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
+            Ok(guard) => guard,
+            Err(error) => return Some(Err(error)),
+        };
+        // A crash during the mutation must not leave a pre-write health marker
+        // capable of suppressing recovery on the next open.
+        crate::store::heal::invalidate_marker(&db_path);
+        let result = f(guard.as_mut().expect("slot was checked above"));
+        (db_path, generation, result)
     };
-
-    // A crash during the mutation must not leave a pre-write health marker
-    // capable of suppressing recovery on the next open.
-    crate::store::heal::invalidate_marker(&db_path);
-    let mut result = f(slot.as_mut().expect("slot was checked above"));
-
-    // Always verify through a fresh connection. Mutation implementations that
-    // already performed the same check have touched the marker after their last
-    // write, so this call is throttled to a cheap metadata check.
-    if let Err(error) = crate::store::heal::verify_and_mark_throttled(&db_path) {
+    if let Err(error) = verify(&db_path) {
         result = Err(error);
     }
-
     if let Err(e) = &result {
         if e.is_index_corrupt() {
             tracing::error!(
@@ -110,38 +140,17 @@ pub fn run_mutation<T>(
                 error = %e,
                 "index is corrupt — closing this connection so the next open can quarantine, salvage memory and rebuild"
             );
-            close_over_corruption(slot);
+            // The slot was released for the probe, so it may hold a newer
+            // context now (reopened over a rebuilt file). The verdict is about
+            // the file this one opened; it must not tear down its successor.
+            let mut guard = slot.blocking_lock();
+            if guard
+                .as_ref()
+                .is_some_and(|ctx| ctx.generation == generation)
+            {
+                close_over_corruption(&mut guard);
+            }
         }
-    }
-    Some(result)
-}
-
-/// [`run_mutation`] for a daemon task that shares the slot with live requests:
-/// `verify` (the full-file integrity probe) runs only after the slot and the
-/// writer admission are released, so requests are not queued behind a scan of
-/// the whole database. Blocking: call from `spawn_blocking`.
-pub fn run_mutation_verify_after_release<T>(
-    slot: &tokio::sync::Mutex<Option<Context>>,
-    what: &str,
-    f: impl FnOnce(&mut Context) -> Result<T>,
-    verify: impl FnOnce(&Path) -> Result<()>,
-) -> Option<Result<T>> {
-    let (db_path, mut result) = {
-        let mut guard = slot.blocking_lock();
-        let db_path = guard.as_ref()?.db_path.clone();
-        let _writer_guard = match crate::store::mutation_lock::acquire_writer(&db_path, what) {
-            Ok(guard) => guard,
-            Err(error) => return Some(Err(error)),
-        };
-        crate::store::heal::invalidate_marker(&db_path);
-        let result = f(guard.as_mut().expect("slot was checked above"));
-        (db_path, result)
-    };
-    if let Err(error) = verify(&db_path) {
-        result = Err(error);
-    }
-    if result.as_ref().is_err_and(Error::is_index_corrupt) {
-        close_over_corruption(&mut slot.blocking_lock());
     }
     Some(result)
 }
@@ -426,6 +435,7 @@ impl Context {
             corrupt_in_use: false,
             migrated_from,
             _live_guard: Some(live_guard),
+            generation: next_generation(),
         })
     }
 
@@ -508,6 +518,7 @@ impl Context {
             corrupt_in_use: false,
             migrated_from: None,
             _live_guard: None,
+            generation: next_generation(),
         })
     }
 
@@ -597,6 +608,7 @@ impl Context {
             corrupt_in_use: false,
             migrated_from: None,
             _live_guard: Some(live_guard),
+            generation: next_generation(),
         })
     }
 
@@ -714,12 +726,12 @@ mod close_over_corruption_tests {
         assert!(slot.is_none() && !heal::has_process_probe(&db_path));
 
         let dir = tempfile::tempdir().unwrap();
-        let mut slot = probed_slot(dir.path());
-        let db_path = slot.as_ref().unwrap().db_path.clone();
-        run_mutation(&mut slot, "test mutation", |ctx| -> Result<()> {
+        let slot = tokio::sync::Mutex::new(probed_slot(dir.path()));
+        let db_path = slot.try_lock().unwrap().as_ref().unwrap().db_path.clone();
+        run_mutation(&slot, "test mutation", |ctx| -> Result<()> {
             Err(corrupt_error(ctx))
         });
-        assert!(slot.is_none() && !heal::has_process_probe(&db_path));
+        assert!(slot.try_lock().unwrap().is_none() && !heal::has_process_probe(&db_path));
     }
 
     /// Catches: the telemetry write that runs on every hook voiding the record

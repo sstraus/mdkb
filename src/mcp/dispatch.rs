@@ -25,7 +25,7 @@ use crate::cli::hook_logic::{
 use crate::code::indexing::IndexFacade;
 use crate::core::Context;
 use crate::core::cli_mutation::{CliMutation, CliMutationResult};
-use crate::core::indexing::{UpdateOutcome, UpdateRequest, update_documents};
+use crate::core::indexing::{UpdateOutcome, UpdateRequest, update_documents_unverified};
 use crate::core::search::{handle_hybrid_search, handle_mget, hybrid_search_fts};
 use crate::daemon::registry::{RepoHandle, RepoRegistry};
 use crate::domain::{SearchResult, UpdateResult};
@@ -810,14 +810,17 @@ async fn run_embedding_backfill(handle: Arc<RepoHandle>) -> usize {
     }
     let ctx = Arc::clone(&handle.ctx);
     let drained = tokio::task::spawn_blocking(move || {
-        let mut guard = ctx.blocking_lock();
         // Cheap indexed COUNT(*): only a positive count is worth loading the model.
-        match crate::core::run_guarded_read(&mut guard, "embedding backlog count", |ctx| {
-            crate::store::memory::count_pending_embeddings(&ctx.conn)
-        }) {
+        let pending = {
+            let mut guard = ctx.blocking_lock();
+            crate::core::run_guarded_read(&mut guard, "embedding backlog count", |ctx| {
+                crate::store::memory::count_pending_embeddings(&ctx.conn)
+            })
+        };
+        match pending {
             Some(Ok(0)) | None => Some(0),
             Some(Ok(_)) => {
-                match crate::core::run_mutation(&mut guard, "memory embedding backfill", |ctx| {
+                match crate::core::run_mutation(&ctx, "memory embedding backfill", |ctx| {
                     crate::store::memory::backfill_memory_embeddings(&ctx.conn)
                 }) {
                     Some(Ok(n)) => Some(n),
@@ -2744,9 +2747,8 @@ pub async fn update_impl(
         let root = handle.root.clone();
         let request = request.clone();
         tokio::task::spawn_blocking(move || {
-            let mut ctx_guard = ctx.blocking_lock();
-            crate::core::run_mutation(&mut ctx_guard, "document update", |ctx| {
-                update_documents(ctx, &root, &request)
+            crate::core::run_mutation(&ctx, "document update", |ctx| {
+                update_documents_unverified(ctx, &root, &request)
             })
             .ok_or_else(|| "Database not initialized".to_string())?
             .map_err(|e| format!("Document update failed: {e}"))
@@ -2813,8 +2815,7 @@ async fn index_sessions(handle: &RepoHandle) -> Option<UpdateResult> {
     // with the lock taken on the blocking thread (PERF-1).
     let ctx = Arc::clone(&handle.ctx);
     let indexed = tokio::task::spawn_blocking(move || {
-        let mut ctx_guard = ctx.blocking_lock();
-        crate::core::run_mutation(&mut ctx_guard, "session index", |ctx| {
+        crate::core::run_mutation(&ctx, "session index", |ctx| {
             crate::core::sessions::handle_session_index(ctx, &sessions_base, &project_root)
         })
     })
@@ -5921,10 +5922,15 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
         return;
     }
     let now = chrono::Utc::now().timestamp();
-    let mut guard = handle.ctx.lock().await;
-    match crate::core::run_mutation(&mut guard, "prior settling", |ctx| {
-        settle_injections(&ctx.conn, &session, now, &errors)
-    }) {
+    let ctx = Arc::clone(&handle.ctx);
+    let settle_session_id = session.clone();
+    let prior_outcome = tokio::task::spawn_blocking(move || {
+        crate::core::run_mutation(&ctx, "prior settling", |ctx| {
+            settle_injections(&ctx.conn, &settle_session_id, now, &errors)
+        })
+    })
+    .await;
+    match prior_outcome.unwrap_or(None) {
         Some(Ok(report)) if !report.is_empty() => {
             // All three outcomes are logged, not just the one that moves a
             // counter: a run that settles nothing but `unobservable` is the
@@ -5952,11 +5958,17 @@ async fn settle_session(handle: Arc<RepoHandle>, transcript_path: String, sessio
 
     // Recall candidates offered in this session, labelled from the same
     // window. Only strong signals label; the rest stay open, not negative.
-    match crate::core::run_mutation(&mut guard, "recall settling", |ctx| {
-        let open = crate::store::recall_ledger::open_candidates(&ctx.conn, &session)?;
-        let labels = crate::domain::recall_outcome::label(&open, &recall_events);
-        crate::store::recall_ledger::set_outcomes(&ctx.conn, &labels, now)
-    }) {
+    let ctx = Arc::clone(&handle.ctx);
+    let ledger_session = session.clone();
+    let recall_outcome = tokio::task::spawn_blocking(move || {
+        crate::core::run_mutation(&ctx, "recall settling", |ctx| {
+            let open = crate::store::recall_ledger::open_candidates(&ctx.conn, &ledger_session)?;
+            let labels = crate::domain::recall_outcome::label(&open, &recall_events);
+            crate::store::recall_ledger::set_outcomes(&ctx.conn, &labels, now)
+        })
+    })
+    .await;
+    match recall_outcome.unwrap_or(None) {
         Some(Ok(labelled)) if labelled > 0 => {
             tracing::info!(
                 "recall settling: labelled {labelled} candidate(s) in session {session}"
@@ -6150,17 +6162,25 @@ async fn mine_episode_inner(
         return MiningOutcome::Failed(format!("open store failed: {e}"));
     }
     let now = chrono::Utc::now().timestamp();
-    let mut guard = handle.ctx.lock().await;
-    match crate::core::run_mutation(&mut guard, "prior mining", |ctx| {
-        integrate_distilled(
-            &ctx.conn,
-            &distilled,
-            &session,
-            now,
-            lesson_embedding.as_deref(),
-            error_signature.as_deref(),
-        )
-    }) {
+    let ctx = Arc::clone(&handle.ctx);
+    let integrated = tokio::task::spawn_blocking(move || {
+        crate::core::run_mutation(&ctx, "prior mining", |ctx| {
+            integrate_distilled(
+                &ctx.conn,
+                &distilled,
+                &session,
+                now,
+                lesson_embedding.as_deref(),
+                error_signature.as_deref(),
+            )
+        })
+    })
+    .await;
+    let integrated = match integrated {
+        Ok(outcome) => outcome,
+        Err(e) => return MiningOutcome::Failed(format!("integrate task failed: {e}")),
+    };
+    match integrated {
         Some(Err(error)) => {
             tracing::debug!("prior mining: integrate_distilled failed: {error}");
             MiningOutcome::Failed(format!("integrate failed: {error}"))
