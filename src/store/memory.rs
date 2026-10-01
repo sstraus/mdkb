@@ -6166,4 +6166,473 @@ mod tests {
             "[topic] deploy-notes: A concise title"
         );
     }
+
+    // ==================== Mutation survivors (#228-3ab5, #229-a676, #230-3545) ====================
+
+    /// Catches: a decay curve with a wrong operator — `now - reference`, the
+    /// day divisor, the access strength or the 90-day scale — which the loose
+    /// 90-day tests absorb because strength is 1 at zero accesses.
+    #[test]
+    fn confidence_decays_by_the_documented_curve() {
+        let day = 86_400;
+        let mut e = make_entry_at(0, 0, 0, None, SourceType::UserStatement);
+        e.entry_type = EntryType::Prior;
+        // No accesses: strength 1, so 180 days is e^-2 of 0.425.
+        assert!((e.confidence_at(180 * day) - 0.0575174953755604).abs() < 1e-9);
+        // Three accesses: strength 1 + ln 4 stretches the same 90 days.
+        e.access_count = 3;
+        assert!((e.confidence_at(90 * day) - 0.27950757235370893).abs() < 1e-9);
+        // A clock behind the reference never lifts confidence over its start.
+        assert!((e.confidence_at(-10 * day) - 0.425).abs() < 1e-12);
+    }
+
+    /// Catches: the dispute test accepting no correction, a tie, or an older
+    /// refutation (the guard and the two comparisons).
+    #[test]
+    fn a_dispute_needs_a_correction_and_a_refutation_newer_than_the_confirmation() {
+        let disputed = |corrections: u32, refuted: Option<i64>, confirmed: Option<i64>| {
+            let mut e = make_entry_at(0, 0, 0, None, SourceType::UserStatement);
+            e.corrections = corrections;
+            e.last_refuted_at = refuted;
+            e.last_confirmed_at = confirmed;
+            e.is_disputed()
+        };
+        assert!(!disputed(0, Some(100), None), "no correction recorded");
+        assert!(!disputed(1, None, None), "no refutation stamp");
+        assert!(disputed(1, Some(100), None), "one dispute, never confirmed");
+        assert!(disputed(2, Some(100), None), "two disputes");
+        assert!(!disputed(1, Some(100), Some(100)), "a tie goes to the confirmation");
+        assert!(disputed(1, Some(101), Some(100)), "refuted after confirmed");
+        assert!(!disputed(1, Some(99), Some(100)), "confirmed after refuted");
+    }
+
+    /// Catches: a documented 30-day prior lifetime changed by an operator in the
+    /// constant. Every consumer reads the constant, so none can notice.
+    #[test]
+    fn a_prior_lives_thirty_days() {
+        assert_eq!(PRIOR_TTL_SECS, 2_592_000);
+    }
+
+    /// Catches: an error message that lists no valid types.
+    #[test]
+    fn the_valid_entry_types_are_listed_in_declaration_order() {
+        assert_eq!(
+            EntryType::valid_set(),
+            "topic, problem, decision, reminder, prior, handoff"
+        );
+        let err = "bogus".parse::<EntryType>().unwrap_err();
+        assert_eq!(
+            err,
+            "Invalid entry type: bogus. Valid: topic, problem, decision, reminder, prior, handoff"
+        );
+    }
+
+    /// Catches: a status or sort-order name dropped from its parser.
+    #[test]
+    fn every_status_and_sort_order_name_parses() {
+        for (name, want) in [
+            ("active", EntryStatus::Active),
+            ("Superseded", EntryStatus::Superseded),
+            ("ARCHIVED", EntryStatus::Archived),
+        ] {
+            assert_eq!(name.parse::<EntryStatus>(), Ok(want), "{name}");
+        }
+        assert_eq!(
+            "gone".parse::<EntryStatus>(),
+            Err("Invalid entry status: gone".to_string())
+        );
+        for (name, want) in [
+            ("popular", MemorySortOrder::Popular),
+            ("Recent", MemorySortOrder::Recent),
+            ("NEWEST", MemorySortOrder::Newest),
+        ] {
+            assert_eq!(name.parse::<MemorySortOrder>(), Ok(want), "{name}");
+        }
+        assert!("oldest".parse::<MemorySortOrder>().is_err());
+    }
+
+    /// Catches: a conflict snapshot that stores nothing, loses the loser's
+    /// markdown, or keeps more than the revision cap.
+    #[test]
+    fn a_conflict_snapshot_keeps_the_losing_markdown_up_to_the_cap() {
+        let conn = setup_db();
+        add_entry(&conn, &typed_entry("e1", "T", "c", EntryType::Topic)).unwrap();
+
+        save_conflict_snapshot(&conn, "e1", "# T\nloser body", "file").unwrap();
+        let revisions = get_revisions(&conn, "e1").unwrap();
+        assert_eq!(revisions.len(), 1);
+        assert!(revisions[0].diff.starts_with("# conflict "), "{}", revisions[0].diff);
+        assert!(
+            revisions[0]
+                .diff
+                .ends_with(" — this version lost to the file\n# T\nloser body"),
+            "{}",
+            revisions[0].diff
+        );
+
+        for n in 1..=3 {
+            save_conflict_snapshot(&conn, "e1", &format!("v{n}"), "database").unwrap();
+        }
+        let kept: Vec<String> = get_revisions(&conn, "e1")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.diff)
+            .collect();
+        assert_eq!(kept.len(), MAX_REVISIONS);
+        assert!(kept[0].ends_with("v1"), "oldest dropped first: {kept:?}");
+        assert!(kept[2].ends_with("v3"), "{kept:?}");
+    }
+
+    /// Catches: an export listing that returns nothing, or hides an expired entry.
+    #[test]
+    fn list_entries_all_returns_every_entry_expired_ones_included() {
+        let conn = setup_db();
+        let mut expired = typed_entry("b-old", "Old", "c", EntryType::Topic);
+        expired.expires_at = Some(1);
+        add_entry(&conn, &expired).unwrap();
+        add_entry(&conn, &typed_entry("a-live", "Live", "c", EntryType::Topic)).unwrap();
+
+        let ids: Vec<String> = list_entries_all(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, ["a-live", "b-old"]);
+    }
+
+    fn entry_with(id: &str, status: EntryStatus, confirmations: u32, corrections: u32) -> MemoryEntry {
+        let mut e = typed_entry(id, &format!("Title {id}"), "Content", EntryType::Topic);
+        e.status = status;
+        e.confirmations = confirmations;
+        e.corrections = corrections;
+        e
+    }
+
+    /// Catches: a confirmation or refutation message or stored counter off by
+    /// the wrong operator (`+` as `-`/`*`, `-` as `+`), at one signal each way
+    /// and at zero.
+    #[test]
+    fn each_signal_stores_and_reports_the_exact_counter() {
+        let conn = setup_db();
+        add_entry(&conn, &entry_with("e", EntryStatus::Active, 2, 2)).unwrap();
+        let counters = |conn: &Connection| {
+            let e = get_entry_without_tracking(conn, "e").unwrap().unwrap();
+            (e.confirmations, e.corrections)
+        };
+
+        assert_eq!(confirm_entry(&conn, "e", 1).unwrap(), "Confirmed: e (3 confirmations)");
+        assert_eq!(counters(&conn), (3, 2));
+        assert_eq!(confirm_entry(&conn, "e", -1).unwrap(), "Refuted: e (3 corrections)");
+        assert_eq!(counters(&conn), (3, 3));
+        assert_eq!(confirm_entry(&conn, "e", 0).unwrap(), "Confirmed: e (3 confirmations)");
+        assert_eq!(counters(&conn), (3, 3));
+    }
+
+    /// Catches: an archived entry restored by a refutation or a zero signal
+    /// (`&&` as `||`, `>` as `>=`), a restore message shown for an active
+    /// entry, and `updated_at` moved by a counter-only change (or left alone by
+    /// the real status change).
+    #[test]
+    fn only_a_positive_signal_restores_an_archived_entry() {
+        let conn = setup_db();
+        for id in ["refuted", "neutral", "restored", "plain"] {
+            let status = if id == "plain" { EntryStatus::Active } else { EntryStatus::Archived };
+            add_entry(&conn, &entry_with(id, status, 0, 0)).unwrap();
+        }
+        let state = |id: &str| {
+            let e = get_entry_without_tracking(&conn, id).unwrap().unwrap();
+            (e.status, e.updated_at)
+        };
+        let before = Utc::now().timestamp();
+
+        assert_eq!(confirm_entry(&conn, "refuted", -1).unwrap(), "Refuted: refuted (1 corrections)");
+        assert_eq!(state("refuted"), (EntryStatus::Archived, 1000));
+
+        assert_eq!(confirm_entry(&conn, "neutral", 0).unwrap(), "Confirmed: neutral (0 confirmations)");
+        assert_eq!(state("neutral"), (EntryStatus::Archived, 1000));
+
+        assert_eq!(confirm_entry(&conn, "plain", 1).unwrap(), "Confirmed: plain (1 confirmations)");
+        assert_eq!(state("plain"), (EntryStatus::Active, 1000), "counters never move updated_at");
+
+        assert_eq!(
+            confirm_entry(&conn, "restored", 1).unwrap(),
+            "Confirmed and restored to active: restored"
+        );
+        let (status, updated_at) = state("restored");
+        assert_eq!(status, EntryStatus::Active);
+        assert!(updated_at >= before, "a status change is a projected change: {updated_at}");
+    }
+
+    /// Catches: the correction size limit doubled (`/` as `*`) or moved by one
+    /// (`>` as `>=`/`==`) — and the content cap after the block is appended.
+    #[test]
+    fn a_correction_is_limited_to_half_the_content_cap_and_the_cap_itself() {
+        let conn = setup_db();
+        add_entry(&conn, &entry_with("e", EntryStatus::Active, 0, 0)).unwrap();
+        let half = MAX_CONTENT_SIZE / 2;
+
+        let too_long = "x".repeat(half + 1);
+        let err = correct_entry(&conn, "e", Some(&too_long)).unwrap_err().to_string();
+        assert!(err.contains(&format!("Correction text exceeds {half} bytes")), "{err}");
+
+        let at_limit = "x".repeat(half);
+        assert_eq!(
+            correct_entry(&conn, "e", Some(&at_limit)).unwrap(),
+            "Corrected: e (correction appended, confidence boosted)"
+        );
+        let stored = get_entry_without_tracking(&conn, "e").unwrap().unwrap();
+        assert_eq!(stored.confirmations, 1);
+        assert!(stored.content.ends_with(&at_limit));
+
+        // The appended block counts toward the cap: fill the body so that the
+        // result is exactly MAX_CONTENT_SIZE, then one byte more.
+        let block = "\n\n## Correction (2000-01-01)\n\n".len();
+        for (existing, accepted) in [
+            (MAX_CONTENT_SIZE - block - 10, true),
+            (MAX_CONTENT_SIZE - block - 9, false),
+        ] {
+            let id = format!("fill-{accepted}");
+            let mut e = entry_with(&id, EntryStatus::Active, 0, 0);
+            e.content = "c".repeat(existing);
+            add_entry(&conn, &e).unwrap();
+            let result = correct_entry(&conn, &id, Some("0123456789"));
+            if accepted {
+                result.unwrap();
+                let stored = get_entry_without_tracking(&conn, &id).unwrap().unwrap();
+                assert_eq!(stored.content.len(), MAX_CONTENT_SIZE);
+            } else {
+                let err = result.unwrap_err().to_string();
+                assert!(err.contains("max content size"), "{err}");
+            }
+        }
+    }
+
+    /// Catches: a delete that reports success for an id that was not there, or
+    /// failure for one that was.
+    #[test]
+    fn delete_entry_reports_whether_a_row_went_away() {
+        let conn = setup_db();
+        add_entry(&conn, &entry_with("e", EntryStatus::Active, 0, 0)).unwrap();
+        assert!(delete_entry(&conn, "e").unwrap());
+        assert!(!delete_entry(&conn, "e").unwrap(), "already gone");
+    }
+
+    /// `[1, offset, 0, ...]`: its L2 distance to `[1, 0, ...]` is exactly `offset`.
+    fn offset_embedding(offset: f32) -> Vec<f32> {
+        let mut v = vec![0.0; crate::store::vectors::EMBEDDING_DIM];
+        v[0] = 1.0;
+        v[1] = offset;
+        v
+    }
+
+    fn add_with_embedding(conn: &Connection, entry: &MemoryEntry, embedding: &[f32]) -> i64 {
+        add_entry(conn, entry).unwrap();
+        let rowid = get_rowid(conn, &entry.id).unwrap().unwrap();
+        crate::store::vectors::store_memory_embedding(conn, rowid, embedding, "test").unwrap();
+        rowid
+    }
+
+    /// Catches: a similarity warning that is empty or wrong, the entry's own
+    /// rowid listed as a neighbour, a far entry listed, and the 0.55 edge
+    /// misplaced (it is inside).
+    #[test]
+    fn similar_entries_are_listed_nearest_first_up_to_the_edge_and_never_the_entry_itself() {
+        let conn = setup_db_with_vectors();
+        let own = add_with_embedding(
+            &conn,
+            &typed_entry("self", "Self", "c", EntryType::Topic),
+            &offset_embedding(0.0),
+        );
+        for (id, offset) in [("near", 0.4), ("edge", 0.55), ("far", 0.6)] {
+            add_with_embedding(
+                &conn,
+                &typed_entry(id, id, "c", EntryType::Topic),
+                &offset_embedding(offset),
+            );
+        }
+
+        let warnings = find_similar_entries(&conn, &offset_embedding(0.0), own, "self").unwrap();
+
+        assert_eq!(
+            warnings,
+            "\nSimilar entry exists: near (similarity: 0.92). Consider updating it instead.\
+             \nSimilar entry exists: edge (similarity: 0.85). Consider updating it instead."
+        );
+    }
+
+    /// Catches: a recency score that is not `ln(1 + n) * 0.5^(age / half-life)`,
+    /// or that is positive for a non-positive half-life.
+    #[test]
+    fn access_recency_is_a_log_count_halving_per_half_life() {
+        let now = 1_000_000;
+        let ln4 = 4.0_f64.ln();
+        assert_eq!(access_recency_score(0, Some(now), now, 100), 0.0, "never accessed");
+        assert_eq!(access_recency_score(5, None, now, 100), 0.0, "no timestamp");
+        assert_eq!(access_recency_score(5, Some(now - 100), now, -10), 0.0, "negative half-life");
+        assert_eq!(access_recency_score(5, Some(now - 100), now, 0), 0.0, "zero half-life");
+        assert!((access_recency_score(3, Some(now), now, 100) - ln4).abs() < 1e-12, "just now");
+        assert!(
+            (access_recency_score(3, Some(now - 100), now, 100) - ln4 * 0.5).abs() < 1e-12,
+            "one half-life ago"
+        );
+        assert!(
+            (access_recency_score(3, Some(now + 500), now, 100) - ln4).abs() < 1e-12,
+            "a stamp in the future is not older than now"
+        );
+    }
+
+    /// An entry whose BM25 rank for `alpha` is first, and one whose rank is
+    /// second.
+    fn alpha_pair() -> (MemoryEntry, MemoryEntry) {
+        (
+            typed_entry("first", "alpha alpha alpha alpha", "alpha", EntryType::Topic),
+            typed_entry(
+                "second",
+                "Other note",
+                "a long filler text about gamma delta epsilon zeta eta theta iota kappa lambda \
+                 and one alpha mention at the very end",
+                EntryType::Topic,
+            ),
+        )
+    }
+
+    /// Catches: the BM25-only score not being `0.7 / rank + 0.3 * confidence`
+    /// (`1 / (rank + 1)` turned `1 * (rank + 1)` is invisible at rank 0).
+    #[test]
+    fn bm25_only_scores_fall_with_rank() {
+        let conn = setup_db_with_vectors();
+        let (first, second) = alpha_pair();
+        add_entry(&conn, &first).unwrap();
+        add_entry(&conn, &second).unwrap();
+
+        let results = search_entries_recall(&conn, "alpha", None, 10, None, &ungated(0.0)).unwrap();
+
+        let ranked: Vec<(&str, f64)> = results.iter().map(|r| (r.id.as_str(), r.score)).collect();
+        assert_eq!(ranked.len(), 2, "{ranked:?}");
+        assert_eq!(ranked[0].0, "first");
+        assert_eq!(ranked[1].0, "second");
+        assert!((ranked[0].1 - 0.8275).abs() < 1e-6, "{ranked:?}");
+        assert!((ranked[1].1 - 0.4775).abs() < 1e-6, "{ranked:?}");
+    }
+
+    fn well_used_second() -> MemoryEntry {
+        let (_, mut second) = alpha_pair();
+        second.access_count = 50;
+        second.last_accessed = Some(Utc::now().timestamp() - 10);
+        second
+    }
+
+    /// Catches: the access-recency weight ignored, or applied at zero, in the
+    /// BM25-only order (the sort is gated on `weight > 0`).
+    #[test]
+    fn bm25_only_order_follows_recent_use_only_when_the_weight_is_positive() {
+        let conn = setup_db_with_vectors();
+        add_entry(&conn, &alpha_pair().0).unwrap();
+        add_entry(&conn, &well_used_second()).unwrap();
+
+        let order = |weight: f64| -> Vec<String> {
+            search_entries_recall(&conn, "alpha", None, 10, None, &ungated(weight))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.entry.id)
+                .collect()
+        };
+        assert_eq!(order(0.2), ["second", "first"], "recent use floats it up");
+        assert_eq!(order(0.0), ["first", "second"], "weight 0 keeps BM25 order");
+    }
+
+    /// Catches: the same gate on the fused (vector + BM25) path.
+    #[test]
+    fn fused_order_follows_recent_use_only_when_the_weight_is_positive() {
+        let conn = setup_db_with_vectors();
+        add_with_embedding(&conn, &alpha_pair().0, &test_embedding(0.30));
+        add_with_embedding(&conn, &well_used_second(), &test_embedding(0.31));
+        let query = test_embedding(0.30);
+
+        let order = |weight: f64| -> Vec<String> {
+            search_entries_recall(&conn, "alpha", Some(&query), 10, None, &ungated(weight))
+                .unwrap()
+                .into_iter()
+                .map(|r| r.entry.id)
+                .collect()
+        };
+        assert_eq!(order(0.2), ["second", "first"], "the bonus outweighs one rank");
+        assert_eq!(order(0.0), ["first", "second"], "no bonus without weight");
+    }
+
+    /// Catches: the relevance floor applied when it is 0.0 (disabled) or not
+    /// applied when it is positive, in the BM25-only path where only a strong
+    /// lexical match is admitted.
+    #[test]
+    fn the_relevance_floor_applies_only_when_it_is_positive() {
+        let conn = setup_db_with_vectors();
+        add_entry(
+            &conn,
+            &typed_entry("weak", "A note", "mentions alpha once", EntryType::Topic),
+        )
+        .unwrap();
+        add_entry(
+            &conn,
+            &typed_entry("strong", "PKCE note", "the code_verifier is kept", EntryType::Topic),
+        )
+        .unwrap();
+        let ids = |query: &str, floor: f32| -> Vec<String> {
+            let cfg = crate::config::SearchMemoryConfig {
+                min_recall_cosine: floor,
+                ..ungated(0.0)
+            };
+            search_entries_recall(&conn, query, None, 10, None, &cfg)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.entry.id)
+                .collect()
+        };
+
+        assert_eq!(ids("alpha", 0.0), ["weak"], "floor off: every BM25 hit");
+        assert!(ids("alpha", 0.5).is_empty(), "floor on: one common word is not evidence");
+        assert_eq!(ids("code_verifier", 0.5), ["strong"], "an identifier is");
+    }
+
+    /// Catches: the vector leg fetching `limit + 2` candidates instead of
+    /// `limit * 2`: a third-nearest entry that is also BM25 rank 2 would then
+    /// overtake the BM25 leader.
+    #[test]
+    fn the_vector_leg_fetches_twice_the_limit() {
+        let conn = setup_db_with_vectors();
+        let (leader, runner_up) = alpha_pair();
+        let leader = MemoryEntry { id: "y".into(), ..leader };
+        let runner_up = MemoryEntry { id: "x".into(), ..runner_up };
+        add_entry(&conn, &leader).unwrap();
+        add_with_embedding(&conn, &runner_up, &test_embedding(0.32));
+        for (id, seed) in [("z", 0.30), ("w", 0.31)] {
+            add_with_embedding(
+                &conn,
+                &typed_entry(id, id, "unrelated words only", EntryType::Topic),
+                &test_embedding(seed),
+            );
+        }
+
+        let results =
+            search_entries_recall(&conn, "alpha", Some(&test_embedding(0.30)), 1, None, &ungated(0.0))
+                .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "y");
+    }
+
+    /// Catches: a vector fetch of zero rows (`limit * 2` as `limit / 2` at limit
+    /// 1) that silently drops the search to BM25-only: the entry would lose its
+    /// distance.
+    #[test]
+    fn a_result_in_both_legs_carries_its_vector_distance() {
+        let conn = setup_db_with_vectors();
+        add_with_embedding(&conn, &alpha_pair().0, &test_embedding(0.30));
+
+        let results =
+            search_entries_recall(&conn, "alpha", Some(&test_embedding(0.30)), 1, None, &ungated(0.0))
+                .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].distance.is_some_and(|d| d < 1e-3), "{:?}", results[0].distance);
+    }
 }
