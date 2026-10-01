@@ -9,9 +9,14 @@ fn mdkb_bin() -> Command {
 }
 
 /// Invoke `mdkb hook <event>` with the given stdin JSON and return (exit_code, stdout).
+/// Runs in a scratch directory: the hook opens the store at its working
+/// directory, and cargo's is the crate root, whose `.mdkb` it would write into.
 fn run_hook(event: &str, stdin_json: &str) -> (i32, String) {
+    let scratch = tempfile::tempdir().expect("scratch cwd");
     let mut child = mdkb_bin()
         .args(["hook", event])
+        .current_dir(scratch.path())
+        .env("HOME", scratch.path())
         .env("MDKB_NO_DAEMON", "1")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

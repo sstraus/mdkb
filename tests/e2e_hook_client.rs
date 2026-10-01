@@ -82,7 +82,10 @@ fn make_repo() -> TempDir {
 /// the elapsed wall-clock for the exchange.
 fn call_once(socket: &std::path::Path, body: &[u8]) -> (Duration, Vec<u8>) {
     let mut sock = UnixStream::connect(socket).expect("connect hook socket");
-    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    // The first request to a daemon opens and initialises the store; measured
+    // on the rb box that takes 2-5 s idle and longer under load. Only the
+    // steady-state calls are timed, so the read bound just has to outlast it.
+    sock.set_read_timeout(Some(Duration::from_secs(30))).unwrap();
     sock.set_write_timeout(Some(Duration::from_secs(5)))
         .unwrap();
 
@@ -96,7 +99,6 @@ fn call_once(socket: &std::path::Path, body: &[u8]) -> (Duration, Vec<u8>) {
     let resp_len = u32::from_le_bytes(hdr) as usize;
     let mut out = vec![0u8; resp_len];
     sock.read_exact(&mut out).unwrap();
-    eprintln!("PROBE call_once {:?}", start.elapsed());
     (start.elapsed(), out)
 }
 
