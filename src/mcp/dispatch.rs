@@ -4412,27 +4412,43 @@ fn admit_doc_hits(
         .collect()
 }
 
-/// A closure for [`admit_doc_hits`] and [`doc_graph_neighbors`]: whether the file
-/// behind an indexed document (`collection`, `path`) is still on disk. Between a deletion and the next `update` the index still
-/// lists it, and recall must not point at it. Read-only: `update` prunes the
-/// row. A collection's directory is resolved once per collection; a stat that
-/// fails for any reason but absence keeps the document, as `update` does.
-fn indexed_file_present<'a>(
+/// A closure for [`admit_doc_hits`] and [`doc_graph_neighbors`]: where the file
+/// behind an indexed document (`collection`, `path`) is, or `None` for a
+/// collection the index does not know. Between a deletion and the next `update`
+/// the index still lists the document, and recall must not point at it. The
+/// directory is resolved once per collection; this touches the index only, so it
+/// can run under the store guard. The filesystem is asked afterwards, outside
+/// the guard, by [`file_still_there`] — a stat on a hung mount must not hold the
+/// store lock past the hook deadline.
+fn indexed_file_path<'a>(
     conn: &'a rusqlite::Connection,
     root: &'a std::path::Path,
-) -> impl FnMut(&str, &str) -> bool + 'a {
+) -> impl FnMut(&str, &str) -> Option<std::path::PathBuf> + 'a {
     let mut dirs: std::collections::HashMap<String, Option<std::path::PathBuf>> =
         std::collections::HashMap::new();
     move |collection, path| {
-        let dir = dirs.entry(collection.to_string()).or_insert_with(|| {
-            crate::store::collections::get_collection(conn, collection)
-                .ok()
-                .flatten()
-                .map(|c| root.join(c.path))
-        });
-        dir.as_ref()
-            .is_none_or(|dir| !matches!(dir.join(path).try_exists(), Ok(false)))
+        dirs.entry(collection.to_string())
+            .or_insert_with(|| {
+                crate::store::collections::get_collection(conn, collection)
+                    .ok()
+                    .flatten()
+                    .map(|c| root.join(c.path))
+            })
+            .as_ref()
+            .map(|dir| dir.join(path))
     }
+}
+
+/// Whether the file resolved by [`indexed_file_path`] is still a file. Read-only:
+/// `update` prunes the row. Absence and a directory in the file's place (`update`
+/// indexes files only) count as gone; a stat that fails for any other reason, or
+/// an unknown collection, keeps the document, as `update` does.
+fn file_still_there(file: &Option<std::path::PathBuf>) -> bool {
+    file.as_ref()
+        .is_none_or(|file| match std::fs::metadata(file) {
+            Ok(meta) => meta.is_file(),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        })
 }
 
 fn injectable(entries: Vec<memory::ScoredMemoryEntry>) -> Vec<memory::MemoryEntry> {
@@ -5512,6 +5528,8 @@ async fn hook_user_prompt_submit_impl_timed(
             let (prompt, query_embedding, search_cfg) = (prompt_owned, embedding, search_cfg_owned);
             let mut observed: Vec<memory::ScoredMemoryEntry> = Vec::new();
             let mut doc_hits: Vec<(String, Option<String>)> = Vec::new();
+            let mut doc_candidates: Vec<((String, Option<String>), Option<std::path::PathBuf>)> =
+                Vec::new();
             let search_t0 = std::time::Instant::now();
             let search = crate::core::run_guarded_read(store.slot(), "hook memory recall", |ctx| {
                 memory::search_entries_hybrid_fts(
@@ -5618,17 +5636,29 @@ async fn hook_user_prompt_submit_impl_timed(
                         false,
                     )
                     .map(|hits| {
-                        let mut present = indexed_file_present(&ctx.conn, &root);
-                        admit_doc_hits(
+                        // Admission and ranking happen here, under the guard;
+                        // the files are only resolved, and checked below once
+                        // the guard is gone. `files[i]` belongs to the i-th
+                        // admitted hit: `present` runs once per admitted hit,
+                        // in order, and the limit is applied after the check.
+                        let mut resolve = indexed_file_path(&ctx.conn, &root);
+                        let mut files = Vec::new();
+                        let admitted = admit_doc_hits(
                             hits,
                             &prompt,
                             docs_min_cosine,
-                            |hit| present(&hit.collection, &hit.path),
-                            docs_limit,
-                        )
+                            |hit| {
+                                files.push(resolve(&hit.collection, &hit.path));
+                                true
+                            },
+                            usize::MAX,
+                        );
+                        (admitted, files)
                     })
                 }) {
-                    Some(Ok(hits)) => doc_hits = hits,
+                    Some(Ok((admitted, files))) => {
+                        doc_candidates = admitted.into_iter().zip(files).collect()
+                    }
                     Some(Err(error)) => {
                         // Degrade silently (hooks must not block) but stay observable.
                         tracing::debug!("recall doc search failed: {error}");
@@ -5657,6 +5687,14 @@ async fn hook_user_prompt_submit_impl_timed(
                     None => {}
                 }
             }
+            drop(store);
+            doc_hits.extend(
+                doc_candidates
+                    .into_iter()
+                    .filter(|(_, file)| file_still_there(file))
+                    .map(|(hit, _)| hit)
+                    .take(docs_limit),
+            );
             Some((scored_results, observed, doc_hits, rerank_pool))
         });
         let Ok(Some((mut scored_results, observed_hits, doc_hits_found, mut rerank_pool))) =
@@ -5791,6 +5829,9 @@ async fn hook_user_prompt_submit_impl_timed(
     // the (now finalized) memory ids about to be injected.
     let mut neighbors: Vec<(String, String)> = Vec::new();
     if !path_tokens.is_empty() {
+        // Ranked candidates with their resolved files, as in the docs leg; the
+        // cap is applied after the file check, outside the store guard.
+        let mut candidates: Vec<((String, String), Option<std::path::PathBuf>)> = Vec::new();
         if let Ok(mut store) = hook_store(handle).await {
             let seen: std::collections::HashSet<String> =
                 results.iter().map(|e| e.id.clone()).collect();
@@ -5798,21 +5839,33 @@ async fn hook_user_prompt_submit_impl_timed(
                 store.slot(),
                 "hook document graph neighbors",
                 |ctx| {
-                    doc_graph_neighbors(
+                    let mut resolve = indexed_file_path(&ctx.conn, &handle.root);
+                    let mut files = Vec::new();
+                    let found = doc_graph_neighbors(
                         &ctx.conn,
                         &path_tokens,
                         &seen,
-                        handle.config.graph.doc_neighbor_cap,
+                        usize::MAX,
                         query_embedding.as_deref(),
-                        indexed_file_present(&ctx.conn, &handle.root),
-                    )
+                        |collection, path| {
+                            files.push(resolve(collection, path));
+                            true
+                        },
+                    )?;
+                    Ok(found.into_iter().zip(files).collect::<Vec<_>>())
                 },
             ) {
-                Some(Ok(found)) => neighbors = found,
+                Some(Ok(found)) => candidates = found,
                 Some(Err(error)) => tracing::debug!("hook document neighbors failed: {error}"),
                 None => {}
             }
         }
+        neighbors = candidates
+            .into_iter()
+            .filter(|(_, file)| file_still_there(file))
+            .map(|(neighbor, _)| neighbor)
+            .take(handle.config.graph.doc_neighbor_cap)
+            .collect();
     }
 
     phases.mark("enrich");
@@ -6171,7 +6224,7 @@ async fn prompt_prior_block(
 /// strong, curated signal) and so are non-document targets (entity tags like
 /// `themes`/`owner`). Neighbors whose canonical path is in `seen`
 /// (already-injected memory ids) or already emitted are de-duplicated, and so are
-/// those whose file is gone (`present`; see [`indexed_file_present`]).
+/// those the caller's `present` rejects.
 fn doc_graph_neighbors(
     conn: &rusqlite::Connection,
     tokens: &[String],
@@ -16475,7 +16528,10 @@ mod tests {
         let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
         let body = additional_context(&out);
         assert!(body.contains("docs/c.md"), "{body}");
-        assert!(!body.contains("docs/a.md") && !body.contains("docs/b.md"), "{body}");
+        assert!(
+            !body.contains("docs/a.md") && !body.contains("docs/b.md"),
+            "{body}"
+        );
     }
 
     /// Catches: the whole collection directory removed (not one file): every
@@ -16490,7 +16546,10 @@ mod tests {
         std::fs::remove_dir_all(tmp.path().join("docs")).unwrap();
         let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
         let body = additional_context(&out);
-        assert!(!body.contains("docs/one.md") && !body.contains("docs/two.md"), "{body}");
+        assert!(
+            !body.contains("docs/one.md") && !body.contains("docs/two.md"),
+            "{body}"
+        );
     }
 
     /// Catches: the collection directory resolved once for ALL collections (or
@@ -16535,7 +16594,10 @@ mod tests {
         std::fs::write(tmp.path().join("elsewhere/guide.md"), "x").unwrap();
         let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
         let body = additional_context(&out);
-        assert!(body.contains("guide.md"), "present file in 2nd collection: {body}");
+        assert!(
+            body.contains("guide.md"),
+            "present file in 2nd collection: {body}"
+        );
         assert!(body.contains("docs/main.md"), "{body}");
     }
 
@@ -16593,7 +16655,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
-        seed_document(&handle, "docs/now_dir.md", "Quarantine autoheal dir", content).await;
+        seed_document(
+            &handle,
+            "docs/now_dir.md",
+            "Quarantine autoheal dir",
+            content,
+        )
+        .await;
         seed_document(&handle, "docs/file.md", "Quarantine autoheal file", content).await;
         let p = tmp.path().join("docs/docs/now_dir.md");
         std::fs::remove_file(&p).unwrap();
@@ -16649,7 +16717,7 @@ mod tests {
 
     /// Catches: a stat error other than absence (EACCES on the parent dir)
     /// dropping the document. `update` keeps the row in that case, so recall
-    /// must too (documented in `indexed_file_present`).
+    /// must too (documented in `file_still_there`).
     #[cfg(unix)]
     #[tokio::test]
     async fn critic_226_unreadable_directory_keeps_the_document() {
@@ -16657,7 +16725,13 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let handle = make_handle(&tmp);
         let content = "The autoheal routine quarantines a corrupt index before rebuilding it.";
-        seed_document(&handle, "sub/locked.md", "Quarantine autoheal locked", content).await;
+        seed_document(
+            &handle,
+            "sub/locked.md",
+            "Quarantine autoheal locked",
+            content,
+        )
+        .await;
         let dir = tmp.path().join("docs/sub");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
         let out = hook_user_prompt_submit_impl(&handle, "how does quarantine autoheal work").await;
